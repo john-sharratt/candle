@@ -69,7 +69,9 @@ use std::sync::OnceLock;
 
 use ahash::{AHashMap, AHashSet};
 use candle_nn::kv_cache::{rewrite_sealed, FormatCensus, QuantFormat, SealedSequence, Sweep};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::conversation::window_sealed_tokens;
@@ -304,6 +306,13 @@ pub struct Substrate {
     /// it ([`Self::scoped_timelines_for_group`]). In-memory only and derived:
     /// the embedder sets it before each turn from the target's own files.
     retrieval_scopes: PMap<TimelineId, PMap<GroupId, Arc<HashSet<TimelineId>>>>,
+
+    /// A digest of each scope in [`Self::retrieval_scopes`], taken when it is
+    /// set: two targets whose scopes of a group name the same conversations
+    /// share its assembled scan, and their probes ride one launch
+    /// ([`Self::scope_digest`]). Each target's scope is its own set, so the
+    /// sets themselves cannot be told equal without walking them.
+    scope_digests: PMap<TimelineId, PMap<GroupId, u64>>,
 
     /// Per-stream in-RAM index of where each chunk / tokens record /
     /// committed-through watermark sits on disk, kept per writer and read
@@ -576,6 +585,23 @@ pub const IDLE_DEMOTE_GRACE_EPOCHS: u64 = 16;
 /// Eight rounds hold a plan across a typical read-then-edit stretch at about
 /// 2K tokens of thinking a round, ~16K in all, inside the dialogue's share.
 pub const REASONING_ROUNDS: usize = 8;
+
+/// [`Substrate::scope_digest`] of a target with no scope of a scoped group.
+pub const EMPTY_SCOPE_DIGEST: u64 = 0;
+
+/// A digest of the conversations `allowed` names, order-free: the same set
+/// gives the same digest whichever target it was built for. An empty set is
+/// [`EMPTY_SCOPE_DIGEST`], as no scope at all is: both offer nothing.
+fn scope_digest_of(allowed: &HashSet<TimelineId>) -> u64 {
+    if allowed.is_empty() {
+        return EMPTY_SCOPE_DIGEST;
+    }
+    let mut ids: Vec<u64> = allowed.iter().map(|t| t.raw()).collect();
+    ids.sort_unstable();
+    let mut h = DefaultHasher::new();
+    ids.hash(&mut h);
+    h.finish().max(1)
+}
 
 /// The scheduler's publisher id for [`ResidenceSlab::publish_pins`].
 const SCHEDULER_PINS: u64 = 0;
@@ -3867,6 +3893,10 @@ impl Substrate {
         group: GroupId,
         allowed: Arc<HashSet<TimelineId>>,
     ) {
+        self.scope_digests
+            .entry(target)
+            .or_default()
+            .insert(group, scope_digest_of(&allowed));
         self.retrieval_scopes
             .entry(target)
             .or_default()
@@ -3877,7 +3907,22 @@ impl Substrate {
     /// Forget every scope `target` was given — it is going away.
     pub fn clear_retrieval_scope(&mut self, target: TimelineId) {
         self.retrieval_scopes.remove(&target);
+        self.scope_digests.remove(&target);
         self.retrieval_version += 1;
+    }
+
+    /// What `group` offers `target`, as a digest two targets compare: `None`
+    /// for a group that is not scoped — it offers every target the same — and
+    /// otherwise the digest of the target's scope, [`EMPTY_SCOPE_DIGEST`] when
+    /// it has none and the group offers it nothing.
+    pub fn scope_digest(&self, group: GroupId, target: TimelineId) -> Option<u64> {
+        self.scoped_groups.contains(&group).then(|| {
+            self.scope_digests
+                .get(&target)
+                .and_then(|by_group| by_group.get(&group))
+                .copied()
+                .unwrap_or(EMPTY_SCOPE_DIGEST)
+        })
     }
 
     /// The retrieval version: unchanged while no group's scoping, no target's
@@ -5720,6 +5765,7 @@ impl Substrate {
         self.splice_source_timelines.remove(&timeline);
         // A tombstoned conversation is never a projection's target again.
         self.retrieval_scopes.remove(&timeline);
+        self.scope_digests.remove(&timeline);
         self.retrieval_version += 1;
         // Nor carries anything, nor is carried: a pinned item whose turns are
         // gone would keep emitting a promise nothing can deliver.
@@ -7639,6 +7685,7 @@ impl Substrate {
         // read again. Either way the groups it is in offer a different set.
         if archived {
             self.retrieval_scopes.remove(&timeline);
+            self.scope_digests.remove(&timeline);
         }
         self.retrieval_version += 1;
         true
@@ -8904,6 +8951,45 @@ mod tests {
         assert_eq!(scoped(&sub, group, b), vec![ingested[0]]);
         sub.tombstone_timeline(b);
         assert!(sub.retrieval_scopes.is_empty());
+        assert!(
+            sub.scope_digests.is_empty(),
+            "the digests go with the scopes"
+        );
+    }
+
+    /// **Targets whose scopes of a group name the same conversations share
+    /// its digest, whatever order the set was built in**; another set is
+    /// another digest, a scoped group's target with no scope reads as the
+    /// empty one, and a group that is not scoped has none at all.
+    #[test]
+    fn a_scope_digest_names_the_set_a_target_is_offered() {
+        let (mut sub, group, [a, b], ingested) = scope_fixture();
+        assert_eq!(sub.scope_digest(group, a), None, "not scoped");
+        sub.mark_group_scoped(group);
+        assert_eq!(sub.scope_digest(group, a), Some(EMPTY_SCOPE_DIGEST));
+
+        sub.set_retrieval_scope(
+            a,
+            group,
+            Arc::new(HashSet::from([ingested[0], ingested[2]])),
+        );
+        sub.set_retrieval_scope(
+            b,
+            group,
+            Arc::new(HashSet::from([ingested[2], ingested[0]])),
+        );
+        let shared = sub.scope_digest(group, a);
+        assert_eq!(shared, sub.scope_digest(group, b));
+        assert_ne!(shared, Some(EMPTY_SCOPE_DIGEST));
+
+        sub.set_retrieval_scope(b, group, Arc::new(HashSet::from([ingested[1]])));
+        assert_ne!(sub.scope_digest(group, b), shared);
+        assert_eq!(sub.scope_digest(group, a), shared, "a's is its own");
+
+        sub.set_retrieval_scope(a, group, Arc::new(HashSet::new()));
+        assert_eq!(sub.scope_digest(group, a), Some(EMPTY_SCOPE_DIGEST));
+        sub.clear_retrieval_scope(b);
+        assert_eq!(sub.scope_digest(group, b), Some(EMPTY_SCOPE_DIGEST));
     }
 
     /// **A drawing group's candidates are its source's, as its own scope names

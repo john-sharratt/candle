@@ -21,7 +21,9 @@ use maintenance_op::Pass;
 use super::adaptive::{ScanCases, ScanNorm};
 use super::belief_files::{assemble_file_scans, cut_excluded, scan_file_scans, FileScan};
 use super::belief_scan_split::GROUP_SCAN_SPLIT;
-use super::group_assembly::{held, keep, Assemblies, AssemblyKey, AssemblyStamp, GroupAssembly};
+use super::group_assembly::{
+    held, keep, Assemblies, AssemblyKey, AssemblyStamp, GroupAssembly, Whose,
+};
 use super::held_index_pages::HeldIndexPages;
 use super::ids::{
     process_timeline_allocator, GroupId, LayerId, SectionId, TimelineAllocator, TimelineId,
@@ -2637,10 +2639,17 @@ impl Conversation {
             // scan while nothing they were gathered from has moved
             // (`group_assembly`), gathered afresh otherwise.
             let by_kind = group.policy.scan.normalize == ScanNorm::KindZ;
+            // A masked scan, and a compounded one that leaves the target's
+            // lineage out, are the target's own; any other is every target's
+            // whose scope of the group names the same conversations.
+            let whose = if masked || sub.is_append_only_layer(target.layer) {
+                Whose::Target(target.timeline)
+            } else {
+                Whose::Scope(sub.scope_digest(group.id, target.timeline))
+            };
             let key = AssemblyKey {
                 group: group.id,
-                target: target.timeline,
-                masked,
+                whose,
             };
             let stamp = AssemblyStamp::of(&sub);
             let (mut scope_us, mut tags_us, mut exclude_us, mut kinds_us) = (0, 0, 0, 0);

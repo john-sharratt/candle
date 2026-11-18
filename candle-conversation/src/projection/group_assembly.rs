@@ -9,8 +9,11 @@
 //! kinds 6), though nothing they read had changed since the reprojection
 //! before.
 //!
-//! So the assembly is kept per group, target and mask, stamped with what it
-//! was built from:
+//! So the assembly is kept per group and whose it is — one target's, when the
+//! scan is masked to it or leaves its lineage out, and otherwise every
+//! target's whose scope of the group is the same ([`Whose`]), so the
+//! conversations reprojecting together share it and their probes ride one
+//! launch — stamped with what it was built from:
 //!
 //! - [`Substrate::gallery_epoch`] — a stream declared, a signature or
 //!   projection-event blob written, a turn or timeline tombstoned, which is
@@ -29,13 +32,24 @@ use super::belief_files::FileScan;
 use super::ids::{GroupId, TimelineId};
 use crate::substrate::Substrate;
 
-/// Whose assembly: the group, the target it offers to, and whether the scan
-/// is masked to the target's own timeline.
+/// Whose assembly: one target's alone, or every target's whose scope of the
+/// group names the same conversations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Whose {
+    /// A scan masked to the target's own timeline, or one that leaves the
+    /// target's lineage out: no other target's assembly is the same.
+    Target(TimelineId),
+    /// Shared: the group's scope digest (`Substrate::scope_digest`), `None`
+    /// for a group that is not scoped. Targets that share one share its
+    /// files, and their probes ride one launch.
+    Scope(Option<u64>),
+}
+
+/// Whose assembly of which group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct AssemblyKey {
     pub group: GroupId,
-    pub target: TimelineId,
-    pub masked: bool,
+    pub whose: Whose,
 }
 
 /// What an assembly was built from (module docs).
@@ -129,9 +143,22 @@ mod tests {
     fn key(target: u64) -> AssemblyKey {
         AssemblyKey {
             group: GroupId::from_raw(7).unwrap(),
-            target: TimelineId::from_raw(target).unwrap(),
-            masked: false,
+            whose: Whose::Target(TimelineId::from_raw(target).unwrap()),
         }
+    }
+
+    /// Targets with the same scope digest share one key, and so one
+    /// assembly; another digest, or a target's own, is another.
+    #[test]
+    fn targets_with_one_scope_share_a_key() {
+        let shared = |digest| AssemblyKey {
+            group: GroupId::from_raw(7).unwrap(),
+            whose: Whose::Scope(digest),
+        };
+        assert_eq!(shared(Some(9)), shared(Some(9)));
+        assert_ne!(shared(Some(9)), shared(Some(10)));
+        assert_ne!(shared(None), shared(Some(9)));
+        assert_ne!(shared(Some(9)), key(9));
     }
 
     const AT: AssemblyStamp = AssemblyStamp {
