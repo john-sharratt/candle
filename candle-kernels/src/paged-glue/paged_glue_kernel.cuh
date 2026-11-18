@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdio>
 // =============================================================================
 // paged_glue_kernel.cuh — reprojection "glue" attention (decode-derivative).
 //

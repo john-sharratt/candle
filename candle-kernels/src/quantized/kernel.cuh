@@ -80,10 +80,9 @@ struct YTiles {
 // These are defined in their respective loader/*.cuh files but need forward
 // declaration here since kernel.cuh is included before the specific loaders.
 // The impl/*.cu files include both kernel.cuh and loader/*.cuh.
-template <typename compute_t>
+template <typename compute_t, int half_idx>
 __device__ __forceinline__ void dequant_q8_0_for_4x_mma_k16_runtime(
     const uint8_t* __restrict__ smem_rows,
-    int half_idx,
     int lane,
     uint32_t* frag_b
 );
