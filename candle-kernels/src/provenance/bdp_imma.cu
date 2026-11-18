@@ -22,11 +22,17 @@
 //
 // Uses inline-PTX `mma` (not wmma): the m16n8k32 fragment<->thread mappings are
 // documented in the PTX ISA, which is what makes building the fragments from
-// the packed bits legitimate. A warp computes a 16x8 (query x token) tile per 16 K-steps; the
-// accumulator lives entirely in registers, so the epilogue run-merges straight
-// from registers into the shared per-(query, rank) accumulators — no staging
-// buffer at all. Everything else (chunk grid, ballot dense-ranking, rank
-// windows, global accumulators, finalize) mirrors `bdp_bmma.cu`.
+// the packed bits legitimate. A warp owns 16 of the chunk's gallery tokens and
+// computes every query block of a tile against them, 16x8 (query x token) per
+// 16 K-steps: its gallery fragments are expanded once and serve both query
+// blocks, and a tile of 16 queries or fewer runs one block, not two. A
+// reprojection's scan carries the few tokens decoded since the last one
+// (`ProbeRows`), so its launches are almost always a single tile, and work
+// done per gallery token is what they cost. The accumulator lives entirely in
+// registers, so the epilogue run-merges straight from registers into the
+// shared per-(query, rank) accumulators — no staging buffer at all.
+// Everything else (chunk grid, ballot dense-ranking, rank windows, global
+// accumulators, finalize) mirrors `bdp_bmma.cu`.
 
 #include <cstdint>
 #include <cuda_runtime.h>
@@ -43,8 +49,12 @@
 #define BDP_IMMA_DEVICE_OK 0
 #endif
 
-// Gallery tokens per CTA chunk (4 warp token-quarters of 16 = 2 MMA n-tiles).
-#define IMMA_TC 64
+// Gallery tokens per CTA chunk: 8 warps of 16 tokens (2 MMA n-tiles) each.
+#define IMMA_TC 128
+// Warps per CTA, each owning 16 of the chunk's tokens.
+#define IMMA_WARPS 8
+// Arena page entries one chunk spans.
+#define IMMA_CHUNK_ENTRIES (IMMA_TC / 32)
 // Query tokens per CTA tile (2 MMA m-blocks of 16).
 #define IMMA_QT 32
 // The locked folded group width this backend requires: 8 u64 = 512 bits =
@@ -117,40 +127,59 @@ extern "C" __global__ void __launch_bounds__(256) bdp_imma_accum_kernel(
     __shared__ unsigned int sh_case[IMMA_TC];
     __shared__ unsigned short sh_rank[IMMA_TC];
     __shared__ unsigned int sh_rank_case[IMMA_TC];
-    __shared__ unsigned int sh_chg[2]; // per-warp case-change ballot masks
+    // Per-warp case-change ballot masks, one per 32 of the chunk's tokens.
+    __shared__ unsigned int sh_chg[IMMA_TC / 32];
     __shared__ int sh_nranks;
-    // Per-(query, windowed rank) accumulators — same widths/rationale as the
-    // b1 backend (sum <= 64*512, sumsq <= 64*512^2, both u32 per chunk).
+    // The chunk's page entries, read once: group g's strip in each entry's
+    // page (null past the end), the slots it scans and the case it votes for.
+    __shared__ const unsigned long long *sh_entry_strip[IMMA_CHUNK_ENTRIES];
+    __shared__ unsigned int sh_entry_slots[IMMA_CHUNK_ENTRIES];
+    __shared__ unsigned int sh_entry_case[IMMA_CHUNK_ENTRIES];
+    // Per-(query, windowed rank) accumulators, u32 per chunk: sum <=
+    // 128*512 and sumsq <= 128*512^2 (2^25) both fit.
     __shared__ unsigned int sh_max[IMMA_QT * IMMA_ACC_STRIDE];
     __shared__ unsigned int sh_sum[IMMA_QT * IMMA_ACC_STRIDE];
     __shared__ unsigned int sh_sq[IMMA_QT * IMMA_ACC_STRIDE];
 
-    // Stage the gallery chunk's bit records ONCE (reused by every query tile).
-    for (int idx = tid; idx < IMMA_TC * IMMA_GW; idx += blockDim.x) {
-        const int t = idx >> 3;
-        const int k = idx & 7;
-        const int j = j0 + t;
-        unsigned long long w = 0ull;
-        // Slot `j` is slot `j & 31` of entry `j >> 5`'s page, scanned when
-        // its bit is set; a slot not scanned stages zero words.
-        if (j < n_slots && ((entry_slots[j >> 5] >> (j & 31)) & 1u)) {
-            const unsigned long long *tok =
-                // Group g's strip in this page — one address per (page, group).
-                (const unsigned long long *)page_ptr[(size_t)entry_page[j >> 5] * n_groups + g] +
-                (size_t)(j & (IMMA_PAGE_TOKENS - 1)) * IMMA_GW;
-            w = tok[k];
+    // The chunk's page entries — each slot `j` is slot `j & 31` of entry
+    // `j >> 5`'s page — read once, so staging a word costs one load, not the
+    // entry's three dependent ones. The chunk starts on an entry (`IMMA_TC` is
+    // a whole number of pages), and an entry past the end scans nothing.
+    if (tid < IMMA_CHUNK_ENTRIES) {
+        const int e = (j0 >> 5) + tid;
+        const bool live = e * IMMA_PAGE_TOKENS < n_slots;
+        // Group g's strip in this page — one address per (page, group).
+        sh_entry_strip[tid] =
+            live ? (const unsigned long long *)page_ptr[(size_t)entry_page[e] * n_groups + g]
+                 : nullptr;
+        sh_entry_slots[tid] = live ? entry_slots[e] : 0u;
+        sh_entry_case[tid] = live ? gallery_case[e] : 0xFFFFFFFFu;
+    }
+    __syncthreads();
+
+    // Stage the gallery chunk's bit records ONCE (reused by every query tile),
+    // a token's 64 bytes as four 16-byte loads; a slot not scanned stages zero
+    // words.
+    for (int idx = tid; idx < IMMA_TC * (IMMA_GW / 2); idx += blockDim.x) {
+        const int t = idx >> 2;
+        const int h = idx & 3;
+        const int ce = t >> 5;
+        const int sl = t & (IMMA_PAGE_TOKENS - 1);
+        ulonglong2 w = make_ulonglong2(0ull, 0ull);
+        if ((sh_entry_slots[ce] >> sl) & 1u) {
+            w = reinterpret_cast<const ulonglong2 *>(sh_entry_strip[ce] +
+                                                     (size_t)sl * IMMA_GW)[h];
         }
-        sh_b[t * IMMA_ROW_WORDS + k] = w;
+        sh_b[t * IMMA_ROW_WORDS + 2 * h] = w.x;
+        sh_b[t * IMMA_ROW_WORDS + 2 * h + 1] = w.y;
     }
     // Stage each slot's global case id: its entry's when the slot is scanned,
     // the sentinel otherwise (an unscanned slot, the padded tail). A gap in a
     // case's run gives it a second rank here; ranks flush by case id, so the
     // two merge in the global accumulators.
     for (int t = tid; t < IMMA_TC; t += blockDim.x) {
-        const int j = j0 + t;
-        sh_case[t] = (j < n_slots && ((entry_slots[j >> 5] >> (j & 31)) & 1u))
-                         ? gallery_case[j >> 5]
-                         : 0xFFFFFFFFu;
+        const int ce = t >> 5;
+        sh_case[t] = ((sh_entry_slots[ce] >> (t & 31)) & 1u) ? sh_entry_case[ce] : 0xFFFFFFFFu;
     }
     __syncthreads();
 
@@ -181,20 +210,24 @@ extern "C" __global__ void __launch_bounds__(256) bdp_imma_accum_kernel(
         if (c == 0xFFFFFFFFu) {
             sh_rank[tid] = IMMA_RANK_INVALID;
         } else {
-            int r;
-            if (tid < 32) {
-                r = (int)__popc(sh_chg[0] & (0xFFFFFFFFu >> (31 - tid))) - 1;
-            } else {
-                r = (int)__popc(sh_chg[0]) +
-                    (int)__popc(sh_chg[1] & (0xFFFFFFFFu >> (63 - tid))) - 1;
+            // The changes before this token's 32, then its own 32's up to it.
+            int r = -1;
+            for (int w = 0; w < (tid >> 5); w++) {
+                r += (int)__popc(sh_chg[w]);
             }
+            r += (int)__popc(sh_chg[tid >> 5] & (0xFFFFFFFFu >> (31 - (tid & 31))));
             sh_rank[tid] = (unsigned short)r;
             if (tid == 0 || c != sh_case[tid - 1]) {
                 sh_rank_case[r] = c;
             }
         }
         if (tid == 0) {
-            sh_nranks = __popc(sh_chg[0]) + __popc(sh_chg[1]);
+            int n = 0;
+#pragma unroll
+            for (int w = 0; w < IMMA_TC / 32; w++) {
+                n += (int)__popc(sh_chg[w]);
+            }
+            sh_nranks = n;
         }
     }
     __syncthreads();
@@ -203,18 +236,20 @@ extern "C" __global__ void __launch_bounds__(256) bdp_imma_accum_kernel(
         return; // whole chunk past the token end (empty launch tail)
     }
 
-    // Warp assignment: 8 warps = 2 query m-blocks x 4 token quarters; a quarter
-    // is 16 tokens = 2 MMA n-tiles of 8.
-    const int qb = warp & 1;  // query block: rows [qb*16, qb*16+16)
-    const int tq = warp >> 1; // token quarter: tokens [tq*16, tq*16+16)
+    // Warp assignment: each of the 8 warps owns 16 of the chunk's tokens
+    // (2 MMA n-tiles of 8), and computes every query block of a tile against
+    // them.
+    const int tq = warp;         // the warp's tokens: [tq*16, tq*16+16)
     const int grp = lane >> 2;   // fragment group id (0..7)
     const int tig = lane & 3;    // thread-in-group (0..3)
 
     // This warp's gallery (B) fragments, expanded ONCE and held in registers
-    // for every query tile. They depend only on the chunk, so expanding them
-    // inside the query loop redid the same work once per tile. Documented
-    // m16n8k32.s8 B layout (col-major 32x8): b0=(klo, grp) b1=(khi, grp), with
-    // klo = tig*4..+4 and khi = klo+16 — both carved from word ks/2.
+    // for every query tile and both of its query blocks. They depend only on
+    // the chunk, so expanding them inside the query loop redid the same work
+    // once per tile — and a warp per query block redid it once per block.
+    // Documented m16n8k32.s8 B layout (col-major 32x8): b0=(klo, grp)
+    // b1=(khi, grp), with klo = tig*4..+4 and khi = klo+16 — both carved from
+    // word ks/2.
     unsigned int bfrag[2][16][2];
 #pragma unroll
     for (int tile = 0; tile < 2; tile++) {
@@ -254,13 +289,17 @@ extern "C" __global__ void __launch_bounds__(256) bdp_imma_accum_kernel(
             }
             sh_pq[qq] = p;
         }
+        // The tile's query blocks of 16: a tile of 16 queries or fewer has one,
+        // and its second block — rows past the probe end, which the flush skips
+        // — is neither expanded nor multiplied. The same for every warp.
+        const int nmb = (n_probe_tokens - q0) > 16 ? 2 : 1;
         // The tile's query (A) fragments, expanded once by the whole block into
         // the exact register image each lane loads — one 16-byte shared read per
-        // K-step. Every token-quarter warp reads the same rows, so expanding in
-        // each warp did the same work four times over. Documented m16n8k32.s8 A
-        // layout (row-major 16x32): a0=(grp, klo) a1=(grp+8, klo) a2=(grp, khi)
+        // K-step. Every warp reads the same rows, so expanding in each warp did
+        // the same work eight times over. Documented m16n8k32.s8 A layout
+        // (row-major 16x32): a0=(grp, klo) a1=(grp+8, klo) a2=(grp, khi)
         // a3=(grp+8, khi).
-        for (int e = tid; e < 2 * 16 * 32; e += blockDim.x) {
+        for (int e = tid; e < nmb * 16 * 32; e += blockDim.x) {
             const int eb = e >> 9;          // query block
             const int ks = (e >> 5) & 15;   // K-step
             const int el = e & 31;          // lane
@@ -281,7 +320,9 @@ extern "C" __global__ void __launch_bounds__(256) bdp_imma_accum_kernel(
         for (int rw = 0; rw < nranks; rw += IMMA_RANK_CAP) {
             const int wcount =
                 (nranks - rw) < IMMA_RANK_CAP ? (nranks - rw) : IMMA_RANK_CAP;
-            for (int idx = tid; idx < IMMA_QT * wcount; idx += blockDim.x) {
+            // The rows the tile's blocks write: a one-block tile's other 16 are
+            // never written, and the flush skips them.
+            for (int idx = tid; idx < nmb * 16 * wcount; idx += blockDim.x) {
                 const int base =
                     (idx / wcount) * IMMA_ACC_STRIDE + (idx % wcount);
                 sh_max[base] = 0u;
@@ -290,39 +331,8 @@ extern "C" __global__ void __launch_bounds__(256) bdp_imma_accum_kernel(
             }
             __syncthreads();
 
-            // The warp's two 16x8 tiles (documented m16n8 C layout: c[0]=(grp,
-            // tig*2), c[1]=(grp, tig*2+1), c[2]/c[3] = rows +8). Both operands
-            // arrive expanded: A as one 16-byte shared read of the image the
-            // block built for this tile, B from the registers this warp filled
-            // for the chunk.
-            int acc[2][4];
-            const uint4 *afrag = &sh_afrag[qb * 16 * 32 + lane];
-#pragma unroll
-            for (int tile = 0; tile < 2; tile++) {
-                int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-#pragma unroll
-                for (int ks = 0; ks < 16; ks++) {
-                    const uint4 a = afrag[ks * 32];
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
-                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                        : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
-                        : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(bfrag[tile][ks][0]),
-                          "r"(bfrag[tile][ks][1]));
-                }
-                acc[tile][0] = c0;
-                acc[tile][1] = c1;
-                acc[tile][2] = c2;
-                acc[tile][3] = c3;
-            }
-
-            // With the 0/1 encoding the MMA accumulated m11 = popc(q AND t), so
-            // agreement = 512 - popc(q) - popc(t) + 2*m11 — exact.
-            const unsigned int pq0 = sh_pq[qb * 16 + grp];
-            const unsigned int pq1 = sh_pq[qb * 16 + grp + 8];
-
-            // **One case under the whole quarter — the common case.** A case is
-            // an exchange, thousands of tokens long, so the 16 tokens a warp
+            // **One case under the warp's 16 tokens — the common case.** A case
+            // is an exchange, thousands of tokens long, so the 16 tokens a warp
             // holds almost always share one rank. Then each row's statistics
             // reduce in registers — the lane's four agreements, then the row's
             // four lanes by shuffle — and one lane per row updates the shared
@@ -331,102 +341,139 @@ extern "C" __global__ void __launch_bounds__(256) bdp_imma_accum_kernel(
             // lanes to an address, were what held the kernel: L1 77.8% busy at
             // 21% compute (ncu, sm_120). Max and integer sums are exact in any
             // order, so the statistics are the per-token path's bit for bit.
+            // The same for every query block of the tile.
             const unsigned short rq = sh_rank[tq * 16];
             const bool one_case = __all_sync(0xFFFFFFFFu, sh_rank[tq * 16 + (lane & 15)] == rq) &&
                                   (unsigned int)((int)rq - rw) < (unsigned int)wcount;
-            if (one_case) {
-#pragma unroll
-                for (int half = 0; half < 2; half++) {
-                    const unsigned int pq = half ? pq1 : pq0;
-                    unsigned int mx = 0u, sm = 0u, sq = 0u;
-#pragma unroll
-                    for (int tile = 0; tile < 2; tile++) {
-                        const int n0 = tq * 16 + tile * 8 + tig * 2;
-#pragma unroll
-                        for (int i = 0; i < 2; i++) {
-                            const unsigned int ag =
-                                (unsigned int)(512 + 2 * acc[tile][half * 2 + i]) - pq -
-                                sh_pt[n0 + i];
-                            mx = ag > mx ? ag : mx;
-                            sm += ag;
-                            sq += ag * ag;
-                        }
-                    }
-#pragma unroll
-                    for (int off = 1; off < 4; off <<= 1) {
-                        const unsigned int omx = __shfl_xor_sync(0xFFFFFFFFu, mx, off);
-                        mx = omx > mx ? omx : mx;
-                        sm += __shfl_xor_sync(0xFFFFFFFFu, sm, off);
-                        sq += __shfl_xor_sync(0xFFFFFFFFu, sq, off);
-                    }
-                    if (tig == 0) {
-                        const int at = (qb * 16 + grp + half * 8) * IMMA_ACC_STRIDE - rw + rq;
-                        atomicMax(&sh_max[at], mx);
-                        atomicAdd(&sh_sum[at], sm);
-                        atomicAdd(&sh_sq[at], sq);
-                    }
-                }
-            }
-#pragma unroll
-            for (int tile = 0; tile < 2; tile++) {
-                if (one_case) {
-                    break;
-                }
-                const int t0 = tq * 16 + tile * 8;
-                const int c0 = acc[tile][0];
-                const int c1 = acc[tile][1];
-                const int c2 = acc[tile][2];
-                const int c3 = acc[tile][3];
 
-                // Per-token epilogue for a quarter that spans a case boundary:
-                // this thread's 4 accumulator elements are (row grp, tokens
-                // n0/n0+1) and (row grp+8, same tokens) — the adjacent-token
-                // pair merges in registers when it shares a rank.
-                const int n0 = t0 + tig * 2;
-                const unsigned short rk0 = sh_rank[n0];
-                const unsigned short rk1 = sh_rank[n0 + 1];
-                const bool ok0 =
-                    (unsigned int)((int)rk0 - rw) < (unsigned int)wcount;
-                const bool ok1 =
-                    (unsigned int)((int)rk1 - rw) < (unsigned int)wcount;
-                const unsigned int pt0 = sh_pt[n0];
-                const unsigned int pt1 = sh_pt[n0 + 1];
-                const unsigned int ag00 =
-                    (unsigned int)(512 + 2 * c0) - pq0 - pt0;
-                const unsigned int ag01 =
-                    (unsigned int)(512 + 2 * c1) - pq0 - pt1;
-                const unsigned int ag10 =
-                    (unsigned int)(512 + 2 * c2) - pq1 - pt0;
-                const unsigned int ag11 =
-                    (unsigned int)(512 + 2 * c3) - pq1 - pt1;
+            for (int qb = 0; qb < nmb; qb++) {
+                // The warp's two 16x8 tiles of query block `qb` (documented
+                // m16n8 C layout: c[0]=(grp, tig*2), c[1]=(grp, tig*2+1),
+                // c[2]/c[3] = rows +8). Both operands arrive expanded: A as one
+                // 16-byte shared read of the image the block built for this
+                // tile, B from the registers this warp filled for the chunk.
+                int acc[2][4];
+                const uint4 *afrag = &sh_afrag[qb * 16 * 32 + lane];
 #pragma unroll
-                for (int half = 0; half < 2; half++) {
-                    const int row = qb * 16 + grp + half * 8;
-                    const unsigned int agA = half ? ag10 : ag00;
-                    const unsigned int agB = half ? ag11 : ag01;
-                    const int base = row * IMMA_ACC_STRIDE - rw;
-                    if (ok0 && ok1 && rk0 == rk1) {
-                        const unsigned int mx = agA > agB ? agA : agB;
-                        atomicMax(&sh_max[base + rk0], mx);
-                        atomicAdd(&sh_sum[base + rk0], agA + agB);
-                        atomicAdd(&sh_sq[base + rk0], agA * agA + agB * agB);
-                    } else {
-                        if (ok0) {
-                            atomicMax(&sh_max[base + rk0], agA);
-                            atomicAdd(&sh_sum[base + rk0], agA);
-                            atomicAdd(&sh_sq[base + rk0], agA * agA);
+                for (int tile = 0; tile < 2; tile++) {
+                    int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+#pragma unroll
+                    for (int ks = 0; ks < 16; ks++) {
+                        const uint4 a = afrag[ks * 32];
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                            : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                            : "r"(a.x), "r"(a.y), "r"(a.z), "r"(a.w), "r"(bfrag[tile][ks][0]),
+                              "r"(bfrag[tile][ks][1]));
+                    }
+                    acc[tile][0] = c0;
+                    acc[tile][1] = c1;
+                    acc[tile][2] = c2;
+                    acc[tile][3] = c3;
+                }
+
+                // With the 0/1 encoding the MMA accumulated m11 = popc(q AND t),
+                // so agreement = 512 - popc(q) - popc(t) + 2*m11 — exact.
+                const unsigned int pq0 = sh_pq[qb * 16 + grp];
+                const unsigned int pq1 = sh_pq[qb * 16 + grp + 8];
+
+                if (one_case) {
+#pragma unroll
+                    for (int half = 0; half < 2; half++) {
+                        const unsigned int pq = half ? pq1 : pq0;
+                        unsigned int mx = 0u, sm = 0u, sq = 0u;
+#pragma unroll
+                        for (int tile = 0; tile < 2; tile++) {
+                            const int n0 = tq * 16 + tile * 8 + tig * 2;
+#pragma unroll
+                            for (int i = 0; i < 2; i++) {
+                                const unsigned int ag =
+                                    (unsigned int)(512 + 2 * acc[tile][half * 2 + i]) - pq -
+                                    sh_pt[n0 + i];
+                                mx = ag > mx ? ag : mx;
+                                sm += ag;
+                                sq += ag * ag;
+                            }
                         }
-                        if (ok1) {
-                            atomicMax(&sh_max[base + rk1], agB);
-                            atomicAdd(&sh_sum[base + rk1], agB);
-                            atomicAdd(&sh_sq[base + rk1], agB * agB);
+#pragma unroll
+                        for (int off = 1; off < 4; off <<= 1) {
+                            const unsigned int omx = __shfl_xor_sync(0xFFFFFFFFu, mx, off);
+                            mx = omx > mx ? omx : mx;
+                            sm += __shfl_xor_sync(0xFFFFFFFFu, sm, off);
+                            sq += __shfl_xor_sync(0xFFFFFFFFu, sq, off);
+                        }
+                        if (tig == 0) {
+                            const int at =
+                                (qb * 16 + grp + half * 8) * IMMA_ACC_STRIDE - rw + rq;
+                            atomicMax(&sh_max[at], mx);
+                            atomicAdd(&sh_sum[at], sm);
+                            atomicAdd(&sh_sq[at], sq);
                         }
                     }
                 }
+#pragma unroll
+                for (int tile = 0; tile < 2; tile++) {
+                    if (one_case) {
+                        break;
+                    }
+                    const int t0 = tq * 16 + tile * 8;
+                    const int c0 = acc[tile][0];
+                    const int c1 = acc[tile][1];
+                    const int c2 = acc[tile][2];
+                    const int c3 = acc[tile][3];
+
+                    // Per-token epilogue for a warp whose tokens span a case
+                    // boundary: this thread's 4 accumulator elements are (row
+                    // grp, tokens n0/n0+1) and (row grp+8, same tokens) — the
+                    // adjacent-token pair merges in registers when it shares a
+                    // rank.
+                    const int n0 = t0 + tig * 2;
+                    const unsigned short rk0 = sh_rank[n0];
+                    const unsigned short rk1 = sh_rank[n0 + 1];
+                    const bool ok0 =
+                        (unsigned int)((int)rk0 - rw) < (unsigned int)wcount;
+                    const bool ok1 =
+                        (unsigned int)((int)rk1 - rw) < (unsigned int)wcount;
+                    const unsigned int pt0 = sh_pt[n0];
+                    const unsigned int pt1 = sh_pt[n0 + 1];
+                    const unsigned int ag00 =
+                        (unsigned int)(512 + 2 * c0) - pq0 - pt0;
+                    const unsigned int ag01 =
+                        (unsigned int)(512 + 2 * c1) - pq0 - pt1;
+                    const unsigned int ag10 =
+                        (unsigned int)(512 + 2 * c2) - pq1 - pt0;
+                    const unsigned int ag11 =
+                        (unsigned int)(512 + 2 * c3) - pq1 - pt1;
+#pragma unroll
+                    for (int half = 0; half < 2; half++) {
+                        const int row = qb * 16 + grp + half * 8;
+                        const unsigned int agA = half ? ag10 : ag00;
+                        const unsigned int agB = half ? ag11 : ag01;
+                        const int base = row * IMMA_ACC_STRIDE - rw;
+                        if (ok0 && ok1 && rk0 == rk1) {
+                            const unsigned int mx = agA > agB ? agA : agB;
+                            atomicMax(&sh_max[base + rk0], mx);
+                            atomicAdd(&sh_sum[base + rk0], agA + agB);
+                            atomicAdd(&sh_sq[base + rk0], agA * agA + agB * agB);
+                        } else {
+                            if (ok0) {
+                                atomicMax(&sh_max[base + rk0], agA);
+                                atomicAdd(&sh_sum[base + rk0], agA);
+                                atomicAdd(&sh_sq[base + rk0], agA * agA);
+                            }
+                            if (ok1) {
+                                atomicMax(&sh_max[base + rk1], agB);
+                                atomicAdd(&sh_sum[base + rk1], agB);
+                                atomicAdd(&sh_sq[base + rk1], agB * agB);
+                            }
+                        }
+                    }
+                }
+                // Explicit reconvergence after the divergent epilogue: the next
+                // query block's mma.sync requires all 32 lanes converged.
+                __syncwarp();
             }
-            // Explicit reconvergence after the divergent epilogue: the next
-            // query tile's mma.sync requires all 32 lanes converged.
-            __syncwarp();
             __syncthreads();
 
             // Flush this window to the global per-case accumulators (identical

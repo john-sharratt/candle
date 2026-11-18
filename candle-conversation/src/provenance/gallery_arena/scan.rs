@@ -2675,8 +2675,10 @@ mod tests {
         }
 
         // Probes exercising tile tails: 1, 9 and 100 query tokens, and 161 —
-        // six query tiles, the last holding one row.
-        let probes_owned: Vec<Vec<WideQSig>> = [1usize, 9, 100, 161]
+        // six query tiles, the last holding one row. A tile of 16 queries or
+        // fewer runs one query block, more runs two: 16, 17 and 20 sit on
+        // either side of that.
+        let probes_owned: Vec<Vec<WideQSig>> = [1usize, 9, 16, 17, 20, 100, 161]
             .iter()
             .map(|&n| (0..n).map(|_| rand_sig(&mut rng)).collect())
             .collect();
@@ -3086,7 +3088,9 @@ mod tests {
                 _ => arena.scan_weighted(&segs, &[probe], &[]),
             };
             println!("{shape}: {tokens} index tokens");
-            for probe_tokens in [66usize, 256, 1_024] {
+            // A live reprojection's launch carries the few tokens decoded since
+            // the last (`ProbeRows`): 1–64 is its common case.
+            for probe_tokens in [1usize, 6, 16, 32, 66, 256, 1_024] {
                 for name in &backends {
                     // The first scan builds the index and uploads the pages.
                     let warm: Vec<WideQSig> =
