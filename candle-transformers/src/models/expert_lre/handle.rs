@@ -361,6 +361,22 @@ fn warm_sizing_from(
     }
 }
 
+/// What was free at launch, `launch`, less what this process now holds resident
+/// that it will not give back and has not pinned: `own_resident`, its private
+/// working set, less `pinned`, which [`warm_sizing_from`] takes out itself.
+///
+/// **The launch figure's gap is not all droppable.** It stands for the mapped
+/// checkpoint's pages, which the warm tier never competed with — but the
+/// process's own heap is in the gap too, and that stays. On WhiteWorld (64 GB,
+/// 2026-11-17) zend's opened substrate held ~31 GB resident; sized from the
+/// launch figure, the tier pinned 30 GB with 18.9 GB free, the process's
+/// working set was paged out to 0.02 GB, the pagefile reached 47 GB, and the
+/// boot ran past keep's ten-minute trial. Taken out here, the same machine
+/// sizes the tier to what it has.
+fn launch_less_own(launch: u64, own_resident: u64, pinned: u64) -> u64 {
+    launch.saturating_sub(own_resident.saturating_sub(pinned))
+}
+
 /// How many `stride`-byte pinned slots this host can afford, wanting
 /// `total_slots` of them.
 ///
@@ -390,13 +406,18 @@ pub(crate) fn warm_slots_for(stride: usize, total_slots: usize) -> usize {
         return 0;
     };
     let budget = candle::vram::host_ram_budget(total_ram);
+    let pinned = candle::vram::host_pinned_bytes();
     let sizing = warm_sizing_from(
         stride,
         total_experts,
         total_ram,
         available,
-        candle::vram::launch_available_ram().unwrap_or(available),
-        candle::vram::host_pinned_bytes(),
+        launch_less_own(
+            candle::vram::launch_available_ram().unwrap_or(available),
+            candle::vram::process_private_resident().unwrap_or(pinned),
+            pinned,
+        ),
+        pinned,
         // This tier's OWN slice of the host partition. It used to be handed the
         // KV tier's budget as a ceiling, which never bound: this runs before the
         // pool is pinned, so that figure was computed against a machine with
@@ -1571,8 +1592,8 @@ impl ExpertCache {
 #[cfg(all(test, feature = "cuda"))]
 mod warm_sizing_tests {
     use super::{
-        warm_sizing_from, CEILING_AVAILABLE, CEILING_HOST_BUDGET, CEILING_NONE, CEILING_PINNABLE,
-        PAGEABLE_RESERVE, WARM_TIER_HEADROOM,
+        launch_less_own, warm_sizing_from, CEILING_AVAILABLE, CEILING_HOST_BUDGET, CEILING_NONE,
+        CEILING_PINNABLE, PAGEABLE_RESERVE, WARM_TIER_HEADROOM,
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -1938,5 +1959,53 @@ mod warm_sizing_tests {
         let s = warm_sizing_from(SLOT, EVICTABLE, 31 * GIB, 20 * GIB, 20 * GIB, 0, 27 * GIB);
         assert_eq!(s.taken_bytes, (s.slots * SLOT) as u64);
         assert!(s.taken_bytes <= s.available_less_headroom.min(s.pinnable_cap));
+    }
+
+    /// **The process's own heap is not droppable, and the tier is not sized
+    /// over it.** WhiteWorld's 5184 trial (2026-11-17): ~50 GiB free at launch,
+    /// 18.9 GiB free when the tier was sized, ~30.4 GiB of the process resident
+    /// (zend's substrate; 2 GiB of it pinned), and a stated 28 GiB pin. Sized from
+    /// the launch figure alone the tier took the whole pin over the free RAM and
+    /// the box paged; with the process's own heap out of the launch figure, the
+    /// tier fits in what was free.
+    #[test]
+    fn the_tier_is_not_sized_over_the_processs_own_heap() {
+        let pinned = 2 * GIB;
+        let launch = 50 * GIB;
+        let free_now = 18 * GIB + 9 * GIB / 10;
+        let own = 30 * GIB + 2 * GIB / 5;
+        let pin = 28 * GIB;
+        // Flash-Next's evictable experts: enough that the pin, not the count,
+        // is what the old sizing stops at.
+        let experts = 24_064;
+        let before = warm_sizing_from(SLOT, experts, 64 * GIB, free_now, launch, pinned, pin);
+        assert!(
+            before.taken_bytes > free_now,
+            "the old sizing took {} GiB with {} GiB free",
+            before.taken_bytes / GIB,
+            free_now / GIB
+        );
+        let corrected = launch_less_own(launch, own, pinned);
+        assert_eq!(corrected, launch - (own - pinned));
+        let after = warm_sizing_from(SLOT, experts, 64 * GIB, free_now, corrected, pinned, pin);
+        // What the machine had, less everything the process holds, less the
+        // headroom: the tier and the process's own heap fit in it together.
+        assert!(
+            after.taken_bytes + WARM_TIER_HEADROOM <= launch - own,
+            "the tier takes {} GiB beside {} GiB of the process's own",
+            after.taken_bytes / GIB,
+            own / GIB
+        );
+        assert!(after.taken_bytes < free_now);
+        assert_eq!(after.bound_by, CEILING_AVAILABLE);
+    }
+
+    /// A process whose only resident memory is what it pinned changes nothing:
+    /// the launch figure stands, as the mid-load trough case needs.
+    #[test]
+    fn a_process_holding_only_pinned_memory_keeps_the_launch_figure() {
+        assert_eq!(launch_less_own(15 * GIB, GIB, GIB), 15 * GIB);
+        assert_eq!(launch_less_own(15 * GIB, GIB / 2, GIB), 15 * GIB);
+        assert_eq!(launch_less_own(4 * GIB, 9 * GIB, 0), 0);
     }
 }

@@ -199,6 +199,70 @@ pub fn launch_available_ram() -> Option<u64> {
     *LAUNCH_AVAIL.get_or_init(available_physical_ram)
 }
 
+/// Bytes of this process's own memory that are resident and not file-backed —
+/// its private working set, page-locked memory included — or `None` where the
+/// platform has no probe here.
+///
+/// The term [`launch_available_ram`] cannot see. That reading predates the
+/// process, and the gap between it and what is free now is mostly the mapped
+/// checkpoint's pages, which are droppable — but not all of it. Whatever the
+/// process has allocated for itself since launch is resident and stays: on
+/// WhiteWorld (64 GB, 2026-11-17) zend's opened substrate held ~31 GB of it, and
+/// a warm tier sized from the launch figure alone pinned 30 GB beside it, the
+/// machine paged the process out and a two-minute boot took fourteen.
+#[cfg(windows)]
+pub fn process_private_resident() -> Option<u64> {
+    /// `PROCESS_MEMORY_COUNTERS_EX2`, which `K32GetProcessMemoryInfo` fills
+    /// when `cb` names its size (Windows 10 1809 and later).
+    #[repr(C)]
+    struct Counters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+        private_usage: usize,
+        private_working_set_size: usize,
+        shared_commit_usage: u64,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn K32GetProcessMemoryInfo(
+            process: *mut std::ffi::c_void,
+            counters: *mut Counters,
+            cb: u32,
+        ) -> i32;
+    }
+    // SAFETY: plain Win32 calls; `c` is a writable struct of the size passed.
+    unsafe {
+        let mut c: Counters = std::mem::zeroed();
+        c.cb = std::mem::size_of::<Counters>() as u32;
+        let ok = K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb);
+        (ok != 0).then_some(c.private_working_set_size as u64)
+    }
+}
+
+/// [`process_private_resident`] on Linux: `RssAnon`, the resident anonymous
+/// pages.
+#[cfg(target_os = "linux")]
+pub fn process_private_resident() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("RssAnon:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn process_private_resident() -> Option<u64> {
+    None
+}
+
 /// The least host RAM seen free since the process started, or `u64::MAX` if
 /// nothing has sampled yet.
 ///
@@ -777,6 +841,23 @@ mod tests {
         assert_eq!(b.tier_pool_bytes, 0);
         assert_eq!(b.kv_warm_budget_bytes, KV_WARM_FLOOR);
         assert_eq!(b.expert_pinned_budget_bytes, 0);
+    }
+
+    /// **The process's own resident memory is read, and grows with what it
+    /// allocates**: 64 MiB touched shows up in it, on the platforms that probe.
+    #[test]
+    fn own_resident_memory_is_read_and_grows() {
+        let Some(before) = process_private_resident() else {
+            assert!(cfg!(not(any(windows, target_os = "linux"))));
+            return;
+        };
+        let held = vec![1u8; 64 << 20];
+        let after = process_private_resident().unwrap();
+        assert!(
+            after >= before + (48 << 20),
+            "{before} then {after} with 64 MiB touched"
+        );
+        drop(held);
     }
 
     /// The rate derivation needs two samples and never goes negative.
