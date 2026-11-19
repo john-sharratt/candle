@@ -19,10 +19,10 @@
 //!   or projection-event blob written, a turn or timeline tombstoned in a
 //!   conversation the group reads, or in a calibration of one of its files,
 //!   which is every change to its files' turns, windows and calibrations'
-//!   signatures — and, for a target's own assembly, of the target's group;
-//! - [`Substrate::retrieval_version`] — a group's scoping, a target's scope, a
-//!   chunk exclusion, an archived flag, a timeline's metadata (its path, the
-//!   unit it calibrates);
+//!   signatures; and its scoping, a target's scope of it, its chunk
+//!   exclusion, a timeline's metadata (its path, the unit it calibrates) or
+//!   archived flag;
+//! - for a target's own assembly, the epoch of the target's group;
 //!
 //! and the policy it was assembled under: the group's tags and whether it reads
 //! kinds. A scan reuses it while all of them stand, and assembles afresh when
@@ -62,7 +62,6 @@ pub(crate) struct AssemblyStamp {
     /// The target's group's content epoch, for an assembly that is the
     /// target's own ([`Whose::Target`]); zero for a shared one.
     pub target_epoch: u64,
-    pub retrieval: u64,
 }
 
 impl AssemblyStamp {
@@ -74,7 +73,6 @@ impl AssemblyStamp {
                 Whose::Target(_) => sub.group_epoch(target_group),
                 Whose::Scope(_) => 0,
             },
-            retrieval: sub.retrieval_version(),
         }
     }
 }
@@ -174,11 +172,10 @@ mod tests {
     const AT: AssemblyStamp = AssemblyStamp {
         group_epoch: 10,
         target_epoch: 0,
-        retrieval: 4,
     };
 
     /// **An assembly serves only the stamp, tags and kind reading it was built
-    /// under**: a moved epoch, a moved retrieval version, other tags or a
+    /// under**: a moved group epoch, a moved target epoch, other tags or a
     /// changed kind reading each send the scan to assemble afresh.
     #[test]
     fn an_assembly_serves_only_what_it_was_built_from() {
@@ -194,8 +191,6 @@ mod tests {
             ..AT
         };
         assert!(!a.serves(later_target, &["code".into()], true));
-        let later_scope = AssemblyStamp { retrieval: 5, ..AT };
-        assert!(!a.serves(later_scope, &["code".into()], true));
         assert!(!a.serves(AT, &["docs".into()], true));
         assert!(!a.serves(AT, &["code".into()], false));
     }

@@ -19,7 +19,13 @@
 //!
 //! and a change that names no timeline moves every group's. A group's epoch is
 //! read as the sum of its own and that shared one, which moves whenever either
-//! does.
+//! does. A stream that holds no turn — a prompt section — is read by no
+//! group's scan, and moves none.
+//!
+//! What a group offers beyond its turns moves its epoch the same way: its
+//! scoping, a target's scope of it when that scope names other conversations,
+//! its chunk exclusion, what it draws from, and a timeline's metadata (a
+//! file's path names its kind, a calibration names its file) or archived flag.
 
 use super::stream_index::StreamKey;
 use super::Substrate;
@@ -47,6 +53,18 @@ impl Substrate {
                 groups.push(entry.group);
             }
         }
+        self.groups_content_changed(groups);
+    }
+
+    /// What `group` offers changed — its scoping, a target's scope of it, its
+    /// chunk exclusion, what it draws from: its epoch and its drawers' move.
+    pub(super) fn group_content_changed(&mut self, group: GroupId) {
+        self.groups_content_changed(vec![group]);
+    }
+
+    /// The epochs of `groups` and of every group drawing from one of them
+    /// move, each once.
+    fn groups_content_changed(&mut self, mut groups: Vec<GroupId>) {
         let drawers: Vec<GroupId> = self
             .drawing_groups
             .iter()
@@ -63,16 +81,20 @@ impl Substrate {
     }
 
     /// A value on `key`'s stream changed: the groups reading its turn's
-    /// timeline move, or every group's when the stream is no turn.
+    /// timeline move. A stream that is no turn is read by no group's scan,
+    /// and one whose turn is not declared yet is read once its declaration
+    /// comes, which moves its groups then.
     pub(super) fn stream_content_changed(&mut self, key: StreamKey) {
-        match self
-            .streams
+        if let Some(timeline) = self.stream_turn_timeline(key) {
+            self.timeline_content_changed(timeline);
+        }
+    }
+
+    /// The timeline of the turn declared on `key`'s stream, if one is.
+    pub(super) fn stream_turn_timeline(&self, key: StreamKey) -> Option<TimelineId> {
+        self.streams
             .turn(key)
             .and_then(|t| TimelineId::from_raw(t.decl.timeline_id))
-        {
-            Some(timeline) => self.timeline_content_changed(timeline),
-            None => self.all_groups_content_changed(),
-        }
     }
 
     /// Something changed whose timeline is not known: every group's epoch
@@ -169,17 +191,42 @@ mod tests {
         assert!(after[3] > before[3], "a group drawing from the file's");
     }
 
-    /// **A change that names no timeline moves every group**: a stream that is
-    /// no turn, and a timeline this version does not hold.
+    /// **A stream that holds no turn moves no group**, its declaration and
+    /// its values alike: no group's scan reads it, and a turn declared on it
+    /// later moves its own group then. A timeline this version does not hold
+    /// moves every group.
     #[test]
-    fn a_change_naming_no_timeline_moves_every_group() {
+    fn a_stream_holding_no_turn_moves_no_group() {
         let mut sub = substrate(&[(7, 1), (8, 2)]);
         let before = [1, 2].map(|g| sub.group_epoch(group(g)));
         write_sig(&mut sub, turn_stream_id(99, 0), 99);
+        assert_eq!([1, 2].map(|g| sub.group_epoch(group(g))), before);
+        sub.timeline_content_changed(timeline(1234));
         let after = [1, 2].map(|g| sub.group_epoch(group(g)));
         assert!(after[0] > before[0] && after[1] > before[1]);
-        sub.timeline_content_changed(timeline(1234));
-        assert!(sub.group_epoch(group(1)) > after[0]);
+    }
+
+    /// **A target's scope moves its group only when it names other
+    /// conversations** — it is set again on every request — and clearing it
+    /// moves the groups it scoped.
+    #[test]
+    fn a_scope_moves_its_group_only_when_it_changes() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        let mut sub = substrate(&[(7, 1), (8, 2)]);
+        let target = timeline(50);
+        let scope = || Arc::new(HashSet::from([timeline(7)]));
+        sub.set_retrieval_scope(target, group(1), scope());
+        let set = sub.group_epoch(group(1));
+        sub.set_retrieval_scope(target, group(1), scope());
+        assert_eq!(sub.group_epoch(group(1)), set, "the same scope again");
+        sub.set_retrieval_scope(target, group(1), Arc::new(HashSet::new()));
+        let changed = sub.group_epoch(group(1));
+        assert!(changed > set);
+        let other = sub.group_epoch(group(2));
+        sub.clear_retrieval_scope(target);
+        assert!(sub.group_epoch(group(1)) > changed);
+        assert_eq!(sub.group_epoch(group(2)), other, "a group it never scoped");
     }
 
     /// **A tombstone moves its timeline's group**, as a reset moves every one.

@@ -348,18 +348,12 @@ pub struct Substrate {
     /// [`Self::gallery_epoch`]).
     gallery_epoch: u64,
 
-    /// Bumped whenever what a belief turn group offers changes beyond its
-    /// streams: a group marked scoped, a target's scope set or cleared, a
-    /// group's chunk exclusion replaced, a conversation archived or restored.
-    /// With [`Self::gallery_epoch`] and [`Self::custom_objects_version`] it
-    /// stamps an assembled group scan, which is reused while all three stand
-    /// (`projection::group_assembly`).
-    retrieval_version: u64,
-
-    /// Each belief group's content epoch: moved by every change that moves
-    /// [`Self::gallery_epoch`] and names a timeline whose turns the group's
-    /// scan reads (`group_epoch`). An assembled group scan is stamped with
-    /// its group's, so a turn sealed in one conversation reassembles the
+    /// Each belief group's content epoch (`group_epoch`): moved by every
+    /// change to what the group's scan is assembled from — a turn of a
+    /// conversation it reads, a calibration of one of its files, its scoping,
+    /// a target's scope of it, its chunk exclusion, what it draws from, a
+    /// conversation's metadata or archived flag. An assembled group scan is
+    /// stamped with it, so a turn sealed in one conversation reassembles the
     /// groups that read it and no other.
     group_epochs: PMap<GroupId, u64>,
 
@@ -3733,7 +3727,7 @@ impl Substrate {
     /// overlap, so a unit is placed through one group or the other. Idempotent.
     pub fn set_group_draws(&mut self, drawing: GroupId, from: GroupId) {
         if self.drawing_groups.insert(drawing, from) != Some(from) {
-            self.retrieval_version += 1;
+            self.group_content_changed(drawing);
         }
     }
 
@@ -3888,7 +3882,7 @@ impl Substrate {
     /// scope names them. Idempotent.
     pub fn mark_group_scoped(&mut self, group: GroupId) {
         if self.scoped_groups.insert(group).is_none() {
-            self.retrieval_version += 1;
+            self.group_content_changed(group);
         }
     }
 
@@ -3905,22 +3899,31 @@ impl Substrate {
         group: GroupId,
         allowed: Arc<HashSet<TimelineId>>,
     ) {
-        self.scope_digests
+        let digest = scope_digest_of(&allowed);
+        let before = self
+            .scope_digests
             .entry(target)
             .or_default()
-            .insert(group, scope_digest_of(&allowed));
+            .insert(group, digest);
         self.retrieval_scopes
             .entry(target)
             .or_default()
             .insert(group, allowed);
-        self.retrieval_version += 1;
+        // A scope naming the same conversations changes nothing a scan reads:
+        // a target's scope is set again on every request.
+        if before != Some(digest) {
+            self.group_content_changed(group);
+        }
     }
 
     /// Forget every scope `target` was given — it is going away.
     pub fn clear_retrieval_scope(&mut self, target: TimelineId) {
         self.retrieval_scopes.remove(&target);
-        self.scope_digests.remove(&target);
-        self.retrieval_version += 1;
+        if let Some(scoped) = self.scope_digests.remove(&target) {
+            for group in scoped.keys().copied().collect::<Vec<_>>() {
+                self.group_content_changed(group);
+            }
+        }
     }
 
     /// What `group` offers `target`, as a digest two targets compare: `None`
@@ -3935,13 +3938,6 @@ impl Substrate {
                 .copied()
                 .unwrap_or(EMPTY_SCOPE_DIGEST)
         })
-    }
-
-    /// The retrieval version: unchanged while no group's scoping, no target's
-    /// scope, no chunk exclusion and no archived flag has changed. See the
-    /// field.
-    pub fn retrieval_version(&self) -> u64 {
-        self.retrieval_version
     }
 
     /// [`Self::active_timelines_for_group`] as `target` may see it: all of
@@ -4809,6 +4805,9 @@ impl Substrate {
         if section && !id.is_none() && self.ended_sections.is_ended(stream_id, generation) {
             return;
         }
+        // The turn the stream held before, whose timeline a redeclaration
+        // takes it from.
+        let left = self.stream_turn_timeline(key);
         // A memo lives on the physical stream it was decoded from, so a
         // declaration moving a turn's position leaves nothing stale behind.
         let Some(Declared { displaced, .. }) = self.streams.declare(key, decl, id) else {
@@ -4829,10 +4828,11 @@ impl Substrate {
             // moved: its gallery reads them by position.
             self.gallery_changed(timeline);
             self.timeline_content_changed(timeline);
-        } else {
-            // No turn stands on the stream now — a section, or a turn
-            // redeclared as one — so which timeline it left is not known.
-            self.all_groups_content_changed();
+        }
+        // A turn redeclared elsewhere, or as no turn, leaves its timeline.
+        if let Some(old) = left.filter(|&old| Some(old) != self.stream_turn_timeline(key)) {
+            self.gallery_changed(old);
+            self.timeline_content_changed(old);
         }
         if section {
             if id.is_none() {
@@ -5205,11 +5205,15 @@ impl Substrate {
         let Some(timeline) = TimelineId::from_raw(timeline_raw) else {
             return;
         };
+        // The file this timeline calibrated before the record, which a
+        // re-pointed calibration leaves.
+        let calibrated = self.calibrates(timeline);
         let Some(entry) = entry_mut(&mut self.timelines, &timeline) else {
             self.pending
                 .hold(timeline_raw, PendingChild::Label(meta.clone()), id);
             return;
         };
+        let mut custom_changed = false;
         if !meta.conv_id.is_empty() {
             if take(&mut entry.ids.conv_id, id) {
                 entry.conv_id = Some(meta.conv_id.clone());
@@ -5223,7 +5227,7 @@ impl Substrate {
             if take_keyed(&mut entry.ids.custom, k.clone(), id) {
                 // A file's path names its kind and a calibration names its
                 // unit: what an assembled group scan was built from.
-                self.retrieval_version += 1;
+                custom_changed = true;
                 let before = entry.custom.insert(k.clone(), v.clone());
                 if k == Self::CALIBRATES_KEY {
                     Self::index_calibration(
@@ -5236,6 +5240,14 @@ impl Substrate {
                 if k == Self::CONTENT_KEY {
                     Self::index_unit(&mut self.units_by_key, timeline, before.as_deref(), v);
                 }
+            }
+        }
+        if custom_changed {
+            // Its own groups and its calibrated file's as it now stands, and
+            // the file it calibrated before.
+            self.timeline_content_changed(timeline);
+            if let Some(unit) = calibrated.filter(|&u| Some(u) != self.calibrates(timeline)) {
+                self.timeline_content_changed(unit);
             }
         }
     }
@@ -5428,7 +5440,7 @@ impl Substrate {
                 ChunkExclusion::of_ranges(r.cut)
             });
         self.chunk_exclusion.insert(group, Arc::new(cut));
-        self.retrieval_version += 1;
+        self.group_content_changed(group);
     }
 
     /// The record behind the custom object keyed `key_hash`.
@@ -5787,9 +5799,10 @@ impl Substrate {
         self.retire_snapshot_stream(timeline);
         self.splice_source_timelines.remove(&timeline);
         // A tombstoned conversation is never a projection's target again.
+        // Its own assemblies go with it: it reprojects nothing again, and the
+        // groups offering it moved with its tombstone above.
         self.retrieval_scopes.remove(&timeline);
         self.scope_digests.remove(&timeline);
-        self.retrieval_version += 1;
         // Nor carries anything, nor is carried: a pinned item whose turns are
         // gone would keep emitting a promise nothing can deliver.
         self.working_sets.remove(&timeline);
@@ -5932,6 +5945,12 @@ impl Substrate {
     /// unstamped stream as the log stands at that point, and the next
     /// unstamped declaration starts the stream again.
     fn end_section(&mut self, stream_id: StreamId, generation: Option<SectionGeneration>) {
+        // A section is no turn, and no group's scan reads it; a turn the
+        // stream held is its timeline's.
+        let held_turn = self.stream_turn_timeline(StreamKey {
+            stream_id,
+            writer: generation.map_or(0, |g| g.writer),
+        });
         match generation {
             Some(g) => {
                 self.ended_sections.end(stream_id, g);
@@ -5959,7 +5978,9 @@ impl Substrate {
             }
         }
         self.gallery_epoch += 1;
-        self.all_groups_content_changed();
+        if let Some(timeline) = held_turn {
+            self.timeline_content_changed(timeline);
+        }
     }
 
     /// Mark `timeline`'s durable state as **ephemeral**: nothing will ever read
@@ -7711,7 +7732,7 @@ impl Substrate {
             self.retrieval_scopes.remove(&timeline);
             self.scope_digests.remove(&timeline);
         }
-        self.retrieval_version += 1;
+        self.timeline_content_changed(timeline);
         true
     }
 
