@@ -5786,6 +5786,8 @@ impl Scheduler {
                 )),
             };
         }
+        // The work ahead of every waiting turn moved (`prefill_wait`).
+        self.prefill_waits.window_ran();
 
         // Record the co-batched creep throughput — prefill and section members are
         // tallied into their own channels, sharing the wall-clock of the segment
@@ -5951,7 +5953,24 @@ impl Scheduler {
         }
 
         // The window stopped short: the creep's rows are in its arena, and it
-        // resumes at `win_end`.
+        // resumes at `win_end`. Each prefill member is told how far its chunk
+        // has run, so a cohort crawling a layer a window beside a person's
+        // decode reads to its caller as moving, not as never admitted.
+        for m in &members {
+            let WaveMember::Prefill { seq_id, .. } = *m else {
+                continue;
+            };
+            if let Some(p) = self
+                .active_prefills
+                .iter()
+                .find(|p| p.work.sequence_id.0 == seq_id)
+            {
+                let _ = p.work.event_tx.send(TurnEvent::PrefillLayers {
+                    layers_done: win_end,
+                    layers_total: n,
+                });
+            }
+        }
         self.wave_prefill_cursor = win_end;
         self.wave_prefill_members = members;
         self.wave_prefill_rows = inputs

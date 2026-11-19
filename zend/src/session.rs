@@ -4177,6 +4177,7 @@ fn run_inference_stream(
                             ahead_tokens,
                             ahead_turns,
                             waiting_ms,
+                            ..
                         } => {
                             let status = queued_status(ahead_tokens, ahead_turns, waiting_ms);
                             if last_queued.as_deref() != Some(status.as_str()) {

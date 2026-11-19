@@ -17222,6 +17222,7 @@ mod tests {
         );
     }
 
+    mod creep_window_progress;
     mod faulted_turn;
     mod idle_telemetry;
     mod positional_ledger;

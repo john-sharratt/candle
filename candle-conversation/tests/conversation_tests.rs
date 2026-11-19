@@ -216,7 +216,7 @@ fn test_streaming_events() {
         match event {
             TurnEvent::Prefill(_) => {}
             TurnEvent::PrefillProgress { .. } => got_prefill = true,
-            TurnEvent::PrefillQueued { .. } => {}
+            TurnEvent::PrefillQueued { .. } | TurnEvent::PrefillLayers { .. } => {}
             TurnEvent::Token(id) => {
                 got_token = true;
                 collected_tokens.push(id);
@@ -1465,6 +1465,12 @@ fn test_tool_call_weather_pos1() {
             }
             TurnEvent::PrefillQueued { waiting_ms, .. } => {
                 eprintln!("Prefill queued: {waiting_ms} ms");
+            }
+            TurnEvent::PrefillLayers {
+                layers_done,
+                layers_total,
+            } => {
+                eprintln!("Prefill layers: {layers_done}/{layers_total}");
             }
             TurnEvent::Token(id) => {
                 let decoded_special = decoder.decode_with_special(&[id]);

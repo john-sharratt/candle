@@ -245,6 +245,7 @@ mod tests {
                 ahead_tokens: 1,
                 ahead_turns: 1,
                 waiting_ms: 1_000,
+                ahead_moved: false,
             };
             while queued.send(waits()).is_ok() {
                 std::thread::sleep(Duration::from_millis(20));

@@ -12,12 +12,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How long a background wait lets its turn stand still — no token decoded,
-/// no prefill chunk run — before it gives the turn up
+/// no prefill layer run, nothing ahead of it run — before it gives the turn up
 /// ([`ConversationError::TurnStalled`]). Measured from the turn's last
-/// movement, not its start, so a long decode or a long prefill that is
-/// running never reaches it: only a turn the card has not admitted, or has
-/// held behind other work, or has lost, does. The longest a running prompt
-/// was measured standing between chunks is 22 s (`scheduler::prefill_wait`).
+/// movement ([`TurnHandle::moves`]), not its start, so a long decode, a long
+/// prefill, or a long wait behind prefill work that is running never reaches
+/// it: only a turn the card has not admitted while nothing ahead of it moved,
+/// or has lost, does.
 pub const STALL: Duration = Duration::from_secs(60);
 
 /// Handle to an in-flight inference turn. Returned by [`crate::Sequence::submit_turn`].
@@ -56,16 +56,23 @@ impl TurnHandle {
         }
     }
 
-    /// Whether `event` is the turn doing work: a token decoded, a prefill chunk
-    /// run, or the turn ending. A turn told it still waits
-    /// ([`TurnEvent::PrefillQueued`]) has not moved, and neither has one
-    /// reporting its statistics — a turn never admitted is told it waits once
-    /// a second, and counted as moving it would never stall.
+    /// Whether `event` is the turn doing work, or the work it waits behind
+    /// doing it: a token decoded, a prefill chunk or layer run, a wait behind a
+    /// prefill window that ran ([`TurnEvent::PrefillQueued`] with
+    /// `ahead_moved`), or the turn ending. A turn told it still waits with
+    /// nothing ahead of it moving has not moved, and neither has one reporting
+    /// its statistics — a turn never admitted is told it waits once a second,
+    /// and counted as moving it would never stall.
     pub(crate) fn moves(event: &TurnEvent) -> bool {
         matches!(
             event,
             TurnEvent::Token(_)
                 | TurnEvent::PrefillProgress { .. }
+                | TurnEvent::PrefillLayers { .. }
+                | TurnEvent::PrefillQueued {
+                    ahead_moved: true,
+                    ..
+                }
                 | TurnEvent::Done(_)
                 | TurnEvent::Error(_)
         )
@@ -275,6 +282,20 @@ pub enum TurnEvent {
         ahead_turns: usize,
         /// Since the turn last made progress, or since it was queued.
         waiting_ms: u64,
+        /// Whether the scheduler ran a prefill window since the turn was last
+        /// told: the work ahead of it moved.
+        ahead_moved: bool,
+    },
+
+    /// The turn's current chunk ran through the model's layers this far in a
+    /// window that stopped short of the last: a creep cohort beside decode
+    /// advances a few layers a window, and the chunk lands
+    /// ([`TurnEvent::PrefillProgress`]) once it has run them all.
+    PrefillLayers {
+        /// Layers the chunk has run.
+        layers_done: usize,
+        /// Layers it runs in all.
+        layers_total: usize,
     },
 
     /// A raw token ID (streamed during generation).
@@ -579,6 +600,7 @@ pub(crate) mod tests {
             ahead_tokens: 1,
             ahead_turns: 1,
             waiting_ms: 1_000,
+            ahead_moved: false,
         }
     }
 
@@ -638,7 +660,43 @@ pub(crate) mod tests {
             tokens_total: 1
         }));
         assert!(TurnHandle::moves(&TurnEvent::Done(response("x"))));
+        assert!(TurnHandle::moves(&TurnEvent::PrefillLayers {
+            layers_done: 1,
+            layers_total: 40
+        }));
+        assert!(TurnHandle::moves(&TurnEvent::PrefillQueued {
+            ahead_tokens: 1,
+            ahead_turns: 1,
+            waiting_ms: 1_000,
+            ahead_moved: true,
+        }));
         assert!(!TurnHandle::moves(&queued()));
         assert!(!TurnHandle::moves(&TurnEvent::Prefill("p".into())));
+    }
+
+    /// **A turn waiting behind work that moves never stalls**, however long
+    /// it waits: told once a second that a window ran ahead of it, for far
+    /// longer than the limit, it carries on to its end.
+    #[test]
+    fn a_turn_behind_moving_work_never_stalls() {
+        let (tx, rx) = flume::unbounded();
+        let handle = TurnHandle::new(rx);
+        let stall = Duration::from_millis(300);
+        let feeder = std::thread::spawn(move || {
+            for waited in 0..12u64 {
+                tx.send(TurnEvent::PrefillQueued {
+                    ahead_tokens: 1,
+                    ahead_turns: 1,
+                    waiting_ms: waited * 100,
+                    ahead_moved: true,
+                })
+                .unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            tx.send(TurnEvent::Done(response("finished"))).unwrap();
+        });
+        let got = handle.wait_moving(&CancelToken::new(), stall).unwrap();
+        assert_eq!(got.text, "finished", "waited ~1.2 s against a 0.3 s limit");
+        feeder.join().unwrap();
     }
 }

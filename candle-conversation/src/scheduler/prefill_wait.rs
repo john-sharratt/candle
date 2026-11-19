@@ -13,10 +13,21 @@
 //! this turn's band that came before it — a lower band rides beside it, never
 //! in front.
 //!
+//! **A turn behind work that moves is not stalled.** Each tell says whether a
+//! prefill window ran since the last one (`ahead_moved`), and a caller's stall
+//! clock counts that as the turn moving (`TurnHandle::moves`). Beside a person's
+//! decode a `Low` cohort rides one layer a window, about once in 65 steps'
+//! worth of decode (`throttle_ratio`), so a sweep of a deep cohort outlasts the
+//! 60 s a background wait allows. Told only that they waited, every file read
+//! queued behind it was given up mid-read on BlackWorld (2026-11-19): nine files
+//! at once, 66 s into a 58 s reply, each read thrown away and begun again.
+//!
 //! [`TurnEvent::PrefillQueued`]: crate::handle::TurnEvent::PrefillQueued
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+use crate::handle::TurnEvent;
 
 /// How often a waiting turn is told it is still waiting.
 pub(super) const WAIT_EVENT_EVERY: Duration = Duration::from_secs(1);
@@ -56,12 +67,35 @@ pub(super) fn ahead_of(queue: &[Work], at: usize, running: Ahead) -> Ahead {
         })
 }
 
+/// One turn told it waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Told {
+    pub(super) turn: usize,
+    /// Since its offset last moved.
+    pub(super) waited: Duration,
+    /// Whether a prefill window ran since it was last told, or since it was
+    /// first seen waiting.
+    pub(super) ahead_moved: bool,
+}
+
+/// One turn's wait, as last seen.
+#[derive(Debug, Clone, Copy)]
+struct Seen {
+    offset: usize,
+    moved_at: Instant,
+    told: Option<Instant>,
+    /// [`PrefillWaits::windows`] when it was last told, or first seen.
+    windows: u64,
+}
+
 /// When each turn last moved, and when it was last told it waits.
 #[derive(Debug, Default)]
 pub(super) struct PrefillWaits {
     last_sweep: Option<Instant>,
-    /// Per turn: the offset last seen, when it last changed, when last told.
-    seen: HashMap<usize, (usize, Instant, Option<Instant>)>,
+    seen: HashMap<usize, Seen>,
+    /// Prefill windows the scheduler has run: every forward that advanced the
+    /// creep cohort or a chunk, whatever its members.
+    windows: u64,
 }
 
 impl PrefillWaits {
@@ -77,29 +111,45 @@ impl PrefillWaits {
         true
     }
 
-    /// The turns in `queue` to tell now, with how long each has stood still:
-    /// a turn whose offset has not moved for [`WAIT_EVENT_EVERY`] and was not
-    /// told within it. A turn first seen starts its clock now; one no longer in
-    /// the queue is forgotten.
-    pub(super) fn stalled(&mut self, now: Instant, queue: &[Work]) -> Vec<(usize, Duration)> {
+    /// A prefill window ran: the work ahead of every waiting turn moved.
+    pub(super) fn window_ran(&mut self) {
+        self.windows += 1;
+    }
+
+    /// The turns in `queue` to tell now: a turn whose offset has not moved for
+    /// [`WAIT_EVENT_EVERY`] and was not told within it, with how long it has
+    /// stood still and whether a window ran since it was last told. A turn
+    /// first seen starts its clock now; one no longer in the queue is
+    /// forgotten.
+    pub(super) fn stalled(&mut self, now: Instant, queue: &[Work]) -> Vec<Told> {
         let mut next = HashMap::with_capacity(queue.len());
         let mut tell = Vec::new();
         for w in queue {
             let Some(turn) = w.turn else { continue };
-            let (moved_at, told) = match self.seen.get(&turn) {
-                Some(&(offset, moved_at, told)) if offset == w.offset => (moved_at, told),
-                _ => (now, None),
+            let mut seen = match self.seen.get(&turn) {
+                Some(s) if s.offset == w.offset => *s,
+                _ => Seen {
+                    offset: w.offset,
+                    moved_at: now,
+                    told: None,
+                    windows: self.windows,
+                },
             };
-            let waited = now.duration_since(moved_at);
+            let waited = now.duration_since(seen.moved_at);
             let due = waited >= WAIT_EVENT_EVERY
-                && told.is_none_or(|t| now.duration_since(t) >= WAIT_EVENT_EVERY);
-            let told = if due {
-                tell.push((turn, waited));
-                Some(now)
-            } else {
-                told
-            };
-            next.insert(turn, (w.offset, moved_at, told));
+                && seen
+                    .told
+                    .is_none_or(|t| now.duration_since(t) >= WAIT_EVENT_EVERY);
+            if due {
+                tell.push(Told {
+                    turn,
+                    waited,
+                    ahead_moved: self.windows != seen.windows,
+                });
+                seen.told = Some(now);
+                seen.windows = self.windows;
+            }
+            next.insert(turn, seen);
         }
         self.seen = next;
         tell
@@ -180,15 +230,21 @@ impl super::Scheduler {
             });
         }
         let tell = self.prefill_waits.stalled(now, &queue);
-        for (turn, waited) in tell {
+        for Told {
+            turn,
+            waited,
+            ahead_moved,
+        } in tell
+        {
             let Some(at) = queue.iter().position(|w| w.turn == Some(turn)) else {
                 continue;
             };
             let ahead = ahead_of(&queue, at, running);
-            let event = crate::handle::TurnEvent::PrefillQueued {
+            let event = TurnEvent::PrefillQueued {
                 ahead_tokens: ahead.tokens,
                 ahead_turns: ahead.turns,
                 waiting_ms: waited.as_millis() as u64,
+                ahead_moved,
             };
             let tx = self
                 .active_prefills
@@ -273,24 +329,72 @@ mod tests {
         let q = [turn(7, 2, 100)];
         assert!(w.stalled(at(0), &q).is_empty(), "just seen");
         assert!(w.stalled(at(900), &q).is_empty(), "still under a second");
-        assert_eq!(w.stalled(at(1_000), &q), vec![(7, Duration::from_secs(1))]);
+        assert_eq!(w.stalled(at(1_000), &q), vec![told(7, 1_000, false)]);
         assert!(
             w.stalled(at(1_500), &q).is_empty(),
             "told within the second"
         );
-        assert_eq!(w.stalled(at(2_000), &q), vec![(7, Duration::from_secs(2))]);
+        assert_eq!(w.stalled(at(2_000), &q), vec![told(7, 2_000, false)]);
         let moved = [Work { offset: 64, ..q[0] }];
         assert!(
             w.stalled(at(2_500), &moved).is_empty(),
             "it moved: the clock restarts"
         );
         assert!(w.stalled(at(3_400), &moved).is_empty());
-        assert_eq!(
-            w.stalled(at(3_500), &moved),
-            vec![(7, Duration::from_secs(1))]
-        );
+        assert_eq!(w.stalled(at(3_500), &moved), vec![told(7, 1_000, false)]);
         assert!(w.stalled(at(3_600), &[]).is_empty());
         assert!(w.seen.is_empty(), "a turn no longer queued is forgotten");
+    }
+
+    fn told(turn: usize, waited_ms: u64, ahead_moved: bool) -> Told {
+        Told {
+            turn,
+            waited: Duration::from_millis(waited_ms),
+            ahead_moved,
+        }
+    }
+
+    /// **Behind work that moves, a still turn is told so.** A window run since
+    /// the turn was last told — or since it was first seen — reads as the work
+    /// ahead having moved; a tell with no window since reads as not. The turn's
+    /// own clock still runs from its own offset: what is ahead moving is not the
+    /// turn moving, and it says how long it has itself stood still.
+    #[test]
+    fn a_tell_says_whether_a_window_ran_since_the_last() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut w = PrefillWaits::default();
+        let q = [turn(7, 0, 100)];
+        assert!(w.stalled(at(0), &q).is_empty(), "just seen");
+        w.window_ran();
+        assert_eq!(
+            w.stalled(at(1_000), &q),
+            vec![told(7, 1_000, true)],
+            "a window ran after it was first seen"
+        );
+        assert_eq!(
+            w.stalled(at(2_000), &q),
+            vec![told(7, 2_000, false)],
+            "none since the last tell"
+        );
+        w.window_ran();
+        w.window_ran();
+        assert_eq!(w.stalled(at(3_000), &q), vec![told(7, 3_000, true)]);
+        assert_eq!(w.stalled(at(4_000), &q), vec![told(7, 4_000, false)]);
+    }
+
+    /// A window that ran before a turn queued is not work it waited behind.
+    #[test]
+    fn a_window_before_the_turn_queued_is_not_counted() {
+        let t0 = Instant::now();
+        let mut w = PrefillWaits::default();
+        w.window_ran();
+        let q = [turn(3, 0, 10)];
+        assert!(w.stalled(t0, &q).is_empty());
+        assert_eq!(
+            w.stalled(t0 + Duration::from_secs(1), &q),
+            vec![told(3, 1_000, false)]
+        );
     }
 
     /// Ingest work carries no caller, so it is never told — only counted.
