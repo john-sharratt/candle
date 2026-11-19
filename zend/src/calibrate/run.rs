@@ -34,8 +34,8 @@ use std::time::Instant;
 
 use candle_conversation::chain_health::chain_break;
 use candle_conversation::projection::{
-    DecodePriority, GroupId, OptionalState, Reserved, SelectionState, TimelineId,
-    NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
+    DecodePriority, GroupId, OptionalState, Reserved, SelectionState, TimelineId, TurnIndex,
+    TurnKey, NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
 };
 use candle_conversation::stencil::{ThinkMode, TriggerRegistry, TurnGrammar};
 use candle_conversation::substrate::Substrate;
@@ -54,6 +54,7 @@ use super::seal::seal_calibration;
 use super::sections::{compose, grammar, split};
 use super::spec::CalibrateSpec;
 use super::thinking::{exemplar, thinking_of};
+use super::windows::{windows, WINDOW_TOKENS};
 use crate::branch_ingest::keys::{key_version, CONTENT_KEY, KEY_VERSION};
 use crate::code_read::PATH_KEY;
 use crate::ingest_backlog::{self, Work};
@@ -724,17 +725,78 @@ struct Drafted {
 /// heading ([`super::sections`]), each for as many questions as its rule gives
 /// a unit of `tokens`; the draft is tombstoned either way.
 ///
-/// **Every part in one turn, with the reading in front of it.** The parts see
-/// each other, so a later one can be told to ask nothing an earlier one asked;
-/// a question two parts repeat word for word is kept once. An answer that
-/// carries no headings is read as one list, against the parts' counts
-/// together.
+/// **A reading past the lineage cap is drafted over windows**
+/// (`super::windows`): each window's draft holds its turns, is asked for its
+/// share, and the questions of every window are kept once. A part is empty
+/// only when every window left it so.
 fn draft(
     engine: &ConversationEngine,
     spec: &CalibrateSpec,
     base: &Sequence,
     unit: &Unit,
     tokens: usize,
+) -> anyhow::Result<Drafted> {
+    if tokens <= Substrate::INHERITED_CHAIN_TOKEN_CAP {
+        return draft_window(engine, spec, base, unit, tokens, None);
+    }
+    let turn_tokens: Vec<usize> = {
+        let conversation = engine.conversation();
+        let read = conversation.read();
+        (0..read.turn_count(unit.timeline))
+            .map(|i| read.turn_token_count_of(unit.timeline, TurnIndex(i)))
+            .collect()
+    };
+    let mut out = Drafted {
+        questions: Vec::new(),
+        wanted: 0,
+        empty: Vec::new(),
+        last_answer: String::new(),
+    };
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut empty: Option<Vec<String>> = None;
+    for window in windows(&turn_tokens, WINDOW_TOKENS) {
+        let held: usize = window.iter().map(|&i| turn_tokens[i as usize]).sum();
+        let keys = window
+            .iter()
+            .map(|&i| TurnKey::new(unit.timeline, TurnIndex(i)))
+            .collect();
+        let drafted = draft_window(engine, spec, base, unit, held, Some(keys))?;
+        out.wanted += drafted.wanted;
+        out.questions.extend(
+            drafted
+                .questions
+                .into_iter()
+                .filter(|q| seen.insert(q.to_lowercase())),
+        );
+        empty = Some(match empty {
+            None => drafted.empty,
+            Some(before) => before
+                .into_iter()
+                .filter(|part| drafted.empty.contains(part))
+                .collect(),
+        });
+        out.last_answer = drafted.last_answer;
+    }
+    out.empty = empty.unwrap_or_default();
+    Ok(out)
+}
+
+/// One draft of a unit's questions, over `window` of its reading — the whole
+/// reading, its inherited chain, when `None` — asked for as many as `tokens`
+/// of reading call for.
+///
+/// **Every part in one turn, with the reading in front of it.** The parts see
+/// each other, so a later one can be told to ask nothing an earlier one asked;
+/// a question two parts repeat word for word is kept once. An answer that
+/// carries no headings is read as one list, against the parts' counts
+/// together.
+fn draft_window(
+    engine: &ConversationEngine,
+    spec: &CalibrateSpec,
+    base: &Sequence,
+    unit: &Unit,
+    tokens: usize,
+    window: Option<Vec<TurnKey>>,
 ) -> anyhow::Result<Drafted> {
     on_a_draft(
         engine,
@@ -743,6 +805,9 @@ fn draft(
         unit.timeline,
         &unit.subject,
         |conv| {
+            if let Some(window) = window {
+                conv.frame_window(window);
+            }
             // A draft has no tools, and one that opens a call anyway writes no
             // question: a file too long for its projection was asked for again
             // with `file_read`, every pass.

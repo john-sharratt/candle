@@ -48,23 +48,43 @@ pub(crate) struct ChainLink<'a> {
 impl Frame {
     /// The frame of `target` as `substrate` holds it: `sections`, then every
     /// turn of `target`'s inherited chain (`Substrate::inherited_chain`, its
-    /// own timeline last).
+    /// own timeline last) — or, given a `window`, exactly those turns in their
+    /// order: a calibration draft over part of a reading too long for the
+    /// chain's cap (`Sequence::frame_window`).
     pub(crate) fn of(
         substrate: &Substrate,
         sections: Arc<Vec<SectionId>>,
         target: ProjectionTarget,
+        window: Option<&[TurnKey]>,
     ) -> Self {
+        let layer_of = |tl: TimelineId| {
+            substrate
+                .timeline_target(tl)
+                .map_or(target.layer, |(layer, _)| layer)
+        };
+        if let Some(window) = window {
+            let lineage = window
+                .iter()
+                .filter(|k| substrate.turn_token_count_of(k.timeline, k.index) > 0)
+                .map(|k| ResolvedTurn {
+                    id: TurnId {
+                        layer_id: layer_of(k.timeline),
+                        group_id: target.group,
+                        index: k.index,
+                    },
+                    timeline: Some(k.timeline),
+                })
+                .collect();
+            return Self { sections, lineage };
+        }
         let chain: Vec<(TimelineId, LayerId, Vec<usize>)> = substrate
             .inherited_chain(target.timeline)
             .into_iter()
             .map(|tl| {
-                let layer = substrate
-                    .timeline_target(tl)
-                    .map_or(target.layer, |(layer, _)| layer);
                 let tokens = (0..substrate.turn_count(tl))
                     .map(|i| substrate.turn_token_count_of(tl, TurnIndex(i)))
                     .collect();
-                (tl, layer, tokens)
+                (tl, layer_of(tl), tokens)
             })
             .collect();
         let links: Vec<ChainLink<'_>> = chain

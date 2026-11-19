@@ -23,7 +23,7 @@ use crate::persistence::streams::ContentAddress;
 use crate::projection::{
     decode_events, decode_points, from_projection_with_origins, Builder, Conversation,
     DecodePriority, Observe, ProjectionEvent, ProjectionMode, ProjectionPoint, ProjectionTarget,
-    SectionId, SectionTree, SelectionState, SystemPromptItem, TimelineId, TurnIndex,
+    SectionId, SectionTree, SelectionState, SystemPromptItem, TimelineId, TurnIndex, TurnKey,
 };
 use crate::provenance::gallery_arena::BeliefArena;
 use crate::provenance::{decode_wide_sigs, WideQSig};
@@ -502,6 +502,9 @@ pub struct Sequence {
     /// never ran a turn is framed exactly as the base would have been, behind
     /// whatever lineage it has been given by its first submit.
     frame: Option<Arc<Vec<SectionId>>>,
+    /// The turns the pending frame lays down in place of the inherited chain
+    /// ([`Self::frame_window`]); `None` lays down the chain.
+    frame_window: Option<Vec<TurnKey>>,
     branch_spans: Vec<(usize, usize)>,
     /// True when this conversation was **born with a prompt checkpoint** — as
     /// opposed to a fork, whose state is the parent's or the timeline's and
@@ -866,6 +869,7 @@ impl Sequence {
             target,
             birth_prefix: Arc::new(Vec::new()),
             frame: None,
+            frame_window: None,
             branch_spans: Vec::new(),
             state_is_prompt_only: false,
             installed_branch: None,
@@ -2908,10 +2912,17 @@ impl Sequence {
         ProjectionInputs {
             projection: Arc::clone(&self.projection),
             selection: self.selection.clone(),
-            frame: self
-                .frame
-                .take()
-                .map(|sections| Frame::of(&self.substrate.read(), sections, self.target)),
+            frame: {
+                let window = self.frame_window.take();
+                self.frame.take().map(|sections| {
+                    Frame::of(
+                        &self.substrate.read(),
+                        sections,
+                        self.target,
+                        window.as_deref(),
+                    )
+                })
+            },
         }
     }
 
@@ -4630,6 +4641,7 @@ impl Sequence {
             // one of an empty slot (an ingest base that never ran a turn) is
             // framed as its parent would have been.
             frame: self.frame.clone(),
+            frame_window: None,
             branch_spans: self.branch_spans.clone(),
             // A fork's state is real — the parent's live state or the
             // timeline's snapshot, never exactly the prompt checkpoint — so
@@ -5245,6 +5257,15 @@ impl Sequence {
     /// `Ok(false)` when the model carries no recurrent state, or no ancestor
     /// has a snapshot yet — both ordinary, and both leave the sequence starting
     /// from the sequence-start state.
+    /// Lay `turns` down in place of the inherited chain when this append-only
+    /// conversation's first turn is framed ([`Frame::of`]): a calibration draft
+    /// over one window of a reading too long for the chain's cap
+    /// (`Substrate::INHERITED_CHAIN_TOKEN_CAP`). No effect on a conversation
+    /// past its first turn, or one that reprojects — it has no frame.
+    pub fn frame_window(&mut self, turns: Vec<TurnKey>) {
+        self.frame_window = Some(turns);
+    }
+
     pub fn seed_recurrent_from_lineage(&self) -> crate::Result<bool> {
         let (tx, rx) = flume::bounded(1);
         self.scheduler_tx

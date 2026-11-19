@@ -16,6 +16,7 @@
 
 use candle_conversation::{
     models::{Model, ModelBuilder},
+    projection::{TurnIndex, TurnKey},
     ConversationEngine, SamplingConfig, SequenceConfig,
 };
 
@@ -108,5 +109,45 @@ fn an_append_only_fork_with_no_lineage_is_framed_by_its_sections() {
     assert!(
         dump.pieces.iter().all(|p| p.timeline.is_none()),
         "a fork with no lineage frames no turn"
+    );
+}
+
+/// **A frame window lays down exactly its turns of the lineage**, in place of
+/// the inherited chain: a calibration draft over part of a long reading.
+#[test]
+fn a_frame_window_lays_down_its_turns_alone() {
+    let engine = engine();
+    let prompt = test_builder().format_system_prompt();
+    let mut parent = engine
+        .new_conversation(&prompt, append_only())
+        .expect("the parent");
+    for text in ["The first page.", "The second page.", "The third page."] {
+        parent.insert_turn(text, "Read.").expect("a page seals");
+    }
+    let lineage = parent.timeline_id();
+
+    let base = engine
+        .new_conversation(&prompt, append_only())
+        .expect("a base that never runs a turn");
+    let mut fork = base.fork().expect("the fork");
+    engine
+        .set_forked_from(fork.timeline_id(), lineage)
+        .expect("the fork's lineage");
+    fork.frame_window(vec![
+        TurnKey::new(lineage, TurnIndex(0)),
+        TurnKey::new(lineage, TurnIndex(2)),
+    ]);
+    let dump = fork.prompt_dump().expect("a first turn's frame");
+    let mut held: Vec<u32> = dump
+        .pieces
+        .iter()
+        .filter(|p| p.timeline == Some(lineage.raw()))
+        .filter_map(|p| p.index)
+        .collect();
+    held.dedup();
+    assert_eq!(
+        held,
+        vec![0, 2],
+        "the window's turns, in order, and no other"
     );
 }

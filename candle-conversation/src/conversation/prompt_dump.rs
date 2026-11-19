@@ -229,7 +229,12 @@ impl Sequence {
         let resolver = self.substrate.read_for_scored(self.target, &scores);
         let (segments, selection_scores) = if self.config.disable_reprojection {
             let sections = self.frame.as_ref()?;
-            let frame = Frame::of(&self.substrate.read(), Arc::clone(sections), self.target);
+            let frame = Frame::of(
+                &self.substrate.read(),
+                Arc::clone(sections),
+                self.target,
+                self.frame_window.as_deref(),
+            );
             (frame.segments(), SelectionScores::default())
         } else {
             let projection = self.projection.project_with_selection(

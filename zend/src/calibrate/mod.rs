@@ -36,6 +36,7 @@ pub mod seal;
 pub mod sections;
 pub mod spec;
 pub mod thinking;
+mod windows;
 
 pub use mark::mark_sealed;
 pub(crate) use run::calibration_meta;
