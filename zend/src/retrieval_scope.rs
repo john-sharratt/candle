@@ -3,12 +3,14 @@
 //!
 //! The `repo_map` and `code_reading` layers hold every branch's version of a
 //! file or folder, keyed by what it shows. A conversation reads each
-//! repository at its own base, so the only versions right for it are the
-//! ones its base tree holds: every file and folder of that tree is keyed by
-//! the same rules the ingest used ([`crate::branch_ingest`]) and looked up in
-//! an [`IngestIndex`] of what has been ingested. A path the conversation has
-//! changed contributes no key — its own copy is what it reads — and neither
-//! does the folder holding it.
+//! repository at its own base, so the versions right for it are the ones its
+//! base tree holds: every file and folder of that tree is keyed by the same
+//! rules the ingest used ([`crate::branch_ingest`]) and looked up in an
+//! [`IngestIndex`] of what has been ingested. A file version not yet read
+//! stands at its path's latest reading until its own commits
+//! ([`IngestIndex::latest_of`]). A path the conversation has changed
+//! contributes no key — its own copy is what it reads — and neither does the
+//! folder holding it.
 //!
 //! Working a scope out reads no file and takes no base: a repository the
 //! conversation has not read yet is scoped at the base its first read would
@@ -766,6 +768,22 @@ mod tests {
         let rs = scoped(root.path());
         let scope = scope_of(&rs, &RepoFiles::overlay(ws).unwrap());
         assert_eq!(*scope.files, set(&[1, 2, 30]));
+        assert_eq!(*scope.folders, set(&[10, 11]));
+    }
+
+    /// **A file committed since its path was last read stays in scope** at its
+    /// path's latest reading — of the two versions of `a.rs` read, the one
+    /// begun last — until its own version is read; the folders, whose
+    /// listings did not move, are as they were.
+    #[test]
+    fn a_file_committed_since_it_was_read_stands_at_its_latest_reading() {
+        let (root, ws) = workspace();
+        let rs = scoped(root.path());
+        let dir = root.path().join("r");
+        std::fs::write(dir.join("a.rs"), "fn later() {}\n").unwrap();
+        git(&dir, &["commit", "-q", "-am", "later"]);
+        let scope = scope_of(&rs, &RepoFiles::overlay(ws).unwrap());
+        assert_eq!(*scope.files, set(&[2, 3, 30]));
         assert_eq!(*scope.folders, set(&[10, 11]));
     }
 

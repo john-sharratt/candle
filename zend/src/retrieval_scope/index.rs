@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use candle_conversation::projection::{GroupId, TimelineId};
 use candle_conversation::ConversationEngine;
 
-use crate::branch_ingest::keys::{key_version, unversioned, CONTENT_KEY};
+use crate::branch_ingest::keys::{file_key_path, key_version, unversioned, CONTENT_KEY};
 use crate::code_read::{is_upload_path, PATH_KEY};
 use crate::layers::keys::{parse_deps, DEPS_KEY, FILE_KEY};
 
@@ -32,10 +32,22 @@ pub struct DerivedUnit {
 /// forked from the reading, came up with no file in it. So a key is filed
 /// under its [`unversioned`] form, and the newest version of a unit present is
 /// the one found.
+///
+/// **A file version not yet read is stood in for by its path's latest
+/// reading** ([`Self::latest_of`]). A commit changes a file's blob, and its new
+/// version is read over a pass like a key version change; looked up by the new
+/// blob alone, the file fell out of every scope on the branch until then. On
+/// BlackWorld (2026-11-19) `candle-conversation/src/conversation.rs`, three
+/// lines of imports changed, was out of every conversation for as long as its
+/// re-reads kept failing, and a question whose answer was a call on its
+/// fifteenth page was declined.
 #[derive(Debug, Default)]
 pub struct IngestIndex {
     /// Unversioned key → the newest version committed under it.
     by_key: HashMap<String, (u32, TimelineId)>,
+    /// A file's workspace-relative path → its latest committed reading, of any
+    /// version: the one begun last, as its id orders it.
+    by_path: HashMap<String, TimelineId>,
     /// Every committed upload's conversation: uploads are in every scope.
     uploads: Vec<TimelineId>,
     /// Every committed unit of a layer of files, by the unversioned
@@ -51,10 +63,12 @@ impl IngestIndex {
     /// The index as the substrate holds it now, at `generation`.
     pub fn read(engine: &ConversationEngine, generation: u64) -> Self {
         let mut by_key: HashMap<String, (u32, TimelineId)> = HashMap::new();
+        let mut by_path: HashMap<String, TimelineId> = HashMap::new();
         let mut committed: HashSet<TimelineId> = HashSet::new();
         for (timeline, key) in engine.conversations_with_metadata_key(CONTENT_KEY) {
             committed.insert(timeline);
             file_newest(&mut by_key, &key, timeline);
+            path_latest(&mut by_path, &key, timeline);
         }
         let uploads = engine
             .conversations_with_metadata_key(PATH_KEY)
@@ -82,6 +96,7 @@ impl IngestIndex {
         }
         Self {
             by_key,
+            by_path,
             uploads,
             derived,
             generation,
@@ -96,11 +111,14 @@ impl IngestIndex {
         generation: u64,
     ) -> Self {
         let mut index = HashMap::new();
+        let mut by_path = HashMap::new();
         for (key, timeline) in by_key {
             file_newest(&mut index, &key, timeline);
+            path_latest(&mut by_path, &key, timeline);
         }
         Self {
             by_key: index,
+            by_path,
             uploads,
             derived: HashMap::new(),
             generation,
@@ -111,6 +129,16 @@ impl IngestIndex {
     /// newest one present.
     pub fn get(&self, key: &str) -> Option<TimelineId> {
         self.by_key.get(unversioned(key)).map(|&(_, tl)| tl)
+    }
+
+    /// The reading that stands for the file `key` names: the one committed
+    /// under `key` ([`Self::get`]), or — while that version is unread — its
+    /// path's latest reading, of whichever version, until the version's own
+    /// reading commits and replaces it. `None` for a path never read, or a key
+    /// that is not a file's.
+    pub fn latest_of(&self, key: &str) -> Option<TimelineId> {
+        self.get(key)
+            .or_else(|| self.by_path.get(file_key_path(key)?).copied())
     }
 
     /// Every committed unit of a layer of files of the file version `file_key`
@@ -141,6 +169,19 @@ fn file_newest(index: &mut HashMap<String, (u32, TimelineId)>, key: &str, timeli
         .or_insert((version, timeline));
     if version > slot.0 {
         *slot = (version, timeline);
+    }
+}
+
+/// File `timeline`, a reading committed under the file key `key`, as its path's
+/// latest unless one begun later is filed. A key that is not a file's files
+/// nothing.
+fn path_latest(index: &mut HashMap<String, TimelineId>, key: &str, timeline: TimelineId) {
+    let Some(path) = file_key_path(key) else {
+        return;
+    };
+    let slot = index.entry(path.to_string()).or_insert(timeline);
+    if timeline > *slot {
+        *slot = timeline;
     }
 }
 
@@ -192,6 +233,38 @@ mod tests {
         let index = IngestIndex::of(both, Vec::new(), 0);
         assert_eq!(index.get("v3:r/a.rs@1"), Some(tl(2)));
         assert_eq!(index.get("v2:r/a.rs@1"), Some(tl(2)));
+    }
+
+    /// **A file version not yet read is stood in for by its path's latest
+    /// reading**, until its own commits: then that is the one. Another path's
+    /// reading never stands in, and neither does a folder's.
+    #[test]
+    fn an_unread_file_version_is_its_paths_latest_reading_until_read() {
+        let older = HashMap::from([
+            ("v6:r/a.rs@1".to_string(), tl(10)),
+            ("v6:r/a.rs@2".to_string(), tl(20)),
+            ("v6:r/b.rs@1".to_string(), tl(30)),
+        ]);
+        let index = IngestIndex::of(older, Vec::new(), 0);
+        assert_eq!(index.latest_of("v6:r/a.rs@1"), Some(tl(10)), "its own");
+        assert_eq!(
+            index.latest_of("v6:r/a.rs@3"),
+            Some(tl(20)),
+            "unread: the reading begun last"
+        );
+        assert_eq!(index.get("v6:r/a.rs@3"), None, "get stays exact");
+        assert_eq!(index.latest_of("v6:r/c.rs@1"), None, "never read");
+
+        let read = HashMap::from([
+            ("v6:r/a.rs@2".to_string(), tl(20)),
+            ("v6:r/a.rs@3".to_string(), tl(40)),
+        ]);
+        let index = IngestIndex::of(read, Vec::new(), 0);
+        assert_eq!(index.latest_of("v6:r/a.rs@3"), Some(tl(40)), "replaced");
+
+        let folder = HashMap::from([("v6:9f3a".to_string(), tl(50))]);
+        let index = IngestIndex::of(folder, Vec::new(), 0);
+        assert_eq!(index.latest_of("v6:9f3b"), None, "a folder has no path");
     }
 
     /// The units of a layer built on a file's newest reading are the ones in

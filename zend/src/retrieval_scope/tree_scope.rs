@@ -39,7 +39,9 @@ pub struct DerivedScope {
 
 impl TreeScope {
     /// The ingested units of `repo`'s `tree`: every file looked up by its
-    /// key, and — under `folder_scope`, the scope the folder layer walked —
+    /// key — a version not yet read stood in for by its path's latest reading
+    /// ([`IngestIndex::latest_of`]) — and, under `folder_scope`, the scope the
+    /// folder layer walked —
     /// every folder unit derived exactly as the walk derives it, its
     /// manifest's hint found through `hint_of` as the walk finds it.
     pub fn of(
@@ -56,7 +58,7 @@ impl TreeScope {
             .collect();
         let prefix = format!("{repo}/");
         for (path, key) in &keys {
-            if let Some(tl) = index.get(key) {
+            if let Some(tl) = index.latest_of(key) {
                 out.files.insert(path.to_string(), tl);
             }
             for unit in index.derived_of(key) {
