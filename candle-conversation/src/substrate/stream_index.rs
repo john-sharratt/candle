@@ -36,7 +36,7 @@ use crate::persistence::identity::{RecordIdentity, VersionStamp};
 use crate::persistence::streams::{StreamDecl, StreamId, TurnDecl};
 use crate::projection::TurnIndex;
 
-use super::pcoll::{PMap, POrdMap};
+use super::pcoll::{PMap, POrdMap, POrdSet};
 use super::stamps::take;
 use super::{IndexPage, StreamRuntime};
 use crate::persistence::segment::SegmentId;
@@ -112,6 +112,18 @@ pub struct StreamIndex {
     positions: PMap<StreamKey, u32>,
     /// The stream id of each turn position, to the stream at that position.
     logical: PMap<StreamId, StreamKey>,
+    /// The writers' streams declared as each prompt section's `debug_name`,
+    /// ordered by name so a name's prefix is a range: what an owner's sections
+    /// are found by, instead of a walk over every stream.
+    named: POrdMap<String, POrdSet<StreamKey>>,
+}
+
+/// The `debug_name` a declaration names a prompt section by; `None` for a turn.
+fn section_name(decl: &StreamDecl) -> Option<&str> {
+    match decl {
+        StreamDecl::PromptSection(d) => Some(&d.debug_name),
+        StreamDecl::Turn(_) => None,
+    }
 }
 
 impl StreamIndex {
@@ -186,7 +198,15 @@ impl StreamIndex {
             StreamDecl::Turn(t) => Some((t.timeline_id, t.turn_index)),
             StreamDecl::PromptSection(_) => None,
         };
+        let was = rt.decl.as_ref().and_then(section_name).map(str::to_string);
+        let named = section_name(&decl).map(str::to_string);
         rt.decl = Some(decl);
+        if let Some(name) = was {
+            self.unname(&name, key);
+        }
+        if let Some(name) = named {
+            self.named.entry(name).or_default().insert(key);
+        }
         let mut out = Declared::default();
         if let Some((timeline, rank)) = self.unrank(key, &mut out.changed) {
             out.changed
@@ -218,6 +238,7 @@ impl StreamIndex {
         if let Some((timeline, rank)) = self.unrank(key, &mut changed) {
             changed.extend(self.place(timeline, rank, &mut Vec::new()));
         }
+        self.unname_stream(key);
         if let Some(rt) = self.physical_mut(key) {
             rt.decl = None;
             rt.ids.decl = RecordIdentity::NONE;
@@ -343,6 +364,7 @@ impl StreamIndex {
     /// Drop one writer's stream, returning the logical ids whose stream
     /// changed.
     pub fn remove_writer(&mut self, key: StreamKey) -> Vec<StreamId> {
+        self.unname_stream(key);
         let Some(writers) = self.streams.get_mut(&key.stream_id) else {
             return Vec::new();
         };
@@ -359,6 +381,54 @@ impl StreamIndex {
         changed.sort_unstable();
         changed.dedup();
         changed
+    }
+
+    /// Take `key`'s stream out of the name index, under the name its
+    /// declaration holds.
+    fn unname_stream(&mut self, key: StreamKey) {
+        let name = self
+            .physical(key)
+            .and_then(|rt| rt.decl.as_ref())
+            .and_then(section_name)
+            .map(str::to_string);
+        if let Some(name) = name {
+            self.unname(&name, key);
+        }
+    }
+
+    /// Take `key` from the streams declared as `name`.
+    fn unname(&mut self, name: &str, key: StreamKey) {
+        if let Some(keys) = self.named.get_mut(name) {
+            keys.remove(&key);
+            if keys.is_empty() {
+                self.named.remove(name);
+            }
+        }
+    }
+
+    /// The prompt-section streams declared as `name`, under the id each is
+    /// read by: a writer's stream only where its id resolves to it, as
+    /// [`Self::iter_logical`] lists them.
+    pub fn sections_named(&self, name: &str) -> Vec<StreamId> {
+        self.named
+            .get(name)
+            .into_iter()
+            .flat_map(|keys| keys.iter())
+            .filter(|key| self.resolve(key.stream_id) == Some(**key))
+            .map(|key| key.stream_id)
+            .collect()
+    }
+
+    /// The prompt-section streams declared under a name starting `prefix` —
+    /// see [`Self::sections_named`].
+    pub fn sections_named_under(&self, prefix: &str) -> Vec<StreamId> {
+        self.named
+            .range(prefix.to_string()..)
+            .take_while(|(name, _)| name.starts_with(prefix))
+            .flat_map(|(_, keys)| keys.iter())
+            .filter(|key| self.resolve(key.stream_id) == Some(**key))
+            .map(|key| key.stream_id)
+            .collect()
     }
 
     /// Take `key` out of its timeline's order, answering which timeline and
@@ -812,6 +882,56 @@ mod tests {
             "the losing prefill is not a second stream"
         );
         assert_eq!(index.iter_physical().count(), 2);
+    }
+
+    fn named_section(name: &str) -> StreamDecl {
+        StreamDecl::PromptSection(SectionDecl {
+            address: ContentAddress {
+                prefix_hash: ContentHash { lo: 1, hi: 2 },
+                section_hash: ContentHash { lo: 3, hi: 4 },
+            },
+            debug_name: name.into(),
+        })
+    }
+
+    /// The name index follows every declaration: a section is found by its
+    /// name and by a prefix of it, a writer whose id resolves elsewhere is not,
+    /// a redeclaration under another name moves it, and undeclaring or
+    /// removing the stream takes it out. A turn is never named.
+    #[test]
+    fn sections_are_found_by_name_and_prefix() {
+        let mut index = StreamIndex::default();
+        let key = |sid: u64, writer: u64| StreamKey {
+            stream_id: StreamId(sid),
+            writer,
+        };
+        index.declare(key(10, 5), named_section("conv/7/journal/0"), id(5, 1));
+        index.declare(key(11, 5), named_section("conv/7/memory/0"), id(5, 2));
+        index.declare(key(12, 5), named_section("conv/70/journal/0"), id(5, 3));
+        index.declare(key(13, 5), named_section("tool_catalog"), id(5, 4));
+        // A second writer's prefill of stream 10, ranked below: one stream.
+        index.declare(key(10, 9), named_section("conv/7/journal/0"), id(9, 0));
+        write(&mut index, 0, 5, 10, 100);
+
+        let none: Vec<StreamId> = Vec::new();
+        assert_eq!(index.sections_named("conv/7/journal/0"), vec![StreamId(10)]);
+        assert_eq!(index.sections_named("conv/7/journal/1"), none);
+        let mut under = index.sections_named_under("conv/7/");
+        under.sort_unstable_by_key(|s| s.0);
+        assert_eq!(under, vec![StreamId(10), StreamId(11)]);
+
+        index.declare(key(11, 5), named_section("conv/7/memory/1"), id(5, 5));
+        assert_eq!(index.sections_named("conv/7/memory/0"), none);
+        assert_eq!(index.sections_named("conv/7/memory/1"), vec![StreamId(11)]);
+
+        index.undeclare(key(11, 5));
+        assert_eq!(index.sections_named("conv/7/memory/1"), none);
+        index.remove_writer(key(10, 9));
+        assert_eq!(index.sections_named("conv/7/journal/0"), vec![StreamId(10)]);
+        index.remove_writer(key(10, 5));
+        assert_eq!(index.sections_named_under("conv/7/"), none);
+        assert_eq!(index.sections_named("tool_catalog"), vec![StreamId(13)]);
+        assert_eq!(index.named.len(), 2, "only the live names are held");
     }
 
     /// Removing one writer's stream re-places the turns of its timeline and

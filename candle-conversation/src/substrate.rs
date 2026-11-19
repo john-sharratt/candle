@@ -6209,22 +6209,14 @@ impl Substrate {
     /// declarations, so it holds across a restart; a tombstoned stream is not
     /// listed.
     pub fn persisted_owned_streams(&self, owner: TimelineId, name: Option<&str>) -> Vec<StreamId> {
-        let exact = name.map(|n| Self::owned_stream_name(owner, n));
-        let prefix = format!("conv/{}/", owner.raw());
-        let mut found: Vec<StreamId> = self
-            .streams
-            .iter_logical()
-            .filter_map(|(id, stream)| match &stream.decl {
-                Some(StreamDecl::PromptSection(d)) => {
-                    let named = match &exact {
-                        Some(exact) => d.debug_name == *exact,
-                        None => d.debug_name.starts_with(&prefix),
-                    };
-                    named.then_some(id)
-                }
-                _ => None,
-            })
-            .collect();
+        let mut found = match name {
+            Some(n) => self
+                .streams
+                .sections_named(&Self::owned_stream_name(owner, n)),
+            None => self
+                .streams
+                .sections_named_under(&format!("conv/{}/", owner.raw())),
+        };
         found.sort_unstable_by_key(|s| s.0);
         found
     }
@@ -8121,47 +8113,32 @@ impl Substrate {
         hot.first().map(|s| s.chunks.len())
     }
 
-    /// Look up a section by its persistence `debug_name` (the symbolic
-    /// id passed to `insert_section` at ingest time).  Walks the
-    /// persistence manifest's `SectionDecl` records to resolve the
-    /// content-addressed `StreamId`, then walks the in-RAM `sections`
-    /// map to find which `SectionId` got that stream installed.  Used
-    /// by calibration consumers that want to pick out individual
-    /// scenarios by their human-readable identifier after loading the
-    /// workspace's full substrate.
-    ///
-    /// Linear in section count; the calibration scenario list is
-    /// O(thousands) at most so this is fine.  Returns the first match
-    /// when duplicate `debug_name`s exist (callers should keep names
-    /// unique per workspace).
     /// Reverse of [`Self::section_id_for_debug_name`]: the symbolic `debug_name`
     /// for a `SectionId` (tool name, `system.frame`, …). `SectionId` → residence →
     /// `stream_id` → `PromptSection.debug_name`. Used by the promote tracker.
     pub fn section_debug_name(&self, id: SectionId) -> Option<String> {
         let entry = self.sections.get(&id)?;
         let stream_id = self.residences.get(entry.residence).stream_id;
-        self.all_streams().find_map(|(sid, entry)| {
-            if sid != stream_id {
-                return None;
-            }
-            match entry.decl.as_ref()? {
-                StreamDecl::PromptSection(s) => Some(s.debug_name.clone()),
-                _ => None,
-            }
-        })
+        match self.streams.get(stream_id)?.decl.as_ref()? {
+            StreamDecl::PromptSection(s) => Some(s.debug_name.clone()),
+            StreamDecl::Turn(_) => None,
+        }
     }
 
+    /// Look up a section by its persistence `debug_name` (the symbolic id
+    /// passed to `insert_section` at ingest time): the stream declared under
+    /// that name, through the stream index's name index, then the in-RAM
+    /// `sections` entry that stream was installed as. Used by calibration
+    /// consumers that pick out individual scenarios by their human-readable
+    /// identifier after loading the workspace's full substrate. Returns the
+    /// lowest-numbered stream when duplicate `debug_name`s exist (callers
+    /// should keep names unique per workspace).
     pub fn section_id_for_debug_name(&self, debug_name: &str) -> Option<SectionId> {
-        // Find the stream id matching this debug_name from the
-        // substrate's in-RAM stream index (the authoritative source
-        // since Phase 3 — the manifest no longer holds per-entity
-        // state).
-        let stream_id =
-            self.all_streams()
-                .find_map(|(sid, entry)| match entry.decl.as_ref()? {
-                    StreamDecl::PromptSection(s) if s.debug_name == debug_name => Some(sid),
-                    _ => None,
-                })?;
+        let stream_id = self
+            .streams
+            .sections_named(debug_name)
+            .into_iter()
+            .min_by_key(|s| s.0)?;
         // Map stream_id back to the in-RAM SectionId via the residence
         // slab — the residence holds the stream id we installed at
         // ingest time.

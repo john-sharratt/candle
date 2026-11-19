@@ -1708,21 +1708,14 @@ impl Conversation {
         profile::record("beliefs:arena:rows", us(arena.rows_us));
         profile::record("beliefs:arena:tally", us(arena.tally_us));
         let groups_us = t_groups.elapsed().as_micros() as u64;
-        let split = || {
+        let group_part = || {
             format!(
                 "probe_windows={} collections_us={coll_us} groups_us={} groups_scanned={} \
                  group_windows={} group_turns={} select_us={} assemble_us={} score_us={} \
                  normalize_us={} files={} galleries_built={} walk_us={} exchange_us={} \
-                 cal_built={} cal_windows={} cal_us={} segments_us={} arena_scans={} \
-                 arena_launches={} \
-                 arena_segments={} arena_fresh_tokens={} arena_index_us={} \
-                 arena_fingerprint_us={} arena_windows={} arena_pinned={} arena_upload_us={} \
-                 arena_kernel_us={} arena_readback_us={} arena_rows_us={} arena_tally_us={} \
+                 cal_built={} cal_windows={} cal_us={} segments_us={} \
                  seal={seal} scope_us={} tags_us={} files_us={} exclude_us={} kinds_us={} \
-                 lineage_us={} release_us={} arena_kernel_gpu_us={} arena_index_built={} \
-                 arena_index_build_us={} arena_index_absent={} arena_index_stale={} \
-                 arena_index_narrower={} arena_held={} arena_hold_us={} arena_queue_us={} \
-                 arena_view_us={} assemblies_reused={}",
+                 lineage_us={} release_us={} assemblies_reused={}",
                 probe.len(),
                 groups_us,
                 groups.scanned,
@@ -1740,6 +1733,25 @@ impl Conversation {
                 groups.cal_windows,
                 groups.cal_us,
                 groups.segments_us,
+                groups.scope_us,
+                groups.tags_us,
+                groups.files_us,
+                groups.exclude_us,
+                groups.kinds_us,
+                groups.lineage_us,
+                groups.release_us,
+                groups.assemblies_reused,
+            )
+        };
+        let arena_part = || {
+            format!(
+                "arena_scans={} arena_launches={} arena_segments={} arena_fresh_tokens={} \
+                 arena_index_us={} arena_fingerprint_us={} arena_windows={} arena_pinned={} \
+                 arena_upload_us={} arena_kernel_us={} arena_readback_us={} arena_rows_us={} \
+                 arena_tally_us={} arena_kernel_gpu_us={} arena_index_built={} \
+                 arena_index_build_us={} arena_index_absent={} arena_index_stale={} \
+                 arena_index_narrower={} arena_held={} arena_hold_us={} arena_queue_us={} \
+                 arena_view_us={}",
                 arena.scans,
                 arena.launches,
                 arena.segments,
@@ -1753,13 +1765,6 @@ impl Conversation {
                 arena.readback_us,
                 arena.rows_us,
                 arena.tally_us,
-                groups.scope_us,
-                groups.tags_us,
-                groups.files_us,
-                groups.exclude_us,
-                groups.kinds_us,
-                groups.lineage_us,
-                groups.release_us,
                 arena.kernel_gpu_us,
                 arena.index_built,
                 arena.index_build_us,
@@ -1770,21 +1775,28 @@ impl Conversation {
                 arena.hold_us,
                 arena.queue_us,
                 arena.view_us,
-                groups.assemblies_reused,
             )
         };
-        // A scan past a second is written whole: it is a conversation's first
-        // reprojection or a cold arena, the one instance the event keeps is
-        // overwritten by the next scan within a second, and a first token
-        // waits on it.
+        // A scan past a second is written whole, its groups' and its arena's
+        // halves as a line each so neither is cut off where a log reader ends
+        // a line: it is a conversation's first reprojection or a cold arena,
+        // the one instance the event keeps is overwritten by the next scan
+        // within a second, and a first token waits on it.
         if coll_us + groups_us > SLOW_SCAN_US {
             tracing::info!(
                 target: "candle_conversation::provenance",
                 "belief scan slow {}",
-                split()
+                group_part()
+            );
+            tracing::info!(
+                target: "candle_conversation::provenance",
+                "belief scan slow arena {}",
+                arena_part()
             );
         }
-        note("belief scan phase split", split);
+        note("belief scan phase split", || {
+            format!("{} {}", group_part(), arena_part())
+        });
         (scores, candidates)
     }
 
