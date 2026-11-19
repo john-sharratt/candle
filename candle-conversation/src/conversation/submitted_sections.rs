@@ -251,6 +251,12 @@ struct Sealed {
     waited_ms: u64,
     /// Working out the state it starts from.
     start_ms: u64,
+    /// Tokenizing it and asking whether its stream is on disk.
+    encode_ms: u64,
+    /// The scheduler's answer to the scratch slot it is prefilled in.
+    slot_ms: u64,
+    /// From asking the scheduler to ingest it to its answer.
+    ingest_ms: u64,
 }
 
 /// Let go of the end states of the sections a just-sealed section continues,
@@ -310,6 +316,9 @@ impl SealJob {
                     blocks = sealed.blocks,
                     waited_ms = sealed.waited_ms,
                     start_ms = sealed.start_ms,
+                    encode_ms = sealed.encode_ms,
+                    slot_ms = sealed.slot_ms,
+                    ingest_ms = sealed.ingest_ms,
                     total_ms = millis(started),
                     "submitted section sealed",
                 );
@@ -400,6 +409,7 @@ impl SealJob {
         let waiting = Instant::now();
         let sealed_prefix = self.sealed_prefix()?;
         let waited_ms = millis(waiting);
+        let encoding_at = Instant::now();
         let encoding = self
             .tokenizer
             .encode(self.content.as_str(), false)
@@ -416,8 +426,10 @@ impl SealJob {
             section_hash: hash_tokens(&tokens),
         };
         let stream = section_stream_id(address);
+        let persisted = self.substrate.section_stream_is_persisted(stream);
+        let encode_ms = millis(encoding_at);
 
-        if self.substrate.section_stream_is_persisted(stream) {
+        if persisted {
             let (tx, rx) = flume::bounded(1);
             self.scheduler_tx
                 .send(SchedulerRequest::RestoreSection {
@@ -437,6 +449,9 @@ impl SealJob {
                         how: "restored",
                         waited_ms,
                         start_ms: 0,
+                        encode_ms,
+                        slot_ms: 0,
+                        ingest_ms: 0,
                     });
                 }
                 Err(e) => tracing::warn!(
@@ -450,7 +465,10 @@ impl SealJob {
         let starting = Instant::now();
         let start = self.start_state()?;
         let start_ms = millis(starting);
+        let slotting = Instant::now();
         let slot = alloc_scratch_slot_on(&self.scheduler_tx, &self.substrate)?;
+        let slot_ms = millis(slotting);
+        let ingesting = Instant::now();
         let (tx, rx) = flume::bounded(1);
         let sent = self
             .scheduler_tx
@@ -468,6 +486,7 @@ impl SealJob {
             })
             .map_err(|_| ConversationError::SchedulerGone);
         let sealed = sent.and_then(|()| rx.recv().map_err(|_| ConversationError::SchedulerGone)?);
+        let ingest_ms = millis(ingesting);
         let _ = self
             .scheduler_tx
             .send(SchedulerRequest::FreeSequence { sequence_id: slot });
@@ -479,6 +498,9 @@ impl SealJob {
             how: "prefilled",
             waited_ms,
             start_ms,
+            encode_ms,
+            slot_ms,
+            ingest_ms,
         })
     }
 
