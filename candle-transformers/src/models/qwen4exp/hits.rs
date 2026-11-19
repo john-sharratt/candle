@@ -192,6 +192,67 @@ pub struct HitHolder {
     pub generation: u64,
 }
 
+/// What a sequence forked or moved from `from` holds of its counters: a share
+/// of them, under the declaration `from` counts under — an owner's current
+/// one, or a view's own, so a stale view's carve stays stale. `None` when
+/// `from` holds none.
+fn share_of(hits: &HashMap<usize, HitHolder>, from: usize) -> Result<Option<HitHolder>> {
+    Ok(match hits.get(&from) {
+        Some(h) if h.owned => Some(HitHolder {
+            hits: h.hits.clone(),
+            owned: false,
+            generation: h.hits.generation()?,
+        }),
+        Some(h) => Some(HitHolder {
+            hits: h.hits.clone(),
+            owned: false,
+            generation: h.generation,
+        }),
+        None => None,
+    })
+}
+
+/// `child` is carved from `parent` (`fork_recurrent`): its rows count into
+/// the counters `parent` counts into — the parent's projection declared the
+/// rounds, the child's rows are the reads.
+pub fn fork_holder(
+    hits: &mut HashMap<usize, HitHolder>,
+    parent: usize,
+    child: usize,
+) -> Result<()> {
+    match share_of(hits, parent)? {
+        Some(share) => {
+            hits.insert(child, share);
+        }
+        None => {
+            hits.remove(&child);
+        }
+    }
+    Ok(())
+}
+
+/// `from`'s carried state moves to `to` (`move_recurrent`), and its counting
+/// moves with it. A sequence that owns counters keeps them — a view
+/// finalizing into its conversation leaves the conversation's own — and every
+/// other destination counts into what `from` counted into: a reprojection's
+/// fresh view, carved once its conversation declared the rebuilt layout,
+/// counts under that declaration. A share leaves the sequence it moved from.
+///
+/// Carried by the fork alone, the reprojected view held no counters, and every
+/// row a turn decoded after its first reprojection counted nothing: on
+/// BlackWorld (2026-11-19) a reply's first read held 228 queries and 80,751
+/// hits, and its next twenty held none, so no round's score ever moved off its
+/// piece's and the fill took a piece's rounds in order from its first.
+pub fn move_holder(hits: &mut HashMap<usize, HitHolder>, from: usize, to: usize) -> Result<()> {
+    if !hits.get(&to).is_some_and(|h| h.owned) {
+        fork_holder(hits, from, to)?;
+    }
+    if hits.get(&from).is_some_and(|h| !h.owned) {
+        hits.remove(&from);
+    }
+    Ok(())
+}
+
 /// The kernel's span table as last uploaded: the words and the device copy.
 /// A wave's spans and counter pointers are the same at every sampled layer,
 /// and across waves until a declaration changes, so the table goes up only
@@ -994,6 +1055,79 @@ mod tests {
         let after = hits[&1].hits.take()?;
         assert_eq!(after.hits, vec![1, 4], "the parent's rows alone");
         assert_eq!(after.queries, 2);
+        Ok(())
+    }
+
+    /// An owner's counters on the CPU, declared once: generation 0.
+    fn owner() -> Result<HitHolder> {
+        Ok(HitHolder {
+            hits: SeqHits::new(
+                vec![0, 1],
+                2,
+                PooledRounds::default(),
+                keep_shape(),
+                &Device::Cpu,
+            )?,
+            owned: true,
+            generation: 0,
+        })
+    }
+
+    /// **A carved view counts into its parent's counters** under the
+    /// parent's current declaration; one carved from a stale view stays
+    /// stale; a parent with none leaves the child none.
+    #[test]
+    fn a_fork_shares_the_parents_counters() -> Result<()> {
+        let mut hits = HashMap::from([(1usize, owner()?)]);
+        hits[&1]
+            .hits
+            .redeclare(vec![0], 1, PooledRounds::default(), &Device::Cpu)?;
+        fork_holder(&mut hits, 1, 5)?;
+        assert!(!hits[&5].owned);
+        assert_eq!(hits[&5].generation, 1, "the parent's current declaration");
+        hits[&1]
+            .hits
+            .redeclare(vec![0], 1, PooledRounds::default(), &Device::Cpu)?;
+        fork_holder(&mut hits, 5, 6)?;
+        assert_eq!(hits[&6].generation, 1, "carved from a stale view: stale");
+        fork_holder(&mut hits, 9, 6)?;
+        assert!(
+            !hits.contains_key(&6),
+            "a parent with no counters gives none"
+        );
+        Ok(())
+    }
+
+    /// **A reprojection's fresh view counts again.** The conversation's state
+    /// moves onto a view carved after its rebuild declared the new layout: the
+    /// view takes a share under that declaration and the conversation keeps
+    /// owning its counters. A view finalizing back leaves the conversation's
+    /// counters as they were and gives up its share.
+    #[test]
+    fn a_move_carries_the_counting() -> Result<()> {
+        let mut hits = HashMap::from([(1usize, owner()?)]);
+        // The turn's first view, then the conversation rebuilt and redeclared.
+        fork_holder(&mut hits, 1, 5)?;
+        hits[&1]
+            .hits
+            .redeclare(vec![0], 1, PooledRounds::default(), &Device::Cpu)?;
+        // The rebuild carves view 6 and moves the conversation's state onto it.
+        move_holder(&mut hits, 1, 6)?;
+        assert!(hits[&1].owned, "the conversation keeps its counters");
+        assert!(!hits[&6].owned);
+        assert_eq!(
+            hits[&6].generation,
+            hits[&1].hits.generation()?,
+            "the new view counts under the rebuilt layout"
+        );
+        // The turn ends: the view's state moves back to the conversation.
+        move_holder(&mut hits, 6, 1)?;
+        assert!(hits[&1].owned, "an owner's counters are never replaced");
+        assert!(!hits.contains_key(&6), "the share leaves with the move");
+        // A move from a sequence with no counters clears a stale share.
+        hits.insert(7, hits[&5].clone());
+        move_holder(&mut hits, 8, 7)?;
+        assert!(!hits.contains_key(&7));
         Ok(())
     }
 

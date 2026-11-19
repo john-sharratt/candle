@@ -56,8 +56,8 @@ use super::coverage::coverage_disagreements;
 use super::draft::{HeadWave, SeedStore};
 use super::engine::{GpuLayerMix, Qwen4ExpGpu};
 use super::hits::{
-    block_map, block_range, count_hits, HitHolder, HitTable, KeepShape, PooledRounds, SeqHits,
-    ShadowScan,
+    block_map, block_range, count_hits, fork_holder, move_holder, HitHolder, HitTable, KeepShape,
+    PooledRounds, SeqHits, ShadowScan,
 };
 use super::hyper::{hc_combine, hc_combine_gated, hc_mix, hc_mix_with_operand};
 use super::index_keys::key_page_growth_bytes;
@@ -822,29 +822,7 @@ impl Qwen4ExpBatched {
                 .hits
                 .write()
                 .map_err(|_| candle::Error::Msg("hits lock poisoned".into()))?;
-            // The child counts under the layout its parent counts under: an
-            // owner's current one, or — carved from a view — the view's own,
-            // so a stale view's carve stays stale.
-            let held = match hits.get(&parent) {
-                Some(p) if p.owned => Some((p.hits.clone(), p.hits.generation()?)),
-                Some(p) => Some((p.hits.clone(), p.generation)),
-                None => None,
-            };
-            match held {
-                Some((h, generation)) => {
-                    hits.insert(
-                        child,
-                        HitHolder {
-                            hits: h,
-                            owned: false,
-                            generation,
-                        },
-                    );
-                }
-                None => {
-                    hits.remove(&child);
-                }
-            }
+            fork_holder(&mut hits, parent, child)?;
         }
         self.mark_seeded(child)?;
         Ok(())
@@ -1630,6 +1608,16 @@ impl Qwen4ExpBatched {
     /// entries are gone afterwards and the parent's previous ones are dropped.
     pub fn move_recurrent(&self, child: usize, parent: usize) -> Result<()> {
         self.refuse_parked(child)?;
+        // Its counting moves with it, whatever state it carries: a
+        // reprojection's fresh view counts into its conversation's counters
+        // again (`super::hits::move_holder`).
+        {
+            let mut hits = self
+                .hits
+                .write()
+                .map_err(|_| candle::Error::Msg("hits lock poisoned".into()))?;
+            move_holder(&mut hits, child, parent)?;
+        }
         // A view claimed its state at admission and never ran a wave: what it
         // holds is sequence-start zeros, not a continuation, and moving it would
         // wipe the parent's. It goes; the parent keeps what it had — the same
