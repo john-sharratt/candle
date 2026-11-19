@@ -397,6 +397,8 @@ Sections §6.3 and §6.4 describe provenance retrieval *before* generation begin
 
 **What runs: mid-decode reprojection.** The production engine re-selects a decoding session's working set from the session's own decode. Every decoded token's Q signature is captured as it is produced (§6.6). A reprojection is triggered every 64 decoded tokens, or at a line break once more than 16 tokens have been decoded since the last one; its probe is the signatures of the last 256 decoded tokens, scored against the resident gallery by the GPU scan, with the working set's momentum carrying belief across a turn's reprojections (§9.11.1). The scan's result assembles the working set for the next forward, so the scan never blocks the current one. Retrieval therefore *follows* reasoning by at most one reprojection interval: the probe is what the model has just written, not what it is about to write. The configuration is `candle-conversation/src/config.rs` (`REPROJECT_EVERY_N_TOKENS`, `REPROJECT_MAX_PROBE_TOKENS`).
 
+**Where a reply begins: the question read twice, and short early strides.** A query's own Q vectors depend on the context it is read against. Every conversation starts on a small set of configured background files, and a question read against them scores the corpus differently from the same question read without them — measured on one battery question, its answer file ranked second of 6,854 alone and fifth against the background (§9.12). So a request is read twice on the conversation's own slot: first prefilled to the token before its last against the working set with the background files held out, and scored, its fresh scores feeding the working set and its hits and K/V discarded; then submitted again unchanged, its opening working set ranked by the first reading's scores beside the background files, prefilled once more, and decoded with no further scan at its opening's end. The reply's first reasoning tokens then take reprojections at 8, 16 and 32 decoded tokens before the 64-token cadence, because what the model writes early in its reasoning — what it believes it has read — stays in its context whatever the working set holds afterwards. The two readings cost one extra prefill of the question and one scan before the first token; the early strides cost three reprojections in a reply's first 32 tokens and none once its reasoning closes.
+
 **What is designed and not built: Speculative Context Decode.** The rest of this section specifies a probe session that would decode *ahead* of the real one, so that the context for the next reasoning step is assembled from where the reasoning is going rather than where it has been. It is not in the engine, and no figure in this paper is measured with it.
 
 **Mechanism.** Generation would operate as a pipelined two-session loop with variable-length probe windows.
@@ -1086,14 +1088,47 @@ The retrieval log across all three layers would constitute the dependency graph.
 
 **Scoring.** Recall: the share of a question's expected items the answer names, any of an item's spellings found case-insensitively. The four dimensions the protocol listed — recall, chain completeness, conceptual accuracy, precision — reduce here to recall plus a reading of every answer for invented names.
 
-**Results.** On the production cluster, through private chats — one fresh chat per question, deleted once answered — with the daemon's model and its projection over the production substrate, every question prefixed with an instruction to answer from memory and call no tool, which all 24 answers obeyed (`docs/results/dependency_battery_2026-11-10.md`):
+**Results.** On the production cluster, through private chats — one fresh chat per question, deleted once answered — with the daemon's model and its projection over the production substrate, every question prefixed with an instruction to answer from memory and call no tool, which every answer obeyed. The first run (2026-11-10, `docs/results/dependency_battery_2026-11-10.md`) and the run after the retrieval work below (2026-11-20, `docs/results/dependency_battery_2026-11-20_b.md`):
 
-| Category | Mean recall | Full marks | Declined outright |
-|---|---:|---:|---:|
-| Direct | 33.3% | 1 of 8 | 3 |
-| Transitive | 54.2% | 2 of 8 | 1 |
-| Architectural | 85.4% | 5 of 8 | 1 |
-| All 24 | 57.6% | 8 | 5 |
+| Category | Mean recall, 11-10 | Full marks | Mean recall, 11-20 | Full marks |
+|---|---:|---:|---:|---:|
+| Direct | 33.3% | 1 of 8 | 47.9% | 2 of 8 |
+| Transitive | 54.2% | 2 of 8 | 51.0% | 1 of 8 |
+| Architectural | 85.4% | 5 of 8 | 87.5% | 6 of 8 |
+| All 24 | 57.6% | 8 | **62.2%** | **9** |
+
+Between them the battery ran nine more times as the retrieval changed, at 46.2–59.7%; with 24 questions one question moves a category by up to 12 points, so it is the direct questions' rise and the ranking measurements below, not the total alone, that carry the result.
+
+**The scoring formula.** Which files a question's probe should place was measured apart from the model's answers, in a scoring lab (`candle-conversation/examples/provenance_gates`, `lab`): the battery's 23 file-answered questions, each probed once through the daemon — the question prefilled and decoded through its thinking — and its tokens' votes scanned against every one of the 6,854 ingested files on the resident gallery, then re-ranked on the host under formulas read from a file, so every variant scores the same probes and the same votes (`docs/results/provenance_scoring_lab_2026-11-16.md`). The binding limit it found was votes per token, not normalization: under one vote per token a question's probe gave any vote to only 20–67 files, and seven answer files scored exactly zero, which no normalization can lift. The formula production runs on code reading:
+
+- **Top-k votes.** Each probe token votes for its best 8 files, file `r` by `z_r × (a_r − a_9)` — its z-score times its margin over the ninth — not for its single best.
+- **Vote power ½.** Each kept vote is square-rooted before summing, so one spiky match does not outweigh many moderate ones.
+- **A needle gate.** Only the quarter of the probe's tokens with the largest summed vote count.
+- **Every fold group alike** (`[1, 1, 1]`), and the file's **calibration** questions (§9.11.1) as a second competition at weight 1, one vote a token — a calibration question matches its own file cleanly, and spreading its vote dilutes it.
+- **Kind-normalized.** A file scores as a z-score among the files of its own kind on the same question, which replaces a hand-set down-weighting of documents.
+- **The lineage out.** The conversation's own inherited documents, placed anyway, are not ranked.
+
+Every non-linear alternative tried — reciprocal-rank and softmax vote laws, token weighting, log or count aggregates, content/calibration blends, token runs — scored below summed `z × margin`; the formula plateaus there. Tool selection keeps one vote per token: a tool probe has one clean match, and spreading its vote raised wrong tools over the selection gate (Top-1 80.0% → 63.7%).
+
+| Probe, on the recalibrated substrate (2026-11-20) | hit@1 | hit@5 | hit@10 | MRR |
+|---|---:|---:|---:|---:|
+| The question and its decoded thinking | 0.65 | **0.83** | **0.87** | **0.713** |
+| The decoded thinking alone | 0.61 | 0.83 | 0.83 | 0.676 |
+| The question alone | 0.43 | 0.78 | 0.78 | 0.573 |
+| One vote per token, the whole probe (2026-11-18) | 0.43 | 0.57 | 0.61 | 0.508 |
+
+The answer file is in the top five of 6,854 on 19 of 23 questions, and first on 15 (`docs/results/provenance_scoring_lab_2026-11-20.md`).
+
+**What raised the hit rate.** The ranking and the answers are two measurements: the lab ranks, and what the model reads is what the projection places from that ranking. The work between the two runs closed gaps between them, each found by reading a failing question's projection records:
+
+- **Calibrations that saw their file.** A calibration is drafted by a conversation forked on the file's reading; when append-only conversations stopped carrying their lineage in their frame, every draft was asked for its file's questions knowing only the file's name, and 1,227 calibrations were written blind. The frame carries the lineage again, a draft that holds none of its reading is refused, and a reading past the 64,000-token lineage cap — the battery's six largest answer files among them — is drafted over windows of its turns. The whole substrate was recalibrated; the scoring formula's MRR rose 0.663 → 0.713 with nothing in the formula changed.
+- **Hits that survive a reprojection.** A reprojection moves the turn onto a rebuilt view; the hit counters stayed with the old one, so every file's hit momentum read zero after the first boundary. They now move with the state.
+- **The question's leaders keep their places.** The pool's minimum per kind is filled first by the files the boundary's scan scores highest, so a file lifted only by hits earned on whatever the slot held cannot push out a file the question names.
+- **Short strides early in the reasoning.** A reply still reasoning reprojects at 8, 16 and 32 decoded tokens before the 64-token cadence. Measured on one direct question, its answer file entered at token 64 before — after the reasoning had written that it had read nothing holding the symbol — and at token 8 after.
+- **A first question that opens its slot.** The first boundary after a new question chooses its rounds whole; a conversation's set, cleared when it opens, ignored the mark, and the first question's slot was filled a third of a budget at a time.
+- **A request read twice.** Every conversation starts on configured seed files as background, and the question read against them is a different probe: one direct question scored its answer file second of 6,854 read alone and fifth read against the seeds. A request is now prefilled first without the seeds and scored, that reading discarded, and the turn submitted again — its opening ranked by the first reading's scores beside the seeds, prefilled once more, and decoded (§6.5).
+
+What remains is placement, not ranking: three questions still declined with files they do not concern in context, and the first reading's own score of an answer file still moves with what the question is read against.
 
 What the memory holds is the documentation and the module structure more than the call graph: the architectural answers are in `AGENTS.md` and the design documents, and five of eight came back whole; the direct questions ask for call sites, which documents rarely name, and one did. The answers cite where they came from — a design document's section, a module header — and when the model had not seen the source it said so: five declined outright, more named what they knew and declined the rest, and one withdrew identifiers it had just named because it had not read the file that would confirm them. The errors found on reading are near-misses (the CUDA constant placed in the arena-table header beside the one that defines it; an out-of-date caller), not invented names.
 
@@ -1118,7 +1153,7 @@ What the memory holds is the documentation and the module structure more than th
 
 The one-shot ablation contrast is sharpest with this mechanism explicit: one-shot retrieves once before any reasoning tokens; reprojection retrieves throughout. Any transitive dependency the full system discovers that one-shot misses was surfaced by a mid-reasoning update, and the projection record names the reprojection that surfaced it.
 
-**What is public.** The source and the raw measurement rows are public (Appendix C); every throughput, compression and retrieval figure in this paper is reproducible from a named test in the repository and a named row in `docs/performance.md`. The live system is open to signed-in users, but it does not expose a retrieval log or a one-shot mode, and the ingested conversation is not released; the battery, its ground truth and its per-question scoring are in the repository (`zend/examples/dependency_battery/`, `docs/results/dependency_battery_2026-11-10.md`).
+**What is public.** The source and the raw measurement rows are public (Appendix C); every throughput, compression and retrieval figure in this paper is reproducible from a named test in the repository and a named row in `docs/performance.md`. The live system is open to signed-in users, but it does not expose a retrieval log or a one-shot mode, and the ingested conversation is not released; the battery, its ground truth and its per-question scoring are in the repository (`zend/examples/dependency_battery/`, `docs/results/dependency_battery_2026-11-10.md`, `docs/results/dependency_battery_2026-11-20_b.md`), and so is the scoring lab with its formulas and measurements (`candle-conversation/examples/provenance_gates`, `docs/results/provenance_scoring_lab_2026-11-16.md`, `docs/results/provenance_scoring_lab_2026-11-20.md`).
 
 ---
 
