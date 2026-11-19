@@ -11933,7 +11933,12 @@ impl Scheduler {
         //    the turn-boundary challenger below.
         let t_scan = Instant::now();
         let warm_span = profile::span("reproject:queue_norm_warm");
-        self.queue_norm_warm(&policy.substrate, &policy.projection, policy.target);
+        self.queue_norm_warm(
+            &policy.substrate,
+            &policy.projection,
+            policy.target,
+            policy.max_probe_tokens,
+        );
         warm_span.end();
         let warm_us = t_scan.elapsed().as_micros() as u64;
         let schema = policy.projection.schema();

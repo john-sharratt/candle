@@ -5657,7 +5657,7 @@ impl ProbeCtx {
 /// problem: the scan is O(probe × gallery), and the tail of a large tool
 /// payload is not a query, so scoring it dilutes the turn's actual intent
 /// across whatever the payload happens to mention.
-fn cap_probe_window(probe: Vec<WideQSig>, max_tail: usize) -> Vec<WideQSig> {
+pub(crate) fn cap_probe_window(probe: Vec<WideQSig>, max_tail: usize) -> Vec<WideQSig> {
     /// Head signatures kept regardless of how far the tail window has slid —
     /// mirrors the scheduler's `QUERY_HEAD_CHUNKS` (2 chunks of 32).
     const HEAD: usize = 64;

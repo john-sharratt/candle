@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use flume::Sender;
 
 use super::Scheduler;
+use crate::conversation::cap_probe_window;
 use crate::persistence::streams::StreamId;
 use crate::projection::{
     Builder, Conversation, GroupId, GroupVotes, LayerId, ProjectionTarget, Schema, TimelineId,
@@ -127,11 +128,19 @@ impl Scheduler {
     /// Queue the dialogue warm-up replay when it is armed — see
     /// [`Conversation::take_warm_replay`]. A no-op otherwise, so it is cheap to
     /// call on every reprojection.
+    ///
+    /// **Each replayed turn probes with the window its seal scan did**: its
+    /// head and its last `max_probe_tokens` (`cap_probe_window`). The replay
+    /// re-teaches what the seals taught, and a whole turn's signature — a tool
+    /// result's included — is neither that observation nor its cost: 512
+    /// whole turns averaged 432 tokens and took 51 s of scans on BlackWorld
+    /// (2026-11-18), one per loop iteration beside the first chat after a load.
     pub(super) fn queue_norm_warm(
         &mut self,
         substrate: &Conversation,
         projection: &Arc<Builder>,
         target: ProjectionTarget,
+        max_probe_tokens: usize,
     ) {
         let Some(probes) = substrate.take_warm_replay(target) else {
             return;
@@ -142,7 +151,10 @@ impl Scheduler {
             substrate: substrate.clone(),
             projection: Arc::clone(projection),
             target,
-            probe,
+            probe: WarmProbe {
+                source: probe.source,
+                probe: cap_probe_window(probe.probe, max_probe_tokens),
+            },
         }));
     }
 
@@ -294,9 +306,9 @@ mod tests {
             "nothing queued blocks as usual"
         );
 
-        sched.queue_norm_warm(&conv, &builder, target);
+        sched.queue_norm_warm(&conv, &builder, target, WHOLE);
         assert_eq!(sched.norm_warm.backlog.len(), 2, "the two dialogue turns");
-        sched.queue_norm_warm(&conv, &builder, target);
+        sched.queue_norm_warm(&conv, &builder, target, WHOLE);
         assert_eq!(
             sched.norm_warm.backlog.len(),
             2,
@@ -311,8 +323,39 @@ mod tests {
         assert_eq!(sched.norm_warm_wait(), None);
 
         conv.reset_normalization_warm();
-        sched.queue_norm_warm(&conv, &builder, target);
+        sched.queue_norm_warm(&conv, &builder, target, WHOLE);
         assert_eq!(sched.norm_warm.backlog.len(), 2, "a re-arm queues it again");
+    }
+
+    /// A probe window wider than any turn here: every turn replays whole.
+    const WHOLE: usize = 4096;
+
+    /// **A replayed turn probes with the window its seal scan did**: its 64
+    /// head signatures and its last `max_probe_tokens`, where a turn within
+    /// them replays whole.
+    #[test]
+    fn a_replayed_turn_probes_with_its_seal_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let conv = open(dir.path());
+        let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
+        let target = record_turns(
+            &conv,
+            &builder,
+            &[
+                (&[], 0xAAAA_AAAA_AAAA_AAAA, 200),
+                (&[], 0xABAB_ABAB_ABAB_ABAB, 40),
+            ],
+        );
+        let (mut sched, _tx) = make_test_scheduler();
+        sched.queue_norm_warm(&conv, &builder, target, 16);
+        let mut lens: Vec<usize> = sched
+            .norm_warm
+            .backlog
+            .iter()
+            .map(|job| job.probe.probe.len())
+            .collect();
+        lens.sort_unstable();
+        assert_eq!(lens, vec![40, 64 + 16]);
     }
 
     /// **A raw group scan is answered on a later step, not when it arrives** —

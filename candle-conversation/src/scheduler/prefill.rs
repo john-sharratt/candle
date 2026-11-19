@@ -1010,7 +1010,13 @@ impl Scheduler {
                     why.map_or(String::new(), |w| format!(" none={w:?}"))
                 )
             });
+            // Its own line: at the end of the rates line it was past what a
+            // log reader shows of one.
             let steps = self.step_census.take(now);
+            tracing::info!(
+                target: "candle_conversation::scheduler::admission",
+                "step census {steps}"
+            );
             let idle = self.idle_census(now);
             match learned {
                 Some(r) => tracing::info!(
@@ -1047,7 +1053,6 @@ impl Scheduler {
                     hit_model = format!("{hit_model:.3}"),
                     decode_fit,
                     fit_seen,
-                    steps,
                     idle,
                     prefill_samples = samples,
                     decode_samples,
@@ -1057,7 +1062,6 @@ impl Scheduler {
                     target: "candle_conversation::scheduler::admission",
                     prefill_samples = samples,
                     decode_samples,
-                    steps,
                     "learned rates not yet published: the rate model has not learned both halves"
                 ),
             }
