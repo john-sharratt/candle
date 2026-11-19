@@ -200,6 +200,7 @@ mod control {
                 | StreamItem::Handed { .. }
                 | StreamItem::TurnEnd { .. } => {}
                 StreamItem::Error(e) => panic!("the turn failed: {e}"),
+                StreamItem::Left => panic!("the turn was stopped: its member is leaving"),
             }
         }
         // Print the decoded text so coherence can be eyeballed — a wrong
