@@ -970,8 +970,6 @@ fn parse_recency(
 struct YamlWorkingSet {
     beta: f32,
     min_momentum: f32,
-    #[serde(default)]
-    seeds: Vec<String>,
     /// What the slot keeps back for what arrives between two projections:
     /// one cadence of decoded tokens or one prefill chunk.
     reserve_tokens: usize,
@@ -1095,7 +1093,6 @@ fn parse_working_set(
     Ok(Some(WorkingSetConfig {
         beta: yw.beta,
         min_momentum: yw.min_momentum,
-        seeds: yw.seeds.clone(),
         reserve_tokens: yw.reserve_tokens,
         type_shares,
         fill_shares,

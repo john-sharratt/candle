@@ -1,6 +1,7 @@
 use super::answered::{after_reasoning, answered};
 use super::band::rank;
 use super::block_guard::BlockGuard;
+use super::early_boundaries::early_boundary;
 use super::named_tool::steer_to_named_tool;
 use super::segment_rearm::drop_rearms_segment;
 use super::spec_chooser::{in_head_order, locate_rows, SpecChooser};
@@ -2293,14 +2294,20 @@ impl Scheduler {
                     if step == Step::OpenedToolCall {
                         state.wrote_tool_call = true;
                     }
-                    // A played-back turn reprojects where its recording did.
-                    let fires = match state
-                        .reprojection
-                        .as_ref()
-                        .and_then(|p| p.projection.script())
-                    {
-                        Some(script) => script.fires_at(count),
-                        None => step.fires(),
+                    // A played-back turn reprojects where its recording did; a
+                    // live one where the rule fires, and early in its reasoning
+                    // (`early_boundaries`).
+                    let fires = match state.reprojection.as_ref().map(|p| p.projection.script()) {
+                        Some(Some(script)) => script.fires_at(count),
+                        Some(None) => {
+                            step.fires()
+                                || early_boundary(
+                                    count,
+                                    state.think_close_at.is_none(),
+                                    state.boundary.in_tool_call(),
+                                )
+                        }
+                        None => false,
                     };
                     if fires {
                         Self::queue_reprojection(&mut self.pending_reprojections, seq_id);

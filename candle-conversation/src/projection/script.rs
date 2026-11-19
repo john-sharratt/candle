@@ -369,12 +369,7 @@ mod tests {
             ],
         )]);
         let choice = s.choice_at(0).unwrap();
-        let mut projection = Projection {
-            segments: Vec::new(),
-            selections: Vec::new(),
-            selection_scores: Default::default(),
-            selection_origins: Default::default(),
-        };
+        let mut projection = Projection::default();
         let face_of_five = TurnKey::new(timeline(55), TurnIndex(0));
         choice.place_turns(&mut projection, &|_| true, &|key| {
             (key == TurnKey::new(timeline(5), TurnIndex(0))).then_some(face_of_five)
@@ -488,9 +483,7 @@ mod tests {
                 glue,
                 ProjectionSegment::Sealed(SealedKind::Turn(chosen, crate::Role::Assistant)),
             ],
-            selections: Vec::new(),
-            selection_scores: Default::default(),
-            selection_origins: Default::default(),
+            ..Projection::default()
         };
         ScriptedChoice {
             members: Arc::new(HashSet::new()),

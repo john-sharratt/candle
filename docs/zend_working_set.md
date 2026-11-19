@@ -9,8 +9,15 @@
 differ. Of §4.2's block, `budget_tokens`, `folder_tokens`, `guidance_tokens`,
 `max_file_tokens` and `max_admits` are gone: the pool's size is the card's
 (`working_set::PoolSize`), and the slot's caps are `shares:`.**
-- The working set's momentum, seeds and withheld set rank the **pool**, the
+- The working set's momentum and withheld set rank the **pool**, the
   fill's candidate set of whole conversations holding index pages only.
+- **Seeds are removed** (2026-11-20). A dialogue's pool opens empty, and its
+  first members are what the first boundary's scan of the question ranks
+  (§4.7). Seeded, every new conversation read its question against the same
+  three files at a flat momentum of 1,000 — `Cargo.toml`, `docs/deployment.md`,
+  `docs/zend_branch_ingest.md` — and the question's hits on them lifted
+  unrelated files over the one the question named
+  (`docs/results/provenance_scoring_lab_2026-11-20.md`).
   Whole-file membership charged against `budget_tokens`, `max_admits`, the
   dislodge margin and the `max_file_tokens` refusal (§4.3, §4.4) go.
 - The slot fill places whole turns under caps that are shares of the room:
@@ -33,12 +40,9 @@ already-ingested `code_reading` files and `repo_map` folders, projected ahead of
 its own turns as **one sequence in the order its members entered**. The unit is
 always a **whole ingest conversation** — one file or one folder.
 
-1. **Provenance** — the files the conversation keeps attending to, by a
-   per-file momentum score.
-2. **Seeds** — documents, folders and files named in `projection.yaml` that a
-   conversation starts out attending to: its first provenance, at the momentum
-   of one full-strength hit (1000), fading like any other file it stops
-   attending to.
+Its members are **provenance**: the files the conversation keeps attending
+to, by a per-file momentum score. A conversation opens with none; its first
+are what its first question's scan ranks (§4.7).
 
 **Every `file_read` runs for real** (§4.5). The working set once answered a read
 of a file the corpus held whole with an `in_context` pointer and locked that
@@ -222,37 +226,15 @@ On the dialogue layer, replacing `fast_path_window` (deleted):
   - name: dialogue
     working_set:
       reserve_tokens: 16384      # what arrives between two projections; the slot is the engine's trained window less this
-      budget_tokens: 64000       # seeds + provenance, folders and files together
+      budget_tokens: 64000       # provenance, folders and files together
       folder_tokens: 10000       # repo_map's share of budget_tokens
       guidance_tokens: 16000     # the guidance pool, beside budget_tokens
       beta: 0.2                  # per-file momentum leak (§4.3)
       min_momentum: 100          # below this a file is not a provenance candidate
       max_file_tokens: 48000     # the most of one reading the slot places (§4.4)
-      seeds:
-        - candle/zend/
-        - candle/zend/src/
-        - candle/zend-tools/src/
-        - candle/candle-conversation/src/
-        - candle/candle-transformers/src/models/
-        - candle/candle-nn/src/kv_cache/
-        - candle/candle-core/src/
-        - candle/candle-kernels/src/
-        - candle/docs/
-        - candle/Cargo.toml
-        - candle/docs/deployment.md
-        - candle/docs/zend_branch_ingest.md
-        - candle/docs/zend_working_set.md
-        - candle/zend/src/lib.rs
-        - candle/zend/src/main.rs
-        - candle/zend-tools/src/lib.rs
-        - candle/candle-conversation/src/lib.rs
 ```
 
-- Seeds leave out what the priming chain already carries — the repository roots,
-  `README`, `AGENTS.md` — because lineage emits them anyway. Resolution skips any
-  seed whose timeline is in the dialogue's `inherited_chain`, so an overlap in
-  the list costs nothing.
-- Every seed sits within `--max-depth 3`; a deeper file has no conversation.
+The block declares no seeds (§4.7).
 
 ### 4.3 State and momentum
 
@@ -279,10 +261,9 @@ set at setup from each `working_set` rule's `share`). Every operation:
 | Operation | What happens |
 |---|---|
 | `observe` | Momentum decays for everything; a conversation under `min_momentum` leaves the map and, if a member, the sequence — the gap closes. A member its scope no longer offers leaves too. Then the strongest non-members try to enter at the end, each dislodging only provenance it beats by `DISLODGE_MARGIN` (×1.5) — without the margin two files near the floor trade places every reprojection and each trade rebuilds everything to its right. |
-| `seed` | At open, in list order: each seed gains `seed_momentum` (1000) and enters at the end while the budget has room — seeds dislodge nothing. One that misses for room stays a candidate. |
 | `remove` | A tombstoned conversation leaves; the gap closes. |
 
-An unattended seed falls under the floor after
+An unattended file scored once at 1,000 falls under the floor after
 `ln(1000 / min_momentum) / ln(1 / (1 − β))` reprojections — eleven at the
 defaults.
 
@@ -319,9 +300,12 @@ every scanned group's fresh `(TurnKey, score)` list — a working-set group is
 not belief-driven but is still scanned (`GroupSchema::is_scanned`). For the two
 working-set groups the max per timeline is taken and handed to the dialogue's
 `WorkingSet` under the substrate write lock. The turn's opening projection is
-not scanned (it reads zero scores), so it projects the momentum as it stood —
-which is what an opening should see. Momentum ranks only who enters and who is
-dislodged; it never places anyone.
+not scanned (it reads zero scores), so it projects the momentum as it stood:
+the conversation's last question's files, or nothing for a new conversation.
+The boundary at the end of the opening, before the reply's first reasoning
+token (`docs/hit_driven_projection.md` §7.4), is the first to score the
+question, and the slot the reply reasons against is chosen there. Momentum
+ranks only who enters and who is dislodged; it never places anyone.
 
 **Momentum need not survive a restart.** It is a ranking, not a promise; it
 stays in-memory and rebuilds from the scan within a few reprojections.
@@ -341,7 +325,7 @@ nothing is chosen at projection time.
 engine whose fill carves the slot (`docs/hit_driven_projection.md` §7.2),
 the fill places at most `max_file_tokens` of one reading: its first and last
 turns and the page turns that score highest, each whole (§8.1 there). So a
-reading longer than the cap is admitted as a seed or as provenance, and
+reading longer than the cap is admitted as provenance, and
 charged the cap against the budget, not its whole size
 (`Candidate::carved_to`, applied by `Substrate::provenance_charge`). On an
 engine that emits members whole, it is never a member.
@@ -415,7 +399,7 @@ for the rest of the turn's loop:
    its own copy, which no reading holds.
 
 **Tombstone removes.** `tombstone_timeline` drops the timeline from every
-working set, momentum and seeds included (§3.4).
+working set, momentum included (§3.4).
 
 **A selected turn with no hot K/V is dropped with a warning**
 (`apply_projection`). No member is a promise the model was told it holds, so
@@ -448,24 +432,30 @@ read running for real, nothing drove a lock, and the tier, its marks, its
 restart and `lock_tokens` / `release_on` were deleted
 (`docs/hit_driven_projection.md` §12 item 26).
 
-### 4.7 Seeds
+### 4.7 A working set opens empty
 
-Resolved per dialogue once, when it opens: a file through `CONTENT_KEY` at the
-blob the dialogue's branch holds, a folder through `folder_unit`. A miss
-(changed, not ingested, in the lineage) is skipped. Each resolved seed gains the
-seeding momentum and enters provenance in list order while the budget has room,
-dislodging nothing (§4.3) — so the seeds are the leftmost members, beside the
-system prompt and the priming chain. One that does not fit, has no recorded
-size, or, where members are emitted whole, is past `max_file_tokens` (§4.4) is
-left out with a warning naming it; one
-that missed only for room stays a candidate and can enter later on its
-momentum.
+A dialogue's working set holds nothing when it opens. Its question is read
+against the system prompt, the priming chain and the dialogue's own history,
+and the boundary at the opening's end — before the reply's first reasoning
+token — scans the question and pools what it ranks; the reply reasons against
+the slot that boundary fills.
+
+There were seeds until 2026-11-20: seventeen folders and files named in
+`projection.yaml`, resolved on the dialogue's branch at open and entered at the
+momentum of one full-strength hit (1,000). They cost every question. On
+BlackWorld (2026-11-20) a new conversation asked where `recorded_reply` is
+defined read its question against `Cargo.toml`, `docs/deployment.md` and
+`docs/zend_branch_ingest.md`; the question's hits on them lifted a yenbot file
+and `conversation_tests.rs` over `recorded_reply.rs`, which the same question's
+scan ranks second of 6,854 files, and the answer file entered only 64 tokens
+into the reasoning — after the model had written that it had read nothing
+holding the symbol. What a dialogue always carries is the priming chain's,
+through lineage; nothing else is placed before a question ranks it.
 
 ### 4.8 Restart
 
-A working set is rebuilt at open: momentum starts empty and the seeds re-enter
-it at the seeding momentum (§4.7); the scan rebuilds the rest within a few
-reprojections.
+A working set is rebuilt at open: it starts empty (§4.7), and the scan
+rebuilds it from the next question.
 
 **Marks are not gather scope.** Dialogue turns written while locks existed
 carry `working_set:` tags. A turn's tags also name the tag-scoped galleries it
@@ -587,7 +577,7 @@ whose type would pass its share dislodges only weaker voluntary members of its
 own type — by the same `DISLODGE_MARGIN` — so a burst of strong documents can
 take each other's places but never the room the code would have. When it beats
 none of them it waits on its momentum, and the next-best candidate by score is
-considered. Seeds keep to the shares too. When the budget shrinks under a
+considered. When the budget shrinks under a
 standing set, `observe` trims each type's weakest members back under its share
 (`WorkingSet::trim_types`). Guidance is its own pool and holds no type's
 share. Provenance orders everything inside the caps exactly as before.
@@ -640,7 +630,7 @@ measurement watches these numbers.
 
 | Piece | Where |
 |---|---|
-| `WorkingSet`: seed / observe / remove / withhold, per-file momentum | `candle-conversation/src/working_set/state.rs` |
+| `WorkingSet`: observe / remove / withhold, per-file momentum | `candle-conversation/src/working_set/state.rs` |
 | `WorkingSetConfig` (the `working_set:` block) | `candle-conversation/src/working_set/config.rs` |
 | `is_mark`, `is_dialogue` / `gather_tags` | `candle-conversation/src/working_set/marks.rs` |
 | Per-dialogue sets on the substrate; `tombstone_timeline` drops from every set | `candle-conversation/src/substrate.rs` (`working_set_*`) |
@@ -649,10 +639,9 @@ measurement watches these numbers.
 | Filling the groups; off the flexbox, emitted verbatim | `projection/project.rs` (Step 4b), `projection/working_set_pick.rs` |
 | The dialogue group holds lineage + its own turns; members per group | `projection/resolver.rs` (`TargetedRead::group_turns`, `working_set_members`) |
 | Withheld files: the set of files a turn's loop read for real, kept out of provenance's newcomers | `candle-conversation/src/working_set/state.rs` (`withhold`, `clear_withheld`), `substrate.rs` / `engine.rs` (`working_set_withhold`, `working_set_clear_withheld`) |
-| Which ingested readings stand for a file, and whether a reading covers it whole | `zend/src/working_set/corpus.rs`, `zend/src/working_set/coverage.rs` |
+| Which ingested readings a turn's reads keep out | `zend/src/working_set/corpus.rs` |
 | The dialogue layer's `working_set:` block | `zend/src/working_set.rs` (`dialogue_config`) |
-| Seed resolution | `zend/src/working_set/seeds.rs` |
-| Open, the read files withheld after each round, cleared at a new question | `zend/src/session.rs` (`run_inference_stream`, `withhold_read_files`) |
+| Open (empty, scoped), the read files withheld after each round, cleared at a new question | `zend/src/session.rs` (`run_inference_stream`, `withhold_read_files`) |
 | Layer config | `zend/src/prompts/projection.yaml` |
 | Faces: `face_of` / `unit_of`, the `face` / `face_of` keys | `candle-conversation/src/substrate/faces.rs` |
 | A dialogue holds an opening by its face; the event records the unit | `projection/project.rs`, `projection/event.rs` (`build_selection`) |
@@ -662,8 +651,8 @@ measurement watches these numbers.
 ## 7. Tests (CPU unless marked)
 
 - `WorkingSet`: a newcomer enters at the end and dislodges only provenance it
-  beats by the margin; a link of the dialogue's own chain is never seeded or
-  admitted; `observe` settles a steady file at `fresh/β` and decays an idle
+  beats by the margin; a link of the dialogue's own chain is never
+  admitted; a pool opens empty; `observe` settles a steady file at `fresh/β` and decays an idle
   one; a file below `min_momentum` leaves the map and is never a candidate; a
   withheld file keeps its momentum but does not enter; a tombstoned timeline
   leaves the set.
@@ -673,8 +662,6 @@ measurement watches these numbers.
   working set (the dialogue group's selection is identical with and without a
   full working set); a focused projection carries no working set; an ingest
   target selects nothing.
-- Coverage: a reading whose pages cover `0..ceil(lines/PAGE_LINES)` covers its
-  file; one missing a page, or whose page response was an error, does not.
 - Hot: a selected turn with no hot K/V is dropped with a warning.
 - Marks: a dialogue turn carrying only `working_set:` marks is still dialogue.
 - **Behavioural, daemon:** with the working set present in a tool round, the
@@ -691,14 +678,13 @@ measurement watches these numbers.
 | D5 | Where the working set sits | Its own layers' groups, which already emit ahead of the dialogue. |
 | D6 | Tool rounds | `in_tool_rounds: true`; ingestion unchanged. |
 | D7 | Provenance unit | Whole files and folders are what enters and leaves. Where the fill carves the slot, a reading past `max_file_tokens` is a member charged the cap, and the fill keeps its floor and best-scored page turns (§4.4). |
-| D8 | Seed list | §4.2 draft, to be edited. |
+| D8 | Seed list | None (2026-11-20): a working set opens empty and its question's scan fills it (§4.7). |
 | D9 | Fade rate | Per-file momentum at β 0.2, leaking by its own value. |
 | D10 | Default budget | 64K voluntary, guidance 16K, caps on one fill of the trained window less the 16K reserve, beside the dialogue's 180K window (`docs/hit_driven_projection.md` §4, §7.2). Strength is momentum lifted by the model's own hits (§4.3, `hit_driven_projection.md` §7.1). |
 | D11 | Momentum store | In `WorkingSet`, not the belief carry; in-memory. |
-| D12 | Restart | Nothing is restored: seeds re-enter at open and momentum rebuilds from the scan. |
+| D12 | Restart | Nothing is restored: the set opens empty and momentum rebuilds from the scan. |
 | D13 | Folder vs file budget | `folder_tokens` slice for `repo_map`, the rest for `code_reading`. |
 | D14 | A file decaying out under an `in_context` reply | No reply says `in_context`: every read runs (§4.5). |
-| D15 | "Complete read" without touching ingestion | Derived from the chain's own `file_read` pages and responses. |
 | D16 | A selected file that cannot be made hot | Dropped with a warning; nothing placed is a promise. |
 | D17 | Provenance floor | `min_momentum: 100`, the noise floor `code_reading` already gates at. |
 

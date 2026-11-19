@@ -178,6 +178,12 @@ impl WorkingSet {
         self.fresh.get(&timeline).copied().unwrap_or(0.0)
     }
 
+    /// Every conversation the last scan folded in scored, with its fresh
+    /// score — pooled or not.
+    pub fn scanned(&self) -> impl Iterator<Item = (TimelineId, f32)> + '_ {
+        self.fresh.iter().map(|(&t, &s)| (t, s))
+    }
+
     /// Tokens every member together holds.
     pub fn tokens(&self) -> usize {
         self.members.iter().map(|m| m.tokens).sum()
@@ -185,45 +191,6 @@ impl WorkingSet {
 
     fn position(&self, timeline: TimelineId) -> Option<usize> {
         self.members.iter().position(|m| m.timeline == timeline)
-    }
-
-    /// Seed the pool with `candidates`, in list order: each gains `momentum`
-    /// (or keeps what it has, if that is higher) and enters after the members
-    /// already there while `pool` has room. Returns the candidates that did
-    /// not enter, in list order; one that missed only for room keeps its
-    /// momentum and is ranked at the next observation.
-    pub fn seed(
-        &mut self,
-        candidates: &[(TimelineId, Candidate)],
-        pool: PoolSize,
-        momentum: f32,
-    ) -> Vec<TimelineId> {
-        let mut refused = Vec::new();
-        for &(timeline, candidate) in candidates {
-            if self.is_member(timeline) {
-                continue;
-            }
-            let (Some(tokens), Some(share)) = (candidate.tokens, candidate.share) else {
-                refused.push(timeline);
-                continue;
-            };
-            let entry = self.momentum.entry(timeline).or_insert(0.0);
-            *entry = entry.max(momentum);
-            let typed_over = candidate
-                .kind
-                .is_some_and(|k| self.type_tokens(k.id) + tokens > k.tokens(pool.tokens));
-            if self.tokens() + tokens > pool.tokens || typed_over {
-                refused.push(timeline);
-                continue;
-            }
-            self.members.push(Member {
-                timeline,
-                tokens,
-                share,
-                kind: candidate.kind,
-            });
-        }
-        refused
     }
 
     /// Fold one reprojection in.
@@ -300,9 +267,34 @@ impl WorkingSet {
         };
         for kind in KINDS {
             let mut count = 0usize;
+            // The scan's own leaders first: the pieces this boundary's scan
+            // scores highest hold their places whatever the hits lift the
+            // others to, so the hits reorder what the question ranks and
+            // never push it out (`docs/hit_driven_projection.md` §7.2 step 1).
+            let mut leaders: Vec<&Member> = ranked
+                .iter()
+                .map(|(m, _)| m)
+                .filter(|m| m.share == kind && self.fresh_of(m.timeline) > 0.0)
+                .collect();
+            leaders.sort_by(|a, b| {
+                self.fresh_of(b.timeline)
+                    .total_cmp(&self.fresh_of(a.timeline))
+                    .then(a.timeline.raw().cmp(&b.timeline.raw()))
+            });
+            for m in leaders {
+                if count == pool.per_kind {
+                    break;
+                }
+                if take(m, &mut chosen, &mut used) {
+                    count += 1;
+                }
+            }
             for (m, _) in ranked.iter().filter(|(m, _)| m.share == kind) {
                 if count == pool.per_kind {
                     break;
+                }
+                if chosen.contains(&m.timeline) {
+                    continue;
                 }
                 if take(m, &mut chosen, &mut used) {
                     count += 1;
@@ -341,6 +333,7 @@ impl WorkingSet {
     }
 
     /// Tokens the members of type `id` hold.
+    #[cfg(test)]
     fn type_tokens(&self, id: u8) -> usize {
         self.members
             .iter()
@@ -492,13 +485,13 @@ mod tests {
     }
 
     /// **A file the indexer keeps reading outlasts its fading score**: two
-    /// seeds at one momentum, only one read each stride. Two reprojections
+    /// files at one momentum, only one read each stride. Two reprojections
     /// later the unread one's momentum is under the floor and it leaves; the
     /// read one's strength is its momentum lifted by `1 + h`.
     #[test]
     fn a_read_file_outlasts_an_unread_one() {
         let mut ws = WorkingSet::default();
-        ws.seed(&[(tl(1), cand(1)), (tl(2), cand(2))], pool(1000), 150.0);
+        observe(&mut ws, &[(1, 150.0), (2, 150.0)], 1000);
         let cfg = HitsConfig::default();
         ws.observe_hits(&read(&[1]), &cfg);
         observe(&mut ws, &[], 1000);
@@ -518,7 +511,7 @@ mod tests {
     fn hits_decide_which_member_stays() {
         for (kept_by_hits, dropped) in [(1u64, 2u64), (2, 1)] {
             let mut ws = WorkingSet::default();
-            ws.seed(&[(tl(1), cand(1)), (tl(2), cand(2))], pool(200), 1000.0);
+            observe(&mut ws, &[(1, 1000.0), (2, 1000.0)], 200);
             ws.observe_hits(&read(&[kept_by_hits]), &HitsConfig::default());
             observe(&mut ws, &[(3, 900.0)], 200);
             let members = order(&ws);
@@ -528,12 +521,49 @@ mod tests {
         }
     }
 
+    /// **The scan's own leaders hold their places against hit-lifted
+    /// strength**: a member the indexer read stands at 800 · (1 + 1) = 1,600;
+    /// a newcomer the scan scores 900 is weaker but leads the scan, so it
+    /// takes the kind's one place and the read member no longer fits.
+    #[test]
+    fn the_scans_leaders_hold_their_places_against_hits() {
+        let size = PoolSize {
+            tokens: 100,
+            per_kind: 1,
+        };
+        let mut ws = WorkingSet::default();
+        observe_in(&mut ws, &[(1, 1_000.0)], size);
+        ws.observe_hits(&read(&[1]), &HitsConfig::default());
+        observe_in(&mut ws, &[(2, 900.0)], size);
+        assert!((ws.score_of(tl(1)).unwrap() - 1_600.0).abs() < 1e-3);
+        assert_eq!(order(&ws), vec![2]);
+    }
+
+    /// **A scan leader counts toward its kind's minimum**: with two places
+    /// per kind, the scan's leader and the strongest of the rest are both
+    /// pooled, and the leader is not counted twice against the tokens.
+    #[test]
+    fn a_scan_leader_counts_toward_its_kinds_minimum() {
+        let size = PoolSize {
+            tokens: 200,
+            per_kind: 2,
+        };
+        let mut ws = WorkingSet::default();
+        observe_in(&mut ws, &[(1, 1_000.0), (3, 1_000.0)], size);
+        ws.observe_hits(&read(&[1, 3]), &HitsConfig::default());
+        observe_in(&mut ws, &[(2, 900.0)], size);
+        let members = order(&ws);
+        assert_eq!(members.len(), 2, "{members:?}");
+        assert!(members.contains(&2), "{members:?}");
+        assert_eq!(ws.tokens(), 200);
+    }
+
     /// Hit momentum leaks like momentum and leaves the map once it lifts
     /// nothing; with no hits folded in, strength is momentum.
     #[test]
     fn hit_momentum_leaks_and_leaves() {
         let mut ws = WorkingSet::default();
-        ws.seed(&[(tl(1), cand(1))], pool(1000), 1000.0);
+        observe(&mut ws, &[(1, 1000.0)], 1000);
         assert_eq!(ws.score_of(tl(1)), ws.momentum_of(tl(1)));
         let cfg = HitsConfig::default();
         ws.observe_hits(&read(&[1]), &cfg);
@@ -585,8 +615,12 @@ mod tests {
             kind: None,
         };
         let mut ws = WorkingSet::default();
-        let refused = ws.seed(&[(tl(9), cand(9)), (tl(7), nowhere)], pool(10_000), 1_000.0);
-        assert_eq!(refused, vec![tl(9), tl(7)]);
+        let fresh: HashMap<TimelineId, f32> = HashMap::from([(tl(9), 1_000.0), (tl(7), 1_000.0)]);
+        let candidate = |t: TimelineId| match t.raw() {
+            7 => Some(nowhere),
+            _ => info(t),
+        };
+        ws.observe(&fresh, 0.2, 100.0, pool(10_000), &candidate);
         assert!(ws.members().is_empty());
     }
 
@@ -602,25 +636,21 @@ mod tests {
         assert_eq!(order(&ws), vec![1, 3, 4], "2 fell to 83, under 100");
     }
 
-    /// **Seeds enter in list order at the seeding momentum while they fit**;
-    /// one that misses for room keeps its momentum.
+    /// **A conversation opens on an empty pool**: nothing is a member until a
+    /// scan scores it.
     #[test]
-    fn seeds_enter_in_list_order_while_they_fit() {
-        let mut ws = WorkingSet::default();
-        let seeds: Vec<(TimelineId, Candidate)> =
-            [1, 8, 2, 9, 3].iter().map(|&r| (tl(r), cand(r))).collect();
-        let refused = ws.seed(&seeds, pool(200), 1_000.0);
-        assert_eq!(order(&ws), vec![1, 2]);
-        assert_eq!(refused, vec![tl(8), tl(9), tl(3)]);
-        assert_eq!(ws.momentum_of(tl(3)), Some(1_000.0), "3 keeps its momentum");
+    fn a_pool_opens_empty() {
+        let ws = WorkingSet::default();
+        assert!(ws.members().is_empty());
+        assert_eq!(ws.tokens(), 0);
     }
 
-    /// An unattended seed fades like any other file: 1,000 × 0.8¹⁰ ≈ 107 is
-    /// still in after ten reprojections, and the eleventh takes it out.
+    /// An unattended file fades: 1,000 × 0.8¹⁰ ≈ 107 is still in after ten
+    /// reprojections that do not score it, and the eleventh takes it out.
     #[test]
-    fn an_unattended_seed_fades_out() {
+    fn an_unattended_file_fades_out() {
         let mut ws = WorkingSet::default();
-        ws.seed(&[(tl(1), cand(1))], pool(1_000), 1_000.0);
+        observe(&mut ws, &[(1, 1_000.0)], 1_000);
         for _ in 0..10 {
             observe(&mut ws, &[], 1_000);
         }
@@ -660,18 +690,6 @@ mod tests {
         assert_eq!(order(&ws), vec![70, 71, 1, 2]);
         assert_eq!(ws.momentum_of(tl(72)), Some(900.0), "72 keeps its momentum");
         assert_eq!(ws.type_tokens(DOCS.id), 200);
-    }
-
-    /// **Seeds keep to the share too**: of three document seeds two enter,
-    /// and the code seed after them.
-    #[test]
-    fn document_seeds_keep_to_the_share() {
-        let mut ws = WorkingSet::default();
-        let seeds: Vec<(TimelineId, Candidate)> =
-            [70, 71, 72, 1].iter().map(|&r| (tl(r), cand(r))).collect();
-        let refused = ws.seed(&seeds, pool(1_000), 1_000.0);
-        assert_eq!(order(&ws), vec![70, 71, 1]);
-        assert_eq!(refused, vec![tl(72)]);
     }
 
     /// The pooled pieces carry their tokens and kinds, in insertion order.

@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use super::fill_report::{PieceReport, Unpooled};
 use super::ids::{CollectionId, GroupId, SectionId, TurnIndex, TurnKey};
 use super::project::{ProjectionSegment, SealedKind};
 use super::scan_stats::GroupScan;
@@ -328,6 +329,15 @@ pub struct ProjectionEvent {
     /// Empty on records written before this field and on synthesized events.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<GroupScanRecord>,
+    /// Every working piece the dialogue's slot fill was offered — the scores
+    /// it ranked the piece's rounds by, what it placed, and where the piece
+    /// stands in the pool — strongest first. Empty for a target with no fill.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pieces: Vec<PieceReport>,
+    /// The strongest conversations this boundary's scan scored that the pool
+    /// does not hold.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unpooled: Vec<Unpooled>,
 }
 
 /// One turn group's scan, named for the record.
@@ -387,6 +397,8 @@ pub fn aggregate(
         materialized: Vec::new(),
         self_reference: false,
         groups: Vec::new(),
+        pieces: Vec::new(),
+        unpooled: Vec::new(),
     }
 }
 
@@ -449,6 +461,8 @@ pub fn staged_ingest_event(
         materialized: Vec::new(),
         self_reference: false,
         groups: Vec::new(),
+        pieces: Vec::new(),
+        unpooled: Vec::new(),
     }
 }
 
@@ -514,6 +528,8 @@ pub fn summary_node_event(
         materialized: Vec::new(),
         self_reference: false,
         groups: Vec::new(),
+        pieces: Vec::new(),
+        unpooled: Vec::new(),
     }
 }
 

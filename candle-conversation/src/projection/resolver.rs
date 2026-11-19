@@ -21,6 +21,7 @@ use maintenance_op::Pass;
 use super::adaptive::{ScanCases, ScanNorm};
 use super::belief_files::{assemble_file_scans, cut_excluded, scan_file_scans, FileScan};
 use super::belief_scan_split::GROUP_SCAN_SPLIT;
+use super::fill_report::{Standing, Unpooled};
 use super::group_assembly::{
     held, keep, Assemblies, AssemblyKey, AssemblyStamp, GroupAssembly, Whose,
 };
@@ -6195,6 +6196,45 @@ impl<'a> ContentResolver for TargetedRead<'a> {
             held: ws.held().clone(),
             opening: ws.opening(),
         })
+    }
+
+    fn working_set_standing(&self, timeline: TimelineId) -> Standing {
+        let path = self
+            .read
+            .custom_of(timeline)
+            .and_then(|m| m.get("path"))
+            .filter(|p| !p.is_empty())
+            .cloned();
+        let Some(ws) = self.read.working_set(self.target.timeline) else {
+            return Standing {
+                path,
+                ..Standing::default()
+            };
+        };
+        Standing {
+            momentum: ws.momentum_of(timeline).unwrap_or(0.0),
+            fresh: ws.fresh_of(timeline),
+            hits: ws.hits_of(timeline),
+            strength: ws.score_of(timeline).unwrap_or(0.0),
+            path,
+        }
+    }
+
+    fn working_set_unpooled(&self, n: usize) -> Vec<Unpooled> {
+        let Some(ws) = self.read.working_set(self.target.timeline) else {
+            return Vec::new();
+        };
+        let mut scanned: Vec<(TimelineId, f32)> =
+            ws.scanned().filter(|(t, _)| !ws.is_member(*t)).collect();
+        scanned.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.raw().cmp(&b.0.raw())));
+        scanned
+            .into_iter()
+            .take(n)
+            .map(|(t, _)| Unpooled {
+                timeline: t.raw(),
+                standing: self.working_set_standing(t),
+            })
+            .collect()
     }
 
     fn timeline_turns(&self, timeline: TimelineId) -> Vec<TurnKey> {

@@ -101,7 +101,7 @@ use candle::engine_events::note;
 use super::adaptive::AnchorMember;
 use super::dialogue_fill::{self, ContextExchange, DialogueSlot, WorkingPiece};
 use super::fill::{Caps, Kind};
-use super::fill_report::{line, piece_reports};
+use super::fill_report::{line, piece_reports, PieceReport, Unpooled, UNPOOLED_KEPT};
 use super::ids::{
     CollectionId, GroupId, LayerId, SectionId, TimelineId, TurnId, TurnIndex, TurnKey,
 };
@@ -435,6 +435,13 @@ pub struct Projection {
     /// record / GUI can show "why is this turn in my context?". Empty entries
     /// (e.g. the live user message) carry no origin.
     pub selection_origins: HashMap<TurnKey, SelectionOrigin>,
+    /// What the dialogue's slot fill weighed each working piece at, and where
+    /// each stands in the pool (`fill_report`). Empty for a target with no
+    /// fill.
+    pub fill: Vec<PieceReport>,
+    /// The strongest conversations the scan scored that the pool does not
+    /// hold.
+    pub unpooled: Vec<Unpooled>,
 }
 
 /// A belief node's identity: a named section collection (the tool catalog) or a
@@ -1956,6 +1963,8 @@ pub fn run_with_sink<R: ContentResolver>(
             selections: resolved_selections,
             selection_scores,
             selection_origins,
+            fill: Vec::new(),
+            unpooled: Vec::new(),
         };
     }
 
@@ -2212,6 +2221,8 @@ pub fn run_with_sink<R: ContentResolver>(
     }
 
     // ── Step 11b: The dialogue's fill ────────────────────────────────────────
+    let mut fill: Vec<PieceReport> = Vec::new();
+    let mut unpooled: Vec<Unpooled> = Vec::new();
     if let Some(((layer, ws), trained)) = fill_target {
         let slot_window = ws.slot_window(trained);
         if let Some(why) = &slot_window.expanded {
@@ -2362,18 +2373,18 @@ pub fn run_with_sink<R: ContentResolver>(
             |k| resolver.turn_token_count(k),
         );
         // What the fill weighed each working piece at — the scores it ranked
-        // by, which the selection record does not show (`fill_report`).
-        note("projection fill pieces", || {
-            line(
-                &piece_reports(
-                    &slot.working,
-                    &plan.working,
-                    |k| resolver.turn_score(k),
-                    |k| resolver.turn_token_count(k),
-                ),
-                10,
-            )
-        });
+        // by, which the selection record does not show (`fill_report`) — and
+        // what the scan scored that the pool does not hold. Both ride the
+        // projection record.
+        fill = piece_reports(
+            &slot.working,
+            &plan.working,
+            |k| resolver.turn_score(k),
+            |k| resolver.turn_token_count(k),
+            |t| resolver.working_set_standing(t),
+        );
+        unpooled = resolver.working_set_unpooled(UNPOOLED_KEPT);
+        note("projection fill pieces", || line(&fill, 10));
         // Each cap's use (`docs/hit_driven_projection.md` §12 item 26).
         let tokens_of = |keys: &[TurnKey]| -> usize {
             keys.iter().map(|k| resolver.turn_token_count(*k)).sum()
@@ -2563,6 +2574,8 @@ pub fn run_with_sink<R: ContentResolver>(
         selections: resolved_selections,
         selection_scores,
         selection_origins,
+        fill,
+        unpooled,
     }
 }
 

@@ -100,8 +100,9 @@ use crate::persistence::walker::WalkEntry;
 use crate::projection::scan_stats::GroupScan;
 use crate::projection::{
     decode_events, CorruptTurnPolicy, GroupId, HitsConfig, LayerId, OwnedSection, OwnedSections,
-    ProjectionEvent, ProjectionTarget, SectionId, SlotBoundary, SystemItem, TimelineAllocator,
-    TimelineId, TurnIndex, TurnKey, WorkingSetMembers, WorkingSetShare,
+    ProjectionEvent, ProjectionTarget, SectionId, SlotBoundary, Standing, SystemItem,
+    TimelineAllocator, TimelineId, TurnIndex, TurnKey, Unpooled, WorkingSetMembers,
+    WorkingSetShare,
 };
 use crate::provenance::chunk_exclusion::records::{from_json, group_of_key, CutRecord};
 use crate::provenance::chunk_exclusion::ChunkExclusion;
@@ -1440,6 +1441,21 @@ pub trait ContentResolver {
     /// with no working set, whose fill is chosen whole. Default `None`.
     fn working_set_boundary(&self) -> Option<SlotBoundary> {
         None
+    }
+
+    /// Where `timeline` stands in the target's pool — its momentum, the
+    /// scan's fresh score, its hit momentum and strength, and the path it
+    /// reads — for the projection record (`projection::fill_report`).
+    /// Default: nothing known.
+    fn working_set_standing(&self, _timeline: TimelineId) -> Standing {
+        Standing::default()
+    }
+
+    /// The `n` strongest conversations the last scan scored that the
+    /// target's pool does not hold, strongest fresh score first. Default
+    /// empty.
+    fn working_set_unpooled(&self, _n: usize) -> Vec<Unpooled> {
+        Vec::new()
     }
 
     /// Every turn of `timeline`, ascending — how a working-set group takes a
@@ -3762,6 +3778,7 @@ impl Substrate {
     /// already — admitted again it emitted twice: `AGENTS.md`'s 46K characters
     /// stood in both the working set and the chain), or the scope of its group
     /// no longer offers it to `target`.
+    #[cfg(test)]
     fn working_set_candidate(&self, target: TimelineId, timeline: TimelineId) -> Option<Candidate> {
         let chain: HashSet<TimelineId> = self.inherited_chain(target).into_iter().collect();
         self.working_set_candidate_beside(target, &chain, timeline)
@@ -3796,31 +3813,6 @@ impl Substrate {
             share: group.and_then(|g| self.working_set_shares.get(&g).copied()),
             kind,
         })
-    }
-
-    /// Seed `target`'s pool with `candidates` at `momentum`
-    /// ([`WorkingSet::seed`]), under this card's pool size. Returns the
-    /// candidates that did not enter.
-    pub fn working_set_seed(
-        &mut self,
-        target: TimelineId,
-        candidates: &[TimelineId],
-        momentum: f32,
-    ) -> Vec<TimelineId> {
-        let mut refused = Vec::new();
-        let mut admissible = Vec::new();
-        for &timeline in candidates {
-            match self.working_set_candidate(target, timeline) {
-                Some(candidate) => admissible.push((timeline, candidate)),
-                None => refused.push(timeline),
-            }
-        }
-        let pool = self.pool_size;
-        refused.extend(
-            self.working_set_mut(target)
-                .seed(&admissible, pool, momentum),
-        );
-        refused
     }
 
     /// Keep `reads` from entering `target`'s working set
@@ -9177,17 +9169,13 @@ mod tests {
     }
 
     /// A link of the dialogue's own inherited chain is projected as its opening
-    /// already, so it is never a member: not seeded, not admitted on momentum.
+    /// already, so it is never a member, however strongly the scan scores it.
     /// Admitted, it emitted twice.
     #[test]
     fn a_link_of_the_dialogues_own_chain_is_never_a_member() {
         let (mut sub, target, reads) = working_set_fixture(2, 10);
         set_parent(&mut sub, target, reads[0]);
         assert!(sub.working_set_candidate(target, reads[0]).is_none());
-        assert_eq!(
-            sub.working_set_seed(target, &[reads[0], reads[1]], 1000.0),
-            vec![reads[0]],
-        );
         let fresh = HashMap::from([(reads[0], 5000.0), (reads[1], 5000.0)]);
         ws_observe(&mut sub, target, &fresh);
         let members = sub.working_set(target).unwrap().members();
@@ -9206,10 +9194,8 @@ mod tests {
             candidate.is_some_and(|c| c.share.is_none()),
             "no group's share"
         );
-        assert_eq!(
-            sub.working_set_seed(target, &[elsewhere], 1000.0),
-            vec![elsewhere]
-        );
+        ws_observe(&mut sub, target, &HashMap::from([(elsewhere, 5000.0)]));
+        assert!(sub.working_set(target).unwrap().members().is_empty());
     }
 
     /// A retired conversation reads as a miss. Its turns are gone, so serving
@@ -9224,9 +9210,10 @@ mod tests {
         for tl in [reads[0], reads[1], empty, target] {
             assert!(sub.working_set_candidate(target, tl).is_none(), "{tl:?}");
         }
-        assert_eq!(
-            sub.working_set_seed(target, &[reads[0], empty], 1000.0),
-            vec![reads[0], empty],
+        ws_observe(
+            &mut sub,
+            target,
+            &HashMap::from([(reads[0], 5000.0), (empty, 5000.0)]),
         );
         assert!(sub.working_set(target).unwrap().provenance().is_empty());
     }
@@ -9262,10 +9249,8 @@ mod tests {
         sub.append_with_blocks(partial, 10, 0, 1);
         assert_eq!(sub.turn_count(partial), 2);
         assert!(sub.working_set_candidate(target, partial).is_none());
-        assert_eq!(
-            sub.working_set_seed(target, &[partial], 1000.0),
-            vec![partial],
-        );
+        ws_observe(&mut sub, target, &HashMap::from([(partial, 5000.0)]));
+        assert!(sub.working_set(target).unwrap().members().is_empty());
 
         let retired = unshared_timeline(4);
         sub.register_timeline(retired, LayerId::for_test(1), GroupId::for_test(1));
@@ -9362,7 +9347,11 @@ mod tests {
     #[test]
     fn a_tombstone_leaves_every_working_set() {
         let (mut sub, target, reads) = working_set_fixture(3, 10);
-        sub.working_set_seed(target, &[reads[0], reads[1]], 1000.0);
+        ws_observe(
+            &mut sub,
+            target,
+            &HashMap::from([(reads[0], 1000.0), (reads[1], 1000.0)]),
+        );
         ws_observe(&mut sub, target, &HashMap::from([(reads[2], 500.0)]));
         assert_eq!(sub.working_set(target).unwrap().members().len(), 3);
         for r in &reads {
@@ -9377,7 +9366,11 @@ mod tests {
     #[test]
     fn clearing_drops_the_set_for_a_rebuild() {
         let (mut sub, target, reads) = working_set_fixture(2, 10);
-        sub.working_set_seed(target, &reads, 1000.0);
+        ws_observe(
+            &mut sub,
+            target,
+            &HashMap::from([(reads[0], 1000.0), (reads[1], 1000.0)]),
+        );
         sub.working_set_clear(target);
         assert!(sub.working_set(target).is_none());
     }

@@ -63,6 +63,7 @@ mod creep_slice;
 mod decode;
 mod detached;
 mod diag;
+mod early_boundaries;
 mod ephemeral_fork;
 mod expert_counters;
 pub mod exported_state;
@@ -5088,6 +5089,8 @@ impl Scheduler {
                                 0,
                                 0.0,
                             );
+                            opening.pieces = projection.fill.clone();
+                            opening.unpooled = projection.unpooled.clone();
                             // The turn's decode state seeds its belief from what this
                             // opening projection actually selected (the carried belief
                             // stepped against this turn's selection), so the first
@@ -12350,6 +12353,8 @@ impl Scheduler {
                 0,
                 0.0,
             );
+            composition.pieces = projection.fill.clone();
+            composition.unpooled = projection.unpooled.clone();
             // The dialogue glue, sourced from the SAME `assemble_pieces` decision
             // the engine injects from — so the panel shows the real boundary
             // markers, never a reconstruction. `decode` keeps special tokens (the

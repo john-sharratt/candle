@@ -275,6 +275,7 @@ pub use event::{
     MaterializedPiece, ProjectionBucket, ProjectionEvent, ProjectionPoint, ProjectionSelection,
     SelectedSection, SelectedTurn, SelectionScores, SystemItem,
 };
+pub use fill_report::{PieceReport, Standing, Unpooled, UNPOOLED_KEPT};
 pub use group_votes::GroupVotes;
 pub use hits::{HitMomentum, HitsConfig};
 pub use ids::{

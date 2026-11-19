@@ -4156,6 +4156,8 @@ impl Sequence {
             stats.tokens_generated as u32,
             stats.decode_ms / 1000.0,
         );
+        ev.pieces = projection.fill.clone();
+        ev.unpooled = projection.unpooled.clone();
         // Materialized dialogue, from the SAME `assemble_pieces` decision the
         // engine injects from, so the persisted panel can never drift from what
         // the projection really does. It no longer needs the dialect's boundary
@@ -5528,7 +5530,7 @@ impl ProbeCtx {
             &self.selection,
         );
         let substrate_total = resolver.total_token_count(self.target.timeline) as u32;
-        let ev = from_projection_with_origins(
+        let mut ev = from_projection_with_origins(
             &projection.segments,
             &projection.selection_origins,
             self.projection.schema(),
@@ -5538,6 +5540,8 @@ impl ProbeCtx {
             0,
             0.0,
         );
+        ev.pieces = projection.fill;
+        ev.unpooled = projection.unpooled;
         Ok(Probed {
             event: ev,
             sigs: probe,

@@ -79,8 +79,12 @@ The findings this answers are in
   selection or the shadow scan (§6).
 - **Boundary**: a point where the projection runs. A reply reaches one at a
   line feed past the content gate, every `reproject_every_n_tokens` (64), and
-  at `<tool_call>` (`provenance::boundaries`, `scheduler/decode.rs`); a turn's
-  opening and each prefill chunk end at one (§7.4).
+  at `<tool_call>` (`provenance::boundaries`, `scheduler/decode.rs`); while it
+  is still reasoning — before `</think>`, outside a tool call — it also reaches
+  one at 8, 16 and 32 decoded tokens (`scheduler/early_boundaries.rs`, §7.4); a
+  turn's opening and each prefill chunk end at one (§7.4). The early
+  boundaries are the decode loop's alone: the gallery cuts sealed turns by the
+  rule, and they cut nothing.
 - **Stride**: the queries between two boundaries.
 
 ## 4. Rotation
@@ -369,11 +373,18 @@ At each boundary:
 
 1. **Pool, by piece: the candidate set.** The pool is the only set the slot
    fill draws working-set rounds from. Its pieces are the ones holding a
-   floor (§8.5), then pieces by strength (§7.1) — seeds at the seed
-   momentum, a file the turn's loop just read withheld
-   (`docs/zend_working_set.md` §4.5) — kind by kind. A piece enters or leaves
-   the pool whole, with its index pages only: no K/V moves for a pooled
-   piece until the fill places one of its rounds.
+   floor (§8.5), then pieces by strength (§7.1) — a file the turn's loop just
+   read withheld (`docs/zend_working_set.md` §4.5) — kind by kind. A piece
+   enters or leaves the pool whole, with its index pages only: no K/V moves
+   for a pooled piece until the fill places one of its rounds. A dialogue's
+   pool opens empty (`docs/zend_working_set.md` §4.7).
+   - **The scan's leaders first.** Each kind's minimum count is filled first
+     by the pieces this boundary's scan scores highest — by their fresh
+     score, not their strength — and then by strength
+     (`WorkingSet::choose`). Hits reorder what the question ranks; they never
+     push it out of the pool. Without this, a piece the indexer had read
+     during the opening — whatever the slot happened to hold — out-ranked by
+     its lifted strength a piece the question named.
    - **Size, per card: the larger of a token budget and a count per kind.**
      2,000,000 tokens on the 72 GB card, 1,000,000 on the 24 GB card, 512,000
      on the 16 GB card (`scheduler::pool::pool_tokens_for`), and at least 6
@@ -511,7 +522,22 @@ against the slot the last boundary chose. Its prefill rows are selected
 (§6.2), so the sampled layers count real hits and its last 64 rows are kept
 for the shadow scan, exactly as decoded queries are. The boundary at its end
 re-chooses the slot from those hits, and the reply decodes against that slot
-(`wants_early_reprojection`, which fires at the first decoded token).
+(`wants_early_reprojection`, which fires at the first decoded token). That
+boundary is the first to score the question; a new dialogue's opening holds no
+working set at all (`docs/zend_working_set.md` §4.7), so what the reply first
+reasons against is what the question ranks.
+
+**The reasoning's first strides are short.** A reply still reasoning takes
+boundaries at 8, 16 and 32 decoded tokens before the cadence's at 64
+(`scheduler/early_boundaries.rs`). The opening's last 64 rows give the shadow
+scan its first queries over what the question pooled; the early boundaries
+bring in what those and the first reasoning tokens would have read while the
+model is still deciding what it knows. Measured on BlackWorld (2026-11-20),
+the answer file of "where is `recorded_reply` defined" entered at the 64-token
+boundary and led from the next one — after the reasoning had written that it
+had read nothing holding the symbol. Each costs one reprojection (about 215 ms
+on the 72 GB card) on the first 32 tokens of a reply, and none once
+`</think>` is decoded.
 
 An opening longer than `reserve_tokens` is cut into chunks of that length
 with a boundary between them, so a long tool result moves the slot as it
@@ -941,6 +967,18 @@ the slot's held turns recorded at each scanned boundary
     pieces against placed ones and the top hit pieces by name; rounds
     entering and leaving against the allowance; each cap's use; and the
     `pool:index_read` count, bytes and time.
+27. **The fill in the record.** Every projection record carries `pieces` —
+    each working piece the fill was offered, with the best of its turns'
+    scores, the best it left out, what it placed, and its standing in the
+    pool: momentum, the boundary's fresh score, hit momentum, strength and
+    path — and `unpooled`, the 24 strongest conversations the scan scored that
+    the pool does not hold (`projection/fill_report.rs`). Read at
+    `/v1/conversations/:id/projections/:turn/:event`: why a file the question
+    named was not placed is the record's answer, not a reconstruction.
+28. **No seeds; the scan's leaders first; early boundaries (§7.2 step 1,
+    §7.4).** A dialogue's pool opens empty, each kind's minimum is filled by
+    the boundary's scan leaders before strength, and a reasoning reply takes
+    boundaries at 8, 16 and 32 tokens — built 2026-11-20.
 
 ## 13. Handover
 
