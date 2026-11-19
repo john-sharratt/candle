@@ -795,7 +795,9 @@ fn draft(
                 prompt = ?dump.as_ref().map(|d| d.token_count),
                 "calibration draft projected",
             );
-            if held == Some(0) {
+            // No dump is a framed first turn — the system prompt alone — and
+            // as blind as one that places nothing of the reading.
+            if held.unwrap_or(0) == 0 {
                 anyhow::bail!("{BLIND_DRAFT} ({tokens} tokens)");
             }
             let handle = conv
