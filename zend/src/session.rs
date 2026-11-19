@@ -3814,9 +3814,14 @@ fn run_inference_stream(
             } else {
                 tool_round_selection(&selection)
             };
+            // The round's head, timed by part: what stands between a message
+            // and its first token before the engine sees the turn
+            // (`round head` below).
+            let t_head = Instant::now();
             if state.journaling {
                 carry_journal(&state, &conv_id, timeline, &mut cs, &mut round_selection).await;
             }
+            let journal_ms = t_head.elapsed().as_millis() as u64;
             let mut withheld = unavailable(&state.tool_host.availability_facts(), &offered);
             withhold_by_level(&mut withheld.tools, &offered, level);
             // The prompt shows what the grammar lets the turn call, and no more.
@@ -3829,6 +3834,7 @@ fn run_inference_stream(
             // task's answer ends in the `Steps:` section of the steps it was
             // given (`answer_steps`). Reading the files and building the
             // grammar is blocking work.
+            let t_triggers = Instant::now();
             let base = round_triggers(&state, think_mode, tools_mode, &withheld);
             let (hold_state, seen, held_files) =
                 (Arc::clone(&state), cs.seen.clone(), Arc::clone(&cs.files));
@@ -3845,6 +3851,7 @@ fn run_inference_stream(
                     round_triggers(&state, think_mode, tools_mode, &withheld)
                 }
             };
+            let triggers_ms = t_triggers.elapsed().as_millis() as u64;
             let options = candle_conversation::TurnOptions {
                 max_tokens,
                 sampling: Some(this_turn),
@@ -3864,6 +3871,7 @@ fn run_inference_stream(
             // own base holds. Set before every submit — a tool round can move
             // the base (a commit, a merge, a switch) or change a file. Git reads
             // on a base not yet listed, so on the blocking pool.
+            let t_scope = Instant::now();
             let scope_state = Arc::clone(&state);
             let scope_files = Arc::clone(&cs.files);
             let scope_conv = conv_id.clone();
@@ -3879,7 +3887,10 @@ fn run_inference_stream(
             {
                 tracing::warn!(conv_id = %conv_id, "retrieval scope panicked: {e}");
             }
+            let scope_ms = t_scope.elapsed().as_millis() as u64;
             let submitted = Instant::now();
+            // Logged once, at the round's first token.
+            let mut head_logged = false;
             let handle = match cs
                 .conv
                 .submit_turn_with_options(current_message.clone(), options)
@@ -3976,6 +3987,24 @@ fn run_inference_stream(
                     };
                     match event {
                         TurnEvent::Token(id) => {
+                            if !head_logged {
+                                head_logged = true;
+                                // Message to first token, by what it waited on:
+                                // the journal's sections, the round's grammar,
+                                // the retrieval scope, then the engine — its
+                                // admission, projection, prefill and the first
+                                // reprojection.
+                                tracing::info!(
+                                    conv_id = %conv_id,
+                                    iteration,
+                                    journal_ms,
+                                    triggers_ms,
+                                    scope_ms,
+                                    engine_ms = submitted.elapsed().as_millis() as u64,
+                                    first_token_ms = t_head.elapsed().as_millis() as u64,
+                                    "round head"
+                                );
+                            }
                             if turn_error.is_none() {
                                 let from = text_stream.push(id);
                                 let text = text_stream.text();
@@ -4875,6 +4904,7 @@ async fn carry_journal(
     cs: &mut ConvState,
     selection: &mut SelectionState,
 ) {
+    let t_open = Instant::now();
     let journal = state
         .journals
         .of(conv_id, || journal_record(state, timeline));
@@ -4888,7 +4918,10 @@ async fn carry_journal(
             .map(|(from, replies)| (from.0, replies.iter().map(|r| own_notes(r)).collect()));
         journal.lock().unwrap().steps_mut().rebuild(request);
     }
+    let open_ms = t_open.elapsed().as_millis() as u64;
+    let t_sections = Instant::now();
     let (prompt, sections) = journal_sections(state, conv_id, &journal);
+    let sections_ms = t_sections.elapsed().as_millis() as u64;
     let wants: Vec<Want<'_>> = sections.iter().map(section_want).collect();
     let lineage_sweep = lineage::sweep_names();
     let memory_sweep = memory_sections::sweep_names();
@@ -4906,6 +4939,7 @@ async fn carry_journal(
     // taken up again after its state was let go — holds no section yet, and
     // this reconcile submits the whole journal.
     let fresh = carried.holds_nothing();
+    let t_reconcile = Instant::now();
     let mut sealed = carried
         .reconcile(
             conv,
@@ -4923,6 +4957,8 @@ async fn carry_journal(
     // round answers its opening question from. So it gives the journal a
     // moment to seal. Everything is submitted by now: this reconcile only
     // waits. Later rounds take new entries as they seal, without waiting.
+    let reconcile_ms = t_reconcile.elapsed().as_millis() as u64;
+    let t_wait = Instant::now();
     if (opened || fresh) && sealed.len() < wants.len() {
         sealed = carried
             .reconcile(
@@ -4938,6 +4974,19 @@ async fn carry_journal(
     }
     journal.lock().unwrap().journal_mut().swept(&prompt);
     carry::select(selection, &sealed);
+    // Where a round's journal time went: opening the journal and its steps,
+    // building its sections (ancestors' journals, the memory, its own),
+    // submitting them, and a first round's wait for them to seal.
+    tracing::info!(
+        conv_id = %conv_id,
+        open_ms,
+        sections_ms,
+        sections = wants.len(),
+        reconcile_ms,
+        seal_wait_ms = t_wait.elapsed().as_millis() as u64,
+        sealed = sealed.len(),
+        "journal carry"
+    );
 }
 
 /// The journal sections the conversation `conv_id` carries, in the order its

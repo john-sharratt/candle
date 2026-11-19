@@ -96,6 +96,10 @@ use candle_nn::kv_cache::{SealedSequence, Sweep};
 /// one-time cost.
 const WARM_REPLAY_MAX_TURNS: usize = 512;
 
+/// A belief scan longer than this, collections and groups together, is logged
+/// with its whole phase split.
+const SLOW_SCAN_US: u64 = 1_000_000;
+
 /// How many times a metadata edit starts again before it gives up: far past
 /// any run of members writing one field at once.
 const EDIT_TRIES: usize = 64;
@@ -1703,7 +1707,8 @@ impl Conversation {
         profile::record("beliefs:arena:readback", us(arena.readback_us));
         profile::record("beliefs:arena:rows", us(arena.rows_us));
         profile::record("beliefs:arena:tally", us(arena.tally_us));
-        note("belief scan phase split", || {
+        let groups_us = t_groups.elapsed().as_micros() as u64;
+        let split = || {
             format!(
                 "probe_windows={} collections_us={coll_us} groups_us={} groups_scanned={} \
                  group_windows={} group_turns={} select_us={} assemble_us={} score_us={} \
@@ -1719,7 +1724,7 @@ impl Conversation {
                  arena_index_narrower={} arena_held={} arena_hold_us={} arena_queue_us={} \
                  arena_view_us={} assemblies_reused={}",
                 probe.len(),
-                t_groups.elapsed().as_micros(),
+                groups_us,
                 groups.scanned,
                 groups.windows,
                 groups.turns,
@@ -1767,7 +1772,19 @@ impl Conversation {
                 arena.view_us,
                 groups.assemblies_reused,
             )
-        });
+        };
+        // A scan past a second is written whole: it is a conversation's first
+        // reprojection or a cold arena, the one instance the event keeps is
+        // overwritten by the next scan within a second, and a first token
+        // waits on it.
+        if coll_us + groups_us > SLOW_SCAN_US {
+            tracing::info!(
+                target: "candle_conversation::provenance",
+                "belief scan slow {}",
+                split()
+            );
+        }
+        note("belief scan phase split", split);
         (scores, candidates)
     }
 
