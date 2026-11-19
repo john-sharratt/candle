@@ -118,6 +118,7 @@ mod run;
 mod sample;
 mod section_pack;
 mod section_pages;
+mod section_timing;
 mod segment_rearm;
 mod settle;
 mod spec_chooser;
@@ -149,6 +150,7 @@ use held_turn::HeldTurn;
 use phase_split::cobatched_step_shares;
 use reproject_abandon::or_abandon;
 use section_pages::SectionPages;
+use section_timing::SectionTiming;
 
 use self::paused_creep::PausedCreep;
 use self::phase_ring::{ProjectedKind, VramBands};
@@ -2456,6 +2458,8 @@ pub(super) struct ActiveSectionIngest {
     pub(super) band: DecodePriority,
     pub(super) response_tx: Sender<Result<SealResult, ConversationError>>,
     pub(super) error: Option<ConversationError>,
+    /// When it was queued, admitted and prepared — written beside its seal.
+    pub(super) timing: SectionTiming,
 }
 
 /// A member of the in-flight continuous-fair-wave prefill group
@@ -9008,6 +9012,7 @@ impl Scheduler {
         &mut self,
         s: QueuedSection,
     ) -> Result<(), Box<(QueuedSection, ConversationError)>> {
+        let begun_at = Instant::now();
         if !s.tokens.is_empty() {
             // The prefix's state first, so the claim below takes it as the
             // slot's store instead of building one from zero.
@@ -9069,6 +9074,7 @@ impl Scheduler {
             band: s.band,
             response_tx: s.response_tx,
             error: None,
+            timing: SectionTiming::new(s.queued_at, begun_at, Instant::now()),
         });
         Ok(())
     }

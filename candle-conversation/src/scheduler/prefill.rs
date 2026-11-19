@@ -3825,6 +3825,9 @@ impl Scheduler {
                 let _ = s.response_tx.send(Err(e));
                 continue;
             }
+            let sealing = Instant::now();
+            let tokens = s.tokens.len();
+            let name = s.debug_name.clone();
             let result = self.finalize_section_ingest(
                 s.sequence_id,
                 s.section_id,
@@ -3834,6 +3837,18 @@ impl Scheduler {
                 s.debug_name,
                 s.in_collection,
                 s.export_end,
+            );
+            let split = s.timing.split(sealing, Instant::now());
+            tracing::info!(
+                target: "candle_conversation::scheduler::section",
+                section = %name,
+                tokens,
+                band = ?s.band,
+                queue_us = split.queue_us,
+                prepare_us = split.prepare_us,
+                forward_us = split.forward_us,
+                seal_us = split.seal_us,
+                "section ingest split"
             );
             let _ = s.response_tx.send(result);
             // swap_remove pulled the last element into i; don't increment.
@@ -8814,6 +8829,7 @@ layers:
             band,
             response_tx,
             error: None,
+            timing: SectionTiming::new(Instant::now(), Instant::now(), Instant::now()),
         }
     }
 
