@@ -50,6 +50,7 @@ mod ended_sections;
 mod faces;
 mod file_gallery;
 pub mod gauge;
+mod group_epoch;
 mod label_records;
 mod lock;
 #[cfg(test)]
@@ -354,6 +355,17 @@ pub struct Substrate {
     /// stamps an assembled group scan, which is reused while all three stand
     /// (`projection::group_assembly`).
     retrieval_version: u64,
+
+    /// Each belief group's content epoch: moved by every change that moves
+    /// [`Self::gallery_epoch`] and names a timeline whose turns the group's
+    /// scan reads (`group_epoch`). An assembled group scan is stamped with
+    /// its group's, so a turn sealed in one conversation reassembles the
+    /// groups that read it and no other.
+    group_epochs: PMap<GroupId, u64>,
+
+    /// Moved by every change that moves [`Self::gallery_epoch`] and names no
+    /// timeline: every group's content epoch moves with it.
+    all_groups_epoch: u64,
 
     /// The epoch every file gallery held on a timeline entry was built under
     /// (`file_gallery`): moved by a change some gallery reads that names no
@@ -4816,6 +4828,11 @@ impl Substrate {
             // Which stream sits at each of the timeline's positions may have
             // moved: its gallery reads them by position.
             self.gallery_changed(timeline);
+            self.timeline_content_changed(timeline);
+        } else {
+            // No turn stands on the stream now — a section, or a turn
+            // redeclared as one — so which timeline it left is not known.
+            self.all_groups_content_changed();
         }
         if section {
             if id.is_none() {
@@ -5105,6 +5122,7 @@ impl Substrate {
         self.gallery_epoch += 1;
         // The turn's seams are read out of its events.
         self.stream_gallery_changed(key);
+        self.stream_content_changed(key);
     }
 
     /// Record `stream_id`'s wide-Q signature window, record `id` — the greatest
@@ -5122,6 +5140,7 @@ impl Substrate {
         self.sig_rewrites += u64::from(replaced);
         self.gallery_epoch += 1;
         self.stream_gallery_changed(key);
+        self.stream_content_changed(key);
     }
 
     /// Record the QSA index page of a turn or a prompt section, record `id` —
@@ -5538,6 +5557,7 @@ impl Substrate {
                     self.gallery_epoch += 1;
                     self.tombstone_epoch += 1;
                     self.gallery_changed(timeline);
+                    self.timeline_content_changed(timeline);
                 }
             }
             None => self.mark_timeline_dead(timeline),
@@ -5549,6 +5569,7 @@ impl Substrate {
         self.tombstoned_timelines.insert(timeline);
         self.gallery_epoch += 1;
         self.tombstone_epoch += 1;
+        self.timeline_content_changed(timeline);
         // The same subsumption the live path applies — see
         // [`Self::tombstone_timeline`]. Replay order is arbitrary, so a turn
         // tombstone read after its timeline's must not resurrect an entry the
@@ -5643,6 +5664,7 @@ impl Substrate {
         self.tombstoned_turns.insert(mark);
         self.gallery_epoch += 1;
         self.tombstone_epoch += 1;
+        self.timeline_content_changed(timeline);
         let (residence, retired_tokens) = match self.turn_mut(timeline, TurnIndex(turn_index)) {
             Some(entry) => {
                 let retired_tokens = entry.content.token_count;
@@ -5748,6 +5770,7 @@ impl Substrate {
         self.tombstoned_timelines.insert(timeline);
         self.gallery_epoch += 1;
         self.tombstone_epoch += 1;
+        self.timeline_content_changed(timeline);
         // **A wholesale tombstone subsumes every turn-scoped one it covers.**
         //
         // `tombstoned_turns` only ever grew, so a conversation that retired a
@@ -5936,6 +5959,7 @@ impl Substrate {
             }
         }
         self.gallery_epoch += 1;
+        self.all_groups_content_changed();
     }
 
     /// Mark `timeline`'s durable state as **ephemeral**: nothing will ever read
@@ -7839,6 +7863,7 @@ impl Substrate {
         self.units_by_key.clear();
         self.section_token_total = 0;
         self.gallery_epoch += 1;
+        self.all_groups_content_changed();
         self.sig_rewrites += 1;
         self.galleries_changed();
     }

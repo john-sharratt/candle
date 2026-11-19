@@ -870,8 +870,8 @@ fn score_belief_groups_scores_every_conversation_in_a_multi_file_group() {
 /// **A group's assembled files are kept between scans and gathered afresh once
 /// the substrate moves.** A second scan with nothing changed scores every turn
 /// exactly as the first did. A file registered between scans is scored by the
-/// next one: the kept assembly is stamped with the gallery epoch, which the new
-/// file's turns move.
+/// next one: the kept assembly is stamped with its group's content epoch
+/// (`Substrate::group_epoch`), which the new file's turns move.
 #[test]
 fn a_kept_group_assembly_scores_alike_and_a_new_file_is_seen() {
     use candle_conversation::projection::{TimelineId, TurnIndex};

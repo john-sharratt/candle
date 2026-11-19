@@ -2651,7 +2651,7 @@ impl Conversation {
                 group: group.id,
                 whose,
             };
-            let stamp = AssemblyStamp::of(&sub);
+            let stamp = AssemblyStamp::of(&sub, key, target.group);
             let (mut scope_us, mut tags_us, mut exclude_us, mut kinds_us) = (0, 0, 0, 0);
             let select_us = t_select.elapsed().as_micros() as u64;
             let t_assemble = Instant::now();

@@ -38,6 +38,7 @@ impl Substrate {
             self.branch_checkpoint_ids.remove(&sid);
         }
         self.gallery_epoch += 1;
+        self.all_groups_content_changed();
         self.galleries_changed();
     }
 
@@ -52,6 +53,7 @@ impl Substrate {
         self.streams.remove_writer(key);
         self.tagged_turns.remove(key);
         self.gallery_epoch += 1;
+        self.all_groups_content_changed();
         self.galleries_changed();
     }
 }

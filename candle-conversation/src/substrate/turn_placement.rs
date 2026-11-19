@@ -125,6 +125,7 @@ impl Substrate {
             turn.block_end,
         );
         self.gallery_epoch += 1;
+        self.timeline_content_changed(timeline);
         true
     }
 
@@ -175,6 +176,7 @@ impl Substrate {
             }
         }
         self.gallery_epoch += 1;
+        self.timeline_content_changed(timeline);
     }
 
     /// Give the turn at `index` of `timeline` `turn`'s content in a fresh
@@ -223,6 +225,7 @@ impl Substrate {
             self.install_cold(residence, cold);
         }
         self.gallery_epoch += 1;
+        self.timeline_content_changed(timeline);
     }
 
     /// Whether a declaration moved a turn this member holds since the last

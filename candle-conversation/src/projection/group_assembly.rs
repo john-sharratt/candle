@@ -15,9 +15,11 @@
 //! conversations reprojecting together share it and their probes ride one
 //! launch — stamped with what it was built from:
 //!
-//! - [`Substrate::gallery_epoch`] — a stream declared, a signature or
-//!   projection-event blob written, a turn or timeline tombstoned, which is
-//!   every change to a file's turns, windows and calibrations' signatures;
+//! - [`Substrate::group_epoch`] of the group — a stream declared, a signature
+//!   or projection-event blob written, a turn or timeline tombstoned in a
+//!   conversation the group reads, or in a calibration of one of its files,
+//!   which is every change to its files' turns, windows and calibrations'
+//!   signatures — and, for a target's own assembly, of the target's group;
 //! - [`Substrate::retrieval_version`] — a group's scoping, a target's scope, a
 //!   chunk exclusion, an archived flag, a timeline's metadata (its path, the
 //!   unit it calibrates);
@@ -55,15 +57,23 @@ pub(crate) struct AssemblyKey {
 /// What an assembly was built from (module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AssemblyStamp {
-    pub gallery_epoch: u64,
+    /// The group's content epoch.
+    pub group_epoch: u64,
+    /// The target's group's content epoch, for an assembly that is the
+    /// target's own ([`Whose::Target`]); zero for a shared one.
+    pub target_epoch: u64,
     pub retrieval: u64,
 }
 
 impl AssemblyStamp {
-    /// `sub` as it stands now.
-    pub fn of(sub: &Substrate) -> Self {
+    /// `key`'s assembly as `sub` stands now, for a target in `target_group`.
+    pub fn of(sub: &Substrate, key: AssemblyKey, target_group: GroupId) -> Self {
         Self {
-            gallery_epoch: sub.gallery_epoch(),
+            group_epoch: sub.group_epoch(key.group),
+            target_epoch: match key.whose {
+                Whose::Target(_) => sub.group_epoch(target_group),
+                Whose::Scope(_) => 0,
+            },
             retrieval: sub.retrieval_version(),
         }
     }
@@ -162,7 +172,8 @@ mod tests {
     }
 
     const AT: AssemblyStamp = AssemblyStamp {
-        gallery_epoch: 10,
+        group_epoch: 10,
+        target_epoch: 0,
         retrieval: 4,
     };
 
@@ -174,10 +185,15 @@ mod tests {
         let a = assembly(AT, &["code"], true);
         assert!(a.serves(AT, &["code".into()], true));
         let later_epoch = AssemblyStamp {
-            gallery_epoch: 11,
+            group_epoch: 11,
             ..AT
         };
         assert!(!a.serves(later_epoch, &["code".into()], true));
+        let later_target = AssemblyStamp {
+            target_epoch: 1,
+            ..AT
+        };
+        assert!(!a.serves(later_target, &["code".into()], true));
         let later_scope = AssemblyStamp { retrieval: 5, ..AT };
         assert!(!a.serves(later_scope, &["code".into()], true));
         assert!(!a.serves(AT, &["docs".into()], true));
@@ -196,7 +212,7 @@ mod tests {
             "another target"
         );
         let moved = AssemblyStamp {
-            gallery_epoch: 12,
+            group_epoch: 12,
             ..AT
         };
         assert!(held(&map, key(1), moved, &[], false).is_none());
