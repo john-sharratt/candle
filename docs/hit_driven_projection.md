@@ -307,6 +307,18 @@ A counter's identity is the round's: (piece id, round index), stable across
 projections (§12 item 8), so the hook that declares them is
 `set_hit_rounds`. Counters are kept per sequence, and per round within it.
 
+**A turn's view counts into its conversation's counters, whichever view it
+is.** The rounds are declared on the conversation's slot; a turn decodes on a
+view carved from it, which shares the slot's counters under the declaration it
+was carved under (`qwen4exp::hits::fork_holder`). A mid-decode reprojection
+rebuilds the slot, declares again, carves a fresh view and moves the turn's
+state onto it, and the counting moves with the state (`hits::move_holder`): the
+fresh view counts under the new declaration, and a view finalizing into its
+conversation leaves the conversation's own counters as they were. Carried by
+the fork alone, every view after a turn's first reprojection counted nothing —
+on BlackWorld (2026-11-19) a reply's first read held 228 queries and its next
+twenty none — so no round's momentum ever moved and the shadow scan never ran.
+
 A round's **hit density** over a stride is its hits divided by its blocks, by
 the number of sampled layers, and by the queries that could have hit it. A
 round is loaded or unloaded for a whole stride, since membership changes only
