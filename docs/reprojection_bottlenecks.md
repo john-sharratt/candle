@@ -271,6 +271,17 @@ the first chat after every deploy pays it (512 probes, ~51 s, one per loop
 iteration). Inside the decode band the rate is ~86 t/s against the forwards'
 ~118: what a decode step does beside its forward is still to be named.
 
+**On `aede7517c`** (replay probes capped at the seal window, step census on
+its own line), BlackWorld 02:20 UTC, with another conversation decoding and a
+background prefill creeping beside the chat: 54 reprojections in the minute,
+28 of them kept; projection 17.6% of a round's wall against 28%; the warm
+replay 3% against 18%. Decode is 61% of the wall, and its steps are
+forward-bound: 33.1 s of forward in 40.0 s stepped, the host's parts of a step
+(draft 2.4 s, score 0.9 s, the rest under 0.3 s) small beside it. A decode
+step run alone beside an owed creep took ~40 ms, one co-batched with it ~100
+ms. What is left of the gap is the forward and how a step shares the device
+with prefill, not reprojection.
+
 ## 4. Done when
 
 On the fixed replay of §1, one stream on BlackWorld:
