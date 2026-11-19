@@ -9,7 +9,7 @@ code-reading measurements are the scoring lab (`candle-conversation/examples/pro
 ## 1. Method
 
 **Code reading.** The 23 file-answered questions of the §9.12 dependency battery
-(`docs/provenance_expectations/dependency_battery.yaml`), each ranked against the 6,678 files of
+(`zend/examples/dependency_battery/battery.yaml`), each ranked against the 6,678 files of
 BlackWorld's `code_reading` corpus. Every question is probed once through the daemon
 (`POST /v1/substrate/zend/project`) and its tokens scanned once on the daemon's resident gallery
 (`/scan`): the content competition (every file one case) and the calibration competition (every
@@ -160,8 +160,17 @@ finalize: one thread per (token, group, segment) walks every case in series unde
 ```bash
 # Code reading (BlackWorld's zend as the daemon)
 cargo run -p candle-conversation --release --example provenance_gates -- \
-  <workspace> lab docs/provenance_expectations/dependency_battery.yaml <formula.yaml> \
-  --decode 256 --daemon http://192.168.1.2:8081 --node 223ebb209828d84c
+  <workspace> lab zend/examples/dependency_battery/battery.yaml <formula.yaml> \
+  --topk --decode 256 --daemon http://192.168.1.2:8081 --node 223ebb209828d84c
+```
+
+`--topk` ranks each token's best files on the CPU, which every `topk: 8` formula reads; without
+it a top-k formula scores one vote per token (the whole probe's 0.508 of round 13). The battery is
+`zend/examples/dependency_battery/battery.yaml`, whose questions carry `files`;
+`docs/provenance_expectations/dependency_battery.yaml` is the `paper` command's expectations and
+does not parse as a battery.
+
+```bash
 
 # Tools
 cargo run -p candle-conversation --release --example selection_experiments -- 6
