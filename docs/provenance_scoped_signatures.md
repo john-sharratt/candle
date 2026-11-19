@@ -287,7 +287,20 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
 - **Written by the unit.** Each unit is asked in a draft forked from its
   layer's base with the unit as its lineage — so it writes its questions with
   its whole content in front of it — without reasoning or tools. The draft is
-  tombstoned once its answer is read; one question per line is kept.
+  tombstoned once its answer is read; one question per line is kept. The draft
+  is an append-only conversation, so its first turn lays its lineage down in
+  its frame (`conversation::Frame`) rather than projecting it; a draft holding
+  none of its reading writes no question and is refused (`calibrate::draft_sight`).
+  From 2026-11-15 to 2026-11-19 every draft was framed by the system prompt
+  alone and wrote a file's questions from its name — 1,227 calibrations, retired
+  and written again.
+- **A reading past the lineage cap is drafted over windows.** An inherited
+  chain is capped at `INHERITED_CHAIN_TOKEN_CAP` (64,000 tokens) and drops a
+  parent past it whole, so such a reading is drafted instead over windows of
+  whole turns of up to 196,608 tokens (`calibrate::windows`) — each its
+  request, a run of its pages and its answer, laid down by an explicit frame
+  window (`Sequence::frame_window`) — each asked its share, the questions of all
+  kept once.
 - **Diverse by how they are asked for.** Each question is an exemplar the
   unit votes with, and a rephrasing takes a second window to vote the same
   probes twice — so each prompt asks for its questions spread across as many
