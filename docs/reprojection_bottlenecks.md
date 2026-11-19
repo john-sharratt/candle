@@ -1,6 +1,7 @@
 # Reprojection after the pool-first revision: where the time goes, and the plan
 
-**Status: plan.** Measured 2026-11-18. The pool-first projection
+**Status: steps 1–2 built, step 3 found built; progress in §3b.** Measured
+2026-11-18. The pool-first projection
 (`docs/hit_driven_projection.md` §7.2, 8088a2457) stays as it is: its
 selection, the pool, the shares and the allowance are not reverted. Each step
 below makes a part of a reprojection fast **where it runs**, on the scheduler
@@ -223,6 +224,52 @@ admits one unit elevates and glues that unit alone.
 
 Whatever step 0's step census names beyond reprojection, taken the same way:
 named, measured, made fast in place.
+
+## 3b. Progress, 2026-11-18/19
+
+Measured with the §1 replay on BlackWorld, one chat alone, after each deploy.
+
+| build | rebuild, ms each | `score` | `pool` | `elevate` | round 3–4 wall decode |
+|---|---:|---:|---:|---:|---:|
+| `04c58c38f` | 467 | 182 | 126 | — | ~53 t/s |
+| `7697b50c5` (kernel, shared assembly, pool decode) | 338 | 114 | 110 | 54 | ~53 t/s |
+| `fd4720410` (compaction names only moved turns, ring LRU) | 230 | 87 | 60 | 41 | 68 t/s |
+| `c95e478e1` (ring sized to the pool) | 215 | 85 | 48 | 42 | 68 t/s |
+| `02578c2ce` (per-group assembly epochs) | — | — | — | — | 68 t/s |
+
+What each change did:
+
+- **The scan kernel** (`4534b339a`): each warp owns 16 of a 128-token chunk and
+  runs both query blocks from one expansion of its gallery fragments; a tile of
+  16 queries or fewer runs one. Bench: 8.30 → 3.99 ms a pass at one probe
+  token, 102 → 75 ms at 1,024, bit-identical. Live device time per
+  reprojection fell from 47–96 to 23–47 ms.
+- **Gallery compaction** (`26757db22`): a pass that planned no moves still
+  asked every resident turn whether it was leased, which marked every cached
+  scan index stale. The span tenants' passes fell from ~100 ms each to 7–50 ms
+  a window, and indexes stay trusted.
+- **The pool's read ring** (`fd4720410`, `c95e478e1`): ordered by use and sized
+  to the card's pool (4 GB on BlackWorld). Cold reads per refresh fell from
+  nearly all of them to a few.
+- **Group assemblies** (`45a0a087e`, `02578c2ce`): stamped with the group's own
+  content epoch. Any turn sealed anywhere, a prompt section, a request's scope
+  or a custom key used to reassemble every group (140–440 ms, a third of
+  reprojections). Now 28 of 29 scans reuse all four.
+
+**Rebuilds already keep what is unchanged** (step 3): the splice plan keeps
+about 95% of a slot's pieces across a rebuild and splices 2–25 of ~125, in
+1.5–20 ms. The apply half is not whole-slot.
+
+**Concurrency** (`docs/results/load_test_2026-11-19_c95e478e1.md`): eight
+chats finish in ~6.5 min against ~8, with experts held at 33.1 GiB above the
+decode floor and compaction running.
+
+**Where a round's time goes now** (`/v1/phases`, chat on `02578c2ce`): decode
+35%, projection 28%, prefill 14%, and the post-boot normalization replay
+(`warm`) 18%. That replay is armed by the first reprojection after a boot, so
+the first chat after every deploy pays it (512 probes, ~51 s, one per loop
+iteration). Inside the decode band the rate is ~86 t/s against the forwards'
+~118: what a decode step does beside its forward is still to be named.
 
 ## 4. Done when
 
