@@ -44,32 +44,58 @@ pub fn transpose_to_pages(
     groups: GroupSet,
     stride_words: usize,
 ) -> Vec<u64> {
+    debug_assert_eq!(mask.len(), sigs.len(), "a mask of another turn");
+    let mut pages = vec![0u64; pages_for(mask.kept()) * stride_words];
+    transpose_into(
+        sigs.iter().map(|s| s.words.as_slice()),
+        mask,
+        gw,
+        groups,
+        stride_words,
+        &mut pages,
+    );
+    pages
+}
+
+/// [`transpose_to_pages`] over a turn's tokens as word slices, into `out` —
+/// exactly [`pages_for`]`(mask.kept()) * stride_words` words, zeroed by the
+/// caller. What a batch of uploads fills, each turn its own slice of one
+/// buffer, from a stored window's words without decoding a signature a token.
+pub fn transpose_into<'a>(
+    tokens: impl Iterator<Item = &'a [u64]>,
+    mask: &KeepMask,
+    gw: usize,
+    groups: GroupSet,
+    stride_words: usize,
+    out: &mut [u64],
+) {
     assert!(
         stride_words >= page_words(gw, groups),
         "a {stride_words}-word slot cannot hold a {}-word page",
         page_words(gw, groups)
     );
-    debug_assert_eq!(mask.len(), sigs.len(), "a mask of another turn");
-    let mut pages = vec![0u64; pages_for(mask.kept()) * stride_words];
-    let kept = sigs
-        .iter()
+    assert_eq!(
+        out.len(),
+        pages_for(mask.kept()) * stride_words,
+        "a page buffer of another turn"
+    );
+    let kept = tokens
         .enumerate()
         .filter(|&(t, _)| mask.keeps(t))
-        .map(|(_, sig)| sig);
-    for (t, sig) in kept.enumerate() {
+        .map(|(_, words)| words);
+    for (t, words) in kept.enumerate() {
         let base = (t / PAGE_TOKENS) * stride_words;
         let in_pg = t % PAGE_TOKENS;
         for (place, g) in groups.iter().enumerate() {
             let s = g * gw;
             // Defensive: a well-formed folded sig is exactly `wpt` wide; a short
             // one leaves that group's slot zero rather than panicking.
-            if s + gw <= sig.words.len() {
+            if s + gw <= words.len() {
                 let dst = base + place * (PAGE_TOKENS * gw) + in_pg * gw;
-                pages[dst..dst + gw].copy_from_slice(&sig.words[s..s + gw]);
+                out[dst..dst + gw].copy_from_slice(&words[s..s + gw]);
             }
         }
     }
-    pages
 }
 
 #[cfg(test)]
@@ -211,6 +237,26 @@ mod tests {
             pages[20 * 8..32 * 8].iter().all(|&w| w == 0),
             "the tail is zero"
         );
+    }
+
+    /// **A turn's flat words transpose as its signatures do**, into the slice
+    /// it is given: 3 tokens of 6 words, two fold groups of 3, groups 0 and 1,
+    /// the middle token dropped, at a 200-word stride — every word placed.
+    #[test]
+    fn flat_words_transpose_into_their_slice() {
+        let words: Vec<u64> = (0..18).map(|w| 100 + w as u64).collect();
+        let mask = KeepMask::from_bools(&[true, false, true]);
+        let groups = GroupSet::all(2);
+        let mut out = vec![0u64; 200];
+        transpose_into(words.chunks_exact(6), &mask, 3, groups, 200, &mut out);
+        let mut want = vec![0u64; 200];
+        // Kept token 0 (source 0): group 0 at 0.., group 1 at 96...
+        want[0..3].copy_from_slice(&[100, 101, 102]);
+        want[96..99].copy_from_slice(&[103, 104, 105]);
+        // Kept token 1 (source 2): place 1, 3 words in.
+        want[3..6].copy_from_slice(&[112, 113, 114]);
+        want[99..102].copy_from_slice(&[115, 116, 117]);
+        assert_eq!(out, want);
     }
 
     #[test]

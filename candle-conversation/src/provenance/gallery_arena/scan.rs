@@ -9,7 +9,7 @@
 //! with the contiguous path ([`needle_tally_segments`]). See
 //! `docs/gallery_residency.md` §5.
 
-use std::collections::hash_map::DefaultHasher;
+use std::collections::hash_map::{DefaultHasher, Entry};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicU64;
@@ -34,6 +34,7 @@ use crate::scheduler::profile;
 use super::super::gpu::{needle_tally_segments, BDP_TQ};
 use super::super::vote_law::VoteLaw;
 use super::super::WideQSig;
+use super::batch_ensure::Wanted;
 use super::index_entries::IndexEntries;
 use super::lease::ScanHold;
 use super::pages::PAGE_TOKENS;
@@ -41,7 +42,8 @@ use super::probe_rows::ProbeRows;
 use super::scan_split::{self, LaunchTiming};
 use super::token_votes::widen_rows;
 use super::{
-    GalleryArena, GroupSet, Holder, IndexMiss, Keep, KeepMask, TokenStats, TokenVotes, TurnSigs,
+    Ensured, GalleryArena, GroupSet, Holder, IndexMiss, Keep, KeepMask, TokenStats, TokenVotes,
+    TurnSigs,
 };
 
 /// What producing a scan's rows cost: the launch's timing, the probe tokens it
@@ -340,14 +342,44 @@ impl GalleryArena {
         // turns). What the build uploads is held by its own pins until the
         // launch, so nothing it admits is given up under it.
         self.evict_past_keep();
-        // Turns pinned so far — released on error so a failed build never leaks pins.
-        let mut pinned_sids: Vec<StreamId> = Vec::new();
-        let mut run_ids: Vec<u64> = Vec::new();
         // What the build cost, and why: the turns it had to upload against the
         // turns already resident.
         let t_build = Instant::now();
-        let mut ensure_time = Duration::ZERO;
-        let mut uploaded = 0usize;
+        // Every turn the walk below reads, admitted and pinned at once, in the
+        // order the walk first meets them.
+        let mut first_seen: HashMap<StreamId, usize> = HashMap::new();
+        let mut wanted: Vec<Wanted<'_>> = Vec::new();
+        for seg in segments {
+            for w in seg.windows.iter().filter(|w| w.case < seg.n_cases) {
+                if let Entry::Vacant(e) = first_seen.entry(w.sid) {
+                    e.insert(wanted.len());
+                    let (holder, groups, keep) = wants[&w.sid];
+                    wanted.push(Wanted {
+                        sid: w.sid,
+                        sigs: w.turn,
+                        fingerprint: w.fingerprint,
+                        holder,
+                        groups,
+                        keep,
+                    });
+                }
+            }
+        }
+        let mut admitted: Vec<Option<Ensured>> = self
+            .scan_ensure_all(&wanted)?
+            .into_iter()
+            .map(Some)
+            .collect();
+        let ensure_time = t_build.elapsed();
+        let uploaded = admitted
+            .iter()
+            .filter(|e| e.as_ref().is_some_and(|e| e.uploaded))
+            .count();
+        // Every turn admitted is pinned, and released on error so a failed
+        // build never leaks pins.
+        let all_pinned: Vec<StreamId> = wanted.iter().map(|w| w.sid).collect();
+        let mut pinned_sids: Vec<StreamId> = Vec::with_capacity(wanted.len());
+        let mut run_ids: Vec<u64> = Vec::with_capacity(wanted.len());
         for seg in segments {
             // Emit each segment's windows in CASE order, so gallery case ids are
             // non-decreasing over the scan order. The scan math is order-independent
@@ -365,32 +397,19 @@ impl GalleryArena {
                 let (base, held) = match turn_base.get(&w.sid) {
                     Some((b, m)) => (*b, Arc::clone(m)),
                     None => {
-                        // Pin the turn atomically with residency so the governor
-                        // can't free its pages before the launch reads them.
-                        let t_ensure = Instant::now();
-                        let (holder, groups, keep) = wants[&w.sid];
-                        let ensured =
-                            self.scan_ensure(w.sid, w.turn, w.fingerprint, holder, groups, keep);
-                        ensure_time += t_ensure.elapsed();
-                        let ensured = match ensured {
-                            Ok(e) => e,
-                            Err(e) => {
-                                for &s in &pinned_sids {
-                                    self.unpin(s);
-                                }
-                                return Err(e);
-                            }
-                        };
-                        uploaded += usize::from(ensured.uploaded);
+                        // Pinned atomically with residency by the admission
+                        // above, so the governor can't free its pages before
+                        // the launch reads them.
+                        let ensured = admitted[first_seen[&w.sid]]
+                            .take()
+                            .expect("a turn is first met once");
                         pinned_sids.push(w.sid);
                         run_ids.push(ensured.run_id);
                         if !ensured.groups.covers(launch) && zero.is_none() {
                             match self.zero_page_addr() {
                                 Ok(z) => zero = Some(z),
                                 Err(e) => {
-                                    for &s in &pinned_sids {
-                                        self.unpin(s);
-                                    }
+                                    self.unpin_all(&all_pinned);
                                     return Err(e);
                                 }
                             }
@@ -439,9 +458,7 @@ impl GalleryArena {
         let n_slots = entries.slots_len();
         let seg_law: Vec<VoteLaw> = segments.iter().map(|s| s.law).collect();
         if let Some(bad) = seg_law.iter().find(|l| !l.is_valid()) {
-            for &s in &pinned_sids {
-                self.unpin(s);
-            }
+            self.unpin_all(&all_pinned);
             return Err(candle::Error::Msg(format!(
                 "paged scan: a segment's vote law {bad:?} is outside 1..={} votes",
                 VoteLaw::MAX_TOP_K
@@ -457,9 +474,7 @@ impl GalleryArena {
             match self.upload_index(&page_ptr, &entries, &seg_case, &seg_top_k) {
                 Ok(d) => Some(d),
                 Err(e) => {
-                    for &s in &pinned_sids {
-                        self.unpin(s);
-                    }
+                    self.unpin_all(&all_pinned);
                     return Err(e);
                 }
             }

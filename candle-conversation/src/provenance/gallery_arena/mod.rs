@@ -22,6 +22,7 @@
 //! turns when it unloads, and a tombstoned turn's at once. See
 //! `docs/gallery_residency.md`.
 
+mod batch_ensure;
 mod belief_arena;
 mod dedup;
 pub(crate) mod eviction;
@@ -149,6 +150,24 @@ impl ResidentTurn {
         self.fingerprint == fingerprint && self.groups.covers(groups) && self.keep.covers(keep)
     }
 
+    /// A read found it serving: it is used now, at `lru`, held for `holder`
+    /// too, and pinned for a scan when `pin`.
+    fn hit(&mut self, lru: u64, holder: Holder, pin: bool) -> Ensured {
+        self.lru = lru;
+        self.touch(Instant::now());
+        self.holder = self.holder.widen(holder);
+        if pin {
+            self.pinned += 1;
+        }
+        Ensured {
+            addrs: self.run.addrs(),
+            run_id: self.run_id,
+            groups: self.groups,
+            mask: Arc::clone(&self.mask),
+            uploaded: false,
+        }
+    }
+
     /// A scan used it at `now`: its interval takes in the time since the last.
     fn touch(&mut self, now: Instant) {
         let since = now.saturating_duration_since(self.used);
@@ -162,6 +181,49 @@ impl ResidentTurn {
 
 /// Weight of the newest gap between scans in a turn's interval.
 const INTERVAL_WEIGHT: f64 = 0.5;
+
+/// What a turn's upload holds: who for, which fold groups, which tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Held {
+    holder: Holder,
+    groups: GroupSet,
+    keep: Keep,
+}
+
+impl Held {
+    /// What an upload of the content `fingerprint`, read for `holder`
+    /// weighing `groups` of the tokens `keep` keeps, holds over `old`, the
+    /// entry it replaces: the wider holder, the union of the groups, and of the
+    /// keeps while the content is unchanged — a re-seal is a new turn to its
+    /// readers. A keep with no codebook (`has_book` false) to name its tokens
+    /// holds them all, and says so: the turn is not held under a keep it was
+    /// never reduced by.
+    fn widened(
+        old: Option<&ResidentTurn>,
+        fingerprint: u64,
+        holder: Holder,
+        groups: GroupSet,
+        keep: Keep,
+        has_book: bool,
+    ) -> Self {
+        let mut held = Held {
+            holder,
+            groups,
+            keep,
+        };
+        if let Some(old) = old {
+            held.holder = old.holder.widen(holder);
+            held.groups = old.groups.union(groups);
+            if old.fingerprint == fingerprint {
+                held.keep = old.keep.union(keep);
+            }
+        }
+        if !has_book {
+            held.keep = Keep::All;
+        }
+        held
+    }
+}
 
 /// One resident turn as [`GalleryArena::resident_runs`] reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -547,21 +609,7 @@ impl GalleryArena {
         // a run needs the residency lock, so its slots can't be freed in this
         // window.
         match res.get_mut(&sid) {
-            Some(rt) if rt.serves(fingerprint, groups, keep) => {
-                rt.lru = lru;
-                rt.touch(Instant::now());
-                rt.holder = rt.holder.widen(holder);
-                if pin {
-                    rt.pinned += 1;
-                }
-                Ok(Ensured {
-                    addrs: rt.run.addrs(),
-                    run_id: rt.run_id,
-                    groups: rt.groups,
-                    mask: Arc::clone(&rt.mask),
-                    uploaded: false,
-                })
-            }
+            Some(rt) if rt.serves(fingerprint, groups, keep) => Ok(rt.hit(lru, holder, pin)),
             _ => self
                 .replace_locked(res, sid, sigs, fingerprint, pin, lru, holder, groups, keep)
                 .map(|(addrs, run_id, groups, mask)| Ensured {
@@ -594,42 +642,21 @@ impl GalleryArena {
         groups: GroupSet,
         keep: Keep,
     ) -> Result<(Vec<u64>, u64, GroupSet, Arc<KeepMask>)> {
-        let mut holder = holder;
-        let mut groups = groups;
-        let mut keep = keep;
-        // A re-seal changes a turn an index may name: asked, so each such index
-        // is marked stale, in every build.
-        let leased = res.contains_key(&sid) && {
-            self.note_change();
-            self.leased(&sid)
-        };
-        if let Some(old) = res.remove(&sid) {
-            holder = old.holder.widen(holder);
-            groups = old.groups.union(groups);
-            if old.fingerprint == fingerprint {
-                keep = old.keep.union(keep);
-            }
-            // The scan thread always unpins before the next ensure on that thread,
-            // so a replaced entry is never pinned. If this ever fires, an in-flight
-            // scan's pages are about to be recycled — the arena would need a
-            // multi-version turn to stay safe under concurrent re-seal + scan.
-            debug_assert!(
-                old.pinned == 0 && !leased,
-                "re-seal of a turn pinned by an active scan — pages would be freed \
-                 under an in-flight kernel"
-            );
-            drop(old); // frees the old run's pages before the fresh upload
-        }
-        // Counted NOW — the pages are freed even if the upload below fails. The
-        // old run id left with the removed entry, so any cached index over it is
-        // already invalid.
-        self.residency_gen.fetch_add(1, Ordering::Relaxed);
-        // A keep with no codebook to name its tokens holds them all, and says
-        // so: the turn is not held under a keep it was never reduced by.
         let book = self.dedup.book();
-        if book.is_none() {
-            keep = Keep::All;
-        }
+        let held = Held::widened(
+            res.get(&sid),
+            fingerprint,
+            holder,
+            groups,
+            keep,
+            book.is_some(),
+        );
+        let Held {
+            holder,
+            groups,
+            keep,
+        } = held;
+        self.drop_replaced(res, sid);
         let mask = self
             .dedup
             .mask(sid, fingerprint, sigs, keep, book.as_deref());
@@ -653,6 +680,33 @@ impl GalleryArena {
             },
         );
         Ok((addrs, run_id, groups, mask))
+    }
+
+    /// Take `sid`'s resident entry out before its fresh upload, freeing its
+    /// pages, and count the change.
+    fn drop_replaced(&self, res: &mut HashMap<StreamId, ResidentTurn>, sid: StreamId) {
+        // A re-seal changes a turn an index may name: asked, so each such index
+        // is marked stale, in every build.
+        let leased = res.contains_key(&sid) && {
+            self.note_change();
+            self.leased(&sid)
+        };
+        if let Some(old) = res.remove(&sid) {
+            // The scan thread always unpins before the next ensure on that thread,
+            // so a replaced entry is never pinned. If this ever fires, an in-flight
+            // scan's pages are about to be recycled — the arena would need a
+            // multi-version turn to stay safe under concurrent re-seal + scan.
+            debug_assert!(
+                old.pinned == 0 && !leased,
+                "re-seal of a turn pinned by an active scan — pages would be freed \
+                 under an in-flight kernel"
+            );
+            drop(old); // frees the old run's pages before the fresh upload
+        }
+        // Counted NOW — the pages are freed even if the upload after fails. The
+        // old run id left with the removed entry, so any cached index over it is
+        // already invalid.
+        self.residency_gen.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Ensure a turn is resident under `fingerprint`, returning its pages' device
@@ -775,40 +829,8 @@ impl GalleryArena {
             .mask(sid, fingerprint, sigs, keep, book.as_deref())
     }
 
-    /// Like [`ensure_resident`](Self::ensure_resident) but **pins** the turn for
-    /// the duration of a scan, and makes no room: the index builder runs the
-    /// keep eviction once, before its first turn. Every pin must be balanced by
-    /// an [`unpin`](Self::unpin). Used by the paged scan's index builder, which
-    /// records the run id to validate a later reuse of its index.
-    pub(super) fn scan_ensure<'a>(
-        &self,
-        sid: StreamId,
-        sigs: impl Into<TurnSigs<'a>>,
-        fingerprint: u64,
-        holder: Holder,
-        groups: GroupSet,
-        keep: Keep,
-    ) -> Result<Ensured> {
-        let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
-        self.ensure_locked(
-            &mut res,
-            sid,
-            sigs.into(),
-            fingerprint,
-            true,
-            holder,
-            groups,
-            keep,
-        )
-    }
-
-    /// Release one pin taken by [`scan_ensure`](Self::scan_ensure).
-    pub(super) fn unpin(&self, sid: StreamId) {
-        self.unpin_all(&[sid]);
-    }
-
-    /// Release the pins [`scan_ensure`](Self::scan_ensure) took on `sids`, in
-    /// one pass under one lock.
+    /// Release the pins [`scan_ensure_all`](Self::scan_ensure_all) took on
+    /// `sids`, in one pass under one lock.
     pub(super) fn unpin_all(&self, sids: &[StreamId]) {
         let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
         for sid in sids {
@@ -1315,6 +1337,7 @@ impl GalleryArena {
 
 #[cfg(test)]
 mod tests {
+    use super::batch_ensure::Wanted;
     use super::*;
     use crate::projection::TimelineId;
     use crate::provenance::WideQSig;
@@ -1347,7 +1370,15 @@ mod tests {
         }
 
         fn pinned(&self, sid: StreamId, sigs: &[WideQSig], fp: u64) -> Result<Ensured> {
-            self.scan_ensure(sid, sigs, fp, Holder::Shared, GroupSet::all(3), Keep::All)
+            let wanted = Wanted {
+                sid,
+                sigs: TurnSigs::from(sigs),
+                fingerprint: fp,
+                holder: Holder::Shared,
+                groups: GroupSet::all(3),
+                keep: Keep::All,
+            };
+            Ok(self.scan_ensure_all(&[wanted])?.remove(0))
         }
     }
 
@@ -1559,7 +1590,7 @@ mod tests {
         let (turns, bytes) = arena.drop_turns(&[sid(0), sid(1), sid(9)]);
         assert_eq!((turns, bytes), (1, 6144), "only the unpinned turn 0 goes");
         assert_eq!(holder_of(sid(0)), None);
-        arena.unpin(sid(1));
+        arena.unpin_all(&[sid(1)]);
         assert_eq!(arena.drop_turns(&[sid(1)]), (1, 6144));
         assert_eq!(arena.resident_turns(), 0);
     }
@@ -1595,8 +1626,7 @@ mod tests {
             assert!(res.contains_key(&sid(2)) && res.contains_key(&sid(3)));
         }
         // Unpin → they become evictable again.
-        arena.unpin(sid(2));
-        arena.unpin(sid(3));
+        arena.unpin_all(&[sid(2), sid(3)]);
         let freed2 = arena.evict_lru(u64::MAX);
         assert!(freed2 > 0);
         assert_eq!(arena.resident_turns(), 0, "unpinned turns now evict");
