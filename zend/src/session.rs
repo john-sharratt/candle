@@ -3818,33 +3818,34 @@ fn run_inference_stream(
             // and its first token before the engine sees the turn
             // (`round head` below).
             let t_head = Instant::now();
+            let mut withheld = unavailable(&state.tool_host.availability_facts(), &offered);
+            withhold_by_level(&mut withheld.tools, &offered, level);
+            // The round's calls to the files it has read or edited are held to
+            // what those files hold now (`docs/stencil_tree.md` §9.2), and a
+            // task's answer ends in the `Steps:` section of the steps it was
+            // given (`answer_steps`). Reading the files and building the
+            // grammar is blocking work, and none of it reads the journal: it
+            // runs on the blocking pool while the journal is carried, and
+            // `triggers_ms` is what is left of it once the journal is.
+            let base = round_triggers(&state, think_mode, tools_mode, &withheld);
+            let (hold_state, seen, held_files) =
+                (Arc::clone(&state), cs.seen.clone(), Arc::clone(&cs.files));
+            let holding = tokio::task::spawn_blocking(move || {
+                let engine = &hold_state.engine;
+                let held = seen.triggers(engine, &base, &held_files);
+                engine.ending_with_steps(&held, &answer_steps::of(engine, timeline))
+            });
             if state.journaling {
                 carry_journal(&state, &conv_id, timeline, &mut cs, &mut round_selection).await;
             }
             let journal_ms = t_head.elapsed().as_millis() as u64;
-            let mut withheld = unavailable(&state.tool_host.availability_facts(), &offered);
-            withhold_by_level(&mut withheld.tools, &offered, level);
             // The prompt shows what the grammar lets the turn call, and no more.
             round_selection.withhold_members(withheld.tools.iter().copied());
             if let Some(summary) = tool_summary_section(tools_mode) {
                 round_selection.note_summary(SectionId::reserved(summary), withheld.lines.clone());
             }
-            // The round's calls to the files it has read or edited are held to
-            // what those files hold now (`docs/stencil_tree.md` §9.2), and a
-            // task's answer ends in the `Steps:` section of the steps it was
-            // given (`answer_steps`). Reading the files and building the
-            // grammar is blocking work.
             let t_triggers = Instant::now();
-            let base = round_triggers(&state, think_mode, tools_mode, &withheld);
-            let (hold_state, seen, held_files) =
-                (Arc::clone(&state), cs.seen.clone(), Arc::clone(&cs.files));
-            let triggers = match tokio::task::spawn_blocking(move || {
-                let engine = &hold_state.engine;
-                let held = seen.triggers(engine, &base, &held_files);
-                engine.ending_with_steps(&held, &answer_steps::of(engine, timeline))
-            })
-            .await
-            {
+            let triggers = match holding.await {
                 Ok(triggers) => triggers,
                 Err(e) => {
                     tracing::warn!(conv_id = %conv_id, "holding a round's values panicked: {e}");
