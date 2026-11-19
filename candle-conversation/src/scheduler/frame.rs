@@ -1,73 +1,72 @@
-//! An append-only conversation's frame: the sections its first turn lays onto
-//! an empty slot in place of a projection (`ProjectionInputs::frame`).
+//! An append-only conversation's frame, as admission lays it down: the
+//! sections and turns its first turn puts onto an empty slot in place of a
+//! projection (`ProjectionInputs::frame`, `conversation::frame`).
 //!
-//! **Only a conversation with nothing else to place is framed.** A frame is
-//! the system prompt and nothing more, so a first turn whose conversation
-//! inherits a lineage — a calibration draft forked onto the reading it writes
-//! questions about, a priming-chain link read behind the links before it — is
-//! projected instead, and the projection places the lineage whole
-//! (`project::ingest_self`). Framed, such a turn decoded with the system prompt
-//! and its own request alone: every calibration draft on BlackWorld from
-//! 2026-11-15 on wrote a file's questions knowing only its name —
-//! `projection_assembler.rs` was asked about a `ProjectionError::CycleDetected`
-//! it does not hold and never about its `glue_islands`.
+//! The frame is worked out on the submitting thread; the wave thread only
+//! turns it into what a projection would have handed admission — the
+//! sections and turns to lift onto the card, and the segments to inject — so a
+//! first turn pays the lift of what it lays down and no projection.
 
-use crate::projection::{ProjectionSegment, ResolvedSection, SealedKind, SectionId};
+use crate::conversation::Frame;
+use crate::projection::{ProjectionSegment, SectionId, TurnKey};
 
 /// Whether a submit lays its frame down in place of projecting: an
-/// append-only conversation (`disable_reprojection`) whose slot is still empty,
-/// and which inherits no lineage the frame would leave out.
-pub(super) fn frames(disable_reprojection: bool, slot_holds_blocks: bool, inherits: bool) -> bool {
-    disable_reprojection && !slot_holds_blocks && !inherits
+/// append-only conversation (`disable_reprojection`) whose slot is still
+/// empty.
+pub(super) fn frames(disable_reprojection: bool, slot_holds_blocks: bool) -> bool {
+    disable_reprojection && !slot_holds_blocks
 }
 
-/// The sections to elevate and the segments to inject for `frame`, in frame
-/// order — what a projection hands admission, with no history and no
-/// selection: every section sealed, nothing generated.
-pub(super) fn framed_segments(frame: &[SectionId]) -> (Vec<SectionId>, Vec<ProjectionSegment>) {
-    let segments = frame
-        .iter()
-        .map(|&id| ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(id))))
-        .collect();
-    (frame.to_vec(), segments)
+/// The sections and turns to lift and the segments to inject for `frame`, in
+/// frame order: every section, then every turn of its lineage, sealed.
+pub(super) fn framed_segments(
+    frame: &Frame,
+) -> (Vec<SectionId>, Vec<ProjectionSegment>, Vec<TurnKey>) {
+    (frame.sections.to_vec(), frame.segments(), frame.turn_keys())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::projection::{
+        GroupId, LayerId, ResolvedTurn, SealedKind, TimelineId, TurnId, TurnIndex,
+    };
 
-    /// **A frame is its sections, sealed, in order** — the same list the slot
-    /// was once primed with, and nothing a projection would add.
+    /// **A frame is laid down whole**: its sections to lift and inject, then
+    /// its lineage's turns, lifted and injected after them.
     #[test]
-    fn a_frame_is_its_sections_in_order() {
-        let frame = [SectionId::new(7), SectionId::new(2), SectionId::new(9)];
-        let (sections, segments) = framed_segments(&frame);
-        assert_eq!(sections, frame);
-        let ids: Vec<SectionId> = segments
-            .iter()
-            .map(|s| match s {
-                ProjectionSegment::Sealed(SealedKind::Section(rs)) => rs.id,
-                other => panic!("a frame segment is a sealed section, got {other:?}"),
-            })
-            .collect();
-        assert_eq!(ids, frame);
+    fn a_frame_is_its_sections_then_its_turns() {
+        let timeline = TimelineId::from_raw(10).unwrap();
+        let reading = ResolvedTurn {
+            id: TurnId {
+                layer_id: LayerId::from_raw(2).unwrap(),
+                group_id: GroupId::from_raw(5).unwrap(),
+                index: TurnIndex(1),
+            },
+            timeline: Some(timeline),
+        };
+        let frame = Frame {
+            sections: Arc::new(vec![SectionId::new(7), SectionId::new(2)]),
+            lineage: vec![reading],
+        };
+        let (sections, segments, turns) = framed_segments(&frame);
+        assert_eq!(sections, vec![SectionId::new(7), SectionId::new(2)]);
+        assert_eq!(turns, vec![TurnKey::new(timeline, TurnIndex(1))]);
+        assert_eq!(segments.len(), 3);
+        assert!(matches!(
+            &segments[2],
+            ProjectionSegment::Sealed(SealedKind::Turn(t, _)) if *t == reading
+        ));
     }
 
-    /// **A conversation that inherits a lineage is projected, not framed**;
-    /// so is one that reprojects, and one whose slot already holds its prompt.
+    /// **Only an empty append-only slot is framed**: a later turn appends to
+    /// what the slot holds, and a reprojecting conversation projects.
     #[test]
-    fn only_an_empty_append_only_slot_with_no_lineage_is_framed() {
-        assert!(frames(true, false, false), "a reading's first turn");
-        assert!(!frames(true, false, true), "a draft on its reading");
-        assert!(!frames(true, true, false), "a later turn");
-        assert!(!frames(false, false, false), "a dialogue");
-    }
-
-    /// **An empty frame injects nothing.**
-    #[test]
-    fn an_empty_frame_injects_nothing() {
-        let (sections, segments) = framed_segments(&[]);
-        assert!(sections.is_empty());
-        assert!(segments.is_empty());
+    fn only_an_empty_append_only_slot_is_framed() {
+        assert!(frames(true, false), "an append-only first turn");
+        assert!(!frames(true, true), "a later turn");
+        assert!(!frames(false, false), "a dialogue");
     }
 }

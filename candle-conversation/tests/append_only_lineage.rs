@@ -5,8 +5,8 @@
 //! system prompt onto its empty slot instead of projecting. A fork that
 //! inherits a lineage — a calibration draft forked onto the reading it writes
 //! questions about, a priming-chain link read behind the links before it — has
-//! more to place than the frame holds, so its first turn is projected and the
-//! lineage is in front of it. Framed, every calibration draft on BlackWorld
+//! more to place than the system prompt, so its frame carries the lineage and
+//! the lineage is in front of it. Without it, every calibration draft on BlackWorld
 //! from 2026-11-15 on wrote a file's questions knowing only its name.
 //!
 //! Uses Qwen2-0.5B via HuggingFace and a CUDA GPU:
@@ -93,15 +93,20 @@ fn an_append_only_fork_onto_a_lineage_holds_it() {
     );
 }
 
-/// **A fork with no lineage is still framed**: nothing but the frame to
-/// place, so there is no projection to report.
+/// **A fork with no lineage is framed by the system prompt alone**: its
+/// frame lays down sections and no turn.
 #[test]
-fn an_append_only_fork_with_no_lineage_is_framed() {
+fn an_append_only_fork_with_no_lineage_is_framed_by_its_sections() {
     let engine = engine();
     let prompt = test_builder().format_system_prompt();
     let base = engine
         .new_conversation(&prompt, append_only())
         .expect("a base that never runs a turn");
     let fork = base.fork().expect("the fork");
-    assert!(fork.prompt_dump().is_none());
+    let dump = fork.prompt_dump().expect("a first turn's frame");
+    assert!(!dump.pieces.is_empty(), "the frame holds the system prompt");
+    assert!(
+        dump.pieces.iter().all(|p| p.timeline.is_none()),
+        "a fork with no lineage frames no turn"
+    );
 }

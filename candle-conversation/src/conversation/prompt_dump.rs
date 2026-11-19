@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use super::Sequence;
+use super::{Frame, Sequence};
 use crate::projection::event::{group_name_of, role_str};
 use crate::projection::{
     GroupId, ProjectionMode, ProjectionSegment, ResolvedTurn, Schema, SealedKind,
@@ -219,34 +219,27 @@ fn name_collection(collection: &SectionCollection, names: &mut HashMap<SectionId
 }
 
 impl Sequence {
-    /// Whether this append-only conversation's next turn is projected: its
-    /// first, unsubmitted, when it inherits a lineage a frame would leave out.
-    fn first_turn_projects(&self) -> bool {
-        self.frame.is_some()
-            && self
-                .substrate
-                .read()
-                .parent_timeline(self.target.timeline)
-                .is_some()
-    }
-
     /// The tokens this conversation would be given if it decoded now, piece by
-    /// piece with the scores that selected them. `None` for a layer that does
-    /// not reproject (`disable_reprojection`), whose prompt is not a selection —
-    /// except the first turn of one that inherits a lineage, which is projected
-    /// rather than framed (`scheduler::frame`), so its prompt is this one.
+    /// piece with the scores that selected them. For a layer that does not
+    /// reproject (`disable_reprojection`), the frame its first turn lays down
+    /// (`Frame`), every piece unscored; `None` for one past its first turn,
+    /// whose prompt is the slot it has appended to, not a selection.
     pub fn prompt_dump(&self) -> Option<PromptDump> {
-        if self.config.disable_reprojection && !self.first_turn_projects() {
-            return None;
-        }
         let scores = self.last_turn_belief_scores(true);
         let resolver = self.substrate.read_for_scored(self.target, &scores);
-        let projection = self.projection.project_with_selection(
-            self.target,
-            &resolver,
-            ProjectionMode::Decode,
-            &self.selection,
-        );
+        let (segments, selection_scores) = if self.config.disable_reprojection {
+            let sections = self.frame.as_ref()?;
+            let frame = Frame::of(&self.substrate.read(), Arc::clone(sections), self.target);
+            (frame.segments(), SelectionScores::default())
+        } else {
+            let projection = self.projection.project_with_selection(
+                self.target,
+                &resolver,
+                ProjectionMode::Decode,
+                &self.selection,
+            );
+            (projection.segments, projection.selection_scores)
+        };
         let schema = self.projection.schema();
         let names = section_names(schema);
         let section_name = |id: SectionId| {
@@ -265,8 +258,8 @@ impl Sequence {
             |timeline: TimelineId, index: TurnIndex| resolver.token_ids_of(timeline, index);
         let decode = |ids: &[u32]| self.tokenizer.decode(ids, false).unwrap_or_default();
         Some(lay_out(
-            &projection.segments,
-            &projection.selection_scores,
+            &segments,
+            &selection_scores,
             &DumpSource {
                 section_name: &section_name,
                 group_name: &group_name,

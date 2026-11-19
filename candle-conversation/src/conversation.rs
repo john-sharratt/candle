@@ -225,7 +225,9 @@ use std::sync::{Arc, Mutex};
 mod carried;
 pub use carried::{Carried, Linking, Want};
 mod ephemeral_turn;
+mod frame;
 pub use ephemeral_turn::{AskScope, UnsealedAsker};
+pub(crate) use frame::Frame;
 mod prefix_state;
 mod prompt_dump;
 pub(crate) mod section_end_state;
@@ -491,12 +493,14 @@ pub struct Sequence {
     /// schema may declare several (zend's does), each contributing its own
     /// run of ids to the birth list.
     birth_prefix: Arc<Vec<SectionId>>,
-    /// The frame an append-only conversation's first turn lays onto an empty
-    /// slot: [`Self::birth_prefix`], sent with the first submit and gone after
+    /// The sections of the frame an append-only conversation's first turn
+    /// lays onto an empty slot: [`Self::birth_prefix`], sent with the first
+    /// submit — its lineage's turns after them ([`Frame::of`]) — and gone after
     /// it ([`ProjectionInputs::frame`]). `None` for a conversation that
     /// re-projects every turn, and once the first turn has been submitted. A
     /// fork carries its parent's, so a unit forked from an ingest base that
-    /// never ran a turn is framed exactly as the base would have been.
+    /// never ran a turn is framed exactly as the base would have been, behind
+    /// whatever lineage it has been given by its first submit.
     frame: Option<Arc<Vec<SectionId>>>,
     branch_spans: Vec<(usize, usize)>,
     /// True when this conversation was **born with a prompt checkpoint** — as
@@ -2904,7 +2908,10 @@ impl Sequence {
         ProjectionInputs {
             projection: Arc::clone(&self.projection),
             selection: self.selection.clone(),
-            frame: self.frame.take(),
+            frame: self
+                .frame
+                .take()
+                .map(|sections| Frame::of(&self.substrate.read(), sections, self.target)),
         }
     }
 

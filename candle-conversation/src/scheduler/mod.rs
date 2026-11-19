@@ -161,7 +161,7 @@ use self::request_laps::RequestLaps;
 use self::wave_timing::WaveTiming;
 use crate::batched_sampler::{BatchedSampler, SequenceSamplingState};
 use crate::config::{DecodeHealthConfig, SamplingConfig};
-use crate::conversation::{is_shared_stream_name, slice_per_layer_sealed};
+use crate::conversation::{is_shared_stream_name, slice_per_layer_sealed, Frame};
 use crate::decode_health::DecodeHealthState;
 use crate::decoded_text::{decode_turn_text, TagIds};
 use crate::dry_reference::reference_flags;
@@ -1517,13 +1517,14 @@ pub(crate) struct ProjectionInputs {
     pub projection: Arc<Builder>,
     /// Section-tree selection for this turn's projection (the composer dials).
     pub selection: SelectionState,
-    /// The sections an append-only conversation's first turn lays onto an
-    /// empty slot instead of projecting: the schema's fixed sections, each tree
-    /// at its default branch. Its later turns skip projection
-    /// (`disable_reprojection`), so this is the prompt its sealed K/V is
-    /// computed under for the conversation's whole life, and no turn's
-    /// selection can alter it. `None` on every other submit.
-    pub frame: Option<Arc<Vec<SectionId>>>,
+    /// What an append-only conversation's first turn lays onto an empty slot
+    /// instead of projecting: the schema's fixed sections, each tree at its
+    /// default branch, then its lineage's turns (`conversation::Frame`). Its
+    /// later turns skip projection (`disable_reprojection`), so this is the
+    /// context its sealed K/V is computed under for the conversation's whole
+    /// life, and no turn's selection can alter it. `None` on every other
+    /// submit.
+    pub frame: Option<Frame>,
 }
 
 // ————————————————————————————————————————————————————————————————————————————
@@ -4944,31 +4945,23 @@ impl Scheduler {
                 // cumulative slot. The seal is unaffected — turns still land
                 // in the substrate.
                 //
-                // The system prompt is laid down by the conversation's first
-                // turn: a submit that carries a frame (`ProjectionInputs::frame`)
-                // and finds the slot empty injects exactly the frame's sections
-                // instead of projecting, as part of its own admission and
-                // prefill — unless the conversation inherits a lineage, which a
-                // frame would leave out: that first turn is projected, and the
-                // projection places the lineage whole (`frame::frames`). From
-                // then on the slot holds blocks and `skip_projection` holds.
-                // The trade-off is that collection-member / `depends_on`-gated
-                // sections (which only materialize via a projection) are NOT
-                // added to a framed slot; utility-layer system prompts
-                // (code_reading, repo_map) use only fixed sections, so this is
-                // exact for them.
+                // The context is laid down by the conversation's first turn: a
+                // submit that carries a frame (`ProjectionInputs::frame`) and
+                // finds the slot empty injects exactly the frame — the fixed
+                // sections, then its lineage's turns — instead of projecting, as
+                // part of its own admission and prefill. From then on the slot
+                // holds blocks and `skip_projection` holds. The trade-off is
+                // that collection-member / `depends_on`-gated sections (which
+                // only materialize via a projection) are NOT added; utility-layer
+                // system prompts (code_reading, repo_map) use only fixed
+                // sections, so this is exact for them.
                 let slot_holds_blocks =
                     self.session.sequence_block_count(parent_id.0).unwrap_or(0) > 0;
                 let skip_projection = disable_reprojection && slot_holds_blocks;
-                let inherits = slot_target.is_some_and(|t| {
-                    self.slot_conversations
-                        .get(&parent_id)
-                        .is_some_and(|c| c.read().parent_timeline(t.timeline).is_some())
-                });
                 let frame = projection_inputs
                     .as_ref()
                     .and_then(|i| i.frame.as_ref())
-                    .filter(|_| frames(disable_reprojection, slot_holds_blocks, inherits));
+                    .filter(|_| frames(disable_reprojection, slot_holds_blocks));
                 // Mark this as an append-only ingest timeline so the gentle-early
                 // ladder can demote its sealed, warm-backed KV to RAM at ~50%
                 // capacity — it is never re-attended until query time. See
@@ -5005,7 +4998,9 @@ impl Scheduler {
                 let mut turn_belief = PriorBelief::default();
                 let (projected_sections, projected_segments) =
                     if let (Some(frame), Some(_)) = (frame, slot_target) {
-                        framed_segments(frame)
+                        let (sections, segments, turns) = framed_segments(frame);
+                        turn_keys_for_elevate = turns;
+                        (sections, segments)
                     } else if let (Some(inputs), Some(target)) = (
                         projection_inputs.as_ref().filter(|_| !skip_projection),
                         slot_target,
