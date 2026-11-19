@@ -60,13 +60,7 @@ pub fn line(s: &Authored, dir: &FsPath) -> Value {
     let Some((conv, p)) = under(s) else {
         return Value::Null;
     };
-    let mut v = json!(overview(
-        &conv,
-        p.builder.schema(),
-        None,
-        target_layer(&p),
-        dir
-    ));
+    let mut v = json!(overview(&conv, p.builder.schema(), target_layer(&p), dir));
     if let Value::Object(m) = &mut v {
         m.insert("path".into(), json!(dir));
         m.insert("views".into(), json!(VIEWS));
@@ -122,7 +116,7 @@ pub async fn layer(
             .find(|l| l.name == name)
             .map(|l| l.groups.clone());
         let read = conv.read();
-        Some(groups.map(|g| layer_conversations(&read, &g, None, Unit::titled)))
+        Some(groups.map(|g| layer_conversations(&read, &g, Unit::titled)))
     })
     .await?;
     match found {

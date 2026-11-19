@@ -82,9 +82,9 @@ pub struct RefreshContext<'a> {
     /// mode's grammar holds can still call them. `None` falls back to
     /// [`Self::think_triggers`].
     pub think_for: Option<ThinkFor>,
-    /// The live dialogue a day layer reads: its group, and the conversation
-    /// that writes titles, which is no dialogue. `None` when there is none.
-    pub dialogue: Option<(GroupId, Option<TimelineId>)>,
+    /// The live dialogue a day layer reads: its group. `None` when there is
+    /// none.
+    pub dialogue: Option<GroupId>,
 }
 
 /// The steering for a thinking level, over a tools mode's call grammar.

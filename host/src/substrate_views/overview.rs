@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use candle_conversation::projection::{Conversation, GroupSchema, Schema, TimelineId};
+use candle_conversation::projection::{Conversation, GroupSchema, Schema};
 use candle_conversation::substrate::Substrate;
 use serde::Serialize;
 
@@ -86,14 +86,12 @@ pub struct GroupView {
 
 /// The overview of `conv`, read under `schema`, with its redo log in `dir`.
 ///
-/// `titler` is a timeline the tenant keeps for itself and leaves out of every
-/// count; `target_layer` is the layer its live conversations are written to.
-/// Reads the shared substrate through the handle — one version of it, held for
-/// the walk — never a rebuild from the log.
+/// `target_layer` is the layer its live conversations are written to. Reads
+/// the shared substrate through the handle — one version of it, held for the
+/// walk — never a rebuild from the log.
 pub fn overview(
     conv: &Conversation,
     schema: &Schema,
-    titler: Option<TimelineId>,
     target_layer: String,
     dir: &Path,
 ) -> SubstrateOverview {
@@ -116,7 +114,7 @@ pub fn overview(
         .layers
         .iter()
         .map(|l| {
-            let (conversation_count, tokens) = layer_totals(s, &l.groups, titler);
+            let (conversation_count, tokens) = layer_totals(s, &l.groups);
             LayerView {
                 name: l.name.clone(),
                 description: l.description.trim().to_string(),
@@ -155,18 +153,14 @@ pub fn overview(
     }
 }
 
-/// `(conversation count, total tokens)` across the non-empty, non-tombstoned,
-/// non-titler timelines targeting a layer's groups — the cheap headline numbers
-/// the overview shows without materializing the conversation list.
-fn layer_totals(
-    s: &Substrate,
-    groups: &[GroupSchema],
-    titler: Option<TimelineId>,
-) -> (usize, usize) {
+/// `(conversation count, total tokens)` across the non-empty, non-tombstoned
+/// timelines targeting a layer's groups — the cheap headline numbers the
+/// overview shows without materializing the conversation list.
+fn layer_totals(s: &Substrate, groups: &[GroupSchema]) -> (usize, usize) {
     groups
         .iter()
         .flat_map(|g| s.timelines_for_group(g.id))
-        .filter(|tl| Some(*tl) != titler && !s.is_tombstoned(*tl) && s.turn_count(*tl) > 0)
+        .filter(|tl| !s.is_tombstoned(*tl) && s.turn_count(*tl) > 0)
         .fold((0, 0), |(n, tok), tl| {
             (n + 1, tok + s.timeline_token_total(tl))
         })
@@ -221,13 +215,7 @@ layers:
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("seg-000001.log"), [0u8; 4]).unwrap();
 
-        let o = overview(
-            &conv,
-            builder.schema(),
-            None,
-            "interaction".into(),
-            dir.path(),
-        );
+        let o = overview(&conv, builder.schema(), "interaction".into(), dir.path());
         let mut v = serde_json::to_value(&o).unwrap();
         // A fresh ephemeral log has nothing dead yet, whichever way it reads.
         v["storage"]
@@ -288,7 +276,7 @@ layers:
         let conv = Conversation::new();
         assert!(conv.toggle_layer("dreams"));
         let dir = tempfile::tempdir().unwrap();
-        let o = overview(&conv, builder.schema(), None, String::new(), dir.path());
+        let o = overview(&conv, builder.schema(), String::new(), dir.path());
         let disabled: Vec<(&str, bool)> = o
             .layers
             .iter()

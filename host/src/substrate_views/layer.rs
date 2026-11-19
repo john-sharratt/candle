@@ -84,18 +84,16 @@ pub fn title(s: &Substrate, tl: TimelineId) -> Option<String> {
 ///
 /// Enumerates EVERY registered timeline of the groups — not just the
 /// conversations a client opened — so a layer the tenant fills itself
-/// surfaces its timelines too. `titler` is a timeline the tenant keeps for
-/// itself and leaves out; empty and tombstoned timelines are left out too.
+/// surfaces its timelines too. Empty and tombstoned timelines are left out.
 pub fn layer_conversations(
     s: &Substrate,
     groups: &[GroupSchema],
-    titler: Option<TimelineId>,
     unit: impl Fn(&Substrate, TimelineId) -> Unit,
 ) -> LayerConversations {
     let mut conversations: Vec<ConvView> = Vec::new();
     for g in groups {
         for tl in s.timelines_for_group(g.id) {
-            if Some(tl) == titler || s.is_tombstoned(tl) || s.turn_count(tl) == 0 {
+            if s.is_tombstoned(tl) || s.turn_count(tl) == 0 {
                 continue;
             }
             let summary_nodes = s
@@ -163,12 +161,7 @@ layers:
         let builder = Builder::from_yaml(SCHEMA).unwrap();
         let conv = Conversation::new();
         let read = conv.read();
-        let layer = layer_conversations(
-            &read,
-            &builder.schema().layers[0].groups,
-            None,
-            Unit::titled,
-        );
+        let layer = layer_conversations(&read, &builder.schema().layers[0].groups, Unit::titled);
         assert_eq!(
             serde_json::to_value(&layer).unwrap(),
             json!({"conversations": []})

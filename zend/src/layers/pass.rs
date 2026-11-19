@@ -444,14 +444,14 @@ fn day_below(day: &DaySource) -> Below {
 
 /// Every closed day of the live dialogue.
 fn dialogue_days(ctx: &RefreshContext<'_>) -> Vec<DaySource> {
-    let Some((group, titler)) = ctx.dialogue else {
+    let Some(group) = ctx.dialogue else {
         return Vec::new();
     };
     let e = ctx.engine;
     let convs: Vec<_> = e
         .group_conversations(group)
         .into_iter()
-        .filter(|tl| Some(*tl) != titler && e.conversation_conv_id(*tl).is_some())
+        .filter(|tl| e.conversation_conv_id(*tl).is_some())
         // A turn stamped with no wall time (a legacy stamp) is of no day:
         // taken at face value it would make a 1970-01-01 of its own.
         .map(|tl| {

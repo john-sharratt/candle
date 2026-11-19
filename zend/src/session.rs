@@ -191,7 +191,9 @@ pub mod diag;
 mod memory_writer;
 mod prewarm;
 mod replay;
+mod titler;
 use prewarm::Prewarm;
+use titler::{retire_titler_timelines, Titler};
 pub mod restore;
 mod titles;
 
@@ -882,9 +884,6 @@ struct InferenceState {
     memory_writer: Mutex<Option<TaskHandle<()>>>,
     /// What the memory's writer stops on — between jobs, and mid-turn.
     memory_stop: CancelToken,
-    /// The titler's timeline id — excluded from `list_conversations` so
-    /// it doesn't show up in the user-facing sidebar.
-    titler_timeline: TimelineId,
     /// Set once shutdown begins. The titler worker checks it between jobs and
     /// stops draining; the request path stops enqueuing new title jobs.
     shutting_down: AtomicBool,
@@ -1809,33 +1808,19 @@ impl InferenceState {
             }
         }
 
-        // Dedicated titler conversation. Lives on the `Reserved::Titler`
-        // id range (at the top of the u32 space) so its layer/group/section
-        // can't collide with the user schema's YAML-allocated ids — even
-        // though they share the same workspace substrate, the titler's
-        // turns never enter a user conversation's projection.
-        //
-        // Its KV cache for the (tiny) system prompt is prefilled once here;
-        // every title-generation reuses it. It is background to the dialogue
-        // it names, so it decodes at `Normal`: it never holds that dialogue's
-        // prompt back.
-        let titler_formatted = conv_config
-            .dialect
-            .format_system_prompt(TITLER_SYSTEM_PROMPT);
-        let titler = engine
-            .new_reserved_conversation(
-                &titler_formatted,
-                Reserved::Titler,
-                DecodePriority::Normal,
-                conv_config.clone(),
-            )
-            .map_err(|e| anyhow::anyhow!("titler create: {e}"))?;
-        let titler_timeline = titler.timeline_id();
-        let tokenizer = Arc::new(engine.tokenizer().clone());
-        tracing::info!(
-            titler_timeline = ?titler_timeline,
-            "titler conversation ready",
+        // The titler: what each title job opens its own conversation on
+        // (`titles::Titler`). The timelines a titler conversation that lived
+        // across jobs left behind hold every title it ever wrote, which each
+        // title's projection scored: they go.
+        let titler = Titler::new(
+            conv_config
+                .dialect
+                .format_system_prompt(TITLER_SYSTEM_PROMPT),
+            conv_config.clone(),
         );
+        let retired = retire_titler_timelines(&engine);
+        let tokenizer = Arc::new(engine.tokenizer().clone());
+        tracing::info!(retired, "titler ready");
 
         // ── Calibrating sections ──────────────────────────────────────────────
         // Prefill each registered tool's authored trajectories and questions into
@@ -2214,7 +2199,7 @@ impl InferenceState {
         // Every conversation keeps its own branch per repository; one with none
         // yet starts on the repository's base.
         let base_branches = conv_branches::base_branches(&workspace);
-        let seeded = conv_branches::seed_live(&engine, &base_branches, titler_timeline);
+        let seeded = conv_branches::seed_live(&engine, &base_branches);
         tracing::info!(seeded, "conversations given their base branches");
         let state = Arc::new(Self {
             decoder,
@@ -2231,7 +2216,6 @@ impl InferenceState {
             titler_worker: Mutex::new(None),
             memory_writer: Mutex::new(None),
             memory_stop: CancelToken::new(),
-            titler_timeline,
             shutting_down: AtomicBool::new(false),
             ingest_convs: Mutex::new(ingest_convs),
             ingest_layers,
@@ -2391,10 +2375,7 @@ impl InferenceState {
                     }
                 })
             }),
-            dialogue: self
-                .refresh_builder
-                .id_for_group("primary_conversation")
-                .map(|group| (group, Some(self.titler_timeline))),
+            dialogue: self.refresh_builder.id_for_group("primary_conversation"),
         }
     }
 
@@ -5766,24 +5747,20 @@ async fn wait_whole(state: &InferenceState, timeline: TimelineId) -> bool {
 
 /// The conversations a resume may touch, of those `wanted` names.
 /// Passthrough conversations are the client's own turns and are not
-/// resumable here; the titler's timeline is not a conversation; an archived
-/// one has been distilled and must not take another turn. A deleted one is
-/// already absent — `known_conversations` excludes tombstoned timelines. An
-/// ingest layer carries no `conv_id` at all and is never listed here.
+/// resumable here; an archived one has been distilled and must not take
+/// another turn. A deleted one is already absent — `known_conversations`
+/// excludes tombstoned timelines. An ingest layer, and a title job, carry no
+/// `conv_id` at all and are never listed here.
 fn resumable_conversations(
     state: &InferenceState,
     wanted: impl Fn(TimelineId) -> bool,
 ) -> Vec<(TimelineId, String)> {
-    let titler = state.titler_timeline;
     state
         .engine
         .known_conversations()
         .into_iter()
         .filter(|(tl, conv_id, _, archived, _)| {
-            *tl != titler
-                && !*archived
-                && !conv_id.starts_with(passthrough::CONV_ID_PREFIX)
-                && wanted(*tl)
+            !*archived && !conv_id.starts_with(passthrough::CONV_ID_PREFIX) && wanted(*tl)
         })
         .map(|(tl, conv_id, _, _, _)| (tl, conv_id))
         .collect()
@@ -6254,18 +6231,13 @@ fn request_retitle(state: &InferenceState, timeline: TimelineId, request: &str, 
     }
 }
 
-/// The titler task. Owns the titler [`Sequence`] exclusively and drains title
-/// jobs one at a time off `rx`. Each title-gen overlaps the main decode (the
-/// scheduler batches both sequences), but the task never blocks the request
-/// path and never piles up work per submit. Between jobs it checks the
-/// shutdown flag, so once shutdown begins it stops draining queued jobs
-/// immediately; on exit it abandons any in-flight turn so the sequence is
-/// left clean.
-async fn titler_task(
-    state: Arc<InferenceState>,
-    mut titler: Sequence,
-    mut rx: mpsc::Receiver<TitleJob>,
-) {
+/// The titler task. Drains title jobs one at a time off `rx`, each on a
+/// conversation of its own ([`Titler`]). Each title-gen overlaps the main
+/// decode (the scheduler batches both sequences), but the task never blocks
+/// the request path and never piles up work per submit. Between jobs it
+/// checks the shutdown flag, so once shutdown begins it stops draining queued
+/// jobs immediately.
+async fn titler_task(state: Arc<InferenceState>, titler: Titler, mut rx: mpsc::Receiver<TitleJob>) {
     while let Some(job) = rx.recv().await {
         if state.shutting_down.load(Ordering::Relaxed) {
             break;
@@ -6279,7 +6251,7 @@ async fn titler_task(
                     FIRST_HEAD_TOKENS,
                     FIRST_TAIL_TOKENS,
                 );
-                generate_one_title(&state, &mut titler, timeline, &prompt).await;
+                generate_one_title(&state, &titler, timeline, &prompt).await;
             }
             TitleJob::Retitle { timeline } => {
                 // Read the title as it stands when the re-title starts — the
@@ -6292,27 +6264,21 @@ async fn titler_task(
                     head_tail_truncate(text, &state.tokenizer, head, tail)
                 };
                 let prompt = retitle_prompt(current.as_deref(), &exchange, &cut);
-                generate_one_title(&state, &mut titler, timeline, &prompt).await;
+                generate_one_title(&state, &titler, timeline, &prompt).await;
             }
         }
     }
-    // If shutdown interrupted a decode, the turn is still in flight — clear it
-    // so the sequence (and its substrate timeline) unwinds cleanly.
-    if titler.is_in_flight() {
-        titler.abort_turn();
-    }
 }
 
-/// Run the titler conversation against `prompt` — a first message, or a
-/// re-title's current title and latest exchange ([`titles`]), already bounded
-/// — and write the result as the main conversation's sidebar label. Errors are
-/// logged and dropped — the worst case is a stale sidebar label, never a failed
-/// response. Any turn that doesn't reach `Done` (scheduler error, or shutdown
-/// mid-decode) is aborted rather than left in flight, so the next title-gen
-/// can `reset`.
+/// Decode a title for `prompt` — a first message, or a re-title's current
+/// title and latest exchange ([`titles`]), already bounded — on a conversation
+/// opened for it, and write the result as the main conversation's sidebar
+/// label. Errors are logged and dropped — the worst case is a stale sidebar
+/// label, never a failed response. The conversation is retired however the
+/// title ends ([`Titler`]).
 async fn generate_one_title(
     state: &Arc<InferenceState>,
-    titler: &mut Sequence,
+    titler: &Titler,
     timeline: TimelineId,
     prompt: &str,
 ) {
@@ -6360,12 +6326,21 @@ async fn generate_one_title(
         }
     };
 
-    // Clear the titler's in-memory turn tree so each title-gen starts from
-    // just the system prompt (no accumulated history).
-    if let Err(e) = titler.reset() {
-        tracing::warn!("titler reset failed: {e}");
-        return;
-    }
+    // A conversation of its own, so the title reads the system prompt and the
+    // text it names, and nothing else. Opening it is a scheduler round trip.
+    let opening = (Arc::clone(state), titler.clone());
+    let mut job = match tokio::task::spawn_blocking(move || opening.1.open(&opening.0)).await {
+        Ok(Ok(job)) => job,
+        Ok(Err(e)) => {
+            tracing::warn!("titler conversation did not open: {e}");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("titler conversation open panicked: {e}");
+            return;
+        }
+    };
+    let titler = &mut job.sequence;
     // The titler generates a short label — never reason. Suppress thinking
     // explicitly (the model thinks by default).
     let mut titler_sel = candle_conversation::SelectionState::new();
@@ -6395,19 +6370,14 @@ async fn generate_one_title(
     let resp = match handle.wait_async().await {
         Ok(r) => r,
         Err(e) => {
-            // No response: scheduler error or shutdown mid-decode. Abandon the
-            // turn so it doesn't wedge the sequence (the cause of the shutdown
-            // "already has a turn in flight" reset loop).
+            // No response: scheduler error or shutdown mid-decode. The
+            // conversation is retired with `job` either way.
             tracing::warn!("titler ended without a response: {e}");
-            drop(handle);
-            titler.abort_turn();
             return;
         }
     };
     let title = clean_title(&resp.text);
-    if let Err(e) = titler.finish_turn(handle, &resp) {
-        tracing::warn!("titler finish_turn failed: {e}");
-    }
+    drop(job);
 
     if title.is_empty() {
         tracing::warn!("titler produced an empty title — skipping label write");
@@ -6989,21 +6959,16 @@ impl ZendSession {
         ))
     }
 
-    /// What the substrate views read: the substrate, the titler's timeline they
-    /// leave out, and the target layer — the loaded engine's, or while zend is
-    /// still loading the substrate the load published once its redo log
-    /// replayed, with no titler or target layer built yet. `None` before the
-    /// replay has finished.
-    fn substrate_for_views(&self) -> Option<(Conversation, Option<TimelineId>, String)> {
+    /// What the substrate views read: the substrate and the target layer — the
+    /// loaded engine's, or while zend is still loading the substrate the load
+    /// published once its redo log replayed, with no target layer built yet.
+    /// `None` before the replay has finished.
+    fn substrate_for_views(&self) -> Option<(Conversation, String)> {
         if let Some(state) = self.inference.load_full() {
-            return Some((
-                state.substrate.clone(),
-                Some(state.titler_timeline),
-                state.target_layer.clone(),
-            ));
+            return Some((state.substrate.clone(), state.target_layer.clone()));
         }
         let conv = self.loading_substrate.get().cloned()?;
-        Some((conv, None, String::new()))
+        Some((conv, String::new()))
     }
 
     /// `GET /v1/substrate` — a structural snapshot of the live substrate for the
@@ -7013,13 +6978,12 @@ impl ZendSession {
     /// rebuild from the log.
     /// Answers while zend is still loading, once its substrate has replayed.
     pub fn substrate_overview(&self) -> Option<SubstrateOverview> {
-        let (conv, titler, target_layer) = self.substrate_for_views()?;
+        let (conv, target_layer) = self.substrate_for_views()?;
         // The builder parsed once at session construction: no lock held, and no
         // per-request re-parse.
         Some(overview(
             &conv,
             self.projection_builder.schema(),
-            titler,
             target_layer,
             &self.config.workspace.root().join(SUBSTRATE_DIR),
         ))
@@ -7056,9 +7020,9 @@ impl ZendSession {
             .iter()
             .find(|l| l.name == name)
             .map(|l| l.groups.clone())?;
-        let (conv, titler, _) = self.substrate_for_views()?;
+        let (conv, _) = self.substrate_for_views()?;
         let read = conv.read();
-        Some(layer_conversations(&read, &groups, titler, unit_of))
+        Some(layer_conversations(&read, &groups, unit_of))
     }
 
     /// `GET /v1/substrate/zend/system-prompt` — the target (dialogue) layer's framing:
@@ -7067,7 +7031,7 @@ impl ZendSession {
     /// itself loads from `substrate_tools`). Fetched when the system-prompt card
     /// expands.
     pub fn substrate_system_prompt(&self) -> Option<SystemPromptView> {
-        let (conv, _, target_layer) = self.substrate_for_views()?;
+        let (conv, target_layer) = self.substrate_for_views()?;
         let read = conv.read();
         Some(system_prompt(
             &read,
@@ -7108,7 +7072,7 @@ impl ZendSession {
     /// every turn decoded. `tl` is the raw timeline id. `None` before the
     /// substrate has replayed or when no such timeline exists.
     pub fn substrate_timeline(&self, tl_raw: u64) -> Option<TimelineDetail> {
-        let (conv, _, _) = self.substrate_for_views()?;
+        let (conv, _) = self.substrate_for_views()?;
         let read = conv.read();
         timeline(&read, self.projection_builder.schema(), tl_raw)
     }
@@ -7331,7 +7295,6 @@ impl ZendSession {
         // count is its own timeline's, never a walk of every turn the substrate
         // holds (the ingest layers are most of them).
         let engine = &state.engine;
-        let titler_timeline = state.titler_timeline;
         let known = engine.known_conversations();
         let passthrough_tagged = engine.conversations_with_metadata_key(passthrough::METADATA_KEY);
         let conv = engine.conversation();
@@ -7339,7 +7302,6 @@ impl ZendSession {
         let active_of = |tl| view.timeline_entry(tl).map_or(0, |e| e.active);
         let mut entries: Vec<(ConvEntry, conv_order::Ranks)> = known
             .into_iter()
-            .filter(|(tl, _, _, _, _)| *tl != titler_timeline)
             .filter(|(_, _, _, archived, _)| include_archived || !*archived)
             .map(|(tl, conv_id, label, archived, order)| {
                 let entry = ConvEntry {

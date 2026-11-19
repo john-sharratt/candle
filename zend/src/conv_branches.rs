@@ -93,11 +93,10 @@ pub fn seed(engine: &ConversationEngine, timeline: TimelineId, bases: &BaseBranc
 }
 
 /// The startup pass: [`seed`] every conversation a user has — named, live,
-/// not archived — except `hidden`, the daemon's own titler. An archived
-/// conversation is seeded when it is next used instead: calibration archives
-/// thousands of exemplars, none of which works on a branch. Returns how many
-/// conversations were written.
-pub fn seed_live(engine: &ConversationEngine, bases: &BaseBranches, hidden: TimelineId) -> usize {
+/// not archived. An archived conversation is seeded when it is next used
+/// instead: calibration archives thousands of exemplars, none of which works
+/// on a branch. Returns how many conversations were written.
+pub fn seed_live(engine: &ConversationEngine, bases: &BaseBranches) -> usize {
     if bases.is_empty() {
         return 0;
     }
@@ -105,7 +104,7 @@ pub fn seed_live(engine: &ConversationEngine, bases: &BaseBranches, hidden: Time
     engine
         .known_conversations()
         .into_iter()
-        .filter(|(tl, _, _, archived, _)| !archived && *tl != hidden && live.contains(tl))
+        .filter(|(tl, _, _, archived, _)| !archived && live.contains(tl))
         .filter(|(tl, ..)| seed(engine, *tl, bases) > 0)
         .count()
 }
