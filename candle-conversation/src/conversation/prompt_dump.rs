@@ -219,11 +219,24 @@ fn name_collection(collection: &SectionCollection, names: &mut HashMap<SectionId
 }
 
 impl Sequence {
+    /// Whether this append-only conversation's next turn is projected: its
+    /// first, unsubmitted, when it inherits a lineage a frame would leave out.
+    fn first_turn_projects(&self) -> bool {
+        self.frame.is_some()
+            && self
+                .substrate
+                .read()
+                .parent_timeline(self.target.timeline)
+                .is_some()
+    }
+
     /// The tokens this conversation would be given if it decoded now, piece by
     /// piece with the scores that selected them. `None` for a layer that does
-    /// not reproject (`disable_reprojection`), whose prompt is not a selection.
+    /// not reproject (`disable_reprojection`), whose prompt is not a selection —
+    /// except the first turn of one that inherits a lineage, which is projected
+    /// rather than framed (`scheduler::frame`), so its prompt is this one.
     pub fn prompt_dump(&self) -> Option<PromptDump> {
-        if self.config.disable_reprojection {
+        if self.config.disable_reprojection && !self.first_turn_projects() {
             return None;
         }
         let scores = self.last_turn_belief_scores(true);

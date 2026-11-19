@@ -144,7 +144,7 @@ use band::recorded_band;
 use census_stage::Stage;
 use detached::Detached;
 use expert_counters::ExpertCounters;
-use frame::framed_segments;
+use frame::{framed_segments, frames};
 use graph_window::graph_window;
 use held_turn::HeldTurn;
 use phase_split::cobatched_step_shares;
@@ -4948,19 +4948,27 @@ impl Scheduler {
                 // turn: a submit that carries a frame (`ProjectionInputs::frame`)
                 // and finds the slot empty injects exactly the frame's sections
                 // instead of projecting, as part of its own admission and
-                // prefill. From then on the slot holds blocks and
-                // `skip_projection` holds. The trade-off is that collection-
-                // member / `depends_on`-gated sections (which only materialize
-                // via a projection) are NOT added; utility-layer system prompts
+                // prefill — unless the conversation inherits a lineage, which a
+                // frame would leave out: that first turn is projected, and the
+                // projection places the lineage whole (`frame::frames`). From
+                // then on the slot holds blocks and `skip_projection` holds.
+                // The trade-off is that collection-member / `depends_on`-gated
+                // sections (which only materialize via a projection) are NOT
+                // added to a framed slot; utility-layer system prompts
                 // (code_reading, repo_map) use only fixed sections, so this is
                 // exact for them.
                 let slot_holds_blocks =
                     self.session.sequence_block_count(parent_id.0).unwrap_or(0) > 0;
                 let skip_projection = disable_reprojection && slot_holds_blocks;
+                let inherits = slot_target.is_some_and(|t| {
+                    self.slot_conversations
+                        .get(&parent_id)
+                        .is_some_and(|c| c.read().parent_timeline(t.timeline).is_some())
+                });
                 let frame = projection_inputs
                     .as_ref()
                     .and_then(|i| i.frame.as_ref())
-                    .filter(|_| disable_reprojection && !slot_holds_blocks);
+                    .filter(|_| frames(disable_reprojection, slot_holds_blocks, inherits));
                 // Mark this as an append-only ingest timeline so the gentle-early
                 // ladder can demote its sealed, warm-backed KV to RAM at ~50%
                 // capacity — it is never re-attended until query time. See
