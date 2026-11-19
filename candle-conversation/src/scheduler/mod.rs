@@ -210,7 +210,7 @@ use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::stencil::{
     Healed, StencilDriver, StepMask, TriggerRegistry, TurnGrammar, TOOL_CALL_TREE_LABEL,
 };
-use crate::substrate::{ContentResolver, HotKv, ResidenceIndex, TurnPartWrite};
+use crate::substrate::{ContentResolver, HotKv, ProjectionScores, ResidenceIndex, TurnPartWrite};
 use crate::summary_tree::scope::Scope;
 use crate::summary_tree::{
     leaf_skeleton, structural_rollup, ProbeError, SelectionDiagnostics, SummariserTrigger, TurnKind,
@@ -3848,6 +3848,12 @@ pub(crate) struct Scheduler {
     /// this batch.
     pending_reprojections: Vec<SequenceId>,
 
+    /// A request's first-reading scores, by the parent slot its turn is
+    /// submitted again on (`first_reading`): the second reading's opening
+    /// projection is scored by them, so the question's files rank beside the
+    /// seeds rather than every round reading zero.
+    first_readings: HashMap<SequenceId, ProjectionScores>,
+
     /// Per-slot `Conversation` (workspace) registry.  Registered when
     /// [`SchedulerRequest::NewSequence`] allocates the slot; removed
     /// when [`SchedulerRequest::FreeSequence`] frees it.  The
@@ -4533,6 +4539,7 @@ impl Scheduler {
             carried_beliefs: HashMap::new(),
             guests,
             pending_reprojections: Vec::new(),
+            first_readings: HashMap::new(),
             slot_tokens: HashMap::new(),
             slot_projection_state: HashMap::new(),
             cold_load_stager: ColdLoadStager::with_preallocation(PINNED_PREALLOC_BYTES),
@@ -5045,7 +5052,14 @@ impl Scheduler {
                         // Target-aware read: the projection sees only
                         // `target.timeline` within `target.group`,
                         // masking sibling timelines.
-                        let view = conversation.read_for(target);
+                        // A request's second reading projects by its first
+                        // reading's scores (`first_reading`); every other
+                        // submit reads the substrate unscored.
+                        let first_reading = self.first_readings.remove(&parent_id);
+                        let view = match &first_reading {
+                            Some(scores) => conversation.read_for_scored(target, scores),
+                            None => conversation.read_for(target),
+                        };
                         question_pending = ContentResolver::working_set_boundary(&view)
                             .is_some_and(|b| b.question_pending);
                         // Prefill mode: section scoring uses the calibrated

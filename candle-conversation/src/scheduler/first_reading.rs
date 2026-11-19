@@ -114,7 +114,8 @@ impl Scheduler {
             (Ok(_), None) => fail(ConversationError::Channel(format!(
                 "first reading: view {view_id} has no parent to submit its turn again on"
             ))),
-            (Ok(candidates), Some(parent)) => {
+            (Ok((candidates, scores)), Some(parent)) => {
+                self.first_readings.insert(parent, scores);
                 note("first reading", || {
                     format!(
                         "view={} parent={} tokens={} candidates={candidates} scored_ms={}",
@@ -141,12 +142,13 @@ impl Scheduler {
     /// Score the reading `view_id` holds: its probe through the belief scan,
     /// folded into the working set's momentum at a boundary that takes the
     /// question. Its hits are read and dropped. Returns how many candidates
-    /// the scan scored.
+    /// the scan scored, and its scores, which the second reading's opening
+    /// projection is ranked by.
     fn score_first_reading(
         &mut self,
         view_id: SequenceId,
         work: &PrefillWork,
-    ) -> Result<usize, ConversationError> {
+    ) -> Result<(usize, ProjectionScores), ConversationError> {
         let policy = work.reprojection.clone().ok_or_else(|| {
             ConversationError::Channel(format!(
                 "first reading: view {view_id} carries no reprojection policy"
@@ -174,7 +176,7 @@ impl Scheduler {
             policy.max_probe_tokens,
         );
         let schema = policy.projection.schema();
-        let (_, group_candidates) = policy.substrate.score_beliefs(
+        let (scores, group_candidates) = policy.substrate.score_beliefs(
             schema,
             policy.target,
             &probe.probe,
@@ -212,7 +214,7 @@ impl Scheduler {
             &group_candidates,
             &HashMap::new(),
         );
-        Ok(group_candidates.iter().map(|(_, c)| c.len()).sum())
+        Ok((group_candidates.iter().map(|(_, c)| c.len()).sum(), scores))
     }
 }
 
