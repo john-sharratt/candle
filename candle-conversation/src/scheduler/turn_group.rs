@@ -500,6 +500,7 @@ impl Scheduler {
                     recorded_reply: None,
                     recurrent_spans: Vec::new(),
                     rereads: false,
+                    second_reading: false,
                 });
                 // An arrival is an admission opportunity.
                 self.settled_since_admit = true;

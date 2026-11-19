@@ -570,8 +570,13 @@ view are discarded: nothing was sealed, so the parent stands where it stood.
 The turn is then submitted again unchanged, and its opening projection places
 the seeds and what the question ranked in one ranking, chosen whole, before
 the question is prefilled the second time and the reply decodes
-(`scheduler/first_reading.rs`). A first reading that cannot be scored fails
-the turn.
+(`scheduler/first_reading.rs`). The second reading only prefills: it takes no
+boundary at its opening's end (`PrefillWork::second_reading`), so its slot is
+the first reading's ranking until the decode's own boundaries move it. Scored
+there again — inside the seeded slot, a different probe — the question
+replaced the first reading's ranking with another, and on BlackWorld
+(2026-11-20) dropped `recorded_reply.rs` at reply token 1 though the opening
+had just placed it. A first reading that cannot be scored fails the turn.
 
 The seeds are background every conversation keeps; the question read against
 them is a different probe. On BlackWorld (2026-11-20) the question naming

@@ -6714,10 +6714,14 @@ impl Scheduler {
         // early first-reprojection below fires only for turns whose target
         // layer runs belief-driven selection — a plain-prompt layer (the
         // titler's single-section schema) gains nothing from the extra swap.
-        let wants_early_reprojection = work
-            .reprojection
-            .as_ref()
-            .is_some_and(|p| p.has_belief_collections());
+        // A request's second reading is not scored at its opening's end: its
+        // first reading scored the question, and it goes straight into the
+        // decode (`first_reading`).
+        let wants_early_reprojection = !work.second_reading
+            && work
+                .reprojection
+                .as_ref()
+                .is_some_and(|p| p.has_belief_collections());
 
         // Through `push_generated` like every other token, so a `</think>` the
         // prefill's own logits produced still fixes the reasoning boundary.
@@ -7469,6 +7473,7 @@ mod wave_chunk_tests {
                 recorded_reply: None,
                 recurrent_spans: Vec::new(),
                 rereads: false,
+                second_reading: false,
             },
             offset: 0,
             next_projection: 0,

@@ -2339,6 +2339,11 @@ pub(super) struct PrefillWork {
     /// scored, and submitted again with them. Set at submit for a turn a new
     /// user message opens.
     pub(super) rereads: bool,
+    /// A request's second reading: projected by its first reading's scores,
+    /// it prefills and goes straight into the decode — the boundary at the
+    /// end of its opening is not taken, the first reading having scored the
+    /// question (`first_reading`).
+    pub(super) second_reading: bool,
 }
 
 /// An in-flight prefill, partially advanced. Lives across scheduler
@@ -5027,8 +5032,10 @@ impl Scheduler {
                 // default when projection is skipped.
                 let mut turn_belief = PriorBelief::default();
                 // Whether a new user message waits for its first boundary — the
-                // turn is a request, read first without the seeds.
+                // turn is a request, read first without the seeds — and
+                // whether this submit is a request's second reading.
                 let mut question_pending = false;
+                let mut second_reading = false;
                 let (projected_sections, projected_segments) =
                     if let (Some(frame), Some(_)) = (frame, slot_target) {
                         let (sections, segments, turns) = framed_segments(frame);
@@ -5056,6 +5063,7 @@ impl Scheduler {
                         // reading's scores (`first_reading`); every other
                         // submit reads the substrate unscored.
                         let first_reading = self.first_readings.remove(&parent_id);
+                        second_reading = first_reading.is_some();
                         let view = match &first_reading {
                             Some(scores) => conversation.read_for_scored(target, scores),
                             None => conversation.read_for(target),
@@ -5314,6 +5322,7 @@ impl Scheduler {
                         recorded_reply,
                         recurrent_spans,
                         rereads,
+                        second_reading,
                     },
                     lift,
                     depth,
@@ -6860,6 +6869,7 @@ impl Scheduler {
             recorded_reply: None,
             recurrent_spans: Vec::new(),
             rereads: false,
+            second_reading: false,
         });
         Ok(())
     }
@@ -17339,6 +17349,7 @@ mod tests {
             recorded_reply: None,
             recurrent_spans: Vec::new(),
             rereads: false,
+            second_reading: false,
         }
     }
 
