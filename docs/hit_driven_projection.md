@@ -373,18 +373,18 @@ At each boundary:
 
 1. **Pool, by piece: the candidate set.** The pool is the only set the slot
    fill draws working-set rounds from. Its pieces are the ones holding a
-   floor (§8.5), then pieces by strength (§7.1) — a file the turn's loop just
-   read withheld (`docs/zend_working_set.md` §4.5) — kind by kind. A piece
-   enters or leaves the pool whole, with its index pages only: no K/V moves
-   for a pooled piece until the fill places one of its rounds. A dialogue's
-   pool opens empty (`docs/zend_working_set.md` §4.7).
+   floor (§8.5), then pieces by strength (§7.1) — seeds at the seed
+   momentum, a file the turn's loop just read withheld
+   (`docs/zend_working_set.md` §4.5) — kind by kind. A piece enters or leaves
+   the pool whole, with its index pages only: no K/V moves for a pooled
+   piece until the fill places one of its rounds.
    - **The scan's leaders first.** Each kind's minimum count is filled first
      by the pieces this boundary's scan scores highest — by their fresh
      score, not their strength — and then by strength
      (`WorkingSet::choose`). Hits reorder what the question ranks; they never
      push it out of the pool. Without this, a piece the indexer had read
-     during the opening — whatever the slot happened to hold — out-ranked by
-     its lifted strength a piece the question named.
+     during the opening — a seed, or whatever else the slot held — out-ranked
+     by its lifted strength a piece the question named.
    - **Size, per card: the larger of a token budget and a count per kind.**
      2,000,000 tokens on the 72 GB card, 1,000,000 on the 24 GB card, 512,000
      on the 16 GB card (`scheduler::pool::pool_tokens_for`), and at least 6
@@ -523,9 +523,12 @@ against the slot the last boundary chose. Its prefill rows are selected
 for the shadow scan, exactly as decoded queries are. The boundary at its end
 re-chooses the slot from those hits, and the reply decodes against that slot
 (`wants_early_reprojection`, which fires at the first decoded token). That
-boundary is the first to score the question; a new dialogue's opening holds no
-working set at all (`docs/zend_working_set.md` §4.7), so what the reply first
-reasons against is what the question ranks.
+boundary is the first to score the question, and it is the question's
+**opening**: the first after a new user message chooses its rounds whole, with
+no allowance (§7.2 step 5). A new question marks it on the dialogue's working
+set even when the set was cleared away when the dialogue opened
+(`Substrate::working_set_clear_withheld`) — missed there, the first question's
+slot was filled a third of a budget at a time.
 
 **The reasoning's first strides are short.** A reply still reasoning takes
 boundaries at 8, 16 and 32 decoded tokens before the cadence's at 64
@@ -975,9 +978,10 @@ the slot's held turns recorded at each scanned boundary
     the pool does not hold (`projection/fill_report.rs`). Read at
     `/v1/conversations/:id/projections/:turn/:event`: why a file the question
     named was not placed is the record's answer, not a reconstruction.
-28. **No seeds; the scan's leaders first; early boundaries (§7.2 step 1,
-    §7.4).** A dialogue's pool opens empty, each kind's minimum is filled by
-    the boundary's scan leaders before strength, and a reasoning reply takes
+28. **The scan's leaders first; the first question opens; early boundaries
+    (§7.2 step 1, §7.4).** Each kind's minimum is filled by the boundary's
+    scan leaders before strength, a dialogue's first question takes its
+    opening whether or not its set exists yet, and a reasoning reply takes
     boundaries at 8, 16 and 32 tokens — built 2026-11-20.
 
 ## 13. Handover

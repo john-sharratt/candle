@@ -3778,7 +3778,6 @@ impl Substrate {
     /// already — admitted again it emitted twice: `AGENTS.md`'s 46K characters
     /// stood in both the working set and the chain), or the scope of its group
     /// no longer offers it to `target`.
-    #[cfg(test)]
     fn working_set_candidate(&self, target: TimelineId, timeline: TimelineId) -> Option<Candidate> {
         let chain: HashSet<TimelineId> = self.inherited_chain(target).into_iter().collect();
         self.working_set_candidate_beside(target, &chain, timeline)
@@ -3815,6 +3814,31 @@ impl Substrate {
         })
     }
 
+    /// Seed `target`'s pool with `candidates` at `momentum`
+    /// ([`WorkingSet::seed`]), under this card's pool size. Returns the
+    /// candidates that did not enter.
+    pub fn working_set_seed(
+        &mut self,
+        target: TimelineId,
+        candidates: &[TimelineId],
+        momentum: f32,
+    ) -> Vec<TimelineId> {
+        let mut refused = Vec::new();
+        let mut admissible = Vec::new();
+        for &timeline in candidates {
+            match self.working_set_candidate(target, timeline) {
+                Some(candidate) => admissible.push((timeline, candidate)),
+                None => refused.push(timeline),
+            }
+        }
+        let pool = self.pool_size;
+        refused.extend(
+            self.working_set_mut(target)
+                .seed(&admissible, pool, momentum),
+        );
+        refused
+    }
+
     /// Keep `reads` from entering `target`'s working set
     /// ([`WorkingSet::withhold`]).
     pub fn working_set_withhold(&mut self, target: TimelineId, reads: &[TimelineId]) {
@@ -3831,12 +3855,12 @@ impl Substrate {
         }
     }
 
-    /// Let `target`'s withheld conversations enter again
-    /// ([`WorkingSet::clear_withheld`]).
+    /// A new question on `target`: its withheld conversations may enter again
+    /// and its next boundary is the question's opening
+    /// ([`WorkingSet::clear_withheld`]). Made if absent — a dialogue opens with
+    /// its set cleared away, and its first question still opens.
     pub fn working_set_clear_withheld(&mut self, target: TimelineId) {
-        if let Some(ws) = arc_mut(&mut self.working_sets, &target) {
-            ws.clear_withheld();
-        }
+        self.working_set_mut(target).clear_withheld();
     }
 
     /// Fold one reprojection's per-piece fresh scores into `target`'s pool
@@ -9361,6 +9385,21 @@ mod tests {
         assert!(ws.provenance().is_empty());
         sub.tombstone_timeline(target);
         assert!(sub.working_set(target).is_none());
+    }
+
+    /// **A new question opens the next boundary even on a set that does not
+    /// exist yet**: a dialogue opens with its set cleared away, and its first
+    /// question must still choose its slot whole, with no allowance.
+    #[test]
+    fn a_first_question_opens_the_first_boundary_of_an_absent_set() {
+        let (mut sub, target, _) = working_set_fixture(0, 10);
+        sub.working_set_clear(target);
+        assert!(sub.working_set(target).is_none());
+        sub.working_set_clear_withheld(target);
+        Substrate::working_set_boundary(&mut sub, target, &[]);
+        assert!(sub.working_set(target).unwrap().opening());
+        Substrate::working_set_boundary(&mut sub, target, &[]);
+        assert!(!sub.working_set(target).unwrap().opening());
     }
 
     #[test]

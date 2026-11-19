@@ -1355,6 +1355,18 @@ impl ConversationEngine {
         self.conversation.read().holds_whole(timeline)
     }
 
+    /// Seed `target`'s pool with `candidates` at `momentum`, in list order
+    /// while the pool has room. Returns the candidates that did not enter.
+    pub fn working_set_seed(
+        &self,
+        target: TimelineId,
+        candidates: &[TimelineId],
+        momentum: f32,
+    ) -> Vec<TimelineId> {
+        self.conversation
+            .update(|s| s.working_set_seed(target, candidates, momentum))
+    }
+
     /// Keep `reads` out of `target`'s working set until
     /// [`Self::working_set_clear_withheld`]: the files they read are verbatim
     /// in its dialogue, read for real this turn. A member among them stays.

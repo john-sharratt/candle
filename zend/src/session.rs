@@ -181,6 +181,8 @@ use crate::tools::{
 use crate::turn_claims::{self, NotTaken};
 use crate::types::{ChatMessage, Role, ToolMode, Usage};
 use crate::worker_hop;
+use crate::working_set::coverage::Coverage;
+use crate::working_set::seeds::Seeding;
 use crate::working_set::{corpus, dialogue_config};
 use crate::workspace::UPLOADS_REPO;
 
@@ -918,8 +920,11 @@ struct InferenceState {
     /// (`docs/incremental_chunk_exclusion.md`).
     exclusion_learners: Mutex<HashMap<GroupId, ExclusionLearner>>,
     /// The dialogue layer's working set (`docs/zend_working_set.md`). `None`
-    /// when the schema declares none.
+    /// when the schema declares none: nothing is seeded.
     working_set: Option<WorkingSetConfig>,
+    /// Whether each `code_reading` chain read its whole file — asked before a
+    /// file is served or seeded, answered once per chain.
+    read_coverage: Coverage,
     /// The workspace captured at startup — its folder and repositories.
     workspace: Workspace,
     /// The branch a conversation starts on in each git repository — `main`,
@@ -2222,6 +2227,7 @@ impl InferenceState {
             learning_exclusions: AtomicBool::new(false),
             exclusion_learners: Mutex::new(HashMap::new()),
             working_set,
+            read_coverage: Coverage::default(),
             refresh_builder: proj_builder_refresh,
             refresh_config: conv_config.clone(),
             formatted_prompt,
@@ -3438,11 +3444,11 @@ fn run_inference_stream(
                 let took = conv_inherit::take(&state.engine, timeline, &files, &mirror, &theirs);
                 tracing::info!(conv_id = %conv_id, %from, took, "a task begins on its starter's work");
             }
-            // Its working set is in-memory and did not survive. It starts
-            // empty and is chosen from the scan of its own questions
-            // (`docs/zend_working_set.md` §4.7): nothing enters before the
-            // question that would rank it.
-            if state.working_set.is_some() {
+            // Its working set is in-memory and did not survive. The seeds
+            // resolve again on its own branch and enter provenance at the
+            // seeding momentum, and the rest of the momentum rebuilds from
+            // the scan.
+            if let Some(config) = state.working_set.clone() {
                 let open_state = Arc::clone(&state);
                 let open_conv = conv_id.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
@@ -3450,8 +3456,11 @@ fn run_inference_stream(
                     open_state.engine.working_set_clear(timeline);
                     let clear_ms = t_open.elapsed().as_millis() as u64;
                     let t_scope = Instant::now();
-                    // Scope it before its first scan, which admits only what
-                    // the conversation's scope offers.
+                    // Scope it first. A seed is admitted only as the
+                    // conversation's scope offers it, and the scope is
+                    // otherwise first set right before its first submit — after
+                    // this — so every seed was refused: measured 2026-10-24, no
+                    // dialogue had carried a seed since scoping landed.
                     open_state.retrieval_scope.apply(
                         &open_state.engine,
                         timeline,
@@ -3459,12 +3468,18 @@ fn run_inference_stream(
                         &files,
                     );
                     let scope_ms = t_scope.elapsed().as_millis() as u64;
+                    let t_seed = Instant::now();
+                    let seeded =
+                        seed_working_set(&open_state, timeline, &open_conv, &files, &config);
+                    let seed_ms = t_seed.elapsed().as_millis() as u64;
                     tracing::info!(
                         target: "zend::working_set",
                         timeline = timeline.raw(),
+                        seeded,
                         clear_ms,
                         scope_ms,
-                        "working set opened empty",
+                        seed_ms,
+                        "working set opened: seeds in provenance",
                     );
                 })
                 .await
@@ -5616,6 +5631,29 @@ fn spawn_journal_folds(
             reconcile_journal_now(&state, &conv_id, timeline).await;
         }
     });
+}
+
+/// Resolve `config`'s seeds for `timeline` on its own branch and seed its
+/// provenance with them. Returns how many were seeded.
+fn seed_working_set(
+    state: &InferenceState,
+    timeline: TimelineId,
+    conv_id: &str,
+    files: &RepoFiles,
+    config: &WorkingSetConfig,
+) -> usize {
+    let folder_of = |repo: &str, inner: &str| {
+        state
+            .retrieval_scope
+            .folder_unit(&state.engine, files, conv_id, repo, inner)
+    };
+    Seeding {
+        engine: &state.engine,
+        files,
+        folder_of: &folder_of,
+        coverage: &state.read_coverage,
+    }
+    .apply(timeline, config)
 }
 
 /// The tool calls a sealed call turn is still waiting on — the round this
@@ -9446,6 +9484,8 @@ mod projection_schema_tests {
         // The persona and the journal are pinned, within 1,024 positions.
         assert!(!schema.system_prompt.pins.is_empty());
         assert_eq!(schema.system_prompt.pins.tokens, 1024);
+        assert_eq!(ws.seeds.len(), 17);
+        assert_eq!(ws.seeds[0], "candle/zend/");
 
         let tools = schema
             .system_prompt

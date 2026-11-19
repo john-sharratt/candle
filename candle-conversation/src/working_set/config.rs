@@ -3,6 +3,10 @@
 use super::fill_shares::FillShares;
 use super::type_shares::TypeShares;
 
+/// The fresh score of a full-strength hit — the top of the normalized band a
+/// reprojection scores a file on.
+const FULL_HIT: f32 = 1000.0;
+
 /// How a dialogue's pool is ranked and its slot shared out.
 ///
 /// Declared on the dialogue layer. A projection whose target layer declares
@@ -15,6 +19,11 @@ pub struct WorkingSetConfig {
     pub beta: f32,
     /// Strength below which a piece leaves the map and is no pool candidate.
     pub min_momentum: f32,
+    /// Workspace paths a dialogue starts out attending to: `repo/dir/` for a
+    /// folder (trailing `/`), `repo/path/file` for a file. Each enters the
+    /// pool at [`Self::seed_momentum`] when the conversation opens, while the
+    /// pool has room, and fades from there.
+    pub seeds: Vec<String>,
     /// What the slot keeps back for what can arrive between two projections:
     /// one cadence of decoded tokens, or one prefill chunk of an opening. The
     /// slot itself is the engine's trained window
@@ -61,6 +70,13 @@ impl WorkingSetConfig {
             expanded,
         }
     }
+
+    /// What a seed starts at: one full-strength hit. With no further hits it
+    /// falls under `min_momentum` after `ln(1000 / min_momentum) / ln(1 / (1 − β))`
+    /// reprojections — eleven at β 0.2 and a floor of 100.
+    pub fn seed_momentum(&self) -> f32 {
+        FULL_HIT
+    }
 }
 
 #[cfg(test)]
@@ -71,6 +87,7 @@ mod tests {
         WorkingSetConfig {
             beta: 0.2,
             min_momentum: 100.0,
+            seeds: Vec::new(),
             reserve_tokens: 16_384,
             type_shares: TypeShares::default(),
             fill_shares: FillShares::new(0.225, 0.02, 0.05, 0.105, 0.60).unwrap(),
@@ -88,5 +105,10 @@ mod tests {
         let reserve = cfg().slot_window(16_384);
         assert_eq!(reserve.window, 32_768, "the reserve leaves nothing");
         assert!(reserve.expanded.is_some());
+    }
+
+    #[test]
+    fn a_seed_starts_at_one_full_hit() {
+        assert_eq!(cfg().seed_momentum(), 1000.0);
     }
 }

@@ -1,12 +1,13 @@
-//! The ingested readings of a file a turn's own reads put out of the working
-//! set (`docs/zend_working_set.md` §4.5).
+//! The ingested readings of a file: which finished `code_reading` conversation
+//! read the version a dialogue's base holds, and which readings a turn's own
+//! reads put out of the working set (`docs/zend_working_set.md` §4.5).
 //!
 //! A `code_reading` conversation is a whole file, read once, sealed in the
 //! substrate and keyed by its path and blob id (`docs/zend_branch_ingest.md`
-//! §6.1). A `file_read` the dialogue makes runs for real, and its page then
-//! stands verbatim in the dialogue, so the readings of the version it read are
-//! kept out of the working set for the rest of the turn's loop
-//! ([`readings_of_all`]).
+//! §6.1). The seeds place such readings ahead of a dialogue. A `file_read` the
+//! dialogue makes runs for real, and its page then stands verbatim in the
+//! dialogue, so the readings of the version it read are kept out of the
+//! working set for the rest of the turn's loop ([`readings_of`]).
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -15,7 +16,9 @@ use candle_conversation::projection::TimelineId;
 use candle_conversation::ConversationEngine;
 use zend_vfs::{Oid, RepoFiles, Workspace};
 
-use crate::branch_ingest::keys::{file_key, CONTENT_KEY};
+use super::coverage::Coverage;
+use crate::branch_ingest::keys::{file_key, CONTENT_KEY, LINES_KEY};
+use crate::code_read::chain_finished;
 use crate::tools::ToolCall;
 
 /// The one tool whose reads are readings of a file.
@@ -96,11 +99,49 @@ pub fn file_key_of(files: &RepoFiles, repo: &str, rel: &str) -> Option<String> {
     Some(file_key(&format!("{repo}/{rel}"), &blob))
 }
 
+/// The finished, complete `code_reading` conversation among `readings` — the
+/// conversations that read one version of a file — or `None` when none read
+/// every line.
+pub fn file_conversation_among(
+    engine: &ConversationEngine,
+    coverage: &Coverage,
+    readings: &[TimelineId],
+) -> Option<TimelineId> {
+    readings
+        .iter()
+        .copied()
+        // A read whose chain never finished holds no summary: placed, it
+        // would put an assistant that deliberates and answers nothing into
+        // this conversation.
+        .filter(|&tl| chain_finished(engine, tl))
+        // A reading with turns empty here — not yet fetched from the member
+        // that wrote them, or retired — places nothing for them; another
+        // reading of the same version may be whole.
+        .filter(|&tl| engine.holds_whole(tl))
+        .find(|&tl| {
+            lines_of(engine, tl).is_some_and(|lines| coverage.is_complete(engine, tl, lines))
+        })
+}
+
 /// The blob id and size of the file `rel` in `repo` as the conversation's
 /// base holds it — `None` when the conversation has changed it (its own copy
 /// is what its read must return), or when there is no such file.
 fn committed(files: &RepoFiles, repo: &str, rel: &str) -> Option<(Oid, u64)> {
     files.repo(repo).ok()?.content_id(rel).ok()?
+}
+
+/// How many lines the file `timeline` read has, as its ingest recorded it.
+/// `None` for a conversation that recorded none.
+fn lines_of(engine: &ConversationEngine, timeline: TimelineId) -> Option<usize> {
+    lines_in(
+        engine
+            .conversation_metadata_value(timeline, LINES_KEY)
+            .as_deref(),
+    )
+}
+
+fn lines_in(recorded: Option<&str>) -> Option<usize> {
+    recorded?.parse().ok()
 }
 
 #[cfg(test)]
@@ -220,5 +261,14 @@ mod tests {
         assert_eq!(committed(&files, "candle", "b.rs"), None);
         assert_eq!(committed(&files, "candle", "nope.rs"), None);
         assert_eq!(committed(&files, "other", "a.rs"), None);
+    }
+
+    /// **The line count is the one the ingest recorded**, and a conversation
+    /// that recorded none — or something that is no count — answers nothing.
+    #[test]
+    fn the_line_count_is_the_one_the_ingest_recorded() {
+        assert_eq!(lines_in(None), None);
+        assert_eq!(lines_in(Some("350")), Some(350));
+        assert_eq!(lines_in(Some("many")), None);
     }
 }

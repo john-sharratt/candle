@@ -193,6 +193,45 @@ impl WorkingSet {
         self.members.iter().position(|m| m.timeline == timeline)
     }
 
+    /// Seed the pool with `candidates`, in list order: each gains `momentum`
+    /// (or keeps what it has, if that is higher) and enters after the members
+    /// already there while `pool` has room. Returns the candidates that did
+    /// not enter, in list order; one that missed only for room keeps its
+    /// momentum and is ranked at the next observation.
+    pub fn seed(
+        &mut self,
+        candidates: &[(TimelineId, Candidate)],
+        pool: PoolSize,
+        momentum: f32,
+    ) -> Vec<TimelineId> {
+        let mut refused = Vec::new();
+        for &(timeline, candidate) in candidates {
+            if self.is_member(timeline) {
+                continue;
+            }
+            let (Some(tokens), Some(share)) = (candidate.tokens, candidate.share) else {
+                refused.push(timeline);
+                continue;
+            };
+            let entry = self.momentum.entry(timeline).or_insert(0.0);
+            *entry = entry.max(momentum);
+            let typed_over = candidate
+                .kind
+                .is_some_and(|k| self.type_tokens(k.id) + tokens > k.tokens(pool.tokens));
+            if self.tokens() + tokens > pool.tokens || typed_over {
+                refused.push(timeline);
+                continue;
+            }
+            self.members.push(Member {
+                timeline,
+                tokens,
+                share,
+                kind: candidate.kind,
+            });
+        }
+        refused
+    }
+
     /// Fold one reprojection in.
     ///
     /// 1. Momentum: `m ← (1 − β)·m + fresh` for every conversation, where one
@@ -333,7 +372,6 @@ impl WorkingSet {
     }
 
     /// Tokens the members of type `id` hold.
-    #[cfg(test)]
     fn type_tokens(&self, id: u8) -> usize {
         self.members
             .iter()
@@ -636,21 +674,54 @@ mod tests {
         assert_eq!(order(&ws), vec![1, 3, 4], "2 fell to 83, under 100");
     }
 
-    /// **A conversation opens on an empty pool**: nothing is a member until a
-    /// scan scores it.
+    /// **Seeds enter in list order at the seeding momentum while they fit**;
+    /// one that misses for room keeps its momentum.
     #[test]
-    fn a_pool_opens_empty() {
-        let ws = WorkingSet::default();
-        assert!(ws.members().is_empty());
-        assert_eq!(ws.tokens(), 0);
+    fn seeds_enter_in_list_order_while_they_fit() {
+        let mut ws = WorkingSet::default();
+        let seeds: Vec<(TimelineId, Candidate)> =
+            [1, 8, 2, 9, 3].iter().map(|&r| (tl(r), cand(r))).collect();
+        let refused = ws.seed(&seeds, pool(200), 1_000.0);
+        assert_eq!(order(&ws), vec![1, 2]);
+        assert_eq!(refused, vec![tl(8), tl(9), tl(3)]);
+        assert_eq!(ws.momentum_of(tl(3)), Some(1_000.0), "3 keeps its momentum");
     }
 
-    /// An unattended file fades: 1,000 × 0.8¹⁰ ≈ 107 is still in after ten
-    /// reprojections that do not score it, and the eleventh takes it out.
+    /// **Seeds keep to the share too**: of three document seeds two enter,
+    /// and the code seed after them.
     #[test]
-    fn an_unattended_file_fades_out() {
+    fn document_seeds_keep_to_the_share() {
         let mut ws = WorkingSet::default();
-        observe(&mut ws, &[(1, 1_000.0)], 1_000);
+        let seeds: Vec<(TimelineId, Candidate)> =
+            [70, 71, 72, 1].iter().map(|&r| (tl(r), cand(r))).collect();
+        let refused = ws.seed(&seeds, pool(1_000), 1_000.0);
+        assert_eq!(order(&ws), vec![70, 71, 1]);
+        assert_eq!(refused, vec![tl(72)]);
+    }
+
+    /// **The seeds give way to what the question ranks**: two seeds at 1,000,
+    /// one the indexer read during the opening, and a pool with room for one
+    /// file. The question's scan leader takes the place, though the read seed
+    /// stands at 800 · (1 + 1) = 1,600.
+    #[test]
+    fn the_seeds_give_way_to_what_the_question_ranks() {
+        let size = PoolSize {
+            tokens: 100,
+            per_kind: 1,
+        };
+        let mut ws = WorkingSet::default();
+        ws.seed(&[(tl(1), cand(1)), (tl(2), cand(2))], pool(200), 1_000.0);
+        ws.observe_hits(&read(&[1]), &HitsConfig::default());
+        observe_in(&mut ws, &[(3, 900.0)], size);
+        assert_eq!(order(&ws), vec![3]);
+    }
+
+    /// An unattended seed fades like any other file: 1,000 × 0.8¹⁰ ≈ 107 is
+    /// still in after ten reprojections, and the eleventh takes it out.
+    #[test]
+    fn an_unattended_seed_fades_out() {
+        let mut ws = WorkingSet::default();
+        ws.seed(&[(tl(1), cand(1))], pool(1_000), 1_000.0);
         for _ in 0..10 {
             observe(&mut ws, &[], 1_000);
         }

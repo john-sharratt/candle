@@ -1223,10 +1223,9 @@ layers:
     on_corrupt_turn: drop_turn
     # What every dialogue already knows about the code (docs/zend_working_set.md):
     # whole `repo_map` folders and `code_reading` files, projected ahead of its
-    # own turns and outside its `window`, in the order they entered. It opens
-    # empty; the files its questions score enter, those it keeps attending to
-    # stay by momentum, and they fade when it stops. Every `file_read` runs for
-    # real, and a file the
+    # own turns and outside its `window`, in the order they entered. The files
+    # it keeps attending to — starting with the seeds — stay by momentum and
+    # fade when it stops. Every `file_read` runs for real, and a file the
     # turn's loop read is not placed again until the next question.
     working_set:
       # The slot is the engine's trained window, so a dialogue runs the
@@ -1264,6 +1263,29 @@ layers:
             - '\.(ya?ml|toml|json|jsonc|ini|cfg|conf|env|properties)$'
             - '(^|/)(Cargo\.toml|package\.json|pyproject\.toml|go\.mod)$'
           max_share: 0.15
+      # What a dialogue starts out attending to: each enters provenance at the
+      # momentum of one full-strength hit (1000) when the conversation opens and
+      # fades like any other file it stops attending to. Within `--max-depth 3`.
+      # The priming chain already carries the repository roots, READMEs and
+      # AGENTS.md for good, so they are not listed here.
+      seeds:
+        - candle/zend/
+        - candle/zend/src/
+        - candle/zend-tools/src/
+        - candle/candle-conversation/src/
+        - candle/candle-transformers/src/models/
+        - candle/candle-nn/src/kv_cache/
+        - candle/candle-core/src/
+        - candle/candle-kernels/src/
+        - candle/docs/
+        - candle/Cargo.toml
+        - candle/docs/deployment.md
+        - candle/docs/zend_branch_ingest.md
+        - candle/docs/zend_working_set.md
+        - candle/zend/src/lib.rs
+        - candle/zend/src/main.rs
+        - candle/zend-tools/src/lib.rs
+        - candle/candle-conversation/src/lib.rs
     budget:
       priority: 100
       min_percent: 50    # dialogue keeps at least half its own window

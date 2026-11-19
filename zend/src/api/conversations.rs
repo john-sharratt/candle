@@ -32,9 +32,9 @@ use crate::mcp::ownership::Viewer;
 use crate::parts::{parts_of, Part};
 use crate::projection_event::ProjectionSpanOut;
 use crate::session::{ConvEntry, ConversationDials, UploadInfo, UploadStats, ZendSession};
-use crate::tool_responses::response_bodies;
 use crate::tools::tool_catalog;
 use crate::types::Role;
+use crate::working_set::coverage::response_bodies;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct ListQuery {
