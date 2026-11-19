@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use super::{SectionRef, SectionState, Sequence};
+use super::{SectionRef, SectionState, Sequence, Sharing};
 
 /// How often a wait for a seal looks at the section's state.
 const SEAL_POLL: Duration = Duration::from_millis(20);
@@ -39,14 +39,17 @@ const SEAL_POLL: Duration = Duration::from_millis(20);
 struct Held {
     text: String,
     after: Vec<String>,
+    sharing: Sharing,
     section: SectionRef,
 }
 
-/// One section to be carried.
+/// One section to be carried: its name, its text, and whose it is
+/// (`docs/shared_journal_sections.md` §2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Want<'a> {
     pub name: &'a str,
     pub text: &'a str,
+    pub sharing: Sharing,
 }
 
 /// How a collection's sections relate to one another.
@@ -68,12 +71,13 @@ struct Plan {
 }
 
 /// One section already held: its name, its text, the sections it was sealed
-/// after, and whether it can still be read (it has neither failed to seal nor
-/// been removed).
+/// after, whose it was sealed as, and whether it can still be read (it has
+/// neither failed to seal nor been removed).
 struct Standing<'a> {
     name: &'a str,
     text: &'a str,
     after: &'a [String],
+    sharing: Sharing,
     alive: bool,
 }
 
@@ -86,7 +90,9 @@ fn before(wanted: &[Want<'_>], i: usize) -> Vec<String> {
 ///
 /// In a [`Linking::Chain`] a section is current only when it was sealed after
 /// exactly the sections now wanted before it, and the first that is not makes
-/// every section after it not current either: they continue it.
+/// every section after it not current either: they continue it. A section
+/// sealed as another [`Sharing`] is not current: it is addressed apart, and
+/// only a shared run's end keeps the state it ends on.
 ///
 /// `sweep` names are removed when `sweeping`, whether or not anything held
 /// carries them, because a stream an earlier run left is not held.
@@ -105,9 +111,13 @@ fn plan(
             Linking::Chain => before(wanted, i),
         };
         let current = !broken
-            && held
-                .iter()
-                .any(|h| h.name == want.name && h.alive && h.text == want.text && h.after == after);
+            && held.iter().any(|h| {
+                h.name == want.name
+                    && h.alive
+                    && h.text == want.text
+                    && h.after == after
+                    && h.sharing == want.sharing
+            });
         if !current {
             plan.submit.push(i);
             broken = kept == Linking::Chain;
@@ -183,6 +193,7 @@ impl Carried {
                 name,
                 text: &h.text,
                 after: &h.after,
+                sharing: h.sharing,
                 alive: !matches!(
                     h.section.state(),
                     SectionState::Failed(_) | SectionState::Removed
@@ -216,13 +227,21 @@ impl Carried {
                 );
                 continue;
             }
-            match sequence.submit_section(collection, want.name, want.text, 1.0, &continues) {
+            match sequence.submit_section(
+                collection,
+                want.name,
+                want.text,
+                1.0,
+                &continues,
+                want.sharing,
+            ) {
                 Ok(section) => {
                     self.held.insert(
                         want.name.to_string(),
                         Held {
                             text: want.text.to_string(),
                             after,
+                            sharing: want.sharing,
                             section,
                         },
                     );
@@ -268,7 +287,11 @@ mod tests {
     use super::*;
 
     fn want<'a>(name: &'a str, text: &'a str) -> Want<'a> {
-        Want { name, text }
+        Want {
+            name,
+            text,
+            sharing: Sharing::Owned,
+        }
     }
 
     const NONE: &[String] = &[];
@@ -278,6 +301,7 @@ mod tests {
             name,
             text,
             after: NONE,
+            sharing: Sharing::Owned,
             alive,
         }
     }
@@ -287,8 +311,32 @@ mod tests {
             name,
             text,
             after,
+            sharing: Sharing::Owned,
             alive: true,
         }
+    }
+
+    /// **A section sealed as another kind is sealed again**, and so is what
+    /// continues it: the opening's close was the end of a shared run, and once
+    /// an entry of the conversation's own follows the opening it is owned.
+    #[test]
+    fn a_section_whose_sharing_changed_is_sealed_again() {
+        let one = names(&["journal/1"]);
+        let mut close = chained("journal/close", "x", &one);
+        close.sharing = Sharing::SharedEnd;
+        let mut first = chained("journal/1", "a", NONE);
+        first.sharing = Sharing::Shared;
+        let held = [first, close];
+        let wanted = [
+            Want {
+                sharing: Sharing::Shared,
+                ..want("journal/1", "a")
+            },
+            want("journal/close", "x"),
+        ];
+        let p = plan(&held, &wanted, Linking::Chain, &[], false);
+        assert_eq!(p.submit, vec![1]);
+        assert!(p.remove.is_empty());
     }
 
     fn names(n: &[&str]) -> Vec<String> {

@@ -26,6 +26,23 @@ use journal_core::period::Period;
 /// the journal, and the next round has it.
 pub const OPENING_SEAL_WAIT: Duration = Duration::from_secs(2);
 
+/// How the opening's first entry begins.
+pub const OPENING_LEAD: &str = "Before this session began, read the workspace: ";
+
+/// Whether `entry` is one of the opening's: over no turns, holding nothing
+/// but its line, and that line the opening's own. A drafted entry over the
+/// first turn has turns behind it in its claims.
+pub fn is_opening(entry: &Entry) -> bool {
+    entry.from_turn == 0
+        && entry.to_turn == 0
+        && entry.claims.is_empty()
+        && entry.intend.is_empty()
+        && entry.opened.is_empty()
+        && entry.resolved.is_empty()
+        && entry.digest.is_empty()
+        && (entry.summary == READING || entry.summary.starts_with(OPENING_LEAD))
+}
+
 /// The opening's second entry.
 pub const READING: &str = "Then read other files that seemed relevant to the work here, and \
 the user asked their opening question of this session, which I must answer.";
@@ -53,12 +70,7 @@ impl SeedRead {
         if !self.documents.is_empty() {
             read.push(listed(&self.documents));
         }
-        (!read.is_empty()).then(|| {
-            format!(
-                "Before this session began, read the workspace: {}.",
-                read.join("; ")
-            )
-        })
+        (!read.is_empty()).then(|| format!("{OPENING_LEAD}{}.", read.join("; ")))
     }
 
     /// The opening as entries written at `now_ms`, in order — both, or none
@@ -170,5 +182,23 @@ mod tests {
             assert_eq!(e.period, Period::Step);
             assert!(e.claims.is_empty());
         }
+    }
+
+    /// **The opening's entries are told apart from a drafted entry**, even one
+    /// over the first turn: a drafted entry says something of its own.
+    #[test]
+    fn only_the_openings_entries_read_as_the_opening() {
+        let read = SeedRead {
+            listings: strings(&["candle"]),
+            documents: Vec::new(),
+        };
+        for e in read.entries(5) {
+            assert!(is_opening(&e), "{}", e.summary);
+        }
+        let drafted = opening_entry("Answered the user's question about kernels.".into(), 5);
+        assert!(!is_opening(&drafted));
+        let mut over_turn_zero = read.entries(5).remove(1);
+        over_turn_zero.intend = vec!["read the decode kernels".into()];
+        assert!(!is_opening(&over_turn_zero));
     }
 }

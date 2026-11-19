@@ -74,7 +74,7 @@ use candle_conversation::stencil::{
 use candle_conversation::throwaway::Throwaway;
 use candle_conversation::{
     Carried, ConversationEngine, Linking, PromptDump, SamplingConfig, Sequence, SequenceConfig,
-    TurnOptions, UnsealedAsker, Want,
+    Sharing, TurnOptions, UnsealedAsker, Want,
 };
 use journal_core::folding::{self, Folded};
 use journal_core::journal::Holds;
@@ -155,6 +155,7 @@ fn journal_wants(prompt: Option<&JournalPrompt>) -> Vec<Want<'_>> {
                 .map(|s| Want {
                     name: &s.name,
                     text: &s.text,
+                    sharing: Sharing::Owned,
                 })
                 .collect()
         })
@@ -1995,6 +1996,7 @@ impl Minds {
         let mission = persona.mission.map(|m| Want {
             name: identity::MISSION_SECTION,
             text: &m.text,
+            sharing: Sharing::Owned,
         });
         let mission_sealed = live
             .mission
@@ -2037,6 +2039,7 @@ impl Minds {
             .map(|c| Want {
                 name: &c.name,
                 text: &c.text,
+                sharing: Sharing::Owned,
             })
             .collect();
         let channels_sealed = live

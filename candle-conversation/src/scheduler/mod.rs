@@ -161,7 +161,7 @@ use self::request_laps::RequestLaps;
 use self::wave_timing::WaveTiming;
 use crate::batched_sampler::{BatchedSampler, SequenceSamplingState};
 use crate::config::{DecodeHealthConfig, SamplingConfig};
-use crate::conversation::slice_per_layer_sealed;
+use crate::conversation::{is_shared_stream_name, slice_per_layer_sealed};
 use crate::decode_health::DecodeHealthState;
 use crate::decoded_text::{decode_turn_text, TagIds};
 use crate::dry_reference::reference_flags;
@@ -10449,6 +10449,39 @@ impl Scheduler {
                         section_id: *section_id,
                         in_collection: *in_collection,
                     });
+                }
+                // **A shared section is quantized at its own seal**
+                // (`docs/shared_journal_sections.md` §4.2). Nothing reads it
+                // yet — the section continuing it waits for this seal to settle
+                // — and every later reader, in this conversation or one that
+                // restores it, then attends over the one form the substrate
+                // keeps: a hit and a miss read the same bytes. It is persisted
+                // at once, too, rather than at a turn's seal that a run sealed
+                // ahead of any conversation never has.
+                if policy_active && is_shared_stream_name(debug_name) {
+                    if let Some(turn_policy) = self.session.compression_policy() {
+                        let boundary_policy = Self::section_compression_policy_boundary();
+                        let member_policy = Self::section_compression_policy_member(&turn_policy);
+                        let (now, keep): (Vec<_>, Vec<_>) =
+                            take(&mut self.pending_section_quantize)
+                                .into_iter()
+                                .partition(|p| {
+                                    p.section_id == *section_id && p.substrate.is(&conversation)
+                                });
+                        self.pending_section_quantize = keep;
+                        if let Err(e) = self.quantize_section_batch(
+                            &conversation,
+                            now,
+                            &boundary_policy,
+                            &member_policy,
+                            false,
+                        ) {
+                            tracing::warn!(
+                                section = %debug_name,
+                                "a shared section's quantize at its seal failed: {e}"
+                            );
+                        }
+                    }
                 }
                 // A transient section — a throwaway conversation's frame — is
                 // never read back from disk, so it declares no stream and writes

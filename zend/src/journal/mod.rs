@@ -37,6 +37,7 @@ pub mod origin;
 pub mod pressure;
 pub mod record;
 pub mod registry;
+pub mod sharing;
 pub mod shelf;
 pub mod state;
 pub mod steps;

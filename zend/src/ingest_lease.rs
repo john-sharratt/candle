@@ -80,6 +80,8 @@ const FACE_PREFIX: &[u8] = b"face/";
 
 const EXCLUSION_PREFIX: &[u8] = b"exclusion/";
 
+const PREWARM_PREFIX: &[u8] = b"prewarm/";
+
 /// The lease key for a content key.
 pub fn lease_key(content_key: &str) -> Vec<u8> {
     prefixed(PREFIX, content_key)
@@ -105,6 +107,12 @@ pub fn exclusion_key(group: &str) -> Vec<u8> {
     prefixed(EXCLUSION_PREFIX, group)
 }
 
+/// The lease key for the shared journal run of a warm scope
+/// (`docs/shared_journal_sections.md` §7.3).
+pub fn prewarm_key(scope: &str) -> Vec<u8> {
+    prefixed(PREWARM_PREFIX, scope)
+}
+
 fn prefixed(prefix: &[u8], name: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(prefix.len() + name.len());
     key.extend_from_slice(prefix);
@@ -113,7 +121,7 @@ fn prefixed(prefix: &[u8], name: &str) -> Vec<u8> {
 }
 
 /// Whether `key` is one of this module's: a reading's, a calibration's, a
-/// worker's, a face's or an exclusion learner's.
+/// worker's, a face's, an exclusion learner's or a warm scope's.
 fn is_unit_lease(key: &[u8]) -> bool {
     [
         PREFIX,
@@ -121,6 +129,7 @@ fn is_unit_lease(key: &[u8]) -> bool {
         WORKER_PREFIX,
         FACE_PREFIX,
         EXCLUSION_PREFIX,
+        PREWARM_PREFIX,
     ]
     .iter()
     .any(|prefix| key.starts_with(prefix))
@@ -282,6 +291,14 @@ pub fn share_exclusion(group: &str) -> Share {
         Some(seat) => claim_worker(seat, exclusion_key(group)),
         None => Share::Mine(Guard::local()),
     }
+}
+
+/// Lease the shared journal run of the warm scope `scope`. [`Share::Mine`] when
+/// this member should seal it; the others receive it by replication. A run
+/// sealed twice costs a seal and keeps one stream, so a member that cannot
+/// propose seals it itself, as it reads a unit.
+pub fn share_prewarm(scope: &str) -> Share {
+    share_key(prewarm_key(scope))
 }
 
 /// Lease the turns of the worker conversation `conv_id`. [`Share::Mine`] when

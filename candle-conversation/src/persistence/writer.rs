@@ -107,6 +107,15 @@ pub(crate) enum WriteJob {
         stream_id: StreamId,
         payload: Arc<BranchCheckpointPayload>,
     },
+    /// The state a shared run's last section ended on (`Snapshot` record under
+    /// its `section_end_state_stream_id`; `docs/shared_journal_sections.md`
+    /// §5). The [`Self::Snapshot`] append and single tail, and replicated like
+    /// it; a job of its own because it is no conversation's snapshot, so a
+    /// written one stands in for no slot's state.
+    SectionEndState {
+        stream_id: StreamId,
+        payload: SnapshotPayload,
+    },
     /// A turn's projection-event trajectory (`ProjectionEvents` record,
     /// last-writer-wins per stream). The in-RAM blob is mirrored synchronously
     /// by the enqueuer; this appends only the durable copy.
@@ -174,7 +183,9 @@ impl WriteJob {
             | WriteJob::SectionTombstone { reason, .. } => {
                 reason.as_ref().map_or(0, |r| r.len()) as u64
             }
-            WriteJob::Snapshot { payload, .. } => payload.encoded_len() as u64,
+            WriteJob::Snapshot { payload, .. } | WriteJob::SectionEndState { payload, .. } => {
+                payload.encoded_len() as u64
+            }
             WriteJob::BranchCheckpoint { payload, .. } => payload.parts().byte_len() as u64,
             WriteJob::KvCold { grid, .. } => grid.bytes() as u64,
             WriteJob::Abandoned { .. } => 0,
@@ -189,7 +200,10 @@ impl WriteJob {
     pub(super) fn is_bulk(&self) -> bool {
         matches!(
             self,
-            WriteJob::KvCold { .. } | WriteJob::Snapshot { .. } | WriteJob::BranchCheckpoint { .. }
+            WriteJob::KvCold { .. }
+                | WriteJob::Snapshot { .. }
+                | WriteJob::SectionEndState { .. }
+                | WriteJob::BranchCheckpoint { .. }
         )
     }
 }
@@ -399,6 +413,16 @@ pub(super) fn process(
                             loc: loc.value,
                         });
                     }
+                }
+                Err(e) => retract_failed_snapshot(substrate, p, stream_id, &e),
+            }
+        }
+        WriteJob::SectionEndState { stream_id, payload } => {
+            // The `Snapshot` append and registration, and nothing reported: no
+            // slot's state is this one.
+            match append_snapshot(p, stream_id, &payload) {
+                Ok(loc) => {
+                    substrate.update(|s| s.apply_snapshot_loc(stream_id, loc.value, loc.id));
                 }
                 Err(e) => retract_failed_snapshot(substrate, p, stream_id, &e),
             }
@@ -696,6 +720,41 @@ mod tests {
         let mut reloaded = Substrate::new();
         let _p = SubstratePersistence::open_in_with_substrate(dir.path(), &mut reloaded).unwrap();
         assert_eq!(reloaded.recurrent_snapshot_loc(failed), fresh);
+    }
+
+    /// **A section's end state lands on the snapshot tail of its end-state
+    /// stream, now and on reload, and stands in for no slot's state**: nothing
+    /// is reported written for a timeline (`docs/shared_journal_sections.md` §5).
+    #[test]
+    fn a_section_end_state_is_a_snapshot_tail_and_no_slots_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let stream_id = StreamId(0xF00D_00A0);
+        let mut substrate = Substrate::new();
+        let p = SubstratePersistence::open_in_with_substrate(dir.path(), &mut substrate).unwrap();
+        let substrate = Arc::new(SubstrateLock::new(substrate));
+        let owner = PersistenceOwner::spawn(p, substrate.clone());
+        let mut kept = snapshot_at(0);
+        kept.timeline_id = 0;
+        kept.aux = vec![7u8; 256];
+        owner.enqueue(WriteJob::SectionEndState {
+            stream_id,
+            payload: kept.clone(),
+        });
+        written(&owner);
+
+        let tail = substrate
+            .read()
+            .recurrent_snapshot_loc(stream_id)
+            .expect("indexed");
+        let bytes = owner.call(|p| p.read_record_payload(&tail)).unwrap();
+        assert_eq!(SnapshotPayload::decode(&bytes).unwrap(), kept);
+        assert!(owner.written_snapshots().is_empty());
+        owner.shutdown();
+        drop(owner);
+
+        let mut reloaded = Substrate::new();
+        let _p = SubstratePersistence::open_in_with_substrate(dir.path(), &mut reloaded).unwrap();
+        assert_eq!(reloaded.recurrent_snapshot_loc(stream_id), Some(tail));
     }
 
     /// **A retired tail supersedes the state before it, now and on reload.** A

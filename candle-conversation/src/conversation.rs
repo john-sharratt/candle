@@ -228,11 +228,14 @@ mod ephemeral_turn;
 pub use ephemeral_turn::{AskScope, UnsealedAsker};
 mod prefix_state;
 mod prompt_dump;
+pub(crate) mod section_end_state;
+mod sharing;
 mod submitted_sections;
 mod turn_bans;
 
 use prefix_state::{checkpoint, shared_held, state_after};
 pub use prompt_dump::{PieceKind, PromptDump, PromptPiece};
+pub use sharing::{is_shared_stream_name, Sharing, SHARED_SECTION_NAME_PREFIX};
 use submitted_sections::SubmittedSections;
 pub use submitted_sections::{SectionRef, SectionState};
 

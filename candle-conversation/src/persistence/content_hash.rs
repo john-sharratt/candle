@@ -279,9 +279,69 @@ pub fn owned_section_prefix(owner_timeline: u64, name: &str, prefix: ContentHash
     h.finish()
 }
 
+/// The prefix hash a **shared section** is addressed under: the content chain
+/// it is sealed after, domain-separated from every other address
+/// (`docs/shared_journal_sections.md` §3). No owner and no name: two
+/// conversations that would compute the same K/V address the same stream.
+pub fn shared_section_prefix(prefix: ContentHash) -> ContentHash {
+    let mut h = ContentHasher::new();
+    h.update(b"shared-section");
+    h.update(&prefix.to_bytes());
+    h.finish()
+}
+
+/// The snapshot stream a section's **end state** is kept under — the
+/// recurrent state the section's seal ended on, for the section a chain
+/// continues it with (`docs/shared_journal_sections.md` §4.1, §5). A third
+/// kind on [`RecordType::Snapshot`](super::record::RecordType::Snapshot),
+/// told apart from a conversation's snapshot and a branch's checkpoint by its
+/// stream id alone.
+pub fn section_end_state_stream_id(section: StreamId) -> StreamId {
+    let mut h = ContentHasher::new();
+    h.update(b"section-end-state");
+    h.update(&section.0.to_le_bytes());
+    let raw = h.finish().lo;
+    StreamId(if raw == 0 { 1 } else { raw })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shared section's prefix is the hash of exactly these bytes: the
+    /// domain, then the chain — no owner, no name.
+    #[test]
+    fn shared_section_prefix_hashes_the_documented_bytes() {
+        let prefix = hash_tokens(&[1, 2, 3]);
+        let mut raw: Vec<u8> = Vec::new();
+        raw.extend_from_slice(b"shared-section");
+        raw.extend_from_slice(&prefix.to_bytes());
+        assert_eq!(shared_section_prefix(prefix), hash_bytes(&raw));
+        assert_ne!(shared_section_prefix(prefix), prefix);
+        assert_ne!(
+            shared_section_prefix(prefix),
+            shared_section_prefix(hash_tokens(&[1, 2, 4]))
+        );
+    }
+
+    /// A section's end-state stream is the low half of the hash of the domain
+    /// and the section's stream id, apart from every other snapshot stream.
+    #[test]
+    fn section_end_state_stream_id_hashes_the_documented_bytes() {
+        let section = StreamId(0x0123_4567_89ab_cdef);
+        let mut raw: Vec<u8> = Vec::new();
+        raw.extend_from_slice(b"section-end-state");
+        raw.extend_from_slice(&section.0.to_le_bytes());
+        assert_eq!(
+            section_end_state_stream_id(section),
+            StreamId(hash_bytes(&raw).lo)
+        );
+        assert_ne!(section_end_state_stream_id(section), section);
+        assert_ne!(
+            section_end_state_stream_id(section),
+            snapshot_stream_id(section.0)
+        );
+    }
 
     /// The salted prefix is the hash of exactly these bytes, in this order.
     #[test]

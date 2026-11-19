@@ -75,11 +75,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use crate::conversation::window_sealed_tokens;
+use crate::conversation::{
+    is_shared_stream_name, window_sealed_tokens, SHARED_SECTION_NAME_PREFIX,
+};
 use crate::index_pages::{self, StoredPages};
 use crate::normalization::Phase;
 use crate::persistence::blob::{retired_blob, BlobKey};
-use crate::persistence::content_hash::{snapshot_stream_id, turn_stream_id};
+use crate::persistence::content_hash::{
+    section_end_state_stream_id, snapshot_stream_id, turn_stream_id,
+};
 use crate::persistence::deleted::DeletedPayload;
 use crate::persistence::identity::{RecordIdentity, VersionStamp};
 use crate::persistence::manifest::{
@@ -5977,6 +5981,10 @@ impl Substrate {
                 self.tagged_turns.remove(key);
             }
         }
+        // The state the section's seal ended on goes with the generation that
+        // sealed it. Not retired for good: a later generation of the same
+        // content ends on the same state and keeps it again.
+        self.drop_snapshot_loc(section_end_state_stream_id(stream_id));
         self.gallery_epoch += 1;
         if let Some(timeline) = held_turn {
             self.timeline_content_changed(timeline);
@@ -6163,11 +6171,11 @@ impl Substrate {
     /// Release one owned section: forget `owner`'s claim, end its stream's
     /// persisted generation, and drop its entry with its hot and warm K/V.
     ///
-    /// The persisted counterpart of [`Self::retire_section`]. A section that
-    /// is shared by content address cannot be removed this way, because a
-    /// stream every conversation reads must outlive any one of them; an owned
+    /// The persisted counterpart of [`Self::retire_section`]. An owned
     /// section's address is salted with its owner, so its stream is read by no
-    /// one else and ending it is safe.
+    /// one else and ending it is safe. A shared one's is not ended: a stream
+    /// every conversation reads must outlive any one of them, so only the
+    /// claim and the entry go ([`Self::drop_owned_entry`]).
     ///
     /// Returns the stream the caller must tombstone **on disk**, or `None`
     /// when `owner` does not own `section` or it never sealed (nothing was
@@ -6223,16 +6231,56 @@ impl Substrate {
 
     /// End `section`'s stream and remove its entry; the stream, if it sealed,
     /// with the generation ended.
+    ///
+    /// **A shared section's stream is not ended**: every conversation that
+    /// would seal exactly it reads it, so one leaving drops only its own entry,
+    /// and the stream is the sweep's to retire
+    /// (`docs/shared_journal_sections.md` §6). Nothing is returned to
+    /// tombstone on disk.
     fn drop_owned_entry(
         &mut self,
         section: SectionId,
     ) -> Option<(StreamId, Option<SectionGeneration>)> {
         let stream = self.section_stream(section)?;
-        let generation = self.tombstone_section(stream);
+        let shared = self.is_shared_section_stream(stream);
+        let generation = if shared {
+            None
+        } else {
+            self.tombstone_section(stream)
+        };
         let entry = self.sections.remove(&section)?;
         self.section_token_total = self.section_token_total.saturating_sub(entry.token_count);
         self.residences.take_warm(entry.residence);
-        Some((stream, generation))
+        (!shared).then_some((stream, generation))
+    }
+
+    /// Whether section stream `stream` is a shared section's — declared under
+    /// a [`is_shared_stream_name`] name.
+    pub fn is_shared_section_stream(&self, stream: StreamId) -> bool {
+        matches!(
+            self.streams.get(stream).and_then(|s| s.decl.as_ref()),
+            Some(StreamDecl::PromptSection(d)) if is_shared_stream_name(&d.debug_name)
+        )
+    }
+
+    /// Every shared section stream the substrate holds, by id — what the sweep
+    /// chooses from (`docs/shared_journal_sections.md` §6).
+    pub fn shared_section_streams(&self) -> Vec<StreamId> {
+        let mut found = self
+            .streams
+            .sections_named_under(SHARED_SECTION_NAME_PREFIX);
+        found.sort_unstable_by_key(|s| s.0);
+        found.dedup();
+        found
+    }
+
+    /// The section streams a live section entry reads — a shared stream one of
+    /// this member's conversations still holds.
+    pub fn held_section_streams(&self) -> HashSet<StreamId> {
+        self.sections
+            .values()
+            .map(|e| self.residences.get(e.residence).stream_id)
+            .collect()
     }
 
     /// Whether `timeline` has been tombstoned.
@@ -10422,6 +10470,82 @@ mod tests {
         assert!(!sub.is_section_tombstoned(StreamId(102)));
         assert!(sub.residence(rb).has_hot() && sub.residence(rb).has_warm());
         assert_eq!(sub.owned_section_named(theirs, "b"), Some(b));
+    }
+
+    /// Declare `stream` a prompt section under `debug_name`.
+    fn declare_section(sub: &mut Substrate, stream: u64, debug_name: &str) {
+        use crate::persistence::streams::{ContentAddress, SectionDecl};
+        sub.apply_stream_decl(
+            StreamId(stream),
+            StreamDecl::PromptSection(SectionDecl {
+                address: ContentAddress::default(),
+                debug_name: debug_name.to_string(),
+            }),
+            RecordIdentity::NONE,
+        );
+    }
+
+    /// **Releasing a shared section ends only this conversation's hold**: its
+    /// entry and claim go, its stream is not ended — another conversation's
+    /// section on the same stream keeps its resident K/V — and nothing is handed
+    /// back to tombstone on disk (`docs/shared_journal_sections.md` §6).
+    #[test]
+    fn releasing_a_shared_section_leaves_its_stream_to_every_reader() {
+        let mut sub = Substrate::new();
+        declare_section(&mut sub, 301, "shared/journal/1");
+        let (a, ra) = install_owned(&mut sub, owner(1), "journal/1", 301);
+        let (b, rb) = install_owned(&mut sub, owner(2), "journal/1", 301);
+        assert!(sub.is_shared_section_stream(StreamId(301)));
+        assert_eq!(sub.shared_section_streams(), vec![StreamId(301)]);
+        assert_eq!(
+            sub.held_section_streams(),
+            HashSet::from([StreamId(301)]),
+            "both entries read the one stream"
+        );
+
+        assert_eq!(sub.release_owned_section(owner(1), a), None);
+        assert!(!sub.section_exists(a));
+        assert!(!sub.residence(ra).has_warm());
+        assert!(!sub.is_section_tombstoned(StreamId(301)));
+        assert!(sub.section_exists(b), "the other reader's section survives");
+        assert!(sub.residence(rb).has_hot() && sub.residence(rb).has_warm());
+        assert!(sub.owned_sections_of(owner(1)).is_empty());
+
+        assert_eq!(sub.release_owned_section(owner(2), b), None);
+        assert!(sub.held_section_streams().is_empty());
+        assert_eq!(
+            sub.shared_section_streams(),
+            vec![StreamId(301)],
+            "the stream stays for the next conversation, and the sweep"
+        );
+    }
+
+    /// **A section's end state goes with its generation**: the snapshot tail
+    /// under its end-state stream is dropped when the section stream ends, and a
+    /// later generation keeps one again.
+    #[test]
+    fn a_sections_end_state_goes_with_its_generation() {
+        use crate::persistence::segment::SegmentId;
+        let mut sub = Substrate::new();
+        declare_section(&mut sub, 401, "shared/journal/close");
+        let end = section_end_state_stream_id(StreamId(401));
+        let at = |offset| RecordLoc {
+            segment: SegmentId(1),
+            offset,
+            payload_len: 64,
+            record_size: 128,
+        };
+        assert!(sub.apply_snapshot_loc(end, at(0), RecordIdentity::NONE));
+        assert_eq!(sub.recurrent_snapshot_loc(end), Some(at(0)));
+
+        sub.tombstone_section(StreamId(401));
+        assert_eq!(sub.recurrent_snapshot_loc(end), None);
+
+        assert!(
+            sub.apply_snapshot_loc(end, at(4096), RecordIdentity::NONE),
+            "not retired for good"
+        );
+        assert_eq!(sub.recurrent_snapshot_loc(end), Some(at(4096)));
     }
 
     /// Only the owner can release: a section is never torn down by a

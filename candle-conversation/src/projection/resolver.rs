@@ -40,12 +40,14 @@ use super::warm_pool;
 use super::working_set_observe::{working_set_config, working_set_fresh};
 use super::working_set_pick::{SlotBoundary, WorkingSetMembers};
 use crate::cancel::CancelToken;
+use crate::conversation::section_end_state;
 use crate::error::ConversationError;
 use crate::index_pages::StoredPages;
 use crate::normalization::{kind_z_band, path_kind, ChildKey, NormalizationCache, ScopeKey};
 use crate::persistence::chunk_window_integrity::{first_divergent_chunk, WindowDivergence};
 use crate::persistence::content_hash::{
-    branch_checkpoint_stream_id, snapshot_stream_id, turn_stream_id, ContentHash,
+    branch_checkpoint_stream_id, section_end_state_stream_id, snapshot_stream_id, turn_stream_id,
+    ContentHash,
 };
 use crate::persistence::identity::{Minter, RecordIdentity, GEN_DETACHED};
 use crate::persistence::integrity::{classify_turn, TurnIntegrity};
@@ -74,6 +76,7 @@ use crate::provenance::{
     decode_wide_sigs_for_scoring, score_slots_fused, score_slots_grouped, score_slots_weighted,
     FusionMode, GalleryArena, SigWindow, WideQSig,
 };
+use crate::scheduler::exported_state::SharedState;
 use crate::scheduler::profile;
 use crate::substrate::pcoll::POrdMap;
 use crate::substrate::{
@@ -5286,6 +5289,51 @@ impl Conversation {
         let payload = Arc::new(payload);
         self.memo_branch_checkpoint(prefix, &payload);
         Ok(Some(payload))
+    }
+
+    /// Keep `state` as the state section stream `section` ended on — the last
+    /// section of a shared run (`docs/shared_journal_sections.md` §4.1). On the
+    /// snapshot single tail under the section's end-state stream, so it
+    /// replicates and goes with the section's generation.
+    pub fn enqueue_section_end_state(&self, section: StreamId, state: &SharedState) {
+        if self.read_only {
+            return;
+        }
+        self.persistence.enqueue(WriteJob::SectionEndState {
+            stream_id: section_end_state_stream_id(section),
+            payload: section_end_state::to_payload(state),
+        });
+    }
+
+    /// The state section stream `section` ended on, when its stream keeps
+    /// one. `None` is ordinary — a section that ended no shared run, or whose
+    /// state was never kept. An indexed but unreadable record is an error, as a
+    /// checkpoint's is: starting from zeros instead is the silent amnesia.
+    pub fn read_section_end_state(
+        &self,
+        section: StreamId,
+    ) -> Result<Option<SharedState>, ConversationError> {
+        let stream_id = section_end_state_stream_id(section);
+        let Some(loc) = self.read().recurrent_snapshot_loc(stream_id) else {
+            return Ok(None);
+        };
+        let bytes = self
+            .read_located(loc, |stale| {
+                self.read()
+                    .recurrent_snapshot_loc(stream_id)
+                    .filter(|now| *now != stale)
+            })
+            .map_err(|e| {
+                ConversationError::Channel(format!(
+                    "the end state of section stream {section:?} is indexed but unreadable: {e}"
+                ))
+            })?;
+        let payload = SnapshotPayload::decode(&bytes).map_err(|e| {
+            ConversationError::Channel(format!(
+                "the end state of section stream {section:?} failed to decode: {e}"
+            ))
+        })?;
+        Ok(section_end_state::from_payload(&payload))
     }
 
     /// Hold `payload` as the decoded checkpoint for `prefix`, so the next

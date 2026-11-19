@@ -57,7 +57,7 @@ use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
 use candle_conversation::{
     CancelToken, Carried, ConversationEngine, ConversationError, EngineSource, GlueMarkers,
-    GroupScanner, Linking, Probed, PromptDump, SamplingConfig, SelectionState, Sequence,
+    GroupScanner, Linking, Probed, PromptDump, SamplingConfig, SelectionState, Sequence, Sharing,
     ThinkSteering, TokenDecoder, TurnEvent, UnsealedAsker, Want,
 };
 use host::calibration;
@@ -72,8 +72,11 @@ use journal_core::entry::Entry;
 use journal_core::fold;
 use journal_core::folding::{self, Folded};
 use journal_core::journal::Holds;
+use journal_core::journal::Journal;
 use journal_core::record::view as journal_view;
-use journal_core::section::{JournalPrompt, Kept, Section, JOURNAL};
+use journal_core::section::{
+    entry_section, JournalPrompt, Kept, Section, CLOSE_SECTION, HISTORY_SECTION, JOURNAL,
+};
 use journal_core::span::Span;
 use journal_core::transcript::{Filed, Hits, Miss, Page};
 use journal_core::workflow::Skip;
@@ -123,9 +126,10 @@ use crate::ingest_cancel;
 use crate::ingest_lease;
 use crate::journal::desk::{Asking, Compile, Record, ZendDesk, FOLD_TOKENS, WRITE_TOKENS};
 use crate::journal::notes::{own_notes, JOURNAL_NOTE_TOOL};
-use crate::journal::opening::OPENING_SEAL_WAIT;
+use crate::journal::opening::{self, OPENING_SEAL_WAIT};
 use crate::journal::record::{kept_in, metadata_of, KEY as JOURNAL_KEY};
 use crate::journal::registry::{Journals, Open};
+use crate::journal::sharing::chain_sharing;
 use crate::journal::shelf::{Above, Drafted, Lazy, Notes, Shelf};
 use crate::journal::state::{Request, SessionJournal, FOLD_SWEEP_EVERY};
 use crate::journal::style::style_for;
@@ -185,7 +189,9 @@ use crate::workspace::UPLOADS_REPO;
 mod ask;
 pub mod diag;
 mod memory_writer;
+mod prewarm;
 mod replay;
+use prewarm::Prewarm;
 pub mod restore;
 mod titles;
 
@@ -1002,6 +1008,9 @@ struct InferenceState {
     journaling: bool,
     /// Every dialogue's journal (`docs/zend_journal.md`).
     journals: Journals,
+    /// The scopes whose shared journal run is sealed ahead of use, and what was
+    /// sealed for each (`docs/shared_journal_sections.md` §7).
+    prewarm: Prewarm,
 }
 
 // Room for the title plus the empty `<think></think>` Qwen3 still decodes under
@@ -2259,6 +2268,7 @@ impl InferenceState {
             resuming: resume::Resuming::default(),
             journaling,
             journals: Journals::default(),
+            prewarm: Prewarm::default(),
             memory,
         });
         // A conversation is this member's for one turn at a time, and what it
@@ -2312,6 +2322,12 @@ impl InferenceState {
                 }
             }
         });
+        // The shared journal runs a new conversation reads, sealed ahead of
+        // it (`docs/shared_journal_sections.md` §7).
+        if state.journaling {
+            state.prewarm.seed(&state.engine.known_conversations());
+            tokio::spawn(prewarm::run(Arc::downgrade(&state)));
+        }
         // The journals' calendar: every open conversation folds the periods
         // that have ended since it last looked — a day turning over while
         // nobody talks to it included.
@@ -4906,6 +4922,7 @@ async fn carry_journal(
     selection: &mut SelectionState,
 ) {
     let t_open = Instant::now();
+    state.prewarm.note(conv_id, t_open);
     let journal = state
         .journals
         .of(conv_id, || journal_record(state, timeline));
@@ -4921,9 +4938,13 @@ async fn carry_journal(
     }
     let open_ms = t_open.elapsed().as_millis() as u64;
     let t_sections = Instant::now();
-    let (prompt, sections) = journal_sections(state, conv_id, &journal);
+    let (prompt, sections, sharing) = journal_sections(state, conv_id, &journal);
     let sections_ms = t_sections.elapsed().as_millis() as u64;
-    let wants: Vec<Want<'_>> = sections.iter().map(section_want).collect();
+    let wants: Vec<Want<'_>> = sections
+        .iter()
+        .zip(&sharing)
+        .map(|(s, &sharing)| section_want(s, sharing))
+        .collect();
     let lineage_sweep = lineage::sweep_names();
     let memory_sweep = memory_sections::sweep_names();
     let mut sweep = prompt.sweep();
@@ -4997,11 +5018,18 @@ fn journal_sections(
     state: &InferenceState,
     conv_id: &str,
     journal: &Mutex<SessionJournal>,
-) -> (JournalPrompt, Vec<Section>) {
-    let prompt = {
+) -> (JournalPrompt, Vec<Section>, Vec<Sharing>) {
+    let (prompt, own_shareable) = {
         let held = journal.lock().unwrap();
-        held.journal()
-            .prompt_with_steps(&held.steps().steps(), held.style())
+        let prompt = held
+            .journal()
+            .prompt_with_steps(&held.steps().steps(), held.style());
+        let shareable: Vec<bool> = prompt
+            .sections
+            .iter()
+            .map(|s| journal_section_is_shareable(&s.name, held.journal()))
+            .collect();
+        (prompt, shareable)
     };
     // A conversation owned through `/mcp` carries its ancestors' journals
     // ahead of its own, and the reader's line after it (`mcp::lineage`).
@@ -5014,11 +5042,33 @@ fn journal_sections(
         name: i.name,
         text: i.text,
     };
+    // The ancestors' journals and the memory are the thread's; the reader's
+    // line is the conversation's (`docs/shared_journal_sections.md` §2).
+    let mut shareable: Vec<bool> = vec![true; inherited.len() + memory.len()];
+    shareable.extend(own_shareable);
+    shareable.extend(reader.iter().map(|_| false));
     let mut sections: Vec<Section> = inherited.into_iter().map(as_section).collect();
     sections.extend(memory.into_iter().map(as_section));
     sections.extend(prompt.sections.iter().cloned());
     sections.extend(reader.map(as_section));
-    (prompt, sections)
+    (prompt, sections, chain_sharing(&shareable, false))
+}
+
+/// Whether the journal section `name` of `journal` says nothing of the
+/// conversation's own: the entries' heading, an entry of the opening, and the
+/// close while nothing is open. A drafted entry, the request's steps and an
+/// open item are the conversation's.
+fn journal_section_is_shareable(name: &str, journal: &Journal) -> bool {
+    if name == HISTORY_SECTION {
+        return true;
+    }
+    if name == CLOSE_SECTION {
+        return journal.open().is_empty();
+    }
+    journal
+        .entries()
+        .find(|e| entry_section(e.id) == name)
+        .is_some_and(opening::is_opening)
 }
 
 /// Open the journal of the conversation at `timeline` with what it read
@@ -5067,11 +5117,12 @@ fn open_journal(
     true
 }
 
-/// A section of the journal's own as the reconcile wants it.
-fn section_want(s: &Section) -> Want<'_> {
+/// A section of the journal as the reconcile wants it.
+fn section_want(s: &Section, sharing: Sharing) -> Want<'_> {
     Want {
         name: &s.name,
         text: &s.text,
+        sharing,
     }
 }
 
@@ -8010,7 +8061,7 @@ impl ZendSession {
         let journal = state
             .journals
             .of(conv_id, || journal_record(&state, timeline));
-        let (_, sections) = journal_sections(&state, conv_id, &journal);
+        let (_, sections, _) = journal_sections(&state, conv_id, &journal);
         out.extend(sections.into_iter().map(|s| (s.name, s.text)));
         // The `tools` collection's summary section is generated at runtime (not a
         // schema section), so its text isn't in `section_contents`. Serve the

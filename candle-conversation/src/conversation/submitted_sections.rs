@@ -8,6 +8,11 @@
 //! collection's projection candidates once it is sealed. It is released when
 //! [`Sequence::remove_section`] is called or the timeline is tombstoned.
 //!
+//! A [`Sharing::Shared`] section — text that is no conversation's own — is
+//! addressed by content alone instead, so every conversation that would seal
+//! exactly it restores the stream the first one sealed, and its release ends
+//! only this conversation's hold (`docs/shared_journal_sections.md`).
+//!
 //! The substrate's section map is shared by every conversation, so ids come from
 //! the substrate's owned partition and ownership is recorded there — see
 //! [`crate::projection::OwnedSections`]. This module holds the per-conversation
@@ -22,10 +27,11 @@ use flume::Sender;
 use heap_census::{set_thread, Scope};
 
 use super::prefix_state::{chain_of, continue_state, state_after};
+use super::sharing::{shared_stream_name, Sharing};
 use super::{alloc_scratch_slot_on, Sequence};
 use crate::error::ConversationError;
 use crate::persistence::content_hash::{
-    hash_tokens, owned_section_prefix, section_stream_id, ContentHash,
+    hash_tokens, owned_section_prefix, section_stream_id, shared_section_prefix, ContentHash,
 };
 use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::projection::{
@@ -34,6 +40,7 @@ use crate::projection::{
 };
 use crate::scheduler::exported_state::SharedState;
 use crate::scheduler::SchedulerRequest;
+use crate::substrate::Substrate;
 use crate::token_buffer::TokenBuffer;
 
 /// Where a submitted section is in its life.
@@ -133,7 +140,7 @@ impl SectionRef {
 
     /// The recurrent state the section's prefill ended on, when it was sealed
     /// in this process — see [`Settled::end`].
-    fn end_state(&self) -> Option<SharedState> {
+    pub fn end_state(&self) -> Option<SharedState> {
         self.settled.end.lock().unwrap().clone()
     }
 
@@ -301,6 +308,8 @@ struct SealJob {
     /// The band the conversation decodes at, which its next turn reads the
     /// section at — see [`SchedulerRequest::IngestSection`]'s `band`.
     band: DecodePriority,
+    /// Whose the section is — see [`Sharing`].
+    sharing: Sharing,
     settled: Arc<Settled>,
 }
 
@@ -331,7 +340,18 @@ impl SealJob {
                     self.settled.settle(SectionState::Ready {
                         blocks: sealed.blocks,
                     });
-                    self.release_superseded(sealed.stream);
+                    // Kept after the settle, so the section continuing this one
+                    // starts from the handed state without waiting on the copy.
+                    if self.sharing.keeps_end_state() {
+                        if let Some(end) = self.settled.end.lock().unwrap().as_ref() {
+                            self.substrate.enqueue_section_end_state(sealed.stream, end);
+                        }
+                    }
+                    // A shared stream is no one's to supersede: what it
+                    // replaced is another chain's, and the sweep's to retire.
+                    if !self.sharing.is_shared() {
+                        self.release_superseded(sealed.stream);
+                    }
                 }
             }
             Err(e) => {
@@ -377,13 +397,24 @@ impl SealJob {
 
     /// The recurrent state at the section's first token. The section it
     /// continues directly ended on exactly that state when it was sealed here,
-    /// and hands it over. Otherwise — it was restored from the log, or there is
-    /// nothing before — it is the state after the schema's prefix, kept for
-    /// every conversation on this prompt, run on through the sections it
-    /// continues, which are this conversation's alone.
+    /// and hands it over. One restored from the log hands over the end state
+    /// its stream keeps, when it ended a shared run — the state its producer's
+    /// seal handed over (`docs/shared_journal_sections.md` §4.1). Otherwise — it
+    /// was restored with none, or there is nothing before — it is the state
+    /// after the schema's prefix, kept for every conversation on this prompt,
+    /// run on through the sections it continues.
     fn start_state(&self) -> crate::Result<Option<SharedState>> {
         if let Some(handed) = self.after.last().and_then(SectionRef::end_state) {
             return Ok(Some(handed));
+        }
+        let kept_stream = self
+            .after
+            .last()
+            .and_then(|last| self.substrate.read().section_stream(last.section_id()));
+        if let Some(stream) = kept_stream {
+            if let Some(kept) = self.substrate.read_section_end_state(stream)? {
+                return Ok(Some(kept));
+            }
         }
         let at_collection =
             state_after(&self.scheduler_tx, &self.substrate, &self.prompt_prefix())?;
@@ -422,7 +453,11 @@ impl SealJob {
             )));
         }
         let address = ContentAddress {
-            prefix_hash: owned_section_prefix(self.owner.raw(), &self.name, self.prefix_hash()),
+            prefix_hash: if self.sharing.is_shared() {
+                shared_section_prefix(self.prefix_hash())
+            } else {
+                owned_section_prefix(self.owner.raw(), &self.name, self.prefix_hash())
+            },
             section_hash: hash_tokens(&tokens),
         };
         let stream = section_stream_id(address);
@@ -478,7 +513,11 @@ impl SealJob {
                 prefix_section_ids: sealed_prefix,
                 tokens,
                 address,
-                debug_name: format!("conv/{}/{}", self.owner.raw(), self.name),
+                debug_name: if self.sharing.is_shared() {
+                    shared_stream_name(&self.name)
+                } else {
+                    Substrate::owned_stream_name(self.owner, &self.name)
+                },
                 in_collection: true,
                 start,
                 band: self.band,
@@ -562,6 +601,12 @@ impl Sequence {
     /// state the prompt before the collection leaves. A section's address
     /// includes what it continues, so the same text after other sections is
     /// sealed afresh.
+    ///
+    /// `sharing` says whose the text is. A [`Sharing::Shared`] section is
+    /// addressed by content alone — the same text after the same sections
+    /// restores whatever conversation sealed it first — and a
+    /// [`Sharing::SharedEnd`] one also keeps the state its seal ends on, for
+    /// the owned section that continues it (`docs/shared_journal_sections.md`).
     pub fn submit_section(
         &mut self,
         collection: &str,
@@ -569,6 +614,7 @@ impl Sequence {
         content: &str,
         priority: f32,
         after: &[SectionRef],
+        sharing: Sharing,
     ) -> crate::Result<SectionRef> {
         if content.is_empty() {
             return Err(ConversationError::Other(format!(
@@ -630,6 +676,7 @@ impl Sequence {
             prefix,
             after: after.to_vec(),
             band,
+            sharing,
             settled: Arc::clone(&settled),
         };
         if let Err(e) = std::thread::Builder::new()

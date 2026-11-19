@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 
 use candle_conversation::projection::{DecodePriority, SelectionState};
 use candle_conversation::stencil::{StencilTree, TurnGrammar};
-use candle_conversation::{AskScope, Carried, Linking, Sequence, TurnOptions, UnsealedAsker, Want};
+use candle_conversation::{
+    AskScope, Carried, Linking, Sequence, Sharing, TurnOptions, UnsealedAsker, Want,
+};
 use journal_core::section::JournalPrompt;
 use journal_core::span::Span;
 use journal_core::transcript::Filed;
@@ -454,6 +456,7 @@ impl Minds {
         let mission = persona.mission.map(|m| Want {
             name: identity::MISSION_SECTION,
             text: &m.text,
+            sharing: Sharing::Owned,
         });
         let mission_sealed = talk
             .mission
@@ -483,6 +486,7 @@ impl Minds {
             .then_some(Want {
                 name: catchup::SECTION,
                 text: &caught.text,
+                sharing: Sharing::Owned,
             })
             .into_iter()
             .collect();
