@@ -12090,6 +12090,9 @@ impl Scheduler {
                 };
                 lifted = turn_lifts.len();
                 top_lift = turn_lifts.values().copied().fold(0.0, f32::max);
+                note("reproject piece lifts", || {
+                    hit_density::piece_lifts_line(&turn_lifts, 10)
+                });
                 let pool = &state.pool;
                 projection_scores.lift_turns(turn_lifts, base, |k| {
                     chain.contains(&k.timeline) || pool.contains_key(&k.timeline)

@@ -119,6 +119,29 @@ fn density_by<G: Eq + Hash>(parts: &[HitPart], group: impl Fn(&RoundKey) -> G) -
         .collect()
 }
 
+/// Each piece's strongest turn lift and how many of its turns are lifted, the
+/// `n` most lifted pieces first, as one line — what the hits added to each
+/// piece's scores this boundary, beside the scores the fill ranked
+/// (`projection fill pieces`).
+pub(super) fn piece_lifts_line(lifts: &HashMap<TurnKey, f32>, n: usize) -> String {
+    let mut by_piece: HashMap<TimelineId, (f32, usize)> = HashMap::new();
+    for (key, &lift) in lifts {
+        let at = by_piece.entry(key.timeline).or_insert((0.0, 0));
+        at.0 = at.0.max(lift);
+        at.1 += 1;
+    }
+    let mut rows: Vec<(TimelineId, f32, usize)> = by_piece
+        .into_iter()
+        .map(|(tl, (top, count))| (tl, top, count))
+        .collect();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.raw().cmp(&b.0.raw())));
+    rows.iter()
+        .take(n)
+        .map(|(tl, top, count)| format!("{}:top={top:.3} turns={count}", tl.raw()))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,6 +156,27 @@ mod tests {
             head: TurnIndex(head),
             index,
         }
+    }
+
+    /// **A piece's line is its strongest turn lift and its lifted turns**, the
+    /// most lifted pieces first, ties by timeline.
+    #[test]
+    fn piece_lifts_are_reported_strongest_first() {
+        let k = |t: u64, i: u32| TurnKey::new(tl(t), TurnIndex(i));
+        let lifts = HashMap::from([
+            (k(7, 0), 1.25),
+            (k(7, 3), 1.5),
+            (k(9, 1), 2.0),
+            (k(4, 0), 1.5),
+        ]);
+        assert_eq!(
+            piece_lifts_line(&lifts, 2),
+            "9:top=2.000 turns=1 | 4:top=1.500 turns=1"
+        );
+        assert_eq!(
+            piece_lifts_line(&lifts, 3),
+            "9:top=2.000 turns=1 | 4:top=1.500 turns=1 | 7:top=1.500 turns=2"
+        );
     }
 
     /// A conversation's rounds pool their hits and blocks: two rounds of one
