@@ -96,9 +96,12 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use candle::engine_events::note;
+
 use super::adaptive::AnchorMember;
 use super::dialogue_fill::{self, ContextExchange, DialogueSlot, WorkingPiece};
 use super::fill::{Caps, Kind};
+use super::fill_report::{line, piece_reports};
 use super::ids::{
     CollectionId, GroupId, LayerId, SectionId, TimelineId, TurnId, TurnIndex, TurnKey,
 };
@@ -2358,6 +2361,19 @@ pub fn run_with_sink<R: ContentResolver>(
             |k| resolver.turn_score(k),
             |k| resolver.turn_token_count(k),
         );
+        // What the fill weighed each working piece at — the scores it ranked
+        // by, which the selection record does not show (`fill_report`).
+        note("projection fill pieces", || {
+            line(
+                &piece_reports(
+                    &slot.working,
+                    &plan.working,
+                    |k| resolver.turn_score(k),
+                    |k| resolver.turn_token_count(k),
+                ),
+                10,
+            )
+        });
         // Each cap's use (`docs/hit_driven_projection.md` §12 item 26).
         let tokens_of = |keys: &[TurnKey]| -> usize {
             keys.iter().map(|k| resolver.turn_token_count(*k)).sum()
