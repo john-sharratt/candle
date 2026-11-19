@@ -45,6 +45,7 @@ use candle_conversation::{
 };
 
 use super::ask::Ask;
+use super::draft_sight::reading_held;
 use super::permits::{Permit, Permits};
 use super::plan::{plan, Prior, Unit};
 use super::questions::questions;
@@ -89,6 +90,10 @@ const MAX_FAILURES: u32 = 3;
 
 /// How a calibration that failed for want of a question says so.
 const NO_QUESTION: &str = "the draft wrote no question";
+
+/// Why a draft that holds none of its unit's reading is not asked: its
+/// questions would be the file's name, guessed at (`draft_sight`).
+const BLIND_DRAFT: &str = "the draft holds none of its reading";
 
 /// How a calibration whose draft stopped short says so.
 const SHORT_DRAFT: &str = "the draft left a part with no question";
@@ -779,6 +784,20 @@ fn draft(
                 tags: vec![TAG.to_string()],
                 ..Default::default()
             };
+            // What of the reading the draft is about to be asked in front of.
+            let dump = conv.prompt_dump();
+            let held = dump.as_ref().map(|d| reading_held(d, unit.timeline));
+            tracing::info!(
+                target: "zend::calibrate",
+                subject = %unit.subject,
+                reading = tokens,
+                held = ?held,
+                prompt = ?dump.as_ref().map(|d| d.token_count),
+                "calibration draft projected",
+            );
+            if held == Some(0) {
+                anyhow::bail!("{BLIND_DRAFT} ({tokens} tokens)");
+            }
             let handle = conv
                 .submit_turn_with_options(
                     compose(&parts, unit.link.then(|| unit_path(&unit.subject))),
