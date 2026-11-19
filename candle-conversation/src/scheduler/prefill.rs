@@ -2896,10 +2896,13 @@ impl Scheduler {
         // An opening on a filled slot stops every `reserve_tokens` for a
         // boundary (§7.4) — but not a calibration's staged or captured prefill,
         // whose projection points and recurrent arms are its own.
+        // A request's first reading is read whole and stops only at its end
+        // (`first_reading`); its second reading takes the strides.
         let stops_every = work
             .reprojection
             .as_ref()
             .filter(|_| work.projection_offsets.is_empty() && work.recurrent_spans.is_empty())
+            .filter(|_| !work.rereads)
             .and_then(|p| p.opening_chunk())
             .filter(|&every| every < total);
         self.active_prefills.push(ActivePrefill {
@@ -7465,6 +7468,7 @@ mod wave_chunk_tests {
                 free_tool_calls_from_penalties: false,
                 recorded_reply: None,
                 recurrent_spans: Vec::new(),
+                rereads: false,
             },
             offset: 0,
             next_projection: 0,
@@ -7496,6 +7500,21 @@ mod wave_chunk_tests {
         p.stops_every = None;
         p.offset = 16_384;
         assert_eq!((p.advance_cap(), p.at_boundary()), (23_616, false));
+    }
+
+    /// **A first reading stops one token short of its end, and stands at a
+    /// boundary there** (`first_reading`): 40 tokens advance 39 and no
+    /// further, so the reading is scored before anything is sampled; short of
+    /// that it is at no boundary.
+    #[test]
+    fn a_first_reading_stops_one_token_short() {
+        let mut p = dialogue_prefill(SequenceId(1), vec![0; 40]);
+        p.work.rereads = true;
+        assert_eq!((p.advance_cap(), p.at_boundary()), (39, false));
+        p.offset = 20;
+        assert_eq!((p.advance_cap(), p.at_boundary()), (19, false));
+        p.offset = 39;
+        assert_eq!((p.advance_cap(), p.at_boundary()), (0, true));
     }
 
     /// **Only a prefill that leaves opens the next admission.** Promotion runs

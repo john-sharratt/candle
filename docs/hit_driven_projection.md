@@ -560,7 +560,27 @@ the scan — lets it go on against the slot it has. A staged or captured
 calibration prefill is not cut: its projection points and recurrent arms are
 its own.
 
-An opening is not prefilled twice. The failure that would have justified it
+**A request is read twice; every other opening once.** The question a new
+user message opens is first prefilled, on the conversation's own slot, against
+the projection with the dialogue's seeds held out (`WorkingSet::holds_out`),
+to the token before its last, so nothing is sampled. That reading is scored
+like a boundary — its fresh scores feed the working set's momentum, and the
+boundary takes the question, which brings the seeds back — and its hits and its
+view are discarded: nothing was sealed, so the parent stands where it stood.
+The turn is then submitted again unchanged, and its opening projection places
+the seeds and what the question ranked in one ranking, chosen whole, before
+the question is prefilled the second time and the reply decodes
+(`scheduler/first_reading.rs`). A first reading that cannot be scored fails
+the turn.
+
+The seeds are background every conversation keeps; the question read against
+them is a different probe. On BlackWorld (2026-11-20) the question naming
+`recorded_reply` scored `recorded_reply.rs` second (3,224) read alone and
+fifth (1,609) read against the seeds, where `scheduler/mod.rs`'s pages filled
+the readings cap first.
+
+A tool result, a turn group's case, a calibration's staged prefill and a
+replay are read once. The failure that would have justified reading them twice
 was attention never reaching a seat the slot held (§1), which the one window
 over a trained-length slot and the pinned ranges answer directly; a second
 prefill of every tool result is a cost with nothing left to buy.
@@ -983,6 +1003,10 @@ the slot's held turns recorded at each scanned boundary
     scan leaders before strength, a dialogue's first question takes its
     opening whether or not its set exists yet, and a reasoning reply takes
     boundaries at 8, 16 and 32 tokens — built 2026-11-20.
+29. **A request is read twice (§7.4).** First without the seeds, scored and
+    discarded; then submitted again with the seeds and what it ranked —
+    `scheduler/first_reading.rs`, `scheduler/turn_probe.rs`,
+    `WorkingSet::holds_out` — built 2026-11-20.
 
 ## 13. Handover
 

@@ -6182,6 +6182,8 @@ impl<'a> ContentResolver for TargetedRead<'a> {
             .into_iter()
             .filter(|tl| self.read.placing_group(target, *tl) == Some(group))
             .filter(|tl| self.read.scope_offers(group, target, *tl))
+            // A new question's first reading is scored without the seeds.
+            .filter(|tl| !ws.holds_out(*tl))
             .map(|tl| (tl, ws.momentum_of(tl).unwrap_or(0.0)))
             .collect();
         Some(WorkingSetMembers { members })
@@ -6195,6 +6197,7 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         Some(SlotBoundary {
             held: ws.held().clone(),
             opening: ws.opening(),
+            question_pending: ws.question_pending(),
         })
     }
 
