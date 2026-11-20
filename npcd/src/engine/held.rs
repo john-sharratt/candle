@@ -89,6 +89,11 @@ fn source(kind: &EventKind) -> Source {
             "thing that happened around you".into(),
             "things that happened around you".into(),
         ),
+        EventKind::Notice { .. } => named(
+            "notice".into(),
+            "thing done in the world".into(),
+            "things done in the world".into(),
+        ),
         EventKind::Announcement { .. } => named(
             "announcement".into(),
             "word sent across the world".into(),

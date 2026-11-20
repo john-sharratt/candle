@@ -14,9 +14,10 @@ parse target, and a test loads it.
 
 ## Format
 
-```yaml
-keep: 4                    # waiting missions the table is kept stocked with
+An operation opens only when one is asked for (`POST /v1/pulse/missions/generate`); nothing
+keeps the table stocked.
 
+```yaml
 prompts:                   # named texts any prompt may include
   verdict: |
     Then give your verdict at the table…

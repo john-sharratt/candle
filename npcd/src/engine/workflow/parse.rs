@@ -1,4 +1,4 @@
-//! Reading a mind's `missions.yaml` into [`Missions`]: the `keep`, `prompts`,
+//! Reading a mind's `missions.yaml` into [`Missions`]: the `prompts`,
 //! `generators` and `workflows` sections, every mapping in the order written,
 //! validated and with prompt includes resolved. Other top-level keys belong to
 //! other readers and are ignored; inside these sections an unknown key is an
@@ -23,10 +23,6 @@ pub fn parse_missions(missions_yaml: &str) -> Result<Missions, String> {
         Value::Null => return Ok(Missions::default()),
         Value::Mapping(top) => top,
         _ => return Err("missions.yaml: the top level is not a mapping".to_string()),
-    };
-    let keep = match top.get("keep") {
-        None | Some(Value::Null) => None,
-        Some(v) => Some(count(v, "missions.yaml: `keep`")?),
     };
     let prompts = match mapping(top.get("prompts"), "prompts")? {
         Some(section) => section
@@ -60,7 +56,6 @@ pub fn parse_missions(missions_yaml: &str) -> Result<Missions, String> {
     }
     validate_generators(&generators, &workflows)?;
     let mut missions = Missions {
-        keep,
         prompts,
         generators,
         workflows,
@@ -440,12 +435,11 @@ mod tests {
     }
 
     #[test]
-    fn top_level_keep_prompts_and_generators_are_read_and_others_ignored() {
+    fn top_level_prompts_and_generators_are_read_and_others_ignored() {
         let m = parse_missions(&format!(
-            "system: ignored\nkeep: 4\nprompts:\n  table: Set work.\ngenerators:\n  - id: untold\n    call: story\n    workflow: w\n    weight: 2\n    context:\n      - era\n    prompt: Choose.\n  - id: plain\n    call: story\n    workflow: w\n    prompt: Again.\nworkflows:\n  w:\n    steps:\n{PLAIN}"
+            "system: ignored\nprompts:\n  table: Set work.\ngenerators:\n  - id: untold\n    call: story\n    workflow: w\n    weight: 2\n    context:\n      - era\n    prompt: Choose.\n  - id: plain\n    call: story\n    workflow: w\n    prompt: Again.\nworkflows:\n  w:\n    steps:\n{PLAIN}"
         ))
         .unwrap();
-        assert_eq!(m.keep, Some(4));
         assert_eq!(m.prompts["table"], "Set work.");
         assert_eq!(
             m.generators,
@@ -635,10 +629,6 @@ mod tests {
             (
                 "generators: {}\n".to_string(),
                 "missions.yaml: `generators` is not a list",
-            ),
-            (
-                "keep: many\n".to_string(),
-                "missions.yaml: `keep` is not a whole number",
             ),
             (
                 "- a\n".to_string(),

@@ -365,12 +365,24 @@ async fn the_lift_schema_floor_enum_is_the_worlds_own_floor_names() {
 /// one `found` field `report_done` takes, for a body carrying a mission.
 #[tokio::test]
 async fn a_body_at_the_command_table_is_offered_its_mission_verb_with_its_body() {
+    use npcd::engine::mission::{Mission, Origin, Todo};
     use npcd::engine::tools::{specs_within, Mode};
     use npcd::engine::work::take_up;
 
     let (rt, _tokens) = daemon();
     place_where(&rt, 15, Where::new("vault-command", "command-room"));
     let (hosted, body) = rt.body_of(15).expect("bound");
+    // The table gives out what is asked of it: work is lodged for the body.
+    hosted.with_sim(|s| {
+        s.missions.lodge(
+            &body,
+            Mission::new(
+                "Read the status board.",
+                vec![Todo::new("go to the dispatch room")],
+                Origin::Lodged { by: "op".into() },
+            ),
+        )
+    });
     take_up(&hosted, &body).expect("the table gives it a mission");
     let table = instance_id("vault-command", "command-room", "order-table");
     let url = format!("http://local/command/{table}/report_done");

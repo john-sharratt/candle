@@ -61,11 +61,14 @@ edit are all commits into the operation's own store over the mind repository; th
 holds only published work, and nothing reaches it, or memory, but through the workflow's last
 step — `publish`, at the merge table on the archive floor.
 
-A loop keeps each world's pool at `keep` missions while its table is open
-(`mission_gen::run::spawn`), reading waiting drafts before it opens new operations. An operator
-can ask for one now (`POST /v1/pulse/missions/generate`), read the pool and the ledger
-(`GET /v1/pulse/missions/pool`), and clear them (`DELETE …/pool`, `?ledger=true` to forget the
-settled targets too).
+**Work is opened on demand.** An operation opens only when one is asked for
+(`POST /v1/pulse/missions/generate`, naming a generator or drawing one by weight); nothing
+keeps the table stocked, and a Maker with nothing set for it is at rest. Once open, an
+operation is carried along by a loop while its table is open (`mission_gen::run::spawn`): the
+table's own steps — its readings — are taken there, and each Maker's step is put on the table
+for the next free Maker who may take it, until the operation settles. An operator can read the
+pool and the ledger (`GET /v1/pulse/missions/pool`) and clear them (`DELETE …/pool`,
+`?ledger=true` to forget the settled targets too).
 
 ## Operations
 
@@ -425,7 +428,7 @@ ways, both fixed in the world rather than in the prompt:
 
 ## The prompts
 
-`missions.yaml` holds the system voice, `keep`, and one entry per generator: `id`, `kind`,
+`missions.yaml` holds the system voice and one entry per generator: `id`, `kind`,
 `weight`, and `prompt`. The prompt explains the call's fields; it never asks for a brief or a
 path. The material comes first in what the model reads and the prompt after it, so the last
 thing read is what to do — instruction first, then a character's anchor in the second person,
@@ -461,10 +464,13 @@ routines:
   record (`docs/mission_templates.md` §6). Operations on any other workflow, opened before the
   file was written, are called off by the authority on the next tick, so a carrier is stood down
   rather than left on work nobody will read.
-- **Or nothing by draw.** `draw: none` hands out no routine: a character with nothing set for it
-  waits at the table until work is posted there (`docs/zen_moon_mind.md` §8.3), and the routines
-  are the catalogue a poster reads at the table — the standing jobs it may set when the table is
-  empty (`order_results`). `draw: routines`, the default, is the routines drawn as above.
+- **Nothing by draw, unless it says so.** `draw: none`, the default, hands out no routine: a
+  character with nothing set for it is at rest until work is posted for it
+  (`docs/zen_moon_mind.md` §8.3), and the routines are the catalogue a poster reads at the
+  table — the standing jobs it may set when the table is empty (`order_results`).
+  `draw: routines` is the routines drawn as above. A world with no file of its own draws
+  nothing either: its Makers are given an operation's steps and what is posted or lodged for
+  them.
 - **Refused when read.** A file with no routines, a routine id that is not kebab-case or is
   repeated, an empty brief or step, a `draw` that is neither, or any key but those above stops
   that world's table, with a warning naming the file — the world neither falls back to

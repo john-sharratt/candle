@@ -29,6 +29,7 @@ use npcd::engine::act::Act;
 use npcd::engine::body::Outcome;
 use npcd::engine::environment;
 use npcd::engine::mission::{Mission, Origin, Todo};
+use npcd::engine::mission_gen::world::Draw;
 use npcd::engine::runtime::{Kind, Runtime};
 use npcd::engine::tick::Pace;
 use npcd::engine::workflow::parse_missions;
@@ -51,9 +52,14 @@ const WORLD: &str = "creators-vault";
 /// as `#[tokio::test]` — but on the current-thread flavour a body that never
 /// awaits never yields, so no spawned task runs and the tests keep driving
 /// every moment and tick by hand, deterministically.
+///
+/// Its table hands out routines, so a Maker with nothing set for it carries one
+/// and is never at rest: these tests are of what the cast hears, reads and
+/// finds of each other, which a Maker at rest takes no turn to show.
 fn daemon() -> Arc<Runtime> {
     let rt = Runtime::new(Mind::new(None), &std::env::temp_dir()).unwrap();
-    rt.host(WORLD, Path::new(ROOMS)).expect("the vault loads");
+    let hosted = rt.host(WORLD, Path::new(ROOMS)).expect("the vault loads");
+    hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::Routines));
     rt.hold_world(WORLD, true);
     rt
 }

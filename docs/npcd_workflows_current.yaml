@@ -60,8 +60,6 @@
 # routed here found. A prompt may include a shared prompt — {elsewhere} — or
 # another step's — {story.read.prompt} — resolved at load.
 
-keep: 4
-
 prompts:
 
   # The system prompt of the table's readings.
@@ -922,5 +920,9 @@ workflows:
 #   it), `report_stuck` (the outcome `stuck`).
 # - A report is held to the step's `checks`, to the steps still undone, and to
 #   an account of at least four words.
-# - The table is kept stocked with `keep` waiting missions, and more while a
-#   Maker has nothing it may take; generators are drawn by weight.
+# - An operation is opened only when one is asked for
+#   (`POST /v1/pulse/missions/generate`, its generator named or drawn by
+#   weight); nothing keeps the table stocked. Once open, its steps follow one
+#   another as its workflow says until it settles — the table's own steps
+#   taken by the engine, a Maker's put on the table for the next free Maker
+#   who may take it.

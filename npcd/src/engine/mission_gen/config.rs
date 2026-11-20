@@ -21,9 +21,6 @@ use crate::mind::files::MindFiles;
 /// The file a mind configures its table in.
 pub const FILE: &str = "missions.yaml";
 
-/// How many generated missions wait at the table when the file does not say.
-const DEFAULT_KEEP: usize = 4;
-
 /// The table calls a workflow step may run.
 pub const READING: &str = "reading";
 
@@ -125,8 +122,6 @@ pub struct Config {
     /// proposer's: told it sets work, a reading answered "nothing here worth
     /// doing" and called the draft sound.
     pub reader: String,
-    /// How many generated missions to keep waiting at the table.
-    pub keep: usize,
     /// What the table is asked when it reads a document — see
     /// [`super::reading`].
     pub reading: String,
@@ -196,7 +191,6 @@ impl Config {
         Ok(Config {
             system,
             reader,
-            keep: m.keep.map_or(DEFAULT_KEEP, |k| k as usize),
             reading,
             writing,
             generators,
@@ -319,7 +313,6 @@ mod tests {
     #[test]
     fn the_template_parses_as_the_engines_configuration() {
         let c = Config::parse(TEMPLATE).unwrap();
-        assert_eq!(c.keep, 4);
         let generators: Vec<(&str, Kind, &str, u32)> = c
             .generators
             .iter()

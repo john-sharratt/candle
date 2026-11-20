@@ -1513,7 +1513,8 @@ impl Runtime {
 
     /// Tell every mind of `hosted` that takes no orders — the minds that are
     /// the world — what `body` has just done, by its name: "Wick has come to
-    /// rest". A thing that happened, so it accumulates and is worth a turn.
+    /// rest". A thing that happened, so it accumulates; it asks nothing, so it
+    /// is a [`EventKind::Notice`], read with whatever next wakes the mind.
     pub(crate) fn tell_whole(&self, hosted: &Hosted, body: &str, did: &str) {
         let Some(name) = hosted.read(|w| w.name_of(body).map(str::to_string)) else {
             return;
@@ -1526,7 +1527,7 @@ impl Runtime {
                 npc,
                 self.world_ms(npc),
                 Salience::NORMAL,
-                EventKind::Description {
+                EventKind::Notice {
                     text: format!("{name} {did}"),
                 },
             );
@@ -8677,19 +8678,35 @@ mod tests {
         }
     }
 
-    /// **A fresh world opens the command table by default.** A world that hands
-    /// out no missions leaves its whole cast with nothing asked of it; so an
-    /// untouched world comes up open, and a character with no mission is given
-    /// one by the table rather than left to drift. (Shutting it is durable and
-    /// an operator's to do — see [`Self::host`].)
+    /// **A fresh world opens the command table by default, and it gives out
+    /// what is asked for.** An untouched world comes up open, so a free
+    /// character has no standing task; with nothing posted for it, it is at
+    /// rest rather than handed a routine, and the moment work is posted the
+    /// table gives it that. (Shutting it is durable and an operator's to do —
+    /// see [`Self::host`].)
     #[tokio::test]
     async fn a_fresh_world_opens_the_command_table_by_default() {
+        use crate::engine::mission::{Mission, Origin, Todo};
         let rt = vaulted();
         embody(&rt, 1, "m1", "green-room");
-        // Nobody has touched the table; its default is open, so a free character
-        // out in the wing has no standing task, and the table gives it work.
         assert_eq!(rt.nudge_for(1), None);
         let hosted = rt.hosted.get(WORLD).unwrap();
+        rt.assign_work(&hosted);
+        assert!(
+            !hosted.sim(|s| s.missions.is_on_mission("m1")),
+            "a routine was drawn"
+        );
+        assert!(rt.at_rest(&hosted, "m1"), "free, with nothing asked of it");
+        hosted.with_sim(|s| {
+            s.missions.post(
+                Mission::new(
+                    "Read the board.",
+                    vec![Todo::report("report it")],
+                    Origin::Lodged { by: "op".into() },
+                ),
+                None,
+            )
+        });
         rt.assign_work(&hosted);
         assert!(hosted.sim(|s| s.missions.is_on_mission("m1")));
     }
@@ -9326,10 +9343,12 @@ mod tests {
     /// more.
     #[tokio::test]
     async fn the_open_table_gives_a_free_character_its_work_where_it_stands() {
+        use crate::engine::mission_gen::world::Draw;
         let rt = vaulted();
         // Out in the wing, away from the table.
         embody(&rt, 1, "m1", "green-room");
         let hosted = rt.hosted.get(WORLD).unwrap();
+        hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::Routines));
         let carrying = || hosted.sim(|s| s.missions.active("m1").map(|m| m.standing_text()));
 
         // Shut table: nothing is given. (The default is open, so this shuts it
@@ -9527,6 +9546,7 @@ mod tests {
     #[tokio::test]
     async fn an_unordered_character_is_given_no_orders() {
         use crate::engine::mission::{Mission, Origin, Todo};
+        use crate::engine::mission_gen::world::Draw;
         let rt = vaulted();
         rt.scheduler.wake(1, 0, 0);
         let unordered = Kind {
@@ -9539,6 +9559,9 @@ mod tests {
         assert!(rt.at_command_table(1), "it is standing at the table");
         assert_eq!(rt.at_table_report(1), None);
         let (hosted, body) = rt.body_of(1).unwrap();
+        // A world that hands out routines, so the one that takes orders is given
+        // one and the one that gives them is not.
+        hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::Routines));
         rt.assign_work(&hosted);
         rt.follow_rest(&hosted);
         assert!(!hosted.sim(|s| s.missions.is_on_mission(&body)));
@@ -10319,12 +10342,14 @@ mod tests {
     /// hall.
     #[tokio::test]
     async fn no_work_is_given_to_a_character_with_no_way_to_a_table() {
+        use crate::engine::mission_gen::world::Draw;
         let rt = vaulted();
         embody_at(&rt, 1, "m1", Where::new("the-waste", "ruins"));
         embody(&rt, 2, "m2", "green-room");
         embody_at(&rt, 3, "m3", Where::new("tower-redoubt", "gatehouse"));
         rt.set_table_open(true);
         let hosted = rt.hosted.get(WORLD).unwrap();
+        hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::Routines));
 
         rt.assign_work(&hosted);
         rt.follow_rest(&hosted);

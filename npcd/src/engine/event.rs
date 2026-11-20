@@ -281,6 +281,17 @@ pub enum EventKind {
         thread: String,
         lines: Vec<TalkLine>,
     },
+    /// Something done in the world that asks nothing of the mind told it — a
+    /// Drone come to rest, one taken up work — said to the minds that are the
+    /// world. Read with whatever next wakes the mind; never a wake of its own,
+    /// and not news, so a mind may rest on it.
+    ///
+    /// **Being told a thing is done is not being asked to do anything.** Told
+    /// as a description, every Drone that came to rest or took up work woke
+    /// Zen, whose rest was then refused once because nothing had been done
+    /// about what reached it: two turns spent on each notice of a hand going
+    /// idle.
+    Notice { text: String },
     /// What the character means to tell `party`, from a private `message` or
     /// a `reach_out` of its own, for its conversation with them to say in its
     /// own words (`docs/npc_conversations.md` §10). The scheduler hands it to
@@ -439,6 +450,7 @@ impl EventKind {
     pub fn tag(&self) -> &'static str {
         match self {
             EventKind::Description { .. } => "description",
+            EventKind::Notice { .. } => "notice",
             EventKind::Announcement { .. } => "announcement",
             EventKind::Terminal { .. } => "terminal",
             EventKind::Speech { .. } => "speech",
@@ -535,6 +547,7 @@ impl Event {
                 to: Addressed::Other { .. },
                 ..
             } | EventKind::Elsewhere { .. }
+                | EventKind::Notice { .. }
         )
     }
 
@@ -545,7 +558,7 @@ impl Event {
     /// it perceives, not handed a record of what the simulation logged.
     pub fn prose(&self) -> String {
         match &self.kind {
-            EventKind::Description { text } => text.trim().to_string(),
+            EventKind::Description { text } | EventKind::Notice { text } => text.trim().to_string(),
             // Framed as reaching everyone, so the character reads it as a word
             // put to the whole world rather than as something that happened in
             // front of it — the one thing the raw text cannot say for itself.

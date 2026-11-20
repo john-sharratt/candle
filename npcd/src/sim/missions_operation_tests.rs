@@ -127,12 +127,10 @@ fn an_operation_moves_its_target_through_the_ledger() {
 
     m.table_took(id, "mend", "\"x\" — wrong").unwrap();
     put_up(&mut m);
-    assert!(
-        matches!(
-            m.collect("bram", &Facts::default()).unwrap().origin,
-            Origin::Random { .. }
-        ),
-        "the writer draws past its own review"
+    assert_eq!(
+        collect_step(&mut m, "bram"),
+        None,
+        "the writer is not given its own review"
     );
     m.cancel("bram");
     assert_eq!(collect_step(&mut m, "yen"), Some((id, "review".into())));
@@ -437,26 +435,6 @@ fn a_report_the_workflow_refuses_still_closes_the_mission() {
     );
     assert!(m.report("pax", Outcome::Fail, "cannot", None).is_some());
     assert!(!m.is_on_mission("pax"));
-}
-
-/// **The table is stocked when every Maker has something it may take**, and
-/// never past `keep` more than there are Makers.
-#[test]
-fn the_table_is_stocked_for_every_maker_not_only_by_count() {
-    let mut m = table();
-    let makers = vec!["ione".to_string(), "paxon".to_string()];
-    assert!(!m.stocked_for(&makers, 1), "an empty table");
-    let id = launch(&mut m, "era:t", 1);
-    put_up(&mut m);
-    collect_step(&mut m, "paxon");
-    m.report("paxon", Outcome::Pass, "written", None);
-    m.table_took(id, "sound", "").unwrap();
-    put_up(&mut m);
-    assert!(!m.stocked_for(&makers, 1), "nothing here Paxon may take");
-    launch(&mut m, "era:u", 1);
-    put_up(&mut m);
-    assert!(m.stocked_for(&makers, 1), "something for each");
-    assert!(!m.stocked_for(&makers, 3), "under keep");
 }
 
 /// **Discarding the pool releases every target in it**, and forgetting the

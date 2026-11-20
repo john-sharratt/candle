@@ -241,34 +241,7 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             if let Some(refusal) = report_block(hosted, body) {
                 return Outcome::Refused(refusal);
             }
-            hosted.with_sim(|s| {
-                // The account is both the report's notes (how it went) and the
-                // answer (what was found) — for a mission done, the two are the
-                // same line, so it is filed under both.
-                match s
-                    .missions
-                    .report(body, Verdict::Pass, &account, Some(account.clone()))
-                {
-                    Some(m) => {
-                        tracing::info!(npc = body, prompt = %m.mission_text(), %account, "mission reported DONE at the command table");
-                        // An operation this report finished is the record
-                        // grown by a document: said once, where it happens.
-                        if let Some(op) = m
-                            .operation()
-                            .and_then(|(id, _)| s.missions.operations().get(id))
-                            .filter(|o| o.succeeded())
-                        {
-                            tracing::info!(operation = %op.name, document = %op.document, "operation: stands in the record");
-                        }
-                        Outcome::Did(format!(
-                            "Reported done, and your answer filed: {}{}",
-                            m.mission_text(),
-                            back_to_now(&m)
-                        ))
-                    }
-                    None => Outcome::Refused("You are not carrying a mission to report on.".into()),
-                }
-            })
+            file_done(hosted, body, &account)
         }
         "report_stuck" => {
             let Some(why) = text(a, "why") else {
@@ -315,7 +288,23 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             // With every step but the report done and its document committed,
             // the world says the work stands; the report that matches is done.
             if let Some(done) = hosted.sim(|s| finished(s, body)) {
-                return Outcome::Refused(done);
+                // **Work with no operation behind it is taken as done.** Its
+                // every step is done in the engine's sight and it has no
+                // document for a gate to hold, so a refusal saying "report it
+                // done" only sent three characters between the two desks for
+                // hours — each sure it had reported already, each told it was
+                // not stuck. An operation's step has a gate and, at review, a
+                // verdict to give, and is told so instead.
+                let standalone = hosted.sim(|s| {
+                    s.missions
+                        .active(body)
+                        .is_some_and(|m| m.operation().is_none())
+                });
+                if !standalone {
+                    return Outcome::Refused(done);
+                }
+                let account = done_account(hosted, body, &why);
+                return file_done(hosted, body, &account);
             }
             hosted.with_sim(
                 |s| match s.missions.report(body, Verdict::Fail, &why, None) {
@@ -413,6 +402,50 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
             ))
         }
         other => Outcome::Refused(format!("`{other}` is not a mission act.")),
+    }
+}
+
+/// File `body`'s mission done with `account` — both the report's notes (how it
+/// went) and its answer (what was found): for a mission done, the two are the
+/// same line.
+fn file_done(hosted: &Hosted, body: &str, account: &str) -> Outcome {
+    hosted.with_sim(|s| {
+        match s
+            .missions
+            .report(body, Verdict::Pass, account, Some(account.to_string()))
+        {
+            Some(m) => {
+                tracing::info!(npc = body, prompt = %m.mission_text(), %account, "mission reported DONE at the command table");
+                // An operation this report finished is the record grown by a
+                // document: said once, where it happens.
+                if let Some(op) = m
+                    .operation()
+                    .and_then(|(id, _)| s.missions.operations().get(id))
+                    .filter(|o| o.succeeded())
+                {
+                    tracing::info!(operation = %op.name, document = %op.document, "operation: stands in the record");
+                }
+                Outcome::Did(format!(
+                    "Reported done, and your answer filed: {}{}",
+                    m.mission_text(),
+                    back_to_now(&m)
+                ))
+            }
+            None => Outcome::Refused("You are not carrying a mission to report on.".into()),
+        }
+    })
+}
+
+/// The account a finished mission is filed done with when its carrier
+/// reported it stuck: what the engine saw on it — the readings its scans
+/// took — or, with none, the carrier's own words.
+fn done_account(hosted: &Hosted, body: &str, said: &str) -> String {
+    let seen = hosted
+        .sim(|s| s.missions.active(body).map(|m| m.observed.clone()))
+        .unwrap_or_default();
+    match seen.is_empty() {
+        true => said.trim().to_string(),
+        false => seen.join("; "),
     }
 }
 
@@ -1857,12 +1890,22 @@ fn set_state(hosted: &Hosted, body: &str, what: &str, to: State) -> Outcome {
     })
 }
 
-/// The machine `said` names, by its own name — or why there is none.
+/// The machine `said` names, by its own name — or why there is none, with
+/// each name there is once.
+///
+/// **A name stands once in the list however many rooms have one.** Seven plant
+/// rooms each hold a breaker panel, and a Maker that asked for the air handler
+/// was told "the breaker panel" seven times over before the list moved on.
 fn machine_named(s: &Sim, said: &str) -> Result<String, String> {
     if let Some(d) = s.devices.by_name(said) {
         return Ok(d.name.clone());
     }
-    let names: Vec<String> = s.devices.iter().map(|d| d.name.clone()).collect();
+    let mut names: Vec<String> = Vec::new();
+    for d in s.devices.iter() {
+        if !names.contains(&d.name) {
+            names.push(d.name.clone());
+        }
+    }
     Err(format!(
         "There is no machine called {said}. `what` is the machine, by its name: {}.",
         list(&names)
@@ -2315,6 +2358,8 @@ fn bench(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::mission::{Origin, Todo};
+    use crate::engine::mission_gen::world::Draw;
     use crate::engine::survey;
     use crate::sim::shelf::NO_OPERATION;
     use npc_map::world::Where;
@@ -2372,12 +2417,15 @@ mod tests {
         assert_eq!(what_happens("A brief with no such paragraph."), None);
     }
 
+    /// The vault with two Makers on the chronicle, its table handing out the
+    /// bank's routines — so `take_up` gives a free Maker a reading to work.
     fn vault() -> Hosted {
         let h = Hosted::load(
             "creators-vault",
             concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps"),
         )
         .expect("the vault must load");
+        h.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::Routines));
         h.with(|w| {
             w.enter(
                 "m1",
@@ -2393,6 +2441,55 @@ mod tests {
             .unwrap();
         });
         h
+    }
+
+    /// **Work with no operation behind it, every step done, is filed done when
+    /// it is reported stuck** — with what was seen on it as its answer —
+    /// rather than refused with "report it done", which three characters
+    /// went between for hours.
+    #[test]
+    fn a_finished_routine_reported_stuck_is_filed_done() {
+        let h = vault();
+        let mut m = Mission::new(
+            "Go to the plant room and read the breaker panel.",
+            vec![Todo::report("go back to the table and report it")],
+            Origin::Random {
+                routine: "read-a-station".into(),
+            },
+        );
+        m.observed
+            .push("in the plant room, the breaker panel: closed".into());
+        h.with_sim(|s| s.missions.assign("m1", m));
+        match perform(
+            &h,
+            "m1",
+            &act(
+                "report_stuck",
+                json!({"why": "I reported it already and the table still shows it"}),
+            ),
+        ) {
+            Outcome::Did(line) => assert!(line.starts_with("Reported done"), "{line}"),
+            other => panic!("a finished routine was not filed: {other:?}"),
+        }
+        assert!(!h.sim(|s| s.missions.is_on_mission("m1")));
+    }
+
+    /// **A machine name is listed once**, though seven plant rooms each hold a
+    /// breaker panel.
+    #[test]
+    fn a_machine_not_found_lists_each_name_once() {
+        let h = vault();
+        let why = h.sim(|s| machine_named(s, "the air handler")).unwrap_err();
+        assert_eq!(why.matches("the breaker panel").count(), 1, "{why}");
+        assert!(
+            h.sim(|s| s
+                .devices
+                .iter()
+                .filter(|d| d.name == "the breaker panel")
+                .count())
+                > 1,
+            "the vault has a panel in more than one room"
+        );
     }
 
     /// The vault, with somewhere to keep documents and two documents in it.
@@ -2936,9 +3033,7 @@ mod tests {
             let writer_draws = s
                 .missions
                 .collect("m1", &Facts::default())
-                .unwrap()
-                .operation()
-                .is_some();
+                .is_some_and(|m| m.operation().is_some());
             assert!(!writer_draws, "not its own draft");
             s.missions.cancel("m1");
             let reviewer = s.missions.collect("m2", &Facts::default()).unwrap();
