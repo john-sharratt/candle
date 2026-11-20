@@ -28,7 +28,7 @@ use super::super::reclaim::ReclaimClock;
 use super::super::stager::StagerMsg;
 use super::super::types::PipelineStats;
 use super::super::warm_tier::WarmTier;
-use super::policy::{Decision, Limits, Policy, ShrinkReason, Signals};
+use super::policy::{Decision, Limits, Policy, ShrinkReason, Signals, HEADROOM};
 
 /// The controller's period.
 const TICK: Duration = Duration::from_secs(1);
@@ -52,6 +52,12 @@ pub(crate) fn max_chunks(
     let by_experts = order.saturating_sub(pinned_slots) / per.max(1);
     let by_budget = expert_budget.saturating_sub(pinned_bytes) / chunk_bytes.max(1);
     by_experts.min(by_budget as usize)
+}
+
+/// Whether a press left the room a chunk needs: the headroom and the chunk
+/// both free.
+pub(crate) fn press_made_room(available: u64, chunk_bytes: u64) -> bool {
+    available >= HEADROOM + chunk_bytes
 }
 
 /// The experts pageable chunk `chunk` holds, and its first warm slot: the
@@ -141,6 +147,7 @@ impl Change {
             Change::Refused => "refused",
             Change::Shrink(ShrinkReason::Severe) => "shrink(severe)",
             Change::Shrink(ShrinkReason::Build) => "shrink(build)",
+            Change::Shrink(ShrinkReason::Short) => "shrink(short)",
             Change::Shrink(ShrinkReason::Pressure) => "shrink(pressure)",
         }
     }
@@ -258,6 +265,14 @@ impl Controller {
         let paged = self.ctx.warm.paged();
         if press_first {
             self.pressed = press(paged.chunk_bytes() as usize);
+            // The press is a probe: the RAM was idle pages only if it is free
+            // now. If not, something is using it — the grow would only take
+            // the machine's headroom, and is refused for a back-off.
+            let after = available_physical_ram().unwrap_or(0);
+            if !press_made_room(after, paged.chunk_bytes()) {
+                self.policy.refused(held);
+                return Some(Change::Refused);
+            }
         }
         let chunk = paged.chunks();
         let pinned = self.ctx.warm.pinned_slots();
@@ -437,6 +452,15 @@ mod tests {
             0,
             "all pinned"
         );
+    }
+
+    /// A press made room only if the headroom and a whole chunk are free
+    /// after it.
+    #[test]
+    fn a_press_made_room_only_with_the_headroom_and_a_chunk_free() {
+        assert!(press_made_room(HEADROOM + CHUNK, CHUNK));
+        assert!(!press_made_room(HEADROOM + CHUNK - 1, CHUNK));
+        assert!(!press_made_room(HEADROOM, CHUNK));
     }
 
     /// Chunk `c` holds the draw's next `per` experts past the pinned part, at

@@ -88,9 +88,35 @@ pub fn target_at(from: (u64, u64), phase: &Phase, t: u64) -> (u64, u64) {
     (lerp(from.0, phase.active), lerp(from.1, phase.idle))
 }
 
+/// The second of `phase` that `elapsed` into it falls in, or `None` once the
+/// phase is over. Read from the clock, not counted: a tick that runs long —
+/// allocating gigabytes, or a machine under the very pressure being made —
+/// must not stretch the phase.
+pub fn second_of(phase: &Phase, elapsed: std::time::Duration) -> Option<u64> {
+    let s = elapsed.as_secs();
+    (s < phase.secs).then_some(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// **A phase ends on the clock**, however few ticks ran inside it.
+    #[test]
+    fn a_phase_ends_on_the_clock() {
+        let p = Phase {
+            active: GIB,
+            idle: 0,
+            secs: 120,
+            ramp: 15,
+        };
+        assert_eq!(second_of(&p, Duration::from_millis(0)), Some(0));
+        assert_eq!(second_of(&p, Duration::from_millis(7_900)), Some(7));
+        assert_eq!(second_of(&p, Duration::from_millis(119_999)), Some(119));
+        assert_eq!(second_of(&p, Duration::from_secs(120)), None);
+        assert_eq!(second_of(&p, Duration::from_secs(290)), None);
+    }
 
     #[test]
     fn sizes_take_a_suffix() {

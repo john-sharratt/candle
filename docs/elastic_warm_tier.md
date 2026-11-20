@@ -97,7 +97,13 @@ constant below is a starting value the balloon runs (§8) tune.
 |---|---|
 | **Severe**: fast faults > `SEVERE_FAULTS` (2,000/s), or available < `FLOOR` (1 GiB) | a quarter of the segments held, at least one |
 | **Build**: available fell by ≥ `SLOPE_BYTES` (2 GiB) over `SLOPE_TICKS` (3) and is below `HEADROOM` + one segment | as many segments as restore `HEADROOM` (3 GiB), at least one |
+| **Short**: available below `HEADROOM` for `SHORT_TICKS` (5) ticks running | as many segments as restore `HEADROOM`, at least one |
 | **Pressure**: fast faults > `PRESSURE_FAULTS` (400/s) for `PRESSURE_TICKS` (3) ticks running | one segment |
+
+The short rule is the build rule for a build too slow for the slope: measured on
+WhiteWorld (2026-11-21), a 14 GiB balloon that took 84 s to ramp left free RAM at
+2.2–4 GiB for 2.5 minutes with the tier untouched, until the floor rule shed a
+quarter at 0.90 GiB. The headroom is the machine's, whoever took it.
 
 A shrink is taken at most once per `SHRINK_DWELL` (2 s): the released pages take
 a moment to reach the free list and the faults to stop, and shrinking again on a
@@ -119,14 +125,22 @@ pageable segment's worth of memory makes the OS trim other working sets and
 hand their pages over. Pressing is the growth that takes RAM from minimized
 apps (§2 item 1), and it may also trim this process — which its faults then
 show, and §4.1 undoes. It is allowed once per `PRESS_DWELL` (30 s), after
-`PRESS_QUIET_TICKS` (60) quiet ticks, and never under a ceiling.
+`PRESS_QUIET_TICKS` (60) quiet ticks, only with free RAM at or past `HEADROOM`,
+and not within `PRESS_AFTER_SHRINK` (10 min) of a shrink: a shrink says
+something is using the machine's RAM, and a press trims a build's live pages as
+readily as an idle app's. **The press is a probe**: the controller re-reads free
+RAM after it and grows only if the headroom and a whole chunk are free
+(`controller::press_made_room`); otherwise the grow is refused, a ceiling for a
+back-off.
 
 ### 4.3 Anti-churn — a ceiling with exponential back-off
 
-A shrink taken for **pressure, severe or build** sets a ceiling: the size the tier
-held before the shrink, less one segment. Growth stops at the ceiling for the
-**back-off** period, which starts at `BACKOFF_MIN` (60 s). When the back-off
-expires the ceiling lifts by one segment, a probe.
+Every shrink sets a ceiling: **the size the shrink leaves**. Growth stops at the
+ceiling for the **back-off** period, which starts at `BACKOFF_MIN` (60 s). When
+the back-off expires the ceiling lifts by one segment, a probe. (A ceiling one
+under the size *before* the shrink let a severe shrink of 18 → 13 grow straight
+back to 17 within 70 s while the build that caused it still held its RAM —
+WhiteWorld, 2026-11-21.)
 
 If pressure recurs within twice the back-off after a ceiling lifted, the next
 back-off doubles, up to `BACKOFF_MAX` (30 min). After `RELAX_AFTER` (1 h, twice

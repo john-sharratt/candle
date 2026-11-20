@@ -1,6 +1,6 @@
 //! The elastic warm tier's controller (`docs/elastic_warm_tier.md` §4): from
 //! this process's hard faults and the machine's free RAM, once a tick, whether
-//! the pinned part grows by a segment, shrinks, or holds.
+//! the pageable part grows by a segment (a chunk), shrinks, or holds.
 //!
 //! Pure: every reading is passed in and time is counted in ticks, so the whole
 //! law pins down in tests against signal sequences.
@@ -37,8 +37,18 @@ pub(crate) const SLOPE_TICKS: usize = 3;
 pub(crate) const SHRINK_DWELL: u64 = 2;
 /// Ticks between grows, and from a shrink to the next grow.
 pub(crate) const GROW_DWELL: u64 = 5;
+/// Ticks running with free RAM under [`HEADROOM`] before the tier gives back
+/// what restores it: a build that ramps too slowly for the slope rule still
+/// takes the machine's headroom, and gets it back within seconds.
+pub(crate) const SHORT_TICKS: u32 = 5;
 /// Ticks between pressed grows.
 pub(crate) const PRESS_DWELL: u64 = 30;
+/// Ticks after a shrink before a grow may press: a shrink says something on
+/// the machine is using its RAM, and pressing writes through a segment's worth
+/// of memory that trims whoever is — a build's live pages as readily as an idle
+/// app's (WhiteWorld, 2026-11-21: a press 70 s after a shrink took free RAM
+/// back to 1.86 GiB under a 14 GiB build).
+pub(crate) const PRESS_AFTER_SHRINK: u64 = 10 * 60;
 /// The back-off a ceiling holds growth for, at its least and its most.
 pub(crate) const BACKOFF_MIN: u64 = 60;
 pub(crate) const BACKOFF_MAX: u64 = 30 * 60;
@@ -72,6 +82,8 @@ pub(crate) enum ShrinkReason {
     Severe,
     /// Free RAM falling fast towards the headroom.
     Build,
+    /// Free RAM under the headroom for [`SHORT_TICKS`] running.
+    Short,
     /// Faults past [`PRESSURE_FAULTS`] for [`PRESSURE_TICKS`] running.
     Pressure,
 }
@@ -81,6 +93,7 @@ impl ShrinkReason {
         match self {
             ShrinkReason::Severe => "severe",
             ShrinkReason::Build => "build",
+            ShrinkReason::Short => "short",
             ShrinkReason::Pressure => "pressure",
         }
     }
@@ -116,6 +129,8 @@ pub(crate) struct Policy {
     slow: f64,
     pressure_run: u32,
     quiet_run: u32,
+    /// Ticks running with free RAM under the headroom.
+    short_run: u32,
     /// Free RAM over the last [`SLOPE_TICKS`] ticks, oldest first.
     available: VecDeque<u64>,
     last_shrink: Option<u64>,
@@ -144,6 +159,7 @@ impl Policy {
             slow: 0.0,
             pressure_run: 0,
             quiet_run: 0,
+            short_run: 0,
             available: VecDeque::with_capacity(SLOPE_TICKS + 1),
             last_shrink: None,
             last_grow: None,
@@ -168,7 +184,8 @@ impl Policy {
         self.backoff
     }
 
-    /// The driver refused a grow: hold growth where it is for a back-off.
+    /// A grow was refused — the allocator said no, or a press left no room
+    /// for it: hold growth where it is for a back-off.
     pub(crate) fn refused(&mut self, held: usize) {
         self.ceiling = Some(Ceiling {
             segments: held,
@@ -192,6 +209,11 @@ impl Policy {
         };
         self.quiet_run = if self.slow < QUIET_FAULTS {
             self.quiet_run + 1
+        } else {
+            0
+        };
+        self.short_run = if s.available < HEADROOM {
+            self.short_run + 1
         } else {
             0
         };
@@ -248,6 +270,9 @@ impl Policy {
         } else if fell && s.available < HEADROOM + seg {
             let short = HEADROOM.saturating_sub(s.available).div_ceil(seg) as usize;
             (short.max(1), ShrinkReason::Build)
+        } else if self.short_run >= SHORT_TICKS {
+            let short = HEADROOM.saturating_sub(s.available).div_ceil(seg) as usize;
+            (short.max(1), ShrinkReason::Short)
         } else if self.pressure_run >= PRESSURE_TICKS {
             (1, ShrinkReason::Pressure)
         } else {
@@ -262,14 +287,20 @@ impl Policy {
         {
             self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
         }
+        // The ceiling is the size the shrink leaves, not the one it left: the
+        // machine has just said it wants those segments, and growing back into
+        // them while it still does is the churn (WhiteWorld, 2026-11-21: shed
+        // 18 → 13 and regrown to 17 within 70 s under a held 14 GiB build).
+        // Each probe past it is one segment per back-off.
         self.ceiling = Some(Ceiling {
-            segments: l.held.saturating_sub(1),
+            segments: l.held - segments,
             until: self.tick + self.backoff,
         });
         self.last_lift = None;
         self.last_pressure = self.tick;
         self.last_shrink = Some(self.tick);
         self.pressure_run = 0;
+        self.short_run = 0;
         Some(Decision::Shrink { segments, reason })
     }
 
@@ -287,8 +318,12 @@ impl Policy {
             self.last_grow = Some(self.tick);
             return Decision::Grow { press: false };
         }
-        if self.quiet_run >= PRESS_QUIET_TICKS
-            && self.ceiling.is_none()
+        // Pressing is for RAM held by idle pages, never short of the headroom
+        // (that is the machine's), and never soon after a shrink said something
+        // is using it. The controller grows only if the press made the room.
+        if s.available >= HEADROOM
+            && self.quiet_run >= PRESS_QUIET_TICKS
+            && self.since(self.last_shrink) >= PRESS_AFTER_SHRINK
             && self.since(self.last_press) >= PRESS_DWELL
         {
             self.last_grow = Some(self.tick);
@@ -466,32 +501,97 @@ mod tests {
         assert_eq!(held, 7);
     }
 
-    /// **Another process's paging is not this one's.** Free RAM held low by
-    /// other processes — but not falling fast, and above the floor — with this
-    /// process quiet takes nothing back; what it does instead is press their
-    /// idle pages out, one segment per press dwell.
+    /// **A build that ramps too slowly for the slope still gets the headroom
+    /// back within seconds**: free RAM under it for [`SHORT_TICKS`] running
+    /// sheds what restores it, with this process quiet — its own faults are
+    /// not the only sign the machine needs its RAM.
     #[test]
-    fn other_processes_paging_does_not_shrink_the_tier() {
+    fn free_ram_held_short_of_the_headroom_is_given_back() {
+        let mut p = Policy::new();
+        let (mut held, mut faults) = (18usize, 0u64);
+        let ds = run(
+            &mut p,
+            &mut held,
+            20,
+            &mut faults,
+            0,
+            GIB + GIB / 4,
+            SHORT_TICKS as usize,
+        );
+        assert!(ds[..SHORT_TICKS as usize - 1]
+            .iter()
+            .all(|d| *d == Decision::Hold));
+        assert_eq!(
+            ds[SHORT_TICKS as usize - 1],
+            Decision::Shrink {
+                segments: 2,
+                reason: ShrinkReason::Short
+            }
+        );
+        assert_eq!(held, 16);
+    }
+
+    /// **No growth back into what a shrink gave up**: the ceiling is the size
+    /// the shrink left, held through the back-off however free RAM looks — a
+    /// build that took the headroom and is still running leaves it free once
+    /// the tier has shrunk.
+    #[test]
+    fn a_shrink_is_not_grown_back_while_its_back_off_holds() {
+        let mut p = Policy::new();
+        let (mut held, mut faults) = (18usize, 0u64);
+        run(&mut p, &mut held, 20, &mut faults, 0, GIB / 2, 1);
+        assert_eq!(held, 13, "severe: a quarter");
+        assert_eq!(p.ceiling().map(|c| c.segments), Some(13));
+        let ds = run(
+            &mut p,
+            &mut held,
+            20,
+            &mut faults,
+            0,
+            5 * GIB,
+            BACKOFF_MIN as usize - 1,
+        );
+        assert_eq!(grows(&ds), 0, "{ds:?}");
+        assert_eq!(held, 13);
+    }
+
+    /// **Pressing waits long after a shrink**, and never presses into the
+    /// headroom: free RAM just past it, with this process quiet, presses only
+    /// once [`PRESS_AFTER_SHRINK`] has passed since the last shrink.
+    #[test]
+    fn pressing_waits_long_after_a_shrink() {
         let mut p = Policy::new();
         let (mut held, mut faults) = (8usize, 0u64);
-        let ds = run(&mut p, &mut held, 20, &mut faults, 0, 2 * GIB, 200);
-        assert!(
-            ds.iter().all(|d| !matches!(d, Decision::Shrink { .. })),
-            "{ds:?}"
+        run(&mut p, &mut held, 20, &mut faults, 900, 40 * GIB, 4);
+        assert_eq!(held, 7, "a pressure shrink");
+        let tight = HEADROOM + SEG / 2;
+        let ds = run(
+            &mut p,
+            &mut held,
+            20,
+            &mut faults,
+            0,
+            tight,
+            PRESS_AFTER_SHRINK as usize - 10,
         );
         assert!(
             ds.iter()
-                .all(|d| matches!(d, Decision::Hold | Decision::Grow { press: true })),
-            "only pressed grows on a full machine: {ds:?}"
+                .all(|d| !matches!(d, Decision::Grow { press: true })),
+            "no press within {PRESS_AFTER_SHRINK} ticks of a shrink"
         );
-        assert_eq!(
-            held,
-            8 + 1 + (200 - PRESS_QUIET_TICKS as usize) / PRESS_DWELL as usize
+        let ds = run(&mut p, &mut held, 20, &mut faults, 0, tight, 60);
+        assert!(ds.contains(&Decision::Grow { press: true }), "{ds:?}");
+        let mut p = Policy::new();
+        let mut held = 8usize;
+        let ds = run(&mut p, &mut held, 20, &mut faults, 0, HEADROOM - 1, 4);
+        assert!(
+            ds.iter().all(|d| !matches!(d, Decision::Grow { .. })),
+            "never a press short of the headroom"
         );
     }
 
-    /// **A shrink sets a ceiling one under the size it shrank from**, held for
-    /// the back-off; then the ceiling lifts one segment, a probe.
+    /// **A shrink sets a ceiling at the size it leaves**, held for the
+    /// back-off; then the ceiling lifts one segment, a probe.
     #[test]
     fn a_ceiling_holds_growth_for_the_back_off_then_lifts_one() {
         let mut p = Policy::new();

@@ -56,16 +56,20 @@ impl Hog {
                 .spawn(move || {
                     let mut value = 2u8;
                     while !stop.load(Ordering::Relaxed) {
-                        let mut held = active.lock().unwrap();
-                        if held.is_empty() {
-                            drop(held);
+                        let n = active.lock().unwrap().len();
+                        if n == 0 {
                             std::thread::sleep(Duration::from_millis(50));
                             continue;
                         }
-                        for c in held.iter_mut() {
-                            touch(c, value);
+                        // The lock one chunk at a time: a whole sweep of a
+                        // build-sized hold takes seconds, and the schedule
+                        // must not wait behind it.
+                        for i in 0..n {
+                            let mut held = active.lock().unwrap();
+                            if let Some(c) = held.get_mut(i) {
+                                touch(c, value);
+                            }
                         }
-                        drop(held);
                         value = value.wrapping_add(1).max(2);
                         sweeps.fetch_add(1, Ordering::Relaxed);
                     }

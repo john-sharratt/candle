@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 use hog::Hog;
-use plan::{parse_plan, target_at};
+use plan::{parse_plan, second_of, target_at};
 use report::{Sampler, HEADER};
 
 struct Args {
@@ -78,7 +78,7 @@ fn main() -> Result<()> {
     let mut from = (0u64, 0u64);
     for (i, phase) in plan.iter().enumerate() {
         let began = Instant::now();
-        for s in 0..phase.secs {
+        while let Some(s) = second_of(phase, began.elapsed()) {
             let (active, idle) = target_at(from, phase, s);
             let held = hog.set(active, idle);
             let line = sampler.line(
