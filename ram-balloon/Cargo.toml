@@ -1,0 +1,13 @@
+[package]
+name = "ram-balloon"
+version = "0.1.0"
+edition = "2021"
+description = "Hold active and idle host RAM on a schedule, and log how this process and a watched one page (docs/elastic_warm_tier.md §8)."
+
+[dependencies]
+candle = { workspace = true }
+anyhow = { workspace = true }
+
+[[bin]]
+name = "ram-balloon"
+path = "src/main.rs"

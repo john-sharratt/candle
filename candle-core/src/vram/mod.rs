@@ -34,6 +34,7 @@ mod driver_model;
 mod gpu_addressable;
 mod host_probe;
 mod managed;
+pub mod process_paging;
 pub mod process_ram;
 pub mod reading;
 

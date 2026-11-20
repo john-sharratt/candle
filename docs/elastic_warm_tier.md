@@ -117,8 +117,11 @@ held before the shrink, less one segment. Growth stops at the ceiling for the
 expires the ceiling lifts by one segment, a probe.
 
 If pressure recurs within twice the back-off after a ceiling lifted, the next
-back-off doubles, up to `BACKOFF_MAX` (30 min). After `RELAX_AFTER` (30 min)
-quiet, the back-off halves, back towards the minimum.
+back-off doubles, up to `BACKOFF_MAX` (30 min). After `RELAX_AFTER` (1 h, twice
+the longest back-off) without pressure, the back-off halves, back towards the
+minimum. Shorter, and the quiet a tier spends waiting out its own back-off would
+relax it: measured in the policy's tests, a 30-minute relax undid every doubling
+at the cap.
 
 So the tier finds its steady size by halving its probing rate each time it
 meets the edge: on a machine whose steady size moves only when something else
@@ -222,8 +225,11 @@ the tier moving.
   pair over it and is never missing from a concurrent read.
 - **The pad book**: grown slots are free churn; retiring slots are never taken;
   a drained segment reports only once every slot is free.
-- **The probes**: this process's hard-fault count is read and grows when its
-  own pages are forced out and back.
+- **The probes**: the Windows process records parse at their offsets from raw
+  bytes; this process's own record is found, its resident bytes grow with what
+  it touches, and its fault count never falls. Paging a process out on demand is
+  not something a unit test can make the OS do; the balloon runs (§8) measure
+  the faults themselves.
 
 ## 8. The balloon harness
 
