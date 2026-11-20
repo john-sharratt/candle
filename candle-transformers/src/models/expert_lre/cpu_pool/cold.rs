@@ -40,9 +40,8 @@ pub(crate) struct ColdSource {
     pub(crate) table: Arc<LiveTable>,
     pub(crate) abort: Arc<AbortWord>,
     pub(crate) fault: Arc<FaultWord>,
-    /// The pinned ranges the stager publishes a cold expert into — the pad and
-    /// the warm tier's segments, host memory the pool can read — the table the
-    /// bucketize kernel classifies by.
+    /// The pinned ranges the stager publishes a cold expert into — the warm
+    /// tier's pinned part and the pad, both host memory the pool can read.
     pub(crate) pinned: PinnedRanges,
     /// The warm tier's pageable copies.
     pub(crate) paged: Arc<PagedImages>,
@@ -127,7 +126,7 @@ impl ColdSource {
     }
 
     pub(crate) fn host_readable(&self, addr: u64) -> bool {
-        self.pinned.contains(addr)
+        self.pinned.iter().any(|&(lo, hi)| addr >= lo && addr < hi)
     }
 
     /// One wait while `(row, expert)` is unpublished (`backoff`): hot spins,

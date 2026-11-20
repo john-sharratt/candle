@@ -66,7 +66,7 @@ fn a_vram_entry_on_another_experts_slot_traps() -> Result<()> {
         gate_row: table_d.device_ptr(&stream).0,
         table_plane: n_experts as i64,
         snap: snap.device_ptr(&stream).0,
-        pinned_table: 0,
+        pinned: [(0, 0), (0, 0)],
         summary: 0,
         summary_seq: 0,
         remote: 0,

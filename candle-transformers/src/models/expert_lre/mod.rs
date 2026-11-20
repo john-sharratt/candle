@@ -153,8 +153,6 @@ pub(crate) mod compute;
 pub mod cpu_pool;
 #[cfg(feature = "cuda")]
 mod dispatch;
-/// The elastic warm tier: its pinned part grown and shrunk with the machine.
-mod elastic;
 #[cfg(test)]
 mod eval;
 /// The word a live launch's workers report a lost cold expert in.

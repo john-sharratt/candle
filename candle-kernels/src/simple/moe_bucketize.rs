@@ -19,10 +19,6 @@ pub const MAX_TOPK: usize = 32;
 /// Kernel bound on the decode-scored token ranges, mirrored from
 /// `MAX_DECODE_RANGES` in the `.cu`.
 pub const MAX_DECODE_RANGES: usize = 32;
-/// Kernel bound on the pinned host ranges a launch reads from its table,
-/// mirrored from `MAX_PINNED_RANGES` in `moe_bucketize_live.cuh`. A table
-/// holding more is read to this many.
-pub const MAX_PINNED_RANGES: usize = 128;
 
 /// A promotion offer with no resident expert behind it, mirrored from
 /// `PROMO_EMPTY` in the `.cu`.
@@ -149,10 +145,11 @@ extern "C" {
         // `u64[3][n_experts]` snapshot of the routed experts' entries (gate,
         // up, down); required when `gate_row` is set.
         snap: *mut c_void,
-        // The mapped table of pinned host ranges `[lo, hi)` a remote (non-VRAM)
-        // entry lies in — a `u64` count, then the pairs, at most
-        // `MAX_PINNED_RANGES` — or null for none.
-        pinned_table: *const c_void,
+        // The two pinned host ranges `[lo, hi)` a remote (non-VRAM) entry lies in.
+        pinned0_lo: u64,
+        pinned0_hi: u64,
+        pinned1_lo: u64,
+        pinned1_hi: u64,
         // Tokens inside one of the `decode_ranges` ranges `[decode_lo[i],
         // decode_hi[i])` are decode-scored (the summary's decode bit). Host
         // pointers, read by the launcher into the launch parameters; at most

@@ -22,53 +22,6 @@ __device__ __forceinline__ void store_started_ticket(uint64_t* started_rows, int
     __threadfence_system();
 }
 
-// The most pinned host ranges a remote entry may lie in: the pad's churn block
-// and the warm tier's segments (`expert_lre::elastic`).
-#define MAX_PINNED_RANGES 128
-
-// The pinned host ranges `[lo, hi)`, as a launch copied them into shared
-// memory: `r[2i]`, `r[2i + 1]` for `i < n`.
-//
-// The host keeps them in a mapped table — a `u64` count, then the pairs — and
-// changes it while kernels run, under two rules that make a stale copy safe:
-// a range is added before any entry points into it, and removed only once no
-// entry does and no invocation can still hold one in its snapshot. So a copy
-// taken just before an add can read an entry into the new range only as VRAM —
-// the GPU reads both images alike — and no copy names a range an entry it can
-// read has left.
-struct PinnedRanges {
-    const uint64_t* r;
-    uint32_t n;
-};
-
-__device__ __forceinline__ bool in_pinned(const PinnedRanges& p, uint64_t a) {
-    for (uint32_t i = 0; i < p.n; i++) {
-        if (a >= p.r[2 * i] && a < p.r[2 * i + 1]) {
-            return true;
-        }
-    }
-    return false;
-}
-
-// Copy the mapped `table` into `sh` (`2 · MAX_PINNED_RANGES` words) and `sh_n`,
-// every thread taking part: one round of host reads a launch, so classifying an
-// entry reads none. A null table is no ranges. Ends on a block barrier.
-__device__ __forceinline__ PinnedRanges load_pinned_ranges(
-    const uint64_t* table, uint64_t* sh, uint32_t* sh_n, int tid, int threads)
-{
-    if (tid == 0) {
-        const uint64_t n = table != nullptr ? ((const volatile uint64_t*)table)[0] : 0ull;
-        *sh_n = n < MAX_PINNED_RANGES ? (uint32_t)n : MAX_PINNED_RANGES;
-    }
-    __syncthreads();
-    const uint32_t n = *sh_n;
-    for (uint32_t i = (uint32_t)tid; i < 2 * n; i += (uint32_t)threads) {
-        sh[i] = ((const volatile uint64_t*)table)[1 + i];
-    }
-    __syncthreads();
-    return PinnedRanges{sh, n};
-}
-
 // The three live entries (gate, up, down) of expert `e`, read volatile: the
 // host rewrites them while kernels run.
 struct LiveEntries {
@@ -87,11 +40,12 @@ __device__ __forceinline__ LiveEntries load_live_entries(const uint64_t* gate_ro
 }
 
 // Classify expert `e` from the entries read — any of the three 0 is cold, a gate
-// entry inside a pinned range is pinned, anything else VRAM — check a VRAM
+// entry inside either pinned range is pinned, anything else VRAM — check a VRAM
 // entry against its slot's owner tag (a mismatch traps, naming the slot), and
 // copy the entries into the snapshot (`[3][n_experts]`). Returns the class.
 __device__ __forceinline__ uint8_t snapshot_expert(
-    int e, const LiveEntries& x, int n_experts, uint64_t* snap, const PinnedRanges& ranges,
+    int e, const LiveEntries& x, int n_experts, uint64_t* snap,
+    uint64_t pinned0_lo, uint64_t pinned0_hi, uint64_t pinned1_lo, uint64_t pinned1_hi,
     const uint32_t* slot_owner, uint64_t zone_end, uint64_t zone_slot_bytes, uint32_t zone_slots,
     int32_t row)
 {
@@ -105,7 +59,9 @@ __device__ __forceinline__ uint8_t snapshot_expert(
     // host memory, and faulted on the VRAM address (Flash-Next C5 ×8 on the
     // RTX 3090, 2026-10-18, after the zone conceded 1,790 slots). Such a read
     // is a promotion in flight: it stays on the GPU, classed VRAM.
-    const auto pinned = [&](uint64_t a) { return in_pinned(ranges, a); };
+    const auto pinned = [&](uint64_t a) {
+        return (a >= pinned0_lo && a < pinned0_hi) || (a >= pinned1_lo && a < pinned1_hi);
+    };
     if (pg == 0ull || x.up == 0ull || x.down == 0ull) {
         cls = CLS_COLD;
     } else if (pinned(pg) && pinned(x.up) && pinned(x.down)) {
@@ -203,7 +159,10 @@ struct ReadAhead {
 // The pinned ranges a remote entry lies in, and the zone's owner tags — what the
 // read-ahead walk vets a predicted expert's source against and tags its slot in.
 struct ZoneRanges {
-    PinnedRanges pinned;
+    uint64_t pinned0_lo;
+    uint64_t pinned0_hi;
+    uint64_t pinned1_lo;
+    uint64_t pinned1_hi;
     const uint32_t* slot_owner;
     uint64_t zone_end;
     uint64_t zone_slot_bytes;
@@ -349,7 +308,8 @@ __device__ __forceinline__ void promotion_walk(
                     const uint64_t pg = g[0];
                     const uint64_t pu = g[table_plane];
                     const uint64_t pd = g[2 * table_plane];
-                    const bool pinned = in_pinned(zone.pinned, pg);
+                    const bool pinned = (pg >= zone.pinned0_lo && pg < zone.pinned0_hi) ||
+                                        (pg >= zone.pinned1_lo && pg < zone.pinned1_hi);
                     if (pg == 0ull || pu == 0ull || pd == 0ull || !pinned ||
                         ((const volatile uint32_t*)promo_marks)[at] != 0u) {
                         continue;
@@ -397,7 +357,8 @@ __device__ __forceinline__ void promotion_walk(
                 const uint64_t pg = g[0];
                 const uint64_t pu = g[table_plane];
                 const uint64_t pd = g[2 * table_plane];
-                const bool pinned = in_pinned(zone.pinned, pg);
+                const bool pinned = (pg >= zone.pinned0_lo && pg < zone.pinned0_hi) ||
+                                    (pg >= zone.pinned1_lo && pg < zone.pinned1_hi);
                 const uint64_t vetted =
                     ((const volatile uint64_t*)ahead.src)[(size_t)t * ahead.cap + q];
                 if (pg == 0ull || pu == 0ull || pd == 0ull || !pinned ||

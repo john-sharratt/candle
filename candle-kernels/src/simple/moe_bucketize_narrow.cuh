@@ -97,9 +97,6 @@ extern "C" __global__ void __launch_bounds__(BUCKETIZE_THREADS) moe_bucketize_na
     // Per expert: computed by the host CPU pool (1), and the split's scratch.
     __shared__ uint8_t sh_cpu[MAX_EXPERTS];
     __shared__ CpuSplitShared sh_cpu_split;
-    // The pinned host ranges, copied from the mapped table once (`PinnedRanges`).
-    __shared__ uint64_t sh_pinned[2 * MAX_PINNED_RANGES];
-    __shared__ uint32_t sh_n_pinned;
 
     const bool live = gate_row != nullptr;
 
@@ -126,13 +123,6 @@ extern "C" __global__ void __launch_bounds__(BUCKETIZE_THREADS) moe_bucketize_na
         }
     }
     __syncthreads();
-    // After the started word, before the first entry is read: an entry the host
-    // published into a range added since reads as VRAM, never the reverse
-    // (`PinnedRanges`). `live` is the block's, so every thread reaches it.
-    PinnedRanges ranges{sh_pinned, 0};
-    if (live) {
-        ranges = load_pinned_ranges(pinned_table, sh_pinned, &sh_n_pinned, tid, BUCKETIZE_THREADS);
-    }
 
     // ── P1: representatives' live loads, rows, token-major slots ──
     const uint32_t total_valid = narrow_valid_before(sh_vmask, a_ub);
@@ -168,7 +158,7 @@ extern "C" __global__ void __launch_bounds__(BUCKETIZE_THREADS) moe_bucketize_na
         rw_ids[slot] = (uint32_t)tid;
         if (rep && live) {
             const uint8_t cls = snapshot_expert(
-                (int)e, entries, n_experts, snap, ranges,
+                (int)e, entries, n_experts, snap, pinned0_lo, pinned0_hi, pinned1_lo, pinned1_hi,
                 slot_owner, zone_end, zone_slot_bytes, zone_slots, row);
             sh_cls[e] = cls;
             sh_marked[e] = promo_slots != nullptr && cls != CLS_VRAM &&
@@ -309,7 +299,8 @@ extern "C" __global__ void __launch_bounds__(BUCKETIZE_THREADS) moe_bucketize_na
                        promo_retarget, remote_dst,
                        ReadAhead{ahead_window, ahead_depth, ahead_n, ahead_list, ahead_src, ahead_cap,
                                  rows, row_layout, ahead_items, ahead_done, ahead_predict != 0},
-                       ZoneRanges{ranges, slot_owner, zone_end, zone_slot_bytes, zone_slots},
+                       ZoneRanges{pinned0_lo, pinned0_hi, pinned1_lo, pinned1_hi, slot_owner,
+                                  zone_end, zone_slot_bytes, zone_slots},
                        CpuCarry{sh_cpu_split.order, sh_cpu_split.take, sh_cls, cpu.promote,
                                 cpu_out.carry});
     }

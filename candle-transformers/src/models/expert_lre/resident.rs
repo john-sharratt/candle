@@ -173,24 +173,6 @@ impl Bands {
         )
     }
 
-    /// The bands for a resident capacity of `capacity`, each layer at its
-    /// startup share of it: the elastic tier grows and shrinks the capacity
-    /// (`docs/elastic_warm_tier.md` §5.3), and a band sized to the startup
-    /// count would cap a grown tier at twice its first size per layer. A startup
-    /// draw that pinned nothing shares the capacity evenly.
-    pub(crate) fn scaled(startup: &[usize], capacity: usize) -> Self {
-        let total: usize = startup.iter().sum();
-        let counts: Vec<usize> = if total == 0 {
-            vec![capacity / startup.len().max(1); startup.len()]
-        } else {
-            startup
-                .iter()
-                .map(|&c| (c as u64 * capacity as u64 / total as u64) as usize)
-                .collect()
-        };
-        Self::around(&counts)
-    }
-
     fn min(&self, row: usize) -> usize {
         self.0.get(row).map_or(0, |b| b.0)
     }
@@ -328,19 +310,6 @@ mod tests {
         assert_eq!((b.min(0), b.max(0)), (50, 200));
         assert_eq!((b.min(1), b.max(1)), (3, 14));
         assert_eq!((b.min(2), b.max(2)), (0, 0), "a layer the fill gave none");
-    }
-
-    /// **Bands follow the capacity at each layer's startup share**; a startup
-    /// with no residents shares it evenly.
-    #[test]
-    fn bands_scale_with_the_capacity() {
-        let b = Bands::scaled(&[10, 30], 80);
-        assert_eq!((b.min(0), b.max(0)), (10, 40), "20 of 80");
-        assert_eq!((b.min(1), b.max(1)), (30, 120), "60 of 80");
-        let b = Bands::scaled(&[10, 30], 20);
-        assert_eq!((b.min(0), b.max(0)), (2, 10), "5 of 20");
-        let b = Bands::scaled(&[0, 0], 40);
-        assert_eq!((b.min(1), b.max(1)), (10, 40));
     }
 
     /// With room the hottest churn slots above the floor are promoted

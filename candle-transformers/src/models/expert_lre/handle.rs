@@ -26,10 +26,6 @@ use super::cpu_pool::params::shared as cpu_params;
 #[cfg(feature = "cuda")]
 use super::dispatch::{CpuPath, Dispatch, OwnerTags};
 #[cfg(feature = "cuda")]
-use super::elastic::controller::{max_segments, spawn_controller, ControllerCtx, Elastic};
-#[cfg(feature = "cuda")]
-use super::elastic::region::segment_slots;
-#[cfg(feature = "cuda")]
 use super::link_rate::measure_link_rate;
 #[cfg(feature = "cuda")]
 use super::live_table::LiveTable;
@@ -71,8 +67,6 @@ use candle::cuda_backend::CudaDevice;
 use candle::quantized::cuda::Q8a128Operand;
 #[cfg(feature = "cuda")]
 use candle::quantized::decode_rows::DecodeRows;
-#[cfg(feature = "cuda")]
-use candle::quantized::pinned_ranges::PinnedRangeTable;
 use candle::quantized::Int8Mode;
 #[cfg(feature = "cuda")]
 use candle::{DType, LiveTensor};
@@ -170,7 +164,7 @@ const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
 /// against live free RAM instead. See `zend_run_iteration_traps.md` §4.
 pub const WARM_TIER_HEADROOM: u64 = 3 * 1024 * 1024 * 1024;
 
-use candle::vram::{gpu_addressable_room, host_ram_budget, total_physical_ram, PAGEABLE_RESERVE};
+use candle::vram::{gpu_addressable_room, PAGEABLE_RESERVE};
 
 /// Layers of pad slots the stager owns: the layer a wave is computing, and the
 /// [`STAGED_HOPS`] after it, which a prefill launch's router votes stage into
@@ -473,10 +467,6 @@ const CPU_FAULT_LIMIT: u32 = 3;
 /// scores, the copy stream) with `&mut self`; the forward thread reaches it
 /// only through the channel and the pass lock (`dispatch::PassState`).
 pub struct ExpertCache {
-    /// The elastic warm tier's controller, stopped first: it holds a sender
-    /// to the stager. `None` for a cache with no tier to move.
-    #[cfg(feature = "cuda")]
-    _elastic: Option<Elastic>,
     /// Channel to the pipeline thread.
     #[cfg(feature = "cuda")]
     tx: mpsc::SyncSender<PipelineMessage>,
@@ -674,12 +664,6 @@ impl ExpertCache {
             .new_stream()
             .map_err(candle::Error::wrap)?;
 
-        // The pinned host memory a live entry may point into, as the table the
-        // bucketize kernel and the CPU pool classify by: the pad's churn block
-        // and each of the warm tier's pinned segments, which add and remove
-        // their own ranges as the elastic tier moves them.
-        let pinned_ranges = Arc::new(PinnedRangeTable::new()?);
-
         // ── CUDA startup: the pack, then the resident tiers from it ──
         let (pack, warm, pad, residency, layer_geometries, all_resident, can_fault) =
             if let Device::Cuda(cuda_dev) = device {
@@ -764,13 +748,8 @@ impl ExpertCache {
                 if let Some(report) = progress {
                     report(LoadPhase::PinWarm, 0, 0);
                 }
-                let mut warm = WarmTier::new(
-                    membership.len(),
-                    stride,
-                    segment_slots(stride, evictable),
-                    gpu_addressable_room(cuda_dev)?,
-                    pinned_ranges.clone(),
-                );
+                let mut warm =
+                    WarmTier::new(membership.len(), stride, gpu_addressable_room(cuda_dev)?);
                 // A refusal shortens the draw rather than leaving slots the tier
                 // does not have: `ram` must never name a slot outside it.
                 let membership = &membership[..membership.len().min(warm.num_slots())];
@@ -905,7 +884,7 @@ impl ExpertCache {
         // (`resident`). The pageable rest stays the warm tier's.
         let mut pad = pad;
         let churn = pad.churn_slots();
-        pad.attach_resident(warm.region().clone());
+        pad.attach_resident(warm.clone());
         let mut residents = Vec::new();
         let mut paged = PagedImages::new(num_moe_layers, experts_per_layer, warm.clone());
         for (row, layer) in residency.iter().enumerate() {
@@ -986,16 +965,10 @@ impl ExpertCache {
         // The down launch's CPU items wait on the pool, and give its results up
         // through the same fault word, whatever is resident.
         let can_fault = can_fault || cpu.is_some();
-        let (lo, hi) = pad.range();
-        if lo < hi {
-            pinned_ranges.add(lo, hi).map_err(|_| {
-                candle::Error::Msg("expert cache: the pinned range table is full".into())
-            })?;
-        }
         let dispatch = Dispatch::new(
             cuda_dev_ref,
             table,
-            pinned_ranges.clone(),
+            [warm.pinned_range(), pad.range()],
             row_tile_bytes_for(&layer_geometries),
             &image_bytes,
             experts_used,
@@ -1037,39 +1010,6 @@ impl ExpertCache {
             stager_dead.clone(),
         )?;
 
-        // The elastic tier (`docs/elastic_warm_tier.md`): the pinned segments
-        // grown while this process is quiet and given back when it pages. A
-        // cache holding every expert in VRAM has no tier to move.
-        let elastic = if all_resident {
-            None
-        } else {
-            let region = warm.region().clone();
-            let evictable =
-                (num_moe_layers - pinned_layer_count(num_moe_layers)) * experts_per_layer;
-            let expert_budget =
-                total_physical_ram().map_or(0, |t| host_ram_budget(t).expert_pinned_budget_bytes);
-            let paged_bytes = (warm.paged_slots() * pad.stride()) as u64;
-            let max_segments = max_segments(
-                evictable,
-                region.per_segment(),
-                region.segment_bytes(),
-                expert_budget,
-                paged_bytes,
-            );
-            if let Ok(mut s) = stats.lock() {
-                s.warm_segments = region.segments();
-                s.warm_pinned_bytes = region.held_bytes();
-            }
-            Some(spawn_controller(ControllerCtx {
-                region,
-                stager: stager.clone(),
-                clock: dispatch.clock.clone(),
-                device: cuda_dev_ref.clone(),
-                stats: stats.clone(),
-                max_segments,
-            })?)
-        };
-
         let trace = Arc::new(Mutex::new(RoutingTrace::new()));
         let pinned_slots = pinned_layer_count(num_moe_layers) * experts_per_layer;
         let state = PipelineState::new(
@@ -1098,7 +1038,6 @@ impl ExpertCache {
         let tx = spawn_pipeline_thread(state, pipeline_dead.clone());
 
         Ok(Self {
-            _elastic: elastic,
             tx,
             stager,
             dispatch,

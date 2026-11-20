@@ -29,7 +29,6 @@ mod metal {
 pub mod cuda;
 #[cfg(not(feature = "cuda"))]
 mod dummy_pinned_staging;
-pub mod pinned_ranges;
 #[cfg(feature = "cuda")]
 pub mod pinned_staging;
 #[cfg(feature = "cuda")]

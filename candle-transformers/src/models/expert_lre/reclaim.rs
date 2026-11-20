@@ -145,15 +145,6 @@ impl ReclaimClock {
         self.started.latest()
     }
 
-    /// Every invocation up to `latest` has completed: the caller read `latest`
-    /// ([`Self::latest_started`]) and then waited out a context-wide
-    /// synchronise, which every invocation begun by then was queued ahead of.
-    /// What lets a slot of the row that ran last be reused while inference is
-    /// idle — no later ticket will start to prove it.
-    pub(crate) fn settled(&self, latest: u64) {
-        self.progress.fetch_max(latest + 1, Ordering::SeqCst);
-    }
-
     /// Whether every invocation up to ticket `key` has completed: `key` is
     /// below a ticket whose summary word was seen, or below one the device has
     /// begun on any row — its bucketize runs after every earlier kernel on the
@@ -298,21 +289,6 @@ mod tests {
         c.enqueued(1, 12);
         assert_eq!(c.begun(1), 7, "enqueued is not begun");
         assert_eq!(c.begun(0), 0, "other rows are untouched");
-    }
-
-    /// Once a synchronise has waited out everything begun, the row that ran
-    /// last is quiet too — though no later ticket has started — and nothing
-    /// past what was begun is: the next invocation's key still waits.
-    #[test]
-    fn a_settled_clock_completes_everything_begun_and_nothing_after() {
-        let c = clock(3);
-        c.started.store(0, 6);
-        c.started.store(2, 7);
-        assert!(!quiet(&c, 2), "the last row run, nothing later begun");
-        c.settled(c.latest_started());
-        assert!(quiet(&c, 2) && quiet(&c, 0));
-        assert!(c.reclaimable(7));
-        assert!(!c.reclaimable(8), "the next invocation has not run");
     }
 
     /// Observation only moves forward, whichever thread reports first.

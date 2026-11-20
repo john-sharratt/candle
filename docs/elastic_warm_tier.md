@@ -167,10 +167,9 @@ reading the table as it stands. The host writes it under two rules:
   then the count, with a system fence between. A segment's slots are published
   only after a read lands in them, long after.
 - **A range is removed after no entry points into it and no invocation could
-  have snapshotted one** (§5.3): its `hi` is zeroed, then its `lo`, leaving an
-  empty pair in place; the next add reuses the slot. The count is a high-water
-  mark, so a kernel reading during a removal sees every other pair where it
-  was, never one moved or missing.
+  have snapshotted one** (§5.3): the last pair is copied over it, a fence, then
+  the count is decremented. A kernel reading between the two sees the moved pair
+  twice, never a pair missing.
 
 ### 5.3 Growing and shrinking the pad
 
@@ -188,24 +187,8 @@ The stager owns the pad's book (`PadBook`), so it executes both.
   is reclaimable (`reclaim.rs`). The stager then hands it back; the controller
   removes the range and frees the block. The resident capacity drops by the
   segment first, so the relabel never promotes into it.
-  Residents left outside the retiring slots past the lowered capacity are
-  unlabelled, coldest first, so the churn slots still take a row's whole cold
-  set (Rule R′ needs one).
-- **Idle drain.** A retiring slot of the row that ran last is free only once a
-  later invocation begins (`reclaim.rs`), and while inference is idle none
-  does. So a drain that waits a whole tick with no invocation begun has the
-  controller read the latest started ticket, wait out a context-wide
-  synchronise (only while no segment records, `try_without_recording`), and
-  settle the clock past that ticket (`ReclaimClock::settled`), then nudge the
-  stager to look again. A slot still carry-pinned for the CPU pool waits for the
-  next invocation, which copies from it: the shrink finishes when inference
-  resumes.
 - **Bands** (`resident::Bands`) scale with the capacity: each layer's band is its
   startup share of the *current* capacity, not of the startup one.
-- **Segment size** is fixed for the process at the model's
-  (`segment_slots(stride, evictable)`), never at the startup moment's: a machine
-  short of RAM at boot pins whole segments only, and leaves the part short of
-  one pageable.
 
 ### 5.4 What stays
 
@@ -238,10 +221,8 @@ the tier moving.
   - a long quiet period halves it;
   - another process's paging, as available RAM falling with no fault of this
     process's, does not shrink below the build rule.
-- **The range table**: an added range is seen; a removed one is gone, and the
-  others are never missing from a concurrent read.
-- **The reclaim clock**: once settled, everything begun is complete and the
-  next invocation is not.
+- **The range table**: an added range is seen; a removed one moves the last
+  pair over it and is never missing from a concurrent read.
 - **The pad book**: grown slots are free churn; retiring slots are never taken;
   a drained segment reports only once every slot is free.
 - **The probes**: the Windows process records parse at their offsets from raw

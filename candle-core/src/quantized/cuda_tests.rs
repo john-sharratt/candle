@@ -10,7 +10,6 @@
 )]
 
 use super::*;
-use crate::quantized::pinned_ranges::PinnedRangeTable;
 use candle_kernels::simple::moe_bucketize::{
     run_moe_bucketize, CpuSplit, BUCKETIZE_LAUNCHED, CARRY_FLAG, CPU_CARRY_WORDS, CPU_MAX_N,
     CPU_PROMOTE_ALL, CPU_WORK_SLOT_BYTES, HEADER_WORDS, PROMO_EMPTY, PROMO_SKIP,
@@ -10027,7 +10026,7 @@ impl BenchLive {
             gate_row: table_d,
             table_plane: n_experts as i64,
             snap: ptr(0),
-            pinned_table: test_pinned_table(),
+            pinned: TEST_PINNED,
             summary: summary_d,
             summary_seq: 5,
             remote: ptr(1),
@@ -10134,7 +10133,10 @@ fn launch_bucketize_raw(
             p(live.map_or(0, |l| l.gate_row)),
             live.map_or(0, |l| l.table_plane),
             p(live.map_or(0, |l| l.snap)),
-            p(live.map_or(0, |l| l.pinned_table)),
+            live.map_or(0, |l| l.pinned[0].0),
+            live.map_or(0, |l| l.pinned[0].1),
+            live.map_or(0, |l| l.pinned[1].0),
+            live.map_or(0, |l| l.pinned[1].1),
             lo.as_ptr(),
             hi.as_ptr(),
             lo.len() as i32,
@@ -10709,29 +10711,6 @@ fn cuda_moe_bucketize_matches_cpu_reference() -> Result<()> {
 /// inside either is a pinned expert.
 const TEST_PINNED: [(u64, u64); 2] = [(0x7000_0000, 0x7100_0000), (0x9000_0000, 0x9010_0000)];
 
-/// [`TEST_PINNED`] as the mapped table the kernel reads, made once for the
-/// process: its device address.
-fn test_pinned_table() -> u64 {
-    pinned_table_of(&TEST_PINNED)
-}
-
-/// A mapped table holding `ranges`, kept for the process: its device address.
-fn pinned_table_of(ranges: &[(u64, u64)]) -> u64 {
-    static TABLES: std::sync::Mutex<Vec<(Vec<(u64, u64)>, PinnedRangeTable)>> =
-        std::sync::Mutex::new(Vec::new());
-    let mut tables = TABLES.lock().unwrap();
-    if let Some((_, t)) = tables.iter().find(|(r, _)| r == ranges) {
-        return t.device_ptr();
-    }
-    let t = PinnedRangeTable::new().expect("a pinned range table");
-    for &(lo, hi) in ranges.iter().filter(|(lo, hi)| lo < hi) {
-        t.add(lo, hi).expect("a test table fits");
-    }
-    let ptr = t.device_ptr();
-    tables.push((ranges.to_vec(), t));
-    ptr
-}
-
 /// The `[3][n_experts]` live table the bucketize tests classify: VRAM gate
 /// entries at `0x10_0000 + e·0x100`, pinned ones inside `TEST_PINNED`, cold 0;
 /// up and down at `+0x10` and `+0x20` of the gate entry; the down entry of every
@@ -11014,7 +10993,7 @@ fn cuda_moe_bucketize_promotes_remote_experts_from_the_ring() -> Result<()> {
             gate_row: table_dev.device_ptr(&stream).0,
             table_plane: 8,
             snap: snap.device_ptr(&stream).0,
-            pinned_table: test_pinned_table(),
+            pinned: TEST_PINNED,
             summary: summary.device_ptr(&stream).0,
             summary_seq: seq,
             remote: remote.device_ptr(&stream).0,
@@ -11285,7 +11264,7 @@ fn cuda_moe_bucketize_reads_ahead_into_offers_within_the_window() -> Result<()> 
                 gate_row: table_dev.device_ptr(&stream).0 + (n * 8) as u64,
                 table_plane: plane as i64,
                 snap: snap.device_ptr(&stream).0,
-                pinned_table: test_pinned_table(),
+                pinned: TEST_PINNED,
                 summary: summary.device_ptr(&stream).0,
                 summary_seq: seq,
                 remote: remote.device_ptr(&stream).0,
@@ -11568,7 +11547,7 @@ fn cuda_moe_bucketize_claims_victims_and_skips_its_own_routed_ones() -> Result<(
             gate_row: table_dev.device_ptr(&stream).0 + (row * n * 8) as u64,
             table_plane: plane,
             snap: snap.device_ptr(&stream).0,
-            pinned_table: test_pinned_table(),
+            pinned: TEST_PINNED,
             summary: summary.device_ptr(&stream).0,
             summary_seq: seq,
             remote: remote.device_ptr(&stream).0,
@@ -11660,7 +11639,7 @@ fn cuda_moe_bucketize_a_prompt_only_expert_takes_only_an_empty_offer() -> Result
             gate_row: table_dev.device_ptr(&stream).0,
             table_plane: 8,
             snap: snap.device_ptr(&stream).0,
-            pinned_table: test_pinned_table(),
+            pinned: TEST_PINNED,
             summary: 0,
             summary_seq: seq,
             remote: remote.device_ptr(&stream).0,
@@ -11693,7 +11672,7 @@ fn cuda_moe_bucketize_a_prompt_only_expert_takes_only_an_empty_offer() -> Result
         gate_row: table_dev.device_ptr(&stream).0,
         table_plane: 8,
         snap: snap.device_ptr(&stream).0,
-        pinned_table: test_pinned_table(),
+        pinned: TEST_PINNED,
         summary: 0,
         summary_seq: 2,
         remote: remote.device_ptr(&stream).0,
@@ -11741,7 +11720,7 @@ fn cuda_moe_bucketize_claims_nothing_on_a_sweep() -> Result<()> {
             gate_row: table_dev.device_ptr(&stream).0,
             table_plane: 8,
             snap: snap.device_ptr(&stream).0,
-            pinned_table: test_pinned_table(),
+            pinned: TEST_PINNED,
             summary: 0,
             summary_seq: seq,
             remote: remote.device_ptr(&stream).0,
@@ -11790,7 +11769,7 @@ fn cuda_moe_bucketize_stores_its_ticket_in_its_rows_started_word() -> Result<()>
             gate_row: table_dev.device_ptr(&stream).0,
             table_plane: 8,
             snap: snap.device_ptr(&stream).0,
-            pinned_table: test_pinned_table(),
+            pinned: TEST_PINNED,
             summary: 0,
             summary_seq: 0,
             remote: 0,
@@ -11817,7 +11796,7 @@ fn cuda_moe_bucketize_stores_its_ticket_in_its_rows_started_word() -> Result<()>
         gate_row: 0,
         table_plane: 0,
         snap: 0,
-        pinned_table: test_pinned_table(),
+        pinned: TEST_PINNED,
         summary: 0,
         summary_seq: 0,
         remote: 0,
@@ -11875,7 +11854,7 @@ fn run_bucketize_live(
             gate_row: gp,
             table_plane: n_experts as i64,
             snap: np,
-            pinned_table: test_pinned_table(),
+            pinned: TEST_PINNED,
             summary: sp,
             summary_seq: 77,
             remote: rp,
@@ -12147,7 +12126,7 @@ fn cuda_moe_bucketize_cpu_class_publishes_cheap_misses() -> Result<()> {
                     gate_row: gp,
                     table_plane: n_experts as i64,
                     snap: np,
-                    pinned_table: test_pinned_table(),
+                    pinned: TEST_PINNED,
                     summary: sp,
                     summary_seq: 41,
                     remote: rp,
@@ -12630,7 +12609,7 @@ fn cuda_moe_bucketize_output_digest() -> Result<()> {
                     gate_row: table_dev.device_ptr(&stream).0 + (row * n_experts * 8) as u64,
                     table_plane: plane as i64,
                     snap: snap.device_ptr(&stream).0,
-                    pinned_table: test_pinned_table(),
+                    pinned: TEST_PINNED,
                     summary: summary.device_ptr(&stream).0,
                     summary_seq: 40 + variant,
                     remote: remote.device_ptr(&stream).0,
@@ -13188,10 +13167,10 @@ fn cuda_cpu_class_back_to_back_layers_pull_their_own_results() -> Result<()> {
                 gate_row: fx.table_d,
                 table_plane: n_experts as i64,
                 snap: np,
-                pinned_table: pinned_table_of(&[(
-                    fx.host as u64,
-                    fx.host as u64 + fx.host_bytes as u64,
-                )]),
+                pinned: [
+                    (fx.host as u64, fx.host as u64 + fx.host_bytes as u64),
+                    (0, 0),
+                ],
                 summary: sp,
                 summary_seq: 9,
                 remote: rp,
@@ -13443,10 +13422,10 @@ fn cpu_class_round_trip(
             gate_row: fx.table_d,
             table_plane: n_experts as i64,
             snap: np,
-            pinned_table: pinned_table_of(&[(
-                fx.host as u64,
-                fx.host as u64 + fx.host_bytes as u64,
-            )]),
+            pinned: [
+                (fx.host as u64, fx.host as u64 + fx.host_bytes as u64),
+                (0, 0),
+            ],
             summary: sp,
             summary_seq: 9,
             remote: rp,
@@ -13874,12 +13853,15 @@ fn live_launch_bit_identical(n_sub: usize, slotted: Slotted) -> Result<()> {
             .map(|i| pp + i * fx.expert_bytes as u64)
             .collect::<Vec<u64>>(),
     );
-    let pinned_table = pinned_table_of(&[(fx.host as u64, fx.host as u64 + fx.host_bytes as u64)]);
+    let pinned = [
+        (fx.host as u64, fx.host as u64 + fx.host_bytes as u64),
+        (0, 0),
+    ];
     let blive = BucketizeLive {
         gate_row: fx.table_d,
         table_plane: n_experts as i64,
         snap: np,
-        pinned_table,
+        pinned,
         summary: sp,
         summary_seq: 1,
         remote: rp,
@@ -14206,7 +14188,10 @@ fn cuda_live_gate_launch_reads_ahead_and_publishes() -> Result<()> {
         gate_row: fx.table_d,
         table_plane: n_experts as i64,
         snap: snap.device_ptr(&stream).0,
-        pinned_table: pinned_table_of(&[(fx.host as u64, fx.host as u64 + fx.host_bytes as u64)]),
+        pinned: [
+            (fx.host as u64, fx.host as u64 + fx.host_bytes as u64),
+            (0, 0),
+        ],
         summary: summary.device_ptr(&stream).0,
         summary_seq: 1,
         remote: remote.device_ptr(&stream).0,

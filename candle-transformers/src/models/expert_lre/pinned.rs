@@ -469,10 +469,7 @@ impl WarmPool {
         None
     }
 
-    /// Exactly `num_slots` slots, or `None` when the driver refuses — no step
-    /// down. The elastic warm tier's segments are all one size
-    /// (`elastic::region`).
-    pub(crate) fn try_alloc(
+    fn try_alloc(
         num_slots: usize,
         slot_size: usize,
         use_: candle::vram::PinnedUse,
@@ -626,6 +623,12 @@ impl WarmPool {
     #[inline]
     pub(crate) fn num_slots(&self) -> usize {
         self.num_slots
+    }
+
+    /// Bytes held, for the memory report.
+    #[inline]
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.total_size
     }
 
     /// An empty pool — no warm tier at all, which the invariant permits.
