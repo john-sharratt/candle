@@ -10340,7 +10340,8 @@ mod tests {
     /// described whatever else ranks.
     #[tokio::test]
     async fn a_maker_at_a_landing_is_offered_the_ride_to_the_time_level() {
-        use crate::engine::tools::{shown_wherever_offered, specs_within, Mode, LIFT_USE};
+        use crate::engine::acts::LIFT_USE;
+        use crate::engine::tools::{shown_wherever_offered, specs_within, Mode};
         let rt = vaulted();
         embody_at(&rt, 1, "m1", Where::new("vault-story", "core"));
         let within = rt.within(1);
