@@ -5,6 +5,10 @@
 
 use core::ffi::c_void;
 
+/// The word an allow-list row's argmax result holds in place of an index when
+/// one of its allowed logits is NaN or +inf ([`run_allow_list_rows`]).
+pub const ALLOW_NOT_FINITE: u32 = u32::MAX;
+
 /// Data type enum for sampling dispatcher
 #[repr(i32)]
 pub enum DType {
@@ -72,6 +76,11 @@ extern "C" {
     /// - `stencil`: Allowed token IDs for constrained sampling (nullable)
     /// - `stencil_size`: Number of allowed tokens (0 = disabled)
     /// - `output_tokens`: Output sampled token IDs
+    /// - `nonfinite_rows`: `[batch_size]` words, or null: each row's set to 1
+    ///   when any of its live logits (its stencil's, for a stencil row) is NaN
+    ///   or +inf — a broken forward, whose token means nothing — and to 0
+    ///   otherwise. Every row's word is written, so the buffer needs no
+    ///   zeroing; −inf passes, since a masked logit is one.
     /// - `seed`: RNG seed
     /// - `rng_offsets`: Per-sequence RNG offsets (nullable for argmax)
     /// - `seq_dials`: `[batch_size]` array of `SeqDials` (see `batched_sampler`),
@@ -127,6 +136,7 @@ extern "C" {
         stencil: *const i32,
         stencil_size: i32,
         output_tokens: *mut u32,
+        nonfinite_rows: *mut u32,
         seed: u64,
         rng_offsets: *mut u64,
         seq_dials: *const c_void,
@@ -165,8 +175,10 @@ extern "C" {
     /// the logits row at device address `logits[r]` (`dtype`: 0 F32, 1 F16,
     /// 2 BF16; an `allow` entry of `u32::MAX` is a banned position, read as
     /// −∞) and writes, from word `out_off[r]` of `out`: with `temp[r] <= 0`
-    /// the local index of the first maximum, otherwise `allow_len[r]` F32
-    /// probabilities — the softmax of the logits divided by `temp[r]`.
+    /// the local index of the first maximum — or [`ALLOW_NOT_FINITE`] when an
+    /// allowed logit is NaN or +inf — otherwise `allow_len[r]` F32
+    /// probabilities — the softmax of the logits divided by `temp[r]`, which
+    /// such a logit leaves non-finite.
     pub fn run_allow_list_rows(
         logits: *const u64,
         allow: *const u32,

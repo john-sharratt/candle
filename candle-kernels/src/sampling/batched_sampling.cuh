@@ -109,6 +109,24 @@ __device__ __forceinline__ float load_as_float<__nv_fp8_e4m3>(const __nv_fp8_e4m
 }
 
 // ============================================================================
+// Non-finite logits
+// ============================================================================
+//
+// A row whose logits hold a NaN or a +inf came from a broken forward: no sample
+// drawn from it means anything, and an argmax over it quietly returns some
+// token, because NaN never wins a `>`. Each kernel tests every raw logit it
+// already loads — before any penalty, since a ban is −inf on purpose — and
+// writes the row's verdict to `nonfinite_rows[row]` (1 or 0) for the host to
+// fail the row on. A bit test, not a float compare, so no fast-math setting can
+// fold it away; −inf passes, since a masked logit is one. The verdict joins the
+// block on a barrier the kernel already takes (`__syncthreads_or`), so the test
+// costs a few integer ops per logit and no extra pass or barrier.
+__device__ __forceinline__ bool logit_not_finite(float v) {
+    const uint32_t b = __float_as_uint(v);
+    return (b & 0x7F800000u) == 0x7F800000u && b != 0xFF800000u;
+}
+
+// ============================================================================
 // Per-sequence sampling dials
 // ============================================================================
 //
@@ -1450,7 +1468,9 @@ __device__ int tiled_sampling_pass(
 // Argmax Functions
 // ============================================================================
 
-// Vectorized argmax for greedy decoding (templated for input type)
+// Vectorized argmax for greedy decoding (templated for input type).
+// `not_finite` is set, in every thread, to whether any raw logit of the row is
+// NaN or +inf (`logit_not_finite`).
 template <typename T, int THREADS>
 __device__ int branchless_argmax_typed(
     const T* __restrict__ logits,
@@ -1460,31 +1480,34 @@ __device__ int branchless_argmax_typed(
     const uint32_t* __restrict__ recent_bitset,
     const DryPenaltyCache* dry_cache,  // Precomputed DRY penalties
     float* __restrict__ smem_vals,
-    int* __restrict__ smem_idxs
+    int* __restrict__ smem_idxs,
+    bool& not_finite
 ) {
     const int tid = threadIdx.x;
-    
+
     float local_max = -INFINITY;
     int local_idx = 0;
-    
+    bool bad = false;
+
     // Process logits with penalties (including DRY from cache)
     #pragma unroll 2
     for (int i = tid; i < vocab_size; i += THREADS) {
         float logit = load_as_float(logits, i);
-        
+        bad |= logit_not_finite(logit);
+
         if (penalties != nullptr) {
             logit = apply_penalties_with_dry_cached(logit, i, batch_idx, *penalties, recent_bitset, dry_cache);
         }
-        
+
         int is_greater = (int)(logit > local_max);
         local_max = fmaxf(local_max, logit);
         local_idx = is_greater * i + (1 - is_greater) * local_idx;
     }
-    
+
     // Store for reduction
     smem_vals[tid] = local_max;
     smem_idxs[tid] = local_idx;
-    __syncthreads();
+    not_finite = __syncthreads_or(bad) != 0;
     
     // Tree reduction (log2(THREADS) = 8 iterations)
     #pragma unroll
@@ -1861,7 +1884,9 @@ __device__ __forceinline__ float sortable_to_float(uint32_t u) {
 // global max/sum passes entirely, reducing the top-k path from 8 to 5 passes.
 
 // 8-bit radix select operating directly on (penalized) logit values.
-// exp() is completely eliminated from the hot loop.
+// exp() is completely eliminated from the hot loop. `not_finite` is set, in
+// every thread, to whether any raw logit of the row is NaN or +inf
+// (`logit_not_finite`) — tested on the first pass, which reads every one.
 template <typename T, int THREADS>
 __device__ float radix_select_logit_threshold(
     const T* __restrict__ logits,
@@ -1872,12 +1897,14 @@ __device__ float radix_select_logit_threshold(
     const uint32_t* __restrict__ recent_bitset,
     const DryPenaltyCache* dry_cache,
     int* __restrict__ histogram,
-    float* __restrict__ smem_scratch
+    float* __restrict__ smem_scratch,
+    bool& not_finite
 ) {
     const int tid = threadIdx.x;
-    
+
     uint32_t prefix = 0;
     int remaining_k = k;
+    bool bad = false;
     __shared__ int radix_broadcast[2];
     // Track the maximum sortable value seen across all tokens (computed during
     // pass 0 where matches=true for all tokens).  Used to clamp the threshold
@@ -1902,28 +1929,32 @@ __device__ float radix_select_logit_threshold(
         #pragma unroll 2
         for (int i = tid; i < vocab_size; i += THREADS) {
             float logit = load_as_float(logits, i);
-            
+            if (pass == 0) {
+                bad |= logit_not_finite(logit);
+            }
+
             if (penalties != nullptr) {
                 logit = apply_penalties_with_dry_cached(
                     logit, i, batch_idx, *penalties, recent_bitset, dry_cache);
             }
-            
+
             uint32_t sortable = float_to_sortable(logit);
 
             // On pass 0 every token matches; track the global maximum.
             if (pass == 0) {
                 atomicMax(&smem_max_sortable, sortable);
             }
-            
+
             bool matches = (prefix_shift >= 32) ||
                            ((sortable >> prefix_shift) == (prefix >> prefix_shift));
-            
+
             if (matches) {
                 int digit = (sortable >> shift) & RADIX_MASK;
                 atomicAdd(&histogram[digit], 1);
             }
         }
-        __syncthreads();
+        // `bad` is set on the first pass only, so every pass's vote is the same.
+        not_finite = __syncthreads_or(bad) != 0;
         
         if (tid == 0) {
             int cumsum = 0;
@@ -2341,23 +2372,29 @@ __global__ void stencil_sampling_kernel(
     
     // Output
     uint32_t* __restrict__ output_tokens,    // [batch_size]
-    
+    // [batch_size] or null: 1 where a stencil token's logit is NaN or +inf
+    // (`logit_not_finite`), else 0 — every row's word written.
+    uint32_t* __restrict__ nonfinite_rows,
+
     // RNG
     uint64_t seed,
     uint64_t* __restrict__ rng_offsets       // [batch_size]
 ) {
     __shared__ StencilSharedMem<MAX_STENCIL, THREADS> smem;
-    
+
     // Dynamic shared memory for recent token bitset (if penalties used)
     extern __shared__ uint32_t recent_bitset[];
-    
+
     const int batch_idx = blockIdx.x;
     const int tid = threadIdx.x;
-    
+
     // Safety checks
     if (output_tokens == nullptr || logits == nullptr || stencil == nullptr || stencil_size <= 0) {
         if (tid == 0 && output_tokens != nullptr) {
             output_tokens[batch_idx] = 0;
+        }
+        if (tid == 0 && nonfinite_rows != nullptr) {
+            nonfinite_rows[batch_idx] = 0;
         }
         return;
     }
@@ -2411,10 +2448,12 @@ __global__ void stencil_sampling_kernel(
     // =========================================================
     // STEP 3: Load logits for stencil tokens, apply penalties
     // =========================================================
+    bool bad = false;
     for (int i = tid; i < actual_stencil_size; i += THREADS) {
         int32_t token_id = smem.stencil_tokens[i];
         float logit = load_as_float(my_logits, token_id);
-        
+        bad |= logit_not_finite(logit);
+
         if constexpr (USE_PENALTIES) {
             // Protected tokens: EOS and the segment-close token must never be penalised
             float saved_logit = logit;
@@ -2462,8 +2501,11 @@ __global__ void stencil_sampling_kernel(
         
         smem.stencil_logits[i] = logit;
     }
-    __syncthreads();
-    
+    const bool not_finite = __syncthreads_or(bad) != 0;
+    if (tid == 0 && nonfinite_rows != nullptr) {
+        nonfinite_rows[batch_idx] = not_finite ? 1u : 0u;
+    }
+
     // =========================================================
     // STEP 4: Check for banned tokens (set to -inf)
     // =========================================================
@@ -2683,6 +2725,7 @@ inline void dispatch_stencil_sampling(
     float top_p,
     // Output
     uint32_t* output_tokens,
+    uint32_t* nonfinite_rows,
     uint64_t seed,
     uint64_t* rng_offsets,
     // Dispatch flag
@@ -2706,7 +2749,7 @@ inline void dispatch_stencil_sampling(
                 token_counts, banned_tokens, num_banned_tokens,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets
+                output_tokens, nonfinite_rows, seed, rng_offsets
             );
     } else {
         stencil_sampling_kernel<T, MAX_STENCIL_SIZE, THREADS_PER_BLOCK, false>
@@ -2717,7 +2760,7 @@ inline void dispatch_stencil_sampling(
                 token_counts, banned_tokens, num_banned_tokens,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets
+                output_tokens, nonfinite_rows, seed, rng_offsets
             );
     }
 }
@@ -2812,6 +2855,9 @@ batched_penalty_sampling_kernel(
 
     // Output
     uint32_t* __restrict__ output_tokens,    // [batch_size]
+    // [batch_size] or null: 1 where the row's live logits hold a NaN or a
+    // +inf (`logit_not_finite`), else 0 — every row's word written.
+    uint32_t* __restrict__ nonfinite_rows,
 
     // RNG
     uint64_t seed,
@@ -2838,6 +2884,9 @@ batched_penalty_sampling_kernel(
     if (output_tokens == nullptr || logits == nullptr) {
         if (tid == 0 && output_tokens != nullptr) {
             output_tokens[batch_idx] = 0;  // Fallback to token 0
+        }
+        if (tid == 0 && nonfinite_rows != nullptr) {
+            nonfinite_rows[batch_idx] = 0;
         }
         return;
     }
@@ -3056,23 +3105,28 @@ batched_penalty_sampling_kernel(
     // STEP 2: Early exit for argmax (temperature <= 0)
     // =========================================================
     if (!(temperature > 0.f)) {  // Handles NaN, <=0, -inf
+        bool not_finite = false;
         int best = branchless_argmax_typed<T, THREADS>(
             my_logits, live_vocab, batch_idx,
             effective_penalties, recent_bitset, dry_cache_ptr,
-            smem.reduction_max, smem.reduction_idx
+            smem.reduction_max, smem.reduction_idx, not_finite
         );
 
         if (tid == 0) {
             output_tokens[batch_idx] = best;
+            if (nonfinite_rows != nullptr) {
+                nonfinite_rows[batch_idx] = not_finite ? 1u : 0u;
+            }
         }
         return;
     }
-    
+
     const float inv_temp = 1.0f / temperature;
     const int k = top_k > 0 ? min(top_k, MAX_K) : MAX_K;
-    
+
     float global_max, global_sum;
     int num_topk;
+    bool not_finite = false;
     
     // =========================================================
     // Processing strategy based on penalties and top-k
@@ -3100,7 +3154,7 @@ batched_penalty_sampling_kernel(
         float logit_threshold = radix_select_logit_threshold<T, THREADS>(
             my_logits, live_vocab, batch_idx, k,
             effective_penalties, recent_bitset, dry_cache_ptr,
-            smem.radix_histogram, smem.reduction_max
+            smem.radix_histogram, smem.reduction_max, not_finite
         );
 
         // Broadcast threshold to ensure all threads agree
@@ -3144,7 +3198,7 @@ batched_penalty_sampling_kernel(
         float logit_threshold = radix_select_logit_threshold<T, THREADS>(
             my_logits, live_vocab, batch_idx, k,
             nullptr, recent_bitset, nullptr,  // No penalties, no DRY
-            smem.radix_histogram, smem.reduction_max
+            smem.radix_histogram, smem.reduction_max, not_finite
         );
 
         // Broadcast threshold
@@ -3229,6 +3283,9 @@ batched_penalty_sampling_kernel(
             token = (uint32_t)typical_draft;
         }
         output_tokens[batch_idx] = token;
+        if (nonfinite_rows != nullptr) {
+            nonfinite_rows[batch_idx] = not_finite ? 1u : 0u;
+        }
     }
 }
 
@@ -3368,6 +3425,7 @@ inline void dispatch_batched_sampling(
     float top_p,
     // Output
     uint32_t* output_tokens,
+    uint32_t* nonfinite_rows,
     uint64_t seed,
     uint64_t* rng_offsets,
     // Per-sequence dials ([batch_size] or null) — see SeqDials.
@@ -3416,7 +3474,7 @@ inline void dispatch_batched_sampling(
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets,
+                output_tokens, nonfinite_rows, seed, rng_offsets,
                 seq_dials
             );
     } else if (use_penalties && use_dry && !use_top_p) {
@@ -3434,7 +3492,7 @@ inline void dispatch_batched_sampling(
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets,
+                output_tokens, nonfinite_rows, seed, rng_offsets,
                 seq_dials
             );
     } else if (use_penalties && !use_dry && use_top_p) {
@@ -3452,7 +3510,7 @@ inline void dispatch_batched_sampling(
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets,
+                output_tokens, nonfinite_rows, seed, rng_offsets,
                 seq_dials
             );
     } else if (use_penalties && !use_dry && !use_top_p) {
@@ -3470,7 +3528,7 @@ inline void dispatch_batched_sampling(
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets,
+                output_tokens, nonfinite_rows, seed, rng_offsets,
                 seq_dials
             );
     } else if (!use_penalties && use_top_p) {
@@ -3489,7 +3547,7 @@ inline void dispatch_batched_sampling(
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets,
+                output_tokens, nonfinite_rows, seed, rng_offsets,
                 seq_dials
             );
     } else {
@@ -3508,7 +3566,7 @@ inline void dispatch_batched_sampling(
                 token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
                 recent_tokens, recent_lens, max_recent_len,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets,
+                output_tokens, nonfinite_rows, seed, rng_offsets,
                 seq_dials
             );
     }
@@ -3570,6 +3628,8 @@ inline void launch_batched_sampling_typed(
     float top_p,
     // Output
     uint32_t* output_tokens,
+    // [batch_size] or null: each row's non-finite verdict (`logit_not_finite`).
+    uint32_t* nonfinite_rows,
     uint64_t seed,
     uint64_t* rng_offsets,
     // Per-sequence dials ([batch_size] or null) — see SeqDials.
@@ -3611,7 +3671,7 @@ inline void launch_batched_sampling_typed(
             token_counts, banned_tokens, num_banned_tokens,
             recent_tokens, recent_lens, max_recent_len,
             temperature, top_k, top_p,
-            output_tokens, seed, rng_offsets,
+            output_tokens, nonfinite_rows, seed, rng_offsets,
             use_penalties,
             stream
         );
@@ -3630,7 +3690,7 @@ inline void launch_batched_sampling_typed(
             token_counts, banned_tokens, num_banned_tokens, banned_tokens_per_seq,
             recent_tokens, recent_lens, max_recent_len,
             temperature, top_k, top_p,
-            output_tokens, seed, rng_offsets,
+            output_tokens, nonfinite_rows, seed, rng_offsets,
             seq_dials,
             use_penalties, use_top_p,
             stream

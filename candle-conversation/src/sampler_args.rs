@@ -6,8 +6,8 @@
 //! cost an allocation and a pageable copy apiece, a dozen per accept-walk
 //! position. Here they are laid end to end in one word buffer that is uploaded
 //! once; each kernel argument is the buffer's base address plus its offset, and
-//! the two arrays the kernel writes — RNG offsets, then outputs — sit together
-//! at the end so one copy reads both back.
+//! the arrays the kernel writes — RNG offsets, outputs, then each row's
+//! non-finite verdict — sit together at the end so one copy reads them back.
 
 /// A word buffer and the offsets of the arguments laid into it.
 #[derive(Debug, Default)]
@@ -72,13 +72,48 @@ impl ArgPack {
     }
 }
 
-/// Split a read-back tail of `n` RNG offsets (two words each, low first)
-/// followed by `n` output tokens.
-pub(crate) fn split_rng_and_outputs(tail: &[u32], n: usize) -> (Vec<u64>, Vec<u32>) {
+/// What one dispatch wrote, per row.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Readback {
+    pub rng: Vec<u64>,
+    pub outputs: Vec<u32>,
+    /// 1 where the row's logits held a NaN or a +inf, else 0.
+    pub nonfinite: Vec<u32>,
+}
+
+/// Split a read-back tail of `n` RNG offsets (two words each, low first),
+/// then `n` output tokens, then `n` non-finite verdicts.
+pub(crate) fn split_readback(tail: &[u32], n: usize) -> Readback {
     let rng = (0..n)
         .map(|i| u64::from(tail[2 * i]) | (u64::from(tail[2 * i + 1]) << 32))
         .collect();
-    (rng, tail[2 * n..3 * n].to_vec())
+    Readback {
+        rng,
+        outputs: tail[2 * n..3 * n].to_vec(),
+        nonfinite: tail[3 * n..4 * n].to_vec(),
+    }
+}
+
+/// Refuse a dispatch any of whose rows the kernel judged non-finite, naming
+/// them. Such a row came from a forward gone bad — a NaN or a +inf in its
+/// logits — and the token drawn from it means nothing, so the rows fail rather
+/// than commit it. The error carries no stall marker: the forward is not run
+/// again, its turns fail.
+pub(crate) fn refuse_nonfinite(verdicts: &[u32]) -> candle::Result<()> {
+    let bad: Vec<usize> = verdicts
+        .iter()
+        .enumerate()
+        .filter(|(_, &v)| v != 0)
+        .map(|(row, _)| row)
+        .collect();
+    if bad.is_empty() {
+        return Ok(());
+    }
+    candle::bail!(
+        "sampling refused: the logits of row(s) {bad:?} of {} held a NaN or a +inf — \
+         the forward that produced them is broken, so no token is drawn from them",
+        verdicts.len()
+    )
 }
 
 #[cfg(test)]
@@ -122,10 +157,24 @@ mod tests {
     }
 
     #[test]
-    fn the_tail_splits_into_rng_offsets_then_outputs() {
-        let tail = [1, 2, 3, 0, 40, 41];
-        let (rng, out) = split_rng_and_outputs(&tail, 2);
-        assert_eq!(rng, vec![0x0000_0002_0000_0001, 3]);
-        assert_eq!(out, vec![40, 41]);
+    fn the_tail_splits_into_rng_offsets_then_outputs_then_verdicts() {
+        let tail = [1, 2, 3, 0, 40, 41, 0, 1];
+        assert_eq!(
+            split_readback(&tail, 2),
+            Readback {
+                rng: vec![0x0000_0002_0000_0001, 3],
+                outputs: vec![40, 41],
+                nonfinite: vec![0, 1],
+            }
+        );
+    }
+
+    /// Clean rows pass; one flagged row refuses the dispatch, by its row.
+    #[test]
+    fn a_flagged_row_refuses_the_dispatch_and_is_named() {
+        assert!(refuse_nonfinite(&[0, 0, 0]).is_ok());
+        assert!(refuse_nonfinite(&[]).is_ok());
+        let e = refuse_nonfinite(&[0, 1, 0, 1]).unwrap_err().to_string();
+        assert!(e.contains("row(s) [1, 3] of 4"), "{e}");
     }
 }

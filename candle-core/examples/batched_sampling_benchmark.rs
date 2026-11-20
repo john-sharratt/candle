@@ -181,6 +181,10 @@ mod bench {
         let mut output_gpu: CudaSlice<u32> = stream
             .alloc_zeros(batch_size as usize)
             .expect("alloc output");
+        // The rows' non-finite verdicts, written as production's are.
+        let mut nonfinite_gpu: CudaSlice<u32> = stream
+            .alloc_zeros(batch_size as usize)
+            .expect("alloc verdicts");
         let mut rng_offsets_gpu: CudaSlice<u64> =
             stream.alloc_zeros(batch_size as usize).expect("alloc rng");
 
@@ -189,6 +193,7 @@ mod bench {
             let (logits_ptr, _g1) = logits_gpu.device_ptr(stream);
             let (output_ptr, _g2) = output_gpu.device_ptr_mut(stream);
             let (rng_ptr, _g3) = rng_offsets_gpu.device_ptr_mut(stream);
+            let (nonfinite_ptr, _g4) = nonfinite_gpu.device_ptr_mut(stream);
             unsafe {
                 run_batched_sampling(
                     logits_ptr as *const c_void,
@@ -236,6 +241,7 @@ mod bench {
                     std::ptr::null(), // stencil
                     0,                // stencil_size
                     output_ptr as *mut u32,
+                    nonfinite_ptr as *mut u32,
                     42, // seed
                     rng_ptr as *mut u64,
                     std::ptr::null(),
@@ -252,6 +258,7 @@ mod bench {
             let (logits_ptr, _g1) = logits_gpu.device_ptr(stream);
             let (output_ptr, _g2) = output_gpu.device_ptr_mut(stream);
             let (rng_ptr, _g3) = rng_offsets_gpu.device_ptr_mut(stream);
+            let (nonfinite_ptr, _g4) = nonfinite_gpu.device_ptr_mut(stream);
 
             stream.synchronize().expect("pre-sync");
             let t0 = Instant::now();
@@ -302,6 +309,7 @@ mod bench {
                     std::ptr::null(),
                     0,
                     output_ptr as *mut u32,
+                    nonfinite_ptr as *mut u32,
                     42,
                     rng_ptr as *mut u64,
                     // No per-row dials: every row samples on the scalars above.
@@ -391,6 +399,8 @@ mod bench {
 
         let mut output_gpu: CudaSlice<u32> =
             stream.alloc_zeros(batch_size as usize).expect("alloc");
+        let mut nonfinite_gpu: CudaSlice<u32> =
+            stream.alloc_zeros(batch_size as usize).expect("alloc");
         let mut rng_offsets_gpu: CudaSlice<u64> =
             stream.alloc_zeros(batch_size as usize).expect("alloc");
 
@@ -399,6 +409,7 @@ mod bench {
             let (lp, _g1) = logits_gpu.device_ptr(stream);
             let (op, _g2) = output_gpu.device_ptr_mut(stream);
             let (rp, _g3) = rng_offsets_gpu.device_ptr_mut(stream);
+            let (nfp, _g8) = nonfinite_gpu.device_ptr_mut(stream);
             let (tcp, _g4) = tc_gpu.device_ptr(stream);
             let (recp, _g5) = recent_gpu.device_ptr(stream);
             let (rlp, _g6) = rl_gpu.device_ptr(stream);
@@ -450,6 +461,7 @@ mod bench {
                     std::ptr::null(),
                     0,
                     op as *mut u32,
+                    nfp as *mut u32,
                     42,
                     rp as *mut u64,
                     std::ptr::null(),
@@ -469,6 +481,7 @@ mod bench {
             let (recp, _g5) = recent_gpu.device_ptr(stream);
             let (rlp, _g6) = rl_gpu.device_ptr(stream);
             let (banp, _g7) = ban_gpu.device_ptr(stream);
+            let (nfp, _g8) = nonfinite_gpu.device_ptr_mut(stream);
 
             stream.synchronize().expect("pre-sync");
             let t0 = Instant::now();
@@ -519,6 +532,7 @@ mod bench {
                     std::ptr::null(),
                     0,
                     op as *mut u32,
+                    nfp as *mut u32,
                     42,
                     rp as *mut u64,
                     std::ptr::null(),

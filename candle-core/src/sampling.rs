@@ -619,6 +619,11 @@ impl BatchedSampling {
                     std::ptr::null(), // stencil
                     0,                // stencil_size
                     output_ptr as *mut u32,
+                    // No verdict: these tokens stay on the device, read by the
+                    // next step (a draft walk's embedding gather) or as a
+                    // proposal, never committed to a turn — the scheduler's
+                    // sampler reads its rows' verdicts.
+                    std::ptr::null_mut(),
                     self.seed,
                     rng_ptr as *mut u64,
                     std::ptr::null(), // seq_dials — this path is uniform-config

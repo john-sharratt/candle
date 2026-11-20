@@ -67,6 +67,7 @@ extern "C" void run_batched_sampling_f32(
     float top_p,
     // Output
     uint32_t* output_tokens,
+    uint32_t* nonfinite_rows,
     uint64_t seed,
     uint64_t* rng_offsets,
     const void* seq_dials,
@@ -125,6 +126,7 @@ extern "C" void run_batched_sampling_f16(
     float top_p,
     // Output
     uint32_t* output_tokens,
+    uint32_t* nonfinite_rows,
     uint64_t seed,
     uint64_t* rng_offsets,
     const void* seq_dials,
@@ -183,6 +185,7 @@ extern "C" void run_batched_sampling_fp8_e4m3(
     float top_p,
     // Output
     uint32_t* output_tokens,
+    uint32_t* nonfinite_rows,
     uint64_t seed,
     uint64_t* rng_offsets,
     const void* seq_dials,
@@ -241,6 +244,7 @@ extern "C" void run_batched_sampling_bf16(
     float top_p,
     // Output
     uint32_t* output_tokens,
+    uint32_t* nonfinite_rows,
     uint64_t seed,
     uint64_t* rng_offsets,
     const void* seq_dials,
@@ -310,6 +314,9 @@ extern "C" void run_batched_sampling(
     int32_t stencil_size,
     // Output
     uint32_t* output_tokens,
+    // [batch_size] or null: 1 where the row's logits hold a NaN or a +inf,
+    // else 0, every row's word written (`logit_not_finite`).
+    uint32_t* nonfinite_rows,
     uint64_t seed,
     uint64_t* rng_offsets,
     // Per-sequence dials ([batch_size] of SeqDials) or null — see SeqDials.
@@ -334,7 +341,7 @@ extern "C" void run_batched_sampling(
                 recent_tokens, recent_lens, max_recent_len,
                 stencil, stencil_size,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets,
+                output_tokens, nonfinite_rows, seed, rng_offsets,
                 seq_dials, stream
             );
             break;
@@ -354,7 +361,7 @@ extern "C" void run_batched_sampling(
                 recent_tokens, recent_lens, max_recent_len,
                 stencil, stencil_size,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets,
+                output_tokens, nonfinite_rows, seed, rng_offsets,
                 seq_dials, stream
             );
             break;
@@ -374,7 +381,7 @@ extern "C" void run_batched_sampling(
                 recent_tokens, recent_lens, max_recent_len,
                 stencil, stencil_size,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets,
+                output_tokens, nonfinite_rows, seed, rng_offsets,
                 seq_dials, stream
             );
             break;
@@ -394,7 +401,7 @@ extern "C" void run_batched_sampling(
                 recent_tokens, recent_lens, max_recent_len,
                 stencil, stencil_size,
                 temperature, top_k, top_p,
-                output_tokens, seed, rng_offsets,
+                output_tokens, nonfinite_rows, seed, rng_offsets,
                 seq_dials, stream
             );
             break;
