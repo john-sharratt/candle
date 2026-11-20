@@ -2359,6 +2359,7 @@ fn bench(
 mod tests {
     use super::*;
     use crate::engine::mission::{Origin, Todo};
+    use crate::engine::mission_gen::world::Draw;
     use crate::engine::survey;
     use crate::sim::shelf::NO_OPERATION;
     use npc_map::world::Where;
@@ -2416,12 +2417,15 @@ mod tests {
         assert_eq!(what_happens("A brief with no such paragraph."), None);
     }
 
+    /// The vault with two Makers on the chronicle, its table handing out the
+    /// bank's routines — so `take_up` gives a free Maker a reading to work.
     fn vault() -> Hosted {
         let h = Hosted::load(
             "creators-vault",
             concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps"),
         )
         .expect("the vault must load");
+        h.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::Routines));
         h.with(|w| {
             w.enter(
                 "m1",
@@ -3029,9 +3033,7 @@ mod tests {
             let writer_draws = s
                 .missions
                 .collect("m1", &Facts::default())
-                .unwrap()
-                .operation()
-                .is_some();
+                .is_some_and(|m| m.operation().is_some());
             assert!(!writer_draws, "not its own draft");
             s.missions.cancel("m1");
             let reviewer = s.missions.collect("m2", &Facts::default()).unwrap();

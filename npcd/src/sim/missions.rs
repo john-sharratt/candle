@@ -2220,8 +2220,12 @@ mod tests {
         assert!(m.is_on_mission("bram"));
         assert!(!m.has_lodged("bram"), "the lodged queue is drawn down");
 
-        // With nothing lodged, a routine is drawn from the bank — a valid, open,
-        // non-empty, non-destructive mission it can act on.
+        // With nothing lodged, a table that draws nothing hands out nothing —
+        // the default — and one that draws routines gives one from the bank: a
+        // valid, open, non-empty, non-destructive mission it can act on.
+        m.cancel("bram");
+        assert!(m.collect("bram", &facts).is_none(), "a routine was drawn");
+        m.set_routines(Vec::new(), Draw::Routines);
         let drawn = m.collect("bram", &facts).unwrap().clone();
         assert!(drawn.is_open());
         assert!(!drawn.todo.is_empty(), "a routine gives steps to act on");

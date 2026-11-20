@@ -31,6 +31,7 @@ use crate::discord::link::{code, index, linking};
 use crate::discord::message::snowflake_at;
 use crate::discord::post::Target;
 use crate::discord::store::{self, Bot};
+use crate::engine::mission_gen::world::Draw;
 use crate::engine::runtime::Runtime;
 use crate::images::Images;
 use crate::mind::Mind;
@@ -144,6 +145,9 @@ async fn daemon(scripts: Vec<Script>) -> Daemon {
         .unwrap();
     let zen = npcs::npc_id_of_wire(made["npc_id"].as_str().unwrap()).unwrap();
     let hosted = rt.host(WORLD, Path::new(ROOMS)).unwrap();
+    // A world that hands its characters work, so the bot's character is never
+    // at rest: these tests are of what reaches it, not of rest.
+    hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::Routines));
     rt.hold_world(WORLD, true);
     hosted.with(|w| {
         w.enter("zen", "Zen", Where::new("vault-casting", "green-room"))

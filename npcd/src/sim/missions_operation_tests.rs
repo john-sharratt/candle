@@ -127,12 +127,10 @@ fn an_operation_moves_its_target_through_the_ledger() {
 
     m.table_took(id, "mend", "\"x\" — wrong").unwrap();
     put_up(&mut m);
-    assert!(
-        matches!(
-            m.collect("bram", &Facts::default()).unwrap().origin,
-            Origin::Random { .. }
-        ),
-        "the writer draws past its own review"
+    assert_eq!(
+        collect_step(&mut m, "bram"),
+        None,
+        "the writer is not given its own review"
     );
     m.cancel("bram");
     assert_eq!(collect_step(&mut m, "yen"), Some((id, "review".into())));
