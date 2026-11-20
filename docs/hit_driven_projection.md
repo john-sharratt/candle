@@ -81,8 +81,8 @@ The findings this answers are in
   line feed past the content gate, every `reproject_every_n_tokens` (64), and
   at `<tool_call>` (`provenance::boundaries`, `scheduler/decode.rs`); while it
   is still reasoning — before `</think>`, outside a tool call — it also reaches
-  one at 8, 16 and 32 decoded tokens (`scheduler/early_boundaries.rs`, §7.4); a
-  turn's opening and each prefill chunk end at one (§7.4). The early
+  one at 9, 16 and 32 decoded tokens (`scheduler/early_boundaries.rs`, §7.4);
+  each chunk of a long opening ends at one, the opening's last does not (§7.4). The early
   boundaries are the decode loop's alone: the gallery cuts sealed turns by the
   rule, and they cut nothing.
 - **Stride**: the queries between two boundaries.
@@ -516,10 +516,16 @@ piece leaving the slot is released at the same placement.
 A turn's opening — the user's turn, or a tool result — is prefilled once,
 against the slot the last boundary chose. Its prefill rows are selected
 (§6.2), so the sampled layers count real hits and its last 64 rows are kept
-for the shadow scan, exactly as decoded queries are. The boundary at its end
-re-chooses the slot from those hits, and the reply decodes against that slot
-(`wants_early_reprojection`, which fires at the first decoded token). That
-boundary is the first to score the question, and it is the question's
+for the shadow scan, exactly as decoded queries are. **No boundary fires at its
+end**: the reply decodes on the slot the question was prefilled against, so
+the recurrent layers' state and the attended K/V were computed together. The
+first boundary after it is the reasoning's first early boundary, at decoded
+token 9, which re-feeds the reasoning's first 8 tokens over the slot it
+chooses (`docs/reprojection_refeed.md`). A boundary fired at the opening's end
+re-chose the slot with nothing forwarded over it but the token or two after
+`<think>`, and was never measured; on 2026-11-20 (c), with the request read
+once, the direct questions' declines named the journals and guides that slot
+held. The first boundary to score the question is the question's
 **opening**: the first after a new user message chooses its rounds whole, with
 no allowance (§7.2 step 5). A new question marks it on the dialogue's working
 set even when the set was cleared away when the dialogue opened
@@ -527,7 +533,7 @@ set even when the set was cleared away when the dialogue opened
 slot was filled a third of a budget at a time.
 
 **The reasoning's first strides are short.** A reply still reasoning takes
-boundaries at 8, 16 and 32 decoded tokens before the cadence's at 64
+boundaries at 9, 16 and 32 decoded tokens before the cadence's at 64
 (`scheduler/early_boundaries.rs`). The opening's last 64 rows give the shadow
 scan its first queries over what the question pooled; the early boundaries
 bring in what those and the first reasoning tokens would have read while the
@@ -985,7 +991,8 @@ the slot's held turns recorded at each scanned boundary
     (§7.2 step 1, §7.4).** Each kind's minimum is filled by the boundary's
     scan leaders before strength, a dialogue's first question takes its
     opening whether or not its set exists yet, and a reasoning reply takes
-    boundaries at 8, 16 and 32 tokens — built 2026-11-20.
+    boundaries at 9, 16 and 32 tokens, the first of them in place of a
+    boundary at the opening's end — built 2026-11-20.
 
 ## 13. Handover
 

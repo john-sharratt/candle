@@ -6701,20 +6701,11 @@ impl Scheduler {
         // (which normally sets it) only sees tokens sampled in `batch_decode_step`,
         // never this one. Without it the in-call reprojection freeze never engages
         // for these turns and cadence/punctuation triggers re-orient the selection
-        // mid-call. The early first-reprojection push below still fires once — it
-        // is this turn's lock-in reprojection, exactly like the one `is_tool_open`
-        // fires before freezing.
+        // mid-call. Such a call decodes on the slot its opening was prefilled
+        // against: no boundary fires inside its body.
         let first_token_opens_call = stencil
             .as_ref()
             .is_some_and(|d| d.tree().label() == super::TOOL_CALL_TREE_LABEL);
-        // Captured before `work.reprojection` moves into the DecodeState: the
-        // early first-reprojection below fires only for turns whose target
-        // layer runs belief-driven selection — a plain-prompt layer (the
-        // titler's single-section schema) gains nothing from the extra swap.
-        let wants_early_reprojection = work
-            .reprojection
-            .as_ref()
-            .is_some_and(|p| p.has_belief_collections());
 
         // Through `push_generated` like every other token, so a `</think>` the
         // prefill's own logits produced still fixes the reasoning boundary.
@@ -6777,20 +6768,13 @@ impl Scheduler {
         // No speculative rewind can be in flight on this path — the turn has not
         // decoded yet — so the cut is taken at once.
         super::flush_page_cut(self.model.as_ref(), work.sequence_id, &mut state);
+        // No boundary at the end of the opening: the reply decodes on the slot
+        // its question was prefilled against, so the recurrent state and the
+        // attended K/V agree. The question's hits are counted; the first
+        // boundary to apply them is the reasoning's first early one
+        // (`early_boundaries`), which re-feeds the reasoning's first tokens
+        // over the slot it chooses.
         self.active_decodes.insert(work.sequence_id, state);
-        // Fire the turn's FIRST reprojection immediately (drained right after
-        // the next decode step, ~token 1). The prefill just wrote the user
-        // query's wide-Q into R16, so the belief scan can score it and
-        // materialize the right sections BEFORE the model's plan forms in the
-        // early <think> tokens — waiting for the 64-token cadence lets a
-        // wrong-tool prefix anchor the reasoning first (the submit-time
-        // projection only carries the PREVIOUS turn's belief; it cannot see
-        // this turn's query). For a first-token tool call this is the turn's
-        // lock-in reprojection: `in_tool_call` is already set above, so the
-        // call body stays frozen afterwards.
-        if wants_early_reprojection {
-            Self::queue_reprojection(&mut self.pending_reprojections, work.sequence_id);
-        }
     }
 
     /// Forward `tokens` on `sequence_id`, splitting the pass at the turn's

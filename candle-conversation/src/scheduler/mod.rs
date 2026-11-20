@@ -1475,21 +1475,6 @@ pub(crate) struct ReprojectionPolicy {
 }
 
 impl ReprojectionPolicy {
-    /// Whether the target layer declares any belief-driven collection. The
-    /// immediate first-reprojection at prefill promotion only pays off when
-    /// there is a belief scan to run against the query's wide-Q — a
-    /// plain-prompt layer (e.g. the titler's single-section schema) gains
-    /// nothing from the extra view swap, so its turns skip it. Cadence and
-    /// punctuation reprojections are unaffected.
-    pub(crate) fn has_belief_collections(&self) -> bool {
-        self.projection
-            .schema()
-            .system_prompt
-            .items
-            .iter()
-            .any(|i| matches!(i, SystemPromptItem::Collection(_)))
-    }
-
     /// How far an opening is prefilled before a boundary re-chooses the slot
     /// (`docs/hit_driven_projection.md` §7.4): the target layer's
     /// `reserve_tokens`, on an engine that selects. `None` where the slot is
