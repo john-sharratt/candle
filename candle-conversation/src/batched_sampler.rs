@@ -10,13 +10,13 @@ use crate::banned_rows::banned_buffer;
 use crate::config::SamplingConfig;
 use crate::line_ends::ends_a_line;
 use crate::penalty_counts::{count_table_ptr, PenaltyTables, SparseCounts};
-use crate::sampler_args::{split_rng_and_outputs, ArgPack};
+use crate::sampler_args::{refuse_nonfinite, split_readback, ArgPack};
 use crate::scheduler::profile;
 use crate::stencil::ban;
 use crate::token_buffer::TokenBuffer;
 use candle::cuda_backend::{CudaStorageSlice, Held};
 use candle::{DType, Device, IndexOp, Tensor};
-use candle_kernels::sampling::{run_batched_sampling, DType as KernelDType};
+use candle_kernels::sampling::{run_batched_sampling, DType as KernelDType, ALLOW_NOT_FINITE};
 use candle_transformers::generation::{LogitsProcessor, PendingSample};
 use candle_transformers::models::speculative_choice::TypicalAcceptance;
 use cudarc::driver::{DevicePtr, DevicePtrMut};
@@ -57,6 +57,18 @@ enum AllowResult {
     Index(usize),
     /// The softmax at the row's temperature, one per allowed token.
     Probs(Vec<f32>),
+}
+
+impl AllowResult {
+    /// Whether the row's allowed logits were all numbers: no
+    /// [`ALLOW_NOT_FINITE`] in place of an index, no probability a NaN or an
+    /// infinity left non-finite.
+    fn finite(&self) -> bool {
+        match self {
+            AllowResult::Index(i) => *i != ALLOW_NOT_FINITE as usize,
+            AllowResult::Probs(p) => p.iter().all(|x| x.is_finite()),
+        }
+    }
 }
 
 /// The tokens a bitmap allows, in order.
@@ -1519,7 +1531,7 @@ impl BatchedSampler {
                 stream.synchronize().w()
             },
         )?;
-        Ok(rows
+        let results: Vec<AllowResult> = rows
             .iter()
             .zip(&out_off)
             .map(|(row, &at)| {
@@ -1535,7 +1547,13 @@ impl BatchedSampler {
                     )
                 }
             })
-            .collect())
+            .collect();
+        // A row whose allowed logits held a NaN or a +inf: the kernel marks an
+        // argmax so, and leaves a softmax non-finite. Refused as the
+        // full-vocabulary rows are, before anything is drawn from it.
+        let verdicts: Vec<u32> = results.iter().map(|r| u32::from(!r.finite())).collect();
+        refuse_nonfinite(&verdicts)?;
+        Ok(results)
     }
 
     /// Commit a scored row onto `state`: resolve a free row's pick (segment
@@ -2324,8 +2342,9 @@ impl BatchedSampler {
         // Every small per-dispatch array in one upload. Per-sequence dials go
         // in as raw 4-byte words — `SeqDials` is packed `f32`/`i32` fields (its
         // C twin `batched_sampling::SeqDials` has the identical layout), so the
-        // byte image is what the kernel reads back. The two arrays the kernel
-        // writes, RNG offsets then outputs, go last so one copy reads both.
+        // byte image is what the kernel reads back. The arrays the kernel
+        // writes — RNG offsets, outputs, then each row's non-finite verdict —
+        // go last so one copy reads them all.
         const SEQ_DIALS_WORDS: usize = std::mem::size_of::<SeqDials>() / 4;
         // SAFETY: `SeqDials` is `#[repr(C)]` with only 4-byte `f32`/`i32`
         // fields and no padding, so a contiguous slice of them is a valid
@@ -2350,6 +2369,7 @@ impl BatchedSampler {
         let seq_dials_at = pack.push_i32(seq_dials_words);
         let rng_at = pack.push_u64(rng_offsets);
         let output_at = pack.reserve(rows);
+        let nonfinite_at = pack.reserve(rows);
         let words = pack.words();
         let mut args = self
             .args
@@ -2405,6 +2425,7 @@ impl BatchedSampler {
             let recent_lens_ptr = at(recent_lens_at);
             let stencil_ptr = at(stencil_at);
             let output_ptr = at(output_at);
+            let nonfinite_ptr = at(nonfinite_at);
             let rng_ptr = at(rng_at);
             let seq_dials_ptr = at(seq_dials_at);
             let reference_view = reference.as_ref().map(|flags| flags.device_ptr(&stream));
@@ -2479,6 +2500,7 @@ impl BatchedSampler {
                     },
                     stencil_size,
                     output_ptr as *mut u32,
+                    nonfinite_ptr as *mut u32,
                     seed,
                     rng_ptr as *mut u64,
                     // Null on an empty (guard) upload, else the per-row dials.
@@ -2518,16 +2540,19 @@ impl BatchedSampler {
             }
         } // Guards dropped here
 
-        // One stream-ordered copy reads the RNG offsets and the outputs back.
-        // It is queued behind the kernel, and a device-to-host copy into
-        // pageable memory returns only once it has completed, so no separate
-        // synchronise is needed.
+        // One stream-ordered copy reads the RNG offsets, the outputs and the
+        // verdicts back. It is queued behind the kernel, and a device-to-host
+        // copy into pageable memory returns only once it has completed, so no
+        // separate synchronise is needed.
         let tail = stream
-            .memcpy_dtov(&packed.slice(rng_at..output_at + rows))
+            .memcpy_dtov(&packed.slice(rng_at..nonfinite_at + rows))
             .map_err(|e| candle::Error::Msg(format!("failed to download sampling results: {e}")))?;
-        let (rng, outputs) = split_rng_and_outputs(&tail, rows);
-        output_tokens.copy_from_slice(&outputs);
-        rng_offsets.copy_from_slice(&rng);
+        let readback = split_readback(&tail, rows);
+        // A row the kernel judged non-finite fails the dispatch before
+        // anything is handed back, so no state moves for the token it drew.
+        refuse_nonfinite(&readback.nonfinite)?;
+        output_tokens.copy_from_slice(&readback.outputs);
+        rng_offsets.copy_from_slice(&readback.rng);
 
         Ok(())
     }

@@ -666,6 +666,12 @@ pub fn alloc_zeroed<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroB
 
 /// Run the GPU kernel and return sampled tokens.
 pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
+    run_gpu_verdicts(stream, p).0
+}
+
+/// Run the GPU kernel and return the sampled tokens and each row's
+/// non-finite verdict (`nonfinite_rows`: 1 where a raw logit was NaN or +inf).
+pub fn run_gpu_verdicts(stream: &Arc<CudaStream>, p: &SamplingParams) -> (Vec<u32>, Vec<u32>) {
     let logits_gpu = stream
         .memcpy_stod(&p.logits_f32)
         .expect("upload logits failed");
@@ -687,6 +693,11 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
         && p.segment_suppress_penalties.iter().any(|&v| v != 0.0);
 
     let mut output_gpu: CudaSlice<u32> = alloc_zeroed(stream, p.batch_size as usize);
+    // Filled with a value the kernel never writes, so a row it left unwritten
+    // shows.
+    let mut verdicts_gpu: CudaSlice<u32> = stream
+        .memcpy_stod(&vec![7u32; p.batch_size as usize])
+        .expect("upload verdicts");
 
     let mut rng_offsets_gpu: CudaSlice<u64> = if p.rng_offsets.is_empty() {
         alloc_zeroed(stream, p.batch_size as usize)
@@ -700,6 +711,7 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
         let (logits_ptr, _g1) = logits_gpu.device_ptr(stream);
         let (output_ptr, _g2) = output_gpu.device_ptr_mut(stream);
         let (rng_ptr, _g3) = rng_offsets_gpu.device_ptr_mut(stream);
+        let (verdicts_ptr, _g4) = verdicts_gpu.device_ptr_mut(stream);
 
         let suppress_tok_ptr = if suppress_active {
             suppress_tokens_gpu
@@ -847,6 +859,7 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
                 stencil_ptr,
                 p.stencil_size,
                 output_ptr as *mut u32,
+                verdicts_ptr as *mut u32,
                 p.seed,
                 rng_ptr as *mut u64,
                 std::ptr::null(),
@@ -857,9 +870,14 @@ pub fn run_gpu(stream: &Arc<CudaStream>, p: &SamplingParams) -> Vec<u32> {
 
     stream.synchronize().expect("sync failed");
 
-    stream
-        .memcpy_dtov(&output_gpu)
-        .expect("download output failed")
+    (
+        stream
+            .memcpy_dtov(&output_gpu)
+            .expect("download output failed"),
+        stream
+            .memcpy_dtov(&verdicts_gpu)
+            .expect("download verdicts failed"),
+    )
 }
 
 /// Run CPU reference for all sequences in the batch.
@@ -998,6 +1016,16 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
     p: &SamplingParams,
     dtype_enum: i32,
 ) -> Vec<u32> {
+    run_gpu_typed_verdicts(stream, typed_logits, p, dtype_enum).0
+}
+
+/// [`run_gpu_typed`], with each row's non-finite verdict beside its token.
+pub fn run_gpu_typed_verdicts<T: cudarc::driver::DeviceRepr>(
+    stream: &Arc<CudaStream>,
+    typed_logits: &[T],
+    p: &SamplingParams,
+    dtype_enum: i32,
+) -> (Vec<u32>, Vec<u32>) {
     let logits_gpu = stream
         .memcpy_stod(typed_logits)
         .expect("upload typed logits failed");
@@ -1019,6 +1047,11 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
         && p.segment_suppress_penalties.iter().any(|&v| v != 0.0);
 
     let mut output_gpu: CudaSlice<u32> = alloc_zeroed(stream, p.batch_size as usize);
+    // Filled with a value the kernel never writes, so a row it left unwritten
+    // shows.
+    let mut verdicts_gpu: CudaSlice<u32> = stream
+        .memcpy_stod(&vec![7u32; p.batch_size as usize])
+        .expect("upload verdicts");
 
     let mut rng_offsets_gpu: CudaSlice<u64> = if p.rng_offsets.is_empty() {
         alloc_zeroed(stream, p.batch_size as usize)
@@ -1032,6 +1065,7 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
         let (logits_ptr, _g1) = logits_gpu.device_ptr(stream);
         let (output_ptr, _g2) = output_gpu.device_ptr_mut(stream);
         let (rng_ptr, _g3) = rng_offsets_gpu.device_ptr_mut(stream);
+        let (verdicts_ptr, _g4) = verdicts_gpu.device_ptr_mut(stream);
 
         let suppress_tok_ptr = if suppress_active {
             suppress_tokens_gpu
@@ -1179,6 +1213,7 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
                 stencil_ptr,
                 p.stencil_size,
                 output_ptr as *mut u32,
+                verdicts_ptr as *mut u32,
                 p.seed,
                 rng_ptr as *mut u64,
                 std::ptr::null(),
@@ -1188,9 +1223,14 @@ pub fn run_gpu_typed<T: cudarc::driver::DeviceRepr>(
     }
 
     stream.synchronize().expect("sync failed");
-    stream
-        .memcpy_dtov(&output_gpu)
-        .expect("download output failed")
+    (
+        stream
+            .memcpy_dtov(&output_gpu)
+            .expect("download output failed"),
+        stream
+            .memcpy_dtov(&verdicts_gpu)
+            .expect("download verdicts failed"),
+    )
 }
 
 /// Convert f32 logits to f16 and return both the typed buffer and the

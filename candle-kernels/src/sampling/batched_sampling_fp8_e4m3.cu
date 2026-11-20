@@ -56,6 +56,7 @@ extern "C" void run_batched_sampling_fp8_e4m3(
     float top_p,
     // Output
     uint32_t* output_tokens,
+    uint32_t* nonfinite_rows,
     uint64_t seed,
     uint64_t* rng_offsets,
     const void* seq_dials,
@@ -77,7 +78,7 @@ extern "C" void run_batched_sampling_fp8_e4m3(
         recent_tokens, recent_lens, max_recent_len,
         stencil, stencil_size,
         temperature, top_k, top_p,
-        output_tokens, seed, rng_offsets,
+        output_tokens, nonfinite_rows, seed, rng_offsets,
         reinterpret_cast<const SeqDials*>(seq_dials),
         static_cast<cudaStream_t>(stream)
     );

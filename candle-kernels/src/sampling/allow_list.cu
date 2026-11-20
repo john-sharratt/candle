@@ -17,7 +17,10 @@
 // produce, which reads as -inf and so draws with probability zero.
 //
 // Output, per row: with temperature <= 0, one word — the local index of the
-// first maximum; otherwise `allow_len` F32 probabilities.
+// first maximum, or NOT_FINITE when an allowed logit is NaN or +inf (a broken
+// forward; an argmax over it would quietly pick something); otherwise
+// `allow_len` F32 probabilities, which such a logit leaves non-finite for the
+// host to refuse.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -27,6 +30,14 @@
 
 #define ALLOW_BLOCK 256
 #define BANNED 0xFFFFFFFFu
+#define NOT_FINITE 0xFFFFFFFFu
+
+// NaN or +inf, by its bits so no fast-math setting folds it away; −inf, which a
+// banned position reads as, passes.
+__device__ __forceinline__ bool logit_not_finite(float v) {
+    const uint32_t b = __float_as_uint(v);
+    return (b & 0x7F800000u) == 0x7F800000u && b != 0xFF800000u;
+}
 
 // dtype codes: 0 = F32, 1 = F16, 2 = BF16.
 __device__ __forceinline__ float load_logit(uint64_t row, uint32_t token, int dtype) {
@@ -66,8 +77,10 @@ extern "C" __global__ void allow_list_rows_kernel(
     float best = -INFINITY;
     uint32_t best_i = 0;
     bool any = false;
+    bool bad = false;
     for (uint32_t j = threadIdx.x; j < n; j += blockDim.x) {
         float v = allowed_logit(row, tokens[j], dtype);
+        bad |= logit_not_finite(v);
         if (!any || v > best) {
             best = v;
             best_i = j;
@@ -76,7 +89,7 @@ extern "C" __global__ void allow_list_rows_kernel(
     }
     s_val[threadIdx.x] = any ? best : -INFINITY;
     s_idx[threadIdx.x] = any ? best_i : UINT32_MAX;
-    __syncthreads();
+    const bool not_finite = __syncthreads_or(bad) != 0;
     for (uint32_t s = blockDim.x / 2; s > 0; s >>= 1) {
         if (threadIdx.x < s) {
             float ov = s_val[threadIdx.x + s];
@@ -94,7 +107,7 @@ extern "C" __global__ void allow_list_rows_kernel(
 
     if (t <= 0.0f) {
         if (threadIdx.x == 0) {
-            dst[0] = row_argmax == UINT32_MAX ? 0u : row_argmax;
+            dst[0] = not_finite ? NOT_FINITE : (row_argmax == UINT32_MAX ? 0u : row_argmax);
         }
         return;
     }
