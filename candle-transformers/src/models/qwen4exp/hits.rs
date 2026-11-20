@@ -549,6 +549,21 @@ fn u32_device_ptr(t: &Tensor) -> Result<u64> {
     Ok(p)
 }
 
+/// One counter set's shadow job, gathered while the hit table is built: the
+/// tables are held here until the launch has read their addresses.
+#[cfg(feature = "cuda")]
+struct PendingShadow {
+    keep: u64,
+    mask: u64,
+    rows: Arc<ShadowRows>,
+    counters: u64,
+    n_pieces: u32,
+    /// The rung covering the context's seats.
+    tab: Tensor,
+    /// The rung the queries were kept on.
+    q_tab: Tensor,
+}
+
 /// What the scan needs of the engine at a sampled layer: the kernel's
 /// geometry and the RoPE each sequence's rung is read from.
 #[cfg(feature = "cuda")]
@@ -597,7 +612,7 @@ pub fn count_hits(
     let mut words: Vec<u32> = Vec::new();
     let mut guards = Vec::new();
     let mut sets: Vec<u64> = Vec::new();
-    let mut jobs: Vec<(u64, u64, Arc<ShadowRows>, u64, u32, Tensor)> = Vec::new();
+    let mut jobs: Vec<PendingShadow> = Vec::new();
     let mut slots: Vec<(usize, u64)> = Vec::new();
     let mut max_rows = 0usize;
     for (i, span) in spans.iter().enumerate() {
@@ -637,16 +652,24 @@ pub fn count_hits(
             let mask = h.stride.kept[layer];
             if h.stride.due {
                 if let Some(rows) = h.counts.shadow.get(layer).filter(|_| mask != 0) {
-                    let rung = scan.rope.rung_for(offsets[i] + span.len)?;
-                    let tab = scan.rope.table(rung)?;
-                    jobs.push((
-                        h.stride.layer_ptr(layer)?,
+                    // The queries were kept on the sequence's rung; the
+                    // context seats the pool behind each one, so its keys
+                    // rotate on the rung covering the pool or the query's own
+                    // depth, whichever is further, and the query's block
+                    // (`docs/reprojection_refeed.md` §2.3).
+                    let reach = offsets[i] + span.len;
+                    let q_tab = scan.rope.table(scan.rope.rung_for(reach)?)?;
+                    let seats = reach.max(rows.n_rows() * scan.geom.ratio) + scan.geom.ratio;
+                    let tab = scan.rope.table(scan.rope.rung_for(seats)?)?;
+                    jobs.push(PendingShadow {
+                        keep: h.stride.layer_ptr(layer)?,
                         mask,
-                        Arc::clone(rows),
-                        cnt_ptr,
-                        h.counts.n_pieces as u32,
+                        rows: Arc::clone(rows),
+                        counters: cnt_ptr,
+                        n_pieces: h.counts.n_pieces as u32,
                         tab,
-                    ));
+                        q_tab,
+                    });
                 }
                 h.stride.kept[layer] = 0;
             }
@@ -682,24 +705,20 @@ pub fn count_hits(
     // The scan reads the stride the count below is about to overwrite, so it
     // goes first, on the same stream.
     if !jobs.is_empty() {
-        let tabs: Vec<u64> = jobs
-            .iter()
-            .map(|j| tensor_ptr(&j.5))
-            .collect::<Result<_>>()?;
         let shadow_jobs: Vec<ShadowJob<'_>> = jobs
             .iter()
-            .zip(&tabs)
-            .map(
-                |((keep, mask, rows, counters, n_pieces, _), &tab)| ShadowJob {
-                    keep: *keep,
-                    mask: *mask,
-                    rows: rows.as_ref(),
-                    counters: *counters,
-                    n_pieces: *n_pieces,
-                    tab,
-                },
-            )
-            .collect();
+            .map(|j| {
+                Ok(ShadowJob {
+                    keep: j.keep,
+                    mask: j.mask,
+                    rows: j.rows.as_ref(),
+                    counters: j.counters,
+                    n_pieces: j.n_pieces,
+                    tab: tensor_ptr(&j.tab)?,
+                    q_tab: tensor_ptr(&j.q_tab)?,
+                })
+            })
+            .collect::<Result<_>>()?;
         shadow::launch(&shadow_jobs, &scan.geom, device)?;
     }
 

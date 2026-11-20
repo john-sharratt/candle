@@ -410,6 +410,43 @@ impl SealedSequence {
             self.chunks.pop();
         }
     }
+
+    /// Drop the last `tokens` tokens — the span a re-feed forwards again over
+    /// a rebuilt context (`docs/reprojection_refeed.md` §2.2). The chunk the
+    /// cut lands in keeps its first tokens; chunks wholly past it go. Every
+    /// chunk the cut reaches must still take writes: the re-feed writes those
+    /// positions again, and the gap leaves them native for it. A cut longer
+    /// than the sequence, or into a quantized chunk, is refused.
+    pub fn trim_tail(&mut self, tokens: usize) -> candle::Result<()> {
+        if tokens > self.token_count {
+            candle::bail!(
+                "re-feed: a cut of {tokens} token(s) is longer than the {} the tail holds",
+                self.token_count
+            );
+        }
+        let mut left = tokens;
+        while left > 0 {
+            let Some(last) = self.chunks.last_mut() else {
+                candle::bail!("re-feed: the tail's chunks hold fewer tokens than it counts");
+            };
+            let held = last.token_count as usize;
+            if held > 0 && !last.is_native() {
+                candle::bail!(
+                    "re-feed: the cut reaches a quantized chunk — the gap must leave the tail's \
+                     last tokens native"
+                );
+            }
+            if held > left {
+                last.token_count -= left as u16;
+                left = 0;
+            } else {
+                left -= held;
+                self.chunks.pop();
+            }
+        }
+        self.token_count -= tokens;
+        Ok(())
+    }
 }
 
 /// Per-block chunk window — combines physical chunk references (RAII `ChunkGid`s)
@@ -2042,6 +2079,14 @@ mod sealed_tail_tests {
         }
     }
 
+    /// A chunk as a live tail writes it: K in `R16`, V in `F16`.
+    fn native_chunk(tokens: u16) -> SealedChunk {
+        SealedChunk {
+            v_fmt: Arc::new(vec![ArenaFormatTag::F16.as_u8(); N_PALETTE]),
+            ..sealed_chunk(tokens, ArenaFormatTag::R16.as_u8())
+        }
+    }
+
     fn sequence(chunks: Vec<SealedChunk>) -> SealedSequence {
         let token_count = chunks.iter().map(|c| c.token_count as usize).sum();
         SealedSequence {
@@ -2071,6 +2116,33 @@ mod sealed_tail_tests {
         let counts: Vec<u16> = s.chunks.iter().map(|c| c.token_count).collect();
         assert_eq!(counts, vec![32, 7]);
         assert_eq!(s.token_count, 39);
+    }
+
+    /// **A re-feed's cut keeps the landing chunk's first tokens and drops the
+    /// chunks past it**: 6 off `[32, 3]` leaves `[29]`; 3 off it leaves `[32]`.
+    #[test]
+    fn a_trim_cuts_the_last_tokens_across_a_chunk_boundary() {
+        let mut s = sequence(vec![native_chunk(32), native_chunk(3)]);
+        s.trim_tail(6).unwrap();
+        let counts: Vec<u16> = s.chunks.iter().map(|c| c.token_count).collect();
+        assert_eq!((counts, s.token_count), (vec![29], 29));
+        let mut s = sequence(vec![native_chunk(32), native_chunk(3)]);
+        s.trim_tail(3).unwrap();
+        let counts: Vec<u16> = s.chunks.iter().map(|c| c.token_count).collect();
+        assert_eq!((counts, s.token_count), (vec![32], 32));
+    }
+
+    /// **A cut into a quantized chunk, or past the tail, is refused**, and a
+    /// cut of nothing changes nothing.
+    #[test]
+    fn a_trim_refuses_a_quantized_chunk_and_an_overlong_cut() {
+        let q3 = ArenaFormatTag::Q3_0.as_u8();
+        let mut s = sequence(vec![sealed_chunk(32, q3), native_chunk(2)]);
+        assert!(s.trim_tail(4).is_err());
+        let mut s = sequence(vec![native_chunk(5)]);
+        assert!(s.trim_tail(6).is_err());
+        s.trim_tail(0).unwrap();
+        assert_eq!(s.token_count, 5);
     }
 
     /// An empty chunk inside the history is not the tail, and stays.

@@ -189,12 +189,12 @@ pub use compression_policy::{
     QWEN3_MOE_KV_FACTORS, QWEN4EXP_KV_FACTORS, QWEN4EXP_Q2KO_KV_FACTORS,
 };
 pub use format_census::FormatCensus;
-pub use gap::gap_take;
 #[cfg(feature = "cuda")]
 pub use gap::{
     gap_jobs_within, CatchUpHost, GapCatchUp, GapCycle, GapKind, GapQuantize, GapSealed,
     GapSealedResidence, GapSeq, LeaseRefusal, QuantizeHost,
 };
+pub use gap::{gap_take, HELD_TAIL_TOKENS};
 pub use gid_pool::{ChunkGid, ChunkGidPool, ClassOccupancy, GpuArenaClassStats};
 pub use gpu_chunks::ChunkPin;
 pub use head_gids::HeadGids;

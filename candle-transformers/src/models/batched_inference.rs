@@ -5257,6 +5257,21 @@ pub trait ManagedBatchedModel {
         Ok(0)
     }
 
+    /// How many of `seq`'s last tokens a re-feed forwards again over a rebuilt
+    /// context, at most `max` (`docs/reprojection_refeed.md` §2): on a model
+    /// with per-position state, back to the newest boundary that state can be
+    /// cut at without reaching a closed page. `max` on a model with none.
+    fn refeed_span(&self, _seq: usize, max: usize) -> Result<usize> {
+        Ok(max)
+    }
+
+    /// Discard the per-position state of `seq`'s last `tokens` tokens — the
+    /// span [`Self::refeed_span`] chose, which the re-feed writes again. A
+    /// no-op for a model that keeps none.
+    fn rewind_positional_tail(&self, _seq: usize, _tokens: usize) -> Result<()> {
+        Ok(())
+    }
+
     /// Install a sealed piece ahead of whatever `seq` forwards next — the
     /// counterpart of Arc-injecting that piece's K/V.
     ///

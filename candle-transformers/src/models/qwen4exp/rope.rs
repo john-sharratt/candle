@@ -2,7 +2,9 @@
 //!
 //! 64 rotary dims at θ 1e7, trained to 262,144 positions, then the YaRN
 //! factors vLLM's Flash-Next recipe publishes: 2.0 to 524,288 and 4.0 to
-//! 1,000,000. The attention and the QSA indexer rotate with the same schedule
+//! 1,000,000 — and 8.0 to 2,097,152, the reach of the factored table, the rung
+//! the shadow scan scores a 2M pool on (`docs/reprojection_refeed.md` §2.3).
+//! The attention and the QSA indexer rotate with the same schedule
 //! — the reference hands the indexer the attention's own rotary embedding, `m`
 //! included (§12).
 //!
@@ -17,8 +19,11 @@ use super::config::Qwen4ExpConfig;
 /// The trained window.
 pub const FLASH_NEXT_L0: usize = 262_144;
 
-/// The longest supported reach.
-pub const FLASH_NEXT_MAX: usize = 1_000_000;
+/// The 4× rung's ceiling: the longest reach vLLM's recipe publishes.
+pub const FLASH_NEXT_4X: usize = 1_000_000;
+
+/// The longest supported reach: the factored table's, 2048 × 1024 positions.
+pub const FLASH_NEXT_MAX: usize = 2_097_152;
 
 /// The schedule over `cfg`'s rotary width and base.
 pub fn flash_next_schedule(cfg: &Qwen4ExpConfig) -> candle::Result<RopeSchedule> {
@@ -41,8 +46,12 @@ fn flash_next(rope_dim: usize, theta: f32) -> candle::Result<RopeSchedule> {
                 factor: 2.0,
             },
             Rung {
-                ceiling: FLASH_NEXT_MAX,
+                ceiling: FLASH_NEXT_4X,
                 factor: 4.0,
+            },
+            Rung {
+                ceiling: FLASH_NEXT_MAX,
+                factor: 8.0,
             },
         ],
         true,
@@ -60,6 +69,9 @@ mod tests {
     fn flash_next_takes_the_reference_angle() {
         let s = flash_next(64, 1e7).unwrap();
         assert_eq!(s.lo_angle(), AngleArithmetic::F32Product);
-        assert_eq!(s.ceilings(), vec![FLASH_NEXT_L0, 524_288, FLASH_NEXT_MAX]);
+        assert_eq!(
+            s.ceilings(),
+            vec![FLASH_NEXT_L0, 524_288, 1_000_000, 2_097_152]
+        );
     }
 }

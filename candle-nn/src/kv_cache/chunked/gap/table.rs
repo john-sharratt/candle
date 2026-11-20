@@ -52,7 +52,28 @@ impl LayerShape {
             })
             .unwrap_or(end.max(start))
     }
+
+    /// The first chunk holding one of the sequence's last
+    /// [`HELD_TAIL_TOKENS`] tokens: those chunks stay native, because a
+    /// re-feed writes them again. A shape holding fewer than that many tokens
+    /// past `first` holds every chunk it read.
+    fn held_from(&self) -> usize {
+        let mut left = HELD_TAIL_TOKENS;
+        for (at, &usage) in self.usage.iter().enumerate().rev() {
+            let usage = usage as usize;
+            if usage >= left {
+                return self.first + at;
+            }
+            left -= usage;
+        }
+        self.first
+    }
 }
+
+/// How many of a sequence's last tokens the gap leaves native: the most a
+/// re-feed forwards again over a rebuilt slot (`docs/reprojection_refeed.md`
+/// §2.2), the recurrent layers' short span.
+pub const HELD_TAIL_TOKENS: usize = 8;
 
 /// The chunks a gap takes from one sequence, given its `cursor` and every
 /// layer's shape: empty when there is nothing complete past the cursor.
@@ -60,7 +81,8 @@ impl LayerShape {
 /// The range starts at the cursor or at the latest writer boundary, whichever
 /// is later — a reprojection that injected sealed chunks moved the boundary
 /// past them — and ends where the first layer stops having full native
-/// chunks.
+/// chunks, or at the first chunk holding one of the sequence's last
+/// [`HELD_TAIL_TOKENS`] tokens, whichever comes first.
 pub(crate) fn take_range(cursor: usize, layers: &[LayerShape]) -> Range<usize> {
     let Some(start) = layers.iter().map(|l| l.writer_start).max() else {
         return 0..0;
@@ -68,7 +90,7 @@ pub(crate) fn take_range(cursor: usize, layers: &[LayerShape]) -> Range<usize> {
     let start = start.max(cursor);
     let end = layers
         .iter()
-        .map(|l| l.complete_end(start))
+        .map(|l| l.complete_end(start).min(l.held_from()))
         .min()
         .unwrap_or(start);
     start..end.max(start)
@@ -213,16 +235,20 @@ mod tests {
         assert_eq!(take_range(2, &[tail]), 2..4);
     }
 
+    // A writer chunk of `HELD_TAIL_TOKENS` or more holds the whole held tail,
+    // so the tests of anything else end on one: `TAIL`.
+    const TAIL: u32 = HELD_TAIL_TOKENS as u32 + 1;
+
     #[test]
     fn complete_blocks_are_taken_and_the_writer_chunk_is_not() {
-        let usage = [FULL, FULL, FULL, 7];
+        let usage = [FULL, FULL, FULL, TAIL];
         let native = [true; 4];
         assert_eq!(take_range(0, &[layer(0, &usage, &native)]), 0..3);
     }
 
     #[test]
     fn nothing_before_the_cursor_is_taken_again() {
-        let usage = [FULL, FULL, FULL, 7];
+        let usage = [FULL, FULL, FULL, TAIL];
         let native = [true; 4];
         assert_eq!(take_range(2, &[layer(0, &usage, &native)]), 2..3);
         assert_eq!(take_range(3, &[layer(0, &usage, &native)]), 3..3);
@@ -230,22 +256,37 @@ mod tests {
 
     #[test]
     fn shared_chunks_below_the_writer_boundary_are_never_the_gaps() {
-        let usage = [FULL, FULL, FULL, FULL, 3];
+        let usage = [FULL, FULL, FULL, FULL, TAIL];
         let native = [false, false, true, true, true];
         assert_eq!(take_range(0, &[layer(2, &usage, &native)]), 2..4);
     }
 
     #[test]
-    fn a_full_last_chunk_is_complete() {
-        let usage = [FULL, FULL];
-        let native = [true; 2];
+    fn a_full_chunk_before_the_writer_is_complete() {
+        let usage = [FULL, FULL, TAIL];
+        let native = [true; 3];
         assert_eq!(take_range(0, &[layer(0, &usage, &native)]), 0..2);
+    }
+
+    /// **The chunks holding the sequence's last 8 tokens stay native**: a
+    /// re-feed writes them again. 4 tokens in the writer and 4 in the chunk
+    /// before hold both; 8 in the writer hold it alone; a full last chunk holds
+    /// itself.
+    #[test]
+    fn the_chunks_holding_the_last_eight_tokens_stay_native() {
+        let held = HELD_TAIL_TOKENS as u32;
+        let split = [FULL, FULL, FULL, held / 2];
+        assert_eq!(take_range(0, &[layer(0, &split, &[true; 4])]), 0..2);
+        let whole = [FULL, FULL, FULL, held];
+        assert_eq!(take_range(0, &[layer(0, &whole, &[true; 4])]), 0..3);
+        let full_last = [FULL, FULL];
+        assert_eq!(take_range(0, &[layer(0, &full_last, &[true; 2])]), 0..1);
     }
 
     #[test]
     fn the_empty_writer_and_a_pad_after_it_are_not_blocks() {
-        let usage = [FULL, 0, 0];
-        let native = [true; 3];
+        let usage = [FULL, FULL, 0, 0];
+        let native = [true; 4];
         assert_eq!(take_range(0, &[layer(0, &usage, &native)]), 0..1);
     }
 
@@ -272,7 +313,7 @@ mod tests {
 
     #[test]
     fn the_latest_writer_boundary_wins_over_the_cursor() {
-        let usage = [FULL, FULL, FULL, FULL, 2];
+        let usage = [FULL, FULL, FULL, FULL, TAIL];
         let native = [true; 5];
         assert_eq!(take_range(1, &[layer(3, &usage, &native)]), 3..4);
     }
@@ -305,9 +346,9 @@ mod tests {
 
     #[test]
     fn usage_and_native_of_different_lengths_stop_at_the_shorter() {
-        let longer_usage = layer(0, &[FULL, FULL, FULL], &[true, true]);
+        let longer_usage = layer(0, &[FULL, FULL, FULL, TAIL], &[true, true]);
         assert_eq!(take_range(0, &[longer_usage]), 0..2);
-        let longer_native = layer(0, &[FULL], &[true, true, true]);
+        let longer_native = layer(0, &[FULL, TAIL], &[true, true, true]);
         assert_eq!(take_range(0, &[longer_native]), 0..1);
     }
 
@@ -326,8 +367,8 @@ mod tests {
 
     #[test]
     fn layers_with_different_writer_boundaries_start_at_the_latest() {
-        let usage = [FULL; 6];
-        let native = [true; 6];
+        let usage = [FULL, FULL, FULL, FULL, FULL, FULL, TAIL];
+        let native = [true; 7];
         assert_eq!(
             take_range(
                 0,

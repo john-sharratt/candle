@@ -109,6 +109,7 @@ pub(crate) mod projection_assembler;
 mod projection_identity;
 mod rates_store;
 mod recurrent_park;
+mod refeed;
 mod relief_pacing;
 pub mod relief_trace;
 mod remote_arena;
@@ -149,6 +150,7 @@ use frame::{framed_segments, frames};
 use graph_window::graph_window;
 use held_turn::HeldTurn;
 use phase_split::cobatched_step_shares;
+use refeed::without_last;
 use reproject_abandon::or_abandon;
 use section_pages::SectionPages;
 use section_timing::SectionTiming;
@@ -1553,6 +1555,10 @@ struct ReprojectInFlight {
     /// travel rather than being discarded, so this list and a stored one are the
     /// same shape.
     tail_index_page: Vec<(usize, Vec<u8>)>,
+    /// The turn's last tokens left out of the rebuild — off `tail_per_layer`
+    /// and its index rows — which it forwards again once it is back on the
+    /// slot (`refeed`).
+    refeed_tokens: usize,
     /// The turn being swapped: a decode, or an opening stopped at a boundary
     /// (`held_turn`).
     turn: HeldTurn,
@@ -3826,6 +3832,10 @@ pub(crate) struct Scheduler {
     /// this batch.
     pending_reprojections: Vec<SequenceId>,
 
+    /// Each rebuilt decode's re-fed tokens, by its new view, until its next
+    /// wave carries them (`refeed`).
+    refeeds: HashMap<SequenceId, Vec<u32>>,
+
     /// Per-slot `Conversation` (workspace) registry.  Registered when
     /// [`SchedulerRequest::NewSequence`] allocates the slot; removed
     /// when [`SchedulerRequest::FreeSequence`] frees it.  The
@@ -4511,6 +4521,7 @@ impl Scheduler {
             carried_beliefs: HashMap::new(),
             guests,
             pending_reprojections: Vec::new(),
+            refeeds: HashMap::new(),
             slot_tokens: HashMap::new(),
             slot_projection_state: HashMap::new(),
             cold_load_stager: ColdLoadStager::with_preallocation(PINNED_PREALLOC_BYTES),
@@ -12548,6 +12559,20 @@ impl Scheduler {
                 .snapshot_sequence_tail(view_id.0, view_state.turn_start_parent_blocks)
                 .map_err(ConversationError::Model)?
         };
+        // **The re-feed** (`refeed`, `docs/reprojection_refeed.md`): the turn's
+        // last tokens are left out of the rebuild — trimmed off the captured
+        // K/V first, which touches nothing, then their index rows dropped — and
+        // forwarded again over the rebuilt slot once the turn is back on it.
+        let refeed_tokens = self.choose_refeed(view_id)?;
+        let mut tail_per_layer = tail_per_layer;
+        for layer in tail_per_layer.iter_mut() {
+            layer
+                .trim_tail(refeed_tokens)
+                .map_err(ConversationError::Model)?;
+        }
+        self.model
+            .rewind_positional_tail(view_id.0, refeed_tokens)
+            .map_err(ConversationError::Model)?;
         // Pull the turn and its sampling state off the old view id before
         // freeing the slot, then re-bind to the new view id after the
         // rebuild. Failing to find the turn is an internal invariant
@@ -12778,6 +12803,7 @@ impl Scheduler {
             parent_id,
             tail_per_layer,
             tail_index_page,
+            refeed_tokens,
             turn,
             sampling_state,
             sections_len: projected_sections.len(),
@@ -12832,6 +12858,7 @@ impl Scheduler {
             parent_id,
             tail_per_layer,
             tail_index_page,
+            refeed_tokens,
             mut turn,
             sampling_state,
             sections_len,
@@ -13043,6 +13070,7 @@ impl Scheduler {
             // also wiped above). Reconstruct from the turn's own record of
             // what it forwarded: the opening, then what it decoded.
             let (opening, decoded) = turn.slot_tokens();
+            let (opening, decoded) = without_last(opening, decoded, refeed_tokens);
             Self::record_slot_tokens(&mut self.slot_tokens, parent_id, opening);
             Self::record_slot_tokens(&mut self.slot_tokens, parent_id, decoded);
         }
@@ -13115,6 +13143,7 @@ impl Scheduler {
         // goes back to the loop; an opening to the prefill group, its next
         // stride against the rebuilt slot.
         self.rebind_turn(view_id, new_view_id, turn);
+        self.hold_refeed(new_view_id, refeed_tokens);
         if let Some(state) = sampling_state {
             self.sampling_states.insert(new_view_id, state);
         }

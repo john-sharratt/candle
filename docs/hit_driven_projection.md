@@ -242,27 +242,23 @@ way back but its base score.
 At each sampled layer, the stride's queries are scored against the unloaded
 rounds' index rows.
 
-- **In windows ending at the query.** The unloaded rows are cut into windows
-  in pool order, each as long as the query's own position `p`. Each window is
-  seated directly behind the query: its rows rotate at positions `0 .. p`,
-  through the scorer's per-page signed offset, so the query is the one the
-  real selection used, rotated where it already is. The indexer ranks a
-  context of the length the slot gives it, never longer than it was trained
-  on, and its scores are on the scale of the real cut.
-- **Windows hold unloaded rows only.** The slot's prompt and pinned ranges are
-  already attended and are not repeated in any window. The work is bounded by
-  the pool, not by the window count: every unloaded row is scored once per
-  query whatever `p` is, and a window's top-k is linear in its length, so a
-  small `p` early in a dialogue makes many short windows for the same total.
-  A window no longer than the budget keeps every block, and the cut alone
-  decides its hits.
-- **A hit is a block that would have been read.** Each window ranks its blocks
-  as the real selection ranks the slot's: the checkpoint's budget, one
-  window. An unloaded block is one hit for its round when it is in its
-  window's selection **and** scores above the query's cut. The first condition
-  keeps it to what the indexer would choose from a context that size; the
-  second keeps a window of nothing relevant from handing out a full budget of
-  hits.
+- **One context seated behind the query.** The unloaded rows, in pool order,
+  are one context directly behind the query (`docs/reprojection_refeed.md`
+  §2.3): over `S = max(C, L)` blocks for a query of `C` candidate blocks and
+  `L` unloaded rows, row `j` rotates at `(S − L + j) · ratio` and the query,
+  rotated back from where it was kept, at `S · ratio + tail − 1`. The keys and
+  the query rotate on the rung that covers the seats — ×8 for a 2M pool, ×4
+  for 1M, ×2 for 512K — so the indexer ranks the whole pool at once, on the
+  YaRN rung the schedule gives a context that long.
+- **The context holds unloaded rows only.** The slot's prompt and pinned
+  ranges are already attended and are not repeated. Every unloaded row is
+  scored once per query, and the context's top-k is linear in its length.
+- **A hit is a block that would have been read.** The context ranks its blocks
+  as the real selection ranks the slot's: the checkpoint's budget, `keep`
+  blocks. An unloaded block is one hit for its round when it is in that
+  selection **and** scores above the query's cut. The first condition keeps it
+  to what the indexer would choose from the pool; the second keeps a pool of
+  nothing relevant from handing out a full budget of hits.
 - **Weighed as real hits.** A shadow hit counts into the same counter, at the
   same weight, as a hit on a loaded round. Above the cut it would have
   displaced a block the selection did read, so it is evidence of the same

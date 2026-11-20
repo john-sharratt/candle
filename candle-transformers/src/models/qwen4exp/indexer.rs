@@ -156,6 +156,31 @@ pub struct ScoreRows {
 /// the live tail goes to cuBLAS — the rotated tail, its page table and the one
 /// tile's scoring product every tile is written into. `page_chunks` is asked only
 /// when the paged scorer runs.
+/// What a re-feed rewinds of a live index tail: the completed blocks it keeps
+/// and the tokens after them it forwards again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefeedCut {
+    pub keep_blocks: usize,
+    pub tokens: usize,
+}
+
+/// The re-feed of a live tail of `blocks` completed `ratio`-token blocks and
+/// `open` carried rows: back to the newest block boundary at or after `max`
+/// tokens from its end, so only whole blocks and the open rows are dropped and
+/// the forward pools them again — at most `max` tokens, and the whole tail
+/// when it holds fewer. A tail never reaches back past its own start, which is
+/// the newest closed page.
+pub fn refeed_cut(blocks: usize, open: usize, ratio: usize, max: usize) -> RefeedCut {
+    let ratio = ratio.max(1);
+    let held = blocks * ratio + open;
+    let keep_tokens = held.saturating_sub(max).div_ceil(ratio) * ratio;
+    let keep_blocks = (keep_tokens / ratio).min(blocks);
+    RefeedCut {
+        keep_blocks,
+        tokens: held - keep_blocks * ratio,
+    }
+}
+
 pub fn score_bound_for(
     page_cols: usize,
     page_chunks: impl FnOnce() -> Result<usize>,
@@ -1049,6 +1074,29 @@ impl IndexCache {
             .iter()
             .find(|p| p.base < pos && pos < p.base + p.tokens)
             .map_or(pos, |p| p.base)
+    }
+
+    /// The live tail's last tokens a re-feed may forward again
+    /// (`docs/reprojection_refeed.md` §2): [`refeed_cut`] over this cache's
+    /// completed blocks and open rows.
+    pub fn refeed_cut(&self, ratio: usize, max: usize) -> RefeedCut {
+        refeed_cut(self.n_blocks, self.n_open, ratio, max)
+    }
+
+    /// Drop the live tail back to its first `keep_blocks` completed blocks — the
+    /// rows a re-feed writes again ([`Self::refeed_cut`]). The keys above are
+    /// dead rows and the open block's are overwritten by the next append, so
+    /// nothing is erased. Never reaches a page: a page is closed and stays.
+    pub fn rewind_live(&mut self, keep_blocks: usize) -> Result<()> {
+        if keep_blocks > self.n_blocks {
+            candle::bail!(
+                "qsa index: a rewind to {keep_blocks} live block(s) of {} would grow the tail",
+                self.n_blocks
+            );
+        }
+        self.n_blocks = keep_blocks;
+        self.n_open = 0;
+        Ok(())
     }
 
     /// Cut the cache back to position `pos`: keep the injected pages that end at
@@ -3059,6 +3107,60 @@ mod tests {
                 None
             }
         }
+    }
+
+    /// **A re-feed rewinds back to the newest block boundary within 8 tokens**:
+    /// 10 blocks and 2 open rows (42 tokens) keep 9 blocks and re-feed 6; 10
+    /// whole blocks keep 8 and re-feed 8; a tail of 5 tokens re-feeds all 5.
+    #[test]
+    fn a_refeed_rewinds_to_the_newest_block_boundary_within_its_reach() {
+        let cut = |blocks, open| refeed_cut(blocks, open, 4, 8);
+        assert_eq!(
+            cut(10, 2),
+            RefeedCut {
+                keep_blocks: 9,
+                tokens: 6
+            }
+        );
+        assert_eq!(
+            cut(10, 0),
+            RefeedCut {
+                keep_blocks: 8,
+                tokens: 8
+            }
+        );
+        assert_eq!(
+            cut(1, 1),
+            RefeedCut {
+                keep_blocks: 0,
+                tokens: 5
+            }
+        );
+        assert_eq!(
+            cut(0, 0),
+            RefeedCut {
+                keep_blocks: 0,
+                tokens: 0
+            }
+        );
+        // Every cut of a long tail re-feeds 5..=8 tokens: whole blocks only.
+        for open in 0..4 {
+            let c = cut(20, open);
+            assert!((5..=8).contains(&c.tokens), "{open} open: {c:?}");
+            assert_eq!(c.keep_blocks * 4 + c.tokens, 80 + open);
+        }
+    }
+
+    /// **A rewound tail keeps its first blocks and no open rows**, and refuses
+    /// to grow.
+    #[test]
+    fn a_rewound_tail_keeps_its_first_blocks() {
+        let mut c = IndexCache::new(8, &Device::Cpu).unwrap();
+        c.n_blocks = 5;
+        c.n_open = 3;
+        c.rewind_live(3).unwrap();
+        assert_eq!((c.n_blocks, c.n_open, c.len(4)), (3, 0, 12));
+        assert!(c.rewind_live(4).is_err());
     }
 
     /// **A fresh 128K turn's deepest chunk prices its cuBLAS scoring as one

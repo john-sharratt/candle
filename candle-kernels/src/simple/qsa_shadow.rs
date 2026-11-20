@@ -1,10 +1,11 @@
 //! FFI binding for the shadow scan (`simple/qsa_shadow.cu`).
 //!
 //! `run_qsa_shadow` scores each due sequence's kept queries against its
-//! unloaded pooled rows, in windows seated behind each query, and counts a row
-//! that is in its window's top `keep` and above the query's cut into the
+//! unloaded pooled rows as one context seated behind each query, and counts a
+//! row that is in the context's top `keep` and above the query's cut into the
 //! round's counter — one launch over every due sequence, each named by one
-//! [`ShadowSpan`] of a device table (`docs/hit_driven_projection.md` §6.3).
+//! [`ShadowSpan`] of a device table (`docs/hit_driven_projection.md` §6.3,
+//! `docs/reprojection_refeed.md` §2.3).
 //!
 //! The table is one upload: the spans, then every span's page descriptors
 //! (`SHADOW_PAGE_WORDS` i64 each), then every span's row prefixes, which a
@@ -35,8 +36,11 @@ pub struct ShadowSpan {
     pub row_map: *const u32,
     /// Device counters: hits, queries, shadow queries, publish sequence.
     pub counters: *mut u32,
-    /// Device factored RoPE table of the sequence's rung.
+    /// Device factored RoPE table of the rung covering the context's seats.
     pub tab: *const f32,
+    /// Device factored RoPE table the kept queries were rotated on: the
+    /// sequence's rung.
+    pub q_tab: *const f32,
     /// Words from the table's start to this span's page descriptors. Even, so
     /// the i64 descriptors are aligned.
     pub pages_off: u32,
@@ -53,10 +57,10 @@ pub struct ShadowSpan {
 }
 
 /// Words one [`ShadowSpan`] is uploaded as.
-pub const SHADOW_SPAN_WORDS: usize = 16;
+pub const SHADOW_SPAN_WORDS: usize = 18;
 
 impl ShadowSpan {
-    /// The span as the kernel reads it: four pointers as low and high halves,
+    /// The span as the kernel reads it: five pointers as low and high halves,
     /// then the eight counts and offsets — what a table of spans is uploaded
     /// as.
     pub fn words(&self) -> [u32; SHADOW_SPAN_WORDS] {
@@ -65,13 +69,14 @@ impl ShadowSpan {
             self.row_map as u64,
             self.counters as u64,
             self.tab as u64,
+            self.q_tab as u64,
         ];
         let mut w = [0u32; SHADOW_SPAN_WORDS];
         for (i, v) in p.iter().enumerate() {
             w[2 * i] = *v as u32;
             w[2 * i + 1] = (*v >> 32) as u32;
         }
-        w[8..].copy_from_slice(&[
+        w[10..].copy_from_slice(&[
             self.pages_off,
             self.first_off,
             self.n_rows,
@@ -87,13 +92,11 @@ impl ShadowSpan {
 
 extern "C" {
     /// `spans` is device memory holding `n_spans` [`ShadowSpan`] and the
-    /// descriptors and prefixes they name; `max_windows` the most windows any
-    /// kept query cuts its rows into.
+    /// descriptors and prefixes they name.
     #[allow(clippy::too_many_arguments)]
     pub fn run_qsa_shadow(
         spans: *const c_void,
         n_spans: i32,
-        max_windows: i32,
         heads: i32,
         head_dim: i32,
         pairs: i32,
@@ -118,6 +121,7 @@ mod tests {
             row_map: 0x3000_0000_4000 as *const u32,
             counters: 0x5000_0000_6000 as *mut u32,
             tab: 0x7000_0000_8000 as *const f32,
+            q_tab: 0x9000_0000_a000 as *const f32,
             pages_off: 16,
             first_off: 40,
             n_rows: 1,
@@ -127,15 +131,15 @@ mod tests {
             mask_hi: 5,
             pad: 0,
         };
-        // SAFETY: `ShadowSpan` is `repr(C)`, 64 bytes, with no padding.
+        // SAFETY: `ShadowSpan` is `repr(C)`, 72 bytes, with no padding.
         let bytes: [u8; SHADOW_SPAN_WORDS * 4] = unsafe { std::mem::transmute_copy(&span) };
         let from_words: Vec<u8> = span.words().iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(bytes.to_vec(), from_words);
         assert_eq!(
             span.words(),
             [
-                0x2000, 0x1000, 0x4000, 0x3000, 0x6000, 0x5000, 0x8000, 0x7000, 16, 40, 1, 2, 3, 4,
-                5, 0
+                0x2000, 0x1000, 0x4000, 0x3000, 0x6000, 0x5000, 0x8000, 0x7000, 0xa000, 0x9000, 16,
+                40, 1, 2, 3, 4, 5, 0
             ]
         );
     }

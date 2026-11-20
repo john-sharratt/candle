@@ -1065,6 +1065,66 @@ impl Qwen4ExpBatched {
         Ok(closed)
     }
 
+    /// How many of `seq`'s last tokens a re-feed forwards again, at most `max`
+    /// (`docs/reprojection_refeed.md` §2): the live index tail's re-feed cut
+    /// ([`IndexCache::refeed_cut`]) — back to the newest block boundary within
+    /// `max` tokens, never past the tail's start, which is the newest closed
+    /// page. Every layer indexes one stream, so they agree; a disagreement is
+    /// refused. `max` for a sequence with no index.
+    pub fn refeed_span(&self, seq: usize, max: usize) -> Result<usize> {
+        let ratios = self.attention_ratios();
+        let map = self
+            .index
+            .read()
+            .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
+        let Some(caches) = map.get(&seq) else {
+            return Ok(max);
+        };
+        let mut span: Option<usize> = None;
+        for (c, &ratio) in caches.iter().zip(ratios.iter()) {
+            if ratio == 0 {
+                continue;
+            }
+            let tokens = c.refeed_cut(ratio, max).tokens;
+            match span {
+                None => span = Some(tokens),
+                Some(first) if first != tokens => candle::bail!(
+                    "qsa re-feed: one layer's live tail re-feeds {first} token(s) and another's \
+                     {tokens} — the layers have diverged"
+                ),
+                Some(_) => {}
+            }
+        }
+        Ok(span.unwrap_or(max))
+    }
+
+    /// Drop `seq`'s last `tokens` index rows on every attention layer — the
+    /// span [`Self::refeed_span`] chose, which the re-feed writes again. A span
+    /// that is not a re-feed cut of every layer's tail is refused.
+    pub fn rewind_positional_tail(&self, seq: usize, tokens: usize) -> Result<()> {
+        let ratios = self.attention_ratios();
+        let mut map = self
+            .index
+            .write()
+            .map_err(|_| candle::Error::Msg("qwen4exp: index lock poisoned".into()))?;
+        let Some(caches) = map.get_mut(&seq) else {
+            return Ok(());
+        };
+        for (c, &ratio) in caches.iter_mut().zip(ratios.iter()) {
+            // A layer with no indexer keeps one row a token.
+            let cut = c.refeed_cut(ratio.max(1), tokens);
+            if cut.tokens != tokens {
+                candle::bail!(
+                    "qsa re-feed: a rewind of {tokens} token(s) is not a cut of this layer's live \
+                     tail, which re-feeds {}",
+                    cut.tokens
+                );
+            }
+            c.rewind_live(cut.keep_blocks)?;
+        }
+        Ok(())
+    }
+
     /// The page covering `seq`'s tokens from `start_pos` onward.
     ///
     /// **Taken on a fork, because this slot keeps decoding.** A section is
@@ -3164,6 +3224,14 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
 
     fn close_positional_page(&self, seq: usize) -> Result<usize> {
         Qwen4ExpBatched::close_positional_page(self, seq)
+    }
+
+    fn refeed_span(&self, seq: usize, max: usize) -> Result<usize> {
+        Qwen4ExpBatched::refeed_span(self, seq, max)
+    }
+
+    fn rewind_positional_tail(&self, seq: usize, tokens: usize) -> Result<()> {
+        Qwen4ExpBatched::rewind_positional_tail(self, seq, tokens)
     }
 
     fn positional_coverage(&self, seq: usize) -> Option<usize> {
