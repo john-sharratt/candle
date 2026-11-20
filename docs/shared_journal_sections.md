@@ -179,6 +179,16 @@ The warmer looks every minute and seals a run only when its text moved: it
 keeps each scope's and hour's run by a digest of its sections' names, texts and
 sharing.
 
+**A scope's seal runs in a task of its own** (`prewarm::seal_scope`), holding
+the scope's lease until it ends, and a pass leaves a scope that is still
+sealing. A run is given until its hour is over to seal (`prewarm::seal_wait`):
+at `Low` band on a busy card a section waits many minutes for admission, and a
+run given two minutes on WhiteWorld (2026-11-20) was given up and started
+again every pass and never sealed. A run given up is removed, and its sections'
+prefills still waiting for admission are withdrawn with it
+(`Scheduler::withdraw_queued_section`): left queued, each attempt added another,
+and 25 abandoned copies of one 3-token section sealed together.
+
 ### 7.3 One producer
 
 Only the member holding the `prewarm/<scope>` lease seals a scope's run, and
@@ -197,8 +207,8 @@ the opening; the run is its sections up to the first that is the conversation's
 own. Owners come from the conversations the substrate holds at start and from
 every journal carried since, for a day after the last.
 
-The sweep runs only after a pass that sealed or found every due run, so the
-current set it spares is whole. It retires by ending the generation
+The sweep runs only after a pass that found every due run sealed, with none
+still sealing, so the current set it spares is whole. It retires by ending the generation
 (`retire_section_generation`), which leaves a resident copy serving.
 
 ## 8. Tests

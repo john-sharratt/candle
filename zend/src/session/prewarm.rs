@@ -47,9 +47,6 @@ const HOUR_MS: u64 = 3_600_000;
 /// How long a sealed run is given to become durable before it is let go.
 const DURABLE_WAIT: Duration = Duration::from_secs(60);
 
-/// How long a run is given to seal.
-const SEAL_WAIT: Duration = Duration::from_secs(120);
-
 /// The thread a scope's run is sealed for: one no conversation is in, so it
 /// carries no thread journal and no memory, as a new thread does not.
 const FRESH_THREAD: &str = "~prewarm";
@@ -107,12 +104,26 @@ fn hour_of(at_ms: u64) -> u64 {
     at_ms / HOUR_MS
 }
 
+/// How long a run dated `at_ms` is given to seal, from `now_ms`: until its hour
+/// is over, when it is no new conversation's any more.
+///
+/// The run is sealed at the background band, and on a busy card a section
+/// there waits many minutes for admission: given two minutes, the run on
+/// WhiteWorld (2026-11-20) was given up and started again every pass and never
+/// sealed, while its 3-token head waited 1,102 s once.
+pub(super) fn seal_wait(at_ms: u64, now_ms: u64) -> Duration {
+    Duration::from_millis(((hour_of(at_ms) + 1) * HOUR_MS).saturating_sub(now_ms))
+}
+
 /// What the warmer knows: the scopes conversations carried a journal in, and
 /// for each scope and hour the run it sealed and the streams it left.
 #[derive(Default)]
 pub(super) struct Prewarm {
     seen: Mutex<HashMap<Scope, Instant>>,
     sealed: Mutex<HashMap<(Scope, u64), Sealed>>,
+    /// The scopes whose runs are sealing now, each in a task of its own that
+    /// holds the scope's lease: a pass leaves them to it.
+    sealing: Mutex<HashSet<Scope>>,
 }
 
 /// One run the warmer sealed: what it was made of, and its streams.
@@ -164,6 +175,21 @@ impl Prewarm {
 
     fn record(&self, scope: Scope, hour: u64, sealed: Sealed) {
         self.sealed.lock().unwrap().insert((scope, hour), sealed);
+    }
+
+    /// Whether `scope`'s runs are sealing now.
+    fn is_sealing(&self, scope: &Scope) -> bool {
+        self.sealing.lock().unwrap().contains(scope)
+    }
+
+    /// `scope`'s runs start sealing.
+    fn begin_sealing(&self, scope: Scope) {
+        self.sealing.lock().unwrap().insert(scope);
+    }
+
+    /// `scope`'s runs are sealed, or given up.
+    fn end_sealing(&self, scope: &Scope) {
+        self.sealing.lock().unwrap().remove(scope);
     }
 
     /// Forget the runs of hours before `hour`: their streams are the sweep's.
@@ -237,16 +263,33 @@ pub(super) async fn run(state: Weak<InferenceState>) {
     }
 }
 
-/// One pass: seal every due scope's run that moved, then retire what no run
-/// holds.
+/// One run to seal: when it is dated, what it is made of, and its digest.
+struct Due {
+    at_ms: u64,
+    sections: Vec<Section>,
+    sharing: Vec<Sharing>,
+    digest: u64,
+}
+
+/// One pass: start sealing every due scope's runs that moved, then retire what
+/// no run holds.
+///
+/// **A scope's seal runs in a task of its own**, holding the scope's lease
+/// until it is done, and a pass leaves a scope that is still sealing. A seal
+/// in the pass itself held the whole loop for as long as it waited, and gave
+/// the run up at a deadline only to start it again on the next pass.
 async fn pass(state: &Arc<InferenceState>) {
     let now = now_ms();
     state.prewarm.forget_before(hour_of(now));
     let mut complete = true;
     for scope in state.prewarm.due(Instant::now()) {
+        if state.prewarm.is_sealing(&scope) {
+            complete = false;
+            continue;
+        }
         let key = scope.key();
         let lease = tokio::task::spawn_blocking(move || share_prewarm(&key)).await;
-        let _guard = match lease {
+        let guard = match lease {
             Ok(Share::Mine(guard)) => guard,
             Ok(Share::Theirs) => continue,
             Err(e) => {
@@ -255,35 +298,35 @@ async fn pass(state: &Arc<InferenceState>) {
                 continue;
             }
         };
-        for at_ms in warm_times(now) {
-            let (sections, sharing) = run_of(state, &scope, at_ms);
-            if sections.is_empty() {
-                continue;
-            }
-            let digest = digest(&sections, &sharing);
-            if state.prewarm.is_sealed(&scope, hour_of(at_ms), digest) {
-                continue;
-            }
-            let started = Instant::now();
-            match seal_run(state, &sections, &sharing).await {
-                Ok(streams) => {
-                    tracing::info!(
-                        scope = %scope.key(),
-                        hour = hour_of(at_ms),
-                        sections = sections.len(),
-                        took_ms = started.elapsed().as_millis() as u64,
-                        "shared journal run sealed ahead"
-                    );
-                    state
-                        .prewarm
-                        .record(scope.clone(), hour_of(at_ms), Sealed { digest, streams });
+        let due: Vec<Due> = warm_times(now)
+            .into_iter()
+            .filter_map(|at_ms| {
+                let (sections, sharing) = run_of(state, &scope, at_ms);
+                if sections.is_empty() {
+                    return None;
                 }
-                Err(e) => {
-                    tracing::warn!(scope = %scope.key(), "a shared journal run did not seal: {e}");
-                    complete = false;
-                }
-            }
+                let digest = digest(&sections, &sharing);
+                (!state.prewarm.is_sealed(&scope, hour_of(at_ms), digest)).then_some(Due {
+                    at_ms,
+                    sections,
+                    sharing,
+                    digest,
+                })
+            })
+            .collect();
+        if due.is_empty() {
+            continue;
         }
+        // Its runs are not recorded until they seal, so this pass does not
+        // know every current run.
+        complete = false;
+        state.prewarm.begin_sealing(scope.clone());
+        let sealing = Arc::clone(state);
+        tokio::spawn(async move {
+            let _guard = guard;
+            seal_scope(&sealing, &scope, due).await;
+            sealing.prewarm.end_sealing(&scope);
+        });
     }
     // Only a pass that knows every current run may say what none holds. On
     // the blocking pool: its lease waits for the vote.
@@ -295,12 +338,44 @@ async fn pass(state: &Arc<InferenceState>) {
     }
 }
 
-/// Seal `sections` as a new conversation would, wait until they are durable,
-/// and let go of them. The streams they sealed under.
+/// Seal `scope`'s due runs one after another, each given until its hour is over.
+async fn seal_scope(state: &Arc<InferenceState>, scope: &Scope, due: Vec<Due>) {
+    for run in due {
+        let started = Instant::now();
+        let wait = seal_wait(run.at_ms, now_ms());
+        match seal_run(state, &run.sections, &run.sharing, wait).await {
+            Ok(streams) => {
+                tracing::info!(
+                    scope = %scope.key(),
+                    hour = hour_of(run.at_ms),
+                    sections = run.sections.len(),
+                    took_ms = started.elapsed().as_millis() as u64,
+                    "shared journal run sealed ahead"
+                );
+                state.prewarm.record(
+                    scope.clone(),
+                    hour_of(run.at_ms),
+                    Sealed {
+                        digest: run.digest,
+                        streams,
+                    },
+                );
+            }
+            Err(e) => {
+                tracing::warn!(scope = %scope.key(), "a shared journal run did not seal: {e}");
+            }
+        }
+    }
+}
+
+/// Seal `sections` as a new conversation would, giving them `wait` to seal,
+/// wait until they are durable, and let go of them. The streams they sealed
+/// under.
 async fn seal_run(
     state: &Arc<InferenceState>,
     sections: &[Section],
     sharing: &[Sharing],
+    wait: Duration,
 ) -> anyhow::Result<Vec<StreamId>> {
     let forking = Arc::clone(state);
     let mut seq: Sequence =
@@ -326,7 +401,7 @@ async fn seal_run(
             &wants,
             Linking::Chain,
             &[],
-            Some(SEAL_WAIT),
+            Some(wait),
             tokio::time::sleep,
         )
         .await;
@@ -437,6 +512,35 @@ mod tests {
             warm_times(hour + HOUR_MS - 1),
             vec![hour + HOUR_MS - 1, hour + HOUR_MS]
         );
+    }
+
+    /// **A run is given until its hour is over to seal**: the rest of this
+    /// hour for this hour's run, the whole of the next for the next hour's.
+    #[test]
+    fn a_run_is_given_until_its_hour_is_over() {
+        let hour = 490_000 * HOUR_MS;
+        assert_eq!(
+            seal_wait(hour + 10 * 60_000, hour + 10 * 60_000),
+            Duration::from_millis(50 * 60_000)
+        );
+        assert_eq!(
+            seal_wait(hour + HOUR_MS, hour + HOUR_MS - HOUR_LEAD_MS),
+            Duration::from_millis(HOUR_MS + HOUR_LEAD_MS)
+        );
+        assert_eq!(seal_wait(hour, hour + HOUR_MS + 1), Duration::ZERO);
+    }
+
+    /// **A scope sealing is left alone until its seal ends.**
+    #[test]
+    fn a_scope_is_sealing_until_its_seal_ends() {
+        let p = Prewarm::default();
+        let scope = Scope::Threadless;
+        assert!(!p.is_sealing(&scope));
+        p.begin_sealing(scope.clone());
+        assert!(p.is_sealing(&scope));
+        assert!(!p.is_sealing(&Scope::Owner("abc".into())));
+        p.end_sealing(&scope);
+        assert!(!p.is_sealing(&scope));
     }
 
     /// A scope is warm for a day after its last conversation, the threadless one

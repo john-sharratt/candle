@@ -500,11 +500,20 @@ impl SealJob {
         let starting = Instant::now();
         let start = self.start_state()?;
         let start_ms = millis(starting);
+        self.still_wanted()?;
         let slotting = Instant::now();
         let slot = alloc_scratch_slot_on(&self.scheduler_tx, &self.substrate)?;
         let slot_ms = millis(slotting);
+        if let Err(removed) = self.still_wanted() {
+            let _ = self
+                .scheduler_tx
+                .send(SchedulerRequest::FreeSequence { sequence_id: slot });
+            return Err(removed);
+        }
         let ingesting = Instant::now();
         let (tx, rx) = flume::bounded(1);
+        // Removed from here on, the section's retire withdraws this request
+        // from the scheduler's queue (`Scheduler::withdraw_queued_section`).
         let sent = self
             .scheduler_tx
             .send(SchedulerRequest::IngestSection {
@@ -541,6 +550,20 @@ impl SealJob {
             slot_ms,
             ingest_ms,
         })
+    }
+
+    /// `Ok` while the section has not been removed. A removed section's prefill
+    /// would seal what nobody holds, so it is not asked for: a caller that gives
+    /// a seal up and submits it again would otherwise queue a prefill each time
+    /// for the scheduler to run long after the section had gone.
+    fn still_wanted(&self) -> crate::Result<()> {
+        if self.settled.get() == SectionState::Removed {
+            return Err(ConversationError::Other(format!(
+                "section {:?} was removed before its prefill was asked for",
+                self.name
+            )));
+        }
+        Ok(())
     }
 
     /// The content hash of the sections this one seals against — the chain a
@@ -829,6 +852,8 @@ impl Sequence {
 mod tests {
     use super::*;
     use crate::projection::SelectionRule;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::Tokenizer;
 
     const YAML: &str = r#"
 system_prompt:
@@ -971,6 +996,33 @@ layers:
         let one = [sealed_with_end("journal/1", 1)];
         forget_passed_end_states(&one);
         assert!(one[0].end_state().is_some());
+    }
+
+    /// **A removed section asks for no prefill**; a pending one may.
+    #[test]
+    fn a_removed_section_is_no_longer_wanted() {
+        let (tx, _rx) = flume::unbounded();
+        let (base, _) = base_with_collection();
+        let settled = Settled::new();
+        let job = SealJob {
+            scheduler_tx: tx,
+            substrate: Conversation::new(),
+            tokenizer: Arc::new(Tokenizer::new(WordLevel::default())),
+            schema: base,
+            owner: TimelineId::for_test(1),
+            section: SectionId::new(0x8000_0001),
+            name: "journal/history".into(),
+            content: "x".into(),
+            prefix: Vec::new(),
+            after: Vec::new(),
+            band: DecodePriority::Low,
+            sharing: Sharing::Shared,
+            settled: Arc::clone(&settled),
+        };
+        assert!(job.still_wanted().is_ok());
+        settled.remove();
+        let refused = job.still_wanted().unwrap_err().to_string();
+        assert!(refused.contains("removed before its prefill"), "{refused}");
     }
 
     #[test]

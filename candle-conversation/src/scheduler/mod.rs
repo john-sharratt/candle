@@ -5565,6 +5565,7 @@ impl Scheduler {
                 // substrate's alone to let go: section ids are a schema's own,
                 // and a page is kept while another substrate holds the section.
                 for id in sections {
+                    self.withdraw_queued_section(&conversation, id);
                     let stream = conversation.read().section_stream(id);
                     conversation.retire_section(id);
                     if let Some(stream) = stream {
@@ -7335,6 +7336,36 @@ impl Scheduler {
             queued = self.prefill_queue.len(),
             "admission budget moved"
         );
+    }
+
+    /// Withdraw the ingest of `section` on `conversation`'s substrate still
+    /// waiting for admission: the section was retired — removed by its owner,
+    /// or replaced under its name — so its prefill would seal what nobody holds.
+    /// Answered with an error, so its seal thread stops waiting and frees its
+    /// scratch slot.
+    ///
+    /// Left in the queue, every resubmission of a section that could not be
+    /// admitted in time added another prefill behind it: on WhiteWorld
+    /// (2026-11-20) the journal pre-warmer gave its run up every two minutes
+    /// and 25 abandoned copies of one 3-token section sealed together, the
+    /// oldest queued for over eighteen minutes.
+    fn withdraw_queued_section(&mut self, conversation: &Conversation, section: SectionId) {
+        let conversations = &self.slot_conversations;
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.section_queue)
+            .into_iter()
+            .partition(|s| {
+                s.section_id == section
+                    && conversations
+                        .get(&s.sequence_id)
+                        .is_some_and(|c| c.same_substrate(conversation))
+            });
+        self.section_queue = kept.into();
+        for s in gone {
+            let _ = s.response_tx.send(Err(ConversationError::Channel(format!(
+                "section ingest {} withdrawn: the section was retired before it was admitted",
+                s.debug_name
+            ))));
+        }
     }
 
     /// Purge every in-flight scheduling entry keyed by a slot id that is being
@@ -17675,6 +17706,35 @@ mod tests {
         assert!(sched.section_queue.is_empty());
         let answer = rx.try_recv().expect("the caller is answered");
         assert!(answer.is_err(), "with an error, not a seal");
+    }
+
+    /// **A retired section's queued ingest is withdrawn and answered**, on its
+    /// own substrate only: the same section id queued for another substrate
+    /// stays.
+    #[test]
+    fn a_retired_section_withdraws_its_queued_ingest() {
+        let mut sched = admission_scheduler();
+        let ours = Conversation::new();
+        let theirs = Conversation::new();
+        let (slot, rx) = ingest_section(&mut sched, 64);
+        sched.slot_conversations.insert(slot, ours.clone());
+        let (other, other_rx) = ingest_section(&mut sched, 64);
+        sched.slot_conversations.insert(other, theirs.clone());
+
+        assert!(sched.handle_request(SchedulerRequest::RetireSections {
+            conversation: ours,
+            sections: vec![SectionId::new(1)],
+        }));
+
+        let queued: Vec<SequenceId> = sched.section_queue.iter().map(|s| s.sequence_id).collect();
+        assert_eq!(
+            queued,
+            vec![other],
+            "only the retired substrate's ingest left"
+        );
+        let answer = rx.try_recv().expect("the caller is answered");
+        assert!(answer.is_err(), "with an error, not a seal");
+        assert!(other_rx.try_recv().is_err(), "the other is still waiting");
     }
 
     // —— view-creation tests —————————————————————————————————————————————————
