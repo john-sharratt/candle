@@ -58,6 +58,9 @@ dropped text resumed ("elevate_`elevate.rs`", "the `candle-kernels`arena_table.c
 you're asking about", "a reason why a reason why"). Two answers fall into a repetition loop,
 none in (f): t1's `fold_provenance_checked` a few hundred times, d1's reasoning on the journal
 tool names. The sampler's penalty counts forgot the dropped tokens; the recurrent state did not.
+(Run (h), without the re-decode, looped on t1's name list too
+(`dependency_battery_2026-11-20_h.md`): t1's loop is not the re-decode's alone; the broken
+names are — 8 answers here, 1 in (h).)
 
 **The answer files are placed as in (f), and the direct declines are the same.** d1's
 `recorded_reply.rs` leads the slot from t=69 and the reasoning still says it never saw the
