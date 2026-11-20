@@ -27,8 +27,9 @@ nodes:
     plural: false
     off: [ring-north]
     character: >
-      The one car serves every level from this corner, so a Maker with
-      somewhere to be waits on it here before anything else.
+      The one car serves every level from this corner. A Maker with
+      somewhere to be calls it here with `lift_use`, naming the level, and
+      rides it there.
 
   - id: command-room
     kind: work
