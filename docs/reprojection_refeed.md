@@ -147,6 +147,11 @@ tokens the model reads the placed files with are its own reasoning about the
 question. A first-token tool call likewise decodes on the opening's slot; no
 boundary fires inside its body.
 
+Measured against the boundary at the opening's end
+(`docs/results/dependency_battery_2026-11-20_d.md`): 53.8% against 52.8%, no
+measurable change, and still below the 62.2% of the question read again over
+its placed files.
+
 ### 2.5 Further back
 
 Every projection re-feeds at most 8 tokens. A re-feed that reaches back in
