@@ -69,7 +69,7 @@ pub enum Next {
 /// and a worker until it is closed or idle twelve hours, so a caller that
 /// loses its ids and opens a chat on every send is stopped here, told to close
 /// what it no longer needs.
-pub const MAX_CHATS: usize = 64;
+pub const MAX_CHATS: usize = 128;
 
 /// What a send is refused with while Zen answers on the chat `id`.
 pub fn still_answering(id: &str) -> String {
@@ -535,7 +535,7 @@ mod tests {
         assert_eq!(record::kept_count(&r, "p"), 1);
         assert_eq!(
             too_many(),
-            "You have 64 chats with Zen kept, the most there may be: go on with one by passing its \
+            "You have 128 chats with Zen kept, the most there may be: go on with one by passing its \
              id as `chat`, or close those you are done with (`zen_chat_close`). One left alone is \
              deleted twelve hours after its last message."
         );
