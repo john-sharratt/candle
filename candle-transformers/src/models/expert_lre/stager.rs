@@ -147,6 +147,19 @@ pub(crate) enum StagerMsg {
         source: ReadSource,
         opens_request: bool,
     },
+    /// The elastic tier appended a segment of `slots` to the resident region
+    /// (`docs/elastic_warm_tier.md` §5.3): free churn, and as many more
+    /// residents allowed.
+    Grown { slots: usize },
+    /// Give back the resident region's last `slots`: retire them, drain them,
+    /// and answer on `done` with how many left the book once none is in use.
+    Shrink {
+        slots: usize,
+        done: mpsc::Sender<usize>,
+    },
+    /// Look at a draining shrink again: the reclaim clock may have moved
+    /// without a routed row (`ReclaimClock::settled`).
+    Drain,
 }
 
 /// Where a reader's bytes come from.
@@ -256,8 +269,32 @@ struct Stager {
     active: Instant,
     /// Decode's host accesses, the resident set's policy input (`resident`).
     host: HostScores,
-    /// How many residents each layer may hold, around the startup fill's.
+    /// How many residents each layer may hold, around its startup share of the
+    /// resident capacity.
     bands: Bands,
+    /// Residents per layer as the startup fill left them: the shares the
+    /// bands keep as the capacity moves.
+    startup_counts: Vec<usize>,
+    /// A shrink draining its retiring slots, and where to say it is done.
+    shrinking: Option<mpsc::Sender<usize>>,
+    /// Something a draining shrink waits on may have moved: look again at the
+    /// end of the pass.
+    drain_due: bool,
+}
+
+/// Where a shrink giving back `slots` of a `len`-slot book begins: never
+/// inside the churn block's `churn` slots.
+fn retire_first(len: usize, churn: usize, slots: usize) -> usize {
+    len.saturating_sub(slots).max(churn)
+}
+
+/// Of `residents` — `(slot, score)` — the coldest ones past `capacity`: what
+/// a shrink unlabels so the churn slots it leaves can still take a row's cold
+/// set.
+fn excess_residents(mut residents: Vec<(usize, f32)>, capacity: usize) -> Vec<usize> {
+    let excess = residents.len().saturating_sub(capacity);
+    residents.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    residents.into_iter().take(excess).map(|r| r.0).collect()
 }
 
 /// The share of a layer's experts a row must route to count as wide
@@ -357,6 +394,9 @@ pub(crate) fn spawn_stager(
         active: Instant::now(),
         host,
         bands,
+        startup_counts,
+        shrinking: None,
+        drain_due: false,
     };
     std::thread::Builder::new()
         .name("expert-stager".into())
@@ -503,6 +543,10 @@ impl Stager {
                 progressed |= self.assign()?;
             }
             progressed |= self.serve_spec()?;
+            // Behind the demand row's reads, never ahead of them.
+            if std::mem::take(&mut self.drain_due) {
+                self.drain_shrink()?;
+            }
             let idle = self.routed.is_empty() && self.demand.is_none() && self.in_flight == 0;
             if idle && (self.spec.is_empty() || self.spec_stalled) {
                 if self.disconnected {
@@ -559,11 +603,22 @@ impl Stager {
     }
 
     fn handle(&mut self, m: StagerMsg) -> Result<()> {
-        // Any message can change what the speculative queue may take, and
-        // every one is inference running.
+        // The elastic tier's messages are not inference: they leave the
+        // cool-down where it is.
+        let m = match m {
+            StagerMsg::Grown { slots } => return self.grown(slots),
+            StagerMsg::Shrink { slots, done } => return self.shrink(slots, done),
+            StagerMsg::Drain => return self.drain_shrink(),
+            m => m,
+        };
+        // Any other message can change what the speculative queue may take,
+        // and every one is inference running.
         self.spec_stalled = false;
         self.active = Instant::now();
         match m {
+            StagerMsg::Grown { .. } | StagerMsg::Shrink { .. } | StagerMsg::Drain => {
+                unreachable!("the elastic tier's messages are handled above")
+            }
             StagerMsg::Routed {
                 row,
                 slot,
@@ -628,7 +683,116 @@ impl Stager {
                 if done {
                     self.demand = None;
                 }
+                if self.book.retiring().is_some_and(|first| slot >= first) {
+                    self.drain_due = true;
+                }
             }
+        }
+        Ok(())
+    }
+
+    /// The resident region grew by `slots` at its end: they join the book as
+    /// free churn, and the resident capacity rises by as many.
+    fn grown(&mut self, slots: usize) -> Result<()> {
+        self.book.grow(slots);
+        self.set_capacity(self.book.len() - self.ctx.pad.churn_slots());
+        Ok(())
+    }
+
+    /// Give back the resident region's last `slots`: the capacity drops first,
+    /// so no relabel promotes into them, then they retire and drain.
+    fn shrink(&mut self, slots: usize, done: mpsc::Sender<usize>) -> Result<()> {
+        if self.shrinking.is_some() {
+            // One shrink at a time; the controller waits for each answer.
+            let _ = done.send(0);
+            return Ok(());
+        }
+        let churn = self.ctx.pad.churn_slots();
+        let first = retire_first(self.book.len(), churn, slots);
+        let unlabelled = self.book.retire_from(first);
+        self.set_capacity(first - churn);
+        let residents: Vec<(usize, f32)> = self
+            .book
+            .held()
+            .filter(|h| h.3)
+            .map(|(slot, row, expert, _)| (slot, self.host.score(row, expert)))
+            .collect();
+        let excess = excess_residents(residents, self.ctx.resident_capacity);
+        {
+            let residency = self.ctx.residency.clone();
+            let places = residency
+                .lock()
+                .map_err(|_| candle::Error::Msg("expert stager: residency poisoned".into()))?;
+            let mut churned = unlabelled;
+            for slot in excess {
+                self.book.set_resident(slot, false);
+                if let PadSlot::Held(row, expert) = self.book.state(slot) {
+                    churned.push((row, expert));
+                }
+            }
+            // A resident no more: host-backed only if the warm tier also
+            // holds a pageable copy, as a demoted one is (`rebalance`).
+            for (row, expert) in churned {
+                self.ctx
+                    .host_backed
+                    .set(row, expert, places.place(row, expert).warm.is_some());
+            }
+        }
+        self.shrinking = Some(done);
+        self.drain_shrink()
+    }
+
+    /// The resident capacity is now `capacity`: the bands follow it, at each
+    /// layer's startup share.
+    fn set_capacity(&mut self, capacity: usize) {
+        self.ctx.resident_capacity = capacity;
+        self.bands = Bands::scaled(&self.startup_counts, capacity);
+        if let Ok(mut s) = self.ctx.stats.lock() {
+            s.resident_capacity = capacity;
+            s.pad_slots = self.book.len();
+        }
+    }
+
+    /// Evict what a draining shrink's retiring slots still hold, each once its
+    /// pins are released and its row has no invocation in flight — emptying
+    /// an entry under one is what `reclaim` forbids — and finish the shrink
+    /// once every one is empty. A slot whose expert another invocation may
+    /// still read waits for the next look: a routed row, a landing in a
+    /// retiring slot, or the controller's [`StagerMsg::Drain`].
+    fn drain_shrink(&mut self) -> Result<()> {
+        if self.shrinking.is_none() {
+            return Ok(());
+        }
+        let held = self.book.retiring_held();
+        let released = self.carries_done();
+        if !held.is_empty() || released > 0 {
+            let residency = self.ctx.residency.clone();
+            let mut r = residency
+                .lock()
+                .map_err(|_| candle::Error::Msg("expert stager: residency poisoned".into()))?;
+            for (_, pr, pe) in self.carry_pins.drain(..released) {
+                r.pin_pad(pr, pe, -1);
+            }
+            let clock = self.ctx.clock.clone();
+            for (slot, row, expert) in held {
+                if r.place(row, expert).pins != 0 || !clock.reclaimable(clock.begun(row)) {
+                    continue;
+                }
+                if self.evict(&mut r, slot, None) {
+                    self.book.set_retired(slot);
+                }
+            }
+        }
+        if !self.book.drained() {
+            return Ok(());
+        }
+        let gone = self.book.truncate();
+        if let Ok(mut s) = self.ctx.stats.lock() {
+            s.pad_slots = self.book.len();
+        }
+        if let Some(done) = self.shrinking.take() {
+            // A controller gone with the cache has nothing left to free.
+            let _ = done.send(gone);
         }
         Ok(())
     }
@@ -816,6 +980,9 @@ impl Stager {
         if !d.unassigned.is_empty() || !d.pending.is_empty() {
             self.demand = Some(d);
         }
+        // The clock has moved: a draining shrink may evict more, once this
+        // row's reads are out.
+        self.drain_due = self.shrinking.is_some();
         Ok(())
     }
 
@@ -832,12 +999,7 @@ impl Stager {
     /// landed: the pin count is kept per `(row, expert)`, not per slot, so it
     /// holds whichever pad slot the read lands in from the moment it does.
     fn pin_carries(&mut self, row: usize, ticket: u64, pooled: &[usize]) -> Result<()> {
-        let clock = &self.ctx.clock;
-        let done = self
-            .carry_pins
-            .iter()
-            .take_while(|&&(key, _, _)| clock.reclaimable(key))
-            .count();
+        let done = self.carries_done();
         if done == 0 && pooled.is_empty() {
             return Ok(());
         }
@@ -853,6 +1015,16 @@ impl Stager {
             self.carry_pins.push_back((ticket + 1, row, e));
         }
         Ok(())
+    }
+
+    /// How many of the oldest carry pins may go: every invocation up to each
+    /// one's key is done.
+    fn carries_done(&self) -> usize {
+        let clock = &self.ctx.clock;
+        self.carry_pins
+            .iter()
+            .take_while(|&&(key, _, _)| clock.reclaimable(key))
+            .count()
     }
 
     /// Queue a speculative read of `(row, expert)` unless one is queued; it may
@@ -1151,7 +1323,26 @@ impl Stager {
 
 #[cfg(test)]
 mod tests {
-    use super::{demand_left_behind, overwritable, wide_row};
+    use super::{demand_left_behind, excess_residents, overwritable, retire_first, wide_row};
+
+    /// A shrink retires the book's last slots, and never reaches into the
+    /// churn block.
+    #[test]
+    fn a_shrink_retires_the_last_slots_above_the_churn_block() {
+        assert_eq!(retire_first(1_000, 200, 300), 700);
+        assert_eq!(retire_first(1_000, 200, 900), 200, "the churn block stays");
+        assert_eq!(retire_first(1_000, 200, 0), 1_000, "nothing retired");
+    }
+
+    /// Residents past a lowered capacity are unlabelled coldest first, ties by
+    /// slot; none at or under it.
+    #[test]
+    fn residents_past_the_capacity_go_coldest_first() {
+        let residents = vec![(4, 2.0), (9, 0.5), (1, 0.5), (7, 3.0)];
+        assert_eq!(excess_residents(residents.clone(), 2), vec![1, 9]);
+        assert_eq!(excess_residents(residents.clone(), 3), vec![1]);
+        assert!(excess_residents(residents, 4).is_empty());
+    }
 
     /// A quarter of the layer routed is wide; less is not, and an empty layer
     /// never is.

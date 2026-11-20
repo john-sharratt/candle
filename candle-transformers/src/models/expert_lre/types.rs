@@ -123,8 +123,16 @@ pub struct PipelineStats {
     pub resident_promotions: usize,
     pub resident_demotions: usize,
     /// **Gauge**: how many pad slots may be resident — the warm tier's pinned
-    /// block.
+    /// segments.
     pub resident_capacity: usize,
+    /// **Gauge**: the elastic warm tier's pinned segments, and their bytes
+    /// (`docs/elastic_warm_tier.md` §6).
+    pub warm_segments: usize,
+    pub warm_pinned_bytes: u64,
+    /// Segments the elastic tier took while quiet, and gave back under
+    /// pressure.
+    pub warm_grown: usize,
+    pub warm_shrunk: usize,
     /// **Gauge**: residents per MoE layer, as of the last relabel.
     pub resident_rows: Vec<usize>,
     /// Of the read-ahead claims, those copied from the pad — staged ahead off

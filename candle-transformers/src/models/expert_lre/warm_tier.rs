@@ -1,4 +1,4 @@
-//! The expert warm tier: pinned slots first, pageable slots for the rest.
+//! The expert warm tier: pinned segments first, pageable slots for the rest.
 //!
 //! Pinned host memory is the fast source — an upload is a direct DMA — but the
 //! driver caps how much of the machine it will page-lock, and the cap is the
@@ -9,11 +9,13 @@
 //! upload from pageable memory, and the load died in the startup fill with
 //! `CUDA_ERROR_OUT_OF_MEMORY`.
 //!
-//! So the pinned part takes as much of the draw as the driver grants and then
-//! **proves** the driver still has [`DRIVER_LOCK_MARGIN`] to lock, giving
-//! slots back a step at a time until it does. The ceiling is measured on the
-//! machine it runs on rather than assumed from one; whatever the draw wants
-//! beyond it lives in ordinary pageable memory.
+//! So the pinned part takes as many segments of the draw as the driver grants
+//! (`elastic::region`), then **proves** the driver still has
+//! [`DRIVER_LOCK_MARGIN`] to lock, giving segments back until it does. The
+//! ceiling is measured on the machine it runs on rather than assumed from one;
+//! whatever the draw wants beyond it lives in ordinary pageable memory. Past
+//! the load, the pinned part is the elastic tier's to grow and shrink
+//! (`docs/elastic_warm_tier.md`): its segments are the pad's resident region.
 //!
 //! A pageable slot is never handed to the driver as an upload source: every
 //! upload from one goes through the pinned cold-staging ring first
@@ -23,15 +25,19 @@
 //! PCIe 5.0 upload it gates, and more threads only slow it — which is why the
 //! pinned part is as large as the driver allows.
 //!
-//! Slot `i` is membership entry `i`: slots `0..pinned` are pinned, the rest
-//! pageable. Both are cut to the pack's stride and sector-aligned, so the
-//! startup fill's direct reads land in either with nothing in between.
+//! Slot `i` is membership entry `i`: slots `0..pinned_slots()` — the startup
+//! draw's pinned part, fixed for the process — are pinned, the rest pageable.
+//! Both are cut to the pack's stride and sector-aligned, so the startup fill's
+//! direct reads land in either with nothing in between.
 
-use super::page_pressure::PAGE_PRESSURE_BYTES;
-use super::pinned::{step_down, WarmPool};
-use candle::direct_io::DIRECT_IO_SECTOR;
-use candle::vram::PinnedUse;
 use std::alloc::{alloc, dealloc, Layout};
+use std::sync::Arc;
+
+use candle::direct_io::DIRECT_IO_SECTOR;
+use candle::quantized::pinned_ranges::PinnedRangeTable;
+
+use super::elastic::region::ResidentRegion;
+use super::page_pressure::{press, PAGE_PRESSURE_BYTES};
 
 /// Page-locked host memory the driver must still be able to grant once the
 /// pinned part is sized: an upload from pageable memory, the embedding shadow,
@@ -79,7 +85,7 @@ pub(crate) fn addressable_pinned_slots(room: Option<u64>, slot_size: usize, want
 
 /// Whether the driver will still page-lock [`DRIVER_LOCK_MARGIN`] right now:
 /// one allocation of that size, freed at once.
-fn driver_lock_margin_free() -> bool {
+pub(crate) fn driver_lock_margin_free() -> bool {
     use cudarc::driver::sys::{cuMemAllocHost_v2, cuMemFreeHost, CUresult};
     let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
     // SAFETY: a plain host allocation, freed before returning and never read.
@@ -92,17 +98,7 @@ fn driver_lock_margin_free() -> bool {
     true
 }
 
-/// Replace `pool` with one of `slots`, releasing the old pages first: holding
-/// both at once would need the very pages the margin probe asks for.
-fn retake(pool: &mut WarmPool, slots: usize, slot_size: usize) {
-    drop(std::mem::replace(
-        pool,
-        WarmPool::empty(PinnedUse::WeightWarmTier),
-    ));
-    *pool = WarmPool::new(slots, slot_size, PinnedUse::WeightWarmTier);
-}
-
-/// The largest slot count at or below `held` for which `keeps_margin` holds,
+/// The largest count at or below `held` for which `keeps_margin` holds,
 /// stepping down by `step` — `0` when none does.
 fn largest_keeping_margin(
     mut held: usize,
@@ -186,73 +182,104 @@ unsafe impl Send for PagedSlots {}
 unsafe impl Sync for PagedSlots {}
 
 pub(crate) struct WarmTier {
-    pinned: WarmPool,
+    /// The pinned segments — after the fill, the pad's resident region.
+    pinned: Arc<ResidentRegion>,
+    /// Pinned slots the startup draw took: the membership index the pageable
+    /// part starts at, fixed whatever the region does after.
+    startup_pinned: usize,
     paged: PagedSlots,
 }
 
 impl WarmTier {
-    /// A tier of `want_slots` stride-sized slots: as many pinned as the driver
+    /// A tier of `want_slots` stride-sized slots: as many pinned, in whole
+    /// segments of `per` slots whose ranges go in `ranges`, as the driver
     /// grants while still leaving it [`DRIVER_LOCK_MARGIN`] to lock and the
     /// device [`ADDRESSABLE_MARGIN`] of `addressable_room` to address, the rest
-    /// pageable.
-    pub(crate) fn new(want_slots: usize, slot_size: usize, addressable_room: Option<u64>) -> Self {
+    /// pageable. `per` is fixed for the process — the elastic tier grows and
+    /// shrinks by it — so it is the model's, not this moment's
+    /// (`segment_slots` of the evictable experts, `elastic::region`).
+    pub(crate) fn new(
+        want_slots: usize,
+        slot_size: usize,
+        per: usize,
+        addressable_room: Option<u64>,
+        ranges: Arc<PinnedRangeTable>,
+    ) -> Self {
         let want_pinned = addressable_pinned_slots(addressable_room, slot_size, want_slots);
-        let mut pinned = WarmPool::new(want_pinned, slot_size, PinnedUse::WeightWarmTier);
-        // Each probe that fails gives back one step and re-takes the smaller
-        // pool: one pool at a time, since holding both would need the pages the
-        // margin is asking for.
-        let keep = largest_keeping_margin(
-            pinned.num_slots(),
-            |held| step_down(held, slot_size),
+        let region = Arc::new(ResidentRegion::new(slot_size, per, ranges));
+        let per = region.per_segment();
+        // Whole segments, as many as the draw wants and the driver grants. A
+        // refusal is pressed past once — the pages may be other processes'
+        // idle ones — and a second refusal is the answer.
+        let mut pressed = false;
+        while region.slots() + per <= want_pinned {
+            if region.grow() {
+                continue;
+            }
+            if pressed || !press(PAGE_PRESSURE_BYTES) {
+                break;
+            }
+            pressed = true;
+        }
+        let kept = largest_keeping_margin(
+            region.segments(),
+            |held| held - 1,
             |held| {
-                if held != pinned.num_slots() {
-                    retake(&mut pinned, held, slot_size);
+                while region.segments() > held {
+                    region.pop();
                 }
-                pinned.num_slots() == held && driver_lock_margin_free()
+                driver_lock_margin_free()
             },
         );
-        if keep != pinned.num_slots() {
-            retake(&mut pinned, keep, slot_size);
+        while region.segments() > kept {
+            region.pop();
         }
-        let paged = PagedSlots::new(want_slots.saturating_sub(pinned.num_slots()), slot_size);
+        let startup_pinned = region.slots();
+        let paged = PagedSlots::new(want_slots.saturating_sub(startup_pinned), slot_size);
         tracing::info!(
             target: "candle_transformers::expert_lre",
-            pinned = pinned.num_slots(),
+            pinned = startup_pinned,
+            segments = region.segments(),
             paged = paged.num_slots,
-            pinned_gib = (pinned.num_slots() * slot_size) as f64 / (1u64 << 30) as f64,
+            pinned_gib = (startup_pinned * slot_size) as f64 / (1u64 << 30) as f64,
             paged_gib = (paged.num_slots * slot_size) as f64 / (1u64 << 30) as f64,
-            pressure_gib = PAGE_PRESSURE_BYTES as f64 / (1u64 << 30) as f64,
-            "warm tier: pinned part, then pageable for the rest"
+            pressed,
+            "warm tier: pinned segments, then pageable for the rest"
         );
-        Self { pinned, paged }
+        Self {
+            pinned: region,
+            startup_pinned,
+            paged,
+        }
     }
 
     pub(crate) fn num_slots(&self) -> usize {
-        self.pinned.num_slots() + self.paged.num_slots
+        self.startup_pinned + self.paged.num_slots
     }
 
     pub(crate) fn paged_slots(&self) -> usize {
         self.paged.num_slots
     }
 
-    /// Whether slot `i` is page-locked, and so a valid direct upload source.
+    /// Whether membership slot `i` is pinned, and so a valid direct upload
+    /// source.
     pub(crate) fn is_pinned(&self, i: usize) -> bool {
-        i < self.pinned.num_slots()
+        i < self.startup_pinned
     }
 
-    /// The pinned part's addresses, `[lo, hi)`.
-    pub(crate) fn pinned_range(&self) -> (u64, u64) {
-        self.pinned.range()
+    /// The pinned segments, for the pad and the elastic controller.
+    pub(crate) fn region(&self) -> &Arc<ResidentRegion> {
+        &self.pinned
     }
 
-    /// Slots in the pinned part: `0..pinned_slots()`. Once the startup fill
-    /// has written them they are the pad's resident region (`pad.rs`).
+    /// Slots the startup draw pinned: `0..pinned_slots()`. Once the startup
+    /// fill has written them they are the pad's resident region (`pad.rs`).
     pub(crate) fn pinned_slots(&self) -> usize {
-        self.pinned.num_slots()
+        self.startup_pinned
     }
 
     pub(crate) fn slot_ref(&self, i: usize, len: usize) -> &[u8] {
-        match i.checked_sub(self.pinned.num_slots()) {
+        match i.checked_sub(self.startup_pinned) {
             None => self.pinned.slot_ref(i, len),
             Some(p) => self.paged.slot(p, len),
         }
@@ -261,16 +288,16 @@ impl WarmTier {
     /// The first `n` slots as separate stride-long slices, for one batched
     /// fill across both parts.
     pub(crate) fn slots_mut(&mut self, n: usize, stride: usize) -> Vec<&mut [u8]> {
-        let pinned_n = n.min(self.pinned.num_slots());
+        let pinned_n = n.min(self.startup_pinned);
         let paged_n = n - pinned_n;
         assert!(
             paged_n <= self.paged.num_slots,
             "warm tier: {n} slots past the tier"
         );
-        let mut out: Vec<&mut [u8]> = self
-            .pinned
-            .span_mut(0, pinned_n)
-            .chunks_exact_mut(stride)
+        // SAFETY: the fill is the only writer, before the tier is shared, and
+        // each slot is handed out once.
+        let mut out: Vec<&mut [u8]> = (0..pinned_n)
+            .map(|r| unsafe { &mut self.pinned.slot_mut(r)[..stride] })
             .collect();
         if paged_n > 0 {
             // SAFETY: bounds checked above; one exclusive borrow of the block.
@@ -284,7 +311,7 @@ impl WarmTier {
 
     /// Bytes held, both parts.
     pub(crate) fn total_bytes(&self) -> usize {
-        self.pinned.total_bytes() + self.paged.num_slots * self.paged.slot_size
+        self.pinned.held_bytes() as usize + self.paged.num_slots * self.paged.slot_size
     }
 }
 
@@ -318,36 +345,34 @@ mod tests {
         assert_eq!(addressable_pinned_slots(None, 1 << 20, 100), 100);
     }
 
-    /// A pool the driver leaves its margin beside is kept whole.
+    /// A pinned part the driver leaves its margin beside is kept whole.
     #[test]
     fn a_pool_that_keeps_the_margin_is_kept() {
-        assert_eq!(largest_keeping_margin(10_496, |h| h - 37, |_| true), 10_496);
+        assert_eq!(largest_keeping_margin(14, |h| h - 1, |_| true), 14);
     }
 
-    /// A pool that leaves no margin steps down until one is left — the 31.5 GiB
-    /// box, whose driver ceiling sits a margin above the size that loads.
+    /// One that leaves no margin gives segments back until one is left — the
+    /// 31.5 GiB box, whose driver ceiling sits a margin above the size that
+    /// loads.
     #[test]
-    fn a_pool_without_the_margin_steps_down_to_one_that_keeps_it() {
+    fn a_pool_without_the_margin_gives_segments_back_until_it_keeps_it() {
         let mut probed = Vec::new();
         let kept = largest_keeping_margin(
-            100,
-            |h| h - 10,
+            10,
+            |h| h - 1,
             |h| {
                 probed.push(h);
-                h <= 75
+                h <= 7
             },
         );
-        assert_eq!(kept, 70);
-        assert_eq!(probed, vec![100, 90, 80, 70]);
+        assert_eq!(kept, 7);
+        assert_eq!(probed, vec![10, 9, 8, 7]);
     }
 
-    /// No size keeps the margin: nothing is pinned, and every draw slot is pageable.
+    /// No size keeping the margin pins nothing, and every draw slot is pageable.
     #[test]
     fn no_size_keeping_the_margin_pins_nothing() {
-        assert_eq!(
-            largest_keeping_margin(30, |h| h.saturating_sub(10), |_| false),
-            0
-        );
+        assert_eq!(largest_keeping_margin(3, |h| h - 1, |_| false), 0);
         assert_eq!(largest_keeping_margin(0, |h| h, |_| false), 0);
     }
 
@@ -368,6 +393,42 @@ mod tests {
         let p = PagedSlots::new(0, 8192);
         assert_eq!(p.num_slots, 0);
         assert!(p.layout.is_none());
+    }
+
+    /// **The pinned part is whole segments, the rest pageable**, and the
+    /// startup draw's pinned count is fixed whatever the region does after.
+    #[test]
+    fn the_pinned_part_is_whole_segments_and_the_startup_count_stays() -> candle::Result<()> {
+        let Ok(_dev) = candle::Device::new_cuda(0) else {
+            return Ok(());
+        };
+        let ranges = Arc::new(PinnedRangeTable::new()?);
+        let tier = WarmTier::new(13, 8192, 5, None, ranges.clone());
+        assert_eq!(tier.pinned_slots(), 10, "two whole segments");
+        assert_eq!(
+            tier.paged_slots(),
+            3,
+            "the part short of a segment is pageable"
+        );
+        assert_eq!(ranges.ranges().len(), 2);
+        let mut tier = WarmTier::new(10, 8192, 10, None, ranges.clone());
+        assert_eq!(tier.pinned_slots(), 10, "a small tier is one segment");
+        assert_eq!(tier.paged_slots(), 0);
+        assert_eq!(
+            ranges.ranges().len(),
+            3,
+            "the first tier's two, and this one's"
+        );
+        {
+            let mut slots = tier.slots_mut(10, 8192);
+            slots[9].fill(7);
+        }
+        assert_eq!(tier.slot_ref(9, 8192)[0], 7);
+        assert!(tier.region().grow());
+        assert_eq!(tier.pinned_slots(), 10, "the startup count is fixed");
+        assert_eq!(tier.region().slots(), 20);
+        assert!(tier.is_pinned(9) && !tier.is_pinned(10));
+        Ok(())
     }
 
     /// What staging one pageable slot costs on the host: one expert record copied into a

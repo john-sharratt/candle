@@ -37,8 +37,8 @@
 //! mispredicted one simply loses its protection.
 
 use super::cache::PREFILL_HIT_SCORE;
+use super::elastic::region::ResidentRegion;
 use super::pinned::WarmPool;
-use super::warm_tier::WarmTier;
 use candle::Result;
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -64,6 +64,10 @@ pub(crate) struct PadBook {
     free: Vec<usize>,
     scores: Vec<f32>,
     n_experts: usize,
+    /// Slots at and past this are retiring: the resident region is shrinking
+    /// to it (`docs/elastic_warm_tier.md` §5.3). Off the free list, never a
+    /// read's victim, drained by the stager.
+    retiring: Option<usize>,
 }
 
 /// Which held slots a victim search may return.
@@ -100,7 +104,96 @@ impl PadBook {
             resident,
             scores: vec![0.0; rows * n_experts],
             n_experts,
+            retiring: None,
         }
+    }
+
+    /// Slots in the book.
+    pub(crate) fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// `n` more slots at the end, free churn — the resident region grew a
+    /// segment. They come off the free list after every lower one.
+    pub(crate) fn grow(&mut self, n: usize) {
+        let first = self.slots.len();
+        self.slots.resize(first + n, PadSlot::Free);
+        self.fresh.resize(first + n, false);
+        self.resident.resize(first + n, false);
+        let mut free: Vec<usize> = (first..first + n).rev().collect();
+        free.append(&mut self.free);
+        self.free = free;
+    }
+
+    /// Retire every slot from `first` on: off the free list, unlabelled,
+    /// never a victim. Each held one is for the stager to evict
+    /// ([`Self::retiring_held`]), each loading one once it lands. Returns the
+    /// residents unlabelled, `(row, expert)`.
+    pub(crate) fn retire_from(&mut self, first: usize) -> Vec<(usize, usize)> {
+        self.retiring = Some(first);
+        self.free.retain(|&s| s < first);
+        let mut unlabelled = Vec::new();
+        for slot in first..self.slots.len() {
+            if std::mem::take(&mut self.resident[slot]) {
+                if let PadSlot::Held(row, expert) = self.slots[slot] {
+                    unlabelled.push((row, expert));
+                }
+            }
+        }
+        unlabelled
+    }
+
+    /// Where the retiring slots begin, while a shrink is draining.
+    pub(crate) fn retiring(&self) -> Option<usize> {
+        self.retiring
+    }
+
+    fn is_retiring(&self, slot: usize) -> bool {
+        self.retiring.is_some_and(|first| slot >= first)
+    }
+
+    /// The retiring slots that still hold an expert, `(slot, row, expert)`.
+    pub(crate) fn retiring_held(&self) -> Vec<(usize, usize, usize)> {
+        let Some(first) = self.retiring else {
+            return Vec::new();
+        };
+        (first..self.slots.len())
+            .filter_map(|s| match self.slots[s] {
+                PadSlot::Held(row, expert) => Some((s, row, expert)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A retiring slot's expert was evicted: it is empty, and stays off the
+    /// free list.
+    pub(crate) fn set_retired(&mut self, slot: usize) {
+        debug_assert!(self.is_retiring(slot));
+        self.slots[slot] = PadSlot::Free;
+        self.fresh[slot] = false;
+    }
+
+    /// Whether every retiring slot is empty: the shrink may finish.
+    pub(crate) fn drained(&self) -> bool {
+        self.retiring
+            .is_some_and(|first| self.slots[first..].iter().all(|s| *s == PadSlot::Free))
+    }
+
+    /// Finish a drained shrink: the retiring slots leave the book. Returns how
+    /// many.
+    pub(crate) fn truncate(&mut self) -> usize {
+        let Some(first) = self.retiring.take() else {
+            return 0;
+        };
+        assert!(
+            self.slots[first..].iter().all(|s| *s == PadSlot::Free),
+            "pad: a shrink finished with a slot still in use"
+        );
+        let gone = self.slots.len() - first;
+        self.slots.truncate(first);
+        self.fresh.truncate(first);
+        self.resident.truncate(first);
+        gone
     }
 
     #[cfg(test)]
@@ -113,11 +206,13 @@ impl PadBook {
         self.resident[slot] = resident;
     }
 
-    /// The held slots, `(slot, row, expert, resident)`.
+    /// The held slots outside a retiring range, `(slot, row, expert,
+    /// resident)` — what the resident relabel chooses among.
     pub(crate) fn held(&self) -> impl Iterator<Item = (usize, usize, usize, bool)> + '_ {
         self.slots
             .iter()
             .enumerate()
+            .filter(|&(slot, _)| !self.is_retiring(slot))
             .filter_map(|(slot, s)| match *s {
                 PadSlot::Held(row, expert) => Some((slot, row, expert, self.resident[slot])),
                 _ => None,
@@ -217,7 +312,7 @@ impl PadBook {
             .iter()
             .enumerate()
             .filter_map(|(slot, s)| match *s {
-                PadSlot::Held(row, expert) if !self.resident[slot] => {
+                PadSlot::Held(row, expert) if !self.resident[slot] && !self.is_retiring(slot) => {
                     let is_fresh = self.fresh[slot];
                     if is_fresh && fresh == Fresh::Spare {
                         return None;
@@ -238,16 +333,14 @@ impl PadBook {
 }
 
 /// The pad's memory: its own churn block, then the resident region — the warm
-/// tier's pinned block, appended once the startup fill has written it.
+/// tier's pinned segments, appended once the startup fill has written them,
+/// and grown and shrunk at their end by the elastic tier
+/// (`docs/elastic_warm_tier.md` §5.3).
 pub(crate) struct Pad {
     pool: WarmPool,
     stride: usize,
-    /// The resident region, `(base, slots)`: slots `pool.num_slots()..` of the
-    /// pad.
-    resident: (u64, usize),
-    /// The warm tier the resident region lies in, held so the region lives as
-    /// long as the pad does.
-    warm: Option<Arc<WarmTier>>,
+    /// The resident region: slots `pool.num_slots()..` of the pad.
+    resident: Option<Arc<ResidentRegion>>,
 }
 
 impl Pad {
@@ -266,29 +359,19 @@ impl Pad {
         Ok(Self {
             pool,
             stride,
-            resident: (0, 0),
-            warm: None,
+            resident: None,
         })
     }
 
-    /// Append the warm tier's pinned block, which the startup fill has
-    /// written, as the resident region — its slots `stride` apart, as the
-    /// pad's own are. Once, before the stager takes the pad.
-    pub(crate) fn attach_resident(&mut self, warm: Arc<WarmTier>) {
+    /// Append the warm tier's pinned segments, which the startup fill has
+    /// written, as the resident region — slots `stride` apart, as the pad's own
+    /// are. Once, before the stager takes the pad.
+    pub(crate) fn attach_resident(&mut self, region: Arc<ResidentRegion>) {
         assert!(
-            self.warm.is_none(),
+            self.resident.is_none(),
             "expert pad: resident region attached twice"
         );
-        let (lo, hi) = warm.pinned_range();
-        let slots = warm.pinned_slots();
-        assert_eq!(
-            hi - lo,
-            (slots * self.stride) as u64,
-            "expert pad: the warm tier's pinned slots are not the pad's {} B stride",
-            self.stride
-        );
-        self.resident = (lo, slots);
-        self.warm = Some(warm);
+        self.resident = Some(region);
     }
 
     /// The churn block's slots: `0..churn_slots()`.
@@ -296,8 +379,9 @@ impl Pad {
         self.pool.num_slots()
     }
 
+    /// Slots now: the churn block's and the resident region's as it stands.
     pub(crate) fn num_slots(&self) -> usize {
-        self.pool.num_slots() + self.resident.1
+        self.pool.num_slots() + self.resident.as_ref().map_or(0, |r| r.slots())
     }
 
     pub(crate) fn stride(&self) -> usize {
@@ -308,19 +392,16 @@ impl Pad {
     pub(crate) fn slot_addr(&self, i: usize) -> u64 {
         match i.checked_sub(self.pool.num_slots()) {
             None => self.pool.slot_addr(i),
-            Some(r) => {
-                assert!(
-                    r < self.resident.1,
-                    "expert pad: slot {i} is past the pad's {} slots",
-                    self.num_slots()
-                );
-                self.resident.0 + (r * self.stride) as u64
-            }
+            Some(r) => self
+                .resident
+                .as_ref()
+                .unwrap_or_else(|| panic!("expert pad: slot {i} is past the churn block"))
+                .addr(r),
         }
     }
 
-    /// The churn block's addresses, `[lo, hi)`; the resident region's are the
-    /// warm tier's pinned range.
+    /// The churn block's addresses, `[lo, hi)`; the resident region's segments
+    /// are each a range of their own.
     pub(crate) fn range(&self) -> (u64, u64) {
         self.pool.range()
     }
@@ -461,6 +542,65 @@ mod tests {
             held,
             vec![(0, 0, 3, true), (2, 1, 0, true), (3, 1, 1, false)]
         );
+    }
+
+    /// **Grown slots are free churn, taken after every lower free slot.**
+    #[test]
+    fn grown_slots_are_free_churn_after_the_lower_ones() {
+        let mut b = PadBook::new(2, 1, 4, &[]);
+        b.grow(2);
+        assert_eq!(b.len(), 4);
+        assert_eq!(
+            (0..4).map(|_| b.take_free()).collect::<Vec<_>>(),
+            vec![Some(0), Some(1), Some(2), Some(3)]
+        );
+        assert!(!b.is_resident(3));
+    }
+
+    /// **A retiring slot is never taken and never a victim**; its held expert
+    /// is the stager's to evict, its loading one once it lands, and the shrink
+    /// finishes only when every retiring slot is empty.
+    #[test]
+    fn retiring_slots_drain_before_the_shrink_finishes() {
+        let mut b = PadBook::new(6, 1, 8, &[(5, 0, 7)]);
+        // Slot 3 held, slot 4 loading, 5 resident and held, 0..3 free.
+        for slot in [0, 1, 2, 3, 4] {
+            assert_eq!(b.take_free(), Some(slot));
+        }
+        b.start_load(3, 0, 3, false);
+        b.landed(3);
+        b.start_load(4, 0, 4, false);
+        assert_eq!(b.retire_from(3), vec![(0, 7)], "the resident it unlabelled");
+        assert_eq!(b.retiring(), Some(3));
+        assert!(!b.is_resident(5), "a retiring resident is unlabelled");
+        assert!(
+            b.victims(8, Fresh::Last, |_, _| Some(false)).is_empty(),
+            "no retiring slot is a victim"
+        );
+        assert!(b.held().all(|(s, ..)| s < 3), "nor a relabel's candidate");
+        assert_eq!(b.retiring_held(), vec![(3, 0, 3), (5, 0, 7)]);
+        assert!(!b.drained());
+        b.set_retired(3);
+        b.set_retired(5);
+        assert!(!b.drained(), "slot 4 is still loading");
+        b.landed(4);
+        assert_eq!(b.retiring_held(), vec![(4, 0, 4)]);
+        b.set_retired(4);
+        assert!(b.drained());
+        assert_eq!(b.truncate(), 3);
+        assert_eq!((b.len(), b.retiring()), (3, None));
+    }
+
+    /// Retiring takes the slots off the free list, so a free one past the
+    /// mark is never handed out.
+    #[test]
+    fn retiring_takes_free_slots_off_the_list() {
+        let mut b = PadBook::new(4, 1, 4, &[]);
+        assert!(b.retire_from(2).is_empty());
+        assert_eq!(b.take_free(), Some(0));
+        assert_eq!(b.take_free(), Some(1));
+        assert_eq!(b.take_free(), None);
+        assert!(b.drained());
     }
 
     /// A row's scored experts, highest first, ties by expert, floored and capped.
