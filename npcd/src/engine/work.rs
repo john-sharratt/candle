@@ -33,7 +33,7 @@ use serde_json::{Map, Value};
 
 use crate::engine::act::Act;
 use crate::engine::archive;
-use crate::engine::body::Outcome;
+use crate::engine::body::{self, Outcome};
 use crate::engine::chronology;
 use crate::engine::enact::order_refusal;
 use crate::engine::mission::{progress_line, time_step, Aim, DocStep, Mission, Outcome as Verdict};
@@ -46,7 +46,6 @@ use crate::engine::mission_gen::{gates, leakage, rejection, write_template};
 use crate::engine::order_table;
 use crate::engine::passage;
 use crate::engine::people;
-use crate::engine::way::{self, Way};
 use crate::engine::workflow::OnFailed;
 use crate::engine::workflow::PUBLISHED;
 use crate::opstore::owner::Owner;
@@ -935,18 +934,26 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
             .clone();
         if let Some(year) = time_step(&step) {
             let here = w.actor(body)?.at.clone();
-            let at_machine = w
-                .map()
-                .parts_at(w.node(&here)?)
-                .any(|(part, _)| part.id == "time-machine");
-            return Some(match at_machine {
-                true => format!("A time machine is here: `time_travel` naming the year {year}."),
-                false => format!(
-                    "You are not working in {year} yet. The time machines are on the time level: \
-                     `move_to` the lift, `lift_use` naming the time level, `move_to` the first \
-                     time room, then `time_travel` naming the year {year}."
-                ),
-            });
+            let has_machine = |at: &Where| {
+                w.node(at).is_some_and(|n| {
+                    w.map()
+                        .parts_at(n)
+                        .any(|(part, _)| part.id == "time-machine")
+                })
+            };
+            if has_machine(&here) {
+                return Some(format!(
+                    "A time machine is here: `time_travel` naming the year {year}."
+                ));
+            }
+            let name = route::reachable_from(w.map(), &here)
+                .iter()
+                .filter(|at| has_machine(at))
+                .find_map(|at| body::destination_name(w, &here, at))?;
+            return Some(format!(
+                "You are not working in {year} yet. The time machines are on the time level: \
+                 `move_to` {name}, then `time_travel` naming the year {year}."
+            ));
         }
         let here = w.actor(body)?.at.clone();
         let reach: Vec<Where> = std::iter::once(here.clone())
@@ -955,29 +962,9 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
         let room_of = |at: &Where| w.node(at).map(|n| n.name.clone());
         let level_of = |at: &Where| w.map().get(&at.area).map(|a| a.name.clone());
         let place = |at: &Where| format!("{}/{}", at.area, at.node);
-        // The way to a room as `move_to` and the lift take it ([`way::way`]):
-        // the ride first when it is on another level, out through a door before
-        // that when the body stands off the shaft, and through the door's room
-        // when the room lies beyond one.
-        let legs = |way: Way, room: &str| -> String {
-            let arrive = |through: Option<String>| match through {
-                None => format!("`move_to` {room}"),
-                Some(door) => format!("`move_to` {door}, then `move_to` {room}"),
-            };
-            match way {
-                Way::Walk { through } => arrive(through),
-                Way::Ride {
-                    level,
-                    first,
-                    through,
-                } => format!(
-                    "{}`move_to` the lift, `lift_use` naming {level} — it calls the car and \
-                     waits for it — then {}",
-                    first.map_or_else(String::new, |d| format!("`move_to` {d}, then ")),
-                    arrive(through)
-                ),
-            }
-        };
+        // The name `move_to` takes a room by from here — one act wherever the
+        // room is, the world riding the lift for a journey that changes floor.
+        let go = |at: &Where| body::destination_name(w, &here, at);
         // **A document is read and written at a desk, and the desks can be
         // reached.** Makers gave drafts up as stuck "between the lift and the
         // command room", the chronicle level "not accessible" — one from the
@@ -1004,17 +991,11 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
                     "You are at a desk, in {room}: {write}, then `bench_commit` it."
                 ));
             }
-            return Some(match way::way(w, &here, desk)? {
-                Way::Walk { through: None } => {
-                    format!("A desk is within reach in {room}: `move_to` it, and work there.")
-                }
-                walk @ Way::Walk { .. } => format!(
-                    "A desk is within reach in {room}: {}, and work there.",
-                    legs(walk, &room)
-                ),
-                ride => format!(
-                    "The desks are on {on}, and the lift goes there: {}.",
-                    legs(ride, &room),
+            let name = go(desk)?;
+            return Some(match desk.area == here.area {
+                true => format!("A desk is within reach in {room}: `move_to` it, and work there."),
+                false => format!(
+                    "The desks are on {on}: `move_to` {name}, and work there.",
                     on = level_of(desk)?
                 ),
             });
@@ -1030,12 +1011,10 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
             if attends {
                 return Some(format!("{room} is within reach: `focus` on it."));
             }
-            return Some(match way::way(w, &here, at)? {
-                Way::Walk { through: None } => format!("{room} is within reach: `move_to` it."),
-                walk @ Way::Walk { .. } => {
-                    format!("{room} is within reach: {}.", legs(walk, &room))
-                }
-                ride => format!("{room} is on {}: {}.", level_of(at)?, legs(ride, &room)),
+            let name = go(at)?;
+            return Some(match at.area == here.area {
+                true => format!("{room} is within reach: `move_to` it."),
+                false => format!("{room} is on {}: `move_to` {name}.", level_of(at)?),
             });
         }
         for d in s.devices.iter().filter(|d| aim.is_machine(&d.name)) {

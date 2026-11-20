@@ -134,7 +134,6 @@ use crate::engine::terminal::Machine;
 use crate::engine::tick::{Due, Pace, Scheduler, Shared as SharedScheduler};
 use crate::engine::tools::{self, Mode, Tool};
 use crate::engine::watcher::{is_ingestible, Ledger, Reconcile};
-use crate::engine::way::{self, Way};
 use crate::engine::witnessed;
 use crate::engine::work;
 use crate::mind::files::MindFiles;
@@ -167,7 +166,6 @@ use host::process::fatal;
 use host::stopping::{Ending, Stopping};
 use host::MODEL;
 use journals::experience::ExperienceKind;
-use npc_map::schema::NodeKind;
 use npc_map::world::Where;
 use npc_map::{describe, perceive, route};
 use substrate_git::member::{Access, Repos};
@@ -1723,9 +1721,9 @@ impl Runtime {
             // A mind that takes no orders goes nowhere: a place its mission
             // names is named, with no way to it.
             let bodiless = s.missions.is_unordered(&body);
-            // The way to a place, in the grammar's verbs: a walk on this level
-            // or through a door from it, the lift to any other — `move_to` does
-            // not cross floors ([`way::way`]).
+            // The way to a place, in the grammar's verbs: one `move_to`, by the
+            // name the grammar offers it under, wherever it is — the world
+            // rides the lift for a journey that changes floor.
             let way_to = |to: &Where| -> Option<String> {
                 let room = w.node(to)?.name.clone();
                 if bodiless {
@@ -1734,43 +1732,13 @@ impl Runtime {
                 if attends {
                     return Some(format!("{room}: `focus` on it"));
                 }
-                // The last leg: into the room, through the door's room when it
-                // lies beyond one.
-                let arrive = |through: Option<String>| match through {
-                    None => format!("`move_to` {room}"),
-                    Some(door) => format!("`move_to` {door}, then `move_to` {room}"),
-                };
-                let (level, first, through) = match way::way(w, &here, to)? {
-                    Way::Walk { through: None } => return Some(format!("{room}: `move_to` it")),
-                    Way::Walk { through } => return Some(format!("{room}: {}", arrive(through))),
-                    Way::Ride {
-                        level,
-                        first,
-                        through,
-                    } => (level, first, through),
-                };
-                let on = w.map().get(&to.area)?.name.clone();
-                let then = arrive(through);
-                if let Some(door) = first {
-                    return Some(format!(
-                        "{room}, on {on}: `move_to` {door}, then `move_to` the lift, `lift_use` \
-                         naming {level}, then {then}"
-                    ));
-                }
-                // At the lift already, the way is the ride itself — said from
-                // where the body stands, so it is news there and is told again.
-                // Told only "go to the lift" back in the room, a character reached
-                // the lift, had nothing new, and walked back out.
-                let at_lift = w.node(&here).is_some_and(|n| n.kind == NodeKind::Core);
-                Some(match at_lift {
-                    true => format!(
-                        "{room}, on {on}. You are at the lift: `lift_use` naming {level} — it \
-                         calls the car and waits for it if it is not here — then {then}"
-                    ),
-                    false => format!(
-                        "{room}, on {on}: `move_to` the lift, `lift_use` naming {level}, then \
-                         {then}"
-                    ),
+                let name = body::destination_name(w, &here, to)?;
+                Some(match to.area == here.area {
+                    true => format!("{room}: `move_to` it"),
+                    false => {
+                        let on = w.map().get(&to.area)?.name.clone();
+                        format!("{room}, on {on}: `move_to` {name}")
+                    }
                 })
             };
             let reach: Vec<Where> = std::iter::once(here.clone())
@@ -10358,6 +10326,41 @@ mod tests {
             specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
         );
         assert!(shown_wherever_offered(&LIFT_USE));
+    }
+
+    /// **A room on another floor is one `move_to` away, and the grammar offers
+    /// it.** Makers sent to the time level stood on its landing all evening
+    /// without calling the car; the time rooms are now names `move_to` takes
+    /// from anywhere in the vault, and the world rides the lift for them.
+    #[tokio::test]
+    async fn a_maker_is_offered_the_rooms_of_another_floor_to_move_to() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        let within = rt.within(1);
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        let time_rooms: Vec<String> = hosted.read(|w| {
+            let here = w.actor("m1").unwrap().at.clone();
+            body::destinations_from(w, &here)
+                .into_iter()
+                .filter(|(_, p)| {
+                    w.map()
+                        .get(&p.area)
+                        .is_some_and(|a| a.name == "the time level")
+                })
+                .map(|(name, _)| name)
+                .collect()
+        });
+        assert!(
+            !time_rooms.is_empty(),
+            "no room on the time level is offered"
+        );
+        for name in &time_rooms {
+            assert!(
+                within.places.contains(name),
+                "`{name}` is not in the grammar: {:?}",
+                within.places
+            );
+        }
     }
 
     /// **A character is only given work it has a table to report at.** The

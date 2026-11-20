@@ -190,9 +190,9 @@ mod tests {
         w.enter("m2", "Maker-02", at("green-room")).unwrap();
         w.mark_seen("m1");
         w.mark_seen("m2");
-        let elsewhere = Where::new("vault-chronicle", "core");
-        w.set_off("m1", elsewhere.clone()).unwrap();
-        w.set_off("m2", elsewhere).unwrap();
+        // Each heads for the room the other is leaving, so they meet between.
+        w.set_off("m1", at("green-room")).unwrap();
+        w.set_off("m2", at("band-one")).unwrap();
         w.tick();
         assert_eq!(
             loudest(&since(&w, "m1")),

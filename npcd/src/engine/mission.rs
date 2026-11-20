@@ -1146,7 +1146,7 @@ pub fn time_compass(year: u32, machine_here: bool, way: Option<&str>) -> String 
         ),
         (false, None) => format!(
             "Your mission, next: set your time to {year}, at a time machine on the time level: \
-             `move_to` the lift and `lift_use` naming the time level."
+             `move_to` a room on it that has one, and the lift takes you there."
         ),
     }
 }
@@ -2319,13 +2319,13 @@ mod tests {
             time_compass(
                 2837,
                 false,
-                Some("the first time room, on the time level: `move_to` the lift, `lift_use` naming the time level, then `move_to` the first time room")
+                Some("the first time room, on the time level: `move_to` the first time room")
             ),
             "Your mission, next: set your time to 2837. The time machines are in the first time \
-             room, on the time level: `move_to` the lift, `lift_use` naming the time level, then \
-             `move_to` the first time room; there, `time_travel` naming the year 2837."
+             room, on the time level: `move_to` the first time room; there, `time_travel` naming \
+             the year 2837."
         );
-        assert!(time_compass(2837, false, None).contains("`lift_use` naming the time level"));
+        assert!(time_compass(2837, false, None).contains("the lift takes you there"));
     }
 
     /// **At a desk, the compass says the exact act; away from one, the way.**
@@ -2374,11 +2374,11 @@ mod tests {
             doc_compass(
                 &DocStep::Read("layers/eras/x.md".into()),
                 &DeskVerbs::default(),
-                Some("band one, on the story level: `move_to` the lift"),
+                Some("band one, on the story level: `move_to` band one"),
                 None
             ),
             "Your mission, next: read layers/eras/x.md. Documents are read at a desk: the nearest \
-             is in band one, on the story level: `move_to` the lift."
+             is in band one, on the story level: `move_to` band one."
         );
         // A refused document: the refusal stands in front of the Maker, and
         // both ways out of it are open — never "do not write it again".
@@ -2412,11 +2412,11 @@ mod tests {
             doc_compass(
                 &DocStep::Write("layers/stories/y.md".into()),
                 &reads_only,
-                Some("band one, on the story level: `move_to` the lift"),
+                Some("band one, on the story level: `move_to` band one"),
                 None
             ),
             "Your mission, next: write layers/stories/y.md. A piece is written at a writing \
-             desk: the nearest is in band one, on the story level: `move_to` the lift."
+             desk: the nearest is in band one, on the story level: `move_to` band one."
         );
     }
 

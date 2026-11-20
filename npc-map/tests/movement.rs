@@ -81,8 +81,10 @@ fn crossing_the_building_is_out_to_the_lift_up_and_along() {
     // Three stops, and they are the three a person would describe: you go to
     // the lift, you ride it, you walk to the room. Those are the points
     // somebody would stop and reconsider, which is why they are the points a
-    // mind gets a turn at.
+    // mind gets a turn at. The ride is the car's: the body waits on its landing
+    // until the car sets it down on the far one.
     let mut w = vault();
+    let landing = Where::new("vault-portraits", "core");
     w.enter(
         "m1",
         "Maker-01",
@@ -92,16 +94,20 @@ fn crossing_the_building_is_out_to_the_lift_up_and_along() {
     assert_eq!(w.set_off("m1", command("command-room")), Ok(3));
 
     w.tick();
-    assert_eq!(w.actor("m1").unwrap().at.node, "core", "not at the lift");
-    assert_eq!(w.actor("m1").unwrap().at.area, "vault-portraits");
+    assert_eq!(w.actor("m1").unwrap().at, landing, "not at the lift");
 
-    w.tick();
-    assert_eq!(
-        w.actor("m1").unwrap().at,
-        Where::new("vault-command", "core")
+    let mut ticks = 0;
+    while w.actor("m1").unwrap().at == landing {
+        assert!(ticks < 200, "the car never came");
+        w.tick();
+        ticks += 1;
+    }
+    let off = w.actor("m1").unwrap().at.clone();
+    assert!(
+        off == command("core") || off == command("command-room"),
+        "left the landing other than by the car: {off}"
     );
-
-    w.tick();
+    w.settle();
     assert_eq!(w.actor("m1").unwrap().at, command("command-room"));
 }
 
@@ -167,16 +173,27 @@ fn everyone_who_sets_off_together_stays_level() {
 
 #[test]
 fn the_whole_lift_ride_is_one_stop_however_many_levels_it_crosses() {
-    // You do not get out on every floor. Five portal hops, one stop.
+    // You do not get out on every floor. Five portal hops, one stop: the body
+    // asks to ride to the far landing, and is set down nowhere in between.
     let mut w = vault();
-    w.enter("m1", "Maker-01", Where::new("vault-portraits", "core"))
-        .unwrap();
-    assert_eq!(w.set_off("m1", Where::new("vault-command", "core")), Ok(1));
+    let from = Where::new("vault-portraits", "core");
+    let to = Where::new("vault-command", "core");
+    w.enter("m1", "Maker-01", from.clone()).unwrap();
+    assert_eq!(w.set_off("m1", to.clone()), Ok(1));
     w.tick();
     assert_eq!(
-        w.actor("m1").unwrap().at,
-        Where::new("vault-command", "core")
+        w.riding("m1"),
+        w.floor_of(&to),
+        "not riding to the far floor"
     );
+    let mut ticks = 0;
+    while w.riding("m1").is_some() {
+        assert!(ticks < 200, "the car never came");
+        assert_eq!(w.actor("m1").unwrap().at, from, "got out on the way");
+        w.tick();
+        ticks += 1;
+    }
+    assert_eq!(w.actor("m1").unwrap().at, to);
 }
 
 #[test]
