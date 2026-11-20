@@ -67,6 +67,8 @@ use candle::cuda_backend::CudaDevice;
 use candle::quantized::cuda::Q8a128Operand;
 #[cfg(feature = "cuda")]
 use candle::quantized::decode_rows::DecodeRows;
+#[cfg(feature = "cuda")]
+use candle::quantized::pinned_ranges::PinnedRangeTable;
 use candle::quantized::Int8Mode;
 #[cfg(feature = "cuda")]
 use candle::{DType, LiveTensor};
@@ -965,10 +967,21 @@ impl ExpertCache {
         // The down launch's CPU items wait on the pool, and give its results up
         // through the same fault word, whatever is resident.
         let can_fault = can_fault || cpu.is_some();
+        // The pinned host memory a live entry may point into, as the table the
+        // bucketize kernel and the CPU pool classify by: the warm tier's pinned
+        // part and the pad's churn block.
+        let pinned_ranges = Arc::new(PinnedRangeTable::new()?);
+        for (lo, hi) in [warm.pinned_range(), pad.range()] {
+            if lo < hi {
+                pinned_ranges.add(lo, hi).map_err(|_| {
+                    candle::Error::Msg("expert cache: the pinned range table is full".into())
+                })?;
+            }
+        }
         let dispatch = Dispatch::new(
             cuda_dev_ref,
             table,
-            [warm.pinned_range(), pad.range()],
+            pinned_ranges.clone(),
             row_tile_bytes_for(&layer_geometries),
             &image_bytes,
             experts_used,

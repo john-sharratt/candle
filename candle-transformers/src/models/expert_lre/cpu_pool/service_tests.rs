@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use candle::quantized::ko_quant::quantize_ko;
+use candle::quantized::pinned_ranges::PinnedRangeTable;
 use candle::quantized::GgmlDType;
 use candle::Device;
 
@@ -32,6 +33,16 @@ const Q8A1024_BLOCK: usize = 1152;
 const Q8A1024_META: usize = 1024;
 /// The MoE row every layer here is, of the two the service is built for.
 const ROW: usize = 1;
+
+/// A pinned range table holding `ranges`.
+fn pinned_table(ranges: &[(u64, u64)]) -> candle::Result<Arc<PinnedRangeTable>> {
+    let t = PinnedRangeTable::new()?;
+    for &(lo, hi) in ranges {
+        t.add(lo, hi)
+            .map_err(|_| candle::Error::Msg("a test table fits".into()))?;
+    }
+    Ok(Arc::new(t))
+}
 
 fn lcg(seed: &mut u64) -> f32 {
     *seed = seed
@@ -349,7 +360,7 @@ fn the_service_waits_for_a_cold_expert_and_computes_it() -> candle::Result<()> {
     let mut fx = Fixture::new()?;
     let table = Arc::new(fx.table());
     let fault = Arc::new(FaultWord::new()?);
-    let pinned = [(fx.base(0), fx.base(0) + 4 * fx.image_bytes as u64), (0, 0)];
+    let pinned = pinned_table(&[(fx.base(0), fx.base(0) + 4 * fx.image_bytes as u64)])?;
     fx.service.attach_cold(ColdSource {
         table: table.clone(),
         abort: Arc::new(AbortWord::new()?),
@@ -412,7 +423,7 @@ fn the_service_computes_a_pageable_expert_without_waiting() -> candle::Result<()
         table: table.clone(),
         abort: Arc::new(AbortWord::new()?),
         fault: fault.clone(),
-        pinned: [(0, 0), (0, 0)],
+        pinned: pinned_table(&[])?,
         paged: Arc::new(paged),
         spin_limit: Duration::from_secs(30),
     });
@@ -445,7 +456,7 @@ fn the_service_gives_a_lost_cold_expert_up_through_the_fault_word() -> candle::R
     let table = Arc::new(fx.table());
     let abort = Arc::new(AbortWord::new()?);
     let fault = Arc::new(FaultWord::new()?);
-    let pinned = [(fx.base(0), fx.base(0) + 4 * fx.image_bytes as u64), (0, 0)];
+    let pinned = pinned_table(&[(fx.base(0), fx.base(0) + 4 * fx.image_bytes as u64)])?;
     fx.service.attach_cold(ColdSource {
         table: table.clone(),
         abort: abort.clone(),

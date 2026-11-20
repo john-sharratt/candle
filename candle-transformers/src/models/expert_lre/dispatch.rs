@@ -58,6 +58,7 @@ use candle::quantized::cuda::{
     BucketizeLive, MoeBucketizeWorkspace, MoeLive, OwnerCheck, Q8a128Operand, ReadAhead,
 };
 use candle::quantized::decode_rows::DecodeRows;
+use candle::quantized::pinned_ranges::PinnedRangeTable;
 use candle::quantized::SumScale;
 use candle::{DType, Device, LiveTensor, Result};
 use candle_kernels::simple::moe_bucketize::{
@@ -409,9 +410,10 @@ struct ForwardSide {
 // Every invocation the ring hold can wait on has been launched.
 const _: () = assert!(2 * MAX_UNFLUSHED_INVOCATIONS <= SUMMARY_RING);
 
-/// The two pinned host ranges a remote entry lies in: the warm tier's pinned
-/// part, and the pad.
-pub(crate) type PinnedRanges = [(u64, u64); 2];
+/// The pinned host ranges a remote entry lies in — the pad's churn block and
+/// the warm tier's pinned segments — in the mapped table every bucketize reads
+/// (`docs/elastic_warm_tier.md` §5.2).
+pub(crate) type PinnedRanges = Arc<PinnedRangeTable>;
 
 /// One invocation's host-side reservation, made by [`Dispatch::before`] and
 /// consumed by [`Dispatch::record`]: its sequence number, the summary-ring slot
@@ -725,7 +727,7 @@ impl Dispatch {
                 table: table.clone(),
                 abort: abort.clone(),
                 fault: fault.clone(),
-                pinned,
+                pinned: pinned.clone(),
                 paged: c.paged.clone(),
                 spin_limit: Duration::from_nanos(SPIN_LIMIT_NS),
             });
@@ -1113,7 +1115,7 @@ impl Dispatch {
                 gate_row: table.row_ptr(Proj::Gate, row),
                 table_plane: table.plane(),
                 snap,
-                pinned: self.pinned,
+                pinned_table: self.pinned.device_ptr(),
                 summary: self.ring.dev_slot(slot),
                 summary_seq: summary_word(seq),
                 remote,

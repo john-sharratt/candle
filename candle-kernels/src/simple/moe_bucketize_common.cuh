@@ -50,9 +50,8 @@ struct DecodeRanges {
     uint32_t* __restrict__ perm, uint32_t* __restrict__ rw_ids,                               \
     int32_t* __restrict__ token_starts, int32_t* __restrict__ header,                         \
     uint32_t* __restrict__ inv, int32_t* __restrict__ scan, const uint64_t* gate_row,         \
-    const long long table_plane, uint64_t* __restrict__ snap, const uint64_t pinned0_lo,      \
-    const uint64_t pinned0_hi, const uint64_t pinned1_lo, const uint64_t pinned1_hi,          \
-    const DecodeRanges decode, uint32_t* __restrict__ summary, const uint32_t summary_seq,    \
+    const long long table_plane, uint64_t* __restrict__ snap,                                 \
+    const uint64_t* pinned_table, const DecodeRanges decode, uint32_t* __restrict__ summary, const uint32_t summary_seq,    \
     int32_t* __restrict__ remote, int32_t* __restrict__ counters,                             \
     const uint64_t* promo_slots, uint64_t* promo_log, uint32_t* promo_head,                   \
     const uint32_t* promo_tail, const uint32_t promo_cap, uint32_t* promo_marks,              \

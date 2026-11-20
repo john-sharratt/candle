@@ -7941,10 +7941,7 @@ pub fn moe_bucketize(
             live.map_or(0, |l| l.gate_row) as *const std::ffi::c_void,
             live.map_or(0, |l| l.table_plane),
             live.map_or(0, |l| l.snap) as *mut std::ffi::c_void,
-            live.map_or(0, |l| l.pinned[0].0),
-            live.map_or(0, |l| l.pinned[0].1),
-            live.map_or(0, |l| l.pinned[1].0),
-            live.map_or(0, |l| l.pinned[1].1),
+            live.map_or(0, |l| l.pinned_table) as *const std::ffi::c_void,
             decode_lo.as_ptr(),
             decode_hi.as_ptr(),
             decode_lo.len() as i32,
@@ -8011,7 +8008,7 @@ pub fn moe_bucketize(
 #[derive(Debug, Clone, Copy)]
 pub struct BucketizeLive {
     /// The layer's row of the live gate table (mapped): an entry in VRAM is a
-    /// VRAM expert, one inside a `pinned` range is pinned, 0 is cold. The up
+    /// VRAM expert, one inside a pinned range is pinned, 0 is cold. The up
     /// and down rows are `table_plane` and `2 · table_plane` entries after it,
     /// and an expert with any of its three entries 0 is cold.
     pub gate_row: u64,
@@ -8019,8 +8016,10 @@ pub struct BucketizeLive {
     /// `u64[3][n_experts]` snapshot of the routed experts' entries (gate, up,
     /// down) — the weight tables of the layer's three grouped GEMMs.
     pub snap: u64,
-    /// The two pinned host ranges `[lo, hi)` — the warm tier and the pad.
-    pub pinned: [(u64, u64); 2],
+    /// The device address of the pinned host ranges' table — the pad and the
+    /// warm tier's segments ([`super::pinned_ranges::PinnedRangeTable`]), or 0
+    /// for none.
+    pub pinned_table: u64,
     /// `u32[n_experts + 1]` routing summary (mapped): `count | pinned << 29 |
     /// cold << 30 | decode << 31` per expert, then `summary_seq`, stored last
     /// once every count is visible system-wide.

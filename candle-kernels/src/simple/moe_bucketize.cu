@@ -208,9 +208,9 @@ extern "C" __global__ void moe_bucketize_kernel(
     // [3][n_experts] snapshot of the routed experts' entries (gate, up, down),
     // the layer's GEMM weight tables; required when `gate_row` is set.
     uint64_t* __restrict__ snap,
-    // The two pinned host ranges `[lo, hi)` a remote entry lies in.
-    const uint64_t pinned0_lo, const uint64_t pinned0_hi,
-    const uint64_t pinned1_lo, const uint64_t pinned1_hi,
+    // The mapped table of pinned host ranges `[lo, hi)` a remote entry lies in
+    // — a `u64` count, then the pairs (`PinnedRanges`) — or null for none.
+    const uint64_t* pinned_table,
     const DecodeRanges decode,           // the tokens scored as decode rows
     uint32_t* __restrict__ summary,      // [n_experts + 1] routing summary, or null
     const uint32_t summary_seq,          // stored at summary[n_experts] last
@@ -303,6 +303,10 @@ extern "C" __global__ void moe_bucketize_kernel(
     // Per expert: computed by the host CPU pool (1), and the split's scratch.
     __shared__ uint8_t sh_cpu[MAX_EXPERTS];
     __shared__ CpuSplitShared sh_cpu_split;
+    // The pinned host ranges, copied from the mapped table once (`PinnedRanges`).
+    __shared__ uint64_t sh_pinned[2 * MAX_PINNED_RANGES];
+    __shared__ uint32_t sh_n_pinned;
+    PinnedRanges ranges{sh_pinned, 0};
 
     // ── Phase 1: per-expert histogram (grid-stride, shared-memory atomics) ──
     // Each assignment is read ONCE and atomically bumped into its expert's
@@ -392,13 +396,17 @@ extern "C" __global__ void moe_bucketize_kernel(
         __syncthreads();
     }
     if (gate_row != nullptr) {
+        // After the started word, before the first entry is read: an entry the
+        // host published into a range added since reads as VRAM, never the
+        // reverse (`PinnedRanges`).
+        ranges = load_pinned_ranges(pinned_table, sh_pinned, &sh_n_pinned, tid, BUCKETIZE_THREADS);
         for (int e = tid; e < n_experts; e += BUCKETIZE_THREADS) {
             if (sh_counts[e] == 0) {
                 continue;
             }
             const LiveEntries entries = load_live_entries(gate_row, table_plane, e);
             const uint8_t cls = snapshot_expert(
-                e, entries, n_experts, snap, pinned0_lo, pinned0_hi, pinned1_lo, pinned1_hi,
+                e, entries, n_experts, snap, ranges,
                 slot_owner, zone_end, zone_slot_bytes, zone_slots, row);
             sh_cls[e] = cls;
             if (promo_slots != nullptr && cls != CLS_VRAM) {
@@ -519,8 +527,7 @@ extern "C" __global__ void moe_bucketize_kernel(
                            ReadAhead{ahead_window, ahead_depth, ahead_n, ahead_list, ahead_src,
                                      ahead_cap, rows, row_layout, ahead_items, ahead_done,
                                      ahead_predict != 0},
-                           ZoneRanges{pinned0_lo, pinned0_hi, pinned1_lo, pinned1_hi, slot_owner,
-                                      zone_end, zone_slot_bytes, zone_slots},
+                           ZoneRanges{ranges, slot_owner, zone_end, zone_slot_bytes, zone_slots},
                            CpuCarry{sh_cpu_split.order, sh_cpu_split.take, sh_cls, cpu.promote,
                                     cpu_out.carry});
         }
@@ -771,10 +778,7 @@ extern "C" int32_t run_moe_bucketize(
     const void* gate_row,
     int64_t table_plane,
     void* snap,
-    uint64_t pinned0_lo,
-    uint64_t pinned0_hi,
-    uint64_t pinned1_lo,
-    uint64_t pinned1_hi,
+    const void* pinned_table,
     const uint32_t* decode_lo,
     const uint32_t* decode_hi,
     int32_t decode_ranges,
@@ -881,7 +885,7 @@ extern "C" int32_t run_moe_bucketize(
         (int32_t*)tile_b_start, (int32_t*)tile_b_cnt, (uint32_t*)perm,
         (uint32_t*)rw_ids, (int32_t*)token_starts, (int32_t*)header,
         (uint32_t*)inv, (int32_t*)scan, (const uint64_t*)gate_row,
-        (long long)table_plane, (uint64_t*)snap, pinned0_lo, pinned0_hi, pinned1_lo, pinned1_hi,
+        (long long)table_plane, (uint64_t*)snap, (const uint64_t*)pinned_table,
         decode, (uint32_t*)summary, summary_seq,
         (int32_t*)remote, (int32_t*)counters,
         (const uint64_t*)promo_slots, (uint64_t*)promo_log, (uint32_t*)promo_head,

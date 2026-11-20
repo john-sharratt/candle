@@ -83,7 +83,7 @@ fn cold_launch(row: i32, spin_limit_ns: u64, release: impl FnOnce(*mut u32)) -> 
         gate_row: table_d,
         table_plane: n_experts as i64,
         snap: np,
-        pinned: [(0, 0), (0, 0)],
+        pinned_table: 0,
         summary: sp,
         summary_seq: 1,
         remote: rp,
