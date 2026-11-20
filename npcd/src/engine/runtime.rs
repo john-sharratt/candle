@@ -10333,6 +10333,32 @@ mod tests {
         rt.embody(npc_id, WORLD, body, 0).expect("bound");
     }
 
+    /// **A Maker standing at a landing is offered the ride, and shown it.** Sent
+    /// to the time level, Makers stood at the story level's lift and told each
+    /// other there was no lift act there; this holds the grammar to offering
+    /// `lift_use`, bound to the time level among the floors, with the act
+    /// described whatever else ranks.
+    #[tokio::test]
+    async fn a_maker_at_a_landing_is_offered_the_ride_to_the_time_level() {
+        use crate::engine::tools::{shown_wherever_offered, specs_within, Mode, LIFT_USE};
+        let rt = vaulted();
+        embody_at(&rt, 1, "m1", Where::new("vault-story", "core"));
+        let within = rt.within(1);
+        assert!(within.at_lift, "not on the landing");
+        assert!(
+            within.floors.iter().any(|f| f == "the time level"),
+            "{:?}",
+            within.floors
+        );
+        let specs = specs_within(Mode::Physical, &within);
+        assert!(
+            specs.iter().any(|s| s.name == "lift_use"),
+            "{:?}",
+            specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
+        );
+        assert!(shown_wherever_offered(&LIFT_USE));
+    }
+
     /// **A character is only given work it has a table to report at.** The
     /// waste is open ground with no door, stair or lift to any building, so a
     /// character out there has no way to a command table: a world that draws
