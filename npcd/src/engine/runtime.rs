@@ -1815,10 +1815,13 @@ impl Runtime {
                     DocStep::Write(_) if given => ("file_write", write.is_some()),
                     DocStep::Write(_) => ("compose", desk.compose.is_some()),
                 };
+                // Never the room it stands in: this one does not serve the act
+                // from where the body is, whatever its parts list.
                 let way = (!here_does)
                     .then(|| {
                         reach
                             .iter()
+                            .filter(|at| **at != here)
                             .find(|at| s.part_offers(&place(at), act))
                             .and_then(&way_to)
                     })
