@@ -1,9 +1,10 @@
 # The re-feed — every projection ends by reading its own last tokens again
 
-**Status:** built (2026-11-20). Replaces the request's two readings
-(`scheduler/first_reading.rs`, `docs/hit_driven_projection.md` §7.4). Builds on
-the slot, the pool, the fill and the hit counters of
-`docs/hit_driven_projection.md`, which stay.
+**Status:** built (2026-11-20). Runs beside the request's two readings
+(`scheduler/first_reading.rs`, `docs/hit_driven_projection.md` §7.4), which it
+replaced for runs (c)–(g) and which came back once the fill kept what
+provenance found (§3). Builds on the slot, the pool, the fill and the hit
+counters of `docs/hit_driven_projection.md`, which stay.
 
 ## 1. Why
 
@@ -23,7 +24,7 @@ BlackWorld (2026-11-20, `docs/results/dependency_battery_2026-11-20_b.md`):
 A reprojection swaps K/V in, and on Flash-Next 36 of 48 layers are recurrent:
 the swapped-in content reaches them only through the tokens forwarded after it.
 The two readings put one such prefill at the start of a request and nothing at
-any other projection.
+any other projection; the re-feed puts one at every projection after it.
 
 ## 2. The design
 
@@ -176,24 +177,25 @@ change did not change.
 
 | Removed | Why it goes |
 |---|---|
-| The request's first reading (`scheduler/first_reading.rs`, `PrefillWork::rereads`, `ActivePrefill`'s stop one token short, `Scheduler::first_readings`) | Every projection now re-reads; the request's opening is one of them. |
 | The second reading's skipped boundary (`PrefillWork::second_reading`) | No boundary fires at the opening's end (§2.4). |
 | The boundary at the opening's end (`wants_early_reprojection`, `ReprojectionPolicy::has_belief_collections`) | The rule's first boundary in the reply takes its place (§2.4). |
 | The early boundaries at 9, 16 and 32 reasoning tokens (`scheduler/early_boundaries.rs`) | The cadence counts from the last boundary instead of on multiples of the count (§2.4). |
 | The `<tool_call>` lock-in boundary | No boundary inside a tool call (§2 item 6). |
-| Seeds held out of a first reading (`WorkingSet::holds_out`, `SlotBoundary::question_pending`) | There is one reading; the seeds are in it, as background. |
 | The shadow scan's windows no longer than the query's position | One context at the rung covering it. |
 
-What stays: the pool and its scan leaders, the fill and its caps, the hit
-counters and momentum,
-the first question's opening, the seeds, and the fill report in every
-projection record.
+What stays: the request's two readings (`docs/hit_driven_projection.md` §7.4)
+— removed for runs (c)–(g), back once the fill kept what provenance found:
+measured in (f), the answer files stayed placed and the direct questions
+still declined on an inventory the reasoning wrote over the seeds before its
+first projection, the failure the second reading answers by prefilling the
+question over the files placed for it. Also the pool and its scan leaders,
+the fill and its caps, the hit counters and momentum, the first question's
+opening, the seeds, and the fill report in every projection record.
 
 ## 4. Build
 
 | Step | Where | Tested by |
 |---|---|---|
-| The two readings removed (§3) | `scheduler/` | the conversation suite |
 | The gap holds the last 8 tokens' chunks native (§2.2) | `gap/table.rs` | `the_chunks_holding_the_last_eight_tokens_stay_native` |
 | The captured tail trimmed (§2.1) | `SealedSequence::trim_tail` | `a_trim_cuts_the_last_tokens_across_a_chunk_boundary`, `a_trim_refuses_a_quantized_chunk_and_an_overlong_cut` |
 | The index rewound to a block boundary (§2 item 5) | `indexer::refeed_cut`, `IndexCache::rewind_live`, `wave.rs` | `a_refeed_rewinds_to_the_newest_block_boundary_within_its_reach`, `a_rewound_tail_keeps_its_first_blocks` |

@@ -499,6 +499,7 @@ impl Scheduler {
                     free_tool_calls_from_penalties: false,
                     recorded_reply: None,
                     recurrent_spans: Vec::new(),
+                    rereads: false,
                 });
                 // An arrival is an admission opportunity.
                 self.settled_since_admit = true;

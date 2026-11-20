@@ -2399,6 +2399,15 @@ impl Scheduler {
             if !decoding && self.awaiting_opening(view_id).is_none() {
                 continue;
             }
+            // A request's first reading is scored and the turn submitted again
+            // with the seeds (`first_reading`), not reprojected.
+            if self
+                .awaiting_opening(view_id)
+                .is_some_and(|p| p.work.rereads)
+            {
+                self.read_first(view_id);
+                continue;
+            }
             if decode_diag::fresh() {
                 self.diag_forget_placement(view_id);
             }

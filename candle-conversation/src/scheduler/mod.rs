@@ -67,6 +67,7 @@ mod diag;
 mod ephemeral_fork;
 mod expert_counters;
 pub mod exported_state;
+mod first_reading;
 mod first_sample;
 mod frame;
 mod gallery_sweep;
@@ -133,6 +134,7 @@ mod sweep_forecast;
 mod test_substrate;
 mod turn_airtime;
 mod turn_group;
+mod turn_probe;
 mod turn_seal;
 pub mod turn_status;
 mod urgent_hold;
@@ -154,6 +156,7 @@ use refeed::without_last;
 use reproject_abandon::or_abandon;
 use section_pages::SectionPages;
 use section_timing::SectionTiming;
+use turn_probe::TurnProbe;
 
 use self::paused_creep::PausedCreep;
 use self::phase_ring::{ProjectedKind, VramBands};
@@ -209,7 +212,7 @@ use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::stencil::{
     Healed, StencilDriver, StepMask, TriggerRegistry, TurnGrammar, TOOL_CALL_TREE_LABEL,
 };
-use crate::substrate::{HotKv, ResidenceIndex, TurnPartWrite};
+use crate::substrate::{ContentResolver, HotKv, ProjectionScores, ResidenceIndex, TurnPartWrite};
 use crate::summary_tree::scope::Scope;
 use crate::summary_tree::{
     leaf_skeleton, structural_rollup, ProbeError, SelectionDiagnostics, SummariserTrigger, TurnKind,
@@ -2322,6 +2325,11 @@ pub(super) struct PrefillWork {
     /// Spans of `tokens` each prefilled as a chunk of its own, armed on the
     /// model for a capture or a replay of their recurrent state.
     pub(super) recurrent_spans: Vec<TokenSpan>,
+    /// A request's first reading (`first_reading`): the question is
+    /// prefilled to its last token against a projection without the seeds,
+    /// scored, and submitted again with them. Set at submit for a turn a new
+    /// user message opens.
+    pub(super) rereads: bool,
 }
 
 /// An in-flight prefill, partially advanced. Lives across scheduler
@@ -2356,10 +2364,20 @@ pub(super) struct ActivePrefill {
 }
 
 impl ActivePrefill {
+    /// Where the prefill stops: its last token, or for a first reading the
+    /// token before it, so the reading is scored before anything is sampled.
+    fn end(&self) -> usize {
+        let total = self.work.tokens.len();
+        match self.work.rereads {
+            true => total - 1,
+            false => total,
+        }
+    }
+
     /// The most the next chunk may advance: the tokens left, cut at the next
     /// boundary.
     pub(super) fn advance_cap(&self) -> usize {
-        let left = self.work.tokens.len() - self.offset;
+        let left = self.end() - self.offset;
         match self.stops_every {
             Some(every) => left.min(every - self.offset % every),
             None => left,
@@ -2367,8 +2385,12 @@ impl ActivePrefill {
     }
 
     /// Whether the opening, now at `offset`, stands at a boundary it stops at:
-    /// a whole number of strides in, with tokens still to come.
+    /// a whole number of strides in, with tokens still to come — or a first
+    /// reading at its end.
     pub(super) fn at_boundary(&self) -> bool {
+        if self.work.rereads {
+            return self.offset == self.end();
+        }
         self.stops_every
             .is_some_and(|every| self.offset > 0 && self.offset.is_multiple_of(every))
             && self.offset < self.work.tokens.len()
@@ -3821,6 +3843,12 @@ pub(crate) struct Scheduler {
     /// wave carries them (`refeed`).
     refeeds: HashMap<SequenceId, Vec<u32>>,
 
+    /// A request's first-reading scores, by the parent slot its turn is
+    /// submitted again on (`first_reading`): the second reading's opening
+    /// projection is scored by them, so the question's files rank beside the
+    /// seeds rather than every round reading zero.
+    first_readings: HashMap<SequenceId, ProjectionScores>,
+
     /// Per-slot `Conversation` (workspace) registry.  Registered when
     /// [`SchedulerRequest::NewSequence`] allocates the slot; removed
     /// when [`SchedulerRequest::FreeSequence`] frees it.  The
@@ -4507,6 +4535,7 @@ impl Scheduler {
             guests,
             pending_reprojections: Vec::new(),
             refeeds: HashMap::new(),
+            first_readings: HashMap::new(),
             slot_tokens: HashMap::new(),
             slot_projection_state: HashMap::new(),
             cold_load_stager: ColdLoadStager::with_preallocation(PINNED_PREALLOC_BYTES),
@@ -4993,6 +5022,9 @@ impl Scheduler {
                 // below (carried belief stepped through the submit projection);
                 // default when projection is skipped.
                 let mut turn_belief = PriorBelief::default();
+                // Whether a new user message waits for its first boundary — the
+                // turn is a request, read first without the seeds.
+                let mut question_pending = false;
                 let (projected_sections, projected_segments) =
                     if let (Some(frame), Some(_)) = (frame, slot_target) {
                         let (sections, segments, turns) = framed_segments(frame);
@@ -5016,7 +5048,16 @@ impl Scheduler {
                         // Target-aware read: the projection sees only
                         // `target.timeline` within `target.group`,
                         // masking sibling timelines.
-                        let view = conversation.read_for(target);
+                        // A request's second reading projects by its first
+                        // reading's scores (`first_reading`); every other
+                        // submit reads the substrate unscored.
+                        let first_reading = self.first_readings.remove(&parent_id);
+                        let view = match &first_reading {
+                            Some(scores) => conversation.read_for_scored(target, scores),
+                            None => conversation.read_for(target),
+                        };
+                        question_pending = ContentResolver::working_set_boundary(&view)
+                            .is_some_and(|b| b.question_pending);
                         // Prefill mode: section scoring uses the calibrated
                         // prefill profile (Max / semantic depth, no threshold)
                         // against the prefill-Q section corpus.  The sink
@@ -5232,6 +5273,15 @@ impl Scheduler {
                 // completion that will never come (nothing is running) leaves it
                 // queued indefinitely.
                 self.settled_since_admit = true;
+                let rereads = first_reading::rereads(first_reading::Request {
+                    question_pending,
+                    seals_a_turn: matches!(seal_action, SealAction::Turn),
+                    grouped: seal_group.is_some(),
+                    reprojects: reprojection.is_some(),
+                    staged: !projection_offsets.is_empty() || !recurrent_spans.is_empty(),
+                    replayed: recorded_reply.is_some(),
+                    tokens: prefill_tokens.len(),
+                });
                 self.pending_submits.push_back(submit_admit::PendingSubmit {
                     work: PrefillWork {
                         sequence_id: parent_id,
@@ -5259,6 +5309,7 @@ impl Scheduler {
                         free_tool_calls_from_penalties,
                         recorded_reply,
                         recurrent_spans,
+                        rereads,
                     },
                     lift,
                     depth,
@@ -6804,6 +6855,7 @@ impl Scheduler {
             free_tool_calls_from_penalties: false,
             recorded_reply: None,
             recurrent_spans: Vec::new(),
+            rereads: false,
         });
         Ok(())
     }
@@ -11913,14 +11965,6 @@ impl Scheduler {
         let view_state = self.turn_views.get(&view_id).copied().ok_or_else(|| {
             ConversationError::Channel(format!("reproject: missing view state {view_id}"))
         })?;
-        let turn_start_chunk = view_state.turn_start_parent_blocks;
-        let cur_chunks = self.session.sequence_block_count(view_id.0).unwrap_or(0);
-        if cur_chunks <= turn_start_chunk {
-            return Ok(None);
-        }
-        let max_probe_chunks = policy.max_probe_tokens.max(1).div_ceil(self.chunk_size);
-        let tail_lo = turn_start_chunk.max(cur_chunks.saturating_sub(max_probe_chunks));
-
         // Wall-clock start of the whole reproject — drives `total_ms` so the log
         // reports the real end-to-end cost, not a sum of (partly overlapping)
         // phase fields.
@@ -11928,32 +11972,23 @@ impl Scheduler {
 
         // 2. Gather the live wide-Q probe — folded per-token sign(Q): the query
         //    head (when the trailing window has slid past it) followed by the
-        //    most recent turn chunks. A gather covering no real tokens means
-        //    nothing to score.
+        //    most recent turn chunks, and the pinned question window, which
+        //    policies with `question_pin` scan as a second probe and max-fuse
+        //    (`turn_probe`). A gather covering no real tokens means nothing to
+        //    score.
         let t_probe = Instant::now();
         let probe_span = profile::span("reproject:probe");
-        let mut probe = Vec::new();
-        if tail_lo > turn_start_chunk {
-            let head_hi = (turn_start_chunk + QUERY_HEAD_CHUNKS).min(tail_lo);
-            probe.extend(self.gather_wide_sigs(view_id, (turn_start_chunk, head_hi)));
-        }
-        probe.extend(self.gather_wide_sigs(view_id, (tail_lo, cur_chunks)));
-        if probe.is_empty() {
+        let Some(TurnProbe {
+            probe,
+            question: probe_q,
+        }) = self.turn_probe(
+            view_id,
+            view_state.turn_start_parent_blocks,
+            view_state.question_tokens,
+            policy.max_probe_tokens,
+        )
+        else {
             return Ok(None);
-        }
-        // Concept F: the pinned question window — the turn's user half, whose
-        // boundary was captured at turn open (`ViewState::question_tokens`).
-        // Gathered whole-chunk then trimmed to the exact token boundary;
-        // policies with `question_pin` scan it as a second probe and max-fuse.
-        let probe_q: Vec<crate::provenance::WideQSig> = {
-            let q_tokens = view_state
-                .question_tokens
-                .min(policy.max_probe_tokens.max(1));
-            let q_chunks = q_tokens.div_ceil(self.chunk_size);
-            let q_hi = (turn_start_chunk + q_chunks).min(cur_chunks);
-            let mut q = self.gather_wide_sigs(view_id, (turn_start_chunk, q_hi));
-            q.truncate(q_tokens);
-            q
         };
         probe_span.end();
         let probe_ms = t_probe.elapsed().as_millis() as u64;
@@ -17317,6 +17352,7 @@ mod tests {
             free_tool_calls_from_penalties: false,
             recorded_reply: None,
             recurrent_spans: Vec::new(),
+            rereads: false,
         }
     }
 
