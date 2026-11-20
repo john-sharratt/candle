@@ -125,6 +125,13 @@ pub struct PipelineStats {
     /// **Gauge**: how many pad slots may be resident — the warm tier's pinned
     /// block.
     pub resident_capacity: usize,
+    /// **Gauge**: the warm tier's pageable chunks and their bytes — the
+    /// elastic part (`docs/elastic_warm_tier.md` §6).
+    pub warm_paged_chunks: usize,
+    pub warm_paged_bytes: u64,
+    /// Chunks the elastic tier took while quiet, and gave back under pressure.
+    pub warm_grown: usize,
+    pub warm_shrunk: usize,
     /// **Gauge**: residents per MoE layer, as of the last relabel.
     pub resident_rows: Vec<usize>,
     /// Of the read-ahead claims, those copied from the pad — staged ahead off

@@ -16,9 +16,9 @@
 //!
 //! **A pageable copy needs no wait.** An expert the warm tier holds in pageable
 //! memory is cold to the device, which cannot read that memory, but not to the
-//! pool, which can. Those copies are written once at startup and never move or
-//! change ([`PagedImages`]), so the pool computes from one at once instead of
-//! waiting for the stager's copy of it into the pad.
+//! pool, which can. A copy never moves while it is listed ([`PagedImages`]), so
+//! the pool computes from one at once instead of waiting for the stager's copy
+//! of it into the pad.
 //!
 //! **Giving up.** A wait ends without the expert when the abort word is raised
 //! (the stager or the pipeline thread died), when another wait has already
@@ -27,6 +27,7 @@
 //! publishes no `done`: the down launch's wait on the pool sees the word and
 //! gives up at once, and the host fails the forward.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,12 +52,16 @@ pub(crate) struct ColdSource {
 /// Where the warm tier's pageable copy of each expert starts, if it has one:
 /// the slot image's first byte, which the live table's per-row projection
 /// offsets apply to exactly as they do to a pad slot (the stager stages a
-/// pageable copy into the pad byte for byte). Built once at startup; the
-/// copies never move, and `owner` — the memory they lie in — lives as long as
-/// this does, so every address here stays readable for as long as the pool
-/// can read one.
+/// pageable copy into the pad byte for byte). `owner` — the tier the copies lie
+/// in — lives as long as this does.
+///
+/// The elastic tier adds copies as it fills a chunk and clears them before it
+/// frees one (`docs/elastic_warm_tier.md` §5.3): a copy is set only once its
+/// bytes are written, and its chunk is freed only once every invocation that
+/// could have read the base before the clear is done — the pool computes a
+/// copy only inside the invocation that routed it.
 pub(crate) struct PagedImages {
-    bases: Vec<u64>,
+    bases: Box<[AtomicU64]>,
     n_experts: usize,
     _owner: Arc<dyn Send + Sync>,
 }
@@ -66,20 +71,25 @@ impl PagedImages {
     /// lie in `owner`.
     pub(crate) fn new(rows: usize, n_experts: usize, owner: Arc<dyn Send + Sync>) -> Self {
         Self {
-            bases: vec![0; rows * n_experts],
+            bases: (0..rows * n_experts).map(|_| AtomicU64::new(0)).collect(),
             n_experts,
             _owner: owner,
         }
     }
 
-    /// Record `(row, expert)`'s pageable copy at `base`.
-    pub(crate) fn set(&mut self, row: usize, expert: usize, base: u64) {
-        self.bases[row * self.n_experts + expert] = base;
+    /// Record `(row, expert)`'s pageable copy at `base`, its bytes written.
+    pub(crate) fn set(&self, row: usize, expert: usize, base: u64) {
+        self.bases[row * self.n_experts + expert].store(base, Ordering::Release);
+    }
+
+    /// `(row, expert)` has no pageable copy from here on.
+    pub(crate) fn clear(&self, row: usize, expert: usize) {
+        self.bases[row * self.n_experts + expert].store(0, Ordering::SeqCst);
     }
 
     /// `(row, expert)`'s pageable copy, if it has one.
     pub(crate) fn base(&self, row: usize, expert: usize) -> Option<u64> {
-        Some(self.bases[row * self.n_experts + expert]).filter(|&b| b != 0)
+        Some(self.bases[row * self.n_experts + expert].load(Ordering::Acquire)).filter(|&b| b != 0)
     }
 }
 
@@ -165,7 +175,7 @@ mod tests {
     /// none.
     #[test]
     fn a_pageable_copy_is_per_expert_and_absent_until_set() {
-        let mut p = PagedImages::new(3, 4, Arc::new(()));
+        let p = PagedImages::new(3, 4, Arc::new(()));
         assert_eq!(p.base(2, 3), None);
         p.set(2, 3, 0x1_0000);
         p.set(0, 1, 0x2_0000);
@@ -173,5 +183,8 @@ mod tests {
         assert_eq!(p.base(0, 1), Some(0x2_0000));
         assert_eq!(p.base(1, 3), None);
         assert_eq!(p.base(2, 2), None);
+        p.clear(2, 3);
+        assert_eq!(p.base(2, 3), None, "a cleared copy is gone");
+        assert_eq!(p.base(0, 1), Some(0x2_0000));
     }
 }

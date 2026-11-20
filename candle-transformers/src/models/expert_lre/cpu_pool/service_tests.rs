@@ -404,7 +404,7 @@ fn the_service_computes_a_pageable_expert_without_waiting() -> candle::Result<()
     let table = Arc::new(fx.table());
     let fault = Arc::new(FaultWord::new()?);
     // The fixture's slots outlive the service, so the images need no owner.
-    let mut paged = PagedImages::new(table.n_rows(), table.n_experts(), Arc::new(()));
+    let paged = PagedImages::new(table.n_rows(), table.n_experts(), Arc::new(()));
     for e in [1, 3] {
         paged.set(ROW, e, fx.base(e));
     }

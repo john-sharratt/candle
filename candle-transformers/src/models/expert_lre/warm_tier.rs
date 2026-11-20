@@ -26,12 +26,17 @@
 //! Slot `i` is membership entry `i`: slots `0..pinned` are pinned, the rest
 //! pageable. Both are cut to the pack's stride and sector-aligned, so the
 //! startup fill's direct reads land in either with nothing in between.
+//!
+//! **The pinned part is fixed for the process.** Only the pageable part moves:
+//! it is chunks the elastic tier grows while this process is quiet and frees
+//! when it pages (`docs/elastic_warm_tier.md`), which no kernel addresses.
 
+use super::elastic::paged::PagedChunks;
 use super::page_pressure::PAGE_PRESSURE_BYTES;
 use super::pinned::{step_down, WarmPool};
+#[cfg(test)]
 use candle::direct_io::DIRECT_IO_SECTOR;
 use candle::vram::PinnedUse;
-use std::alloc::{alloc, dealloc, Layout};
 
 /// Page-locked host memory the driver must still be able to grant once the
 /// pinned part is sized: an upload from pageable memory, the embedding shadow,
@@ -115,87 +120,27 @@ fn largest_keeping_margin(
     held
 }
 
-/// Sector-aligned pageable slots.
-struct PagedSlots {
-    base: *mut u8,
-    layout: Option<Layout>,
-    slot_size: usize,
-    num_slots: usize,
-}
-
-impl PagedSlots {
-    /// `num_slots` slots of `slot_size`, uninitialised — the startup fill
-    /// writes every one before anything reads it. An allocation the machine
-    /// refuses yields no slots rather than failing the load.
-    fn new(num_slots: usize, slot_size: usize) -> Self {
-        let bytes = num_slots.checked_mul(slot_size).unwrap_or(0);
-        let layout = Layout::from_size_align(bytes, DIRECT_IO_SECTOR)
-            .ok()
-            .filter(|l| l.size() > 0);
-        // SAFETY: `layout` has a non-zero size.
-        let base = layout.map_or(std::ptr::null_mut(), |l| unsafe { alloc(l) });
-        if base.is_null() {
-            return Self {
-                base: std::ptr::null_mut(),
-                layout: None,
-                slot_size,
-                num_slots: 0,
-            };
-        }
-        Self {
-            base,
-            layout,
-            slot_size,
-            num_slots,
-        }
-    }
-
-    fn slot(&self, i: usize, len: usize) -> &[u8] {
-        assert!(
-            i < self.num_slots && len <= self.slot_size,
-            "paged warm slot {i} out of range"
-        );
-        // SAFETY: bounds checked above; the allocation lives as long as `self`.
-        unsafe { std::slice::from_raw_parts(self.base.add(i * self.slot_size), len) }
-    }
-
-    /// One slot, writable — the fill writes the whole tier through
-    /// [`WarmTier::slots_mut`]; this is the tests' way in to a single one.
-    #[cfg(test)]
-    fn slot_mut(&mut self, i: usize, len: usize) -> &mut [u8] {
-        assert!(
-            i < self.num_slots && len <= self.slot_size,
-            "paged warm slot {i} out of range"
-        );
-        // SAFETY: as `slot`, and `&mut self` makes it exclusive.
-        unsafe { std::slice::from_raw_parts_mut(self.base.add(i * self.slot_size), len) }
-    }
-}
-
-impl Drop for PagedSlots {
-    fn drop(&mut self) {
-        if let Some(l) = self.layout {
-            // SAFETY: `base` came from `alloc(l)`.
-            unsafe { dealloc(self.base, l) };
-        }
-    }
-}
-
-// SAFETY: plain owned memory; after the startup fill it is only read.
-unsafe impl Send for PagedSlots {}
-unsafe impl Sync for PagedSlots {}
-
 pub(crate) struct WarmTier {
     pinned: WarmPool,
-    paged: PagedSlots,
+    /// The pageable part, in chunks of `per_chunk` slots: the elastic tier's to
+    /// grow and shrink (`docs/elastic_warm_tier.md`).
+    paged: PagedChunks,
 }
 
 impl WarmTier {
     /// A tier of `want_slots` stride-sized slots: as many pinned as the driver
     /// grants while still leaving it [`DRIVER_LOCK_MARGIN`] to lock and the
     /// device [`ADDRESSABLE_MARGIN`] of `addressable_room` to address, the rest
-    /// pageable.
-    pub(crate) fn new(want_slots: usize, slot_size: usize, addressable_room: Option<u64>) -> Self {
+    /// pageable in whole chunks of `per_chunk` slots — a remainder short of a
+    /// chunk is left for the elastic tier to grow into. `per_chunk` is fixed
+    /// for the process, so it is the model's, not this moment's
+    /// (`elastic::paged::chunk_slots` of the evictable experts).
+    pub(crate) fn new(
+        want_slots: usize,
+        slot_size: usize,
+        per_chunk: usize,
+        addressable_room: Option<u64>,
+    ) -> Self {
         let want_pinned = addressable_pinned_slots(addressable_room, slot_size, want_slots);
         let mut pinned = WarmPool::new(want_pinned, slot_size, PinnedUse::WeightWarmTier);
         // Each probe that fails gives back one step and re-takes the smaller
@@ -214,25 +159,36 @@ impl WarmTier {
         if keep != pinned.num_slots() {
             retake(&mut pinned, keep, slot_size);
         }
-        let paged = PagedSlots::new(want_slots.saturating_sub(pinned.num_slots()), slot_size);
+        let paged = PagedChunks::new(slot_size, per_chunk);
+        let want_chunks = want_slots.saturating_sub(pinned.num_slots()) / paged.per_chunk();
+        // A refusal stops the startup part short; the elastic tier takes the
+        // rest once the machine can spare it.
+        while paged.chunks() < want_chunks && paged.grow() {}
         tracing::info!(
             target: "candle_transformers::expert_lre",
             pinned = pinned.num_slots(),
-            paged = paged.num_slots,
+            paged = paged.slots(),
+            paged_chunks = paged.chunks(),
             pinned_gib = (pinned.num_slots() * slot_size) as f64 / (1u64 << 30) as f64,
-            paged_gib = (paged.num_slots * slot_size) as f64 / (1u64 << 30) as f64,
+            paged_gib = paged.held_bytes() as f64 / (1u64 << 30) as f64,
             pressure_gib = PAGE_PRESSURE_BYTES as f64 / (1u64 << 30) as f64,
             "warm tier: pinned part, then pageable for the rest"
         );
         Self { pinned, paged }
     }
 
+    /// Slots now: the pinned part's and the pageable chunks' as they stand.
     pub(crate) fn num_slots(&self) -> usize {
-        self.pinned.num_slots() + self.paged.num_slots
+        self.pinned.num_slots() + self.paged.slots()
     }
 
     pub(crate) fn paged_slots(&self) -> usize {
-        self.paged.num_slots
+        self.paged.slots()
+    }
+
+    /// The pageable chunks: warm slot `pinned_slots() + p` is their slot `p`.
+    pub(crate) fn paged(&self) -> &PagedChunks {
+        &self.paged
     }
 
     /// Whether slot `i` is page-locked, and so a valid direct upload source.
@@ -264,7 +220,7 @@ impl WarmTier {
         let pinned_n = n.min(self.pinned.num_slots());
         let paged_n = n - pinned_n;
         assert!(
-            paged_n <= self.paged.num_slots,
+            paged_n <= self.paged.slots(),
             "warm tier: {n} slots past the tier"
         );
         let mut out: Vec<&mut [u8]> = self
@@ -272,19 +228,15 @@ impl WarmTier {
             .span_mut(0, pinned_n)
             .chunks_exact_mut(stride)
             .collect();
-        if paged_n > 0 {
-            // SAFETY: bounds checked above; one exclusive borrow of the block.
-            let block = unsafe {
-                std::slice::from_raw_parts_mut(self.paged.base, paged_n * self.paged.slot_size)
-            };
-            out.extend(block.chunks_exact_mut(stride));
-        }
+        // SAFETY: each paged slot once, inside the held chunks (checked
+        // above), and `&mut self` keeps every other borrow and any pop out.
+        out.extend((0..paged_n).map(|p| unsafe { &mut self.paged.slot_mut(p)[..stride] }));
         out
     }
 
     /// Bytes held, both parts.
     pub(crate) fn total_bytes(&self) -> usize {
-        self.pinned.total_bytes() + self.paged.num_slots * self.paged.slot_size
+        self.pinned.total_bytes() + self.paged.held_bytes() as usize
     }
 }
 
@@ -351,23 +303,18 @@ mod tests {
         assert_eq!(largest_keeping_margin(0, |h| h, |_| false), 0);
     }
 
-    /// Pageable slots are sector-aligned and independent.
+    /// Pageable slots are sector-aligned — the startup fill's direct reads
+    /// land in them — and independent.
     #[test]
     fn paged_slots_are_aligned_and_distinct() {
-        let mut p = PagedSlots::new(3, 8192);
-        assert_eq!(p.num_slots, 3);
-        assert_eq!(p.base as usize % DIRECT_IO_SECTOR, 0);
-        p.slot_mut(0, 8192).fill(1);
-        p.slot_mut(2, 8192).fill(3);
+        let p = PagedChunks::new(8192, 3);
+        assert!(p.grow());
+        assert_eq!(p.slot(0, 1).as_ptr() as usize % DIRECT_IO_SECTOR, 0);
+        // SAFETY: one slot at a time.
+        unsafe { p.slot_mut(0) }.fill(1);
+        unsafe { p.slot_mut(2) }.fill(3);
         assert_eq!(p.slot(0, 8192)[8191], 1);
         assert_eq!(p.slot(2, 8192)[0], 3);
-    }
-
-    #[test]
-    fn an_empty_paged_block_has_no_slots() {
-        let p = PagedSlots::new(0, 8192);
-        assert_eq!(p.num_slots, 0);
-        assert!(p.layout.is_none());
     }
 
     /// What staging one pageable slot costs on the host: one expert record copied into a
@@ -379,9 +326,11 @@ mod tests {
     fn bench_staging_one_pageable_slot() {
         const SLOT: usize = 14_155_776; // 13.5 MiB, DeepSeek-V4-Flash's expert record.
         const SLOTS: usize = 64;
-        let mut src = PagedSlots::new(SLOTS, SLOT);
+        let src = PagedChunks::new(SLOT, SLOTS);
+        assert!(src.grow());
         for i in 0..SLOTS {
-            src.slot_mut(i, SLOT).fill(i as u8);
+            // SAFETY: one slot at a time.
+            unsafe { src.slot_mut(i) }.fill(i as u8);
         }
         let mut dst = vec![0u8; SLOT];
         let reps = 200;

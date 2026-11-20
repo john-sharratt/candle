@@ -26,6 +26,10 @@ use super::cpu_pool::params::shared as cpu_params;
 #[cfg(feature = "cuda")]
 use super::dispatch::{CpuPath, Dispatch, OwnerTags};
 #[cfg(feature = "cuda")]
+use super::elastic::controller::{max_chunks, spawn_controller, ControllerCtx, Elastic};
+#[cfg(feature = "cuda")]
+use super::elastic::paged::chunk_slots;
+#[cfg(feature = "cuda")]
 use super::link_rate::measure_link_rate;
 #[cfg(feature = "cuda")]
 use super::live_table::LiveTable;
@@ -164,7 +168,7 @@ const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
 /// against live free RAM instead. See `zend_run_iteration_traps.md` §4.
 pub const WARM_TIER_HEADROOM: u64 = 3 * 1024 * 1024 * 1024;
 
-use candle::vram::{gpu_addressable_room, PAGEABLE_RESERVE};
+use candle::vram::{gpu_addressable_room, host_ram_budget, total_physical_ram, PAGEABLE_RESERVE};
 
 /// Layers of pad slots the stager owns: the layer a wave is computing, and the
 /// [`STAGED_HOPS`] after it, which a prefill launch's router votes stage into
@@ -467,6 +471,10 @@ const CPU_FAULT_LIMIT: u32 = 3;
 /// scores, the copy stream) with `&mut self`; the forward thread reaches it
 /// only through the channel and the pass lock (`dispatch::PassState`).
 pub struct ExpertCache {
+    /// The elastic warm tier's controller, stopped first: it holds a sender
+    /// to the stager. `None` for a cache with no tier to move.
+    #[cfg(feature = "cuda")]
+    _elastic: Option<Elastic>,
     /// Channel to the pipeline thread.
     #[cfg(feature = "cuda")]
     tx: mpsc::SyncSender<PipelineMessage>,
@@ -665,7 +673,7 @@ impl ExpertCache {
             .map_err(candle::Error::wrap)?;
 
         // ── CUDA startup: the pack, then the resident tiers from it ──
-        let (pack, warm, pad, residency, layer_geometries, all_resident, can_fault) =
+        let (pack, warm, pad, residency, layer_geometries, all_resident, can_fault, order) =
             if let Device::Cuda(cuda_dev) = device {
                 let geoms = geometries_of(pack.header())?;
                 let total_experts = num_moe_layers * experts_per_layer;
@@ -734,22 +742,29 @@ impl ExpertCache {
                 };
                 // `num_slots` is exactly what the startup fill will take into
                 // VRAM, in flat order, so it is the prefix the draw skips over.
-                let membership = stratified_membership(
+                // Drawn over every evictable expert: the startup tier is its
+                // prefix, and the elastic tier grows into the rest in order.
+                let order = stratified_membership(
                     num_moe_layers,
                     experts_per_layer,
-                    want_warm,
+                    evictable,
                     num_slots,
                     pinned,
                     WARM_DRAW_SEED,
                 );
+                let membership = &order[..want_warm.min(order.len())];
                 // Pinned as far as the driver grants and the device can address
                 // while keeping both margins, pageable for the rest — see
                 // `warm_tier`. Read after the pad, which is charged against it.
                 if let Some(report) = progress {
                     report(LoadPhase::PinWarm, 0, 0);
                 }
-                let mut warm =
-                    WarmTier::new(membership.len(), stride, gpu_addressable_room(cuda_dev)?);
+                let mut warm = WarmTier::new(
+                    membership.len(),
+                    stride,
+                    chunk_slots(stride, evictable),
+                    gpu_addressable_room(cuda_dev)?,
+                );
                 // A refusal shortens the draw rather than leaving slots the tier
                 // does not have: `ram` must never name a slot outside it.
                 let membership = &membership[..membership.len().min(warm.num_slots())];
@@ -792,7 +807,16 @@ impl ExpertCache {
                     progress,
                 )?;
                 drop(ring);
-                (pack, warm, pad, residency, geoms, all_resident, can_fault)
+                (
+                    pack,
+                    warm,
+                    pad,
+                    residency,
+                    geoms,
+                    all_resident,
+                    can_fault,
+                    order,
+                )
             } else {
                 // Refused above, where the copy stream is created; kept as the
                 // match's other arm so the binding stays a plain `let`.
@@ -886,7 +910,12 @@ impl ExpertCache {
         let churn = pad.churn_slots();
         pad.attach_resident(warm.clone());
         let mut residents = Vec::new();
-        let mut paged = PagedImages::new(num_moe_layers, experts_per_layer, warm.clone());
+        let paged = Arc::new(PagedImages::new(
+            num_moe_layers,
+            experts_per_layer,
+            warm.clone(),
+        ));
+        let mut paged_members = Vec::new();
         for (row, layer) in residency.iter().enumerate() {
             for (expert, res) in layer.iter().enumerate() {
                 if let Some(slot) = res.vram {
@@ -900,6 +929,7 @@ impl ExpertCache {
                     } else {
                         places.set_warm(row, expert, Some(ws));
                         paged.set(row, expert, warm.slot_ref(ws, 1).as_ptr() as u64);
+                        paged_members.push((ws, row, expert));
                     }
                 }
             }
@@ -957,7 +987,7 @@ impl ExpertCache {
             Some(service) => Some(CpuPath::new(
                 cuda_dev_ref,
                 service,
-                Arc::new(paged),
+                paged.clone(),
                 experts_used,
             )?),
             None => None,
@@ -991,7 +1021,7 @@ impl ExpertCache {
         let (landed_tx, landed_rx) = mpsc::channel();
         let stager = spawn_stager(
             StagerCtx {
-                pack,
+                pack: pack.clone(),
                 warm: warm.clone(),
                 pad: pad.clone(),
                 residency: places.clone(),
@@ -1006,9 +1036,46 @@ impl ExpertCache {
                 residents,
                 resident_capacity,
                 host_backed,
+                paged_images: paged,
+                paged_members,
             },
             stager_dead.clone(),
         )?;
+
+        // The elastic tier (`docs/elastic_warm_tier.md`): pageable chunks grown
+        // while this process is quiet and given back when it pages. The pinned
+        // part is never touched. A cache holding every expert in VRAM has no
+        // tier to move.
+        let elastic = if all_resident {
+            None
+        } else {
+            let paged = warm.paged();
+            let expert_budget =
+                total_physical_ram().map_or(0, |t| host_ram_budget(t).expert_pinned_budget_bytes);
+            let pinned_bytes = (warm.pinned_slots() * pad.stride()) as u64;
+            let max_chunks = max_chunks(
+                order.len(),
+                warm.pinned_slots(),
+                paged.per_chunk(),
+                paged.chunk_bytes(),
+                expert_budget,
+                pinned_bytes,
+            );
+            if let Ok(mut s) = stats.lock() {
+                s.warm_paged_chunks = paged.chunks();
+                s.warm_paged_bytes = paged.held_bytes();
+            }
+            Some(spawn_controller(ControllerCtx {
+                warm: warm.clone(),
+                pack,
+                order,
+                stager: stager.clone(),
+                clock: dispatch.clock.clone(),
+                device: cuda_dev_ref.clone(),
+                stats: stats.clone(),
+                max_chunks,
+            })?)
+        };
 
         let trace = Arc::new(Mutex::new(RoutingTrace::new()));
         let pinned_slots = pinned_layer_count(num_moe_layers) * experts_per_layer;
@@ -1038,6 +1105,7 @@ impl ExpertCache {
         let tx = spawn_pipeline_thread(state, pipeline_dead.clone());
 
         Ok(Self {
+            _elastic: elastic,
             tx,
             stager,
             dispatch,

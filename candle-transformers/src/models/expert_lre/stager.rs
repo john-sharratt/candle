@@ -56,6 +56,7 @@
 
 use super::cache::pinned_layer_count;
 use super::cpu_pool::backoff::{Backoff, COOL_DOWN, INTER_LAYER_SPINS, LOW_POWER_CYCLES};
+use super::cpu_pool::cold::PagedImages;
 use super::dispatch::{AbortWord, SummaryRing, SPIN_LIMIT_NS};
 use super::pack::ExpertPack;
 use super::pad::{Fresh, Pad, PadBook, PadSlot};
@@ -69,7 +70,7 @@ use super::warm_tier::WarmTier;
 use candle::direct_io::AlignedScratch;
 use candle::Result;
 use candle_kernels::simple::moe_bucketize::{SUMMARY_COUNT_MASK, SUMMARY_CPU_BIT};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ptr::read_volatile;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -147,6 +148,40 @@ pub(crate) enum StagerMsg {
         source: ReadSource,
         opens_request: bool,
     },
+    /// The elastic tier filled a pageable chunk (`docs/elastic_warm_tier.md`
+    /// §5.3): warm slots `first, first + 1, …` hold `experts`, in order, their
+    /// bytes written. Publish them as sources.
+    PagedGrown {
+        first: usize,
+        experts: Vec<(usize, usize)>,
+    },
+    /// Give up warm slots `first..` — the last pageable chunk: drop them as
+    /// sources, and answer on `done` once no read and no invocation can still
+    /// reach them.
+    PagedShrink {
+        first: usize,
+        done: mpsc::Sender<()>,
+    },
+    /// Look at a draining shrink again: the reclaim clock may have moved
+    /// without a routed row (`ReclaimClock::settled`).
+    Drain,
+}
+
+/// A pageable shrink waiting on its readers.
+struct PagedShrink {
+    /// Warm slots at and past this are going.
+    first: usize,
+    /// Every invocation that could have read one of their CPU-pool copies
+    /// before they were cleared began at or before this ticket.
+    key: u64,
+    done: mpsc::Sender<()>,
+}
+
+/// Whether a pageable shrink of the slots from `first` may finish: no read
+/// out of them is in flight (`warm_reads`, the warm slot each in-flight read
+/// copies from) and every invocation up to `key` is done.
+fn paged_drained(warm_reads: impl IntoIterator<Item = usize>, first: usize, quiet: bool) -> bool {
+    quiet && warm_reads.into_iter().all(|ws| ws < first)
 }
 
 /// Where a reader's bytes come from.
@@ -215,6 +250,10 @@ pub(crate) struct StagerCtx {
     /// Which experts hold a resident slot, for the VRAM eviction's cost
     /// classes; the stager keeps it current as it relabels.
     pub(crate) host_backed: Arc<HostBacked>,
+    /// The pageable copies the CPU pool computes from.
+    pub(crate) paged_images: Arc<PagedImages>,
+    /// The startup fill's pageable members, `(warm slot, row, expert)`.
+    pub(crate) paged_members: Vec<(usize, usize, usize)>,
 }
 
 struct Stager {
@@ -258,6 +297,15 @@ struct Stager {
     host: HostScores,
     /// How many residents each layer may hold, around the startup fill's.
     bands: Bands,
+    /// The expert in each pageable warm slot, by slot.
+    paged: BTreeMap<usize, (usize, usize)>,
+    /// Reads in flight out of a warm slot: pad slot → warm slot.
+    warm_reads: HashMap<usize, usize>,
+    /// A pageable shrink waiting on its readers.
+    paged_shrink: Option<PagedShrink>,
+    /// Something a draining shrink waits on may have moved: look again at the
+    /// end of the pass, behind the demand row's reads.
+    drain_due: bool,
 }
 
 /// The share of a layer's experts a row must route to count as wide
@@ -357,7 +405,17 @@ pub(crate) fn spawn_stager(
         active: Instant::now(),
         host,
         bands,
+        paged: BTreeMap::new(),
+        warm_reads: HashMap::new(),
+        paged_shrink: None,
+        drain_due: false,
     };
+    s.paged = s
+        .ctx
+        .paged_members
+        .drain(..)
+        .map(|(ws, row, expert)| (ws, (row, expert)))
+        .collect();
     std::thread::Builder::new()
         .name("expert-stager".into())
         .spawn(move || {
@@ -503,6 +561,9 @@ impl Stager {
                 progressed |= self.assign()?;
             }
             progressed |= self.serve_spec()?;
+            if std::mem::take(&mut self.drain_due) {
+                self.drain_paged();
+            }
             let idle = self.routed.is_empty() && self.demand.is_none() && self.in_flight == 0;
             if idle && (self.spec.is_empty() || self.spec_stalled) {
                 if self.disconnected {
@@ -559,11 +620,25 @@ impl Stager {
     }
 
     fn handle(&mut self, m: StagerMsg) -> Result<()> {
-        // Any message can change what the speculative queue may take, and
-        // every one is inference running.
+        // The elastic tier's messages are not inference: they leave the
+        // cool-down where it is.
+        let m = match m {
+            StagerMsg::PagedGrown { first, experts } => return self.paged_grown(first, experts),
+            StagerMsg::PagedShrink { first, done } => return self.paged_shrink(first, done),
+            StagerMsg::Drain => {
+                self.drain_paged();
+                return Ok(());
+            }
+            m => m,
+        };
+        // Any other message can change what the speculative queue may take,
+        // and every one is inference running.
         self.spec_stalled = false;
         self.active = Instant::now();
         match m {
+            StagerMsg::PagedGrown { .. } | StagerMsg::PagedShrink { .. } | StagerMsg::Drain => {
+                unreachable!("the elastic tier's messages are handled above")
+            }
             StagerMsg::Routed {
                 row,
                 slot,
@@ -588,6 +663,9 @@ impl Stager {
                 self.in_flight -= 1;
                 let (row, expert) = self.book.landed(slot);
                 self.loading.remove(&(row, expert));
+                if self.warm_reads.remove(&slot).is_some() && self.paged_shrink.is_some() {
+                    self.drain_due = true;
+                }
                 // Still speculative — not promoted to a demand read by its row
                 // beginning — so its row is ahead and may list it.
                 let ahead = self.spec_loads.remove(&(row, expert)).is_some();
@@ -631,6 +709,73 @@ impl Stager {
             }
         }
         Ok(())
+    }
+
+    /// Warm slots `first..` hold `experts`, written: each becomes a source —
+    /// the stager's for a read into the pad, the CPU pool's to compute from —
+    /// and host-backed to the VRAM eviction.
+    fn paged_grown(&mut self, first: usize, experts: Vec<(usize, usize)>) -> Result<()> {
+        let residency = self.ctx.residency.clone();
+        let mut places = residency
+            .lock()
+            .map_err(|_| candle::Error::Msg("expert stager: residency poisoned".into()))?;
+        for (i, (row, expert)) in experts.into_iter().enumerate() {
+            let ws = first + i;
+            let base = self.ctx.warm.slot_ref(ws, 1).as_ptr() as u64;
+            places.set_warm(row, expert, Some(ws));
+            self.ctx.paged_images.set(row, expert, base);
+            self.ctx.host_backed.set(row, expert, true);
+            self.paged.insert(ws, (row, expert));
+        }
+        Ok(())
+    }
+
+    /// Drop warm slots `first..` as sources: no new read is started out of
+    /// them and the CPU pool finds no copy there from now on. The chunk may go
+    /// once the reads already out have landed and every invocation that could
+    /// have read a copy before the clear is done ([`Self::drain_paged`]).
+    fn paged_shrink(&mut self, first: usize, done: mpsc::Sender<()>) -> Result<()> {
+        if self.paged_shrink.is_some() {
+            // One shrink at a time: the controller waits for each answer, so
+            // this is never sent; refusing it keeps the chunk held.
+            return Ok(());
+        }
+        let gone = self.paged.split_off(&first);
+        {
+            let residency = self.ctx.residency.clone();
+            let mut places = residency
+                .lock()
+                .map_err(|_| candle::Error::Msg("expert stager: residency poisoned".into()))?;
+            for &(row, expert) in gone.values() {
+                places.set_warm(row, expert, None);
+                self.ctx.paged_images.clear(row, expert);
+                // Host-backed still if a resident pad slot holds it.
+                let resident = places
+                    .place(row, expert)
+                    .pad
+                    .is_some_and(|(slot, _)| self.book.is_resident(slot));
+                self.ctx.host_backed.set(row, expert, resident);
+            }
+        }
+        let key = self.ctx.clock.readers_key();
+        self.paged_shrink = Some(PagedShrink { first, key, done });
+        self.drain_paged();
+        Ok(())
+    }
+
+    /// Finish a pageable shrink once nothing can reach its slots.
+    fn drain_paged(&mut self) {
+        let Some(s) = &self.paged_shrink else {
+            return;
+        };
+        let quiet = self.ctx.clock.reclaimable(s.key);
+        if !paged_drained(self.warm_reads.values().copied(), s.first, quiet) {
+            return;
+        }
+        if let Some(s) = self.paged_shrink.take() {
+            // A controller gone with the cache has nothing left to free.
+            let _ = s.done.send(());
+        }
     }
 
     /// Re-choose the resident set at a pass boundary (`resident::plan`): a
@@ -816,6 +961,9 @@ impl Stager {
         if !d.unassigned.is_empty() || !d.pending.is_empty() {
             self.demand = Some(d);
         }
+        // The clock has moved: a draining shrink may finish, once this row's
+        // reads are out.
+        self.drain_due = self.paged_shrink.is_some();
         Ok(())
     }
 
@@ -1026,6 +1174,10 @@ impl Stager {
         priority: Priority,
     ) -> Result<ReadJob> {
         let source = self.source(row, expert)?;
+        if let Source::Warm(ws) = source {
+            // A pageable shrink waits for this read before its chunk goes.
+            self.warm_reads.insert(slot, ws);
+        }
         let ahead = priority == Priority::Speculative;
         self.book.start_load(slot, row, expert, ahead);
         self.loading.insert((row, expert));
@@ -1151,7 +1303,24 @@ impl Stager {
 
 #[cfg(test)]
 mod tests {
-    use super::{demand_left_behind, overwritable, wide_row};
+    use super::{demand_left_behind, overwritable, paged_drained, wide_row};
+
+    /// A pageable shrink finishes only once no read out of its slots is in
+    /// flight and its readers' invocations are done; reads out of the slots
+    /// below it do not hold it.
+    #[test]
+    fn a_paged_shrink_waits_for_its_reads_and_its_readers() {
+        assert!(paged_drained([], 100, true));
+        assert!(paged_drained([12, 99], 100, true), "reads below the chunk");
+        assert!(
+            !paged_drained([12, 100], 100, true),
+            "a read out of the chunk"
+        );
+        assert!(
+            !paged_drained([], 100, false),
+            "an invocation may still read a copy"
+        );
+    }
 
     /// A quarter of the layer routed is wide; less is not, and an empty layer
     /// never is.

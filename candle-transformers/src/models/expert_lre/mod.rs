@@ -153,6 +153,10 @@ pub(crate) mod compute;
 pub mod cpu_pool;
 #[cfg(feature = "cuda")]
 mod dispatch;
+/// The elastic warm tier: the pageable part grown and shrunk with the
+/// machine's RAM (`docs/elastic_warm_tier.md`).
+#[cfg(feature = "cuda")]
+mod elastic;
 #[cfg(test)]
 mod eval;
 /// The word a live launch's workers report a lost cold expert in.

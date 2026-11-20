@@ -103,7 +103,6 @@ impl PadBook {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn is_resident(&self, slot: usize) -> bool {
         self.resident[slot]
     }

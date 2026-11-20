@@ -1,8 +1,19 @@
-# The elastic warm tier — pinned expert RAM that follows the machine
+# The elastic warm tier — pageable expert RAM that follows the machine
 
-**Status:** design (2026-11-21). Builds on the warm tier and the pad of
-`docs/expert_cache_design.md` §6.3 and §6.5, which it changes from a size
-chosen once at load into one the process keeps adjusting.
+**Status:** built (2026-11-21). Builds on the warm tier and the pad of
+`docs/expert_cache_design.md` §6.3 and §6.5. The warm tier's **pinned part is
+sized once at load and never touched after**; its **pageable part** changes
+from a size chosen once at load into one the process keeps adjusting.
+
+**Why not the pinned part.** A first build grew and shrank the pinned part in
+`cuMemAllocHost` segments, behind a mapped range table the bucketize kernels
+read (a97f820d5, reverted by 955760c89). Pinned memory is the wrong thing to
+move: `cuMemFreeHost` may synchronise the device mid-wave, every pinned byte is
+charged against WDDM's GPU-addressable budget and the driver's page-lock
+ceiling that the uploads need, and it is the one memory the OS cannot take
+back anyway — the pageable part is what the OS trims and what a build competes
+for. So the kernels keep their two fixed ranges, and only memory no kernel
+addresses moves.
 
 ## 1. Why
 
@@ -37,12 +48,13 @@ fault on it stalls the wave.
    paging, and no further.
 2. **Count only its own paging.** Other processes page all the time — a
    minimized app is trimmed to the pagefile and that is the OS doing its job.
-   Their paging says nothing about whether this process has too much pinned.
+   Their paging says nothing about whether this process holds too much.
 3. **React fast to a build**: when another process starts using RAM, give it
    back within seconds, so the machine recovers before the build thrashes.
-4. **Not churn.** A grow that will be undone a minute later costs a
-   `cuMemAllocHost` and a fill; a shrink costs the experts it held. The tier
-   settles near its steady size and probes past it rarely.
+4. **Not churn.** A grow that will be undone a minute later costs an
+   allocation and a gigabyte of pack reads; a shrink costs the experts it held.
+   The tier settles near its steady size and probes past it rarely.
+5. **Never touch the pinned part**, nor anything a kernel addresses.
 
 ## 3. The signals
 
@@ -62,9 +74,8 @@ thread.
   `SLOPE_TICKS`, the early signal: a build allocating gigabytes a second empties
   the free list before the OS starts trimming anyone, and waiting for this
   process's faults would wait until the damage was done.
-- **What the tier may still take from the driver**: the GPU-addressable room
-  (`gpu_addressable_room`, WDDM's non-local budget) less `ADDRESSABLE_MARGIN`,
-  and `cuMemAllocHost`'s own answer.
+- **The allocator's own answer**: a refused chunk is a ceiling (§4.3). The
+  driver's budgets do not bound the pageable part: the device never maps it.
 
 The system-wide pages-in rate (`host_perf`) is **not** an input: it counts every
 process's paging (§2 item 2).
@@ -76,7 +87,8 @@ the process is quiet.
 ## 4. The controller
 
 A pure function of the signals and its own state, `elastic::policy`, called once
-a tick; it answers `Hold`, `Grow` or `Shrink(n)` in segments (§5). Every
+a tick; it answers `Hold`, `Grow` or `Shrink(n)` in chunks of the pageable
+part (§5; the policy's code calls them segments). Every
 constant below is a starting value the balloon runs (§8) tune.
 
 ### 4.1 Shrink — fast, multiplicative
@@ -98,7 +110,7 @@ A grow is one segment, at most once per `GROW_DWELL` (5 s), when:
 - the slow fault average is below `QUIET_FAULTS` (25/s), and has been for
   `QUIET_TICKS` (15 s);
 - no shrink in the last `GROW_DWELL`;
-- the tier is below its **ceiling** (§4.3) and below what the driver allows;
+- the tier is below its **ceiling** (§4.3) and its bound (§4.4);
 - available RAM ≥ `HEADROOM` + one segment.
 
 Past that last bound — RAM full of other processes' idle pages — the tier may
@@ -130,83 +142,77 @@ time.
 
 ### 4.4 Bounds
 
-- **Ceiling of the whole tier**: every evictable expert, the host partition's
-  expert budget (`expert_pinned_budget`), and the addressable room less its
-  margin — the bounds the startup sizing uses (`warm_slots_for`), applied at
-  every grow.
+- **Ceiling of the pageable part**: the draw's experts past the pinned part, in
+  whole chunks, and the host partition's expert budget
+  (`expert_pinned_budget`) less the pinned part (`controller::max_chunks`).
 - **Floor**: none. The pad's churn block makes every expert computable at any
   warm size (`expert_cache_design.md` §4).
 
 ## 5. The mechanism
 
-### 5.1 Segments
+### 5.1 Chunks
 
-The pinned part becomes a list of **segments**, each one `cuMemAllocHost` block
-of `SEGMENT_BYTES` (1 GiB) cut to whole slots. Kernels read only memory from
-`cuMemAllocHost` (`quantized/cuda.rs`, `alloc_host_mapped`: a registered range is
-refused by `cuMemHostGetDevicePointer` on WDDM). The startup sizing takes its
-pinned part as segments too, so the tier can shrink below its startup size.
+The pageable part is a list of **chunks**, each one ordinary heap allocation of
+`CHUNK_BYTES` (1 GiB) cut to whole slots, sector-aligned for the direct reads
+(`elastic::paged`). The chunk size is fixed for the process at the model's
+(`chunk_slots(stride, evictable)`). The startup sizing takes its pageable part
+as whole chunks; a remainder short of one is left for the controller to grow
+into.
 
-Pad slot indices stay what they are: the churn block's `0..churn`, then the
-resident region's slots in segment order. A slot's address is its segment's base
-plus its offset, looked up in a table the pad holds behind a lock (readers take
-it once per read).
+Warm slot `i` is still membership entry `i`: `0..pinned` the pinned part, then
+the pageable slots in chunk order. The membership is drawn once over **every**
+evictable expert (`stratified_membership`): the startup tier is its prefix, and
+chunk `c` holds the next `per` entries past the pinned part, so a chunk given
+back and taken again holds the same experts.
 
-### 5.2 The range table
+Nothing on the device addresses a pageable slot. Its two readers are host
+threads: the stager's readers, which copy a pageable copy into the pad
+(`Source::Warm`), and the CPU pool, which computes from it in place
+(`cpu_pool::cold::PagedImages`). So no kernel, range table or driver call is
+involved in moving one.
 
-The bucketize kernel and the CPU pool tell a pinned host copy from a VRAM one by
-its address: today, inside one of two fixed ranges (`PinnedRanges`, the warm
-block and the pad). With segments there are up to `MAX_RANGES` (128) ranges.
+### 5.2 Growing and shrinking
 
-They live in a **range table in mapped pinned memory** — `u32 count` then
-`(lo, hi)` pairs — whose device address the kernel takes in place of the two
-pairs. The address is fixed for the process's life, so a captured graph replays
-reading the table as it stands. The host writes it under two rules:
+The stager owns the residency places, so it publishes and withdraws; the
+controller allocates, fills and frees.
 
-- **A range is added before any entry points into it**: the pair is written,
-  then the count, with a system fence between. A segment's slots are published
-  only after a read lands in them, long after.
-- **A range is removed after no entry points into it and no invocation could
-  have snapshotted one** (§5.3): the last pair is copied over it, a fence, then
-  the count is decremented. A kernel reading between the two sees the moved pair
-  twice, never a pair missing.
+- **Grow**: the controller appends a chunk, fills each slot from the pack with
+  a positioned direct read (`ExpertPack::read_into`), then sends the stager
+  `PagedGrown`: each expert gets its warm slot (`Residency::set_warm`), its
+  CPU-pool copy (`PagedImages::set`) and its host-backed mark for the VRAM
+  eviction. Nothing names a slot until its bytes are written.
+- **Shrink**: the controller sends `PagedShrink` for the last chunk. The stager
+  withdraws its experts — no warm slot, no CPU-pool copy, host-backed only if a
+  resident pad slot still holds one — and reads the readers' key
+  (`ReclaimClock::readers_key`) after the clears. The chunk is **drained** when
+  no read it started out of the chunk is still in flight and every invocation up
+  to the key is done: the pool reads a copy only inside the invocation that
+  routed it. The stager answers; the controller frees the chunk, and drains the
+  next one a multi-chunk shrink owes.
+- **Idle drain.** The key is the latest invocation begun, and while inference is
+  idle nothing later begins to prove it done. So a drain that waits a whole tick
+  with no invocation begun has the controller read the latest started ticket,
+  wait out a context-wide synchronise (only while no segment records,
+  `try_without_recording`), and settle the clock past it
+  (`ReclaimClock::settled`), then nudge the stager (`Drain`).
 
-### 5.3 Growing and shrinking the pad
+### 5.3 What stays
 
-The stager owns the pad's book (`PadBook`), so it executes both.
-
-- **Grow**: the controller allocates the segment, adds its range, and sends it
-  to the stager, which appends its slots to the book as free churn slots and
-  raises the resident capacity by as many. The resident set fills them by the
-  ordinary relabel (`resident::plan`) as reads land.
-- **Shrink**: the stager marks the last segment's slots **retiring**: off the
-  free list, never a read's target. Each held one is evicted as a churn victim
-  is (`Stager::evict`: entry retargeted, retire key read after a fence), once its
-  pins and carry pins are released. A loading one is evicted when it lands. The
-  segment is **drained** when every slot is free and every retire key it took
-  is reclaimable (`reclaim.rs`). The stager then hands it back; the controller
-  removes the range and frees the block. The resident capacity drops by the
-  segment first, so the relabel never promotes into it.
-- **Bands** (`resident::Bands`) scale with the capacity: each layer's band is its
-  startup share of the *current* capacity, not of the startup one.
-
-### 5.4 What stays
-
-- The **pageable part** of the tier, and its static membership.
-- The startup sizing, as the tier's **first** size: conservative, as it is, and
-  now only a starting point.
-- The driver's margins: `ADDRESSABLE_MARGIN` against the non-local budget is
-  checked at every grow, and a refused `cuMemAllocHost` is a ceiling until the
-  back-off lifts it.
+- The **pinned part**, fixed at its startup size for the process: the pad's
+  resident region, and the bucketize kernels' two fixed ranges.
+- The startup sizing, as the pageable part's **first** size.
 
 ## 6. Telemetry
 
 On each change, and once a minute:
 
 ```
-warm tier: elastic segments=N gib=… change=grow|shrink(reason) faults_fast=… faults_slow=…
-           available_gib=… ceiling=… backoff_s=… pressed=…
+warm tier: elastic chunks=N paged_gib=… change=grow|refused|shrink(reason) faults_fast=…
+           faults_slow=… available_gib=… ceiling=… backoff_s=… pressed=… draining=…
 ```
+
+and `warm tier: elastic chunk filled chunk=… fill_ms=…`, `warm tier: elastic
+chunks freed chunks=… reason=… drain_ms=…`.
 
 The stats table carries the same fields, so `/v1/status` and the GUI can show
 the tier moving.
@@ -221,10 +227,13 @@ the tier moving.
   - a long quiet period halves it;
   - another process's paging, as available RAM falling with no fault of this
     process's, does not shrink below the build rule.
-- **The range table**: an added range is seen; a removed one moves the last
-  pair over it and is never missing from a concurrent read.
-- **The pad book**: grown slots are free churn; retiring slots are never taken;
-  a drained segment reports only once every slot is free.
+- **The chunks**: slots index across chunks in order, grow and shrink at the
+  end, the slots below never move; a slot past the chunks is refused.
+- **The membership**: chunk `c` holds the draw's next experts past the pinned
+  part; the bound is the lesser of the draw and the budget.
+- **The drain**: a shrink waits for reads out of its chunk and for its readers'
+  invocations; a settled clock completes everything begun and nothing after.
+- **The CPU pool's copies**: a cleared copy is gone, the others stay.
 - **The probes**: the Windows process records parse at their offsets from raw
   bytes; this process's own record is found, its resident bytes grow with what
   it touches, and its fault count never falls. Paging a process out on demand is
@@ -257,8 +266,9 @@ Run on BlackWorld and WhiteWorld, beside a serving motherd:
 
 1. The per-process fault probe, with its test.
 2. The policy, pure, with its tests.
-3. The segmented pinned part and the range table, the kernel taking the table.
-4. Grow and shrink in the pad book and the stager.
+3. The pageable part in chunks, the membership drawn over every evictable
+   expert.
+4. Publish and withdraw in the stager, with the drain.
 5. The controller thread and the telemetry.
 6. The balloon harness.
 7. Runs on BlackWorld and WhiteWorld; constants tuned from them, recorded here.
