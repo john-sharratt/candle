@@ -1355,6 +1355,12 @@ impl ConversationEngine {
         self.conversation.read().holds_whole(timeline)
     }
 
+    /// Whether some turn of `timeline` is a gap: another member's turn whose
+    /// records are still arriving — the only kind of hole catch-up fills.
+    pub fn holds_gap(&self, timeline: TimelineId) -> bool {
+        self.conversation.read().holds_gap(timeline)
+    }
+
     /// Seed `target`'s pool with `candidates` at `momentum`, in list order
     /// while the pool has room. Returns the candidates that did not enter.
     pub fn working_set_seed(

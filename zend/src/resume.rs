@@ -259,10 +259,59 @@ pub fn round_answered(engine: &ConversationEngine, timeline: TimelineId, call_tu
     answered(call_turn, turns.into_iter())
 }
 
+/// Whether a conversation is held whole enough to resume over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wholeness {
+    /// Every turn's content is here.
+    Whole,
+    /// A gap is still arriving — another member's turn catch-up will fill.
+    Arriving,
+    /// A turn is empty that no catch-up will fill: this member's own, its K/V
+    /// lost with a process that died before writing it, or one retired in
+    /// place. Resumed over, the round would answer as if it had never been
+    /// said, so the request ends instead.
+    Lost,
+}
+
+/// [`Wholeness`] from whether every turn holds its content and whether a gap
+/// is among those that do not.
+pub fn wholeness(whole: bool, gap: bool) -> Wholeness {
+    match (whole, gap) {
+        (true, _) => Wholeness::Whole,
+        (false, true) => Wholeness::Arriving,
+        (false, false) => Wholeness::Lost,
+    }
+}
+
+/// [`wholeness`], asked of the substrate.
+pub fn wholeness_of(engine: &ConversationEngine, timeline: TimelineId) -> Wholeness {
+    wholeness(engine.holds_whole(timeline), engine.holds_gap(timeline))
+}
+
+/// End `timeline`'s unfinished request without running it: its entries —
+/// the call turn, the pending message, a handed mark — are retracted, so no
+/// member resumes it, and the conversation stands at its last sealed round
+/// for the next message.
+pub fn abandon(engine: &ConversationEngine, timeline: TimelineId) {
+    clear_call_turn(engine, timeline);
+    clear_message(engine, timeline);
+    clear_handed(engine, timeline);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{answered, unfinished_of, Resuming, Unfinished};
+    use super::{answered, unfinished_of, wholeness, Resuming, Unfinished, Wholeness};
     use candle_conversation::projection::TimelineId;
+
+    /// **Only a gap is waited for.** A conversation whole resumes; one with a
+    /// gap waits for catch-up; one with an empty turn and no gap holds a hole
+    /// nothing will fill, and its request ends.
+    #[test]
+    fn only_a_gap_is_waited_for() {
+        assert_eq!(wholeness(true, false), Wholeness::Whole);
+        assert_eq!(wholeness(false, true), Wholeness::Arriving);
+        assert_eq!(wholeness(false, false), Wholeness::Lost);
+    }
 
     /// One conversation is resumed once at a time on a member, and free again
     /// once its resume ends.

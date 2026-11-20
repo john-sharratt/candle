@@ -94,7 +94,23 @@ nothing on. Its turns stay resumable: their entries are durable, and the member
 resumes them when it starts again. Another member takes them only through what
 already exists: a worker after `RESUME_AFTER_MS`, a dialogue not until its own
 member returns. Telling a dead member from a slow one needs a liveness signal
-stronger than the beat, which is outside this change.
+stronger than the beat, which is outside this change. (keep stops a member
+cleanly before it would kill it, `docs/replicated_substrate.md` §3.5, so a
+deploy or a restart is a leave, not a death.)
+
+**A sealed turn's K/V is written within a persistence pass or two of its seal,
+pinned or not** (`Substrate::cold_pending`). A working-set pin governs
+eviction only. Deferred while pinned, an active conversation's own turns
+reached the redo log only once it went quiet, and a member killed mid-answer
+came back with their tokens and no K/V (BlackWorld, 2026-11-21).
+
+**A hole no catch-up fills ends the request.** Resume waits up to 120 s only
+for a *gap* — another member's turn still arriving. A turn that is empty and no
+gap — this member's own, sealed in the second or two before a crash with its
+K/V still queued, or retired in place — no member holds. Resumed over, the
+round would answer as if it had never been said; left to "one that does", it
+stayed unfinished forever. Its entries are retracted (`resume::abandon`) and the
+conversation stands at its last sealed round for the next message.
 
 ## 7. Tests
 

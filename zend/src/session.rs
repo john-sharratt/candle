@@ -164,7 +164,7 @@ use crate::repo_path::shown as shown_unit;
 use crate::repo_scan::{utility_config, DIR_KEY};
 use crate::resident::Resident;
 use crate::resume;
-use crate::resume::Unfinished;
+use crate::resume::{Unfinished, Wholeness};
 use crate::retrieval_scope::{Readers, RetrievalScope};
 use crate::round_timing::{self, RoundTiming};
 use crate::self_check::{self, Report as SelfCheckReport};
@@ -5731,16 +5731,15 @@ const WHOLE_WAIT: Duration = Duration::from_secs(120);
 /// How often it looks.
 const WHOLE_LOOK: Duration = Duration::from_millis(500);
 
-/// Whether this member holds `timeline` whole — every turn's content here, no
-/// gap — waiting up to [`WHOLE_WAIT`] for catch-up to fetch what is missing.
-async fn wait_whole(state: &InferenceState, timeline: TimelineId) -> bool {
+/// How whole this member holds `timeline`, waiting up to [`WHOLE_WAIT`] while
+/// a gap is still arriving for catch-up to fetch it. A hole no catch-up fills
+/// is answered at once (`resume::Wholeness::Lost`): waiting cannot mend it.
+async fn wait_whole(state: &InferenceState, timeline: TimelineId) -> Wholeness {
     let until = tokio::time::Instant::now() + WHOLE_WAIT;
     loop {
-        if state.engine.holds_whole(timeline) {
-            return true;
-        }
-        if tokio::time::Instant::now() >= until {
-            return false;
+        let held = resume::wholeness_of(&state.engine, timeline);
+        if held != Wholeness::Arriving || tokio::time::Instant::now() >= until {
+            return held;
         }
         tokio::time::sleep(WHOLE_LOOK).await;
     }
@@ -5917,15 +5916,36 @@ async fn resume_conversation(
     // other member's newest turns as gaps, and its rounds reasoned from a
     // conversation that stopped short of them. Catch-up fills the gaps; this
     // waits for it.
-    if !wait_whole(state, timeline).await {
-        tracing::warn!(
-            conv_id = %conv_id,
-            ?unfinished,
-            "resume: this member does not hold the conversation whole; its request is left \
-             to one that does",
-        );
-        turn_claims::release(claim, conv_id).await;
-        return false;
+    match wait_whole(state, timeline).await {
+        Wholeness::Whole => {}
+        Wholeness::Arriving => {
+            tracing::warn!(
+                conv_id = %conv_id,
+                ?unfinished,
+                "resume: this member does not hold the conversation whole; its request is left \
+                 to one that does",
+            );
+            turn_claims::release(claim, conv_id).await;
+            return false;
+        }
+        // **A hole only this member could have filled ends the request.** Its
+        // own turn whose K/V died with the process before it was written, or
+        // one retired in place: no member holds it, so leaving the request to
+        // "one that does" left it unfinished forever — the chat looking
+        // mid-answer to its reader, and every sweep passing it over
+        // (BlackWorld, 2026-11-21). The conversation stands at its last sealed
+        // round for the next message.
+        Wholeness::Lost => {
+            tracing::warn!(
+                conv_id = %conv_id,
+                ?unfinished,
+                "resume: a turn of the conversation is lost here and no member holds it; the \
+                 request is ended at its last sealed round",
+            );
+            resume::abandon(engine, timeline);
+            turn_claims::release(claim, conv_id).await;
+            return false;
+        }
     }
     // Read again under the claim: a member that held it until a moment ago
     // may have finished the request in between.

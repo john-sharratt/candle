@@ -534,10 +534,10 @@ fn run_loop(
             // seal — the pending sets only shrink and this loop always converges.
             //
             // Clear the in-flight decode's now-stale working-set pins: normally
-            // `snapshot_pending_warm`/`snapshot_pending_cold` skip pinned
-            // residences (the decode is actively attending them), but with the
-            // scheduler stopped nothing attends anything, so every hot turn must
-            // be drainable — otherwise a pinned turn stays hot-only and un-durable.
+            // `snapshot_pending_warm` defers an already-persisted pinned
+            // residence's warm copy (the decode is actively attending it), but
+            // with the scheduler stopped nothing attends anything, so every hot
+            // turn is drainable.
             // Shutdown drain: an empty keep-set stamps nothing, which is right —
             // nothing is attending, so every residence should age out.
             conversation.read().release_working_set_pins();

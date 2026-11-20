@@ -2702,8 +2702,8 @@ impl Substrate {
     /// must capture warm — see the in-body note). Walks the warm set, so hot
     /// residency is irrelevant here: a warm-only slot whose hot was evicted is
     /// STILL captured (this is why the shutdown drain reaches every warm turn).
-    /// Skips slots pinned into the in-flight decode's working set and slots whose
-    /// cold copy already landed or is queued (`COLD_PENDING`).
+    /// Skips slots whose cold copy already landed or is queued (`COLD_PENDING`);
+    /// a working-set pin skips nothing ([`Self::cold_pending`]).
     pub fn snapshot_pending_cold(&self) -> Vec<(ResidenceIndex, StreamId, Vec<SealedSequence>)> {
         // We persist the **warm** tier, not hot. In the quantize-on-evict path
         // warm holds the compressed chunks and hot still holds the source
@@ -2713,18 +2713,6 @@ impl Substrate {
             .into_iter()
             .filter_map(|idx| {
                 let slot = self.residences.get(idx);
-                // Skip the in-flight decode's pinned working set — the warm→cold
-                // analogue of the hot→warm skip in `snapshot_pending_warm` (the fix
-                // 47a9c5ba applied only to the hot→warm leg). A just-cold-recalled
-                // working set lands warm-resident and would be gathered warm→cold on
-                // the very next pass; that GPU gather shares the copy stream and
-                // the sealed arenas the in-flight
-                // decode is still creeping into (Arc-shared via `inject_arc_sealed`),
-                // so it de-syncs the slot's per-layer fill (layer 0 races a chunk
-                // ahead) and the concurrent reproject's `reserve_glue_gap` trips
-                // "layer gap index diverged". Durability is only deferred: the hot +
-                // warm copies stay resident while pinned, and the next unpinned pass
-                // writes cold.
                 if !self.cold_pending(idx) {
                     return None;
                 }
@@ -2735,6 +2723,16 @@ impl Substrate {
     }
 
     /// Whether `idx` is a warm residence the warm→cold phase may write now.
+    ///
+    /// **A working-set pin never defers it.** A pin says a live slot reads the
+    /// residence, which governs eviction, not durability: the write reads the
+    /// warm copy out of its CPU arenas (`seal_to_chunk_images_cpu`), touches no
+    /// device memory and no stream, and [`Self::install_cold`] keeps a pinned
+    /// residence's hot and warm copies. Deferred while pinned, a conversation's
+    /// own turns — pinned for as long as it is active — reached the redo log
+    /// only once it went quiet: a kill on BlackWorld (2026-11-21) brought one
+    /// back with its turns' tokens and no K/V, empty to the projection and
+    /// never resumable.
     fn cold_pending(&self, idx: ResidenceIndex) -> bool {
         let r = self.residences.get(idx);
         // Skip a turn whose cold copy already landed OR whose async cold write
@@ -2743,10 +2741,7 @@ impl Substrate {
         // cold-persists: its KV is spliced by reference onto a durable file
         // timeline, so a cold copy would only strand an orphan when the fork's
         // decl drops at tombstone.
-        r.has_warm()
-            && !r.is_pinned()
-            && !r.has_cold()
-            && !r.has_flag(COLD_PENDING | NO_COLD_PERSIST)
+        r.has_warm() && !r.has_cold() && !r.has_flag(COLD_PENDING | NO_COLD_PERSIST)
     }
 
     /// Count of warm residences awaiting a cold write — the cheap COUNT companion
@@ -12405,55 +12400,49 @@ mod tests {
         );
     }
 
-    /// A pinned warm residence is withheld from the warm→cold work list, and
-    /// returns to it as soon as the keep-set is republished without it.
-    ///
-    /// The durability half of [`set_working_set_pins_replaces_wholesale`],
-    /// which covers only eviction. `snapshot_pending_cold`'s pin skip defers a
-    /// *redo-log append*, so a pin that outlives the slot which published it
-    /// does not merely delay reclaiming VRAM — the turn stays hot+warm and is
-    /// never written, and `pending_cold_count` reports nothing pending because
-    /// it mirrors the same filter. That is how a `repo_map` unit's first turn
-    /// came to persist with token_ids, a block range and zero `Chunk` records.
+    /// **A pinned warm turn is written cold like any other, and keeps its
+    /// resident copies.** A pin governs eviction, never durability: a
+    /// conversation pins its own turns for as long as it is active, and a
+    /// write deferred by the pin left a killed member with those turns' tokens
+    /// and no K/V — empty to the projection, never resumable (BlackWorld,
+    /// 2026-11-21; earlier, every `repo_map` unit's first turn under a pin
+    /// that outlived its slot).
     #[test]
-    fn a_pinned_warm_turn_is_withheld_from_cold_until_unpinned() {
+    fn a_pinned_warm_turn_is_written_cold_and_keeps_its_copies() {
         let (_, _, timeline, mut sub) = make_timeline();
         let (pinned_idx, pinned) = install_hot_and_warm(&mut sub, timeline, 10);
         let (_, other) = install_hot_and_warm(&mut sub, timeline, 10);
-
-        let queued = |sub: &Substrate| -> Vec<ResidenceIndex> {
-            sub.snapshot_pending_cold()
-                .into_iter()
-                .map(|(idx, _, _)| idx)
-                .collect()
-        };
-
         sub.set_working_set_pins(&[TurnKey::new(timeline, pinned_idx)], &[]);
-        let pending = queued(&sub);
-        assert!(
-            !pending.contains(&pinned),
-            "a pinned turn is not gathered warm→cold"
-        );
-        assert!(
-            pending.contains(&other),
-            "an unpinned warm turn still is — the skip is per-residence"
-        );
-        assert_eq!(
-            sub.pending_cold_count(),
-            1,
-            "the count mirrors the filter, so the withheld turn reports as \
-             nothing pending — this is why the wedge was silent"
-        );
 
-        // The slot that published the pin goes away; the scheduler republishes
-        // the union of what is still live (`retire_slot_projection_state`).
-        sub.set_working_set_pins(&[], &[]);
-        let pending = queued(&sub);
+        let pending: Vec<ResidenceIndex> = sub
+            .snapshot_pending_cold()
+            .into_iter()
+            .map(|(idx, _, _)| idx)
+            .collect();
         assert!(
             pending.contains(&pinned),
-            "unpinned → the turn is gathered for its redo-log append"
+            "a pinned turn is gathered warm→cold"
         );
-        assert_eq!(sub.pending_cold_count(), 2);
+        assert!(pending.contains(&other));
+        assert_eq!(
+            sub.pending_cold_count(),
+            2,
+            "the count follows the same filter"
+        );
+
+        // The cold copy lands under the pin, with the evict-when-cold flag
+        // set: the hot and warm copies the live slot reads stay.
+        sub.residence(pinned).set_flag(EVICT_WHEN_COLD);
+        sub.install_cold(
+            pinned,
+            vec![StoredSequence {
+                chunks: Vec::new(),
+                token_count: 0,
+            }],
+        );
+        let r = sub.residence(pinned);
+        assert!(r.has_cold() && r.has_hot() && r.has_warm());
+        assert_eq!(sub.pending_cold_count(), 1, "written once");
     }
 
     /// A zero target evicts nothing — there's no incoming load to make room
