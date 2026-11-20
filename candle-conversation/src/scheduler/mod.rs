@@ -1660,6 +1660,22 @@ struct DecodeState {
     /// exists to keep; the grid's authority is the K/V, and the seal drops
     /// exactly the trailing unforwarded token instead.
     forwarded_generated: usize,
+    /// How many of [`Self::generated_tokens`] have been sent to the caller as
+    /// [`TurnEvent::Token`].
+    ///
+    /// A projection may decode a turn's last tokens again (`refeed`), so the
+    /// newest [`refeed::REFEED`] tokens are held back and streamed once no
+    /// re-decode can reach them; the turn's end sends the rest
+    /// ([`Self::stream_rest`]). A caller is never sent a token that is later
+    /// taken back.
+    streamed: usize,
+    /// The turn's last token is the end-of-turn token that ends it, which is
+    /// part of the sealed turn but never streamed. Cleared by every later push.
+    withholds_end: bool,
+    /// Tokens before this index were not freely sampled — a stencil's static
+    /// run, a healed prefix, a token written under a grammar's mask, a
+    /// recorded reply's — and are never decoded again.
+    fixed_through: usize,
     /// How deep this turn drafts: one past its own running acceptance, clipped
     /// at the model's ladder for the wave's width. A turn writing free prose
     /// keeps ~2 drafted tokens a step and a turn quoting a file keeps nearly all
@@ -1882,6 +1898,7 @@ impl DecodeState {
             self.think_close_at = Some(self.generated_tokens.len() as u32);
         }
         self.generated_tokens.push(token);
+        self.withholds_end = false;
         closes_page
     }
 
@@ -1897,6 +1914,8 @@ impl DecodeState {
         let _ = self.push_generated(token, think_close, breaks);
         // Already carried, so it is forwarded the moment it is recorded.
         self.forwarded_generated = self.generated_tokens.len();
+        // A static run's token or a healed prefix: written, not sampled.
+        self.fixed_through = self.generated_tokens.len();
     }
 
     /// Record a token that is committed but **not yet forwarded** — it rides the
@@ -1908,6 +1927,7 @@ impl DecodeState {
     /// the assumption had to become a count.
     fn push_pending(&mut self, token: u32, think_close: Option<u32>, breaks: &[u32]) {
         let _ = self.push_generated(token, think_close, breaks);
+        self.fixed_through = self.generated_tokens.len();
     }
 
     /// Record a token the caller is about to forward, and note the page cut if
@@ -1922,10 +1942,64 @@ impl DecodeState {
     /// deliberately waiting ([`Self::push_pending`]).
     fn push_committed(&mut self, token: u32, think_close: Option<u32>, breaks: &[u32]) {
         let prev = self.generated_tokens.last().copied();
+        // Written under a grammar or a recording: the token is the grammar's or
+        // the recording's, so no projection decodes it again.
+        let fixed =
+            self.stencil.is_some() || self.pending_mask.is_some() || self.recorded_reply.is_some();
         if self.push_generated(token, think_close, breaks) {
             self.pending_page_cut = true;
             self.pending_page_cut_after = prev;
         }
+        if fixed {
+            self.fixed_through = self.generated_tokens.len();
+        }
+    }
+
+    /// Send the caller every token no re-decode can reach any more: all but the
+    /// newest [`refeed::REFEED`]. `false` when the caller has gone.
+    fn stream_settled(&mut self) -> bool {
+        let through = self.generated_tokens.len().saturating_sub(refeed::REFEED);
+        self.stream_through(through)
+    }
+
+    /// Send the caller the rest of the turn at its end: every token not yet
+    /// sent, less an end-of-turn token that ends it.
+    fn stream_rest(&mut self) -> bool {
+        let through = self.generated_tokens.len() - usize::from(self.withholds_end);
+        self.stream_through(through)
+    }
+
+    fn stream_through(&mut self, through: usize) -> bool {
+        let mut open = true;
+        while self.streamed < through {
+            let t = self.generated_tokens[self.streamed];
+            open &= self.event_tx.send(TurnEvent::Token(t)).is_ok();
+            self.streamed += 1;
+        }
+        open
+    }
+
+    /// Decode again from `anchor`: the tokens after it are dropped, and
+    /// `anchor`'s token — forwarded already, its K/V and index row just
+    /// rewound — is the next step's input, so the step samples the token after
+    /// it over the slot the projection rebuilt. Returns the dropped tokens.
+    ///
+    /// The recurrent state is not rewound: it has folded the dropped tokens and
+    /// carries them on (`docs/reprojection_refeed.md` §2.6).
+    fn redecode_from(&mut self, anchor: usize) -> Vec<u32> {
+        let keep = anchor + 1;
+        let dropped = self.generated_tokens[keep..].to_vec();
+        self.generated_tokens.truncate(keep);
+        self.forwarded_generated = anchor;
+        self.withholds_end = false;
+        // A cut the dropped pending token earned goes with it.
+        self.pending_page_cut = false;
+        self.pending_page_cut_after = None;
+        if self.think_close_at.is_some_and(|at| at as usize >= keep) {
+            self.think_close_at = None;
+        }
+        self.last_projection_end = self.last_projection_end.min(keep as u32);
+        dropped
     }
 
     /// The committed tokens still waiting to be forwarded.
@@ -6483,6 +6557,9 @@ impl Scheduler {
             generated_tokens: TokenBuffer::default(),
             think_close_at: None,
             forwarded_generated: 0,
+            streamed: 0,
+            withholds_end: false,
+            fixed_through: 0,
             draft_depth: DraftDepth::default(),
             pending_page_cut: false,
             pending_page_cut_after: None,
@@ -8304,7 +8381,7 @@ impl Scheduler {
         let mut sealing: Vec<FinishedTurn> = Vec::with_capacity(finished_seq_ids.len());
         for seq_id in finished_seq_ids {
             let high = self.decode_priority_or_high(seq_id).is_live();
-            if let Some(state) = self.active_decodes.remove(&seq_id) {
+            if let Some(mut state) = self.active_decodes.remove(&seq_id) {
                 // The slot's ground is back, so an admission that did not fit
                 // before may fit now.
                 self.settled_since_admit = true;
@@ -8319,6 +8396,10 @@ impl Scheduler {
                     self.discard_faulted_turn(seq_id, &state.seal_action);
                     continue;
                 }
+                // The tokens held back from the stream while a re-decode could
+                // still reach them (`DecodeState::streamed`) go out before the
+                // turn's end.
+                let _ = state.stream_rest();
                 // The summarise decode completes through the job registry, not
                 // the substrate seal path: its body becomes the node's assistant
                 // half and is sealed with the derived scope. No view to finalize,
@@ -13128,10 +13209,11 @@ impl Scheduler {
         // goes back to the loop; an opening to the prefill group, its next
         // stride against the rebuilt slot.
         self.rebind_turn(view_id, new_view_id, turn);
-        self.hold_refeed(new_view_id, refeed_tokens);
         if let Some(state) = sampling_state {
             self.sampling_states.insert(new_view_id, state);
         }
+        // After the sampling state: a re-decode walks it back.
+        self.hold_refeed(new_view_id, refeed_tokens);
         // True end-to-end wall-clock of the whole reproject (prepare → wave →
         // complete), so the phase fields below — which are individually disjoint
         // but separated by the shared glue wave — can be read against a real
@@ -16450,6 +16532,9 @@ mod tests {
             generated_tokens: TokenBuffer::default(),
             think_close_at: None,
             forwarded_generated: 0,
+            streamed: 0,
+            withholds_end: false,
+            fixed_through: 0,
             draft_depth: DraftDepth::default(),
             pending_page_cut: false,
             pending_page_cut_after: None,

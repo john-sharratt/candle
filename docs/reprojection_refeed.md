@@ -1,6 +1,7 @@
 # The re-feed — every projection ends by reading its own last tokens again
 
-**Status:** built (2026-11-20). Replaces the request's two readings
+**Status:** built (2026-11-20); a decoding turn decodes its taken-back tokens
+again rather than re-feeding them (§2.6). Replaces the request's two readings
 (`scheduler/first_reading.rs`, `docs/hit_driven_projection.md` §7.4). Builds on
 the slot, the pool, the fill and the hit counters of
 `docs/hit_driven_projection.md`, which stay.
@@ -162,6 +163,43 @@ Every projection re-feeds at most 8 tokens. A re-feed that reaches back in
 multiples of 8 — several waves, 8 a wave, until the recurrent state and the
 recent K/V are carried by the new context — is the next step once the battery
 has measured this one.
+
+### 2.6 A decode decodes its last tokens again
+
+A decoding turn does not forward its taken-back tokens again: it **decodes
+them again** (`scheduler/refeed.rs`), so the reply can take another path over
+the slot the projection just placed.
+
+1. **The first of them is kept; the rest are dropped.** The span is the
+   re-feed's (§2 item 5), `n` tokens back to an index block. Their K/V and
+   index rows are left out of the rebuild as a re-feed's are. The first of
+   them — the *anchor*, on the block boundary — stays in the turn and is
+   pending again, so the next decode step forwards it as its ordinary input
+   and samples the token after it from the new context. Everything the turn
+   wrote after the anchor, the pending token included, is dropped
+   (`DecodeState::redecode_from`).
+2. **The recurrent state is not rewound.** The DeltaNet layers have folded
+   the dropped tokens and keep them: the state carries the dropped future and
+   goes on folding what is decoded in its place. Only the attention layers'
+   K/V, the index and the text step back.
+3. **The sampler forgets the dropped tokens** — their penalty counts, their
+   place in the recent window, the turn's length (`SequenceSamplingState::forget`)
+   — and its RNG does not step back, so each re-decoded token is a fresh draw.
+4. **Nothing taken back was ever streamed.** A turn streams only the tokens
+   more than `REFEED` behind its newest (`DecodeState::stream_settled`) and
+   sends the rest at its end (`stream_rest`), so a caller is never sent a token
+   that is later dropped. The turn's first token streams at once: no re-decode
+   reaches it.
+5. **Only freely sampled tokens are decoded again.** Tokens a stencil played,
+   a grammar's mask wrote, a heal rewrote or a recorded reply committed are
+   fixed (`DecodeState::fixed_through`), and so is a span holding a page
+   break, the reasoning's close or an end of turn; a turn with a grammar
+   active, or whose span reaches a fixed token, forwards its tokens again as a
+   re-feed instead. An opening has sampled nothing and re-feeds as before.
+
+A re-decode takes back at most 8 tokens a projection, and the next boundary is
+at least the content gate's 17 tokens later (`provenance::boundaries`), so a
+reply always advances.
 
 ## 3. What it replaces
 

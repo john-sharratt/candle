@@ -1,15 +1,25 @@
-//! The re-feed (`docs/reprojection_refeed.md`): a projection that rebuilds a
-//! turn's slot ends by forwarding the turn's last tokens again over it.
+//! The re-feed and the re-decode (`docs/reprojection_refeed.md`): a projection
+//! that rebuilds a turn's slot takes the turn's last tokens back and reads them
+//! again over it.
 //!
 //! A placed piece reaches the recurrent layers only through tokens forwarded
 //! after it. So a rebuild leaves its turn's last tokens out — their index rows
-//! dropped from the live tail, their K/V trimmed off the captured tail — and
-//! the turn forwards them again before it samples on: a decode as a row of its
-//! next wave, ahead of its pending token, as a stencil's static run rides it
-//! (`stencil_wave`); an opening by prefilling them again in its next stride.
+//! dropped from the live tail, their K/V trimmed off the captured tail — and the
+//! turn goes on from the cut:
+//!
+//! - **A decode decodes them again** (§2.6): the first of them is kept and is
+//!   the next step's input, everything the turn wrote after it is dropped, and
+//!   the step samples on over the rebuilt slot, so the reply can take another
+//!   path from there. The caller never saw the dropped tokens: a turn streams
+//!   only what no re-decode can reach (`DecodeState::stream_settled`).
+//! - **Tokens the turn did not sample are forwarded again** — a stencil's
+//!   run, a grammar's, a recorded reply's — as a row of the next wave ahead of
+//!   the pending token, the way a stencil's static run rides it
+//!   (`stencil_wave`); an opening prefills them again in its next stride.
+//!
 //! The attention layers then hold each position once, computed in the new
-//! context. The recurrent state is not rewound: the re-fed tokens fold into it
-//! on top of what it holds, the delta rule overwriting what their keys held.
+//! context. The recurrent state is not rewound: what it folded stays folded,
+//! and what is forwarded or decoded next folds on top.
 //!
 //! The span is at most [`REFEED`] tokens, back to the newest index block
 //! boundary within that reach, and never past the newest closed index page
@@ -19,8 +29,8 @@ use super::stencil_wave::StencilRow;
 use super::*;
 use candle_nn::kv_cache::HELD_TAIL_TOKENS;
 
-/// The most tokens a re-feed forwards again: the recurrent layers' short span,
-/// and the tail the gap leaves native for it.
+/// The most tokens a re-feed forwards again, or a re-decode takes back: the
+/// recurrent layers' short span, and the tail the gap leaves native for it.
 pub(super) const REFEED: usize = HELD_TAIL_TOKENS;
 
 /// `opening` then `decoded`, less their last `n` tokens taken from the end.
@@ -44,11 +54,29 @@ pub(super) fn refeed_row(refeed: &[u32], pending: &[u32]) -> Vec<u32> {
     row
 }
 
+/// Whether the tokens after `anchor` can be decoded again: every one of them
+/// was sampled freely and none has been streamed, and none is a token whose
+/// writing moved the turn's structure — a page break, the reasoning's close,
+/// an end of turn — which `structural` names.
+pub(super) fn redecodable(
+    tokens: &[u32],
+    anchor: usize,
+    fixed_through: usize,
+    streamed: usize,
+    structural: impl Fn(u32) -> bool,
+) -> bool {
+    let from = anchor + 1;
+    from <= tokens.len()
+        && from >= fixed_through
+        && from >= streamed
+        && !tokens[from..].iter().any(|&t| structural(t))
+}
+
 impl Scheduler {
-    /// The tokens `view_id`'s turn forwards again after its rebuild: the
-    /// model's re-feed span, when it lies inside what the turn itself has
-    /// forwarded — its decoded tokens, or its opening's prefilled part — and
-    /// nothing while a played run is still being written.
+    /// The tokens `view_id`'s turn takes back after its rebuild: the model's
+    /// re-feed span, when it lies inside what the turn itself has forwarded —
+    /// its decoded tokens, or its opening's prefilled part — and nothing while
+    /// a played run is still being written.
     pub(super) fn choose_refeed(&self, view_id: SequenceId) -> Result<usize, ConversationError> {
         if self.holds_stencil_row(view_id) {
             return Ok(0);
@@ -67,16 +95,36 @@ impl Scheduler {
         Ok(if span <= forwarded { span } else { 0 })
     }
 
-    /// Hold `n` tokens of `view_id`'s turn to be forwarded again: a decode's
-    /// last `n` forwarded tokens ride its next wave; an opening prefills them
-    /// again in its next stride.
+    /// Take back the last `n` forwarded tokens of `view_id`'s turn. A decode
+    /// that sampled them decodes again from the first of them; one that did
+    /// not forwards them again on its next wave; an opening prefills them again
+    /// in its next stride.
     pub(super) fn hold_refeed(&mut self, view_id: SequenceId, n: usize) {
         if n == 0 {
             return;
         }
         if let Some(d) = self.active_decodes.get(&view_id) {
-            let to = d.forwarded_generated;
-            let tokens = d.generated_tokens[to - n..to].to_vec();
+            let anchor = d.forwarded_generated - n;
+            let free =
+                d.stencil.is_none() && d.pending_mask.is_none() && d.recorded_reply.is_none();
+            let structural = |t: u32| {
+                self.page_break_tokens.contains(&t)
+                    || Some(t) == self.think_close
+                    || self.eos_tokens.contains(&t)
+            };
+            if free
+                && redecodable(
+                    &d.generated_tokens,
+                    anchor,
+                    d.fixed_through,
+                    d.streamed,
+                    structural,
+                )
+            {
+                self.redecode(view_id, anchor);
+                return;
+            }
+            let tokens = d.generated_tokens[anchor..d.forwarded_generated].to_vec();
             self.refeeds.insert(view_id, tokens);
             return;
         }
@@ -87,6 +135,25 @@ impl Scheduler {
         {
             p.offset -= n;
         }
+    }
+
+    /// Decode `view_id`'s turn again from `anchor`, its sampler forgetting
+    /// what the dropped tokens recorded.
+    fn redecode(&mut self, view_id: SequenceId, anchor: usize) {
+        let Some(d) = self.active_decodes.get_mut(&view_id) else {
+            return;
+        };
+        let dropped = d.redecode_from(anchor);
+        if let Some(s) = self.sampling_states.get_mut(&view_id) {
+            s.forget(&dropped);
+        }
+        tracing::debug!(
+            target: "candle_conversation::refeed",
+            seq_id = view_id.0,
+            anchor,
+            dropped = dropped.len(),
+            "re-decode: the turn decodes again from the cut",
+        );
     }
 
     /// Put each held re-feed on the next wave: ahead of a run its stencil
@@ -114,6 +181,7 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::boundary_state;
     use super::*;
 
     /// **A re-feed takes its tokens from the end**: from the decoded tokens
@@ -148,5 +216,84 @@ mod tests {
     #[test]
     fn the_refeed_is_the_held_tail() {
         assert_eq!(REFEED, 8);
+    }
+
+    /// **Only freely sampled, unstreamed tokens are decoded again**, and none
+    /// that moved the turn's structure.
+    #[test]
+    fn a_redecode_takes_back_only_free_unstreamed_tokens() {
+        let tokens = [10, 11, 12, 13, 14, 15];
+        let none = |_: u32| false;
+        assert!(redecodable(&tokens, 2, 0, 0, none));
+        // A token written by a grammar after the anchor.
+        assert!(!redecodable(&tokens, 2, 4, 0, none));
+        assert!(redecodable(&tokens, 2, 3, 0, none));
+        // A token already sent to the caller.
+        assert!(!redecodable(&tokens, 2, 0, 4, none));
+        assert!(redecodable(&tokens, 2, 0, 3, none));
+        // A page break, the reasoning's close or an end of turn after it.
+        assert!(!redecodable(&tokens, 2, 0, 0, |t| t == 14));
+        // The anchor itself is kept, so it may be structural.
+        assert!(redecodable(&tokens, 2, 0, 0, |t| t == 12));
+    }
+
+    /// **The re-decode keeps the anchor as the next input and drops the
+    /// rest**: the anchor is pending again, and the next token pushed follows
+    /// it.
+    #[test]
+    fn a_redecode_keeps_the_anchor_pending_and_drops_what_followed() {
+        let (mut s, _rx) = boundary_state();
+        for t in [1, 2, 3, 4, 5, 6] {
+            s.push_committed(t, None, &[]);
+        }
+        s.mark_forwarded();
+        s.push_committed(7, None, &[]);
+        s.last_projection_end = 7;
+        assert_eq!(s.redecode_from(2), vec![4, 5, 6, 7]);
+        assert_eq!(&s.generated_tokens[..], &[1, 2, 3]);
+        assert_eq!(s.pending_forward(), &[3]);
+        assert_eq!(s.last_projection_end, 3);
+    }
+
+    /// **The stream holds back what a re-decode can reach**: the newest
+    /// [`REFEED`] tokens stay unsent until the turn's end, which sends them
+    /// less a withheld end-of-turn token.
+    #[test]
+    fn the_stream_holds_back_the_reach_of_a_redecode() {
+        let (mut s, rx) = boundary_state();
+        for t in 1..=10 {
+            s.push_committed(t, None, &[]);
+            assert!(s.stream_settled());
+        }
+        let sent: Vec<u32> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                TurnEvent::Token(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sent, vec![1, 2]);
+        s.push_committed(99, None, &[]);
+        s.withholds_end = true;
+        assert!(s.stream_rest());
+        let rest: Vec<u32> = rx
+            .try_iter()
+            .filter_map(|e| match e {
+                TurnEvent::Token(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rest, vec![3, 4, 5, 6, 7, 8, 9, 10]);
+    }
+
+    /// **A token a grammar wrote is fixed**: the re-decode's reach stops after
+    /// it.
+    #[test]
+    fn a_static_token_is_never_decoded_again() {
+        let (mut s, _rx) = boundary_state();
+        s.push_committed(1, None, &[]);
+        s.push_forwarded(2, None, &[]);
+        s.push_committed(3, None, &[]);
+        assert_eq!(s.fixed_through, 2);
     }
 }

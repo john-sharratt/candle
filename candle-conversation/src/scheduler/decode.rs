@@ -302,10 +302,11 @@ impl Scheduler {
                             // The terminating EOS: committed, never forwarded.
                             s.push_pending(t, think_close, breaks);
                         }
-                        if !(ends_turn && k + 1 == run.len()) {
-                            let _ = s.event_tx.send(TurnEvent::Token(t));
+                        if ends_turn && k + 1 == run.len() {
+                            s.withholds_end = true;
                         }
                     }
+                    let _ = s.stream_settled();
                     // A think-steer tree always drops the model's own `</think>`
                     // (the close token is suppressed) and injects the closing tag
                     // as a static run instead, so the commit-loop flip that clears
@@ -1881,7 +1882,6 @@ impl Scheduler {
                 if let Some(state) = self.active_decodes.get_mut(&seq_id) {
                     for &t in prefix {
                         state.push_forwarded(t, think_close, breaks);
-                        let _ = state.event_tx.send(TurnEvent::Token(t));
                     }
                 }
                 heal_prefills.push(HealPrefill {
@@ -2264,12 +2264,11 @@ impl Scheduler {
                     }
                 }
 
-                // Emit the raw token ID — the turn's last one included, unless it
-                // is the EOS that ends it. If the caller dropped the handle, stop
-                // generating.
-                if streams_committed(is_eos)
-                    && state.event_tx.send(TurnEvent::Token(next_token)).is_err()
-                {
+                // Stream what no re-decode can reach any more (`refeed`); the
+                // turn's end sends the rest, less the EOS that ends it. If the
+                // caller dropped the handle, stop generating.
+                state.withholds_end = !streams_committed(is_eos);
+                if !state.stream_settled() {
                     state.finished = true;
                 }
                 if let Some(finish) = FinishReason::after_token(
