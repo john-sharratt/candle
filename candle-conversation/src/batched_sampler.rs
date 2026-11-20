@@ -629,33 +629,6 @@ impl SequenceSamplingState {
         }
     }
 
-    /// Forget the newest `tokens`, each recorded by [`Self::record_token`]: a
-    /// re-decode dropped them from the turn. Counts, the recent window and the
-    /// running lengths step back; the RNG does not, so what is sampled in their
-    /// place is a fresh draw.
-    pub fn forget(&mut self, tokens: &[u32]) {
-        for &t in tokens {
-            if let Some(c) = self.token_counts.get_mut(t as usize) {
-                *c -= 1;
-            }
-        }
-        let counts = &self.token_counts;
-        self.counted
-            .retain(|&t| counts.get(t as usize).is_some_and(|&c| c > 0));
-        let n = tokens.len();
-        self.recent_tokens
-            .truncate(self.recent_tokens.len().saturating_sub(n));
-        let n = n as i32;
-        self.current_len = (self.current_len - n).max(0);
-        if self.in_segment {
-            self.segment_len = (self.segment_len - n).max(0);
-        }
-        if self.in_free_text {
-            self.dry_span_len = (self.dry_span_len - n).max(0);
-        }
-        self.degenerate_run = 0;
-    }
-
     /// Record prompt/context tokens for repeat-penalty context only.
     ///
     /// Populates `recent_tokens` (used by repeat penalty) but NOT
@@ -2973,24 +2946,6 @@ mod tests {
             st.record_token(7, MAX_RECENT);
         }
         assert_eq!(st.degenerate_run, 0);
-    }
-
-    /// **Forgetting steps the record back**: the dropped tokens' counts, their
-    /// place in the recent window and the turn's length go; a token still used
-    /// before them stays counted.
-    #[test]
-    fn forgetting_the_newest_tokens_steps_the_record_back() {
-        let mut st = SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT);
-        st.record_tokens(&[1, 2, 3, 2], MAX_RECENT);
-        let rng = st.rng_offset;
-        st.forget(&[3, 2]);
-        assert_eq!(st.token_counts[1], 1);
-        assert_eq!(st.token_counts[2], 1);
-        assert_eq!(st.token_counts[3], 0);
-        assert_eq!(st.counted, vec![1, 2]);
-        assert_eq!(st.recent_tokens, vec![1, 2]);
-        assert_eq!(st.current_len, 2);
-        assert_eq!(st.rng_offset, rng);
     }
 
     /// The run is per-turn: a fresh turn must not inherit a previous turn's tail.

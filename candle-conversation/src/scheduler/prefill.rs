@@ -6584,11 +6584,6 @@ impl Scheduler {
                     generated_tokens: TokenBuffer::default(),
                     think_close_at: None,
                     forwarded_generated: 0,
-                    // Sent above, unless it is the end-of-turn token that ends
-                    // the turn.
-                    streamed: usize::from(replies && streams_committed(first_is_eos)),
-                    withholds_end: false,
-                    fixed_through: 0,
                     draft_depth: DraftDepth::default(),
                     pending_page_cut: false,
                     pending_page_cut_after: None,
@@ -6641,7 +6636,6 @@ impl Scheduler {
                     // The turn's first token opens a page at the prefill/decode
                     // boundary, so the reasoning starts one of its own.
                     state.push_committed(first_token, self.think_close, &self.page_break_tokens);
-                    state.withholds_end = first_is_eos;
                     // No speculative rewind can be in flight — this turn decodes
                     // nothing more — so the cut is taken at once.
                     super::flush_page_cut(self.model.as_ref(), work.sequence_id, &mut state);
@@ -6720,11 +6714,6 @@ impl Scheduler {
             generated_tokens: TokenBuffer::default(),
             think_close_at: None,
             forwarded_generated: 0,
-            // The first token was sent above: the turn's first can never be
-            // decoded again.
-            streamed: 1,
-            withholds_end: false,
-            fixed_through: 0,
             draft_depth: DraftDepth::default(),
             pending_page_cut: false,
             pending_page_cut_after: None,
