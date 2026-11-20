@@ -6071,6 +6071,10 @@ impl<'a> ContentResolver for TargetedRead<'a> {
         self.read.turn_score_for_timeline(turn.timeline, turn.index)
     }
 
+    fn turn_reads(&self, turn: TurnKey) -> f32 {
+        self.read.scores_or_empty().reads(turn.timeline, turn.index)
+    }
+
     fn turn_carries(&self, turn: TurnKey, tags: &[String]) -> bool {
         self.read
             .turn_tags(turn.timeline, turn.index)

@@ -100,7 +100,7 @@ use candle::engine_events::note;
 
 use super::adaptive::AnchorMember;
 use super::dialogue_fill::{self, ContextExchange, DialogueSlot, WorkingPiece};
-use super::fill::{Caps, Kind};
+use super::fill::{minimum_cap, reading_piece_cap, Caps, Kind};
 use super::fill_report::{line, piece_reports, PieceReport, Unpooled, UNPOOLED_KEPT};
 use super::ids::{
     CollectionId, GroupId, LayerId, SectionId, TimelineId, TurnId, TurnIndex, TurnKey,
@@ -2313,6 +2313,7 @@ pub fn run_with_sink<R: ContentResolver>(
                 working.push(WorkingPiece {
                     kind,
                     exchanges: exchanges_of(&ks),
+                    momentum: resolver.working_set_standing(tl).momentum,
                 });
                 working_groups.push(gs.schema.id);
             }
@@ -2350,6 +2351,8 @@ pub fn run_with_sink<R: ContentResolver>(
             journals: shares.journals,
             dialogue: shares.dialogue,
             layers: visible_layers.iter().map(|l| l.window).collect(),
+            reading_piece: reading_piece_cap(shares.readings),
+            minimum: minimum_cap(shares.readings),
         };
         // What the slot holds from the boundary before, and whether this is
         // the first boundary after a new user message — which chooses whole,
@@ -2371,6 +2374,7 @@ pub fn run_with_sink<R: ContentResolver>(
             &slot,
             |k| resolver.turn_score(k),
             |k| resolver.turn_token_count(k),
+            |k| resolver.turn_reads(k),
         );
         // What the fill weighed each working piece at — the scores it ranked
         // by, which the selection record does not show (`fill_report`) — and

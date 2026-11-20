@@ -8,8 +8,9 @@
 //! - **the working set**: each piece's first and last turn — its request and
 //!   its answer — as its floor, scored by the better of the two, and its tool
 //!   turns — a reading's pages — each at its own turn's score (§7.1, §8.2): every
-//!   unit competes on the one band, and a piece's strength, which ranks it for
-//!   the pool, never enters the fill;
+//!   unit competes on the one band. A reading's momentum in the pool orders
+//!   only the minimum ([`FillInput::minimum`]); each unit carries how much the
+//!   model's selection read its turns, which orders what leaves;
 //! - **the dialogue** (§8.3): its newest exchange as the current one — its
 //!   first turn, its newest tool turn and its last kept, its older tool turns
 //!   shed first — its first exchange's floor, and its `recent` exchanges before
@@ -28,12 +29,14 @@ use crate::projection::fill::{fill, Allowance, Caps, FillInput, FloorExchange, K
 use crate::projection::rounds;
 use crate::projection::TurnKey;
 
-/// One working-set piece: its kind for the caps and its exchanges, each its
-/// turns in order.
+/// One working-set piece: its kind for the caps, its exchanges, each its
+/// turns in order, and its momentum in the pool — what ranks the readings
+/// for the minimum.
 #[derive(Debug, Clone)]
 pub struct WorkingPiece {
     pub kind: Kind,
     pub exchanges: Vec<Vec<TurnKey>>,
+    pub momentum: f32,
 }
 
 /// One selected exchange of another group: its kind for the caps
@@ -96,24 +99,11 @@ struct Units {
 }
 
 impl Units {
-    fn add(
-        &mut self,
-        part: Part,
-        rounds: Vec<usize>,
-        piece: usize,
-        kind: Kind,
-        tokens: usize,
-        score: f32,
-    ) -> Unit {
+    /// `u` under the next id, its rounds those of `part`.
+    fn add(&mut self, part: Part, rounds: Vec<usize>, u: Unit) -> Unit {
         let id = self.of.len();
         self.of.push((part, rounds));
-        Unit {
-            id,
-            piece,
-            kind,
-            tokens,
-            score,
-        }
+        Unit { id, ..u }
     }
 }
 
@@ -127,16 +117,30 @@ fn floor_rounds(n: usize) -> Vec<usize> {
     }
 }
 
-/// Plan `slot` (module docs). `score` is a turn's score; `tokens` a turn's.
+/// Plan `slot` (module docs). `score` is a turn's score; `tokens` a turn's;
+/// `reads` how much the model's own selection read it ([`Unit::reads`]).
 pub fn plan(
     slot: &DialogueSlot,
     score: impl Fn(TurnKey) -> f32,
     tokens: impl Fn(TurnKey) -> usize,
+    reads: impl Fn(TurnKey) -> f32,
 ) -> DialoguePlan {
     let sum =
         |ex: &[TurnKey], rounds: &[usize]| -> usize { rounds.iter().map(|&r| tokens(ex[r])).sum() };
     let best_of = |ex: &[TurnKey], rounds: &[usize]| -> f32 {
         rounds.iter().map(|&r| score(ex[r])).fold(0.0, f32::max)
+    };
+    // A unit of `rounds` of `ex`: their tokens, the best of their scores and
+    // of their reads.
+    let unit = |ex: &[TurnKey], rounds: &[usize], piece: usize, kind: Kind| -> Unit {
+        Unit {
+            id: 0,
+            piece,
+            kind,
+            tokens: sum(ex, rounds),
+            score: best_of(ex, rounds),
+            reads: rounds.iter().map(|&r| reads(ex[r])).fold(0.0, f32::max),
+        }
     };
     let mut units = Units::default();
     let mut input = FillInput {
@@ -153,20 +157,27 @@ pub fn plan(
     // The lineage: each exchange whole, at its score.
     for (i, (ex, s)) in slot.lineage.iter().enumerate() {
         let all: Vec<usize> = (0..ex.len()).collect();
-        let t = sum(ex, &all);
-        let u = units.add(Part::Lineage(i), all, piece(), Kind::Dialogue, t, *s);
+        let u = Unit {
+            score: *s,
+            ..unit(ex, &all, piece(), Kind::Dialogue)
+        };
+        let u = units.add(Part::Lineage(i), all, u);
         input.scored.push(u);
     }
 
     // Every other group's exchanges: each whole, at its selection score.
     for (i, cx) in slot.context.iter().enumerate() {
         let all: Vec<usize> = (0..cx.exchange.len()).collect();
-        let t = sum(&cx.exchange, &all);
-        let u = units.add(Part::Context(i), all, piece(), cx.kind, t, cx.score);
+        let u = Unit {
+            score: cx.score,
+            ..unit(&cx.exchange, &all, piece(), cx.kind)
+        };
+        let u = units.add(Part::Context(i), all, u);
         input.scored.push(u);
     }
 
     // The working set: every unit at its own turns' scores, on the band.
+    let mut readings: Vec<(usize, f32)> = Vec::new();
     for (p, wp) in slot.working.iter().enumerate() {
         let pid = piece();
         let mut floor: Vec<Unit> = Vec::new();
@@ -177,26 +188,22 @@ pub fn plan(
             }
             let part = Part::Working(p, e);
             let fr = floor_rounds(n);
-            let pair = units.add(
-                part,
-                fr.clone(),
-                pid,
-                wp.kind,
-                sum(ex, &fr),
-                best_of(ex, &fr),
-            );
+            let pair = units.add(part, fr.clone(), unit(ex, &fr, pid, wp.kind));
             floor.push(pair);
             if n <= 2 {
                 // A floor of every turn there is: nothing else to rank.
                 input.scored.push(pair);
             }
-            for (r, &turn) in ex.iter().enumerate().take(n.saturating_sub(1)).skip(1) {
-                let u = units.add(part, vec![r], pid, wp.kind, tokens(turn), score(turn));
+            for r in 1..n.saturating_sub(1) {
+                let u = units.add(part, vec![r], unit(ex, &[r], pid, wp.kind));
                 input.scored.push(u);
             }
         }
         if !floor.is_empty() {
             input.piece_floors.insert(pid, floor);
+        }
+        if wp.kind == Kind::Reading {
+            readings.push((pid, wp.momentum));
         }
     }
 
@@ -212,14 +219,7 @@ pub fn plan(
         let pid = piece();
         let part = Part::Own(e);
         let one = |units: &mut Units, r: usize| {
-            units.add(
-                part,
-                vec![r],
-                pid,
-                Kind::Dialogue,
-                tokens(ex[r]),
-                score(ex[r]),
-            )
+            units.add(part, vec![r], unit(ex, &[r], pid, Kind::Dialogue))
         };
         let tools: Vec<usize> = (1..n.saturating_sub(1)).collect();
         if Some(e) == current {
@@ -243,14 +243,7 @@ pub fn plan(
             continue;
         }
         let fr = floor_rounds(n);
-        let pair = units.add(
-            part,
-            fr.clone(),
-            pid,
-            Kind::Dialogue,
-            sum(ex, &fr),
-            best_of(ex, &fr),
-        );
+        let pair = units.add(part, fr.clone(), unit(ex, &fr, pid, Kind::Dialogue));
         if e >= recent_from {
             // A recent exchange holds every turn it has.
             let rounds = tools.iter().map(|&r| one(&mut units, r)).collect();
@@ -295,6 +288,10 @@ pub fn plan(
         .map(|(id, _)| id)
         .collect();
     input.allowance = slot.allowance.clone();
+    // The readings take the minimum strongest first by the pool's momentum,
+    // ties in the working set's order.
+    readings.sort_by(|a, b| b.1.total_cmp(&a.1));
+    input.minimum = readings.into_iter().map(|(pid, _)| pid).collect();
 
     let filled = fill(&input, &slot.caps);
     let mut kept: HashMap<Part, HashSet<usize>> = HashMap::new();
@@ -371,6 +368,8 @@ mod tests {
             journals: 10_000,
             dialogue: 10_000,
             layers: vec![30],
+            reading_piece: 10_000,
+            minimum: 0,
         }
     }
 
@@ -384,6 +383,7 @@ mod tests {
         WorkingPiece {
             kind: Kind::Reading,
             exchanges: vec![vec![k(tl, 0), k(tl, 1), k(tl, 2), k(tl, 3)]],
+            momentum: 0.0,
         }
     }
 
@@ -419,7 +419,7 @@ mod tests {
             held: HashSet::new(),
             allowance: None,
         };
-        let p = plan(&slot, |_| 1.0, twenty);
+        let p = plan(&slot, |_| 1.0, twenty, |_| 0.0);
         assert_eq!(p.lineage, vec![k(9, 0)]);
         assert_eq!(p.working, vec![vec![k(5, 0), k(5, 1), k(5, 2), k(5, 3)]]);
         assert_eq!(p.own, vec![k(1, 0), k(1, 1), k(1, 2)]);
@@ -430,7 +430,7 @@ mod tests {
     /// tool turn that ties go to, the oldest, each whole.
     #[test]
     fn a_reading_is_carved_to_whole_turns() {
-        let p = plan(&slot(60, caps(), vec![reading()]), |_| 0.0, twenty);
+        let p = plan(&slot(60, caps(), vec![reading()]), |_| 0.0, twenty, |_| 0.0);
         assert_eq!(p.working, vec![vec![k(5, 0), k(5, 1), k(5, 3)]]);
     }
 
@@ -445,7 +445,12 @@ mod tests {
             ..caps()
         };
         let s = slot(10_000, capped, vec![reading()]);
-        let p = plan(&s, |t| if t == k(5, 2) { 900.0 } else { 0.0 }, twenty);
+        let p = plan(
+            &s,
+            |t| if t == k(5, 2) { 900.0 } else { 0.0 },
+            twenty,
+            |_| 0.0,
+        );
         assert_eq!(p.working, vec![vec![k(5, 0), k(5, 2), k(5, 3)]]);
     }
 
@@ -465,7 +470,7 @@ mod tests {
             (6, 1) => 800.0,
             _ => 0.0,
         };
-        let p = plan(&s, scores, twenty);
+        let p = plan(&s, scores, twenty, |_| 0.0);
         assert_eq!(p.working, vec![vec![], vec![k(6, 0), k(6, 1), k(6, 3)]]);
     }
 
@@ -477,7 +482,7 @@ mod tests {
             own: vec![vec![k(1, 0)], vec![k(1, 1)], vec![k(1, 2)]],
             ..slot(40, caps(), vec![])
         };
-        let p = plan(&slot, |_| 0.0, twenty);
+        let p = plan(&slot, |_| 0.0, twenty, |_| 0.0);
         assert_eq!(p.own, vec![k(1, 0), k(1, 2)]);
     }
 
@@ -489,7 +494,7 @@ mod tests {
             own: vec![vec![k(1, 0), k(1, 1), k(1, 2), k(1, 3), k(1, 4)]],
             ..slot(80, caps(), vec![])
         };
-        let p = plan(&slot, |_| 0.0, twenty);
+        let p = plan(&slot, |_| 0.0, twenty, |_| 0.0);
         assert_eq!(p.own, vec![k(1, 0), k(1, 2), k(1, 3), k(1, 4)]);
     }
 
@@ -507,11 +512,11 @@ mod tests {
         let mut s = slot(10_000, capped, vec![reading()]);
         s.held = HashSet::from([k(5, 0), k(5, 1), k(5, 3)]);
         s.allowance = Some(Allowance::from([(Kind::Reading, 0)]));
-        let p = plan(&s, scores, twenty);
+        let p = plan(&s, scores, twenty, |_| 0.0);
         assert_eq!(p.working, vec![vec![k(5, 0), k(5, 1), k(5, 3)]]);
         // The first boundary after a question chooses whole, by score.
         s.allowance = None;
-        let p = plan(&s, scores, twenty);
+        let p = plan(&s, scores, twenty, |_| 0.0);
         assert_eq!(p.working, vec![vec![k(5, 0), k(5, 2), k(5, 3)]]);
     }
 
@@ -529,7 +534,7 @@ mod tests {
             context: vec![cx(7, 0.5), cx(8, 0.9)],
             ..slot(10_000, caps(), vec![])
         };
-        let p = plan(&slot, |_| 0.0, twenty);
+        let p = plan(&slot, |_| 0.0, twenty, |_| 0.0);
         assert_eq!(p.context, vec![vec![], vec![k(8, 0)]]);
     }
 }

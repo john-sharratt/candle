@@ -18,17 +18,28 @@
 //! shares sum to the room; each other layer's window caps that layer's
 //! exchanges. A cap bounds how much of a kind the scored tier takes and never
 //! reserves room, and floors count toward their kind's cap without ever being
-//! skipped for it. There is no per-piece cap: one reading the indexer reads
-//! above everything else may take the whole of its kind's.
+//! skipped for it.
+//!
+//! **A reading has a minimum and a maximum** (§7.2 step 4). Before the scored
+//! tier, the readings ranked highest by the pool's momentum
+//! ([`FillInput::minimum`]) each take their best-scoring unit and their floor,
+//! in momentum order, while the minimum's share of the readings cap
+//! ([`Caps::minimum`]) has room — so a reading the pool ranks first holds a
+//! seat however many better-scored pages another reading has. What the
+//! minimum places is never displaced at this boundary. No one reading takes
+//! more than [`Caps::reading_piece`] of its kind: past it, its next page is
+//! skipped and the room goes to the next unit by score.
 //!
 //! **A third of a working-set kind's cap may enter per boundary** (§7.2 step
 //! 5). With an [`Allowance`], the working-set rounds the slot already holds
 //! keep their seats first, and a round that is not held enters only while its
 //! kind's allowance has room — rounded up to whole turns, a new piece's floor
-//! counted with it. A held round leaves only as an entry needs its room,
-//! lowest score first; a piece whose last tool round leaves goes whole, floor
-//! and all. With none — the first boundary after a new user message — the
-//! working set is chosen whole, by score.
+//! counted with it; the minimum is outside the allowance. A held round leaves
+//! only as an entry it scores below needs its room, the one the model's own
+//! selection read least first ([`Unit::reads`]), then the lowest score; a
+//! piece whose last tool round leaves goes whole only when the entry outscores
+//! its floor too. With none — the first boundary after a new user message —
+//! the working set is chosen whole, by score.
 
 use std::collections::{HashMap, HashSet};
 
@@ -60,6 +71,10 @@ pub struct Unit {
     pub kind: Kind,
     pub tokens: usize,
     pub score: f32,
+    /// How much the model's own selection read the unit's turns over the
+    /// strides before this boundary — the best of its turns' lifts less one,
+    /// `gain · h` (§7.1); `0` for one it did not read. What leaves first.
+    pub reads: f32,
 }
 
 /// A floor exchange: units that hold their seats together, and the tool
@@ -81,6 +96,10 @@ pub struct Caps {
     /// Each other layer's `window`, indexed by [`Kind::Layer`]. A layer with
     /// no entry takes nothing.
     pub layers: Vec<usize>,
+    /// The most one reading may take of `readings`.
+    pub reading_piece: usize,
+    /// The most of `readings` the minimum may place.
+    pub minimum: usize,
 }
 
 impl Kind {
@@ -96,6 +115,16 @@ impl Kind {
 /// How many tokens of each working-set kind may enter the slot at this
 /// boundary: a third of its cap.
 pub type Allowance = HashMap<Kind, usize>;
+
+/// The most of a readings cap of `readings` one reading may take: two fifths.
+pub fn reading_piece_cap(readings: usize) -> usize {
+    readings * 2 / 5
+}
+
+/// The most of a readings cap of `readings` the minimum places: half.
+pub fn minimum_cap(readings: usize) -> usize {
+    readings / 2
+}
 
 impl Caps {
     /// A third of each working-set kind's cap, rounded up — what may enter
@@ -141,6 +170,9 @@ pub struct FillInput {
     /// What may enter per working-set kind at this boundary; `None` on the
     /// first boundary after a new user message, which chooses whole.
     pub allowance: Option<Allowance>,
+    /// The readings that take the minimum, by piece, the pool's strongest
+    /// first.
+    pub minimum: Vec<usize>,
 }
 
 /// What the fill placed: the units by id, and how far past the room the
@@ -151,30 +183,50 @@ pub struct Fill {
     pub over_room: usize,
 }
 
-/// Tokens placed per cap, as the fill goes.
+/// Tokens placed per cap, and per reading, as the fill goes.
 #[derive(Default, Clone)]
 struct Used {
     total: usize,
     by_kind: HashMap<Kind, usize>,
+    by_reading: HashMap<usize, usize>,
 }
 
 impl Used {
     fn add(&mut self, u: &Unit) {
         self.total += u.tokens;
         *self.by_kind.entry(u.kind).or_default() += u.tokens;
+        if u.kind == Kind::Reading {
+            *self.by_reading.entry(u.piece).or_default() += u.tokens;
+        }
+    }
+
+    fn take(&mut self, u: &Unit) {
+        self.total -= u.tokens;
+        *self.by_kind.entry(u.kind).or_default() -= u.tokens;
+        if u.kind == Kind::Reading {
+            *self.by_reading.entry(u.piece).or_default() -= u.tokens;
+        }
     }
 
     fn kind(&self, k: Kind) -> usize {
         self.by_kind.get(&k).copied().unwrap_or(0)
     }
 
-    /// Whether `units` fit under the cap of every kind they add to.
+    /// Whether `units` fit under the cap of every kind they add to, and each
+    /// reading among them under its maximum.
     fn under_caps(&self, units: &[Unit], caps: &Caps) -> bool {
         let mut add: HashMap<Kind, usize> = HashMap::new();
+        let mut reading: HashMap<usize, usize> = HashMap::new();
         for u in units {
             *add.entry(u.kind).or_default() += u.tokens;
+            if u.kind == Kind::Reading {
+                *reading.entry(u.piece).or_default() += u.tokens;
+            }
         }
         add.iter().all(|(&k, &t)| self.kind(k) + t <= caps.of(k))
+            && reading.iter().all(|(p, &t)| {
+                self.by_reading.get(p).copied().unwrap_or(0) + t <= caps.reading_piece
+            })
     }
 }
 
@@ -244,7 +296,35 @@ pub fn fill(input: &FillInput, caps: &Caps) -> Fill {
         used,
         placed,
         in_slot,
+        protected: HashSet::new(),
+        displaced: HashSet::new(),
     };
+    // 1b. The minimum: each reading the pool ranks highest, its best unit and
+    // its floor, while the minimum's share has room.
+    let mut minimum_used = 0usize;
+    for &piece in &input.minimum {
+        let Some(best) = order
+            .iter()
+            .find(|u| u.piece == piece && u.kind == Kind::Reading)
+        else {
+            continue;
+        };
+        let with = slot.with_floor(best, input);
+        let cost: usize = with
+            .iter()
+            .filter(|w| !slot.in_slot.contains(&w.id))
+            .map(|w| w.tokens)
+            .sum();
+        if minimum_used + cost > caps.minimum || !slot.fits(&with, input, caps) {
+            continue;
+        }
+        slot.place_all(&with);
+        minimum_used += cost;
+        slot.protected.extend(with.iter().map(|w| w.id));
+        if let Some(floor) = input.piece_floors.get(&piece) {
+            slot.protected.extend(floor.iter().map(|f| f.id));
+        }
+    }
     match &input.allowance {
         None => {
             for u in order {
@@ -264,7 +344,7 @@ pub fn fill(input: &FillInput, caps: &Caps) -> Fill {
             // displacing held rounds of its kind it outscores when it needs
             // their room.
             for u in &order {
-                if slot.in_slot.contains(&u.id) {
+                if slot.in_slot.contains(&u.id) || slot.displaced.contains(&u.id) {
                     continue;
                 }
                 let with = slot.with_floor(u, input);
@@ -294,10 +374,16 @@ pub fn fill(input: &FillInput, caps: &Caps) -> Fill {
 }
 
 /// The scored tier's slot as it fills.
+#[derive(Clone)]
 struct Slot {
     used: Used,
     placed: Vec<usize>,
     in_slot: HashSet<usize>,
+    /// What the minimum placed: never displaced at this boundary.
+    protected: HashSet<usize>,
+    /// What an entry displaced: it does not enter again at this boundary, or
+    /// a displaced round would take back its seat from one read more.
+    displaced: HashSet<usize>,
 }
 
 impl Slot {
@@ -344,16 +430,18 @@ impl Slot {
 
     fn remove(&mut self, u: &Unit) {
         if self.in_slot.remove(&u.id) {
-            self.used.total -= u.tokens;
-            *self.used.by_kind.entry(u.kind).or_default() -= u.tokens;
+            self.used.take(u);
             self.placed.retain(|id| *id != u.id);
+            self.displaced.insert(u.id);
         }
     }
 
     /// Make room for `with`, which `u` brings, by taking out held rounds of
-    /// `u`'s kind scored below it, lowest first — a piece whose last tool
-    /// round goes leaving whole, its floor with it. Commits and answers `true`
-    /// when `with` then fits; changes nothing and answers `false` otherwise.
+    /// `u`'s kind scored below it, the least read first, then the lowest
+    /// scored — a piece whose last tool round goes leaving whole, its floor
+    /// with it, when `u` outscores its floor too. Nothing the minimum placed
+    /// leaves. Commits and answers `true` when `with` then fits; changes
+    /// nothing and answers `false` otherwise.
     fn displace_for(&mut self, u: &Unit, with: &[Unit], input: &FillInput, caps: &Caps) -> bool {
         let mut victims: Vec<&Unit> = input
             .scored
@@ -364,14 +452,16 @@ impl Slot {
                     && v.score < u.score
                     && input.held.contains(&v.id)
                     && self.in_slot.contains(&v.id)
+                    && !self.protected.contains(&v.id)
             })
             .collect();
-        victims.sort_by(|a, b| a.score.total_cmp(&b.score).then(b.id.cmp(&a.id)));
-        let mut trial = Slot {
-            used: self.used.clone(),
-            placed: self.placed.clone(),
-            in_slot: self.in_slot.clone(),
-        };
+        victims.sort_by(|a, b| {
+            a.reads
+                .total_cmp(&b.reads)
+                .then(a.score.total_cmp(&b.score))
+                .then(b.id.cmp(&a.id))
+        });
+        let mut trial = self.clone();
         for v in victims {
             if trial.fits(with, input, caps) {
                 break;
@@ -386,7 +476,10 @@ impl Slot {
             let rounds_left = input.scored.iter().any(|r| {
                 r.piece == v.piece && !floor_ids.contains(&r.id) && trial.in_slot.contains(&r.id)
             });
-            if !rounds_left {
+            let floor_yields = floor
+                .iter()
+                .all(|f| f.score < u.score && !trial.protected.contains(&f.id));
+            if !rounds_left && floor_yields {
                 for f in &floor {
                     trial.remove(f);
                 }
@@ -411,6 +504,7 @@ mod tests {
             kind,
             tokens,
             score,
+            reads: 0.0,
         }
     }
 
@@ -422,6 +516,8 @@ mod tests {
             journals: 300,
             dialogue: 1_000,
             layers: vec![100],
+            reading_piece: 1_000,
+            minimum: 0,
         }
     }
 
@@ -434,6 +530,14 @@ mod tests {
         assert_eq!(a[&Kind::Guide], 100);
         assert_eq!(a[&Kind::Journal], 100);
         assert!(!a.contains_key(&Kind::Dialogue));
+    }
+
+    /// Of the shipped 52,425-token readings cap, one reading takes at most
+    /// 20,970 and the minimum 26,212.
+    #[test]
+    fn a_reading_and_the_minimum_take_their_shares_of_the_readings_cap() {
+        assert_eq!(reading_piece_cap(52_425), 20_970);
+        assert_eq!(minimum_cap(52_425), 26_212);
     }
 
     fn readings(scored: Vec<Unit>, held: &[usize], allowance: Option<Allowance>) -> FillInput {
@@ -528,15 +632,132 @@ mod tests {
         assert_eq!(sorted(fill(&input, &caps()).placed), vec![1, 3]);
     }
 
-    /// No cap per piece: one reading's rounds may take the whole readings cap.
+    /// **One reading takes at most its maximum**: ten pages of piece 7 better
+    /// scored than anything else stop at 400 tokens, and the room past it
+    /// goes to piece 8's page.
     #[test]
-    fn one_reading_may_take_the_whole_readings_cap() {
+    fn a_reading_takes_at_most_its_maximum() {
+        let mut scored: Vec<Unit> = (0..10).map(|i| u(i, 7, Kind::Reading, 100, 0.9)).collect();
+        scored.push(u(80, 8, Kind::Reading, 100, 0.5));
         let input = FillInput {
             room: 10_000,
-            scored: (0..10).map(|i| u(i, 7, Kind::Reading, 100, 0.9)).collect(),
+            scored,
             ..Default::default()
         };
-        assert_eq!(fill(&input, &caps()).placed.len(), 10);
+        let capped = Caps {
+            reading_piece: 400,
+            ..caps()
+        };
+        assert_eq!(sorted(fill(&input, &capped).placed), vec![0, 1, 2, 3, 80]);
+    }
+
+    /// **The minimum seats the pool's strongest readings first**: piece 7's
+    /// six pages each outscore piece 8's best, and alone they fill the 500
+    /// readings cap. With piece 8 and then piece 7 taking the minimum, piece 8
+    /// keeps its best page and its floor, and piece 7 fills what is left.
+    #[test]
+    fn the_minimum_seats_the_pools_strongest_readings() {
+        let mut scored: Vec<Unit> = (71..=76)
+            .map(|i| u(i, 7, Kind::Reading, 100, 0.8))
+            .collect();
+        scored.push(u(81, 8, Kind::Reading, 100, 0.75));
+        let floors = HashMap::from([(8, vec![u(80, 8, Kind::Reading, 50, 0.3)])]);
+        let capped = Caps {
+            readings: 500,
+            reading_piece: 500,
+            minimum: 250,
+            ..caps()
+        };
+        let input = |minimum: Vec<usize>| FillInput {
+            room: 10_000,
+            scored: scored.clone(),
+            piece_floors: floors.clone(),
+            minimum,
+            ..Default::default()
+        };
+        assert_eq!(
+            sorted(fill(&input(vec![]), &capped).placed),
+            vec![71, 72, 73, 74, 75]
+        );
+        assert_eq!(
+            sorted(fill(&input(vec![8, 7]), &capped).placed),
+            vec![71, 72, 73, 80, 81]
+        );
+    }
+
+    /// **What the minimum placed is not displaced**: piece 7's page holds the
+    /// readings cap as the minimum, and an entry scored far above it waits.
+    #[test]
+    fn the_minimum_is_not_displaced() {
+        let capped = Caps {
+            readings: 100,
+            minimum: 100,
+            ..caps()
+        };
+        let input = FillInput {
+            room: 10_000,
+            scored: vec![
+                u(71, 7, Kind::Reading, 100, 0.1),
+                u(1, 1, Kind::Reading, 100, 0.9),
+            ],
+            held: HashSet::from([71]),
+            allowance: Some(Allowance::from([(Kind::Reading, 1_000)])),
+            minimum: vec![7],
+            ..Default::default()
+        };
+        assert_eq!(fill(&input, &capped).placed, vec![71]);
+    }
+
+    /// **The least read held round leaves first**: the cap of 300 is full of
+    /// three held rounds. An entry scored 0.9 needs 100: round 21, which the
+    /// model's selection did not read, leaves — not round 11, scored lowest
+    /// but read most.
+    #[test]
+    fn the_least_read_held_round_leaves_first() {
+        let capped = Caps {
+            readings: 300,
+            ..caps()
+        };
+        let read = |id, piece, score, reads| Unit {
+            reads,
+            ..u(id, piece, Kind::Reading, 100, score)
+        };
+        let input = FillInput {
+            room: 10_000,
+            scored: vec![
+                read(11, 1, 0.2, 0.5),
+                read(21, 2, 0.4, 0.0),
+                read(31, 3, 0.45, 0.1),
+                read(41, 4, 0.9, 0.0),
+            ],
+            held: HashSet::from([11, 21, 31]),
+            allowance: Some(Allowance::from([(Kind::Reading, 1_000)])),
+            ..Default::default()
+        };
+        assert_eq!(sorted(fill(&input, &capped).placed), vec![11, 31, 41]);
+    }
+
+    /// **A floor the entry does not outscore stays**: piece 7's last page
+    /// makes room for an entry scored 0.6, and its floor, scored 0.95, keeps
+    /// its seat rather than leaving with the page.
+    #[test]
+    fn a_floor_that_outscores_the_entry_stays() {
+        let capped = Caps {
+            readings: 150,
+            ..caps()
+        };
+        let input = FillInput {
+            room: 10_000,
+            scored: vec![
+                u(71, 7, Kind::Reading, 50, 0.2),
+                u(1, 1, Kind::Reading, 100, 0.6),
+            ],
+            piece_floors: HashMap::from([(7, vec![u(70, 7, Kind::Reading, 50, 0.95)])]),
+            held: HashSet::from([70, 71]),
+            allowance: Some(Allowance::from([(Kind::Reading, 1_000)])),
+            ..Default::default()
+        };
+        assert_eq!(sorted(fill(&input, &capped).placed), vec![1, 70]);
     }
 
     fn sorted(mut v: Vec<usize>) -> Vec<usize> {

@@ -13,7 +13,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use super::dialogue_fill::{plan, ContextExchange, DialoguePlan, DialogueSlot, WorkingPiece};
-use super::fill::{Caps, Kind};
+use super::fill::{minimum_cap, reading_piece_cap, Caps, Kind};
 use super::{TimelineId, TurnIndex, TurnKey};
 
 /// One exchange of `n` turns on a timeline of its own, so the plan's turns can
@@ -42,6 +42,7 @@ fn random_case(rng: &mut StdRng) -> Case {
         .map(|_| WorkingPiece {
             kind: kinds[rng.random_range(0..kinds.len())],
             exchanges: (0..rng.random_range(1..=3)).map(|_| ex(rng, 6)).collect(),
+            momentum: rng.random_range(0.0..1000.0),
         })
         .collect();
     let own = (0..rng.random_range(0..=5)).map(|_| ex(rng, 5)).collect();
@@ -56,13 +57,16 @@ fn random_case(rng: &mut StdRng) -> Case {
             score: rng.random_range(0.0..1.0),
         })
         .collect();
+    let readings = rng.random_range(0..=400);
     let caps = Caps {
-        readings: rng.random_range(0..=400),
+        readings,
         folders: rng.random_range(0..=400),
         guides: rng.random_range(0..=400),
         journals: rng.random_range(0..=400),
         dialogue: rng.random_range(0..=400),
         layers: vec![rng.random_range(0..=400)],
+        reading_piece: reading_piece_cap(readings),
+        minimum: minimum_cap(readings),
     };
     // Half the cases are a boundary with an allowance, the slot holding some
     // of the turns already.
@@ -153,7 +157,7 @@ fn every_carving_of_a_random_slot_keeps_whole_turns_and_its_caps() {
     for case_no in 0..2000 {
         let case = random_case(&mut rng);
         let slot = &case.slot;
-        let plan = plan(slot, |k| case.scores[&k], |k| case.tokens[&k]);
+        let plan = plan(slot, |k| case.scores[&k], |k| case.tokens[&k], |_| 0.0);
         let tokens_of = |keys: &[TurnKey]| -> usize { keys.iter().map(|k| case.tokens[k]).sum() };
         let check = |ex: &[TurnKey], what: &str| -> Vec<TurnKey> {
             let placed = placed_of(&plan, ex);

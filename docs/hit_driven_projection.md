@@ -474,17 +474,36 @@ At each boundary:
    12K with the tools section at its widest, less the turn's own appended
    tokens. A round whose kind is at its cap is skipped and the fill goes on to
    the next by score. Floors count toward their kind's cap but are never
-   skipped for it. There is no per-piece cap: a reading the indexer reads
-   above everything else may take the whole of `readings`.
+   skipped for it.
+
+   **A reading has a minimum and a maximum** (`projection/fill.rs`). Before
+   the rounds by score, the readings the pool ranks highest by momentum each
+   take their best-scored round and their floor, strongest first, until half
+   of `readings` is placed this way (`minimum_cap`); what the minimum places
+   does not leave at that boundary. No one reading takes more than two fifths
+   of `readings` (`reading_piece_cap`, ≈ 21K at a 233K room): its next round
+   is skipped and the room goes on to the next by score. Without them, one
+   large file took the budget: on 2026-11-20 (e) the largest reading held
+   70–87% of `readings` in the projections measured — `scheduler/mod.rs`
+   (18,740 lines) 16 of 104 rounds, ~52K — and a 7-round file the pool ranked
+   first got none, its rounds each outscored by the large file's
+   (`docs/results/dependency_battery_2026-11-20_e.md`).
 5. **Rounds in and out: a third of a budget per boundary.** At most a third
    of each working-set kind's cap — counted in the placed rounds' K/V tokens,
    rounded up to whole turns, a new piece's floor included — may enter the
    slot at one boundary, so no budget is flushed at once and what the
    momentum carries comes in over a few boundaries. The first boundary after
    a new user message has no allowance: the question changes what is read,
-   and it chooses its rounds whole. Rounds leave only as entries need their
-   room, lowest score first; a piece whose last tool turn leaves goes whole,
-   floor and all. A round entering the slot has its K/V and its remaining
+   and it chooses its rounds whole. The minimum is outside the allowance.
+   Rounds leave only as entries scored above them need their room, the round
+   the model's own selection read least first (its turn's lift less one,
+   `ProjectionScores::reads`), then the lowest scored; a round displaced does
+   not enter again at that boundary. The selection's reads are what tells a
+   large file's unread rounds from a small one's read ones: in (e) the model's
+   selection gave `recorded_reply.rs` four times its share of the slot's
+   hits and `scheduler/mod.rs` a quarter of its. A piece whose last tool turn
+   leaves goes whole, floor and all, only when the entry outscores its floor
+   as well. A round entering the slot has its K/V and its remaining
    layers' index rows brought to the device; one leaving keeps its sampled
    rows while its piece stays pooled.
 6. **Seating: stable.** Slot rounds are seated at compact positions: the

@@ -911,6 +911,9 @@ pub struct ProjectionScores {
     /// Concept C: turns whose score was RAISED by locality drag (selected only
     /// through a neighbor) — stamped `SelectionOrigin::Locality` at selection.
     locality_boosted: AHashSet<TurnKey>,
+    /// Each lifted turn's reads: its lift less one, `gain · h`
+    /// ([`Self::lift_turns`]).
+    reads: AHashMap<TurnKey, f32>,
 }
 
 impl ProjectionScores {
@@ -932,6 +935,15 @@ impl ProjectionScores {
     /// Look up a turn's belief score. Zero when not scored this projection.
     pub fn turn(&self, timeline: TimelineId, index: TurnIndex) -> f32 {
         self.turns
+            .get(&TurnKey::new(timeline, index))
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// How much the model's selection read a turn ([`Self::lift_turns`]).
+    /// Zero when unread.
+    pub fn reads(&self, timeline: TimelineId, index: TurnIndex) -> f32 {
+        self.reads
             .get(&TurnKey::new(timeline, index))
             .copied()
             .unwrap_or(0.0)
@@ -962,6 +974,7 @@ impl ProjectionScores {
         credit: impl Fn(&TurnKey) -> bool,
     ) {
         for (key, factor) in lifts {
+            self.reads.insert(key, factor - 1.0);
             match self.turns.get_mut(&key) {
                 Some(s) => *s *= factor,
                 None if credit(&key) => {
@@ -1256,6 +1269,13 @@ pub trait ContentResolver {
     /// Relevance score for a turn — the wide-Q belief score the scheduler
     /// recorded for this projection. Zero when unscored.
     fn turn_score(&self, turn: TurnKey) -> f32;
+
+    /// How much the model's own selection read a turn over the strides before
+    /// this projection: its round's lift less one, `gain · h`
+    /// (`docs/hit_driven_projection.md` §7.1). Zero when unread. Default zero.
+    fn turn_reads(&self, _turn: TurnKey) -> f32 {
+        0.0
+    }
 
     /// Concept B: a turn group's attention mass this projection (0 = no mass /
     /// unscored — adaptivity then rests at the static budget).
@@ -8524,6 +8544,10 @@ impl<'a> ContentResolver for ScoredSubstrate<'a> {
         self.scores.turn(turn.timeline, turn.index)
     }
 
+    fn turn_reads(&self, turn: TurnKey) -> f32 {
+        self.scores.reads(turn.timeline, turn.index)
+    }
+
     fn group_attention_mass(&self, group: GroupId) -> f32 {
         self.scores.group_mass(group)
     }
@@ -8666,6 +8690,10 @@ impl<'a> ContentResolver for SubstrateRead<'a> {
             return 0.0;
         }
         self.scores_or_empty().turn(turn.timeline, turn.index)
+    }
+
+    fn turn_reads(&self, turn: TurnKey) -> f32 {
+        self.scores_or_empty().reads(turn.timeline, turn.index)
     }
 
     fn group_attention_mass(&self, group: GroupId) -> f32 {
@@ -8830,6 +8858,12 @@ mod tests {
         assert_eq!(scores.turn(tl, TurnIndex(2)), 0.0, "no reads, no credit");
         assert_eq!(scores.turn(other, TurnIndex(0)), 0.0, "not credited");
         assert_eq!(scores.turn_count(), 2);
+        // Every lifted turn records its reads, credited or not.
+        assert_eq!(scores.reads(tl, TurnIndex(0)), 1.5);
+        assert_eq!(scores.reads(tl, TurnIndex(1)), 3.0);
+        assert_eq!(scores.reads(tl, TurnIndex(2)), 0.0);
+        assert_eq!(scores.reads(other, TurnIndex(0)), 3.0);
+        assert_eq!(scores.reads(tl, TurnIndex(3)), 0.0, "never lifted");
     }
 
     /// **An append-only layer reads every group self-local, but those of the

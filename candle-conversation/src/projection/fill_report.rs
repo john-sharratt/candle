@@ -148,10 +148,12 @@ mod tests {
             WorkingPiece {
                 kind: Kind::Reading,
                 exchanges: vec![vec![key(1, 0), key(1, 1), key(1, 2)]],
+                momentum: 0.0,
             },
             WorkingPiece {
                 kind: Kind::Reading,
                 exchanges: vec![vec![key(2, 0), key(2, 1)]],
+                momentum: 0.0,
             },
         ];
         let placed = vec![vec![key(1, 0), key(1, 2)], vec![]];
