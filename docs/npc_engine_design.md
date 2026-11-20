@@ -280,9 +280,14 @@ it names them. When the
 engine signs a step off it tells the character so in the same tick, with the one thing to do
 next. Every tick it also carries the **mission compass** whenever that has changed: the next step
 and the way to whatever it names — a room, the room a machine stands in, the room a person is in
-right now — or, when only the report is left, the way back to the table. A way on another level is
-the lift ride (`lift_call`, `lift_use` naming the level, then `move_to`), worded from the landing
-when the body is standing at the lift so it is told again there. The table offers only what the
+right now — or, when only the report is left, the way back to the table. A way anywhere is one
+`move_to`, by the name the grammar offers the room under (`body::destination_name`): every room on
+every floor there is a way to is offered, a name two floors share carrying its level ("the green
+room, on the chronicle level"), and a journey that changes floor is ridden by the world — the body
+walks to its landing, waits there for the car with whoever else is waiting, is set down on the far
+landing and walks on (`World::tick`, `board_for_the_way`). Told to make the ride itself (walk to the
+lift, `lift_use` naming the level, walk on), a cast stood on the landing all evening and never once
+called the car. A landing is never a collision: bodies passing through one queue there. The table offers only what the
 body can do at it: `report_done` / `report_stuck` to one carrying a mission,
 `orders_report_done` to one holding a standing order, and nothing of a mission's to one
 carrying none.

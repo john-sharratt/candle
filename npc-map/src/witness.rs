@@ -837,12 +837,14 @@ mod tests {
     fn a_collision_reads_as_a_bump_from_both_sides() {
         let mut w = vault();
         w.enter("m1", "Maker-01", casting("band-one")).unwrap();
-        w.enter("m2", "Maker-02", casting("green-room")).unwrap();
+        w.enter("m2", "Maker-02", casting("core")).unwrap();
         w.mark_seen("m1");
         w.mark_seen("m2");
-        let elsewhere = Where::new("vault-chronicle", "core");
-        w.set_off("m1", elsewhere.clone()).unwrap();
-        w.set_off("m2", elsewhere).unwrap();
+        // One heads out through the lift's landing, the other in from it, so
+        // they meet between — each still on its way.
+        w.set_off("m1", Where::new("vault-chronicle", "core"))
+            .unwrap();
+        w.set_off("m2", casting("band-one")).unwrap();
         w.tick();
 
         let m1 = narrate(&w, &since(&w, "m1")).expect("m1 made something out");
@@ -852,7 +854,7 @@ mod tests {
         );
         let m2 = narrate(&w, &since(&w, "m2")).expect("m2 made something out");
         assert!(
-            m2.contains("Maker-01 bumps into you") && m2.contains("while travelling"),
+            m2.contains("Maker-01 came in and bumps into you") && m2.contains("while travelling"),
             "{m2}"
         );
     }

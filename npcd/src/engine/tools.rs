@@ -565,17 +565,20 @@ const MOVE_TO: Tool = Tool {
     // Walking needs legs. A tower consciousness has none and never will, so the
     // act is absent for it rather than refused — offered, it would be tried.
     availability: Availability::Embodied,
-    description: "Go somewhere, named the way you know it rather than as coordinates. You name \
-                  the place; getting there is not your business — you will be told when you \
-                  arrive, and told if you never do. Somewhere you have no memory of is refused \
-                  before you stand up.",
+    description: "Go somewhere, named the way you know it rather than as coordinates — on this \
+                  level or any other. You name the place; getting there is not your business: \
+                  a room on another level is reached by the lift, which you wait for on the \
+                  landing and ride as part of the journey. You will be told when you arrive, and \
+                  told if you never do. Somewhere you have no memory of is refused before you \
+                  stand up.",
     params: &[
         Param {
             name: "destination",
             ty: "string",
             required: true,
-            description: "A place you know: \"the green room\", \"band one\", \"the command \
-                          room\". Somewhere on your own level unless you say otherwise.",
+            description: "A room you know: \"the green room\", \"band one\", \"the command \
+                          room\". A name two levels share means the one on your own level; \
+                          the other is named with its level.",
         },
         Param {
             name: "urgency",

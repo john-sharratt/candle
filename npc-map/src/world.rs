@@ -761,6 +761,42 @@ impl World {
         }
     }
 
+    /// Ride the lift for every walk whose next leg changes floor.
+    ///
+    /// **A journey to another floor is one journey.** The route runs through
+    /// the landings — out to this floor's, between landings, on from the far
+    /// one — and the leg between landings is the car's, not the walker's: a
+    /// body on its landing whose way goes on from another landing asks to ride
+    /// there ([`World::ride_lift`]), waits for the car with whoever else is
+    /// waiting, and is set down on the landing its walk goes on from, which
+    /// [`World::land`] reads as the walk's next stop. Asked to make the ride
+    /// itself — walk to the lift, call it, name the level, walk on — a cast
+    /// stood on the landing and never once called the car.
+    ///
+    /// A world with no lift, or a leg that crosses a door rather than the
+    /// shaft, is walked as any other leg.
+    fn board_for_the_way(&mut self) {
+        let rides: Vec<(String, usize)> = self
+            .actors
+            .values()
+            .filter(|a| self.riding(&a.id).is_none())
+            .filter_map(|a| {
+                let walk = a.walk.as_ref()?;
+                let next = walk.ahead.front()?;
+                self.at_landing(&a.id)?;
+                if next.area == a.at.area || !self.shaft.contains(next) {
+                    return None;
+                }
+                let end = walk.leg_end(&a.at)?;
+                let floor = self.shaft.iter().position(|c| c == &end)?;
+                Some((a.id.clone(), floor))
+            })
+            .collect();
+        for (rider, floor) in rides {
+            self.ride_lift(&rider, floor);
+        }
+    }
+
     /// What a body is called, whether or not it is still here.
     ///
     /// The one lookup that answers for somebody who has left, which is what a
@@ -1183,9 +1219,14 @@ impl World {
         self.forget_old_events();
         // The lift runs on its own clock, whether or not anybody is walking.
         self.step_lift();
+        self.board_for_the_way();
+        // A body riding — waiting on its landing for the car, or aboard — goes
+        // nowhere on foot: the car sets it down, and its walk carries on from
+        // the landing it is set down on.
         let legs: Vec<(String, Where)> = self
             .actors
             .values()
+            .filter(|a| self.riding(&a.id).is_none())
             .filter_map(|a| Some((a.id.clone(), a.walk.as_ref()?.leg_end(&a.at)?)))
             .collect();
         if legs.is_empty() {
@@ -1247,6 +1288,11 @@ impl World {
         // somebody already is stops there too — walked into them. One that has
         // *arrived* (its walk cleared on landing) went there on purpose and is
         // joining them, not colliding.
+        //
+        // **Never on a landing.** A landing is where bodies wait for the car
+        // together, and a journey to another floor passes through one: ending
+        // it there for meeting the people already waiting stopped every ride a
+        // queue had formed for.
         for (id, _) in &legs {
             if caught.contains(id) {
                 continue;
@@ -1254,7 +1300,7 @@ impl World {
             let Some(a) = self.actors.get(id) else {
                 continue;
             };
-            if a.walk.is_none() {
+            if a.walk.is_none() || self.shaft.contains(&a.at) {
                 continue;
             }
             let place = a.at.clone();
@@ -1304,7 +1350,9 @@ impl World {
     /// it lives a tick at a time and reads its outcomes.
     pub fn settle(&mut self) -> usize {
         let mut ticks = 0;
-        while self.tick() > 0 {
+        // A moment that moves nobody is not the end while somebody rides: the
+        // car is still on its way to them, or with them aboard.
+        while self.tick() > 0 || !self.riders.is_empty() || !self.waiting.is_empty() {
             ticks += 1;
         }
         ticks
@@ -1457,6 +1505,10 @@ impl World {
             return;
         };
         let place = actor.at.clone();
+        // A ride taken for the journey ends with it: the car must not carry
+        // off a body that has given up the way that went through it.
+        self.riders.remove(id);
+        self.waiting.remove(id);
         let arrived = &walk.toward == ending_at;
         self.log.push(Event {
             at,
@@ -2659,79 +2711,129 @@ mod tests {
         assert!(w.holder_of("a-character").is_none());
     }
 
-    /// **Two bodies crossing at the lift run into each other and both stop.**
-    /// The whole point of the collision: a pair chasing each other between
-    /// levels, forever swapping, finally end up in one place. Both leave the
-    /// casting level for elsewhere, so their first leg ends at the lift (`core`),
-    /// where they meet — still on their way — and stop there.
+    /// **A walk to another floor rides the lift and walks on.** One `set_off`:
+    /// out to this floor's landing, waiting there for the car, carried, set down
+    /// on the far landing, and on into the room — arriving, not lost on the way.
     #[test]
-    fn two_travellers_crossing_at_the_lift_bump_and_both_stop() {
+    fn a_walk_to_another_floor_rides_the_lift_and_walks_on() {
+        let mut w = vault();
+        let room = Where::new("vault-command", "command-room");
+        w.enter("m1", "Maker-01", at("band-one")).unwrap();
+        w.set_off("m1", room.clone()).unwrap();
+
+        // The first leg ends at this floor's landing, and the next asks to ride.
+        w.tick();
+        assert_eq!(w.actor("m1").unwrap().at, at("core"), "not at the lift");
+        w.tick();
+        let command = w.floor_of(&room).expect("the command level is served");
+        assert_eq!(w.riding("m1"), Some(command), "never asked to ride");
+
+        // The body never crosses the shaft on foot: it is on this landing until
+        // the car sets it down on the far one.
+        let mut rode = 0;
+        while w.riding("m1").is_some() && rode < 200 {
+            assert_eq!(w.actor("m1").unwrap().at, at("core"), "left before the car");
+            w.tick();
+            rode += 1;
+        }
+        assert!(rode > 0, "the ride took no time");
+        w.settle();
+        assert_eq!(w.actor("m1").unwrap().at, room, "never got to the room");
+        assert!(w.actor("m1").unwrap().walk.is_none());
+        assert!(
+            w.log().iter().any(|e| e.actor == "m1"
+                && matches!(&e.what, Happening::GotThere { toward } if *toward == room)),
+            "the journey was not answered as arrived"
+        );
+        assert!(
+            !w.log()
+                .iter()
+                .any(|e| e.actor == "m1" && matches!(&e.what, Happening::LostTheWay { .. })),
+            "the ride lost the way"
+        );
+    }
+
+    /// **Two bodies meeting at the lift ride on together.** A landing is where a
+    /// queue for the car forms, and a walk that passes through one is not ended
+    /// by the people already standing there.
+    #[test]
+    fn two_travellers_meeting_at_the_lift_ride_on_together() {
         let mut w = vault();
         w.enter("m1", "Maker-01", at("band-one")).unwrap();
         w.enter("m2", "Maker-02", at("green-room")).unwrap();
         let elsewhere = Where::new("vault-chronicle", "core");
         w.set_off("m1", elsewhere.clone()).unwrap();
-        w.set_off("m2", elsewhere).unwrap();
+        w.set_off("m2", elsewhere.clone()).unwrap();
 
-        // One leg carries both to the casting lift, still bound onward.
         w.tick();
         assert_eq!(w.actor("m1").unwrap().at, at("core"), "m1 not at the lift");
         assert_eq!(w.actor("m2").unwrap().at, at("core"), "m2 not at the lift");
-
-        // The collision stops both — neither carries on to the other level.
         assert!(
-            w.actor("m1").unwrap().walk.is_none(),
-            "m1 kept walking through the collision"
+            w.actor("m1").unwrap().walk.is_some(),
+            "m1 stopped at the lift"
         );
-        assert!(w.actor("m2").unwrap().walk.is_none(), "m2 kept walking");
-
-        // And it is recorded, once, as a collision between the two of them.
-        let bumps: Vec<_> = w
-            .log()
-            .iter()
-            .filter(|e| matches!(&e.what, Happening::Bumped { .. }))
-            .collect();
-        assert_eq!(bumps.len(), 1, "one collision per pair: {bumps:?}");
         assert!(
-            matches!(&bumps[0].what, Happening::Bumped { into } if into == "m2")
-                && bumps[0].actor == "m1",
-            "{:?}",
-            bumps[0]
+            w.actor("m2").unwrap().walk.is_some(),
+            "m2 stopped at the lift"
+        );
+
+        w.settle();
+        assert_eq!(w.actor("m1").unwrap().at, elsewhere);
+        assert_eq!(w.actor("m2").unwrap().at, elsewhere);
+        assert!(
+            !w.log()
+                .iter()
+                .any(|e| matches!(&e.what, Happening::Bumped { .. })),
+            "a queue at the lift was taken for a collision"
         );
     }
 
-    /// **Two bodies swapping levels cross on the lift and end up together.**
-    /// This is the exact shape of the chase the collision exists to break: each
-    /// heads for the level the other is on, over the one lift between them, and
-    /// without this they would swap past each other for ever. Instead they meet
-    /// on it and both stop, in the same room.
+    /// **Two bodies swapping levels each reach the other's.** The shaft is the
+    /// car's, not a corridor they can meet in, so neither is stopped by the
+    /// other on the way.
     #[test]
-    fn two_travellers_swapping_levels_meet_and_stop_together() {
+    fn two_travellers_swapping_levels_each_reach_the_other_s() {
         let mut w = vault();
         let command = Where::new("vault-command", "core");
         let chronicle = Where::new("vault-chronicle", "core");
         w.enter("m1", "Maker-01", command.clone()).unwrap();
         w.enter("m2", "Maker-02", chronicle.clone()).unwrap();
         w.set_off("m1", chronicle.clone()).unwrap();
-        w.set_off("m2", command).unwrap();
+        w.set_off("m2", command.clone()).unwrap();
 
+        w.settle();
+        assert_eq!(w.actor("m1").unwrap().at, chronicle);
+        assert_eq!(w.actor("m2").unwrap().at, command);
+    }
+
+    /// **Giving up the way gives up its ride.** A body waiting at the landing
+    /// for a journey's car that sets off somewhere on its own floor instead is
+    /// not carried off when the car comes.
+    #[test]
+    fn setting_off_elsewhere_from_the_landing_gives_up_the_journey_s_ride() {
+        let mut w = vault();
+        let shaft: Vec<Where> = w.shaft().to_vec();
+        let casting = w.floor_of(&at("core")).expect("casting is served");
+        let far = (0..shaft.len())
+            .find(|f| *f != casting)
+            .expect("two floors");
+        // The car away, so the rider must wait for it.
+        w.call_lift(far);
+        for _ in 0..100 {
+            if w.lift().unwrap().boardable_at(far) {
+                break;
+            }
+            w.tick();
+        }
+        w.enter("m1", "Maker-01", at("core")).unwrap();
+        w.set_off("m1", shaft[far].clone()).unwrap();
         w.tick();
-        let p1 = w.actor("m1").unwrap().at.clone();
-        let p2 = w.actor("m2").unwrap().at.clone();
-        assert_eq!(p1, p2, "the swap left them apart: {p1:?} vs {p2:?}");
-        assert!(w.actor("m1").unwrap().walk.is_none(), "m1 kept going");
-        assert!(w.actor("m2").unwrap().walk.is_none(), "m2 kept going");
+        assert_eq!(w.riding("m1"), Some(far), "never asked to ride");
 
-        let bumps: Vec<_> = w
-            .log()
-            .iter()
-            .filter(|e| matches!(&e.what, Happening::Bumped { .. }))
-            .collect();
-        assert_eq!(
-            bumps.len(),
-            1,
-            "one collision for the crossing pair: {bumps:?}"
-        );
+        w.set_off("m1", at("green-room")).unwrap();
+        assert_eq!(w.riding("m1"), None, "the ride outlived the journey");
+        w.settle();
+        assert_eq!(w.actor("m1").unwrap().at, at("green-room"));
     }
 
     /// Arriving where somebody is standing is joining them, not a collision — you

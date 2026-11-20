@@ -36,7 +36,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
 
-use npc_map::world::{Refused, Voice, Where};
+use npc_map::world::{Refused, Voice, Where, World};
 use npc_map::NodeKind;
 
 use crate::authority::ops::Voiced;
@@ -562,10 +562,10 @@ fn move_to(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
                  there is nowhere to walk to. You are already beside it."
             ));
         }
-        // **Another level is reached by the lift, not on foot.** A body cannot
-        // walk between floors — naming a level to `move_to` is the old instant
-        // stair, gone now — so a level is refused with the way that does work:
-        // go to the lift and ride it.
+        // **A level is not a room.** A journey goes somewhere to be, and a
+        // whole floor is nowhere in particular, so a level named to `move_to`
+        // is refused with what does work: a room on it, which the lift takes
+        // the body to.
         if hosted.read(|w| {
             let here = w.actor(body).map(|a| a.at.clone());
             w.map().areas().any(|a| {
@@ -575,7 +575,8 @@ fn move_to(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
             })
         }) {
             return Outcome::Refused(format!(
-                "You cannot walk to {want} — it is another level. Go to the lift and ride it there."
+                "{want} is another level, not a room: `move_to` a room on it, and the lift takes \
+                 you there."
             ));
         }
         // Naming what *is* reachable, because a refusal that only says no
@@ -588,6 +589,22 @@ fn move_to(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
     };
     let name = hosted.read(|w| w.node(&dest).map(|n| n.name.clone()));
     let name = name.unwrap_or_else(|| want.clone());
+    // Whether the way runs between two landings — ridden, not walked — so the
+    // body is told the lift is part of the journey it set out on, and does not
+    // take the wait on the landing for being stuck.
+    let ridden = hosted.read(|w| {
+        w.route(body, &dest).is_some_and(|way| {
+            way.windows(2).any(|leg| {
+                leg[0].area != leg[1].area
+                    && w.shaft().contains(&leg[0])
+                    && w.shaft().contains(&leg[1])
+            })
+        }) && w.lift().is_some()
+    });
+    let by = match ridden {
+        true => ", by the lift",
+        false => "",
+    };
 
     match hosted.with(|w| w.set_off(body, dest.clone())) {
         // **Walking to where you already stand is not a journey.**
@@ -616,8 +633,8 @@ fn move_to(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
             "You are already at {name}. There is nowhere to walk to, so whatever you want here, \
              do it here."
         )),
-        Ok(1) => Outcome::Did(format!("You set off for {name}. It is one stop.")),
-        Ok(n) => Outcome::Did(format!("You set off for {name}. It is {n} stops.")),
+        Ok(1) => Outcome::Did(format!("You set off for {name}{by}. It is one stop.")),
+        Ok(n) => Outcome::Did(format!("You set off for {name}{by}. It is {n} stops.")),
         Err(why) => Outcome::Refused(refusal(hosted, &why)),
     }
 }
@@ -707,55 +724,83 @@ pub fn destinations(hosted: &Hosted, body: &str) -> Vec<(String, Where)> {
         else {
             return Vec::new();
         };
-        // One pass over the graph. Everything below asks this rather than
-        // computing a route of its own.
-        let open: BTreeSet<Where> = npc_map::route::reachable_from(w.map(), &here)
-            .into_iter()
-            .collect();
-
-        let mut out: Vec<(String, Where)> = Vec::new();
-        // The rooms off this level, the lift's landing (`core`) among them.
-        // Passages are how you get between them rather than somewhere to be, so
-        // they are not destinations.
-        //
-        // **Only this level.** Walking between floors is not a thing a body does
-        // — the way up and down is the lift, so another level is reached by going
-        // to the lift and riding it (`lift_call` / `lift_use`), not by naming it
-        // to `move_to`. Offering a level here is what let the cast cross floors
-        // instantly by the stair and never touch the lift; a level named to
-        // `move_to` anyway is refused with that instruction (see [`move_to`]).
-        if let Some(area) = w.map().get(&here.area) {
-            for node in &area.nodes {
-                let place = Where::new(here.area.clone(), node.id.clone());
-                if node.kind == npc_map::NodeKind::Passage || !open.contains(&place) {
-                    continue;
-                }
-                out.push((node.name.clone(), place));
-            }
-            // **And the rooms a door leads to from this level** — a portal out
-            // of one of its rooms into another building, as the Sharratt room
-            // on the moon opens into the family's own front room. A door is
-            // walked through like any other; the lift, which is no portal, is
-            // still ridden.
-            for node in &area.nodes {
-                let from = Where::new(here.area.clone(), node.id.clone());
-                for to in w.map().ways_from(&from) {
-                    let Some(n) = w.node(to) else { continue };
-                    if n.kind == NodeKind::Passage || n.kind == NodeKind::Core || !open.contains(to)
-                    {
-                        continue;
-                    }
-                    out.push((n.name.clone(), to.clone()));
-                }
-            }
-        }
-
-        // One name, one place. First mention wins, so a room on this level
-        // keeps the word over a level that shares it.
-        let mut seen: BTreeSet<String> = BTreeSet::new();
-        out.retain(|(name, _)| seen.insert(name.to_ascii_lowercase()));
-        out
+        destinations_from(w, &here)
     })
+}
+
+/// Everywhere a body standing at `here` may walk to, and the exact place each
+/// name means — [`destinations`] without the body.
+///
+/// **Every room there is a way to, on any floor.** A journey to another floor
+/// is one `move_to`: the world walks the body to the lift, rides it and walks it
+/// on ([`npc_map::world::World::tick`]). It was three acts — walk to the lift,
+/// `lift_use` naming the level, walk on — and a cast told exactly that stood on
+/// the landing all evening and never once called the car. Passages are how you
+/// get between rooms rather than somewhere to be, and another floor's landing
+/// is somewhere a journey passes through, so neither is offered.
+///
+/// **A name another floor also uses is said with its level** — "the green
+/// room, on the chronicle level" — and this floor's room keeps the bare name,
+/// because the green room means the one on your own floor.
+pub fn destinations_from(w: &World, here: &Where) -> Vec<(String, Where)> {
+    // One pass over the graph. Everything below asks this rather than
+    // computing a route of its own.
+    let open: BTreeSet<Where> = npc_map::route::reachable_from(w.map(), here)
+        .into_iter()
+        .collect();
+    let areas = std::iter::once(here.area.as_str()).chain(
+        w.map()
+            .areas()
+            .map(|a| a.id.as_str())
+            .filter(|id| *id != here.area),
+    );
+    let mut rooms: Vec<(String, String, Where)> = Vec::new();
+    for id in areas {
+        let Some(area) = w.map().get(id) else {
+            continue;
+        };
+        for node in &area.nodes {
+            let place = Where::new(area.id.clone(), node.id.clone());
+            let passed = match node.kind {
+                NodeKind::Passage => true,
+                NodeKind::Core => area.id != here.area,
+                _ => false,
+            };
+            if passed || !open.contains(&place) {
+                continue;
+            }
+            rooms.push((node.name.clone(), area.name.clone(), place));
+        }
+    }
+    let shared = |name: &str| {
+        rooms
+            .iter()
+            .filter(|(n, _, _)| n.eq_ignore_ascii_case(name))
+            .count()
+            > 1
+    };
+    // One name, one place. First mention wins, so a room on this level keeps
+    // the word over anything else that shares it.
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    rooms
+        .iter()
+        .map(
+            |(name, on, place)| match place.area != here.area && shared(name) {
+                true => (format!("{name}, on {on}"), place.clone()),
+                false => (name.clone(), place.clone()),
+            },
+        )
+        .filter(|(name, _)| seen.insert(name.to_ascii_lowercase()))
+        .collect()
+}
+
+/// The name `move_to` offers a place under, from `here` — what the compass and
+/// the work's guidance say, so the way they give is an act the grammar has.
+pub fn destination_name(w: &World, here: &Where, to: &Where) -> Option<String> {
+    destinations_from(w, here)
+        .into_iter()
+        .find(|(_, place)| place == to)
+        .map(|(name, _)| name)
 }
 
 /// The names alone — the grammar's arms for `move_to`.
@@ -831,9 +876,9 @@ fn rooms_on_this_level(hosted: &Hosted, body: &str) -> String {
             .map(|n| n.name.clone())
             .collect()
     });
-    // The other levels are named as what they are — reached by the lift, not on
-    // foot — so a character that asked for one is pointed at the way that works
-    // rather than left to guess a room name it will not find.
+    // The other levels are named too, with how their rooms are reached, so a
+    // character that asked for a floor is pointed at a room on it rather than
+    // left to guess.
     let levels: Vec<String> = hosted.read(|w| {
         let Some(here) = w.actor(body).map(|a| a.at.clone()) else {
             return Vec::new();
@@ -853,7 +898,8 @@ fn rooms_on_this_level(hosted: &Hosted, body: &str) -> String {
     };
     if !levels.is_empty() {
         said.push_str(&format!(
-            " Other levels — {} — are reached by the lift, not on foot.",
+            " Other levels — {} — are reached by the lift: `move_to` a room on one and you \
+             ride there.",
             npc_map::text::list(&levels)
         ));
     }
@@ -943,14 +989,10 @@ fn place_by_name(hosted: &Hosted, body: &str, want: &str) -> Option<Where> {
             return Some(here);
         }
 
-        // Anywhere on *this level* the memory named that the grammar's short
-        // list left out — a corridor, a room by an id rather than its name.
-        //
-        // **Only this level.** Walking between floors is gone: the way up and
-        // down is the lift, so a room three floors up, or another level by name,
-        // is not something `move_to` resolves — it is refused with the lift as
-        // the way (see [`move_to`]). Resolving it here would be the instant stair
-        // by another door.
+        // Anywhere on *this level* the memory named that the grammar's list
+        // left out — a corridor, a room by an id rather than its name. Another
+        // floor's rooms are all in that list by name; a corridor on another
+        // floor is nowhere worth a ride.
         let open: BTreeSet<Where> = npc_map::route::reachable_from(w.map(), &here)
             .into_iter()
             .collect();
@@ -1667,21 +1709,102 @@ mod tests {
         assert!(h.read(|w| w.actor("m1").unwrap().walk.is_some()));
     }
 
-    /// **A place on another level cannot be walked to.** Once the stair went,
-    /// crossing floors is the lift's job — so a room on another level is refused
-    /// (it is not somewhere a body can set off for), and the refusal points at
-    /// the way that does work.
+    /// **A room on another level is one journey, by the lift.** The body is
+    /// told the lift is part of it, and the world walks it out to the landing,
+    /// rides it up and walks it on into the room.
     #[test]
-    fn a_place_on_another_level_cannot_be_walked_to() {
+    fn a_room_on_another_level_is_one_journey_by_the_lift() {
         let h = room();
         let out = perform(
             &h,
             "m1",
             &act("move_to", json!({"destination": "the command room"})),
         );
-        assert!(!out.happened(), "walked to another level: {out:?}");
-        assert!(out.line().unwrap().contains("lift"), "{out:?}");
-        assert!(h.read(|w| w.actor("m1").unwrap().walk.is_none()));
+        assert!(out.happened(), "{out:?}");
+        assert!(
+            out.line()
+                .unwrap()
+                .starts_with("You set off for the command room, by the lift."),
+            "{out:?}"
+        );
+        h.with(|w| {
+            w.settle();
+        });
+        assert_eq!(
+            h.read(|w| w.actor("m1").unwrap().at.clone()),
+            Where::new("vault-command", "command-room")
+        );
+    }
+
+    /// **Every room there is a way to has a name `move_to` takes it by**, from
+    /// anywhere in the vault — the compass and the work's guidance give the way
+    /// as that name, and a room without one has no way told at all.
+    #[test]
+    fn every_reachable_room_is_named_from_everywhere() {
+        let h = vault();
+        let all: Vec<Where> = h.read(|w| {
+            w.map()
+                .children("creators-vault")
+                .iter()
+                .flat_map(|a| a.nodes.iter().map(|n| Where::new(&a.id, &n.id)))
+                .collect()
+        });
+        h.read(|w| {
+            for from in &all {
+                for to in &all {
+                    let kind = w.node(to).unwrap().kind;
+                    let passed = kind == NodeKind::Passage
+                        || (kind == NodeKind::Core && to.area != from.area);
+                    if to == from || passed {
+                        continue;
+                    }
+                    assert!(
+                        destination_name(w, from, to).is_some(),
+                        "no name for {to} from {from}: {:?}",
+                        destinations_from(w, from)
+                            .iter()
+                            .map(|(n, p)| format!("{n}={p}"))
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        });
+    }
+
+    /// **Every room of every floor is somewhere to go, under one name each.**
+    /// A room whose name another floor's room also has is offered with its
+    /// level; this floor's keeps the bare name.
+    #[test]
+    fn the_rooms_of_other_floors_are_offered_and_a_shared_name_says_its_level() {
+        let h = room();
+        let offered = destinations(&h, "m1");
+        let names: Vec<&str> = offered.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"the command room"), "{names:?}");
+        let here = at("green-room");
+        let elsewhere: Vec<&(String, Where)> = offered
+            .iter()
+            .filter(|(_, p)| p.area != here.area)
+            .collect();
+        assert!(!elsewhere.is_empty(), "no other floor offered");
+        // Never another floor's landing: a journey passes through it.
+        let landings = h.read(|w| w.shaft().to_vec());
+        for (name, place) in &offered {
+            assert!(
+                place.area == here.area || !landings.contains(place),
+                "offered another floor's landing as `{name}`"
+            );
+        }
+        // A name used on two floors carries its level wherever it is not ours.
+        for (name, place) in &elsewhere {
+            let bare = h.read(|w| w.node(place).unwrap().name.clone());
+            let clashes = offered
+                .iter()
+                .filter(|(_, p)| p != place)
+                .any(|(_, p)| h.read(|w| w.node(p).unwrap().name.clone()) == bare);
+            if clashes {
+                assert!(name.contains(", on "), "`{name}` does not say its level");
+            }
+        }
     }
 
     #[test]

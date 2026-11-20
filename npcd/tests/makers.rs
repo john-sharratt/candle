@@ -359,7 +359,8 @@ fn sixteen_makers_only_wake_the_ones_something_happened_to() {
 #[test]
 fn a_maker_crossing_the_building_reads_one_line_per_stop() {
     // Movement is condensed, so a journey is not narrated doorway by doorway —
-    // and the three stops are the three a person would name.
+    // and the three stops are the three a person would name: the lift's
+    // landing, where the body waits for the car, and the room it walks on to.
     let mut w = vault();
     let s = Scheduler::new(64);
     let mut a = Attention::new();
@@ -368,21 +369,26 @@ fn a_maker_crossing_the_building_reads_one_line_per_stop() {
     deliver(&mut w, &mut a, &s, m);
     run_due(&s, 0);
 
-    let stops = w
-        .set_off("m1", Where::new("vault-command", "command-room"))
-        .unwrap();
+    let room = Where::new("vault-command", "command-room");
+    let stops = w.set_off("m1", room.clone()).unwrap();
     assert_eq!(stops, 3);
 
-    let mut situations = 0;
-    for stop in 0..stops {
+    // Every place the body comes to stand in is a stop it is grounded at;
+    // the moments it waits on the landing for the car move it nowhere.
+    let mut at = w.actor("m1").unwrap().at.clone();
+    let mut moments = 0u64;
+    while at != room {
+        assert!(moments < 200, "never got to the command room");
+        moments += 1;
         w.tick();
         let d = deliver(&mut w, &mut a, &s, m);
-        run_due(&s, (stop as u64 + 1) * 300_000);
-        if d.percept.is_some() {
-            situations += 1;
+        run_due(&s, moments * 300_000);
+        let now = w.actor("m1").unwrap().at.clone();
+        if now != at {
+            assert!(d.percept.is_some(), "{now} passed without re-grounding");
+            at = now;
         }
     }
-    assert_eq!(situations, stops, "a stop passed without re-grounding");
 
     // It was told it arrived, once, and told it in its own voice — the outcome
     // of something it set in motion three stops ago, which is the one thing a
