@@ -2358,6 +2358,7 @@ fn bench(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::mission::{Origin, Todo};
     use crate::engine::survey;
     use crate::sim::shelf::NO_OPERATION;
     use npc_map::world::Where;
