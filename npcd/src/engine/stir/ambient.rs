@@ -34,6 +34,17 @@
 //! the chair settles because it was pushed back in a hurry. The building is
 //! dull company on purpose.
 //!
+//! # Nothing a character works is in it
+//!
+//! A line about something a character can use is read as that thing's state.
+//! "The lift moves in its shaft without stopping at this level" was dealt at
+//! the lift's own landing, and Makers sent to the time level stood there and
+//! wrote to each other that the car was moving but not stopping for them, went
+//! back to their rooms, and reported their missions stuck — for an evening,
+//! without once calling the car. So the lift, and any machine with acts of its
+//! own, is never mentioned here: what it is doing is the world's to say, by
+//! what it does.
+//!
 //! # And it deals from a bag
 //!
 //! Same reasoning as [`crate::engine::stir::broadcast`]: drawing at random from
@@ -77,7 +88,6 @@ const IDLE: &[&str] = &[
     "The last one through left the door off its catch, and it rests an inch open.",
     "Dust comes off the top of the door frame in a thin line as the door swings.",
     "The rubber on the doorway seal is worn smooth where the door closes on it.",
-    "The lift shaft ticks somewhere behind the wall as the car settles.",
     // Pipes, ducts, and the fabric.
     "A pipe behind the wall carries a knock along its length and away.",
     "The ductwork overhead ticks as the air in it warms.",
@@ -112,16 +122,13 @@ const IDLE: &[&str] = &[
     "Footsteps cross the ceiling overhead, unhurried, from one side to the other.",
     "A trolley goes along a corridor somewhere with one bad wheel.",
     "A crate of parts is set down on the level above and the floor registers it.",
-    "A door shuts two levels down and the sound comes up the shaft.",
-    "The lift moves in its shaft without stopping at this level.",
+    "A door shuts two levels down and the sound comes up the stairwell.",
     "Somebody whistles four notes in the corridor and stops.",
     "A voice on another level calls a name, and somebody calls back.",
     "The air handling starts on its schedule somewhere far off and settles into a steady note.",
-    "The lift shaft carries a scrape of the car's cable somewhere overhead.",
     "Two sets of footsteps go past the door in step and then out of it.",
     "A tool is dropped on a hard floor somewhere below and bounces twice.",
     "Somebody swears quietly on the other side of the wall.",
-    "The lift doors open, somebody steps out with a box of parts, and they close again.",
     // Small mechanical events.
     "A spring-loaded catch somewhere lets go with a flat snap.",
     "A washer drops off the edge of the bench and rolls under it.",
@@ -343,6 +350,20 @@ mod tests {
         for line in pools.iter().flat_map(|p| p.iter()) {
             for tell in TELLS {
                 assert!(!line.contains(tell), "{line:?} reads as {tell:?}");
+            }
+        }
+    }
+
+    /// **No line speaks of the lift.** Told at its landing that the car was
+    /// moving without stopping there, Makers took it for the lift's state and
+    /// never called it.
+    #[test]
+    fn no_line_speaks_of_a_thing_a_character_works() {
+        let pools = [IDLE, COLD, DARK, DAMP, WORKING, QUIET];
+        for line in pools.iter().flat_map(|p| p.iter()) {
+            let lower = line.to_lowercase();
+            for word in ["lift", "shaft", "the car"] {
+                assert!(!lower.contains(word), "{line:?} speaks of {word:?}");
             }
         }
     }
