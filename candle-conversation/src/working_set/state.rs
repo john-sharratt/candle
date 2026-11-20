@@ -82,11 +82,6 @@ pub struct WorkingSet {
     /// Set when a new question starts ([`Self::clear_withheld`]) and taken by
     /// the next boundary, which then chooses whole.
     opening_pending: bool,
-    /// The conversations [`Self::seed`] was given. While a new question waits
-    /// for its first boundary they are held out of the projection, so the
-    /// question's first reading is scored against everything but them
-    /// (`docs/hit_driven_projection.md` §7.4).
-    seeds: HashSet<TimelineId>,
     /// Whether the last boundary was the first after a new question.
     opening: bool,
 }
@@ -120,18 +115,6 @@ impl WorkingSet {
     /// Whether the last boundary was the first after a new question.
     pub fn opening(&self) -> bool {
         self.opening
-    }
-
-    /// Whether a new question waits for its first boundary
-    /// ([`Self::clear_withheld`], taken by [`Self::boundary`]).
-    pub fn question_pending(&self) -> bool {
-        self.opening_pending
-    }
-
-    /// Whether `timeline` is held out of the projection now: a seed, while a
-    /// new question waits for its first boundary.
-    pub fn holds_out(&self, timeline: TimelineId) -> bool {
-        self.opening_pending && self.seeds.contains(&timeline)
     }
 
     /// Every member in insertion order.
@@ -222,7 +205,6 @@ impl WorkingSet {
         momentum: f32,
     ) -> Vec<TimelineId> {
         let mut refused = Vec::new();
-        self.seeds.extend(candidates.iter().map(|&(t, _)| t));
         for &(timeline, candidate) in candidates {
             if self.is_member(timeline) {
                 continue;
@@ -715,24 +697,6 @@ mod tests {
         let refused = ws.seed(&seeds, pool(1_000), 1_000.0);
         assert_eq!(order(&ws), vec![70, 71, 1]);
         assert_eq!(refused, vec![tl(72)]);
-    }
-
-    /// **A new question holds the seeds out until its first boundary**, and
-    /// only the seeds: a member the scan brought in stays, and once the
-    /// boundary takes the question the seeds are back.
-    #[test]
-    fn a_new_question_holds_the_seeds_out_until_its_first_boundary() {
-        let mut ws = WorkingSet::default();
-        ws.seed(&[(tl(1), cand(1))], pool(1_000), 1_000.0);
-        observe(&mut ws, &[(2, 900.0)], 1_000);
-        assert!(!ws.holds_out(tl(1)), "no question waiting");
-        ws.clear_withheld();
-        assert!(ws.question_pending());
-        assert!(ws.holds_out(tl(1)));
-        assert!(!ws.holds_out(tl(2)), "a scanned member is no seed");
-        ws.boundary([]);
-        assert!(!ws.question_pending());
-        assert!(!ws.holds_out(tl(1)));
     }
 
     /// **The seeds give way to what the question ranks**: two seeds at 1,000,

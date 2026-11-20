@@ -2896,13 +2896,10 @@ impl Scheduler {
         // An opening on a filled slot stops every `reserve_tokens` for a
         // boundary (§7.4) — but not a calibration's staged or captured prefill,
         // whose projection points and recurrent arms are its own.
-        // A request's first reading is read whole and stops only at its end
-        // (`first_reading`); its second reading takes the strides.
         let stops_every = work
             .reprojection
             .as_ref()
             .filter(|_| work.projection_offsets.is_empty() && work.recurrent_spans.is_empty())
-            .filter(|_| !work.rereads)
             .and_then(|p| p.opening_chunk())
             .filter(|&every| every < total);
         self.active_prefills.push(ActivePrefill {
@@ -6714,14 +6711,10 @@ impl Scheduler {
         // early first-reprojection below fires only for turns whose target
         // layer runs belief-driven selection — a plain-prompt layer (the
         // titler's single-section schema) gains nothing from the extra swap.
-        // A request's second reading is not scored at its opening's end: its
-        // first reading scored the question, and it goes straight into the
-        // decode (`first_reading`).
-        let wants_early_reprojection = !work.second_reading
-            && work
-                .reprojection
-                .as_ref()
-                .is_some_and(|p| p.has_belief_collections());
+        let wants_early_reprojection = work
+            .reprojection
+            .as_ref()
+            .is_some_and(|p| p.has_belief_collections());
 
         // Through `push_generated` like every other token, so a `</think>` the
         // prefill's own logits produced still fixes the reasoning boundary.
@@ -7472,8 +7465,6 @@ mod wave_chunk_tests {
                 free_tool_calls_from_penalties: false,
                 recorded_reply: None,
                 recurrent_spans: Vec::new(),
-                rereads: false,
-                second_reading: false,
             },
             offset: 0,
             next_projection: 0,
@@ -7505,21 +7496,6 @@ mod wave_chunk_tests {
         p.stops_every = None;
         p.offset = 16_384;
         assert_eq!((p.advance_cap(), p.at_boundary()), (23_616, false));
-    }
-
-    /// **A first reading stops one token short of its end, and stands at a
-    /// boundary there** (`first_reading`): 40 tokens advance 39 and no
-    /// further, so the reading is scored before anything is sampled; short of
-    /// that it is at no boundary.
-    #[test]
-    fn a_first_reading_stops_one_token_short() {
-        let mut p = dialogue_prefill(SequenceId(1), vec![0; 40]);
-        p.work.rereads = true;
-        assert_eq!((p.advance_cap(), p.at_boundary()), (39, false));
-        p.offset = 20;
-        assert_eq!((p.advance_cap(), p.at_boundary()), (19, false));
-        p.offset = 39;
-        assert_eq!((p.advance_cap(), p.at_boundary()), (0, true));
     }
 
     /// **Only a prefill that leaves opens the next admission.** Promotion runs

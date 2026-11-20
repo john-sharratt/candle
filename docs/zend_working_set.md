@@ -461,13 +461,6 @@ left out with a warning naming it; one
 that missed only for room stays a candidate and can enter later on its
 momentum.
 
-**A request's first reading holds the seeds out.** While a new question waits
-for its first boundary, the seeds the set was given are left out of the
-projection (`WorkingSet::holds_out`): the question is read and scored once
-without them, and then again with them and what it ranked
-(`docs/hit_driven_projection.md` §7.4). They stay members throughout, with
-their momentum; only that first reading does not see them.
-
 ### 4.8 Restart
 
 A working set is rebuilt at open: momentum starts empty and the seeds re-enter

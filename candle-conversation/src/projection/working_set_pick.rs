@@ -28,10 +28,6 @@ pub struct SlotBoundary {
     /// Whether this is the first boundary after a new user message, which
     /// chooses its rounds whole, with no allowance.
     pub opening: bool,
-    /// Whether a new user message waits for its first boundary: the turn
-    /// being submitted is a request, read first without the seeds
-    /// (`docs/hit_driven_projection.md` §7.4).
-    pub question_pending: bool,
 }
 
 /// One conversation a working-set group emits.
