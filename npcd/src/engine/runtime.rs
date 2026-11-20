@@ -8835,7 +8835,11 @@ mod tests {
         );
         hosted.with_sim(|s| s.missions.assign("m1", mission));
         let walks = rt.mission_compass(1).expect("a compass");
-        assert!(walks.contains("`lift_use`"), "{walks}");
+        assert_eq!(
+            walks,
+            "Your mission, next: go to the command room. It is in the command room, on the \
+             command level: `move_to` the command room."
+        );
 
         hosted.with_sim(|s| s.set_attends("m1", true));
         let attends = rt.mission_compass(1).expect("a compass");

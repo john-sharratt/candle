@@ -964,7 +964,10 @@ fn still_doable(hosted: &Hosted, body: &str) -> Option<String> {
         let place = |at: &Where| format!("{}/{}", at.area, at.node);
         // The name `move_to` takes a room by from here — one act wherever the
         // room is, the world riding the lift for a journey that changes floor.
-        let go = |at: &Where| body::destination_name(w, &here, at);
+        let go = |at: &Where| match *at == here {
+            true => room_of(at),
+            false => body::destination_name(w, &here, at),
+        };
         // **A document is read and written at a desk, and the desks can be
         // reached.** Makers gave drafts up as stuck "between the lift and the
         // command room", the chronicle level "not accessible" — one from the

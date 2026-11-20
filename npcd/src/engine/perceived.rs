@@ -212,19 +212,20 @@ mod tests {
     }
 
     /// **A collision reaches a character as a description it can read, loud
-    /// enough to stop for.** Two bodies crossing at the lift run into each other;
-    /// the mover reads "You bump into …" in its window, and it preempts, so the
-    /// chase that kept them apart finally hands each of them a turn together.
+    /// enough to stop for.** One body heading out through the lift's landing
+    /// meets another coming in from it; the mover reads "You bump into …" in its
+    /// window, and it preempts, so the chase that kept them apart finally hands
+    /// each of them a turn together.
     #[test]
     fn a_bump_reaches_a_character_as_a_description_that_preempts() {
         let mut w = vault();
         w.enter("m1", "Maker-01", at("band-one")).unwrap();
-        w.enter("m2", "Maker-02", at("green-room")).unwrap();
+        w.enter("m2", "Maker-02", at("core")).unwrap();
         w.mark_seen("m1");
         w.mark_seen("m2");
-        let elsewhere = Where::new("vault-chronicle", "core");
-        w.set_off("m1", elsewhere.clone()).unwrap();
-        w.set_off("m2", elsewhere).unwrap();
+        w.set_off("m1", Where::new("vault-chronicle", "core"))
+            .unwrap();
+        w.set_off("m2", at("band-one")).unwrap();
         w.tick();
 
         let seen = digest(&w, &since(&w, "m1"));

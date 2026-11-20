@@ -1736,6 +1736,41 @@ mod tests {
         );
     }
 
+    /// **Every room there is a way to has a name `move_to` takes it by**, from
+    /// anywhere in the vault — the compass and the work's guidance give the way
+    /// as that name, and a room without one has no way told at all.
+    #[test]
+    fn every_reachable_room_is_named_from_everywhere() {
+        let h = vault();
+        let all: Vec<Where> = h.read(|w| {
+            w.map()
+                .children("creators-vault")
+                .iter()
+                .flat_map(|a| a.nodes.iter().map(|n| Where::new(&a.id, &n.id)))
+                .collect()
+        });
+        h.read(|w| {
+            for from in &all {
+                for to in &all {
+                    let kind = w.node(to).unwrap().kind;
+                    let passed = kind == NodeKind::Passage
+                        || (kind == NodeKind::Core && to.area != from.area);
+                    if to == from || passed {
+                        continue;
+                    }
+                    assert!(
+                        destination_name(w, from, to).is_some(),
+                        "no name for {to} from {from}: {:?}",
+                        destinations_from(w, from)
+                            .iter()
+                            .map(|(n, p)| format!("{n}={p}"))
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        });
+    }
+
     /// **Every room of every floor is somewhere to go, under one name each.**
     /// A room whose name another floor's room also has is offered with its
     /// level; this floor's keeps the bare name.
