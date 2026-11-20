@@ -560,6 +560,11 @@ the scan — lets it go on against the slot it has. A staged or captured
 calibration prefill is not cut: its projection points and recurrent arms are
 its own.
 
+**Superseded by the re-feed (`docs/reprojection_refeed.md`, design
+2026-11-20):** every projection ends by forwarding the turn's last tokens again
+over the rebuilt slot, which replaces the two readings below and the boundary
+they skip.
+
 **A request is read twice; every other opening once.** The question a new
 user message opens is first prefilled, on the conversation's own slot, against
 the projection with the dialogue's seeds held out (`WorkingSet::holds_out`),
