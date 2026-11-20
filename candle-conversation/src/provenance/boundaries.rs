@@ -6,13 +6,17 @@
 //! stored turn and cuts its windows where it fires, so what ingest compares is
 //! cut exactly as what a projection asks.
 //!
-//! A boundary fires after a token when:
+//! A boundary fires after a token outside a tool call when:
 //!
-//! - the token opens a tool call — once, after which every trigger is
-//!   suppressed until the call closes;
-//! - outside a call, the decoded count reaches a multiple of the cadence;
-//! - outside a call, the token is a trigger (a line feed) and more than
-//!   [`CONTENT_GATE`] non-trigger tokens have passed since the last boundary.
+//! - the cadence's count of tokens has passed since the last boundary, or
+//!   since the stream began — every boundary restarts it, so a boundary fired
+//!   by a trigger is followed by a full cadence before the next;
+//! - the token is a trigger (a line feed) and more than [`CONTENT_GATE`]
+//!   non-trigger tokens have passed since the last boundary.
+//!
+//! None fires inside a tool call, its open and close tags included, and its
+//! tokens count toward neither: the call is written against the slot it
+//! opened on.
 //!
 //! The first token of a stream only enters a call when it opens one: the live
 //! loop receives it from the prefill, not from a decode step.
@@ -30,7 +34,8 @@ pub const CONTENT_GATE: usize = 16;
 pub struct BoundaryRule {
     /// The trigger tokens (`reproject_trigger_texts`, tokenized).
     pub triggers: Arc<Vec<u32>>,
-    /// A boundary every this many decoded tokens; 0 for none.
+    /// A boundary once this many tokens have passed since the last one; 0 for
+    /// none.
     pub cadence: usize,
     /// The `<tool_call>` token, when the tokenizer has it as one.
     pub tool_call_open: Option<u32>,
@@ -78,15 +83,15 @@ pub enum Step {
     Quiet,
     /// A boundary after this token.
     Boundary,
-    /// The token opened a tool call: a boundary, and triggers are suppressed
-    /// until the call closes.
+    /// The token opened a tool call: no boundary, and none fires until the
+    /// call closes.
     OpenedToolCall,
 }
 
 impl Step {
     /// Whether a boundary falls after the token.
     pub fn fires(self) -> bool {
-        self != Step::Quiet
+        self == Step::Boundary
     }
 }
 
@@ -95,6 +100,9 @@ impl Step {
 pub struct BoundaryState {
     /// Non-trigger tokens since the last boundary.
     since_boundary: usize,
+    /// Tokens outside a call since the last boundary or the stream's start:
+    /// the cadence's count.
+    since_cadence: usize,
     /// Inside a tool call's body.
     in_tool_call: bool,
 }
@@ -105,10 +113,12 @@ impl BoundaryState {
         BoundaryState::starting(rule.tool_call_open == Some(token))
     }
 
-    /// The state at the start of a stream, inside a tool call's body or not.
+    /// The state after a stream's first token, inside a tool call's body or
+    /// not: a first token outside a call is the cadence's first.
     pub fn starting(in_tool_call: bool) -> BoundaryState {
         BoundaryState {
             since_boundary: 0,
+            since_cadence: usize::from(!in_tool_call),
             in_tool_call,
         }
     }
@@ -118,8 +128,8 @@ impl BoundaryState {
         self.in_tool_call
     }
 
-    /// Take `token`, the stream's `count`-th (counted from one).
-    pub fn step(&mut self, rule: &BoundaryRule, token: u32, count: usize) -> Step {
+    /// Take the stream's next `token`.
+    pub fn step(&mut self, rule: &BoundaryRule, token: u32) -> Step {
         if rule.tool_call_open == Some(token) {
             self.since_boundary = 0;
             self.in_tool_call = true;
@@ -133,10 +143,12 @@ impl BoundaryState {
         if self.in_tool_call {
             return Step::Quiet;
         }
+        self.since_cadence += 1;
         let is_trigger = rule.triggers.contains(&token);
-        let cadence = rule.cadence > 0 && count.is_multiple_of(rule.cadence);
+        let cadence = rule.cadence > 0 && self.since_cadence >= rule.cadence;
         if cadence || (is_trigger && self.since_boundary > CONTENT_GATE) {
             self.since_boundary = 0;
+            self.since_cadence = 0;
             Step::Boundary
         } else {
             if !is_trigger {
@@ -157,7 +169,7 @@ pub fn boundaries(tokens: &[u32], rule: &BoundaryRule) -> Vec<usize> {
     let mut out = Vec::new();
     for (i, &token) in rest.iter().enumerate() {
         let count = i + 2;
-        if state.step(rule, token, count).fires() {
+        if state.step(rule, token).fires() {
             out.push(count);
         }
     }
@@ -206,15 +218,26 @@ mod tests {
     }
 
     #[test]
-    fn the_cadence_fires_on_multiples_of_the_count() {
+    fn the_cadence_fires_every_cadence_tokens() {
         let t = words(130);
         assert_eq!(boundaries(&t, &rule(64)), vec![64, 128]);
     }
 
-    /// A tool call fires once at its open tag, nothing inside it — not even
-    /// the cadence — and the content gate restarts at its close.
+    /// **Every boundary restarts the cadence**: a line feed's boundary at 21
+    /// puts the cadence's next at 21 + 64, not at 64.
     #[test]
-    fn a_tool_call_fires_once_and_freezes_until_it_closes() {
+    fn a_boundary_restarts_the_cadence() {
+        let mut t = words(20);
+        t.push(LF);
+        t.extend(words(110));
+        assert_eq!(boundaries(&t, &rule(64)), vec![21, 85]);
+    }
+
+    /// **No boundary inside a tool call, its tags included**: the call's
+    /// tokens count toward neither the cadence nor the gate, and the content
+    /// gate restarts at its close.
+    #[test]
+    fn a_tool_call_fires_nothing_until_it_closes() {
         let mut t = words(10);
         t.push(OPEN);
         t.extend(words(70));
@@ -224,8 +247,20 @@ mod tests {
         t.push(LF);
         t.extend(words(1));
         t.push(LF);
-        let opened = 11;
-        assert_eq!(boundaries(&t, &rule(64)), vec![opened, 101]);
+        assert_eq!(boundaries(&t, &rule(64)), vec![101]);
+    }
+
+    /// **The cadence counts only the tokens outside a call**: 40 before it and
+    /// 24 after make the 64th.
+    #[test]
+    fn a_tool_call_pauses_the_cadence() {
+        let mut t = words(40);
+        t.push(OPEN);
+        t.extend(words(100));
+        t.push(CLOSE);
+        t.extend(words(30));
+        // Tokens 1..=40 count; the call is 41..=142; 143.. count from 41.
+        assert_eq!(boundaries(&t, &rule(64)), vec![142 + 24]);
     }
 
     #[test]

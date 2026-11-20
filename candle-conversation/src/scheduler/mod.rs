@@ -63,7 +63,7 @@ mod creep_slice;
 mod decode;
 mod detached;
 mod diag;
-mod early_boundaries;
+
 mod ephemeral_fork;
 mod expert_counters;
 pub mod exported_state;

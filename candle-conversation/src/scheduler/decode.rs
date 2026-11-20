@@ -1,7 +1,7 @@
 use super::answered::{after_reasoning, answered};
 use super::band::rank;
 use super::block_guard::BlockGuard;
-use super::early_boundaries::early_boundary;
+
 use super::named_tool::steer_to_named_tool;
 use super::segment_rearm::drop_rearms_segment;
 use super::spec_chooser::{in_head_order, locate_rows, SpecChooser};
@@ -2284,32 +2284,23 @@ impl Scheduler {
                 // ── Continuous re-projection triggers ─────────────────────────
                 // The boundary rule (`provenance::boundaries`) — the one the
                 // gallery cuts ingested turns by: a line feed past the content
-                // gate, the cadence, and one lock-in at `<tool_call>` with the
-                // call body frozen until `</tool_call>`. Skipped when the
-                // sequence just finished — finalize fires via
-                // `cleanup_finished` instead.
+                // gate and the cadence since the last boundary, none inside a
+                // tool call. Skipped when the sequence just finished —
+                // finalize fires via `cleanup_finished` instead.
                 if !state.finished {
                     let count = state.generated_tokens.len();
                     let step = match state.reprojection.as_ref() {
-                        Some(p) => state.boundary.step(&p.boundary, next_token, count),
+                        Some(p) => state.boundary.step(&p.boundary, next_token),
                         None => Step::Quiet,
                     };
                     if step == Step::OpenedToolCall {
                         state.wrote_tool_call = true;
                     }
                     // A played-back turn reprojects where its recording did; a
-                    // live one where the rule fires, and early in its reasoning
-                    // (`early_boundaries`).
+                    // live one where the rule fires.
                     let fires = match state.reprojection.as_ref().map(|p| p.projection.script()) {
                         Some(Some(script)) => script.fires_at(count),
-                        Some(None) => {
-                            step.fires()
-                                || early_boundary(
-                                    count,
-                                    state.think_close_at.is_none(),
-                                    state.boundary.in_tool_call(),
-                                )
-                        }
+                        Some(None) => step.fires(),
                         None => false,
                     };
                     if fires {
@@ -2368,7 +2359,7 @@ impl Scheduler {
 
     /// Queue a view for reprojection at the next drain, deduplicating against
     /// entries already pending. Every reprojection trigger — cadence,
-    /// punctuation, tool-call lock-in, prefill promotion — enqueues through
+    /// punctuation, an opening's stride, a played-back turn's script — enqueues through
     /// here so the queue's invariants live in one place. An associated fn over
     /// the queue field (not `&mut self`) so trigger sites that hold a
     /// `DecodeState` borrow can still call it.

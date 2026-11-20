@@ -23,9 +23,10 @@ A boundary fires during decode (`scheduler/decode.rs`):
 
 - on a line-feed token (`reproject_trigger_texts: ["\n"]`), once more than 16
   non-trigger tokens have been decoded since the last boundary;
-- every `reproject_every_n_tokens` (64) decoded tokens, the cadence;
-- inside a `<tool_call>` body never: one boundary fires at `<tool_call>`, and
-  `</tool_call>` re-enables the triggers.
+- once `reproject_every_n_tokens` (64) tokens have passed since the last
+  boundary, the cadence — every boundary restarts its count;
+- inside a `<tool_call>` never, its tags included: the call's tokens count
+  toward neither, and `</tool_call>` re-enables the rule.
 
 At a boundary the probe is (`scheduler/mod.rs`, the reproject probe):
 

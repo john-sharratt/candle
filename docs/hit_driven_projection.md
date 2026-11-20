@@ -78,13 +78,10 @@ The findings this answers are in
 - **Hit**: one block chosen by one query at one sampled layer, by the real
   selection or the shadow scan (§6).
 - **Boundary**: a point where the projection runs. A reply reaches one at a
-  line feed past the content gate, every `reproject_every_n_tokens` (64), and
-  at `<tool_call>` (`provenance::boundaries`, `scheduler/decode.rs`); while it
-  is still reasoning — before `</think>`, outside a tool call — it also reaches
-  one at 9, 16 and 32 decoded tokens (`scheduler/early_boundaries.rs`, §7.4);
-  each chunk of a long opening ends at one, the opening's last does not (§7.4). The early
-  boundaries are the decode loop's alone: the gallery cuts sealed turns by the
-  rule, and they cut nothing.
+  line feed past the content gate and once `reproject_every_n_tokens` (64)
+  tokens have passed since the last boundary, and never inside a tool call
+  (`provenance::boundaries`, `scheduler/decode.rs`); each chunk of a long
+  opening ends at one, the opening's last does not (§7.4).
 - **Stride**: the queries between two boundaries.
 
 ## 4. Rotation
@@ -116,7 +113,8 @@ with.
 - **The reserve is one append, not a reply.** The slot's pieces fill
   `L0 − reserve_tokens` (default 16,384). The slot is re-chosen at every
   boundary (§7.2), so it only has to hold what can arrive between two of them:
-  one cadence of decoded tokens, or one prefill chunk (§7.4). A reply of any
+  one cadence of decoded tokens and any tool calls written within it, or one
+  prefill chunk (§7.4). A reply of any
   length ends inside rung 1, because each boundary sheds what the next stride
   needs, down to the floors of §8.5; what gives way when even those pass the
   slot is in §7.2.
@@ -519,9 +517,10 @@ against the slot the last boundary chose. Its prefill rows are selected
 for the shadow scan, exactly as decoded queries are. **No boundary fires at its
 end**: the reply decodes on the slot the question was prefilled against, so
 the recurrent layers' state and the attended K/V were computed together. The
-first boundary after it is the reasoning's first early boundary, at decoded
-token 9, which re-feeds the reasoning's first 8 tokens over the slot it
-chooses (`docs/reprojection_refeed.md`). A boundary fired at the opening's end
+first boundary after it is the rule's first in the reply — a line feed past
+the content gate, or the cadence 64 tokens in — which re-feeds the reply's
+last tokens over the slot it chooses (`docs/reprojection_refeed.md`). A
+boundary fired at the opening's end
 re-chose the slot with nothing forwarded over it but the token or two after
 `<think>`, and was never measured; on 2026-11-20 (c), with the request read
 once, the direct questions' declines named the journals and guides that slot
@@ -532,17 +531,15 @@ set even when the set was cleared away when the dialogue opened
 (`Substrate::working_set_clear_withheld`) — missed there, the first question's
 slot was filled a third of a budget at a time.
 
-**The reasoning's first strides are short.** A reply still reasoning takes
-boundaries at 9, 16 and 32 decoded tokens before the cadence's at 64
-(`scheduler/early_boundaries.rs`). The opening's last 64 rows give the shadow
-scan its first queries over what the question pooled; the early boundaries
-bring in what those and the first reasoning tokens would have read while the
-model is still deciding what it knows. Measured on BlackWorld (2026-11-20),
-the answer file of "where is `recorded_reply` defined" entered at the 64-token
-boundary and led from the next one — after the reasoning had written that it
-had read nothing holding the symbol. Each costs one reprojection (about 215 ms
-on the 72 GB card) on the first 32 tokens of a reply, and none once
-`</think>` is decoded.
+**No early strides.** A reply's strides are the rule's from its first token:
+the opening's last 64 rows give the shadow scan its first queries over what
+the question pooled, and the first boundary applies them. Boundaries at 8, 16
+and 32 reasoning tokens were tried (2026-11-20, batteries (a)–(d)) after the
+answer file of "where is `recorded_reply` defined" entered at the 64-token
+boundary, once the reasoning had written that it had read nothing holding the
+symbol; they cost three reprojections (about 215 ms each on the 72 GB card) in
+a reply's first 32 tokens, and went with the boundary at the opening's end
+(`docs/results/dependency_battery_2026-11-20_e.md`).
 
 An opening longer than `reserve_tokens` is cut into chunks of that length
 with a boundary between them, so a long tool result moves the slot as it
@@ -987,12 +984,12 @@ the slot's held turns recorded at each scanned boundary
     the pool does not hold (`projection/fill_report.rs`). Read at
     `/v1/conversations/:id/projections/:turn/:event`: why a file the question
     named was not placed is the record's answer, not a reconstruction.
-28. **The scan's leaders first; the first question opens; early boundaries
-    (§7.2 step 1, §7.4).** Each kind's minimum is filled by the boundary's
-    scan leaders before strength, a dialogue's first question takes its
-    opening whether or not its set exists yet, and a reasoning reply takes
-    boundaries at 9, 16 and 32 tokens, the first of them in place of a
-    boundary at the opening's end — built 2026-11-20.
+28. **The scan's leaders first; the first question opens (§7.2 step 1,
+    §7.4).** Each kind's minimum is filled by the boundary's scan leaders
+    before strength, and a dialogue's first question takes its opening
+    whether or not its set exists yet — built 2026-11-20. The opening's end
+    takes no boundary, the reply no early ones, and the cadence counts from
+    the last boundary with nothing fired inside a tool call.
 
 ## 13. Handover
 

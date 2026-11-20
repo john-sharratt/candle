@@ -69,9 +69,10 @@ row.
    within 8 — 5 to 8 tokens. The layers with an index agree on the span
    (`refeed_span`); a span longer than what the turn itself has forwarded, or a
    turn with a stencil row still being written, re-feeds nothing.
-6. **At a tool call, only at its open tag.** The `<tool_call>` lock-in boundary
-   re-feeds; no boundary fires inside the call body, so nothing re-feeds while
-   a stencil drives it.
+6. **Never inside a tool call.** No boundary fires from `<tool_call>` to
+   `</tool_call>` (`provenance::boundaries`), so nothing re-feeds while a
+   stencil drives a call; a re-feed after the call closes may reach back into
+   its last tokens.
 
 ### 2.1 The re-fed tokens are left out of the rebuild
 
@@ -140,12 +141,15 @@ the opening's end could re-feed a token or two and never the question: on
 over, and the direct questions fell from 47.9% to 27.1%. No boundary fires
 there (`scheduler/prefill.rs`, the promotion to decode). The reply decodes on
 the slot its question was prefilled against, and the first boundary is the
-reasoning's first early one at decoded token 9 (`scheduler/early_boundaries.rs`):
-the reply's first token opens a page, 8 tokens have been forwarded and the 9th
-is pending, so the re-feed is the whole of the reasoning so far — the first
-tokens the model reads the placed files with are its own reasoning about the
-question. A first-token tool call likewise decodes on the opening's slot; no
-boundary fires inside its body.
+rule's first in the reply — a line feed past the content gate, or the cadence
+64 tokens in, counted from the reply's start and restarted at every boundary
+(`provenance::boundaries`) — whose re-feed is the reply's last tokens. A
+first-token tool call likewise decodes on the opening's slot; no boundary
+fires inside its body.
+
+Measured first with an early boundary at decoded token 9, re-feeding the
+reasoning's first 8 tokens, beside early boundaries at 16 and 32; those went
+in (e) (`docs/results/dependency_battery_2026-11-20_e.md`).
 
 Measured against the boundary at the opening's end
 (`docs/results/dependency_battery_2026-11-20_d.md`): 53.8% against 52.8%, no
@@ -165,12 +169,14 @@ has measured this one.
 |---|---|
 | The request's first reading (`scheduler/first_reading.rs`, `PrefillWork::rereads`, `ActivePrefill`'s stop one token short, `Scheduler::first_readings`) | Every projection now re-reads; the request's opening is one of them. |
 | The second reading's skipped boundary (`PrefillWork::second_reading`) | No boundary fires at the opening's end (§2.4). |
-| The boundary at the opening's end (`wants_early_reprojection`, `ReprojectionPolicy::has_belief_collections`) | The first early boundary, at decoded token 9, takes its place (§2.4). |
+| The boundary at the opening's end (`wants_early_reprojection`, `ReprojectionPolicy::has_belief_collections`) | The rule's first boundary in the reply takes its place (§2.4). |
+| The early boundaries at 9, 16 and 32 reasoning tokens (`scheduler/early_boundaries.rs`) | The cadence counts from the last boundary instead of on multiples of the count (§2.4). |
+| The `<tool_call>` lock-in boundary | No boundary inside a tool call (§2 item 6). |
 | Seeds held out of a first reading (`WorkingSet::holds_out`, `SlotBoundary::question_pending`) | There is one reading; the seeds are in it, as background. |
 | The shadow scan's windows no longer than the query's position | One context at the rung covering it. |
 
 What stays: the pool and its scan leaders, the fill and its caps, the hit
-counters and momentum, the early boundaries at 9, 16 and 32 reasoning tokens,
+counters and momentum,
 the first question's opening, the seeds, and the fill report in every
 projection record.
 
@@ -183,7 +189,7 @@ projection record.
 | The captured tail trimmed (§2.1) | `SealedSequence::trim_tail` | `a_trim_cuts_the_last_tokens_across_a_chunk_boundary`, `a_trim_refuses_a_quantized_chunk_and_an_overlong_cut` |
 | The index rewound to a block boundary (§2 item 5) | `indexer::refeed_cut`, `IndexCache::rewind_live`, `wave.rs` | `a_refeed_rewinds_to_the_newest_block_boundary_within_its_reach`, `a_rewound_tail_keeps_its_first_blocks` |
 | The re-feed row (§2 items 1, 5) | `scheduler/refeed.rs`, `reproject_view_prepare`, `play_stencil_runs` | `the_last_tokens_come_off_the_end`, `a_refeed_row_ends_on_the_pending_token` |
-| No boundary at the opening's end; the first early boundary at 9 (§2.4) | `scheduler/prefill.rs`, `scheduler/early_boundaries.rs` | `a_reasoning_reply_takes_its_early_boundaries`, `the_first_boundary_refeeds_the_reasoning_so_far` |
+| No boundary at the opening's end; the cadence from the last boundary; none inside a tool call (§2.4, §2 item 6) | `scheduler/prefill.rs`, `provenance/boundaries.rs` | `a_boundary_restarts_the_cadence`, `a_tool_call_fires_nothing_until_it_closes`, `a_tool_call_pauses_the_cadence` |
 | One context at the covering rung, the ×8 rung (§2.3) | `qsa_shadow.cu`, `shadow.rs`, `hits.rs`, `rope.rs` | `the_shadow_scan_counts_what_its_definition_counts`, `a_span_is_the_kernels_layout`, `flash_next_takes_the_reference_angle` |
 
 Measured against 62.2% (`dependency_battery_2026-11-20_b.md`) by the battery.
