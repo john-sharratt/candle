@@ -25,7 +25,6 @@ fn the_template_declares_its_workflows_and_generators() {
     let m = missions();
     let names: Vec<&str> = m.workflows.iter().map(|w| w.name.as_str()).collect();
     assert_eq!(names, ["story", "life-event", "correction"]);
-    assert_eq!(m.keep, Some(4));
     let generators: Vec<(&str, &str, &str, u32)> = m
         .generators
         .iter()

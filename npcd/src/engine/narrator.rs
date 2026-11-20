@@ -78,7 +78,7 @@ fn event_line(e: &Event) -> Option<String> {
         } => Some(format!("you notice {entity_id}: {}", observation.trim())),
         // Already condensed to prose by the world (an action, a movement, a
         // whisper seen but not heard). Passed bare for the narrator to re-voice.
-        EventKind::Description { text } => {
+        EventKind::Description { text } | EventKind::Notice { text } => {
             let t = text.trim();
             (!t.is_empty()).then(|| t.to_string())
         }

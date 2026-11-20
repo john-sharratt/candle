@@ -251,7 +251,8 @@ report at: a room offering `report_done` is its own room or lies on a route from
 map's doors, portals and lifts (`Runtime::reaches_table`). A body with no table in reach (the
 waste) is given nothing and reads the ordinary standing task for its company instead.
 
-**A drone with no mission is at rest.** In a world that draws nothing (`draw: none`), a body
+**A drone with no mission is at rest.** In a world that draws nothing — every world, unless its
+missions file says `draw: routines`; the vault's Makers as much as the moon's Drones — a body
 that takes orders, carries nothing and has nothing on the table it may take is held by the
 engine as a suspended character is (`Runtime::follow_rest`, `Scheduler::rest`): never due,
 refused a turn, no standing task, and its conversation let go (`Minds::let_go`), so it holds no

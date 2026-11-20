@@ -176,16 +176,23 @@ pub struct Filled {
 
 /// Whether a character collecting at the table with nothing set for it draws
 /// one of the routines.
+///
+/// **A world draws nothing unless it says it does.** A table that handed every
+/// free character a routine kept every Maker of the vault on some reading or
+/// other all day, each a turn a minute on the card, and nobody had asked for
+/// any of it. Work comes from whoever asks for it — an operator, a mind that
+/// gives orders, an operation's next step — and a character with none of it is
+/// at rest.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Draw {
     /// It draws one — the routines are the table's standing work.
-    #[default]
     Routines,
-    /// It draws nothing, and waits at the table for work to be posted. The
+    /// It draws nothing, and is at rest until work is posted for it. The
     /// routines are the catalogue the poster reads (`order_results`), the
     /// standing jobs it may post when the table is empty
     /// (`docs/zen_moon_mind.md` §8.3).
+    #[default]
     None,
 }
 
@@ -731,15 +738,15 @@ routines:
         assert_eq!(work.checks, ["prose"]);
     }
 
-    /// **A world draws its routines unless its file says `draw: none`**, and
-    /// keeps them either way.
+    /// **A world draws its routines only when its file says `draw: routines`**,
+    /// and keeps them either way.
     #[test]
-    fn a_world_may_hand_out_nothing_by_draw() {
-        let drawn = WorldMissions::parse("missions/life.yaml", LIFE).unwrap();
-        assert_eq!(drawn.draw, Draw::Routines);
-        let waiting =
-            WorldMissions::parse("missions/life.yaml", &format!("draw: none\n{LIFE}")).unwrap();
+    fn a_world_hands_out_nothing_unless_it_draws() {
+        let waiting = WorldMissions::parse("missions/life.yaml", LIFE).unwrap();
         assert_eq!(waiting.draw, Draw::None);
+        let drawn =
+            WorldMissions::parse("missions/life.yaml", &format!("draw: routines\n{LIFE}")).unwrap();
+        assert_eq!(drawn.draw, Draw::Routines);
         assert_eq!(waiting.routines, drawn.routines);
         let e = WorldMissions::parse("missions/w.yaml", &format!("draw: sometimes\n{LIFE}"))
             .unwrap_err();

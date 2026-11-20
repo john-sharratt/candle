@@ -2782,6 +2782,27 @@ mod tests {
         assert!(!s.acted_since_news(1), "asked again");
     }
 
+    /// **Being told a hand went idle asks nothing.** A notice — a Drone come to
+    /// rest — schedules no turn, and a mind that has acted on what last reached
+    /// it may still rest on it: it is not news to answer.
+    #[test]
+    fn a_notice_neither_schedules_a_turn_nor_stands_unanswered() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        s.deliver(1, 0, Salience::NORMAL, say("is the cluster up?"));
+        s.tick(1, 0, 0, |_, _| vec!["cluster_status".to_string()])
+            .expect("it ticked");
+        assert!(s.acted_since_news(1));
+        assert!(!s.is_due(1, 1), "a quiet character was due");
+
+        let notice = EventKind::Notice {
+            text: "Wick has come to rest, with nothing to carry.".into(),
+        };
+        s.deliver(1, 1, Salience::NORMAL, notice);
+        assert!(!s.is_due(1, 2), "a notice scheduled a turn");
+        assert!(s.acted_since_news(1), "a notice stood as news to answer");
+    }
+
     /// **What a person asked stands until the character has worked at it and
     /// told them.** Telling them before any act came back leaves it standing;
     /// telling somebody else leaves it standing; and one nothing came of is

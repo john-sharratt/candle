@@ -439,26 +439,6 @@ fn a_report_the_workflow_refuses_still_closes_the_mission() {
     assert!(!m.is_on_mission("pax"));
 }
 
-/// **The table is stocked when every Maker has something it may take**, and
-/// never past `keep` more than there are Makers.
-#[test]
-fn the_table_is_stocked_for_every_maker_not_only_by_count() {
-    let mut m = table();
-    let makers = vec!["ione".to_string(), "paxon".to_string()];
-    assert!(!m.stocked_for(&makers, 1), "an empty table");
-    let id = launch(&mut m, "era:t", 1);
-    put_up(&mut m);
-    collect_step(&mut m, "paxon");
-    m.report("paxon", Outcome::Pass, "written", None);
-    m.table_took(id, "sound", "").unwrap();
-    put_up(&mut m);
-    assert!(!m.stocked_for(&makers, 1), "nothing here Paxon may take");
-    launch(&mut m, "era:u", 1);
-    put_up(&mut m);
-    assert!(m.stocked_for(&makers, 1), "something for each");
-    assert!(!m.stocked_for(&makers, 3), "under keep");
-}
-
 /// **Discarding the pool releases every target in it**, and forgetting the
 /// settled leaves what is in hand; a reserved target is held against a second
 /// generation and let go when nothing comes of it.

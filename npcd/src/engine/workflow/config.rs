@@ -299,8 +299,6 @@ pub struct Generator {
 /// Everything a mind's `missions.yaml` declares for operations.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Missions {
-    /// How many waiting missions the table is kept stocked with, when it says.
-    pub keep: Option<u32>,
     /// The shared prompts, includes resolved.
     pub prompts: BTreeMap<String, String>,
     pub generators: Vec<Generator>,

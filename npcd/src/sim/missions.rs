@@ -1404,26 +1404,6 @@ impl Missions {
         &self.pool
     }
 
-    /// Whether the table holds enough: at least `keep` missions, and something
-    /// each of `makers` may take — up to `keep` more than there are Makers,
-    /// past which nothing more is written however the pool falls.
-    ///
-    /// **Stock is per Maker, not per table.** With four missions waiting the
-    /// table counted as stocked while every one of them was a stage its one
-    /// free Maker had already carried: it drew routine after routine — the
-    /// pressure door, read six times in twenty minutes — and no new work was
-    /// ever written for it.
-    ///
-    /// The world's standing upkeep is not stock: a table holding only that is
-    /// a table with no work on it.
-    pub fn stocked_for(&self, makers: &[String], keep: usize) -> bool {
-        let work = || self.pool.iter().filter(|m| !is_standing(m));
-        let n = work().count();
-        let has_work_for =
-            |body: &str| !self.is_unordered(body) && work().any(|m| self.may_take(body, m));
-        n >= keep + makers.len() || (n >= keep && makers.iter().all(|m| has_work_for(m)))
-    }
-
     /// Strike, from every mission carried, waiting at the table or lodged, each
     /// read of a document `holds` says is not there for it — asked with the
     /// operation the mission is a step of, whose store it reads through; see

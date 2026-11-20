@@ -1,11 +1,12 @@
-//! One generation, and the loop that keeps the table stocked.
+//! One generation, and the loop that carries open work along.
 //!
 //! A generation is: draw a generator by weight, find its next target in the
 //! corpus that the ledger does not block, show the model the generator's prompt
 //! and the target's material, hold its answer to `mission` / `no_mission`, check
 //! it, and put the mission on the table — or record that there was nothing to
-//! do. The loop runs one at a time per world while the table is open and its
-//! pool is below the configured level.
+//! do. A generation runs only when it is asked for
+//! (`POST /v1/pulse/missions/generate`); the loop takes the table's own steps of
+//! the operations that are open and puts their Makers' steps on the table.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -35,7 +36,7 @@ use crate::engine::mission::{time_step_text, Mission, Todo};
 use crate::engine::prose::{self, decode_call, CallAsk, Frame, WORK_BAND};
 use crate::engine::runtime::Runtime;
 use crate::engine::work::what_happens;
-use crate::engine::workflow::{OnFailed, Where};
+use crate::engine::workflow::{Edits, OnFailed, Where};
 use crate::house::table as house_table;
 use crate::mind::files::MindFiles;
 use crate::opstore::owner::Owner;
@@ -552,10 +553,7 @@ pub async fn table_step(
         hosted.with_sim(|s| s.bench.rebase(&op.document, &shelf));
     }
     let Some(text) = shelf.read(&op.document) else {
-        hosted.with_sim(|s| {
-            s.missions
-                .cancel_operation(id, "its document is no longer in its store")
-        });
+        hosted.with_sim(|s| s.missions.cancel_operation(id, DOCUMENT_GONE));
         tracing::warn!(operation = %op.name, document = %op.document, "operation: document gone, called off");
         return Ok(());
     };
@@ -717,11 +715,55 @@ pub fn settle_failed(hosted: &Hosted) {
     }
 }
 
-/// Keep every hosted world's table stocked while the daemon runs.
+/// Why an operation whose document left its store is called off.
+const DOCUMENT_GONE: &str = "its document is no longer in its store";
+
+/// Call off every open operation whose next step works on a document that is
+/// no longer in its store, standing down whoever carries the step. Returns
+/// their names.
 ///
-/// **Only while the table is open.** A shut table hands out nothing, so a
-/// mission written then would only wait — and the corpus it was written from
-/// may have moved on by the time anybody collects it.
+/// **A step on a document that is gone cannot be done, and only the engine
+/// can see that it cannot.** A reviewer was sent to pass a draft no longer in
+/// its operation's store: the table said there was nothing to pass and to
+/// reject it, the rejection was refused because the mending step was still to
+/// do, and the mending was refused because there was nothing to edit. It went
+/// between three refusals for hours. The table's own reading already called
+/// such an operation off; a Maker's step now is too, before anyone is sent to
+/// it. A step that writes its document new is left alone — there is nothing
+/// to find until it is written.
+pub fn call_off_gone_documents(hosted: &Hosted) -> Vec<String> {
+    if hosted.op_stores().is_none() {
+        return Vec::new();
+    }
+    let open: Vec<(u64, String, String)> = hosted.sim(|s| {
+        let ops = s.missions.operations();
+        ops.all()
+            .filter(|o| !o.settled())
+            .filter(|o| ops.edits(o.id).is_some_and(|e| e != Edits::New))
+            .map(|o| (o.id, o.name.clone(), o.document.clone()))
+            .collect()
+    });
+    let mut called = Vec::new();
+    for (id, name, document) in open {
+        let held = hosted
+            .op_shelf(id)
+            .is_some_and(|shelf| shelf.read(&document).is_some());
+        if held || !hosted.with_sim(|s| s.missions.cancel_operation(id, DOCUMENT_GONE)) {
+            continue;
+        }
+        tracing::warn!(operation = %name, %document, "operation: document gone, called off");
+        called.push(name);
+    }
+    called
+}
+
+/// Carry every hosted world's open work along while the daemon runs: its
+/// standing missions, round and house table, the table's own steps of its open
+/// operations and their Makers' steps put on the table.
+///
+/// **Only while the table is open.** A shut table hands out nothing, so a step
+/// put up then would only wait — and the corpus it was written from may have
+/// moved on by the time anybody takes it.
 pub fn spawn(rt: Arc<Runtime>) {
     tokio::spawn(async move {
         let mut told: Option<String> = None;
@@ -870,10 +912,13 @@ pub fn spawn(rt: Arc<Runtime>) {
                         }
                         continue;
                     }
+                    // A world on the record's workflows draws nothing either:
+                    // its Makers are given an operation's steps, and what is
+                    // posted or lodged for them, and are at rest otherwise.
                     Ok(None) => {
                         told_world.remove(&id);
                         hosted.with_sim(|s| {
-                            s.missions.set_routines(Vec::new(), Draw::Routines);
+                            s.missions.set_routines(Vec::new(), Draw::None);
                             s.missions.set_authorizers(Vec::new());
                             s.missions.set_authoring(false);
                         });
@@ -922,6 +967,7 @@ pub fn spawn(rt: Arc<Runtime>) {
                 for (whose, gone) in struck.unwrap_or_default() {
                     tracing::info!(body = ?whose, ?gone, "mission: reads of documents gone from the record struck");
                 }
+                call_off_gone_documents(&hosted);
                 // Steps of operations already open come first: an operation
                 // half done is worth more than a new one opened. The table's
                 // own steps are taken here; a Maker's is put on the table.
@@ -959,23 +1005,12 @@ pub fn spawn(rt: Arc<Runtime>) {
                         "operation: no Maker left who may take it, called off"
                     );
                 }
-                // **One generation a tick.** Each can take minutes, and the open
-                // operations' steps above come first: stocking the table in a
-                // loop here held a draft's reading behind every generation it
-                // took to stock, while the Makers drew routines.
-                if hosted.sim(|s| s.table_open && s.bench.has_root())
-                    && !hosted.sim(|s| s.missions.stocked_for(&makers, config.keep))
-                    && !rt.stopping()
-                {
-                    match generate(&rt, &hosted, config, None).await {
-                        Ok(Generation::NoWork) => {}
-                        // An operation just opened has its first step put on
-                        // the table now rather than a tick later, while a
-                        // Maker at the table would be handed a routine.
-                        Ok(_) => offer_owed(&hosted, &mind),
-                        Err(e) => tracing::warn!("mission generator: {e:#}"),
-                    }
-                }
+                // **Work is opened on demand, never to keep the table stocked.**
+                // A table kept at a level opened operation after operation for
+                // as long as the daemon ran, and every Maker carried something
+                // all day. An operation is opened only when it is asked for —
+                // `POST /v1/pulse/missions/generate` — and its later steps are
+                // moved along above, as its workflow says, until it settles.
             }
         }
     });
@@ -985,7 +1020,7 @@ pub fn spawn(rt: Arc<Runtime>) {
 mod tests {
     use std::sync::Arc;
 
-    use super::{ends, reading_prompt, retry_prompt, settle_failed};
+    use super::{call_off_gone_documents, ends, reading_prompt, retry_prompt, settle_failed};
     use crate::engine::mission::{Mission, Origin, Outcome, Todo};
     use crate::engine::workflow::OnFailed;
     use crate::opstore::owner::Owner;
@@ -1078,6 +1113,69 @@ mod tests {
             "resumed"
         );
         assert_eq!(read(discarded), None, "afresh on the record");
+    }
+
+    /// **A step on a document gone from its store is called off before anyone
+    /// carries it on**: its Maker is stood down and nothing of it is offered
+    /// again. A step whose document is still there, and one that writes its
+    /// document new, go on.
+    #[test]
+    fn an_operation_whose_document_left_its_store_is_called_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mind = dir.path().join("mind");
+        std::fs::create_dir_all(mind.join("layers/eras")).unwrap();
+        let h = Hosted::load(
+            "creators-vault",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps"),
+        )
+        .unwrap();
+        h.set_bench_root(crate::mind::Mind::new(Some(std::path::PathBuf::from(
+            &mind,
+        ))));
+        let stores = MindStores::new(Some(&mind));
+        stores.set_quiet(Box::new(|_| true));
+        h.set_op_stores(Arc::clone(&stores));
+        h.with_sim(|s| s.missions.set_workflows(workflows()));
+        let open = |step: &str, doc: &str| -> u64 {
+            h.with_sim(|s| s.missions.review_document("story", step, doc).unwrap())
+        };
+        let gone = open("fix", DRAFT);
+        let held = open("fix", "layers/stories/the-wall.md");
+        StoreShelf {
+            stores: Arc::clone(&stores),
+            owner: Owner::operation(h.id(), held),
+        }
+        .commit(&[(
+            "layers/stories/the-wall.md".into(),
+            Some("the wall\n".into()),
+        )])
+        .unwrap();
+        let unwritten = open("write", "layers/stories/the-door.md");
+        h.with_sim(|s| {
+            s.missions.assign(
+                "m1",
+                Mission::new(
+                    "Mend it.",
+                    vec![Todo::report("report it")],
+                    Origin::Generated {
+                        generator: "operator".into(),
+                        target: format!("doc:{DRAFT}"),
+                        operation: gone,
+                        step: "fix".into(),
+                    },
+                ),
+            )
+        });
+
+        assert_eq!(call_off_gone_documents(&h).len(), 1);
+        h.sim(|s| {
+            let ops = s.missions.operations();
+            assert!(ops.get(gone).unwrap().settled(), "gone: called off");
+            assert!(!ops.get(held).unwrap().settled(), "held: goes on");
+            assert!(!ops.get(unwritten).unwrap().settled(), "new: goes on");
+            assert!(!s.missions.is_on_mission("m1"), "its Maker is stood down");
+        });
+        assert!(call_off_gone_documents(&h).is_empty(), "called off once");
     }
 
     /// **An answer asked again carries every refusal so far**, numbered, and

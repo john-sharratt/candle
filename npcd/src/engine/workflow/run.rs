@@ -117,9 +117,18 @@ impl Run {
     /// What the most recent step reported finding — what the next step's
     /// `{findings}` answers to, notably when that step sent the work back.
     /// `None` before any step, or when the last step reported nothing.
+    ///
+    /// **A stuck report found nothing in the work.** Its notes say why its
+    /// reporter could not get on — "I cannot reach the time level" — and are
+    /// about the reporter, not the document. Read as findings, they were set
+    /// in the next reviewer's brief as what the draft was to tell, and two
+    /// Makers were sent to mend a draft by the account of a third's lost way.
+    /// The findings are the last step's that took the work.
     pub fn last_findings(&self) -> Option<&str> {
         self.history
-            .last()
+            .iter()
+            .rev()
+            .find(|t| t.outcome.as_deref() != Some(STUCK))
             .map(|t| t.notes.trim())
             .filter(|n| !n.is_empty())
     }
@@ -475,6 +484,35 @@ mod tests {
         assert_eq!(offer.prompt, "Fix it: {findings}");
         assert_eq!(offer.edits, Edits::Change);
         assert!(may_take(&wf, &run, &actor("ann")));
+    }
+
+    /// **The next taker reads what was found in the work, never a stuck
+    /// report's way.** A review given up once stays on offer; the second
+    /// reviewer's findings are the table's reading, not the first reviewer's
+    /// account of where it could not go — and after the limit routes it on,
+    /// still the reading.
+    #[test]
+    fn a_stuck_report_is_never_the_findings() {
+        let wf = workflow();
+        let mut run = start(&wf);
+        advance(&wf, &mut run, &actor("ann"), None, "drafted").unwrap();
+        advance(&wf, &mut run, &Taker::Table, Some("ok"), "a date to fix").unwrap();
+        assert_eq!(
+            advance(
+                &wf,
+                &mut run,
+                &actor("bob"),
+                Some(STUCK),
+                "I cannot find the lift"
+            ),
+            next("review")
+        );
+        assert_eq!(run.last_findings(), Some("a date to fix"));
+        assert_eq!(
+            advance(&wf, &mut run, &actor("cara"), Some(STUCK), "nor can I"),
+            next("draft")
+        );
+        assert_eq!(run.last_findings(), Some("a date to fix"));
     }
 
     #[test]

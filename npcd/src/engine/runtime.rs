@@ -1513,7 +1513,8 @@ impl Runtime {
 
     /// Tell every mind of `hosted` that takes no orders — the minds that are
     /// the world — what `body` has just done, by its name: "Wick has come to
-    /// rest". A thing that happened, so it accumulates and is worth a turn.
+    /// rest". A thing that happened, so it accumulates; it asks nothing, so it
+    /// is a [`EventKind::Notice`], read with whatever next wakes the mind.
     pub(crate) fn tell_whole(&self, hosted: &Hosted, body: &str, did: &str) {
         let Some(name) = hosted.read(|w| w.name_of(body).map(str::to_string)) else {
             return;
@@ -1526,7 +1527,7 @@ impl Runtime {
                 npc,
                 self.world_ms(npc),
                 Salience::NORMAL,
-                EventKind::Description {
+                EventKind::Notice {
                     text: format!("{name} {did}"),
                 },
             );
