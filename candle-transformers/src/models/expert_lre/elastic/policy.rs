@@ -35,6 +35,14 @@ pub(crate) const SLOPE_BYTES: u64 = 2 * GIB;
 pub(crate) const SLOPE_TICKS: usize = 3;
 /// Ticks between shrinks: the pages need a moment to reach the free list.
 pub(crate) const SHRINK_DWELL: u64 = 2;
+/// Ticks ahead a build shrink sheds for: free RAM still falling at its rate
+/// over the window until the next shrink may be taken. Shedding only the
+/// shortfall of the moment trailed a 1 GiB/s build by a step every dwell, and
+/// free RAM touched 0.23 GiB (WhiteWorld, 2026-11-21).
+pub(crate) const LEAD_TICKS: u64 = SHRINK_DWELL;
+/// Free RAM past [`HEADROOM`] that counts as relief: the machine has room for
+/// several segments, not just the next one.
+pub(crate) const RELIEF_SPARE: u64 = 4 * GIB;
 /// Ticks between grows, and from a shrink to the next grow.
 pub(crate) const GROW_DWELL: u64 = 5;
 /// Ticks running with free RAM under [`HEADROOM`] before the tier gives back
@@ -55,6 +63,13 @@ pub(crate) const BACKOFF_MAX: u64 = 30 * 60;
 /// Ticks without pressure after which the back-off halves: twice the longest
 /// back-off, so the quiet a tier spends waiting one out never relaxes it.
 pub(crate) const RELAX_AFTER: u64 = 2 * BACKOFF_MAX;
+
+/// Free RAM [`LEAD_TICKS`] from now, falling as it fell by `fell` over
+/// `ticks`.
+pub(crate) fn projected_available(available: u64, fell: u64, ticks: u64) -> u64 {
+    let per_tick = fell / ticks.max(1);
+    available.saturating_sub(per_tick * LEAD_TICKS)
+}
 
 /// One tick's readings.
 #[derive(Debug, Clone, Copy)]
@@ -118,6 +133,11 @@ pub(crate) enum Decision {
 pub(crate) struct Ceiling {
     pub(crate) segments: usize,
     pub(crate) until: u64,
+    /// Set by free RAM falling short — a build, the headroom gone, the floor —
+    /// which free RAM coming back answers ([`Policy::relieve`]). A ceiling set
+    /// by this process's own faults, or a refusal, is not lifted by free RAM:
+    /// the edge it marks is where this process pages, plentiful RAM or not.
+    pub(crate) ram: bool,
 }
 
 /// The controller's state between ticks.
@@ -131,6 +151,9 @@ pub(crate) struct Policy {
     quiet_run: u32,
     /// Ticks running with free RAM under the headroom.
     short_run: u32,
+    /// Ticks running with [`RELIEF_SPARE`] past the headroom and this process
+    /// quiet.
+    relief_run: u64,
     /// Free RAM over the last [`SLOPE_TICKS`] ticks, oldest first.
     available: VecDeque<u64>,
     last_shrink: Option<u64>,
@@ -160,6 +183,7 @@ impl Policy {
             pressure_run: 0,
             quiet_run: 0,
             short_run: 0,
+            relief_run: 0,
             available: VecDeque::with_capacity(SLOPE_TICKS + 1),
             last_shrink: None,
             last_grow: None,
@@ -190,6 +214,7 @@ impl Policy {
         self.ceiling = Some(Ceiling {
             segments: held,
             until: self.tick + self.backoff,
+            ram: false,
         });
     }
 
@@ -217,21 +242,48 @@ impl Policy {
         } else {
             0
         };
-        let fell = self
-            .available
-            .front()
-            .is_some_and(|&then| then.saturating_sub(s.available) >= SLOPE_BYTES);
+        self.relief_run = if s.available >= HEADROOM + RELIEF_SPARE && self.fast < PRESSURE_FAULTS {
+            self.relief_run + 1
+        } else {
+            0
+        };
+        let fall = self.available.front().map(|&then| {
+            let ticks = self.available.len() as u64;
+            (then.saturating_sub(s.available), ticks)
+        });
         self.available.push_back(s.available);
         while self.available.len() > SLOPE_TICKS {
             self.available.pop_front();
         }
         self.relax();
         self.lift(l);
+        self.relieve();
 
-        if let Some(d) = self.shrink(s, l, fell) {
+        if let Some(d) = self.shrink(s, l, fall) {
             return d;
         }
         self.grow(s, l)
+    }
+
+    /// Ticks of relief that lift a standing ceiling whole: half the back-off,
+    /// so a machine whose pressure keeps coming back — which doubles the
+    /// back-off — is trusted with its RAM less readily each time.
+    pub(crate) fn relief_ticks(&self) -> u64 {
+        self.backoff / 2
+    }
+
+    /// The pressure a shrink answered has gone: free RAM has stood well past
+    /// the headroom, this process quiet, for [`Self::relief_ticks`]. The
+    /// ceiling goes, and the tier regrows at its grow dwell rather than a
+    /// segment per back-off (WhiteWorld, 2026-11-21: 24 GiB free after a build
+    /// ended, and the probes took minutes to retake 6 GiB). Counted as a lift,
+    /// so pressure returning soon after doubles the back-off.
+    fn relieve(&mut self) {
+        if self.ceiling.is_some_and(|c| c.ram) && self.relief_run >= self.relief_ticks() {
+            self.ceiling = None;
+            self.last_lift = Some(self.tick);
+            self.relief_run = 0;
+        }
     }
 
     fn since(&self, at: Option<u64>) -> u64 {
@@ -254,21 +306,27 @@ impl Policy {
                 self.ceiling = (c.segments + 1 < l.max).then_some(Ceiling {
                     segments: c.segments + 1,
                     until: self.tick + self.backoff,
+                    ram: c.ram,
                 });
                 self.last_lift = Some(self.tick);
             }
         }
     }
 
-    fn shrink(&mut self, s: Signals, l: Limits, fell: bool) -> Option<Decision> {
+    /// `fall`: how far free RAM fell over the window, and over how many ticks.
+    fn shrink(&mut self, s: Signals, l: Limits, fall: Option<(u64, u64)>) -> Option<Decision> {
         if l.held == 0 || self.since(self.last_shrink) < SHRINK_DWELL {
             return None;
         }
         let seg = l.segment_bytes.max(1);
+        let projected = fall.map_or(s.available, |(fell, ticks)| {
+            projected_available(s.available, fell, ticks)
+        });
+        let building = fall.is_some_and(|(fell, _)| fell >= SLOPE_BYTES);
         let (segments, reason) = if self.fast > SEVERE_FAULTS || s.available < FLOOR {
             (l.held.div_ceil(4), ShrinkReason::Severe)
-        } else if fell && s.available < HEADROOM + seg {
-            let short = HEADROOM.saturating_sub(s.available).div_ceil(seg) as usize;
+        } else if building && projected < HEADROOM + seg {
+            let short = HEADROOM.saturating_sub(projected).div_ceil(seg) as usize;
             (short.max(1), ShrinkReason::Build)
         } else if self.short_run >= SHORT_TICKS {
             let short = HEADROOM.saturating_sub(s.available).div_ceil(seg) as usize;
@@ -295,12 +353,14 @@ impl Policy {
         self.ceiling = Some(Ceiling {
             segments: l.held - segments,
             until: self.tick + self.backoff,
+            ram: self.fast <= SEVERE_FAULTS && reason != ShrinkReason::Pressure,
         });
         self.last_lift = None;
         self.last_pressure = self.tick;
         self.last_shrink = Some(self.tick);
         self.pressure_run = 0;
         self.short_run = 0;
+        self.relief_run = 0;
         Some(Decision::Shrink { segments, reason })
     }
 
@@ -459,24 +519,129 @@ mod tests {
         );
     }
 
-    /// **A build — free RAM falling fast — is answered before any fault**,
-    /// with as many segments as put the headroom back.
+    /// **A build is shed ahead of it, before any fault**: free RAM falling at
+    /// 1 GiB a tick — the WhiteWorld balloon's 14 GiB in 15 s — is answered
+    /// for where it will be when the next shrink may be taken, not where it
+    /// is, so the headroom is never run through.
     #[test]
-    fn a_build_is_answered_before_any_fault_by_the_headroom_it_took() {
+    fn a_build_is_shed_ahead_of_its_ramp() {
         let mut p = Policy::new();
-        let (mut held, mut faults) = (10usize, 0u64);
-        for avail in [20 * GIB, 14 * GIB, 8 * GIB] {
-            let ds = run(&mut p, &mut held, 20, &mut faults, 0, avail, 1);
-            assert_eq!(ds, vec![Decision::Hold], "{avail}: above the headroom");
+        let (mut held, mut faults) = (18usize, 0u64);
+        let mut shed_at = Vec::new();
+        for avail in [10, 9, 8, 7, 6, 5, 4, 3] {
+            let before = held;
+            let ds = run(&mut p, &mut held, 20, &mut faults, 0, avail * GIB, 1);
+            if let Decision::Shrink { segments, reason } = ds[0] {
+                assert_eq!(reason, ShrinkReason::Build);
+                shed_at.push((avail, before - held, segments));
+            }
         }
-        let ds = run(&mut p, &mut held, 20, &mut faults, 0, GIB + GIB / 2, 1);
+        // At 5 GiB free, falling 1 GiB a tick, 3 GiB is two ticks away: one
+        // segment keeps the headroom. Two ticks on, at 3 GiB, 1 GiB is: two.
+        assert_eq!(shed_at, vec![(5, 1, 1), (3, 2, 2)]);
+    }
+
+    /// **A plunge is shed for whole**: free RAM falling 6 GiB a tick sheds,
+    /// while still far above the headroom, everything its next two ticks will
+    /// take from it.
+    #[test]
+    fn a_plunge_is_shed_while_still_far_above_the_headroom() {
+        let mut p = Policy::new();
+        let (mut held, mut faults) = (18usize, 0u64);
+        run(&mut p, &mut held, 20, &mut faults, 0, 20 * GIB, 1);
+        let ds = run(&mut p, &mut held, 20, &mut faults, 0, 14 * GIB, 1);
+        // 14 GiB now, 2 GiB in two ticks: 1 GiB short of the headroom.
         assert_eq!(
             ds,
             vec![Decision::Shrink {
-                segments: 2,
+                segments: 1,
                 reason: ShrinkReason::Build
             }]
         );
+    }
+
+    /// **Relief lifts a RAM shrink's ceiling whole**: free RAM well past the
+    /// headroom for half the back-off, this process quiet, and the tier
+    /// regrows at its grow dwell instead of a segment per back-off.
+    #[test]
+    fn relief_lifts_a_ram_ceiling_and_regrows_at_the_dwell() {
+        let mut p = Policy::new();
+        let (mut held, mut faults) = (18usize, 0u64);
+        run(
+            &mut p,
+            &mut held,
+            20,
+            &mut faults,
+            0,
+            2 * GIB,
+            SHORT_TICKS as usize,
+        );
+        assert_eq!(held, 17, "short of the headroom: one segment");
+        assert!(p.ceiling().is_some_and(|c| c.ram));
+        let free = HEADROOM + RELIEF_SPARE;
+        let window = p.relief_ticks() as usize;
+        let ds = run(&mut p, &mut held, 20, &mut faults, 0, free, window - 1);
+        assert_eq!(grows(&ds), 0, "held through the relief window");
+        let ds = run(
+            &mut p,
+            &mut held,
+            20,
+            &mut faults,
+            0,
+            free,
+            3 * GROW_DWELL as usize,
+        );
+        assert!(p.ceiling().is_none(), "lifted whole");
+        assert_eq!(grows(&ds), 3, "a segment per grow dwell: {ds:?}");
+    }
+
+    /// **Relief never lifts a ceiling this process's own faults set**: free
+    /// RAM says nothing about where this process pages.
+    #[test]
+    fn relief_does_not_lift_a_fault_ceiling() {
+        let mut p = Policy::new();
+        let (mut held, mut faults) = (8usize, 0u64);
+        run(&mut p, &mut held, 20, &mut faults, 0, 40 * GIB, 1);
+        run(&mut p, &mut held, 20, &mut faults, 900, 40 * GIB, 3);
+        assert_eq!(held, 7);
+        assert!(p.ceiling().is_some_and(|c| !c.ram));
+        let ds = run(
+            &mut p,
+            &mut held,
+            20,
+            &mut faults,
+            0,
+            40 * GIB,
+            BACKOFF_MIN as usize - 1,
+        );
+        assert_eq!(grows(&ds), 0, "held at the ceiling through the back-off");
+    }
+
+    /// **Relief that pressure follows makes the next relief wait longer**: a
+    /// build that keeps coming back doubles the back-off, and the relief
+    /// window is half of it.
+    #[test]
+    fn relief_followed_by_pressure_lengthens_the_next_relief() {
+        let mut p = Policy::new();
+        let (mut held, mut faults) = (18usize, 0u64);
+        let free = HEADROOM + RELIEF_SPARE;
+        let mut windows = Vec::new();
+        for _ in 0..3 {
+            run(
+                &mut p,
+                &mut held,
+                20,
+                &mut faults,
+                0,
+                2 * GIB,
+                SHORT_TICKS as usize,
+            );
+            windows.push(p.relief_ticks());
+            while p.ceiling().is_some() {
+                run(&mut p, &mut held, 20, &mut faults, 0, free, 1);
+            }
+        }
+        assert_eq!(windows, vec![BACKOFF_MIN / 2, BACKOFF_MIN, 2 * BACKOFF_MIN]);
     }
 
     /// **Pressure takes three ticks running and one segment**; another

@@ -96,9 +96,14 @@ constant below is a starting value the balloon runs (§8) tune.
 | Trigger | Shrink |
 |---|---|
 | **Severe**: fast faults > `SEVERE_FAULTS` (2,000/s), or available < `FLOOR` (1 GiB) | a quarter of the segments held, at least one |
-| **Build**: available fell by ≥ `SLOPE_BYTES` (2 GiB) over `SLOPE_TICKS` (3) and is below `HEADROOM` + one segment | as many segments as restore `HEADROOM` (3 GiB), at least one |
+| **Build**: available fell by ≥ `SLOPE_BYTES` (2 GiB) over `SLOPE_TICKS` (3), and **projected** `LEAD_TICKS` (2, one shrink dwell) ahead at that rate is below `HEADROOM` + one segment | as many segments as restore `HEADROOM` (3 GiB) at the projected point, at least one |
 | **Short**: available below `HEADROOM` for `SHORT_TICKS` (5) ticks running | as many segments as restore `HEADROOM`, at least one |
 | **Pressure**: fast faults > `PRESSURE_FAULTS` (400/s) for `PRESSURE_TICKS` (3) ticks running | one segment |
+
+The build rule sheds for where free RAM will be when the next shrink may be
+taken, not where it is: shedding only the shortfall of the moment trailed a
+1 GiB/s build by a step every dwell, and free RAM touched 0.23 GiB on WhiteWorld
+(2026-11-21, balloon run 2) though motherd itself never paged past 56 faults/s.
 
 The short rule is the build rule for a build too slow for the slope: measured on
 WhiteWorld (2026-11-21), a 14 GiB balloon that took 84 s to ramp left free RAM at
@@ -141,6 +146,17 @@ the back-off expires the ceiling lifts by one segment, a probe. (A ceiling one
 under the size *before* the shrink let a severe shrink of 18 → 13 grow straight
 back to 17 within 70 s while the build that caused it still held its RAM —
 WhiteWorld, 2026-11-21.)
+
+**Relief lifts a RAM ceiling whole.** A ceiling set by free RAM falling short —
+build, short, or the floor — records it (`Ceiling::ram`). Once free RAM has stood
+at `HEADROOM` + `RELIEF_SPARE` (4 GiB) or more, this process quiet, for half the
+back-off (`relief_ticks`), the ceiling goes and the tier regrows a segment per
+`GROW_DWELL`, the headroom rule still bounding every grow. Run 2 on WhiteWorld
+had 24 GiB free once its build ended and took minutes to retake 6 GiB a segment
+per back-off. A ceiling set by this process's own faults is never lifted by
+free RAM: it marks where this process pages, plentiful RAM or not. A relief
+counts as a lift, so pressure returning soon after doubles the back-off — and
+with it the next relief window.
 
 If pressure recurs within twice the back-off after a ceiling lifted, the next
 back-off doubles, up to `BACKOFF_MAX` (30 min). After `RELAX_AFTER` (1 h, twice
