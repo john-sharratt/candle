@@ -33,10 +33,10 @@ front of Claude whenever it needs it. `chat` is checked for a chat id's shape â€
 disposed of, or is another person's is answered alike: no chat by that id is
 open, everything said on it is gone, and a send naming no chat opens a new one.
 
-**One person keeps at most `MAX_CHATS` chats, sixteen** (`chats/talk.rs`). Each
+**One person keeps at most `MAX_CHATS` chats, sixty-four** (`chats/talk.rs`). Each
 holds a conversation and a worker until it is closed or idle twelve hours, so a
 caller that loses its ids and opens a chat on every send is refused once it has
-sixteen, told to go on with one by its id or close those it is done with. A
+sixty-four, told to go on with one by its id or close those it is done with. A
 closing chat counts until it is disposed of.
 
 `zen_chat_read` only reads (`readOnlyHint`): it writes nothing, not even a read
