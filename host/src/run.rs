@@ -43,6 +43,7 @@ use crate::cluster::{standalone_agent, Cluster, Join};
 use crate::ctrl_c::accept_ctrl_c;
 use crate::endpoints::{declared, routes, Shared};
 use crate::guard::{dispatch_table, Routes};
+use crate::keep_stop::with_stop;
 use crate::logs::LogBus;
 use crate::machines::state_expert_pin;
 #[cfg(feature = "memory-census")]
@@ -588,6 +589,9 @@ async fn serve_tenants(
         Some(jobs) => with_hold(all.router, Arc::clone(jobs), listen.bind),
         None => all.router,
     };
+    // keep asks it to stop the way `shutdown` does — drain, send what it
+    // wrote, exit — before it would kill it (`keep_stop`).
+    let router = with_stop(router, Arc::clone(&stopping), listen.bind);
     let served = serve(
         &listen,
         &uis,

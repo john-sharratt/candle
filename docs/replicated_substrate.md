@@ -830,6 +830,15 @@ build is certified (§3.8):
    `motherd` the last known-good executable is `keep/stable/<name>.exe`, started with
    the arguments in `keep`'s config:
    - **A process that is gone** is started again from that stable file.
+   - **A running process is stopped cleanly first.** Before a trial, an accept, a
+     restart or a stop, `keep` asks the host on its own port (`status:`, or
+     `agent:` when only that is named) `POST /v1/host/stop`, which runs the
+     `shutdown` command's stop (§12.4): hand the live work on, drain, send what it
+     wrote, flush, exit. `keep` waits 30 s for the exit and kills only past it
+     (`keep/src/graceful.rs`, `host/src/keep_stop.rs`). A kill left events written
+     to the member's log and on no socket: a conversation's later turns sat on
+     BlackWorld's disk, missing on WhiteWorld, until BlackWorld came back
+     (2026-11-21).
    - **A trial** runs from the stable path: the stable file is set aside, the
      staged file copied onto its path and started there — the path the firewall
      allows, and the one a self-relaunch starts. `keep` reads its stderr, written

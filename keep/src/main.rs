@@ -66,6 +66,7 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use trial::{spawn_detached, switch_to, Ended, Running};
 
 mod board;
+mod graceful;
 mod guard;
 mod hold;
 #[cfg(windows)]
@@ -91,7 +92,8 @@ struct ServiceCfg {
     args: Vec<String>,
     cwd: PathBuf,
     /// The `host:port` its `/v1/status` answers on, which arms the last-member
-    /// guard (`guard`). Absent for a service with no quorum.
+    /// guard (`guard`) and is where keep asks it to stop cleanly
+    /// (`graceful`). Absent for a service with no quorum.
     #[serde(default)]
     status: Option<String>,
     /// The `host:port` of the build agent the service runs, which keep asks
@@ -125,6 +127,10 @@ struct Service {
     trial_log: PathBuf,
     /// See [`ServiceCfg::agent`].
     agent: Option<String>,
+    /// Where keep asks the service to stop cleanly before it would kill it
+    /// (`graceful`): the host's own port, which [`ServiceCfg::status`] names,
+    /// or [`ServiceCfg::agent`] — a build agent runs in a host, on its port.
+    stop_at: Option<String>,
 }
 
 struct Slot {
@@ -285,6 +291,7 @@ fn prepare(state: &Path, cfg: ServiceCfg) -> anyhow::Result<Service> {
         stable,
         args: cfg.args.into_iter().map(std::ffi::OsString::from).collect(),
         cwd,
+        stop_at: cfg.status.or_else(|| cfg.agent.clone()),
         agent: cfg.agent,
     })
 }
@@ -351,11 +358,11 @@ fn supervise(svc: Service, rx: Receiver<Req>) {
 fn hold(svc: &Service, live: Option<Live>, forced: bool, reply: Sender<Answer>) -> Option<Live> {
     hold::before_stop(&svc.name, svc.agent.as_deref(), forced);
     if let Some(mut live) = live {
-        stop(&mut live);
+        stop(svc, &mut live);
     }
     // One found by name is the service too, whoever started it.
     if let Some(found) = find(&svc.file) {
-        stop(&mut Live::Adopted(found.pid));
+        stop(svc, &mut Live::Adopted(found.pid));
     }
     eprintln!("keep: {} stopped and held", svc.name);
     let _ = reply.send(Answer {
@@ -399,7 +406,7 @@ fn roll_back_interrupted_trial(svc: &Service) {
         svc.name
     );
     if let Some(found) = find(&svc.file) {
-        stop(&mut Live::Adopted(found.pid));
+        stop(svc, &mut Live::Adopted(found.pid));
     }
     if let Err(e) = restore(&svc.stable) {
         eprintln!(
@@ -414,7 +421,7 @@ fn roll_back_interrupted_trial(svc: &Service) {
 fn restart(svc: &Service, live: Option<Live>, forced: bool, reply: Sender<Answer>) -> Option<Live> {
     hold::before_stop(&svc.name, svc.agent.as_deref(), forced);
     if let Some(mut live) = live {
-        stop(&mut live);
+        stop(svc, &mut live);
     }
     let started = ensure(svc);
     let answer = match &started {
@@ -445,12 +452,12 @@ fn accept_build(
 ) -> Option<Live> {
     hold::before_stop(&svc.name, svc.agent.as_deref(), forced);
     if let Some(mut live) = live {
-        stop(&mut live);
+        stop(svc, &mut live);
     }
     // One found by name is the service too, whoever started it: its image
     // holds the stable file open.
     if let Some(found) = find(&svc.file) {
-        stop(&mut Live::Adopted(found.pid));
+        stop(svc, &mut Live::Adopted(found.pid));
     }
     let installed = accept(path, &svc.stable);
     let started = ensure(svc);
@@ -487,7 +494,7 @@ fn apply(
     // builds before it took its leases, and lets go by exiting.
     hold::before_stop(&svc.name, svc.agent.as_deref(), forced);
     if let Some(mut live) = live {
-        stop(&mut live);
+        stop(svc, &mut live);
     }
     // **The trial runs alone.** One found by name is the service too, whoever
     // started it — a start by hand, a keep that restarted — and a trial spawned
@@ -496,7 +503,7 @@ fn apply(
     // partway through its load, rolled back, and the member was told to upgrade
     // again: a loop that served nothing for a whole run.
     if let Some(found) = find(&svc.file) {
-        stop(&mut Live::Adopted(found.pid));
+        stop(svc, &mut Live::Adopted(found.pid));
     }
     let result = switch_to(
         path,
@@ -583,17 +590,29 @@ fn ensure(svc: &Service) -> Option<Live> {
     }
 }
 
-fn stop(live: &mut Live) {
+/// Stop `svc`'s process: asked to stop cleanly first, when it is a host that
+/// names its address (`graceful`), and killed only if it has not exited
+/// within [`graceful::STOP_WAIT`].
+fn stop(svc: &Service, live: &mut Live) {
+    let status = svc.stop_at.as_deref();
     match live {
         Live::Child(child) => {
-            let _ = child.kill();
+            let exited = graceful::stop_cleanly(&svc.name, status, || {
+                matches!(child.try_wait(), Ok(Some(_)))
+            });
+            if !exited {
+                let _ = child.kill();
+            }
             let _ = child.wait();
         }
         Live::Adopted(pid) => {
-            kill_pid(*pid);
-            let start = std::time::Instant::now();
-            while alive(*pid) && start.elapsed() < Duration::from_secs(30) {
-                thread::sleep(Duration::from_millis(50));
+            let pid = *pid;
+            if !graceful::stop_cleanly(&svc.name, status, || !alive(pid)) {
+                kill_pid(pid);
+                let start = std::time::Instant::now();
+                while alive(pid) && start.elapsed() < Duration::from_secs(30) {
+                    thread::sleep(Duration::from_millis(50));
+                }
             }
         }
     }

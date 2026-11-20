@@ -40,6 +40,7 @@ pub mod download;
 pub mod endpoints;
 pub mod expert_split;
 pub mod guard;
+pub mod keep_stop;
 pub mod loading;
 pub mod logs;
 pub mod machines;

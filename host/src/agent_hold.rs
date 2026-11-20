@@ -42,7 +42,7 @@ pub fn with_hold(router: Router, jobs: Arc<Jobs>, own: IpAddr) -> Router {
 }
 
 /// Whether `peer` is on this machine, which listens on `own`.
-fn on_this_machine(peer: Option<SocketAddr>, own: IpAddr) -> bool {
+pub(crate) fn on_this_machine(peer: Option<SocketAddr>, own: IpAddr) -> bool {
     peer.is_some_and(|p| p.ip().is_loopback() || p.ip() == own)
 }
 
