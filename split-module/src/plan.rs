@@ -42,6 +42,8 @@ pub const MOD: &str = "mod";
 /// Parse a plan.
 pub fn parse(text: &str) -> Result<Vec<PlanFile>, String> {
     let mut files: Vec<PlanFile> = Vec::new();
+    // The file the lines under the last `file` line go to.
+    let mut current: Option<usize> = None;
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim();
         // `=== <map>` heads a plan in the planner's answer; it says nothing
@@ -50,8 +52,8 @@ pub fn parse(text: &str) -> Result<Vec<PlanFile>, String> {
             continue;
         }
         if let Some(doc) = line.strip_prefix("//!") {
-            let file = files
-                .last_mut()
+            let file = current
+                .map(|c| &mut files[c])
                 .ok_or_else(|| format!("line {}: a doc line before any `file`", n + 1))?;
             file.more
                 .push(doc.strip_prefix(' ').unwrap_or(doc).trim_end().to_string());
@@ -63,12 +65,24 @@ pub fn parse(text: &str) -> Result<Vec<PlanFile>, String> {
             let (name, doc) = rest
                 .split_once(':')
                 .ok_or_else(|| format!("line {}: `file <name>: <purpose>`", n + 1))?;
-            let name = name.trim().to_string();
+            // A name written with its extension names the same file.
+            let name = name.trim();
+            let name = name
+                .strip_suffix(".rs")
+                .or_else(|| name.strip_suffix(".cuh"))
+                .unwrap_or(name)
+                .to_string();
             if !is_module_name(&name) {
                 return Err(format!("line {}: `{name}` is not a module name", n + 1));
             }
-            if files.iter().any(|f| f.name == name) {
-                return Err(format!("line {}: file `{name}` named twice", n + 1));
+            // `file mod` may come back: what stays in the file is often a few
+            // short runs between the parts.
+            if let Some(at) = files.iter().position(|f| f.name == name) {
+                if name != MOD {
+                    return Err(format!("line {}: file `{name}` named twice", n + 1));
+                }
+                current = Some(at);
+                continue;
             }
             files.push(PlanFile {
                 name,
@@ -76,10 +90,11 @@ pub fn parse(text: &str) -> Result<Vec<PlanFile>, String> {
                 more: Vec::new(),
                 ids: Vec::new(),
             });
+            current = Some(files.len() - 1);
             continue;
         }
-        let file = files
-            .last_mut()
+        let file = current
+            .map(|c| &mut files[c])
             .ok_or_else(|| format!("line {}: ids before any `file`", n + 1))?;
         for word in line.split(|c: char| c.is_whitespace() || c == ',') {
             if word.is_empty() {
@@ -101,7 +116,12 @@ pub fn parse(text: &str) -> Result<Vec<PlanFile>, String> {
 /// `line` itself when it reads `<module name>: <purpose>`.
 fn bare_file_line(line: &str) -> Option<&str> {
     let (name, _) = line.split_once(':')?;
-    is_module_name(name.trim()).then_some(line)
+    let name = name.trim();
+    let name = name
+        .strip_suffix(".rs")
+        .or_else(|| name.strip_suffix(".cuh"))
+        .unwrap_or(name);
+    is_module_name(name).then_some(line)
 }
 
 fn parse_id(word: &str) -> Option<Id> {
@@ -182,12 +202,22 @@ mod tests {
         assert_eq!(parse("").unwrap_err(), "the plan names no file");
     }
 
+    /// **`file mod` can come back**, and what follows it again stays in the
+    /// file; any other file named twice is refused.
+    #[test]
+    fn file_mod_may_come_back() {
+        let p = parse("file mod: Stays.\n1\nfile a: A.\n2\nfile mod: Stays.\n3\n").unwrap();
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0].ids, vec![Id::Whole(1), Id::Whole(3)]);
+        assert_eq!(p[1].ids, vec![Id::Whole(2)]);
+    }
+
     /// **A planner's slips read as it meant them**: the `=== <map>` head of
     /// its answer is skipped, and a file line without `file` is still one.
     #[test]
     fn a_map_head_and_a_bare_file_line_are_read() {
         let p =
-            parse("=== maps/a.rs.map\n\nfile mod: Stays.\n1\ntests_rows: The tests.\n2.1 2.2\n")
+            parse("=== maps/a.rs.map\n\nfile mod: Stays.\n1\ntests_rows.rs: The tests.\n2.1 2.2\n")
                 .unwrap();
         assert_eq!(
             p.iter()

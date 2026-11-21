@@ -22,6 +22,7 @@
 
 mod assemble;
 mod assign;
+mod cuda;
 mod digest;
 mod layout;
 mod map;
@@ -49,6 +50,49 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `map`, `check` and `apply` for a CUDA or C++ kernel source.
+fn run_kernel(
+    cmd: &str,
+    file: &Path,
+    source: &str,
+    plan_path: Option<&String>,
+) -> Result<String, String> {
+    let layout = cuda::layout::layout(source)?;
+    let (dir, _, stem) = cuda::split::targets(file)?;
+    if cmd == "map" {
+        return Ok(cuda::layout::render(source, &layout));
+    }
+    let plan_path = plan_path.ok_or("check and apply take a plan")?;
+    let plan_text = fs::read_to_string(plan_path).map_err(|e| format!("{plan_path}: {e}"))?;
+    let plan = plan::parse(&plan_text)?;
+    let outputs = cuda::split::split(source, &layout, &plan, &stem)?;
+    let mut report = String::new();
+    match cmd {
+        "check" => {
+            report.push_str(&format!(
+                "{} parts; the parts put back give the source\n{}\t{}\n",
+                outputs.parts.len(),
+                outputs.file.len(),
+                file.display()
+            ));
+            for (name, text) in &outputs.parts {
+                report.push_str(&format!(
+                    "{}\t{}\n",
+                    text.len(),
+                    dir.join(format!("{name}.cuh")).display()
+                ));
+            }
+        }
+        "apply" => {
+            for (path, size) in cuda::split::write(file, &outputs)? {
+                report.push_str(&format!("{size}\t{}\n", path.display()));
+            }
+        }
+        other => return Err(format!("unknown command `{other}`")),
+    }
+    Ok(report)
 }
 
 fn run(args: &[String]) -> Result<String, String> {
@@ -90,6 +134,9 @@ fn run(args: &[String]) -> Result<String, String> {
         _ => {}
     }
     let source = fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    if cuda::is_kernel(file) {
+        return run_kernel(cmd, file, &source, args.get(2));
+    }
     let layout = layout::layout(&source)?;
     let targets = write::targets(file)?;
     if cmd == "map" {

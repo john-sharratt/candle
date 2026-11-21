@@ -124,7 +124,7 @@ pub fn assemble(
                 test_only[*f] &= is_test(&source[item.span.clone()]);
                 names[*f] |= bare_name(&item.name).is_some();
                 test_names[*f] |= item.name.starts_with("mod ") || bare_name(&item.name).is_some();
-                names[*f] |= item.name.starts_with("mod ");
+                names[*f] |= item.name.starts_with("mod ") || item.name.starts_with("extern ");
                 pieces[*f].push((item.span.start, text));
             }
             Placement::Members(to) => {
@@ -156,6 +156,26 @@ pub fn assemble(
                         .filter(|(_, t)| **t == Some(f))
                         .flat_map(|(m, _)| identifiers(&source[m.span.clone()]))
                         .collect()
+                };
+                // How far a re-export of share `f` reaches: as far as the
+                // widest of its items was written to be seen — `pub(crate)`
+                // helpers of a test module are reached from other modules
+                // of the crate — and no further, since a glob re-export of
+                // nothing that reaches so far is refused as a warning.
+                let reach = |f: usize| -> &'static str {
+                    let seen = body
+                        .members
+                        .iter()
+                        .zip(to)
+                        .filter(|(_, t)| **t == Some(f))
+                        .map(|(m, _)| seen_of(&source[m.span.clone()], &m.name))
+                        .max()
+                        .unwrap_or(Seen::Module);
+                    match seen {
+                        Seen::Everywhere => "pub",
+                        Seen::Crate => "pub(crate)",
+                        Seen::Parent | Seen::Module => "pub(super)",
+                    }
                 };
                 for &f in &files {
                     let keep = Some(f) == in_mod;
@@ -225,7 +245,7 @@ pub fn assemble(
                                 // The share in `mod.rs` keeps the module's
                                 // path whole: everything another share holds
                                 // is reached through it, as before the split.
-                                text.push_str(&format!("\n    pub(super) use {path}::*;\n"));
+                                text.push_str(&format!("\n    {} use {path}::*;\n", reach(g)));
                             } else {
                                 // By name, not by glob: a name the module
                                 // declares outranks one its `use super::*`
@@ -267,7 +287,8 @@ pub fn assemble(
                     let mut gather = source[body.head.clone()].to_string();
                     for &g in &files {
                         gather.push_str(&format!(
-                            "\n    pub(super) use super::{}::{module}::*;",
+                            "\n    {} use super::{}::{module}::*;",
+                            reach(g),
                             plan[g].name
                         ));
                     }
@@ -492,6 +513,20 @@ fn seen_of(text: &str, name: &str) -> Seen {
     if name.starts_with("impl ") {
         return Seen::Module;
     }
+    // An `extern { }` block declares its items, each seen as it says: the
+    // block's re-export reaches as far as the widest of them.
+    if name.starts_with("extern ") {
+        let widest = |prefix: &str| text.lines().any(|l| l.trim_start().starts_with(prefix));
+        return if widest("pub fn") || widest("pub static") || widest("pub type") {
+            Seen::Everywhere
+        } else if widest("pub(crate)") {
+            Seen::Crate
+        } else if widest("pub(super)") {
+            Seen::Parent
+        } else {
+            Seen::Module
+        };
+    }
     let code = text.lines().map(str::trim).find(|l| {
         !l.is_empty()
             && !l.starts_with("//")
@@ -612,6 +647,14 @@ mod tests {
         );
     }
 
+    /// **An `extern` block's items are re-exported as far as they are seen.**
+    #[test]
+    fn an_extern_blocks_items_are_re_exported() {
+        let src = "extern \"C\" {\n    pub fn run(x: i32);\n}\n";
+        let out = split(src, "file ffi: The bindings.\n1\n");
+        assert_eq!(out.mod_rs, "mod ffi;\n\npub use ffi::*;\n");
+    }
+
     /// **An inline module placed in the file named for it becomes that file**:
     /// the file holds its body, at the same depth, and `mod.rs` keeps its
     /// declaration where it stood.
@@ -693,6 +736,17 @@ mod tests {
             "#[cfg(test)]\nmod one;\n#[cfg(test)]\nmod two;\n\n\n#[cfg(test)]\nmod tests {\n    \
              pub(super) use super::one::tests::*;\n    pub(super) use super::two::tests::*;\n}\n"
         );
+    }
+
+    /// **A share's re-export reaches as far as its widest item**: a
+    /// `pub(crate)` helper of a test module stays reachable from the crate.
+    #[test]
+    fn a_shares_re_export_reaches_as_far_as_its_items() {
+        let src = "#[cfg(test)]\npub(crate) mod tests {\n    pub(crate) fn gate() {}\n\n    #[test]\n    fn b() {}\n}\n";
+        let out = split(src, "file one: The gate.\n1.1\nfile two: The test.\n1.2\n");
+        assert!(out.mod_rs.contains(
+            "    pub(crate) use super::one::tests::*;\n    pub(super) use super::two::tests::*;\n"
+        ));
     }
 
     /// **A share's `use self::x` names the share that declares `x`**, whose

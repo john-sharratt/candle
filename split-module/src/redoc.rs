@@ -12,18 +12,31 @@ use std::path::Path;
 /// Each file's name and its new doc, as `//!` lines.
 pub fn parse_docs(text: &str) -> Result<Vec<(String, Vec<String>)>, String> {
     let mut docs: Vec<(String, Vec<String>)> = Vec::new();
+    // Where the lines under the last `===` go; `None` after a bare `===`,
+    // which ends the docs rather than naming a file.
+    let mut current: Option<usize> = None;
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim_end();
         if let Some(name) = line.strip_prefix("===") {
-            docs.push((name.trim().to_string(), Vec::new()));
+            let name = name.trim();
+            current = if name.is_empty() {
+                None
+            } else if let Some(at) = docs.iter().position(|(d, _)| d == name) {
+                // A file written twice keeps the later doc.
+                docs[at].1.clear();
+                Some(at)
+            } else {
+                docs.push((name.to_string(), Vec::new()));
+                Some(docs.len() - 1)
+            };
             continue;
         }
         if line.trim().is_empty() {
             continue;
         }
-        let (_, lines) = docs
-            .last_mut()
-            .ok_or_else(|| format!("line {}: a doc line before any `=== <file>`", n + 1))?;
+        let at =
+            current.ok_or_else(|| format!("line {}: a doc line before any `=== <file>`", n + 1))?;
+        let lines = &mut docs[at].1;
         if !line.trim_start().starts_with("//!") {
             return Err(format!("line {}: not a `//!` line: {line}", n + 1));
         }
@@ -79,6 +92,14 @@ pub fn redoc(dir: &Path, docs: &[(String, Vec<String>)]) -> Result<Vec<String>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A bare `===` ends the docs, and a file written twice keeps its
+    /// later doc.**
+    #[test]
+    fn a_bare_head_ends_and_a_repeat_replaces() {
+        let d = parse_docs("=== a.rs\n//! One.\n=== a.rs\n//! Two.\n===\n").unwrap();
+        assert_eq!(d, vec![("a.rs".to_string(), vec!["//! Two.".to_string()])]);
+    }
 
     #[test]
     fn docs_parse_by_file() {
