@@ -710,12 +710,36 @@ fn focus(hosted: &Hosted, body: &str, a: &Map<String, Value>) -> Outcome {
     }
 }
 
+/// The refusal of a lift act away from a landing.
+///
+/// **It sends nobody to the lift.** "Go to it first" taught the three-act way
+/// across floors after `move_to` had come to ride the lift itself: a Maker on
+/// its way to the command room asked for the lift mid-walk, was told to go to
+/// it, and set off back to the room it had just left. A body on a journey is
+/// told the lift is part of it; one standing still is told that `move_to`
+/// rides it.
+fn not_at_the_lift(hosted: &Hosted, body: &str) -> String {
+    let going = hosted.read(|w| {
+        let toward = w.actor(body)?.walk.as_ref()?.toward.clone();
+        w.node(&toward).map(|n| n.name.clone())
+    });
+    match going {
+        Some(room) => format!(
+            "You are on your way to {room}, and the lift is part of that journey: you need do \
+             nothing to ride it. Carry on, and you are told when you arrive."
+        ),
+        None => "You are not at the lift, and need not be: `move_to` the room you are going \
+                 to, on any level, and you ride the lift there."
+            .into(),
+    }
+}
+
 /// Call the lift to the floor you are on. Grammar-gated to the landing with the
 /// car away (see [`tools::Availability::AtLift`]); the refusals here cover the
 /// paths a grammar does not — the API, an unarmed decode.
 fn lift_call(hosted: &Hosted, body: &str) -> Outcome {
     let Some(floor) = hosted.read(|w| w.at_landing(body)) else {
-        return Outcome::Refused("You are not at the lift. Make your way to it first.".into());
+        return Outcome::Refused(not_at_the_lift(hosted, body));
     };
     if hosted.read(|w| w.lift().is_some_and(|l| l.boardable_at(floor))) {
         return Outcome::Refused(
@@ -737,7 +761,7 @@ fn lift_use(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
         );
     };
     let Some(from) = hosted.read(|w| w.at_landing(body)) else {
-        return Outcome::Refused("You are not at the lift. Go to it first.".into());
+        return Outcome::Refused(not_at_the_lift(hosted, body));
     };
     let Some(dest) = hosted.read(|w| w.floor_named(&name)) else {
         return Outcome::Refused(format!("There is no level called \"{name}\" to ride to."));
