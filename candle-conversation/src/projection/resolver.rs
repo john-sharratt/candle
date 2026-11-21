@@ -1583,14 +1583,21 @@ impl Conversation {
     /// the last reprojection — what the model's indexer read of it
     /// (`docs/hit_driven_projection.md` §6.4); it lifts the momentum every
     /// judgment of this reprojection weighs.
+    ///
+    /// The boundary comes first — the slot holds `placed` now
+    /// ([`Substrate::working_set_boundary`]) — in the same edit: each edit of a
+    /// working set copies it from the version readers hold, and its momentum
+    /// and fresh maps name every conversation it has seen.
     pub fn observe_working_set(
         &self,
         schema: &Schema,
         target: ProjectionTarget,
+        placed: &[TurnKey],
         candidates: &[(GroupId, Vec<(TurnKey, f32)>)],
         hit_density: &HashMap<TimelineId, f32>,
     ) {
         let Some(cfg) = working_set_config(schema, target) else {
+            self.update(|s| s.working_set_boundary(target.timeline, placed));
             return;
         };
         // A unit an aging group holds is dated by its metadata, against the
@@ -1608,6 +1615,7 @@ impl Conversation {
             working_set_fresh(schema, candidates, &aged)
         };
         self.update(|s| {
+            s.working_set_boundary(target.timeline, placed);
             s.working_set_observe(
                 target.timeline,
                 &fresh,
