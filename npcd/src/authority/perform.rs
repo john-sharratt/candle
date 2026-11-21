@@ -322,7 +322,10 @@ impl Runtime {
     ///
     /// **A refused act is logged with the world's reason.** The character
     /// reads the refusal; nothing else did, so a Maker that composed its piece
-    /// three times and never got it committed left no trace of why.
+    /// three times and never got it committed left no trace of why. It is
+    /// logged with what was tried, too: a Maker that edited one story six times
+    /// by an anchor it no longer had left the reason six times and never the
+    /// edit it was trying to make.
     ///
     /// **An act the world took is logged too**, with the feed's line for it
     /// and what the character was told came of it. A mind that takes a turn
@@ -352,6 +355,7 @@ impl Runtime {
                 npc,
                 act = act.tool,
                 source = ?source,
+                tried = %act.summary(),
                 answer = %performed.recorded.answer,
                 "an act was refused"
             ),
