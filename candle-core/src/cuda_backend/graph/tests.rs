@@ -2264,6 +2264,58 @@ fn a_drain_inside_a_wave_finds_the_nan_and_leaves_the_stream_usable() -> Result<
     Ok(())
 }
 
+/// **A quantized assert's first use, inside a wave.** The MoE dispatch checks
+/// its int8 activations (`QTYPE_Q8A128V`) on every layer of every wave, so the
+/// dequant scratch those asserts stage through is first made — and later grown
+/// — while a wave records. It must count, finish the wave, and leave the stream
+/// to other threads.
+#[cfg(feature = "tensor-assert")]
+#[test]
+fn a_quantized_assert_inside_a_wave_leaves_the_stream_usable() -> Result<()> {
+    use crate::tensor_assert::QTYPE_Q8A128V;
+    use crate::Device;
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let device = Device::Cuda(dev.clone());
+    // Zeroed q8a128 blocks dequantize to zeros: finite, so the site is clean.
+    let elems = 128 * 64;
+    let q = dev.alloc_zeros::<u8>(elems * 2)?;
+    let ptr = q.device_ptr(&dev.cuda_stream()).0;
+    crate::tensor_assert::epoch(&device)?;
+    dev.synchronize()?;
+
+    let capture = dev.begin_wave_capture()?;
+    dev.record_launches()?;
+    // SAFETY: `q` holds `elems` q8a128 elements' worth of zeroed blocks and
+    // outlives the wave.
+    unsafe {
+        crate::tensor_assert::assert_device_quant(
+            "graph::tests::quant_in_a_wave",
+            ptr,
+            QTYPE_Q8A128V,
+            elems,
+            &dev,
+        )
+    };
+    let report = crate::tensor_assert::report(&device);
+    let finished = capture.finish();
+
+    assert!(report.is_ok(), "the drain inside the wave: {report:?}");
+    assert!(finished.is_ok(), "the wave finished: {finished:?}");
+    let other = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            admit_this_thread();
+            BackendDevice::synchronize(&dev).map_err(|e| e.to_string())
+        })
+        .join()
+        .expect("the other thread")
+    });
+    assert_eq!(other, Ok(()), "another thread's synchronise after the wave");
+    crate::tensor_assert::epoch(&device)?;
+    drop(q);
+    Ok(())
+}
+
 /// **The process's first assert, issued inside a wave.** Nothing in a motherd
 /// asserts at load, so the slot table is made by the first assert of the first
 /// wave — while the wave records. Run alone (the table is per process), this
