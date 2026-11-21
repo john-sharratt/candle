@@ -126,6 +126,13 @@ impl CompactionMap {
         self.records.insert(old_raw, (replacement, addr));
     }
 
+    /// Room for `moves` more relocated slots, so the claims insert without
+    /// growing the tables under them.
+    pub fn reserve(&mut self, moves: usize) {
+        self.moved.reserve(moves);
+        self.new_addr.reserve(moves);
+    }
+
     /// Whether this pass can have moved anything of a payload in `set`'s
     /// arenas: a gid in an arena that gave up a chunk, or a record in one that
     /// gave up a record. `false` means every chunk of it would be left as it is.
@@ -292,6 +299,10 @@ pub struct Sweep<'m> {
     /// sweep can reach is maintained by hand. A rising count is how a new holder nobody
     /// swept is discovered.
     witnessed: AHashSet<i64>,
+    /// Allocations [`Self::witness`] has read, by `alloc_id`, and the pins that
+    /// keep each key naming its allocation until the sweep ends.
+    witnessed_allocs: AHashSet<usize>,
+    witnessed_pins: Vec<HeadGids>,
     /// Destination gids of chunks the sweep deliberately left on their sources, because
     /// no fresh record could be minted for them ([`Self::remint`]).
     ///
@@ -348,6 +359,8 @@ impl<'m> Sweep<'m> {
             clean_reused: 0,
             allocations_rewritten: 0,
             witnessed: AHashSet::new(),
+            witnessed_allocs: AHashSet::new(),
+            witnessed_pins: Vec::new(),
             #[cfg(feature = "cuda")]
             forgone: AHashSet::new(),
             #[cfg(feature = "cuda")]
@@ -380,6 +393,8 @@ impl<'m> Sweep<'m> {
             clean_reused: 0,
             allocations_rewritten: 0,
             witnessed: AHashSet::new(),
+            witnessed_allocs: AHashSet::new(),
+            witnessed_pins: Vec::new(),
             forgone: AHashSet::new(),
             mint: Some((mint, backing)),
             retired: Vec::new(),
@@ -460,12 +475,30 @@ impl<'m> Sweep<'m> {
 
     /// Record that a holder now names `next` — see [`Self::witnessed`]. Called where the
     /// holder installs it, so a chunk left on its source witnesses nothing.
+    ///
+    /// **Once an allocation.** A replacement is shared by every holder of what it
+    /// replaced, and each install witnessed all of its gids again — a chunk's id
+    /// repeated across its palettes, a hash probe and an insert apiece. Witnessed
+    /// once, its repeats asked once a run, the set is the same.
     pub(super) fn witness(&mut self, next: &HeadGids) {
+        let id = next.alloc_id();
+        if self.witnessed_allocs.contains(&id) {
+            return;
+        }
+        let mut last: Option<i64> = None;
         for g in next.as_slice() {
-            if self.map.is_destination(g.raw()) {
-                self.witnessed.insert(g.raw());
+            let raw = g.raw();
+            if last == Some(raw) {
+                continue;
+            }
+            last = Some(raw);
+            if self.map.is_destination(raw) {
+                self.witnessed.insert(raw);
             }
         }
+        // Pinned before the key is kept, as the memo's originals are.
+        self.witnessed_pins.push(next.clone());
+        self.witnessed_allocs.insert(id);
     }
 
     /// Record that `raw` is a slot this sweep minted into — see [`Self::minted`].
@@ -1347,6 +1380,28 @@ mod tests {
         let mut moved = CompactionMap::new();
         moved.insert(raw(3, 1), ChunkGid::detached(raw(0, 4)), 0x400);
         check(&moved, true);
+    }
+
+    /// **A replacement witnessed once stands for every holder that installs
+    /// it**: a second install of the same allocation, and a run of one id
+    /// across its palettes, leave the witnessed set as one read of it would —
+    /// and a destination no holder names is still the gap it was.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_shared_replacement_is_witnessed_once() {
+        let mut map = CompactionMap::new();
+        map.insert(raw(3, 1), ChunkGid::detached(raw(0, 4)), 0x100);
+        map.insert(raw(3, 2), ChunkGid::detached(raw(0, 5)), 0x200);
+        let moved = HeadGids::from_vec(vec![
+            ChunkGid::detached(raw(3, 1)),
+            ChunkGid::detached(raw(3, 1)),
+            ChunkGid::detached(raw(7, 7)),
+        ]);
+        let mut sweep = Sweep::new(&map);
+        let next = sweep.rewrite_gids(&moved).unwrap().expect("moved");
+        sweep.witness(&next);
+        sweep.witness(&next);
+        assert_eq!(sweep.unwitnessed(&map), vec![raw(0, 5)]);
     }
 
     /// **A record in a touched arena is reason enough to read the payload.**

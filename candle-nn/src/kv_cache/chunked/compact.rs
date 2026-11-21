@@ -77,6 +77,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use ahash::AHashSet;
 use candle::Result;
 
 use super::arena::{ArenaKey, ArenaKind};
@@ -875,8 +876,11 @@ impl super::backing::ChunkedKvBacking {
         // rather than per batch, because the collision is across batches: the plan is
         // complete before the first claim, and a destination claimed in the last batch
         // can name a source planned in the first.
-        let planned_sources: HashSet<(usize, u32)> =
-            pending.iter().map(|m| (m.from.0, m.from.1)).collect();
+        let mut planned_sources: AHashSet<(usize, u32)> = AHashSet::with_capacity(pending.len());
+        planned_sources.extend(pending.iter().map(|m| (m.from.0, m.from.1)));
+        // Room for every move up front: a pass of half a million moves rehashed
+        // the map's tables as it grew, inside the claim walk.
+        map.reserve(pending.len());
         let mut planned = 0usize;
         for batch in pending.chunks(MOVES_PER_BATCH) {
             // **The first batch is unconditional.** Planning has already spent part of
@@ -1446,7 +1450,7 @@ impl super::backing::ChunkedKvBacking {
         &self,
         moves: &[ChunkMove],
         keys: &[ArenaKey],
-        planned_sources: &HashSet<(usize, u32)>,
+        planned_sources: &AHashSet<(usize, u32)>,
         map: &mut CompactionMap,
         records: &mut CopyRecords,
     ) -> Result<()> {
