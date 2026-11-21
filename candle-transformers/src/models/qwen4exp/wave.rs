@@ -72,6 +72,7 @@ use super::ple_fused::ple_apply_spans_fused;
 use super::qsa::IndexerWeights;
 use super::qsa_select::{budget_fits_kernel, coalesce_ranges, Strata, MAX_PINS};
 use super::resident_page::{PageRegistry, ResidentPage};
+use super::seal_memo::SealMemo;
 use super::select_bytes::select_layer_bytes;
 use super::sequence_pools::SequencePools;
 use super::shadow::{ShadowGeometry, ShadowRows, ShadowSegment};
@@ -182,6 +183,9 @@ pub struct Qwen4ExpBatched {
     /// The resident index pages of every injected piece some cache still holds,
     /// so a piece pushed into many slots is placed once and shared.
     pages: PageRegistry,
+    /// The records tail seals made, so a seal of pages placed from them reads
+    /// none back (`seal_memo`).
+    seal_memo: SealMemo,
     /// Per sequence, the pages its last reset dropped, held until its next
     /// reset or its release.
     ///
@@ -1292,13 +1296,13 @@ impl Qwen4ExpBatched {
         // stable (a mid-decode reprojection closes an extra one). Position is.
         let mut blobs: Vec<(usize, Vec<u8>)> = Vec::new();
         for pi in first_page..probe.page_count() {
-            let mut layer_pages = Vec::with_capacity(caches.len());
             // Two descriptions of the same page travel together from here: the
             // width, which the caller uses to place the page in the span, and
             // the rows the blob carries, which only this model can read. They
             // are the one thing nothing downstream can cross-check — so they are
             // checked here, where both are in hand.
             let mut width: Option<usize> = None;
+            let mut pages = Vec::with_capacity(caches.len());
             for c in caches.iter() {
                 let (p, w) = c
                     .page_at(pi)
@@ -1317,19 +1321,36 @@ impl Qwen4ExpBatched {
                     ),
                     Some(_) => {}
                 }
-                // A closed page's rows are un-rotated and immutable, so the
-                // record is the page's rows as they stand. A page is already
-                // closed; only the live tail carries an open block.
-                layer_pages.push(SealedIndex {
-                    keys: p.host_rows()?,
-                    last_cells: p.last_cells(),
-                    open: Vec::new(),
-                });
+                pages.push(p);
             }
-            blobs.push((
-                width.unwrap_or(0),
-                paged_index::encode_aux(&[], &layer_pages)?,
-            ));
+            let width = width.unwrap_or(0);
+            // A page every layer of which was placed from one record this loop
+            // made is that record: its rows are the record's and never change,
+            // and this loop reads them back to exactly those bytes.
+            let source = pages.first().and_then(|p| p.source());
+            let kept = source
+                .filter(|k| pages.iter().all(|p| p.source() == Some(*k)))
+                .and_then(|k| self.seal_memo.get(k));
+            if let Some(record) = kept {
+                blobs.push((width, record.to_vec()));
+                continue;
+            }
+            // A closed page's rows are un-rotated and immutable, so the
+            // record is the page's rows as they stand. A page is already
+            // closed; only the live tail carries an open block.
+            let layer_pages = pages
+                .iter()
+                .map(|p| {
+                    Ok(SealedIndex {
+                        keys: p.host_rows()?,
+                        last_cells: p.last_cells(),
+                        open: Vec::new(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let record = paged_index::encode_aux(&[], &layer_pages)?;
+            self.seal_memo.put(&record);
+            blobs.push((width, record));
         }
 
         if tail_tokens > 0 {
@@ -1343,6 +1364,9 @@ impl Qwen4ExpBatched {
                 let cells = fork.flush_open_block(w, cfg.rms_norm_eps)?;
                 layer_pages.push(seal_live(&fork, cells.unwrap_or(ratio))?);
             }
+            // Not kept in the memo: a live tail's record is made another way
+            // than a closed page's, so the page it is placed as is read back
+            // once, by the next seal, whose record is kept.
             blobs.push((tail_tokens, paged_index::encode_aux(&[], &layer_pages)?));
         }
         Ok(blobs)
@@ -1405,6 +1429,7 @@ impl Qwen4ExpBatched {
             )?)
             .collect();
         for (kv, page) in &placed {
+            page.placed_from(*key);
             layers[*kv] = Some(Arc::clone(page));
         }
         self.pages.insert(*key, want, &placed);
@@ -2258,6 +2283,7 @@ impl Qwen4ExpBatched {
             ple: RwLock::new(HashMap::new()),
             index: RwLock::new(HashMap::new()),
             pages: PageRegistry::default(),
+            seal_memo: SealMemo::default(),
             retired: RwLock::new(HashMap::new()),
             pooled: SequencePools::default(),
             index_rope,
