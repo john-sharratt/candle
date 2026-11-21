@@ -229,6 +229,7 @@ pub mod replication;
 mod resolver;
 pub mod rounds;
 pub mod scan_census;
+mod scan_plans;
 pub mod scan_stats;
 mod schema;
 mod score;

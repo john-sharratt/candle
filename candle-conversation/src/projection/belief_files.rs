@@ -20,11 +20,14 @@ use super::adaptive::ScanCases;
 use super::belief_scan_split::add_to_split;
 use super::ids::{TimelineId, TurnIndex};
 use super::resolver::subwindow_bounds;
+use super::scan_plans::{PlanParams, ScanPlans};
 use super::schema::GroupSchema;
 use crate::persistence::content_hash::turn_stream_id;
 use crate::persistence::streams::StreamId;
 use crate::provenance::chunk_exclusion::{uncut, ChunkExclusion};
-use crate::provenance::gallery_arena::{BeliefArena, GroupSet, Holder, PagedSegment, PagedWindow};
+use crate::provenance::gallery_arena::{
+    BeliefArena, GroupSet, Holder, PagedSegment, PagedWindow, ScanPlan,
+};
 use crate::provenance::heads_per_group;
 use crate::provenance::{
     score_slots_grouped, score_slots_law, FusionMode, SigWindow, VoteLaw, WideQSig,
@@ -553,6 +556,7 @@ pub(crate) fn scan_file_scans(
     probes: &[&[WideQSig]],
     arena: Option<&dyn BeliefArena>,
     holder: Holder,
+    plans: &ScanPlans,
 ) -> Vec<Vec<(Vec<f32>, Vec<f32>)>> {
     let weights = &group.policy.layer_weights;
     let cal_weights = &group.policy.calibration_layer_weights;
@@ -605,67 +609,88 @@ pub(crate) fn scan_file_scans(
             .collect()
     };
     let gpu_scores: Option<Vec<Vec<(Vec<f32>, Vec<f32>)>>> = arena.and_then(|arena| {
-        let t_segments = Instant::now();
+        let n_groups = arena.n_groups();
         // Per-turn residency fingerprint: the stored window's
         // (`SigWindow::fingerprint`), which changes only when the turn's blob is
         // rewritten — so a seal re-uploads only that turn's pages, unchanged
         // turns stay resident, and a resident turn is never decoded.
         // One segment per competition, each file's exchanges at its offset in
-        // the competition's cases.
-        let mut segments: Vec<PagedSegment> = comps
-            .iter()
-            .map(|comp| {
+        // the competition's cases. Built when the arena needs them — the first
+        // scan under this reading, or an index to rebuild — and otherwise
+        // stood in for by their plan (`scan_plans`).
+        let build = || -> Vec<PagedSegment> {
+            let t_segments = Instant::now();
+            let mut segments: Vec<PagedSegment> = comps
+                .iter()
+                .map(|comp| {
+                    let mut windows = Vec::new();
+                    let mut n_cases = 0usize;
+                    for &fi in comp {
+                        let f = &files[fi];
+                        windows.extend(f.windows.iter().map(|&(k, s, e, slot)| PagedWindow {
+                            sid: f.arc_sids[k],
+                            fingerprint: f.arcs_kept[k].fingerprint(),
+                            turn: (&f.arcs_kept[k]).into(),
+                            start: s,
+                            end: e,
+                            case: n_cases + case_of(slot, cases),
+                        }));
+                        n_cases += n_cases_of(f, cases);
+                    }
+                    PagedSegment {
+                        windows,
+                        n_cases,
+                        holder,
+                        // Only what the content competitions weigh is scanned, or
+                        // resident (`docs/gallery_residency.md` §4).
+                        groups: GroupSet::weighed(weights, n_groups),
+                        keep: group.policy.scan.gallery_keep,
+                        law,
+                    }
+                })
+                .collect();
+            // The calibration competition, last: each calibrated file a case.
+            if !cal.is_empty() {
                 let mut windows = Vec::new();
-                let mut n_cases = 0usize;
-                for &fi in comp {
+                for (case, &fi) in cal.iter().enumerate() {
                     let f = &files[fi];
-                    windows.extend(f.windows.iter().map(|&(k, s, e, slot)| PagedWindow {
-                        sid: f.arc_sids[k],
-                        fingerprint: f.arcs_kept[k].fingerprint(),
-                        turn: (&f.arcs_kept[k]).into(),
+                    windows.extend(f.cal_windows.iter().map(|&(k, s, e)| PagedWindow {
+                        sid: f.sid(k),
+                        fingerprint: f.arc(k).fingerprint(),
+                        turn: f.arc(k).into(),
                         start: s,
                         end: e,
-                        case: n_cases + case_of(slot, cases),
+                        case,
                     }));
-                    n_cases += n_cases_of(f, cases);
                 }
-                PagedSegment {
+                segments.push(PagedSegment {
                     windows,
-                    n_cases,
+                    n_cases: cal.len(),
                     holder,
-                    // Only what the content competitions weigh is scanned, or
-                    // resident (`docs/gallery_residency.md` §4).
-                    groups: GroupSet::weighed(weights, arena.n_groups()),
-                    keep: group.policy.scan.gallery_keep,
-                    law,
-                }
-            })
-            .collect();
-        // The calibration competition, last: each calibrated file a case.
-        if !cal.is_empty() {
-            let mut windows = Vec::new();
-            for (case, &fi) in cal.iter().enumerate() {
-                let f = &files[fi];
-                windows.extend(f.cal_windows.iter().map(|&(k, s, e)| PagedWindow {
-                    sid: f.sid(k),
-                    fingerprint: f.arc(k).fingerprint(),
-                    turn: f.arc(k).into(),
-                    start: s,
-                    end: e,
-                    case,
-                }));
+                    groups: GroupSet::weighed(cal_weights, n_groups),
+                    keep: group.policy.scan.calibration_gallery_keep,
+                    law: cal_law,
+                });
             }
-            segments.push(PagedSegment {
-                windows,
-                n_cases: cal.len(),
-                holder,
-                groups: GroupSet::weighed(cal_weights, arena.n_groups()),
-                keep: group.policy.scan.calibration_gallery_keep,
-                law: cal_law,
-            });
-        }
-        let segments_us = t_segments.elapsed().as_micros() as u64;
-        add_to_split(|s| s.segments_us += segments_us);
+            let segments_us = t_segments.elapsed().as_micros() as u64;
+            add_to_split(|s| s.segments_us += segments_us);
+            segments
+        };
+        let params = PlanParams {
+            holder,
+            groups: GroupSet::weighed(weights, n_groups),
+            calibration_groups: GroupSet::weighed(cal_weights, n_groups),
+            cases,
+            keep: group.policy.scan.gallery_keep,
+            calibration_keep: group.policy.scan.calibration_gallery_keep,
+            law,
+            calibration_law: cal_law,
+        };
+        let plan = plans.get(&params).unwrap_or_else(|| {
+            let plan = Arc::new(ScanPlan::of(&build()));
+            plans.put(params, Arc::clone(&plan));
+            plan
+        });
         // `[probe][file][slot]`, the content competitions weighed by `w`, the
         // calibration competition by `cw`.
         let arena_scan = |w: &[f32], cw: &[f32]| -> Option<Vec<Vec<Vec<f32>>>> {
@@ -673,7 +698,7 @@ pub(crate) fn scan_file_scans(
             if !cal.is_empty() {
                 per_segment.push(cw);
             }
-            match arena.scan_segment_weighted(&segments, probes, &per_segment) {
+            match arena.scan_keyed(&plan, &build, probes, &per_segment) {
                 Ok(out) => {
                     // One per-GLOBAL-case vote vector per probe, in segment
                     // (competition) order — split back per file, the
@@ -952,10 +977,17 @@ layers:
         let probe: Vec<WideQSig> = questions[1][2..10].to_vec();
         let mut group = schema_group(ScanCases::File);
         let scores = |g: &GroupSchema| {
-            scan_file_scans(&files, g, &[probe.as_slice()], None, Holder::Shared)[0]
-                .iter()
-                .map(|(fused, _)| fused[0])
-                .collect::<Vec<f32>>()
+            scan_file_scans(
+                &files,
+                g,
+                &[probe.as_slice()],
+                None,
+                Holder::Shared,
+                &ScanPlans::default(),
+            )[0]
+            .iter()
+            .map(|(fused, _)| fused[0])
+            .collect::<Vec<f32>>()
         };
         let weighed = scores(&group);
         assert!(
@@ -981,10 +1013,17 @@ layers:
         let probe: Vec<WideQSig> = questions[1][2..10].to_vec();
         let mut group = schema_group(ScanCases::File);
         let scores = |g: &GroupSchema| {
-            scan_file_scans(&files, g, &[probe.as_slice()], None, Holder::Shared)[0]
-                .iter()
-                .map(|(fused, _)| fused[0])
-                .collect::<Vec<f32>>()
+            scan_file_scans(
+                &files,
+                g,
+                &[probe.as_slice()],
+                None,
+                Holder::Shared,
+                &ScanPlans::default(),
+            )[0]
+            .iter()
+            .map(|(fused, _)| fused[0])
+            .collect::<Vec<f32>>()
         };
         group.policy.layer_weights = vec![0.0; 3];
         let calibration_only = scores(&group);

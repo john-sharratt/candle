@@ -12171,13 +12171,13 @@ impl Scheduler {
             .get(&slot)
             .map(|s| s.placed_turns())
             .unwrap_or_default();
-        let target = policy.target.timeline;
-        policy
-            .substrate
-            .update(|s| s.working_set_boundary(target, &placed_turns));
-        policy
-            .substrate
-            .observe_working_set(schema, policy.target, &group_candidates, &density);
+        policy.substrate.observe_working_set(
+            schema,
+            policy.target,
+            &placed_turns,
+            &group_candidates,
+            &density,
+        );
         let ws_us = t_ws.elapsed().as_micros() as u64;
         // The pool behind the slot: the pieces it places and the working
         // set's members (§7.2 step 1).

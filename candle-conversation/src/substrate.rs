@@ -2336,7 +2336,14 @@ impl Substrate {
     /// Returns how many residences were rewritten, for the pass's log line.
     pub fn rewrite_for_compaction(&self, sweep: &mut Sweep<'_>) -> candle::Result<usize> {
         let mut rewritten = 0usize;
-        for (idx, r) in self.residences.iter() {
+        // The residences a sweep can find anything in — those with a hot copy
+        // or a warm one on the device ([`ResidenceSlab::compaction_members`]);
+        // walking every slot visited each warm-only and cold-only residence of
+        // the corpus to find nothing, ~30 ms of every pass on BlackWorld.
+        for idx in self.residences.compaction_members() {
+            let Some(r) = self.residences.try_get(idx) else {
+                continue;
+            };
             let mut any = false;
             while let Some(hot) = r.hot() {
                 let Some(next) = rewrite_sealed(&hot, sweep)? else {

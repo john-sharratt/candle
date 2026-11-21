@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use super::belief_files::FileScan;
 use super::ids::{GroupId, TimelineId};
+use super::scan_plans::ScanPlans;
 use crate::substrate::Substrate;
 
 /// Whose assembly: one target's alone, or every target's whose scope of the
@@ -91,6 +92,8 @@ pub(crate) struct GroupAssembly {
     pub n_timelines: usize,
     /// Turns walked to build galleries that were not held yet.
     pub turns_walked: usize,
+    /// The index keys its files' segments give, by how a scan reads them.
+    pub plans: ScanPlans,
 }
 
 impl GroupAssembly {
@@ -145,6 +148,7 @@ mod tests {
             files: Vec::new(),
             n_timelines: 3,
             turns_walked: 0,
+            plans: ScanPlans::default(),
         }
     }
 

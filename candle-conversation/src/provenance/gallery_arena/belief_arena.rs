@@ -10,7 +10,7 @@
 use candle::Result;
 
 use super::super::WideQSig;
-use super::{GalleryArena, PagedSegment, TokenStats, TokenVotes};
+use super::{GalleryArena, PagedSegment, ScanPlan, TokenStats, TokenVotes};
 
 /// The gallery as a belief scan reads it. See the module documentation.
 pub trait BeliefArena {
@@ -32,6 +32,19 @@ pub trait BeliefArena {
         probes: &[&[WideQSig]],
         segment_weights: &[&[f32]],
     ) -> Result<Vec<Vec<f32>>>;
+
+    /// [`GalleryArena::scan_keyed`]: [`Self::scan_segment_weighted`] over the
+    /// segments `build` makes, whose index key `plan` holds. An arena that
+    /// keeps no index by key builds them every time.
+    fn scan_keyed<'s>(
+        &self,
+        _plan: &ScanPlan,
+        build: &dyn Fn() -> Vec<PagedSegment<'s>>,
+        probes: &[&[WideQSig]],
+        segment_weights: &[&[f32]],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.scan_segment_weighted(&build(), probes, segment_weights)
+    }
 
     /// [`GalleryArena::scan_votes`].
     fn scan_votes(&self, segments: &[PagedSegment], probes: &[&[WideQSig]]) -> Result<TokenVotes>;
@@ -61,6 +74,16 @@ impl BeliefArena for GalleryArena {
         segment_weights: &[&[f32]],
     ) -> Result<Vec<Vec<f32>>> {
         GalleryArena::scan_segment_weighted(self, segments, probes, segment_weights)
+    }
+
+    fn scan_keyed<'s>(
+        &self,
+        plan: &ScanPlan,
+        build: &dyn Fn() -> Vec<PagedSegment<'s>>,
+        probes: &[&[WideQSig]],
+        segment_weights: &[&[f32]],
+    ) -> Result<Vec<Vec<f32>>> {
+        GalleryArena::scan_keyed(self, plan, build, probes, segment_weights)
     }
 
     fn scan_votes(&self, segments: &[PagedSegment], probes: &[&[WideQSig]]) -> Result<TokenVotes> {

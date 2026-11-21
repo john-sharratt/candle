@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use candle::{Device, Result, Tensor};
 use candle_kernels::simple::qsa_page_place::{run_qsa_page_place, PLACE_JOB_WORDS};
@@ -83,6 +83,10 @@ pub struct ResidentPage {
     last_cells: usize,
     d: usize,
     layout: ChunkLayout,
+    /// The record this page was placed from, once it is known — a seal of it
+    /// reads that record back exactly (`seal_memo`). A page closed over a live
+    /// tail was placed from none.
+    source: OnceLock<PieceKey>,
 }
 
 /// Rows of chunk `c` of a page of `rows` rows.
@@ -156,6 +160,7 @@ impl ResidentPage {
                 last_cells,
                 d,
                 layout: ChunkLayout::Blocked,
+                source: OnceLock::new(),
             }));
         }
         let n_jobs = jobs.len() / PLACE_JOB_WORDS;
@@ -208,7 +213,19 @@ impl ResidentPage {
             last_cells,
             d,
             layout: ChunkLayout::RowMajor,
+            source: OnceLock::new(),
         }))
+    }
+
+    /// Record that this page was placed from the record `key` names. Set once:
+    /// a page's rows never change, so neither does what it was placed from.
+    pub fn placed_from(&self, key: PieceKey) {
+        let _ = self.source.set(key);
+    }
+
+    /// The record this page was placed from, if it was.
+    pub fn source(&self) -> Option<&PieceKey> {
+        self.source.get()
     }
 
     pub fn rows(&self) -> usize {
@@ -371,6 +388,7 @@ impl PageRegistry {
 mod tests {
     use candle::DType;
 
+    use super::super::paged_index::{aux_parts, decode_page, encode_aux, SealedIndex};
     use super::*;
 
     fn cuda() -> Option<Device> {
@@ -433,6 +451,49 @@ mod tests {
                 (3, 48, 16, plane)
             ]
         );
+        Ok(())
+    }
+
+    /// **A closed page's record, placed and sealed again, is the same record
+    /// byte for byte** — what lets a tail seal hand back the record a page was
+    /// placed from instead of reading the page off the card (`seal_memo`). The
+    /// record is made the way the seal makes one: each layer's page as
+    /// `(host_rows, last_cells, no open rows)`; it is placed the way a push
+    /// places one, from its decoded sections.
+    #[test]
+    fn a_placed_records_seal_is_the_record() -> Result<()> {
+        let Some(device) = cuda() else { return Ok(()) };
+        let d = 32usize;
+        let seal = |pages: &[Arc<ResidentPage>]| -> Result<Vec<u8>> {
+            let layers = pages
+                .iter()
+                .map(|p| {
+                    Ok(SealedIndex {
+                        keys: p.host_rows()?,
+                        last_cells: p.last_cells(),
+                        open: Vec::new(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            encode_aux(&[], &layers)
+        };
+        let first = [keys(PAGE_BLOCKS + 5, d, 1), keys(PAGE_BLOCKS + 5, d, 2)];
+        let placed = ResidentPage::place_host(&[(&first[0], 3), (&first[1], 3)], d, &device)?;
+        let record = seal(&placed)?;
+        let (_, sections) = aux_parts(&record)?;
+        let decoded = sections
+            .iter()
+            .map(|s| decode_page(s))
+            .collect::<Result<Vec<_>>>()?;
+        let host: Vec<(&Q8Keys, usize)> = decoded.iter().map(|s| (&s.keys, s.last_cells)).collect();
+        let again = ResidentPage::place_host(&host, d, &device)?;
+        assert_eq!(seal(&again)?, record);
+        // What it was placed from is set once and kept.
+        let key = PieceKey::of(&record);
+        assert_eq!(again[0].source(), None);
+        again[0].placed_from(key);
+        again[0].placed_from(PieceKey::of(b"another record"));
+        assert_eq!(again[0].source(), Some(&key));
         Ok(())
     }
 

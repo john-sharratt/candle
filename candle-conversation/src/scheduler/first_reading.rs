@@ -204,13 +204,10 @@ impl Scheduler {
             .get(&slot)
             .map(|s| s.placed_turns())
             .unwrap_or_default();
-        let target = policy.target.timeline;
-        policy
-            .substrate
-            .update(|s| s.working_set_boundary(target, &placed));
         policy.substrate.observe_working_set(
             schema,
             policy.target,
+            &placed,
             &group_candidates,
             &HashMap::new(),
         );

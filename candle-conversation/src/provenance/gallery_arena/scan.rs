@@ -9,9 +9,8 @@
 //! with the contiguous path ([`needle_tally_segments`]). See
 //! `docs/gallery_residency.md` §5.
 
-use std::collections::hash_map::{DefaultHasher, Entry};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,6 +38,7 @@ use super::index_entries::IndexEntries;
 use super::lease::ScanHold;
 use super::pages::PAGE_TOKENS;
 use super::probe_rows::ProbeRows;
+use super::scan_plan::ScanPlan;
 use super::scan_split::{self, LaunchTiming};
 use super::token_votes::widen_rows;
 use super::{
@@ -221,53 +221,6 @@ fn launch_failure(rc: i32) -> (&'static str, i32) {
         _ => "unstaged",
     };
     (stage, cuda_err)
-}
-
-/// Fingerprint the segment structure the built index depends on — file order,
-/// each file's case count, holder, keep and `top_k`, and every window's `(sid,
-/// fingerprint, turn length, start, end, case)`. Cheap (per-window, not
-/// per-token). The holder is in it so an index built for one reader never
-/// stands in for another's, whose build would widen what its turns are held
-/// for; the keep, so an index over a turn's kept tokens never stands in for a
-/// reader asking for more of them.
-///
-/// The fold groups are not: readers of one segment set weighing different
-/// groups share its index, which a reuse checks covers what each segment
-/// weighs (`GalleryArena::reuse_index`). Keyed on them, a turn two groups read
-/// under different weights — a sealed turn in its own conversation's dialogue
-/// and in a shared layer — was two indices and two launches every scan.
-///
-/// **Trust boundary:** two guarantees back reuse. (1) Each turn's *run id*
-/// covers physical page moves — an evict/re-seal/compaction that relocates a
-/// turn's pages gives it a new one, so the cache can't serve stale device
-/// addresses. (2) This 64-bit
-/// SipHash covers logical changes to the scan; a caller MUST vary `w.fingerprint`
-/// whenever the turn's content changes
-/// ([`SigWindow::fingerprint`](super::super::SigWindow::fingerprint) folds in the
-/// stored buffer's address + a content sample), and `turn.len()` is hashed directly
-/// so a length change alone (which moves its entries) also invalidates. A 64-bit
-/// hash collision under an unchanged generation could serve a wrong index — a
-/// ~2⁻⁶⁴ event we accept, the standard content-address trade.
-fn fingerprint_segments(segments: &[PagedSegment]) -> u64 {
-    let mut h = DefaultHasher::new();
-    segments.len().hash(&mut h);
-    for seg in segments {
-        seg.n_cases.hash(&mut h);
-        seg.holder.hash(&mut h);
-        seg.keep.hash(&mut h);
-        // The kernel's rows rank to it; the power is the tally's alone.
-        seg.law.top_k.hash(&mut h);
-        seg.windows.len().hash(&mut h);
-        for w in &seg.windows {
-            w.sid.0.hash(&mut h);
-            w.fingerprint.hash(&mut h);
-            w.turn.len().hash(&mut h);
-            w.start.hash(&mut h);
-            w.end.hash(&mut h);
-            w.case.hash(&mut h);
-        }
-    }
-    h.finish()
 }
 
 impl GalleryArena {
@@ -767,6 +720,53 @@ impl GalleryArena {
         segments: &[PagedSegment],
         launch: impl FnOnce(&PagedIndex, &[GroupSet]) -> Result<T>,
     ) -> Result<T> {
+        let t_fingerprint = Instant::now();
+        let plan = ScanPlan::of(segments);
+        let fingerprint_us = t_fingerprint.elapsed().as_micros() as u64;
+        self.with_index_keyed(
+            &plan,
+            fingerprint_us,
+            |cover| self.build_index(segments, cover),
+            launch,
+        )
+    }
+
+    /// [`Self::scan_segment_weighted`] over the segments `build` makes, under
+    /// the index key `plan` holds for them — `build` is called only when no
+    /// index is cached under it, so a caller whose segments do not change
+    /// neither builds nor fingerprints them again ([`ScanPlan`]).
+    pub fn scan_keyed<'s>(
+        &self,
+        plan: &ScanPlan,
+        build: &dyn Fn() -> Vec<PagedSegment<'s>>,
+        probes: &[&[WideQSig]],
+        segment_weights: &[&[f32]],
+    ) -> Result<Vec<Vec<f32>>> {
+        if segment_weights.len() != plan.weighed.len() {
+            return Err(candle::Error::Msg(format!(
+                "paged scan: {} segment weightings for {} segments",
+                segment_weights.len(),
+                plan.weighed.len()
+            )));
+        }
+        self.with_index_keyed(
+            plan,
+            0,
+            |cover| self.build_index(&build(), cover),
+            |idx, weighed| self.launch_paged(idx, weighed, probes, segment_weights, None),
+        )
+    }
+
+    /// [`Self::with_index`] under `plan`'s key, the index built by `build`
+    /// for the groups it is handed when none is cached; `fingerprint_us` is
+    /// what working the key out cost the caller.
+    fn with_index_keyed<T>(
+        &self,
+        plan: &ScanPlan,
+        fingerprint_us: u64,
+        build: impl FnOnce(&[GroupSet]) -> Result<PagedIndex>,
+        launch: impl FnOnce(&PagedIndex, &[GroupSet]) -> Result<T>,
+    ) -> Result<T> {
         // **Every scan path binds this arena's context first.**
         //
         // Below here are raw driver calls and FFI that read the *calling
@@ -790,10 +790,9 @@ impl GalleryArena {
         // new id and the next reuse rejects the entry.
         let t_index = Instant::now();
         let gen_before = self.residency_gen();
-        let fp = fingerprint_segments(segments);
-        let fingerprint_us = t_index.elapsed().as_micros() as u64;
-        let weighed: Vec<GroupSet> = segments.iter().map(|s| s.groups).collect();
-        let (idx, lease) = match self.reuse_index(fp, &weighed) {
+        let fp = plan.key;
+        let weighed = &plan.weighed;
+        let (idx, lease) = match self.reuse_index(fp, weighed) {
             Ok(lease) => (lease.index(), Some(lease)),
             Err(miss) => {
                 tracing::debug!(
@@ -812,7 +811,7 @@ impl GalleryArena {
                     IndexMiss::Narrower { covering } => covering,
                     IndexMiss::Absent | IndexMiss::Stale => weighed.clone(),
                 };
-                let built = Arc::new(self.build_index(segments, &build_for)?);
+                let built = Arc::new(build(&build_for)?);
                 let build_us = t_build.elapsed().as_micros() as u64;
                 scan_split::add(|s| {
                     s.index_built += 1;
@@ -831,7 +830,7 @@ impl GalleryArena {
             }
         };
         let reused = lease.is_some();
-        let index_us = t_index.elapsed().as_micros() as u64;
+        let index_us = fingerprint_us + t_index.elapsed().as_micros() as u64;
         profile::record(
             if reused {
                 "arena:index_reused"
@@ -845,17 +844,16 @@ impl GalleryArena {
         // conversation's. With `reused` it separates "my working set churned"
         // from "someone else's did".
         let mutations = self.residency_gen().saturating_sub(gen_before);
-        let windows: usize = segments.iter().map(|s| s.windows.len()).sum();
         scan_split::add(|s| {
             s.scans += 1;
-            s.segments += segments.len() as u64;
+            s.segments += plan.weighed.len() as u64;
             s.index_us += index_us;
             s.fingerprint_us += fingerprint_us;
-            s.windows += windows as u64;
+            s.windows += plan.windows as u64;
             s.pinned += idx.pinned_sids.len() as u64;
         });
         let t_launch = Instant::now();
-        let result = launch(&idx, &weighed);
+        let result = launch(&idx, weighed);
         let launch_us = t_launch.elapsed().as_micros() as u64;
         profile::record("arena:launch", t_launch.elapsed());
         // Release the scan's hold whether or not the launch succeeded — the pages
@@ -870,7 +868,7 @@ impl GalleryArena {
         // costs, so a slow scan is attributed to one or the other.
         tracing::trace!(
             target: "candle_conversation::provenance::gallery_arena",
-            segments = segments.len(),
+            segments = plan.weighed.len(),
             turns = idx.pinned_sids.len(),
             tokens = idx.n_tokens,
             reused,
@@ -1376,7 +1374,10 @@ enum LaunchOut {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::super::pages_for;
+    use super::super::scan_plan::fingerprint_segments;
     use super::super::tests::gallery_pool;
     use super::*;
     use crate::persistence::content_hash::turn_stream_id;
@@ -2645,6 +2646,70 @@ mod tests {
             n_heads: 12,
             words: (0..24).map(|_| xorshift(state)).collect(),
         }
+    }
+
+    /// **A keyed scan is the scan of the segments its plan was made from, and
+    /// builds them only while the arena holds no index under the key.** The
+    /// first keyed scan finds the index the plain scan cached and builds
+    /// nothing; one after the turn is dropped rebuilds the index, and so the
+    /// segments, once.
+    #[test]
+    fn a_keyed_scan_builds_its_segments_only_for_an_index() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _pool = gallery_pool();
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let mut rng = 0x4B_E7ED_u64;
+        let turns: Vec<Vec<WideQSig>> = (0..4)
+            .map(|i| (0..(20 + 17 * i)).map(|_| rand_sig(&mut rng)).collect())
+            .collect();
+        let segments = || -> Vec<PagedSegment> {
+            vec![PagedSegment {
+                windows: turns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| PagedWindow {
+                        sid: turn_stream_id(9_300, i as u32),
+                        fingerprint: i as u64,
+                        turn: t.into(),
+                        start: 0,
+                        end: t.len(),
+                        case: i,
+                    })
+                    .collect(),
+                n_cases: turns.len(),
+                holder: Holder::Shared,
+                groups: GroupSet::all(3),
+                keep: Keep::All,
+                law: VoteLaw::SINGLE,
+            }]
+        };
+        let probe: Vec<WideQSig> = (0..9).map(|_| rand_sig(&mut rng)).collect();
+        let weights = [0.5f32, 1.0, 2.0];
+        let per_segment: [&[f32]; 1] = [&weights];
+        let plain = arena
+            .scan_segment_weighted(&segments(), &[probe.as_slice()], &per_segment)
+            .unwrap();
+        let plan = ScanPlan::of(&segments());
+        let built = Cell::new(0usize);
+        let build = || {
+            built.set(built.get() + 1);
+            segments()
+        };
+        let keyed = arena
+            .scan_keyed(&plan, &build, &[probe.as_slice()], &per_segment)
+            .unwrap();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&keyed[0]), bits(&plain[0]), "the keyed scan's votes");
+        assert_eq!(built.get(), 0, "the cached index needs no segments");
+        arena.drop_turns(&[turn_stream_id(9_300, 0)]);
+        let again = arena
+            .scan_keyed(&plan, &build, &[probe.as_slice()], &per_segment)
+            .unwrap();
+        assert_eq!(built.get(), 1, "a stale index is rebuilt from the segments");
+        assert_eq!(bits(&again[0]), bits(&plain[0]), "and votes the same");
     }
 
     /// **A segment of hundreds of cases, its agreements tied across them,

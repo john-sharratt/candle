@@ -78,6 +78,7 @@ pub mod resident_page;
 pub mod rope;
 #[cfg(feature = "cuda")]
 pub mod rows_matmul;
+pub mod seal_memo;
 #[cfg(feature = "cuda")]
 pub mod select_bytes;
 /// Each sequence's pool of index pages with no K/V behind them in its slot.
