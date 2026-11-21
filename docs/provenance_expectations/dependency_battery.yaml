@@ -17,17 +17,18 @@ messages:
   - starts: "In the candle-conversation crate, where is the function `recorded_reply`"
     should:
       - candle/candle-conversation/src/recorded_reply.rs
-      - candle/candle-conversation/src/conversation.rs
+      - candle/candle-conversation/src/conversation/turn_submitter.rs
     should_not: ["candle/docs/results/*"]
   - starts: "Where is the function `tier_fits` defined"
     should:
       - candle/candle-nn/src/kv_cache/chunked/span_geometry.rs
-      - candle/candle-nn/src/kv_cache/chunked/region_pool.rs
+      - candle/candle-nn/src/kv_cache/chunked/region_pool/transient_tier.rs
     should_not: ["candle/docs/results/*"]
   - starts: "Where is `elevate_to_hot` defined"
     should:
       - candle/candle-conversation/src/persistence/elevate.rs
-      - candle/candle-conversation/src/scheduler/mod.rs
+      - candle/candle-conversation/src/scheduler/projection_turns.rs
+      - candle/candle-conversation/src/scheduler/sections.rs
     should_not: ["candle/docs/results/*"]
   - starts: "Where is the provenance function `heads_per_group` defined"
     should:
@@ -38,7 +39,7 @@ messages:
     should_not: ["candle/docs/results/*"]
   - starts: "Where is the Rust wrapper `moe_bucketize` defined"
     should:
-      - candle/candle-core/src/quantized/cuda.rs
+      - candle/candle-core/src/quantized/cuda/bucketize.rs
       - candle/candle-kernels/src/simple/moe_bucketize.cu
       - candle/candle-transformers/src/models/expert_lre/dispatch.rs
     should_not: ["candle/docs/results/*"]
@@ -55,7 +56,7 @@ messages:
   - starts: "Where is `FoldParams::derive` defined"
     should:
       - candle/candle-conversation/src/provenance/wide_sig.rs
-      - candle/candle-conversation/src/scheduler/mod.rs
+      - candle/candle-conversation/src/scheduler/construct.rs
     should_not: ["candle/docs/results/*"]
   # ── Transitive ──
   - starts: "The provenance signature's fold is derived per model"
@@ -67,11 +68,11 @@ messages:
   - starts: "When zend replays a recorded conversation"
     should:
       - candle/candle-conversation/src/recorded_reply.rs
-      - candle/candle-conversation/src/conversation.rs
+      - candle/candle-conversation/src/conversation/turn_submitter.rs
     should_not: ["candle/docs/results/*"]
   - starts: "What breaks, and where, if the 32-token KV block size"
     should:
-      - candle/candle-nn/src/kv_cache/chunked/types.rs
+      - candle/candle-nn/src/kv_cache/chunked/types/mod.rs
       - candle/candle-kernels/src/blocks.cuh
       - candle/candle-kernels/src/arena_table.cuh
     should_not: ["candle/docs/results/*"]
@@ -89,34 +90,36 @@ messages:
     should_not: ["candle/docs/results/*"]
   - starts: "Which configuration fields decide when a conversation reprojects"
     should:
-      - candle/candle-conversation/src/config.rs
-      - candle/candle-conversation/src/conversation.rs
-      - candle/candle-conversation/src/scheduler/mod.rs
+      - candle/candle-conversation/src/config/sequence_config.rs
+      - candle/candle-conversation/src/conversation/sequence_state.rs
+      - candle/candle-conversation/src/scheduler/reprojection.rs
     should_not: ["candle/docs/results/*"]
   - starts: "How does the projection assembler avoid recomputing structural glue"
     should:
-      - candle/candle-conversation/src/scheduler/projection_assembler.rs
+      - candle/candle-conversation/src/scheduler/projection_assembler/slot_state.rs
     should_not: ["candle/docs/results/*"]
   - starts: "Trace how a sealed chunk in the warm tier gets back into VRAM"
     should:
       - candle/candle-conversation/src/persistence/elevate.rs
-      - candle/candle-conversation/src/scheduler/mod.rs
+      - candle/candle-conversation/src/scheduler/projection_turns.rs
+      - candle/candle-conversation/src/scheduler/sections.rs
     should_not: ["candle/docs/results/*"]
   # ── Architectural ──
   - starts: "The KV cache's block size is shared between the Rust code"
     should:
-      - candle/candle-nn/src/kv_cache/chunked/types.rs
+      - candle/candle-nn/src/kv_cache/chunked/types/mod.rs
       - candle/candle-kernels/src/blocks.cuh
     should_not: ["candle/docs/results/*"]
   - starts: "The device memory span is shared by several tenants"
     should:
-      - candle/candle-nn/src/kv_cache/chunked/region_pool.rs
+      - candle/candle-nn/src/kv_cache/chunked/region_pool/transient_tier.rs
       - candle/candle-nn/src/kv_cache/chunked/span_geometry.rs
       - candle/AGENTS.md
     should_not: ["candle/docs/results/*"]
   - starts: "Why can a projection for the Qwen3.8-Flash-Next model not contain live structural glue"
     should:
-      - candle/candle-conversation/src/scheduler/projection_assembler.rs
+      - candle/candle-conversation/src/scheduler/projection_assembler/walk.rs
+      - candle/candle-conversation/src/scheduler/projection_assembler/gap_fill.rs
     should_not: ["candle/docs/results/*"]
   - starts: "Stored keys must stay valid when a projection moves a sealed turn"
     should:

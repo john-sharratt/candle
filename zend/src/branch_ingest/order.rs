@@ -17,9 +17,13 @@ pub fn read_rank(path: &str) -> u8 {
         "/fixtures/",
         "/testdata/",
     ];
+    // A test file is named `<x>_tests.rs`, or `tests_<x>.rs` beside the
+    // module it tests, so a folder's tests list together.
+    let file = lower.rsplit('/').next().unwrap_or(&lower);
     if exercise.iter().any(|d| lower.contains(d))
         || lower.ends_with("_tests.rs")
         || lower.ends_with("_test.rs")
+        || (file.starts_with("tests_") && file.ends_with(".rs"))
     {
         return 2;
     }
@@ -54,6 +58,8 @@ mod tests {
             2
         );
         assert_eq!(read_rank("candle/a/src/thing_tests.rs"), 2);
+        assert_eq!(read_rank("candle/a/src/sampler/tests_rows.rs"), 2);
+        assert_eq!(read_rank("candle/a/src/sampler/attests_rows.rs"), 1);
         // A markdown file among the tests is read with them.
         assert_eq!(read_rank("candle/candle-nn/tests/README.md"), 2);
     }

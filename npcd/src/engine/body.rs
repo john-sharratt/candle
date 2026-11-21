@@ -2355,7 +2355,29 @@ mod tests {
         for (name, src) in [
             ("body.rs", include_str!("body.rs")),
             ("enact.rs", include_str!("enact.rs")),
-            ("work.rs", include_str!("work.rs")),
+            ("work/mod.rs", include_str!("work/mod.rs")),
+            ("work/args.rs", include_str!("work/args.rs")),
+            ("work/bench_acts.rs", include_str!("work/bench_acts.rs")),
+            ("work/craft.rs", include_str!("work/craft.rs")),
+            ("work/dispatch.rs", include_str!("work/dispatch.rs")),
+            ("work/mission_acts.rs", include_str!("work/mission_acts.rs")),
+            ("work/report.rs", include_str!("work/report.rs")),
+            (
+                "work/tests_authoring.rs",
+                include_str!("work/tests_authoring.rs"),
+            ),
+            (
+                "work/tests_documents.rs",
+                include_str!("work/tests_documents.rs"),
+            ),
+            (
+                "work/tests_mission.rs",
+                include_str!("work/tests_mission.rs"),
+            ),
+            (
+                "work/tests_station.rs",
+                include_str!("work/tests_station.rs"),
+            ),
         ] {
             for (n, line) in src.lines().enumerate() {
                 if line.trim_start().starts_with("//") {

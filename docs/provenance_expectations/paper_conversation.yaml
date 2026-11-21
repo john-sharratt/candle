@@ -27,6 +27,7 @@ messages:
     should_not:
       - "*/tests/*"
       - "*_tests.rs"
+      - "*/tests_*.rs"
       - "*/benches/*"
       - "*/examples/*"
       - "battle-cities/*"
@@ -38,6 +39,7 @@ messages:
     should_not:
       - "*/tests/*"
       - "*_tests.rs"
+      - "*/tests_*.rs"
       - "*/benches/*"
       - "*/examples/*"
       - "battle-cities/*"
@@ -51,12 +53,13 @@ messages:
       - candle/candle-nn/src/kv_cache/chunked/compression_policy.rs
       - candle/candle-nn/src/kv_cache/chunked/sampled_selection/params.rs
       - candle/candle-conversation/src/provenance/wide_sig.rs
-      - candle/candle-conversation/src/projection/project.rs
-      - candle/candle-conversation/src/config.rs
+      - candle/candle-conversation/src/projection/project/emit.rs
+      - candle/candle-conversation/src/config/sequence_config.rs
       - candle/AGENTS.md
     should_not:
       - "*/tests/*"
       - "*_tests.rs"
+      - "*/tests_*.rs"
       - "*/benches/*"
       - "battle-cities/*"
 
@@ -71,4 +74,5 @@ messages:
     should_not:
       - "*/tests/*"
       - "*_tests.rs"
+      - "*/tests_*.rs"
       - "*/benches/*"

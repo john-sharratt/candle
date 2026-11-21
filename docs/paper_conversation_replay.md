@@ -225,9 +225,9 @@ better informed, not just tidier.
 4. AGENTS.md:37 says `sign(Q_PCA^T @ K)`; the code is Q·Q with no PCA.
    AGENTS.md:459 says C0–C9; the code has C0–C10.
 5. The paper's probe window is 64 tokens in six places; the code's is 256
-   (`config.rs:1855-1859`).
+   (`config/sequence_config.rs`, `SequenceConfig`'s probe window).
 6. §5's "template K/V never persisted" describes a removed mechanism —
-   `project.rs:2443`: "Template sections seal like any other".
+   `project/emit.rs`: "Template sections seal like any other".
 7. §9.9's "no per-model calibration" contradicts the per-model `*_KV_FACTORS`
    rows.
 8. C10 is calibrated against the same story-rewrite test that validates it.

@@ -24,16 +24,16 @@ questions:
     question: >-
       In the candle-conversation crate, where is the function `recorded_reply`
       defined, and which source file calls it outside its own tests?
-    expect: [recorded_reply.rs, conversation.rs]
-    files: [candle-conversation/src/recorded_reply.rs, candle-conversation/src/conversation.rs]
+    expect: [recorded_reply.rs, turn_submitter.rs]
+    files: [candle-conversation/src/recorded_reply.rs, candle-conversation/src/conversation/turn_submitter.rs]
 
   - id: d2
     category: direct
     question: >-
       Where is the function `tier_fits` defined in candle-nn's KV cache, and
       which file calls it in production code?
-    expect: [span_geometry.rs, region_pool.rs]
-    files: [candle-nn/src/kv_cache/chunked/span_geometry.rs, candle-nn/src/kv_cache/chunked/region_pool.rs]
+    expect: [span_geometry.rs, transient_tier.rs]
+    files: [candle-nn/src/kv_cache/chunked/span_geometry.rs, candle-nn/src/kv_cache/chunked/region_pool/transient_tier.rs]
 
   - id: d3
     category: direct
@@ -41,20 +41,23 @@ questions:
       Where is `elevate_to_hot` defined, and which module calls it outside of
       tests?
     expect: [elevate.rs, scheduler]
-    files: [candle-conversation/src/persistence/elevate.rs, candle-conversation/src/scheduler/mod.rs]
+    files:
+      - candle-conversation/src/persistence/elevate.rs
+      - candle-conversation/src/scheduler/projection_turns.rs
+      - candle-conversation/src/scheduler/sections.rs
 
   - id: d4
     category: direct
     question: >-
       Where is the provenance function `heads_per_group` defined, and which
       other provenance and projection source files call it?
-    expect: [scan.rs, window_score.rs, packed.rs, gpu.rs, resolver.rs, belief_files.rs]
+    expect: [scan.rs, window_score.rs, packed.rs, gpu.rs, belief_collections.rs, belief_files.rs]
     files:
       - candle-conversation/src/provenance/scan.rs
       - candle-conversation/src/provenance/window_score.rs
       - candle-conversation/src/provenance/packed.rs
       - candle-conversation/src/provenance/gpu.rs
-      - candle-conversation/src/projection/resolver.rs
+      - candle-conversation/src/projection/resolver/belief_collections.rs
       - candle-conversation/src/projection/belief_files.rs
 
   - id: d5
@@ -63,9 +66,9 @@ questions:
       Where is the Rust wrapper `moe_bucketize` defined, which CUDA source
       holds the kernel it launches, and which model code calls it to dispatch
       experts?
-    expect: [cuda.rs, moe_bucketize.cu, dispatch.rs, dspark_experts.rs]
+    expect: [bucketize.rs, moe_bucketize.cu, dispatch.rs, dspark_experts.rs]
     files:
-      - candle-core/src/quantized/cuda.rs
+      - candle-core/src/quantized/cuda/bucketize.rs
       - candle-kernels/src/simple/moe_bucketize.cu
       - candle-transformers/src/models/expert_lre/dispatch.rs
       - candle-transformers/src/models/latent_moe/dspark_experts.rs
@@ -92,7 +95,7 @@ questions:
       Where is `FoldParams::derive` defined, and which non-test module calls
       it?
     expect: [wide_sig.rs, scheduler]
-    files: [candle-conversation/src/provenance/wide_sig.rs, candle-conversation/src/scheduler/mod.rs]
+    files: [candle-conversation/src/provenance/wide_sig.rs, candle-conversation/src/scheduler/construct.rs]
 
   # ── Transitive ────────────────────────────────────────────────────────────
   - id: t1
@@ -115,11 +118,11 @@ questions:
       end up committed in place of sampled ones? Trace it from the replay
       harness through the turn option to the function that extracts the ids
       to force.
-    expect: [replay.rs, recorded_turn, conversation.rs, recorded_reply]
+    expect: [replay.rs, recorded_turn, turn_submitter.rs, recorded_reply]
     files:
       - zend/src/session/replay.rs
       - candle-conversation/src/turn.rs
-      - candle-conversation/src/conversation.rs
+      - candle-conversation/src/conversation/turn_submitter.rs
       - candle-conversation/src/recorded_reply.rs
 
   - id: t3
@@ -128,9 +131,9 @@ questions:
       What breaks, and where, if the 32-token KV block size is changed on the
       Rust side only? Name the constant on each side and the kernels' tables
       that depend on it.
-    expect: [CHUNK_SIZE, blocks.cuh, types.rs, arena_table]
+    expect: [CHUNK_SIZE, blocks.cuh, types/mod.rs, arena_table]
     files:
-      - candle-nn/src/kv_cache/chunked/types.rs
+      - candle-nn/src/kv_cache/chunked/types/mod.rs
       - candle-kernels/src/blocks.cuh
       - candle-kernels/src/arena_table.cuh
       - candle-nn/src/kv_cache/arena_table.rs
@@ -164,9 +167,9 @@ questions:
       policy the scheduler runs?
     expect: [reproject_every_n_tokens, reproject_trigger_texts, boundary_rule, ReprojectionPolicy]
     files:
-      - candle-conversation/src/config.rs
-      - candle-conversation/src/conversation.rs
-      - candle-conversation/src/scheduler/mod.rs
+      - candle-conversation/src/config/sequence_config.rs
+      - candle-conversation/src/conversation/sequence_state.rs
+      - candle-conversation/src/scheduler/reprojection.rs
 
   - id: t7
     category: transitive
@@ -175,7 +178,7 @@ questions:
       on every projection? Name the cache, what it is keyed by, and how long
       an entry is retained.
     expect: [glue_islands, "hash", GLUE_ISLAND_RETAIN_GENERATIONS]
-    files: [candle-conversation/src/scheduler/projection_assembler.rs]
+    files: [candle-conversation/src/scheduler/projection_assembler/slot_state.rs]
 
   - id: t8
     category: transitive
@@ -184,7 +187,10 @@ questions:
       projection needs it: which module notices, which function lifts it, and
       in which file that function lives.
     expect: [scheduler, elevate_to_hot, elevate.rs]
-    files: [candle-conversation/src/scheduler/mod.rs, candle-conversation/src/persistence/elevate.rs]
+    files:
+      - candle-conversation/src/scheduler/projection_turns.rs
+      - candle-conversation/src/scheduler/sections.rs
+      - candle-conversation/src/persistence/elevate.rs
 
   # ── Architectural ─────────────────────────────────────────────────────────
   - id: a1
@@ -194,7 +200,7 @@ questions:
       kernels. What is it, what is the constant called, and which crate holds
       the CUDA side?
     expect: ["32", CHUNK_SIZE, candle-kernels]
-    files: [candle-nn/src/kv_cache/chunked/types.rs, candle-kernels/src/lib.rs]
+    files: [candle-nn/src/kv_cache/chunked/types/mod.rs, candle-kernels/src/lib.rs]
 
   - id: a2
     category: architectural
@@ -203,7 +209,7 @@ questions:
       boundary separates the KV side from the expert weights, and which check
       refuses a wave's transient tier that would cross it?
     expect: [weight_floor, tier_fits]
-    files: [candle-nn/src/kv_cache/chunked/span_geometry.rs, candle-nn/src/kv_cache/chunked/region_pool.rs]
+    files: [candle-nn/src/kv_cache/chunked/span_geometry.rs, candle-nn/src/kv_cache/chunked/region_pool/transient_tier.rs]
 
   - id: a3
     category: architectural
@@ -211,7 +217,9 @@ questions:
       Why can a projection for the Qwen3.8-Flash-Next model not contain live
       structural glue between sealed turns, and what refuses it?
     expect: ["recurren|DeltaNet", "gap-fill|gap fill|gapfill", reserve_glue_island]
-    files: [candle-conversation/src/scheduler/projection_assembler.rs]
+    files:
+      - candle-conversation/src/scheduler/projection_assembler/walk.rs
+      - candle-conversation/src/scheduler/projection_assembler/gap_fill.rs
 
   - id: a4
     category: architectural

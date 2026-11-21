@@ -12,7 +12,7 @@ use candle_transformers::models::positional_piece::PositionalPiece;
 use super::TOY_PAGE;
 
 /// A toy page covering `tokens` tokens, told apart by `label`.
-pub(super) fn toy_page(tokens: usize, label: &[u8]) -> Vec<u8> {
+pub(in crate::scheduler) fn toy_page(tokens: usize, label: &[u8]) -> Vec<u8> {
     let mut page = TOY_PAGE.to_vec();
     page.push(b'W');
     page.extend_from_slice(&(tokens as u32).to_le_bytes());
@@ -31,7 +31,7 @@ fn toy_page_width(page: &[u8]) -> usize {
 
 /// One thing placed ahead of the live tail.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Placed {
+pub(in crate::scheduler) enum Placed {
     Page { bytes: Vec<u8>, tokens: usize },
     Gap(usize),
 }
@@ -56,26 +56,26 @@ impl Placed {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct PositionalLedger {
+pub(in crate::scheduler) struct PositionalLedger {
     items: Vec<Placed>,
 }
 
 impl PositionalLedger {
-    pub(super) fn push_page(&mut self, bytes: &[u8]) {
+    pub(in crate::scheduler) fn push_page(&mut self, bytes: &[u8]) {
         self.items.push(Placed::Page {
             bytes: bytes.to_vec(),
             tokens: toy_page_width(bytes),
         });
     }
 
-    pub(super) fn push_gap(&mut self, tokens: usize) {
+    pub(in crate::scheduler) fn push_gap(&mut self, tokens: usize) {
         if tokens > 0 {
             self.items.push(Placed::Gap(tokens));
         }
     }
 
     /// Keep everything before `pos`, refusing a cut inside a page.
-    pub(super) fn truncate(&mut self, pos: usize) -> candle::Result<()> {
+    pub(in crate::scheduler) fn truncate(&mut self, pos: usize) -> candle::Result<()> {
         let (at, rest) = self.split_at(pos)?;
         self.items.truncate(at);
         if let Some(gap) = rest {
@@ -85,7 +85,7 @@ impl PositionalLedger {
     }
 
     /// Replace `[from, to)` with `pieces`, moving everything after.
-    pub(super) fn splice(
+    pub(in crate::scheduler) fn splice(
         &mut self,
         from: usize,
         to: usize,
@@ -113,7 +113,7 @@ impl PositionalLedger {
 
     /// The items with neighbouring gaps merged and empty ones dropped — the
     /// form two ledgers placing the same state agree on.
-    pub(super) fn canonical(&self) -> Vec<Placed> {
+    pub(in crate::scheduler) fn canonical(&self) -> Vec<Placed> {
         let mut out: Vec<Placed> = Vec::new();
         for item in &self.items {
             match (out.last_mut(), item) {
