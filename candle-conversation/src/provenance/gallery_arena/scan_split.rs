@@ -64,6 +64,27 @@ pub struct ArenaScanSplit {
     /// Of the held launches: laying the owned segments back out on the scan
     /// thread before the launch.
     pub view_us: u64,
+    /// Of `fresh_tokens`: those scored over an index this split's scans built
+    /// — a built index starts with no rows, so every probe token is fresh.
+    pub built_fresh_tokens: u64,
+    /// The launch with the most device time: its fresh tokens, the corpus
+    /// tokens its index scans, and that device time — what one launch of a
+    /// slow scan was made of.
+    pub widest_fresh: u64,
+    pub widest_tokens: u64,
+    pub widest_gpu_us: u64,
+}
+
+impl ArenaScanSplit {
+    /// Keep `(fresh, tokens, gpu_us)` as the widest launch when it took more
+    /// device time than the widest so far.
+    pub(crate) fn note_launch(&mut self, fresh: u64, tokens: u64, gpu_us: u64) {
+        if gpu_us >= self.widest_gpu_us && (gpu_us > 0 || self.widest_fresh == 0) {
+            self.widest_fresh = fresh;
+            self.widest_tokens = tokens;
+            self.widest_gpu_us = gpu_us;
+        }
+    }
 }
 
 thread_local! {
@@ -91,6 +112,10 @@ thread_local! {
         hold_us: 0,
         queue_us: 0,
         view_us: 0,
+        built_fresh_tokens: 0,
+        widest_fresh: 0,
+        widest_tokens: 0,
+        widest_gpu_us: 0,
     }) };
 }
 
@@ -148,6 +173,10 @@ pub(crate) fn merge(other: ArenaScanSplit) {
         s.hold_us += other.hold_us;
         s.queue_us += other.queue_us;
         s.view_us += other.view_us;
+        s.built_fresh_tokens += other.built_fresh_tokens;
+        if other.widest_gpu_us > 0 || other.widest_fresh > 0 {
+            s.note_launch(other.widest_fresh, other.widest_tokens, other.widest_gpu_us);
+        }
     });
 }
 
@@ -226,6 +255,10 @@ mod tests {
             hold_us: 21,
             queue_us: 22,
             view_us: 23,
+            built_fresh_tokens: 24,
+            widest_fresh: 25,
+            widest_tokens: 26,
+            widest_gpu_us: 27,
         };
         merge(every);
         merge(every);
@@ -256,7 +289,29 @@ mod tests {
                 hold_us: 42,
                 queue_us: 44,
                 view_us: 46,
+                built_fresh_tokens: 48,
+                widest_fresh: 25,
+                widest_tokens: 26,
+                widest_gpu_us: 27,
             }
+        );
+    }
+
+    /// **The widest launch is the one with the most device time**, a later
+    /// launch replacing it only by taking longer.
+    #[test]
+    fn the_widest_launch_is_the_longest() {
+        let mut s = ArenaScanSplit::default();
+        s.note_launch(64, 38_000_000, 7_000);
+        s.note_launch(2_400, 70_000, 3_000);
+        assert_eq!(
+            (s.widest_fresh, s.widest_tokens, s.widest_gpu_us),
+            (64, 38_000_000, 7_000)
+        );
+        s.note_launch(300, 38_000_000, 30_000);
+        assert_eq!(
+            (s.widest_fresh, s.widest_tokens, s.widest_gpu_us),
+            (300, 38_000_000, 30_000)
         );
     }
 }

@@ -1766,7 +1766,8 @@ impl Conversation {
                  arena_tally_us={} arena_kernel_gpu_us={} arena_index_built={} \
                  arena_index_build_us={} arena_index_absent={} arena_index_stale={} \
                  arena_index_narrower={} arena_held={} arena_hold_us={} arena_queue_us={} \
-                 arena_view_us={}",
+                 arena_view_us={} arena_built_fresh_tokens={} arena_widest_fresh={} \
+                 arena_widest_tokens={} arena_widest_gpu_us={}",
                 arena.scans,
                 arena.launches,
                 arena.segments,
@@ -1790,6 +1791,10 @@ impl Conversation {
                 arena.hold_us,
                 arena.queue_us,
                 arena.view_us,
+                arena.built_fresh_tokens,
+                arena.widest_fresh,
+                arena.widest_tokens,
+                arena.widest_gpu_us,
             )
         };
         // A scan past a second is written whole, its groups' and its arena's

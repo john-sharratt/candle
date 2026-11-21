@@ -12202,6 +12202,8 @@ impl Scheduler {
             format!(
                 "view={} observe_us={observe_us} hits_us={hits_us} ws_us={ws_us} \
                  pool_us={pool_us} pooled={} pool_admitted={} pool_dropped={} \
+                 pool_revived={} pool_lingering={} pool_cold={} pool_fetch_us={} \
+                 pool_place_us={} \
                  pool_read_us={} pool_read_bytes={} pool_reused={} pool_walked_turns={} \
                  candidates={} hit_parts={} queries={} shadow_queries={} \
                  loaded_rounds={} loaded_hit={} loaded_hits={} pooled_rounds={} \
@@ -12210,6 +12212,11 @@ impl Scheduler {
                 pool.pooled,
                 pool.admitted,
                 pool.dropped,
+                pool.revived,
+                pool.lingering,
+                pool.cold,
+                pool.fetch_us,
+                pool.place_us,
                 pool.read_us,
                 pool.read_bytes,
                 pool.reused,

@@ -853,7 +853,14 @@ impl GalleryArena {
             s.pinned += idx.pinned_sids.len() as u64;
         });
         let t_launch = Instant::now();
+        let mut fresh_before = 0;
+        scan_split::add(|s| fresh_before = s.fresh_tokens);
         let result = launch(&idx, weighed);
+        if !reused {
+            scan_split::add(|s| {
+                s.built_fresh_tokens += s.fresh_tokens.saturating_sub(fresh_before);
+            });
+        }
         let launch_us = t_launch.elapsed().as_micros() as u64;
         profile::record("arena:launch", t_launch.elapsed());
         // Release the scan's hold whether or not the launch succeeded — the pages
@@ -924,6 +931,9 @@ impl GalleryArena {
             s.readback_us += readback_us;
             s.rows_us += launched.rows_us;
             s.tally_us += tally_us;
+            if launched.fresh > 0 {
+                s.note_launch(launched.fresh as u64, idx.n_tokens as u64, kernel_gpu_us);
+            }
         });
         // Where a launch's time goes: the probe upload, the kernel (to its
         // synchronize), the vote readback, and the host tally — over the
