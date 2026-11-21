@@ -241,6 +241,7 @@ pub fn app(gateway: &str, state: &TempDir) -> Arc<App> {
             path: "/v1/mcp".into(),
             memory: None,
             diaries: None,
+            model: None,
         }],
         link: Link::new(gateway).unwrap(),
         routes: Routes::kept_in(&routes, vec!["zen".into()]),

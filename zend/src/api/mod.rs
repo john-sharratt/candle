@@ -79,6 +79,10 @@ const MEMORY_OPEN_WAIT: Duration = Duration::from_secs(120);
 /// `/v1/mcp`, declared only by the members that hold the journal repository.
 pub const MEMORY_MCP_PATH: &str = "/v1/mcp/memory";
 
+/// Where zend's MCP server is reached for a call that starts a model turn:
+/// placed `Best`, so the turn runs on the card the machine table fills first.
+pub const MODEL_MCP_PATH: &str = "/v1/mcp/model";
+
 /// Where zend's MCP server is reached for diary calls: declared by the
 /// members that hold the journal repository, and routed by each
 /// conversation's diary key to the one holding what it unlocked
@@ -432,6 +436,17 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
                 .get(mcp_http::get)
                 .delete(mcp_http::delete::<ZendSession>),
         )
+        // The same server, for the calls that start a model turn — a chat's
+        // send, a task's start or reply. The turn runs on the member that took
+        // the call (`docs/claude_zend_gateway.md` §6.3), so the call is placed
+        // as a conversation's turn is, by the machine table: the fast card
+        // first, the slower one when it is full.
+        .route(
+            MODEL_MCP_PATH,
+            Role::Unauthenticated,
+            Dispatch::Best,
+            post(mcp_http::post::<ZendSession>),
+        )
         // The same server, for diary calls: what a conversation unlocked is
         // held in one member's memory alone, so each call goes by the
         // conversation's diary key to the member holding it, which keeps the
@@ -523,6 +538,7 @@ mod tests {
                 ("/v1/journals/grep", "user"),
                 ("/v1/mcp", "unauthenticated"),
                 ("/v1/mcp/memory", "unauthenticated"),
+                ("/v1/mcp/model", "unauthenticated"),
                 ("/v1/mcp/diaries", "unauthenticated"),
                 // Open at the gateway; its handler believes a member's stamp
                 // alone (`worker_continue`).
@@ -602,6 +618,8 @@ mod tests {
             ("GET", "/v1/journals/grep", Dispatch::Any),
             ("POST", "/v1/mcp", Dispatch::Any),
             ("POST", "/v1/mcp/memory", Dispatch::Any),
+            // A call that starts a model turn is placed by the machine table.
+            ("POST", "/v1/mcp/model", Dispatch::Best),
             (
                 "POST",
                 "/v1/mcp/diaries",

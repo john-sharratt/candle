@@ -387,6 +387,27 @@ impl Registry {
         }
     }
 
+    /// A `Best` unit on a route only `nodes` declare — a build that lacks the
+    /// route is never sent it — placed among them by the machine table, as
+    /// [`Self::pick`] places one every member declares. While none of them may
+    /// take it, it waits, as an `Any` one on such a route does.
+    pub fn pick_best_among(&mut self, app: &str, draw: Option<u64>, nodes: &[u64]) -> Pick {
+        if !self.clustered(app) {
+            return Pick::Configured;
+        }
+        let cards = self.cards();
+        let pool: Vec<&MemberView> = self
+            .placeable_but(app, draw, None)
+            .into_iter()
+            .filter(|m| nodes.contains(&m.node))
+            .collect();
+        match place(app, pool, draw, &self.weigh(app, &cards)) {
+            Placed::To(node) => Pick::Member(node),
+            Placed::Full | Placed::Nobody => Pick::Wait,
+            Placed::Unplaced => self.unplaced(draw),
+        }
+    }
+
     /// A unit no member that may take work now can take: refused only when
     /// **no machine of the table takes it at all** (`docs/static_placement.md`
     /// §3.4). While one does, the unit waits for it — a named machine whose

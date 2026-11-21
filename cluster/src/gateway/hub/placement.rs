@@ -148,6 +148,33 @@ impl Hub {
             }
             _ => None,
         };
+        // A `Best` request on a route some member's table leaves out — a call
+        // that starts a model turn, while a rollout has reached only some
+        // members — is placed by the machine table among the members declaring
+        // it, and counted against the one it reaches.
+        if let (Dispatch::Best, Some(at)) = (dispatch, route) {
+            if let Some(nodes) = registry.declaring(app, &at.method, &at.path) {
+                let pick = registry.pick_best_among(app, draw, &nodes);
+                let declaring: Vec<String> = nodes.iter().map(|n| hex(*n)).collect();
+                tracing::info!(
+                    target: "cluster::gateway::placement",
+                    app,
+                    route = %format!("{} {}", at.method, at.path),
+                    declaring = %declaring.join(" "),
+                    picked = ?pick,
+                    "placed among the members declaring the route"
+                );
+                let load = match pick {
+                    Pick::Member(node) if !is_errand(dispatch, key, draw) => {
+                        registry.begin(app, node, draw.is_some()).map(|session| {
+                            Load::new(Arc::clone(self), app, node, session, draw.is_some())
+                        })
+                    }
+                    _ => None,
+                };
+                return Picked { pick, load };
+            }
+        }
         if let (Some(at), Some(nodes)) = (route, narrowed) {
             let pick = registry
                 .round_robin_among(app, &nodes)

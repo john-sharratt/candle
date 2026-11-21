@@ -51,16 +51,22 @@ pub struct Backend {
     /// the same members, and routed by the conversation's [`DIARY_HEADER`] to
     /// the one holding what the conversation unlocked.
     pub diaries: Option<String>,
+    /// The path a call that starts a model turn goes to, when it serves one:
+    /// placed by the machine table, so the turn runs on the card it fills
+    /// first rather than on whichever member is next in turn.
+    pub model: Option<String>,
 }
 
 impl Backend {
     /// The path a call of `tool` with `args` goes to: the diaries', for a
     /// diary call; the memory's, for a call that reads or writes the memory;
-    /// each on a backend that serves one.
+    /// the model's, for a call that starts a model turn; each on a backend
+    /// that serves one.
     pub fn path_for(&self, tool: &str, args: &Value) -> &str {
-        match (&self.diaries, &self.memory) {
-            (Some(diaries), _) if access::access(tool) == Access::Diary => diaries,
-            (_, Some(memory)) if context::needs_memory(tool, args) => memory,
+        match (&self.diaries, &self.memory, &self.model) {
+            (Some(diaries), _, _) if access::access(tool) == Access::Diary => diaries,
+            (_, Some(memory), _) if context::needs_memory(tool, args) => memory,
+            (_, _, Some(model)) if context::starts_model_turn(tool) => model,
             _ => &self.path,
         }
     }
@@ -487,6 +493,7 @@ mod tests {
             path: "/v1/npc/mcp".into(),
             memory: None,
             diaries: None,
+            model: None,
         };
         let session = Session::new("o", Client::ClaudeCode, MODERN, 0);
         let on = OnBehalf {
@@ -568,6 +575,7 @@ mod tests {
             path: "/v1/mcp".into(),
             memory: Some("/v1/mcp/memory".into()),
             diaries: Some("/v1/mcp/diaries".into()),
+            model: Some("/v1/mcp/model".into()),
         };
         let session = Session::new("o", Client::ClaudeCode, MODERN, 0);
         let on = OnBehalf {
@@ -595,8 +603,9 @@ mod tests {
 
     /// **A memory call goes to the memory's path**, which only the members
     /// holding the memory declare; a diary call to the diaries' path, declared
-    /// by the same members; every other call, and every call to a backend
-    /// with neither, to the server's own.
+    /// by the same members; a call that starts a model turn to the model's
+    /// path, placed by the machine table; every other call, and every call to
+    /// a backend with none of them, to the server's own.
     #[test]
     fn a_memory_call_goes_where_the_memory_is_served() {
         let coding = Backend {
@@ -605,6 +614,7 @@ mod tests {
             path: "/v1/mcp".into(),
             memory: Some("/v1/mcp/memory".into()),
             diaries: Some("/v1/mcp/diaries".into()),
+            model: Some("/v1/mcp/model".into()),
         };
         let none = json!({});
         let memory = json!({"journal": "people/yen"});
@@ -615,15 +625,26 @@ mod tests {
         for diary in ["diary_open", "diary_create", "diary_read", "diary_close"] {
             assert_eq!(coding.path_for(diary, &none), "/v1/mcp/diaries", "{diary}");
         }
-        for other in ["thread_attach", "repo_task_start", "cluster_status"] {
+        for turn in ["zen_chat_send", "repo_task_start", "repo_task_reply"] {
+            assert_eq!(coding.path_for(turn, &none), "/v1/mcp/model", "{turn}");
+        }
+        for other in [
+            "thread_attach",
+            "repo_task_nudge",
+            "zen_chat_read",
+            "zen_chat_close",
+            "cluster_status",
+        ] {
             assert_eq!(coding.path_for(other, &none), "/v1/mcp", "{other}");
         }
         let bot = Backend {
             memory: None,
             diaries: None,
+            model: None,
             ..coding
         };
         assert_eq!(bot.path_for("get_user_context", &none), "/v1/mcp");
         assert_eq!(bot.path_for("diary_open", &none), "/v1/mcp");
+        assert_eq!(bot.path_for("zen_chat_send", &none), "/v1/mcp");
     }
 }

@@ -66,8 +66,9 @@ question it has not read.
   chat's thread or its worker, and no thread a person attaches can collide with
   one. Its conversation is `mcp:<owner>:~<id>/zen`.
 
-A chat worker runs every turn exactly as a task's does — the same submit, the
-same move to a faster member (§6.3 there), the same resume after a restart — with
+A chat worker runs every turn exactly as a task's does — the same placement of
+the send by the machine table, so the turn starts on the card it fills first,
+the same move to a faster member (§6.3 there), the same resume after a restart — with
 four differences, all keyed on its kind (`WorkerKind::Chat`):
 
 1. **Its message is the text as sent.** No question block is appended: Zen

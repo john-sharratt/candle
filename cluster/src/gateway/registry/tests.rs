@@ -196,6 +196,21 @@ fn a_route_goes_only_to_the_members_declaring_it() {
     assert_eq!(r.round_robin_among("zend", &[]), None);
 }
 
+/// **A `Best` unit on a route only some members declare is placed by the
+/// machine table among them**: the best-ranked member that declares it, never
+/// one that does not, even ranked first; with none declaring, it waits.
+#[test]
+fn a_best_unit_goes_to_the_best_member_declaring_its_route() {
+    let mut r = three();
+    // m2 (node 2) ranks first, but only nodes 1 and 3 declare the route: m3,
+    // ranked second, takes it ahead of m1, ranked third.
+    assert_eq!(r.pick_best_among("zend", None, &[1, 3]), Pick::Member(3));
+    assert_eq!(r.pick_best_among("zend", None, &[1]), Pick::Member(1));
+    assert_eq!(r.pick_best_among("zend", None, &[]), Pick::Wait);
+    // Every member declaring it, the first-ranked takes it, as `Best` places.
+    assert_eq!(r.pick_best_among("zend", None, &[1, 2, 3]), Pick::Member(2));
+}
+
 /// **A sticky key is held only by a member here**: a claim names the member
 /// its requests go to; an unclaimed key, or one claimed by a node that is no
 /// member, is placed afresh among the members declaring its route.

@@ -805,13 +805,26 @@ items.
 
 ### 6.3 Where a worker runs: back to the fast card
 
-**A worker's turn runs on the member that took the call starting it.** The
-call (`repo_task_start`, `repo_task_reply`) is `/v1/mcp`, placed round robin,
-and the worker loop submits its turns in that process. A turn runs until it
-answers or meets the round cap, 128 tool rounds. So a worker started while the
-fast card was busy or down ran its whole turn on the slow one. On 2026-10-31 a
-cleanup worker ran at 7–16 tokens a second on WhiteWorld's 3090 for 23 minutes
-while BlackWorld, at 42–108, stood beside it.
+**A worker's turn runs on the member that took the call starting it**, and the
+worker loop submits its turns in that process. A turn runs until it answers or
+meets the round cap, 128 tool rounds. So where the starting call is placed is
+where the turn runs: on 2026-10-31 a cleanup worker ran at 7–16 tokens a second
+on WhiteWorld's 3090 for 23 minutes while BlackWorld, at 42–108, stood beside
+it.
+
+**The calls that start a turn are placed by the machine table.** A chat's send,
+a task's start and a reply to a task's question (`zen_chat_send`,
+`repo_task_start`, `repo_task_reply`) go to `/v1/mcp/model`, the same MCP
+server declared `Dispatch::Best` (`zend::api::MODEL_MCP_PATH`; the connector's
+`Backend::path_for`), and every other MCP call to `/v1/mcp`, dealt in turn. A
+`Best` unit fills each machine to its `min` in rank order
+(`docs/static_placement.md` §3.2), so turns start on BlackWorld until it holds
+its four and reach WhiteWorld only then. Until 2026-11-21 these calls went to
+`/v1/mcp` in turn, and every second one started on WhiteWorld however idle
+BlackWorld stood; a turn with no tool round — a dependency battery question —
+has no boundary to move at, so it ran there to its end. While a rollout has
+reached only some members, the gateway places the call among the members that
+declare the route (`Registry::pick_best_among`).
 
 **At every tool-round boundary a worker's turn may move** (`zend/src/worker_hop.rs`).
 The boundary is the moment its call turn is sealed and its commit queued, before

@@ -56,13 +56,16 @@ server:
 # memory calls go to `memory`, the same server declared only by the members
 # that hold the journal repository, so the gateway sends them only there; its
 # diary calls to `diaries`, declared by the same members and routed by each
-# conversation's diary key to the one holding what it unlocked.
+# conversation's diary key to the one holding what it unlocked; a call that
+# starts a model turn — a chat's send, a task's start or reply — to `model`,
+# placed by the machine table, so the turn runs on the card it fills first.
 backends:
   - name: coding
     host: code.tokera.com
     path: /v1/mcp
     memory: /v1/mcp/memory
     diaries: /v1/mcp/diaries
+    model: /v1/mcp/model
   - name: bot
     host: bot.tokera.com
     path: /v1/npc/mcp

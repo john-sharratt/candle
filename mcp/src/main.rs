@@ -127,6 +127,7 @@ async fn main() -> anyhow::Result<()> {
                 path: b.path.clone(),
                 memory: b.memory.clone(),
                 diaries: b.diaries.clone(),
+                model: b.model.clone(),
             })
             .collect(),
         link: Link::new(&config.gateway)?,

@@ -26,7 +26,8 @@ pub struct Routes {
 }
 
 impl Routes {
-    /// Routes kept nowhere.
+    /// Routes kept nowhere: the tests', which have no state to keep them in.
+    #[cfg(test)]
     pub fn in_memory(backends: Vec<String>) -> Self {
         Self {
             by_name: RwLock::new(HashMap::new()),

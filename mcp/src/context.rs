@@ -87,6 +87,18 @@ const MEMORY: [&str; 14] = [
 /// the message itself.
 const CHAT: [&str; 3] = ["zen_chat_send", "zen_chat_read", "zen_chat_close"];
 
+/// The calls that start a model turn on the member that takes them: a chat's
+/// send, a task's start, a reply to a task's question
+/// (`docs/claude_zend_gateway.md` §6.3). A nudge only queues words for the
+/// next round, and a read waits on a turn already placed.
+const MODEL_TURN: [&str; 3] = ["zen_chat_send", "repo_task_start", "repo_task_reply"];
+
+/// Whether a call of `tool` starts a model turn where it lands, and so is
+/// placed by the machine table rather than in turn.
+pub fn starts_model_turn(tool: &str) -> bool {
+    MODEL_TURN.contains(&tool)
+}
+
 /// The longest summary an episode is sent with, as the memory keeps it.
 const MAX_SUMMARY: usize = 160;
 

@@ -97,6 +97,11 @@ pub struct BackendConfig {
     /// holding what a conversation unlocked.
     #[serde(default)]
     pub diaries: Option<String>,
+    /// The path a call that starts a model turn goes to, when it serves one:
+    /// the same server, placed by the machine table, so the turn runs on the
+    /// card the table fills first.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 fn read<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
@@ -160,6 +165,7 @@ mod tests {
                     path: "/v1/mcp".into(),
                     memory: Some("/v1/mcp/memory".into()),
                     diaries: Some("/v1/mcp/diaries".into()),
+                    model: Some("/v1/mcp/model".into()),
                 },
                 BackendConfig {
                     name: "bot".into(),
@@ -167,6 +173,7 @@ mod tests {
                     path: "/v1/npc/mcp".into(),
                     memory: None,
                     diaries: None,
+                    model: None,
                 },
                 BackendConfig {
                     name: "dj".into(),
@@ -174,6 +181,7 @@ mod tests {
                     path: "/v1/zenj/mcp".into(),
                     memory: None,
                     diaries: None,
+                    model: None,
                 }
             ]
         );
