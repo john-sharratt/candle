@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use super::*;
 use crate::engine::act::Act;
 use crate::engine::body::Outcome;
-use crate::engine::mission::{Mission, Origin, Outcome as Verdict, Todo};
+use crate::engine::mission::{Mission, Origin, Outcome as Verdict, StepOutcome, Todo};
 use crate::sim::agenda::{Priority, KEEP};
 use crate::world::Hosted;
 
@@ -85,6 +85,11 @@ fn a_mission_at_now_goes_first_and_the_one_it_displaces_keeps_its_place() {
         "{prompt}"
     );
 
+    // The journey is seen made; the rest of the item is Zen's to judge.
+    h.with_sim(|s| {
+        s.missions
+            .check_off("zen", "go to the watch room", StepOutcome::Achieved)
+    });
     assert_eq!(
         act(
             &h,
@@ -110,6 +115,37 @@ fn a_mission_at_now_goes_first_and_the_one_it_displaces_keeps_its_place() {
         "the step it had done is still done"
     );
     assert_eq!(h.sim(|s| s.missions.chapter("zen")), 0, "no chapter turned");
+}
+
+/// **A step the world sees done is not done by saying so**: an agenda item
+/// whose journey or reading has not been seen is refused `mission_done`, with
+/// how it is done — by attention, or by a Drone — and is still carried.
+#[test]
+fn an_agenda_item_with_a_step_unseen_is_not_closed_by_saying_so() {
+    let h = vault();
+    act(
+        &h,
+        "zen",
+        "mission_add",
+        json!({"title": "the sensor panel", "brief": "A Drone is to read the sensor panel.", "steps": "go to the watch room", "priority": "now"}),
+    );
+    let Outcome::Refused(why) = act(
+        &h,
+        "zen",
+        "mission_done",
+        json!({"mission": "the sensor panel", "found": "active and reading stable"}),
+    ) else {
+        panic!("a step never seen was closed by saying so");
+    };
+    assert!(
+        why.starts_with(
+            "\"the sensor panel\" is not done: \"go to the watch room\" is a step the world sees \
+             done, and it has not seen it."
+        ),
+        "{why}"
+    );
+    assert!(why.contains("`order_post`"), "{why}");
+    assert!(h.sim(|s| s.missions.is_on_mission("zen")), "still carried");
 }
 
 /// **An item of the round is not closed by saying so**: `mission_done` is

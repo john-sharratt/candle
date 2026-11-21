@@ -780,12 +780,20 @@ pub fn still_asked(party: &str, request: &str, table: Option<&str>) -> String {
 /// journal, believed it, and told him the Drone had not reported yet — of an
 /// order that was never posted. What is on the table is read off it every turn
 /// the request stands, so a claim cannot stand in for the act.
-pub fn orders_line(out: &[(String, Option<String>)]) -> String {
+///
+/// `post` is the table's `order_post` address, named so the way to post is
+/// the act itself: told only to "`order_post` it", Zen put the work on its own
+/// agenda instead, an act it could name.
+pub fn orders_line(out: &[(String, Option<String>)], post: Option<&str>) -> String {
     if out.is_empty() {
-        return "Nothing you have posted is on the order table: no Drone has been given any of \
-                it. If it is theirs to do, `order_post` it; until it is posted, nobody is doing \
-                it."
-        .to_string();
+        let how = match post {
+            Some(url) => format!("post it with `invoke` {url}"),
+            None => "post it at the order table".to_string(),
+        };
+        return format!(
+            "Nothing you have posted is on the order table: no Drone has been given any of it. \
+             If it is theirs to do, {how}; until it is posted, nobody is doing it."
+        );
     }
     let each: Vec<String> = out
         .iter()
@@ -1739,7 +1747,12 @@ impl Runtime {
                 (brief, with)
             })
             .collect();
-        Some(orders_line(&named))
+        let post = self
+            .invokable_urls(&hosted, &body)
+            .into_iter()
+            .find(|i| i.act == mission_acts::ORDER_POST.name)
+            .map(|i| i.url);
+        Some(orders_line(&named, post.as_deref()))
     }
 
     /// The mission compass for this character as things stand — its mission's
@@ -10400,17 +10413,24 @@ mod tests {
     /// remembered "I posted it" cannot stand in for the post.
     #[test]
     fn a_standing_request_reads_the_order_table_as_it_is() {
-        let none = orders_line(&[]);
+        let post = "http://local/command/order-table~0/order_post";
+        let none = orders_line(&[], Some(post));
         assert!(
             none.starts_with("Nothing you have posted is on the order table"),
             "{none}"
         );
-        assert!(none.contains("`order_post` it"), "{none}");
+        assert!(
+            none.contains("post it with `invoke` http://local/command/order-table~0/order_post"),
+            "{none}"
+        );
         assert_eq!(
-            orders_line(&[
-                ("Read the sensor panel.".into(), Some("Jitter".into())),
-                ("Watch Earth".into(), None),
-            ]),
+            orders_line(
+                &[
+                    ("Read the sensor panel.".into(), Some("Jitter".into())),
+                    ("Watch Earth".into(), None),
+                ],
+                Some(post)
+            ),
             "On the order table, of yours: \"Read the sensor panel\" — Jitter has it; \"Watch \
              Earth\" — waiting to be taken."
         );

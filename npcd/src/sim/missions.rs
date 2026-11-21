@@ -39,7 +39,7 @@ use super::orders::{Filed, Notice, Orders, EVERY_POSTER};
 use super::round::RoundState;
 use crate::engine::authorize::Authorizer;
 use crate::engine::mission::bank::{self, Duty, Facts};
-use crate::engine::mission::{Mission, MissionPrompt, Origin, Outcome, StepOutcome};
+use crate::engine::mission::{Aim, Mission, MissionPrompt, Origin, Outcome, StepOutcome};
 use crate::engine::mission_gen::round::{Item as RoundItem, STALE_MS};
 use crate::engine::mission_gen::world::{self, Draw, Routine};
 use crate::engine::workflow::{Next, Taker, Where, Workflow, STUCK};
@@ -509,6 +509,34 @@ impl Missions {
             return Err(format!(
                 "\"{title}\" waits on an authorizer's yes to \"{step}\": it is not done until \
                  they sign it."
+            ));
+        }
+        // **A step the world sees done is not done by saying so.** A journey or a
+        // reading is signed off as it happens; only a step the engine cannot see
+        // is the agenda's to judge. Asked to have a Drone read a panel, Zen put
+        // "go to the watch room" on its own agenda from a conversation, closed it
+        // a turn later with "the sensor panel is active and reading stable", and
+        // told the Creator it had read it — of a panel nobody had looked at.
+        let unseen = self
+            .agenda(body)
+            .into_iter()
+            .find(|m| {
+                m.agendum
+                    .as_ref()
+                    .is_some_and(|a| a.title.eq_ignore_ascii_case(title))
+            })
+            .and_then(|m| {
+                m.todo
+                    .iter()
+                    .find(|t| !t.done && !t.reports && Aim::of(&t.text).is_some())
+            })
+            .map(|t| t.text.clone());
+        if let Some(step) = unseen {
+            return Err(format!(
+                "\"{title}\" is not done: \"{step}\" is a step the world sees done, and it has \
+                 not seen it. Do it — `focus` on the room, and its machines are read as your \
+                 attention arrives — or, if it is a Drone's to do, post it at the order table \
+                 (`order_post`), and it is done when they report it."
             ));
         }
         if let Some(step) = round_step {
