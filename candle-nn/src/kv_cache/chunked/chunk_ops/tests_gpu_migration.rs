@@ -14,13 +14,16 @@ use super::*;
 
 #[cfg(test)]
 pub(super) mod tests {
+    #[cfg(feature = "cuda")]
     use super::*;
 
+    #[cfg(feature = "cuda")]
     use crate::kv_cache::chunked::ChunkedKvBacking;
 
     #[cfg(feature = "cuda")]
     use crate::kv_cache::QuantFormat;
 
+    #[cfg(feature = "cuda")]
     use candle::{DType, Device, Tensor};
 
     // ── Batched-async migrate tests (GPU-only) ──────────────────────────────

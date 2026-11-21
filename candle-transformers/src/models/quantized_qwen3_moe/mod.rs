@@ -123,6 +123,7 @@ mod tests_profile;
 mod tests_wave;
 
 pub use layer::*;
+#[cfg(all(feature = "cuda", any(test, feature = "ruler-bench")))]
 pub use model::*;
 pub(crate) use moe::*;
 pub use rope::*;

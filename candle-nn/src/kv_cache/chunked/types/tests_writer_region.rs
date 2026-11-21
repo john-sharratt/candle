@@ -8,6 +8,7 @@
 //! the boundary past it, so it cannot be taken for the writer and swallow the
 //! next write. An append does the same without any caller having to remember.
 
+#[cfg(feature = "cuda")]
 use super::*;
 
 #[cfg(all(test, feature = "cuda"))]
