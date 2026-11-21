@@ -549,9 +549,7 @@ mod tests {
                 Mission::new(
                     "Watch Earth and set what it needs.",
                     vec![Todo::new("post work on the order table")],
-                    Origin::Round {
-                        id: "watch-earth".into(),
-                    },
+                    Origin::Own,
                 ),
             )
         });

@@ -5,8 +5,7 @@
 //! Suspended is `state: suspended` ([`SUSPENDED`]), whoever set it — these
 //! routes, or an edit of the character's state. A suspended character takes no
 //! turn of any kind: its scheduler never makes it due, the guardian does not
-//! scan it, the round does not count the time against its mission
-//! (`RoundState::hold`), and the routes that decode for it directly (`ask`,
+//! scan it, and the routes that decode for it directly (`ask`,
 //! `reflect`, `dream`, `journal/draft`) refuse it with [`refused`]. Everything
 //! delivered to it meanwhile — a message, a thought, a line in an interaction,
 //! what its world does around it — waits in its inbox, and the turn after it

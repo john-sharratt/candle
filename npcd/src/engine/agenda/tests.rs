@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use super::*;
 use crate::engine::act::Act;
 use crate::engine::body::Outcome;
-use crate::engine::mission::{Mission, Origin, Outcome as Verdict, StepOutcome, Todo};
+use crate::engine::mission::{Outcome as Verdict, StepOutcome};
 use crate::sim::agenda::{Priority, KEEP};
 use crate::world::Hosted;
 
@@ -148,56 +148,6 @@ fn an_agenda_item_with_a_step_unseen_is_not_closed_by_saying_so() {
     assert!(h.sim(|s| s.missions.is_on_mission("zen")), "still carried");
 }
 
-/// **An item of the round is not closed by saying so**: `mission_done` is
-/// refused for it, naming its next step and the act that does it, and it is
-/// still carried.
-#[test]
-fn an_item_of_the_round_is_not_closed_by_saying_so() {
-    use crate::engine::mission_gen::round;
-    let h = vault();
-    let items = round::parse(
-        "rounds/creators-vault.yaml",
-        "round:\n  - id: set-the-work\n    brief: Set the work.\n    steps:\n      - post work on \
-         the order table\n",
-    )
-    .unwrap();
-    h.with_sim(|s| {
-        s.missions.set_round(items);
-        round::collect(s, "zen", 0).expect("the round's item is collected");
-    });
-    assert_eq!(
-        act(
-            &h,
-            "zen",
-            "mission_done",
-            json!({"mission": "set the work", "found": "posted it on the sensor panel"})
-        ),
-        Outcome::Refused(
-            "\"set the work\" is an item of your round: it is done when its steps are seen done, \
-             not when you say so. Its next step is to post work on the order table — \
-             `order_post` at the order table, which answers you from wherever your attention is."
-                .into()
-        )
-    );
-    assert!(h.sim(|s| s.missions.is_on_mission("zen")), "still carried");
-
-    // Its steps all seen done, it closes itself on the engine's next pass.
-    h.with_sim(|s| s.missions.posted_work("zen"));
-    assert_eq!(
-        act(
-            &h,
-            "zen",
-            "mission_done",
-            json!({"mission": "set the work", "found": "the work is posted"})
-        ),
-        Outcome::Refused(
-            "\"set the work\" is an item of your round: it is done when its steps are seen done, \
-             not when you say so. Its steps are all seen done, and it closes itself."
-                .into()
-        )
-    );
-}
-
 /// **Editing keeps what was done**: steps it keeps stay signed off, and a
 /// raised priority puts it first.
 #[test]
@@ -290,34 +240,24 @@ fn the_agenda_is_bounded_and_kept_only_by_one_who_takes_no_orders() {
     assert!(!add(&h, "x", "urgent").happened());
 }
 
-/// **A round item collected joins the agenda at `later`**, so a mission of
-/// Zen's own goes ahead of it; and **a mission worked whose steps are all seen
-/// done is closed by the engine**, the next taken up.
+/// **A mission worked whose steps are all seen done is closed by the
+/// engine**, with no report asked, and the next on the agenda taken up.
 #[test]
-fn a_round_item_waits_behind_zens_own_and_what_is_seen_done_closes() {
+fn what_is_seen_done_on_the_agenda_closes_and_the_next_is_taken_up() {
     let h = vault();
-    h.with_sim(|s| {
-        let m = Mission::new(
-            "Watch Earth.",
-            vec![Todo::new("go to the watch room")],
-            Origin::Round {
-                id: "watch-earth".into(),
-            },
-        );
-        s.missions.take_round("zen", m, "watch earth", 0);
-    });
+    add(&h, "watch earth", "later");
     add(&h, "yen's parcels", "soon");
     assert_eq!(titles(&h), ["yen's parcels", "watch earth"]);
     h.with_sim(|s| s.missions.posted_work("zen"));
     assert!(
-        h.with_sim(|s| s.missions.settle_agendas(0)).is_empty(),
+        h.with_sim(|s| s.missions.settle_agendas()).is_empty(),
         "one step still to go"
     );
     h.with_sim(|s| {
         s.missions
             .arrived_in("zen", "the watch room", "the command level")
     });
-    let closed = h.with_sim(|s| s.missions.settle_agendas(0));
+    let closed = h.with_sim(|s| s.missions.settle_agendas());
     assert_eq!(
         closed,
         [(

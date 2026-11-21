@@ -390,10 +390,12 @@ who made it.
 ## 17. Zen's missions
 
 **Zen takes no orders, but it carries missions — several at once, in order of priority — and
-they are its own.** It makes them, in answer to what it hears and sees; it changes and drops them
-as things change; and when it has none left, the next of its **round** — the world's list of what
-the moon's mind is for — is put on its agenda, so it always has the next thing to move on to. A
-Drone carries one mission set for it; Zen keeps an agenda.
+they are its own.** They come from the people who message it, on its messaging platforms: it
+makes one in answer to what it is asked, changes and drops them as things change, and with none
+left it rests. **Nothing on the table is ever Zen's to take**: the table is where Zen puts work for
+the Drones, and `Missions::collect` hands one who gives orders nothing — not what is lodged for
+it, not what waits for whoever takes it, not a routine. A Drone carries one mission set for it;
+Zen keeps an agenda.
 
 What this replaces: an idle thought (`idle:`) names no act, so a Zen woken with it had nothing to
 land on but talk, and a loop broken out of landed on whatever act was left — the phone, the
@@ -435,79 +437,23 @@ wants a Drone to do is still posted on the order table with `order_post` — or,
 (`docs/mission_templates.md`), issued as a template with its arguments. A mission of Zen's own is
 how Zen does a thing; a post is how it has a Drone do one.
 
-### 17.3 The round: what keeps Zen moving when its agenda is empty
+### 17.3 What follows up a post
 
-With nothing on its agenda, **the engine puts the next due item of its round on it**, and Zen is
-woken already working on it (`ROUND_TAKEN`, then the mission). Zen needs no table for this and
-takes no act to get it: the table gives its work to Drones, and nothing to a character that
-takes no orders. The round decides which item; Zen does not choose. With nothing due, Zen
-rests (§17.4).
-
-#### The file
-
-One file, `rounds/<world>.yaml` — apart from the world's template library (`missions/<world>/`)
-and its standing missions (`standing/<world>/`), so each folder holds one kind of file:
-
-```yaml
-round:
-  - id: read-the-reports
-    when: reports            # only while a report waits unread
-    brief: >-
-      Go to the order table and read what the Drones brought back.
-    steps:
-      - read what came back at the order table
-  - id: set-the-work
-    when: table-empty        # only while nothing waits on the table
-    brief: >-
-      Nothing waits on the table. Set the Drones the work the moon needs next.
-    steps:
-      - post work on the order table
-  - id: watch-earth
-    every: 2h                # not again until two hours after it was last done
-    brief: ...
-    steps:
-      - go to the watch room
-      - scan the sensor panel and read what state it is in
-      - post work on the order table
-```
-
-- **`id`** — kebab-case, unique in the round.
-- **`brief` and `steps`** — as any mission's, the steps one to an act the engine sees happen
-  (§17.5).
-- **`when`** — what must be true for the item to be due: `reports`, a report Zen posted waits
-  unread; `table-empty`, nothing waits on the table. Absent, it is always due. (Messages are not a
-  round item: they reach Zen urgently on their own, and are answered before anything on the
-  agenda.)
-- **`every`** — the least time between one doing of it and the next: `30m`, `2h`, `1d`. Absent,
-  none.
-
-A round that names a `when` it does not know, a malformed period, a duplicate id, or an item with
-no step, is refused whole at load, naming the file and the fault.
-
-#### Which item the round gives — the anti-loop rules
-
-- **In order, from where it left off.** The next item is the first due one after the one given
-  last, wrapping round to the start. An item is **due** when its `when` holds, its `every` has
-  passed since it was last done, and it has not failed within the last hour
-  (`standing::RETRY_MS`).
-- **Never the same twice running while another is due.** An item just done is passed over for
-  the next due one; it is given again only when it is the only one due.
-- **An item is due only when doing it can change something** — that is what `when` and `every`
-  are for, and what makes the round a cycle rather than a treadmill.
-
-A round item collected joins the agenda at `later`, so anything Zen adds of its own comes first.
+Zen's work for a Drone is followed up by the report, not by a mission: a filed report reaches its
+poster at once, urgent, naming who reported what and that `order_results` reads it
+(`Runtime::give_notice`). There is no list of standing work the engine puts on an empty agenda —
+a round of that kind was work Zen took from the table, and is gone.
 
 ### 17.4 Nothing to do is a rest
 
-With an empty agenda and nothing on the round due, **Zen is not woken** — no idle thought, no
-restated task — until something reaches it: a message, a report, a tannoy, or an item of the round
-coming due, which is put on its agenda and wakes it with `ROUND_TAKEN` and the mission. A world with no round
-wakes Zen with its `idle:` as before (§7).
+With an empty agenda, **Zen is not given work** — its time is its own (`YOUR_OWN_TIME`, or its
+`idle:`, §7) — until something reaches it: a message, a report, a tannoy.
 
 ### 17.5 Done is seen, not said
 
-A round mission is closed by the engine, **with no report**: when every step is signed off, it is
-done, stamped, and the agenda moves on. Each step is signed off by the act it names landing:
+A mission on the agenda is closed by the engine, **with no report**, when every step is signed
+off (`Missions::settle_agendas`), and the agenda moves on. Each step is signed off by the act it
+names landing:
 
 | Step begins | Signed off when |
 |---|---|
@@ -517,14 +463,11 @@ done, stamped, and the agenda moves on. Each step is signed off by the act it na
 | `post work` | `order_post` puts a mission on the table |
 | `read your messages` | `read` takes a conversation off the phone |
 
-A mission of Zen's own is closed the same way when its steps are seen done; one whose steps the
-engine cannot see (a step that is Zen's to judge) is closed by Zen with `mission_done`, saying what
+One whose steps the engine cannot see (a step that is Zen's to judge) is closed by Zen with `mission_done`, saying what
 it found — never filed as dropped. A step the engine *can* see — a journey, a reading — is never
 closed by `mission_done` while it stands unseen (`Missions::agenda_done`): asked to have a Drone
 read a panel, Zen put "go to the watch room" on its own agenda, closed it with a reading it never
-took, and told the Creator it had read the panel. A round mission carried for an hour (`round::STALE_MS`) without every step signed off
-is called off as failed, rests as a failure does, and the round moves on — so a step Zen cannot do
-holds the round up for an hour, never for good.
+took, and told the Creator it had read the panel.
 
 ### 17.6 What breaks into it
 
@@ -542,9 +485,6 @@ holds the round up for an hour, never for good.
   grammar a closed set and the choice legible.
 - **The agenda's size.** Eight is a guess at what a prompt can carry without the list crowding
   out the mission being worked.
-- **The round's first items for `life`**: read the reports (`when: reports`), set the work
-  (`when: table-empty`), watch Earth (`every: 2h`), look in on the Sharratts (`every: 6h`), tell
-  the story circle (`every: 1d`) — each ending in an act that changes something.
 
 ## 11. Decided by the deployment
 

@@ -457,18 +457,6 @@ impl Inbox {
             && world_ms.saturating_sub(self.last_nudge_ms) >= after_ms
     }
 
-    /// Like [`Self::nudge_due`] but on the "since the task was last restated"
-    /// clock ALONE — it ignores the quiet-since-news clock, so it fires while a
-    /// character is deep in conversation. This is what a summons that must
-    /// break into a conversation rides — the round's next due item: a busy
-    /// character never goes quiet, so the full gate never reaches it, but
-    /// repeating a call every tick collapses the character onto the
-    /// repetition. Its own interval is the middle ground — often enough to
-    /// break a conversation, rarely enough to stay evidence rather than noise.
-    pub fn summons_due(&self, world_ms: u64, after_ms: u64) -> bool {
-        world_ms.saturating_sub(self.last_nudge_ms) >= after_ms
-    }
-
     pub fn readiness(&self) -> Readiness {
         if self.preempted {
             Readiness::Interrupted
@@ -1129,17 +1117,6 @@ impl Scheduler {
     /// `due_at = 0` would make that a tight re-tick loop.
     pub fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, AtomicOrdering::Relaxed)
-    }
-
-    /// Whether a summons that breaks into conversation is due for this character —
-    /// on the "since last restated" clock alone (see [`Inbox::summons_due`]),
-    /// so it reaches one that is deep in conversation.
-    pub fn summons_due(&self, npc_id: u64, world_ms: u64, after_ms: u64) -> bool {
-        self.inboxes
-            .lock()
-            .unwrap()
-            .get(&npc_id)
-            .is_some_and(|i| i.summons_due(world_ms, after_ms))
     }
 
     /// Deliver an event to a character. `false` if there is no such character.
@@ -2834,17 +2811,11 @@ mod tests {
         assert_eq!(s.asked(1, T0 + 1), None, "and it does not come back");
     }
 
-    /// **The active summons reaches a character deep in conversation, where the
-    /// standing task never does.**
-    ///
-    /// The command table has to break into a busy character — one talking to a
-    /// companion never goes quiet, so [`Inbox::nudge_due`]'s quiet-since-news
-    /// half never opens and the standing task never lands. The summons rides the
-    /// "since last restated" clock alone, so it fires whatever news is arriving —
-    /// and it still resets each time it is restated, so it is a cadence and not a
-    /// per-tick repetition (which is the collapse it was written to avoid).
+    /// **The standing task never reaches a character deep in conversation**:
+    /// one talking to a companion is not quiet, so [`Inbox::nudge_due`]'s
+    /// quiet-since-news half stays shut.
     #[test]
-    fn the_active_summons_fires_through_a_conversation_but_still_on_a_cadence() {
+    fn the_standing_task_waits_out_a_conversation() {
         const AFTER: u64 = 30_000;
         const T0: u64 = 1_000_000;
         let s = sched();
@@ -2866,33 +2837,6 @@ mod tests {
         assert!(
             !s.nudge_due(1, T0 + AFTER, 90_000),
             "the standing task must not reach a character mid-conversation"
-        );
-
-        // …but the summons does, on the restated clock alone.
-        assert!(
-            s.summons_due(1, T0 + AFTER, AFTER),
-            "the summons must break into a busy character"
-        );
-
-        // Restating it stamps the clock, so it is not due again until a full
-        // cadence has passed — no per-tick repetition.
-        s.deliver(
-            1,
-            T0 + AFTER,
-            Salience::URGENT,
-            EventKind::Nudge {
-                text: "make your way to the command room".into(),
-            },
-        );
-        for gap in [1_000, 15_000, 29_000] {
-            assert!(
-                !s.summons_due(1, T0 + AFTER + gap, AFTER),
-                "restated {gap}ms after the last summons"
-            );
-        }
-        assert!(
-            s.summons_due(1, T0 + AFTER + AFTER, AFTER),
-            "a full cadence later it is due again"
         );
     }
 

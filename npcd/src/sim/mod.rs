@@ -53,7 +53,6 @@ pub mod posting;
 pub mod purpose;
 pub mod reading;
 pub mod record;
-pub mod round;
 pub mod seed;
 pub mod shelf;
 pub mod terminals;

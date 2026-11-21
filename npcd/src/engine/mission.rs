@@ -157,11 +157,6 @@ pub enum Origin {
     /// for the room `room` (`area/node`) — see `engine::mission_gen::standing`
     /// and `docs/zen_moon_mind.md` §12.
     Standing { id: String, room: String },
-    /// Set by the table to a body that takes no orders: item `id` of its
-    /// world's round — see `engine::mission_gen::round` and
-    /// `docs/zen_moon_mind.md` §17. Closed by the engine when its steps are
-    /// signed off, with no report.
-    Round { id: String },
     /// Made by its carrier for its own agenda (`mission_add`,
     /// `docs/zen_moon_mind.md` §17.2).
     Own,
@@ -2567,9 +2562,7 @@ mod tests {
                 Todo::new("Post work on the order table"),
                 Todo::new("read your messages"),
             ],
-            Origin::Round {
-                id: "keep-the-table".into(),
-            },
+            Origin::Own,
         );
         assert!(m.posted_work());
         assert!(!m.posted_work(), "signed off already");

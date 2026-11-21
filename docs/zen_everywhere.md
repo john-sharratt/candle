@@ -30,7 +30,7 @@ and a standing task restates an idle drone's summons every 90 s
 | A conversation can be unloaded and rejoined from the log | `Minds::let_go` (`mind.rs:2097`) | Used by suspension; an idle drone uses the same path. |
 | A held character: parked, `begin_tick` refuses, inbox fills and is cut on resume, reflect/dream/journal refuse | `Scheduler::suspend`, `follow_suspended`, `held::PER_SOURCE` | Exactly what idle is. |
 | The table hands a free drone its work | `Runtime::assign_work` → `work::take_up` | Built (§8 step 1): no act of a drone's takes work. |
-| The round goes only to unordered bodies | `take_up_round`, `rounds/<world>.yaml` | Zen's own idle work is already Zen's alone. |
+| An unordered body takes nothing from the table | `Missions::collect` | Its missions come from the people who message it. |
 | A conversation with a person puts an item on Zen's agenda | `mission_add` on the thread, `agenda/acts.rs` | A request becomes work for Zen today. |
 | Real devices, worked through an agent on the home network | `effector-bridge`, `npcd/src/bridge/` | Sonos, eISCP receivers, Cast, LG webOS, Android TV, WiZ bulbs, wake-on-LAN; found by `survey_network`. |
 | Coding tasks through zend | `engine/zen_task/` → zend `repo_task_*` as `service:zen` | Offered only when a carried mission grants them; no moon content does. |
@@ -105,8 +105,8 @@ authority reads the cluster's standing and runs each machine's `health` check
 which wakes Zen with the change in hand — only when the standing differs from
 the last reading, or the check's report leads with a change. What moves on
 every reading and means nothing by moving (how long ago a member started, what
-it has yet to send) is taken out before the comparison. Zen's round is what
-only a mind can do: reading what a Drone brought back. A person's request
+it has yet to send) is taken out before the comparison. What a Drone brought
+back reaches Zen as the report's notice, urgent. A person's request
 (`mission_add`, from their conversation) is an item on its agenda: turn the
 television on is connect, act, disconnect.
 
@@ -374,7 +374,7 @@ Four things the first days on WhiteWorld showed, and what answers each:
 - **A carrier that never tries the way is believed in the end**
   (`Mission::refuse_stuck_on_the_way`): every third turn-away in a row with
   nothing tried counts as one, so a mission cannot be stood beside for hours.
-- **A step of the round is `connect to <terminal> …`**, signed off when an act
+- **A step of Zen's is `connect to <terminal> …`**, signed off when an act
   of that terminal lands (`Mission::worked_terminal`). Connecting alone signs
   nothing off.
 
@@ -392,9 +392,9 @@ retired — while the daemon runs and without touching another world's cast
 4. **The cluster adapter**, read-only.
 5. **The machine adapter**: BlackWorld and WhiteWorld, the checks of §5.
 6. **Terminal events, and presence** from the survey.
-7. **The mind's content** (`battle-mind`): Zen's round as observations
-   (`rounds/moon.yaml`: the reports, the cluster, the house network, each
-   machine), its idle text and anchor, the one job it posts for a Drone
+7. **The mind's content** (`battle-mind`): its idle text and anchor — its
+   missions come from the people who message it, with no round of its own
+   — the one job it posts for a Drone
    (`coding-task`, which grants the task acts), and the `ops` and `network`
    templates removed — what they named is Zen's own to do through a terminal.
 8. **`docs/zen_moon_mind.md`** brought to the code: the world is `moon`, and

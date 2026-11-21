@@ -36,11 +36,9 @@ use super::agenda::{Agendum, Priority, KEEP};
 use super::kept_steps::kept_steps;
 use super::operations::{Operation, Operations};
 use super::orders::{Filed, Notice, Orders, EVERY_POSTER};
-use super::round::RoundState;
 use crate::engine::authorize::Authorizer;
 use crate::engine::mission::bank::{self, Duty, Facts};
 use crate::engine::mission::{Aim, Mission, MissionPrompt, Origin, Outcome, StepOutcome};
-use crate::engine::mission_gen::round::{Item as RoundItem, STALE_MS};
 use crate::engine::mission_gen::world::{self, Draw, Routine};
 use crate::engine::workflow::{Next, Taker, Where, Workflow, STUCK};
 use crate::engine::zen_task::Task;
@@ -223,13 +221,6 @@ pub struct Missions {
     /// read afresh like the routines.
     #[serde(skip)]
     authoring: bool,
-    /// What the world's round has done — see [`super::round`].
-    #[serde(default)]
-    round: RoundState,
-    /// The world's round, from `<mind>/missions/<world>/round.yaml` — the
-    /// mind's, read afresh like the routines.
-    #[serde(skip)]
-    round_items: Vec<RoundItem>,
     /// The missions on each agenda set aside behind the one worked, by body
     /// (`docs/zen_moon_mind.md` §17.1): the worked one is the body's
     /// [`Self::active`].
@@ -312,39 +303,6 @@ impl Missions {
             && !self.is_on_mission(body)
             && !self.draws()
             && !self.has_work_for(body)
-    }
-
-    /// Set the world's round (`docs/zen_moon_mind.md` §17) — empty for a
-    /// world with none.
-    pub fn set_round(&mut self, items: Vec<RoundItem>) {
-        self.round_items = items;
-    }
-
-    /// The world's round.
-    pub fn round_items(&self) -> &[RoundItem] {
-        &self.round_items
-    }
-
-    /// Whether the world has a round, which is what a body that takes no
-    /// orders does when nothing calls for it.
-    pub fn has_round(&self) -> bool {
-        !self.round_items.is_empty()
-    }
-
-    /// What the round has done.
-    pub fn round(&self) -> &RoundState {
-        &self.round
-    }
-
-    /// Give `body` a round item's `mission` at `now_ms`, at `later` on its
-    /// agenda, named `title`.
-    pub fn take_round(&mut self, body: &str, mission: Mission, title: &str, now_ms: u64) {
-        if let Origin::Round { id } = &mission.origin {
-            self.round.set(body, id, now_ms);
-        }
-        let agendum = self.agendum(title, Priority::Later);
-        self.active
-            .insert(body.to_string(), mission.on_agenda(agendum));
     }
 
     /// A place on an agenda for a mission coming onto it now.
@@ -475,24 +433,9 @@ impl Missions {
     }
 
     /// Close the mission on `body`'s agenda called `title` as done, on
-    /// `found` — the agenda's own close, for a mission no step shows done.
-    ///
-    /// **An item of the round is not closed by saying so.** Its steps are
-    /// ones the engine sees done (`docs/zen_moon_mind.md` §17.5), and it closes
-    /// itself when they are; `mission_done` is for the agenda's own missions,
-    /// whose steps may be Zen's to judge. The refusal names the next step and,
-    /// for posting work, the act that does it.
+    /// `found` — the agenda's own close, for a mission whose steps are Zen's to
+    /// judge.
     pub fn agenda_done(&mut self, body: &str, title: &str, found: &str) -> Result<Mission, String> {
-        let round_step = self
-            .agenda(body)
-            .into_iter()
-            .find(|m| {
-                m.agendum
-                    .as_ref()
-                    .is_some_and(|a| a.title.eq_ignore_ascii_case(title))
-            })
-            .filter(|m| matches!(m.origin, Origin::Round { .. }))
-            .map(|m| m.next_step().map(|t| t.text.clone()));
         // **A critical step is signed by an authorizer, never by saying the
         // mission is done** (`docs/npc_conversations.md` §7.1).
         let unsigned = self
@@ -537,25 +480,6 @@ impl Missions {
                  not seen it. Do it — `focus` on the room, and its machines are read as your \
                  attention arrives — or, if it is a Drone's to do, post it at the order table \
                  (`order_post`), and it is done when they report it."
-            ));
-        }
-        if let Some(step) = round_step {
-            let next = match step {
-                Some(step) => {
-                    let how = match step.to_lowercase().starts_with("post work") {
-                        true => {
-                            " — `order_post` at the order table, which answers you from \
-                             wherever your attention is"
-                        }
-                        false => "",
-                    };
-                    format!("Its next step is to {step}{how}.")
-                }
-                None => "Its steps are all seen done, and it closes itself.".to_string(),
-            };
-            return Err(format!(
-                "\"{title}\" is an item of your round: it is done when its steps are seen done, \
-                 not when you say so. {next}"
             ));
         }
         self.agenda_work(body, title)?;
@@ -662,49 +586,22 @@ impl Missions {
         })
     }
 
-    /// Stamp every round item done or failed since the last stamp at
-    /// `now_ms`.
-    pub fn stamp_round(&mut self, now_ms: u64) {
-        self.round.stamp(now_ms);
-    }
-
-    /// Hold the round missions of the bodies in `suspended` — those whose
-    /// characters are suspended — and let the rest go (`RoundState::hold`).
-    pub fn hold_round(&mut self, suspended: &BTreeSet<String>, now_ms: u64) {
-        self.round.hold(suspended, now_ms);
-    }
-
     /// Close every mission worked on an agenda whose steps are all signed off,
-    /// as done, and call off as failed every round mission carried
-    /// [`STALE_MS`] without — an agenda is closed by what the engine saw, with
-    /// no report (`docs/zen_moon_mind.md` §17.5). A body held suspended
-    /// ([`Self::hold_round`]) is not called off: its clock stands still.
-    /// Returns each body closed, the mission's title, and how.
-    pub fn settle_agendas(&mut self, now_ms: u64) -> Vec<(String, String, Outcome)> {
+    /// as done — an agenda is closed by what the engine saw, with no report
+    /// (`docs/zen_moon_mind.md` §17.5). Returns each body closed, the mission's
+    /// title, and how.
+    pub fn settle_agendas(&mut self) -> Vec<(String, String, Outcome)> {
         let closing: Vec<(String, String, Outcome)> = self
             .active
             .iter()
+            .filter(|(_, m)| m.all_todos_done())
             .filter_map(|(body, m)| {
                 let title = m.agendum.as_ref()?.title.clone();
-                let stale = matches!(m.origin, Origin::Round { .. })
-                    && !self.round.is_held(body)
-                    && self
-                        .round
-                        .set_at(body)
-                        .is_some_and(|at| now_ms >= at.saturating_add(STALE_MS));
-                match (m.all_todos_done(), stale) {
-                    (true, _) => Some((body.clone(), title, Outcome::Pass)),
-                    (false, true) => Some((body.clone(), title, Outcome::Fail)),
-                    (false, false) => None,
-                }
+                Some((body.clone(), title, Outcome::Pass))
             })
             .collect();
         for (body, _, outcome) in &closing {
-            let notes = match outcome {
-                Outcome::Pass => "every step was seen done",
-                Outcome::Fail => "carried an hour without every step done",
-            };
-            self.report(body, *outcome, notes, None);
+            self.report(body, *outcome, "every step was seen done", None);
         }
         closing
     }
@@ -787,13 +684,10 @@ impl Missions {
     /// journal entry in the mission's place.
     fn close(&mut self, body: &str, mission: &Mission) {
         // A standing job posted at the table is a routine still, whoever set
-        // it, and so is an item of the round.
+        // it.
         if matches!(
             mission.origin,
-            Origin::Random { .. }
-                | Origin::Ordered { job: Some(_), .. }
-                | Origin::Round { .. }
-                | Origin::Own
+            Origin::Random { .. } | Origin::Ordered { job: Some(_), .. } | Origin::Own
         ) {
             return;
         }
@@ -1124,8 +1018,8 @@ impl Missions {
         &self.authorizers
     }
 
-    /// Take `from`'s workflows, routines, authorizers and round in place of
-    /// these: they are the mind's, not the world's, and a world taken in from
+    /// Take `from`'s workflows, routines and authorizers in place of these:
+    /// they are the mind's, not the world's, and a world taken in from
     /// elsewhere keeps the ones this machine loaded.
     pub fn adopt_workflows(&mut self, from: &mut Missions) {
         self.operations.adopt_workflows(&mut from.operations);
@@ -1133,7 +1027,6 @@ impl Missions {
         self.draw = from.draw;
         self.authorizers = std::mem::take(&mut from.authorizers);
         self.authoring = from.authoring;
-        self.round_items = std::mem::take(&mut from.round_items);
     }
 
     /// Call off every operation not yet over, for `why` — what a world that
@@ -1750,9 +1643,6 @@ impl Missions {
                 if let Some((id, _)) = m.operation() {
                     self.operations.cancel(id, "its mission was called off");
                 }
-                if matches!(m.origin, Origin::Round { .. }) {
-                    self.round.dropped(body);
-                }
                 self.called_off(body, &m, why);
                 self.close(body, &m);
                 self.agenda_rank(body);
@@ -1913,7 +1803,6 @@ impl Missions {
                     notes: notes.to_string(),
                 });
             }
-            Origin::Round { id } => self.round.closed(body, id, outcome),
             _ => {}
         }
         self.done.insert(body.to_string(), mission.clone());
