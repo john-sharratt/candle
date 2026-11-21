@@ -205,7 +205,8 @@ fn deeper_visibility(text: &str) -> Option<String> {
 /// The edits that let the shares of a `mod { }` split across files see each
 /// other: each item of its body with no visibility of its own is seen as far
 /// as `seen` — the module every share is under. A test module's helpers,
-/// written beside the tests that call them, are called from every share.
+/// written beside the tests that call them, are called from every share. A
+/// `#[test]` function is called by the harness alone, and is left as it is.
 pub fn share_edits(source: &str, seen: &str) -> Result<Vec<Edit>, String> {
     let mut parser = Parser::new();
     parser
@@ -224,7 +225,17 @@ pub fn share_edits(source: &str, seen: &str) -> Result<Vec<Edit>, String> {
             continue;
         };
         let mut c = list.walk();
+        // Whether an attribute since the last item marks the next one a test.
+        let mut a_test = false;
         for m in list.children(&mut c) {
+            if m.kind() == "attribute_item" {
+                let text = m.utf8_text(source.as_bytes()).unwrap_or("");
+                a_test |= text.contains("test]") || text.contains("::test");
+                continue;
+            }
+            if std::mem::take(&mut a_test) && m.kind() == "function_item" {
+                continue;
+            }
             if VISIBLE_ITEMS.contains(&m.kind()) {
                 let mut cc = m.walk();
                 if !m
@@ -315,12 +326,14 @@ mod tests {
     /// a visibility, and items outside a `mod { }`, are left.
     #[test]
     fn a_split_modules_items_are_seen_by_every_share() {
-        let src = "fn top() {}\nmod tests {\n    use super::*;\n    const N: u8 = 1;\n    pub fn h() {}\n    fn t() {}\n}\n";
+        let src = "fn top() {}\nmod tests {\n    use super::*;\n    const N: u8 = 1;\n    pub fn h() {}\n    fn t() {}\n    \
+                   #[test]\n    fn a_test() {}\n    #[tokio::test]\n    async fn b_test() {}\n}\n";
         let e = share_edits(src, "pub(in super::super)").unwrap();
         assert_eq!(
             apply(src, 0..src.len(), &e).unwrap(),
             "fn top() {}\nmod tests {\n    use super::*;\n    pub(in super::super) const N: u8 = 1;\n    \
-             pub fn h() {}\n    pub(in super::super) fn t() {}\n}\n"
+             pub fn h() {}\n    pub(in super::super) fn t() {}\n    \
+             #[test]\n    fn a_test() {}\n    #[tokio::test]\n    async fn b_test() {}\n}\n"
         );
     }
 

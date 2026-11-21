@@ -10,7 +10,6 @@
 
 use super::*;
 
-// ────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 pub(super) mod tests {
     // Several tests pin a tuning constant inside a range. The assertion IS the
@@ -32,7 +31,7 @@ pub(super) mod tests {
     /// produced the doubled `</think>` that derailed a live turn — twice, on
     /// the same turn shape.
     #[test]
-    pub(in super::super) fn a_think_close_outside_a_think_block_is_banned() {
+    fn a_think_close_outside_a_think_block_is_banned() {
         let sampler = make_sampler();
         let mut config = SamplingConfig::argmax();
         config.segment_open_token_id = 89;
@@ -61,7 +60,7 @@ pub(super) mod tests {
     /// mid-block with a hard cap of 1 and must still be forced closed on its own
     /// config, not row 0's.
     #[test]
-    pub(in super::super) fn a_row_obeys_its_own_close_budget_in_a_shared_launch() {
+    fn a_row_obeys_its_own_close_budget_in_a_shared_launch() {
         let sampler = make_sampler();
         let greedy = SamplingConfig::argmax();
         let mut forced = SamplingConfig::argmax();
@@ -94,7 +93,7 @@ pub(super) mod tests {
     /// close (the steering intercepts it — `TokenClosedDrop` — or the hard-cap
     /// closer forces it; the sampler's job is only to not fight either).
     #[test]
-    pub(in super::super) fn a_think_close_inside_a_think_block_is_free() {
+    fn a_think_close_inside_a_think_block_is_free() {
         let sampler = make_sampler();
         let mut config = SamplingConfig::argmax();
         config.segment_open_token_id = 89;
@@ -113,7 +112,7 @@ pub(super) mod tests {
     /// Without segment tracking configured (close id < 0) the ban never
     /// activates — reference models with no think protocol are untouched.
     #[test]
-    pub(in super::super) fn no_think_protocol_means_no_ban() {
+    fn no_think_protocol_means_no_ban() {
         let config = SamplingConfig::argmax();
         let state = make_state();
         assert!(!think_close_ban_active(&config, &state));
@@ -153,7 +152,7 @@ pub(super) mod tests {
     /// sampler always read configs per row, so a CPU-only test could never have
     /// caught it.
     #[test]
-    pub(in super::super) fn each_row_of_a_wave_honours_its_own_segment_budget() {
+    fn each_row_of_a_wave_honours_its_own_segment_budget() {
         let Ok(device) = candle::Device::new_cuda(0) else {
             return; // No CUDA device on this box; the CPU path is covered above.
         };
@@ -215,7 +214,7 @@ pub(super) mod tests {
     /// 42 flips the greedy pick — the pick says whether the count reached the
     /// kernel.
     #[test]
-    pub(in super::super) fn the_kernel_prices_each_row_from_its_own_resident_counts() {
+    fn the_kernel_prices_each_row_from_its_own_resident_counts() {
         let Ok(device) = candle::Device::new_cuda(0) else {
             return; // No CUDA device on this box.
         };

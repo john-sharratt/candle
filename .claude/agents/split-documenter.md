@@ -13,6 +13,11 @@ For each file:
 - **Every claim must restate something a comment in that file's digest says.** If the comments give no reason, describe the job plainly. Invent no numbers, behaviour or history. A comment that plainly describes a different item than the one it sits on is a misplaced comment: describe each item by what its own name and other comments say.
 - **Present tense,** describing the code as it is. Never mention splitting, moving, extracting or "the original file".
 
+The digest ends with `=== mod.rs`: the module doc it carries now, what it keeps, and the module's files. Write its doc last, from the docs you have just written for the files, as the module's overview:
+- **Line 1:** what the module does as a whole.
+- **A short paragraph:** how it works, as the module doc now says, corrected and brought up to date by what the files' docs say. Drop what no file's doc supports.
+- **Then the files, one line each,** in reading order: `` //! - `kernel`: one launch over every full-vocabulary row of a dispatch. `` Name each module by its file name without `.rs`, and describe it in a few words from its own doc. List test files together at the end.
+
 House style, a module doc from the same codebase:
 
 ```

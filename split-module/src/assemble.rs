@@ -275,9 +275,32 @@ pub fn assemble(
     Ok(Outputs { mod_rs, children })
 }
 
-/// `source[range]` with `edits` applied — none for what stays as it was.
+/// `source[range]` with `edits` applied — none for what stays as it was — and
+/// its bare section rules left behind ([`drop_bare_rules`]).
 fn piece(source: &str, range: Range<usize>, edits: &[Edit]) -> Result<String, String> {
-    apply(source, range, edits)
+    Ok(drop_bare_rules(&apply(source, range, edits)?))
+}
+
+/// `text` without its bare section rules: a `//` line of nothing but rule
+/// characters, which separated one part of the original file from the next
+/// and separates nothing in a file of one part. A rule with a title — `// ──
+/// Per-row bans ──` — names what follows it, and is kept.
+fn drop_bare_rules(text: &str) -> String {
+    let is_rule = |line: &str| {
+        line.trim()
+            .strip_prefix("//")
+            .map(str::trim)
+            .is_some_and(|rest| {
+                rest.chars().count() >= 3
+                    && rest
+                        .chars()
+                        .all(|c| matches!(c, '─' | '━' | '═' | '-' | '=' | '*' | '#' | '~' | '_'))
+            })
+    };
+    if !text.lines().any(is_rule) {
+        return text.to_string();
+    }
+    text.split_inclusive('\n').filter(|l| !is_rule(l)).collect()
 }
 
 /// Whether an item, by the attributes over it, is built only for tests.
@@ -430,8 +453,21 @@ mod tests {
         assert_eq!(
             out.children[1].1,
             "//! The test.\n\nuse super::*;\n\n#[cfg(test)]\npub(super) mod tests {\n    use super::*;\n\n    \
-             use super::super::one::tests::*;\n\n    #[test]\n    pub(in super::super) fn b() { helper(); }\n}\n"
+             use super::super::one::tests::*;\n\n    #[test]\n    fn b() { helper(); }\n}\n"
         );
+    }
+
+    /// **A bare rule is left behind; a titled one names what follows and
+    /// stays.**
+    #[test]
+    fn bare_section_rules_are_dropped() {
+        assert_eq!(
+            drop_bare_rules(
+                "// ──────\n// ── Bans ──\nfn a() {}\n    // ====\n    // a - b\nfn b() {}\n"
+            ),
+            "// ── Bans ──\nfn a() {}\n    // a - b\nfn b() {}\n"
+        );
+        assert_eq!(drop_bare_rules("fn a() {}"), "fn a() {}");
     }
 
     /// **Nothing is moved that the accounting cannot place**: a claim over

@@ -9,7 +9,6 @@
 
 use super::*;
 
-// ────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 pub(super) mod tests {
     // Several tests pin a tuning constant inside a range. The assertion IS the
@@ -40,7 +39,7 @@ pub(super) mod tests {
 
     /// An argmax row reads back one word; a sampled row one per allowed token.
     #[test]
-    pub(in super::super) fn an_allow_row_reads_back_its_index_or_its_probabilities() {
+    fn an_allow_row_reads_back_its_index_or_its_probabilities() {
         assert_eq!(allow_result_words(&allow_row(vec![3, 4, 5], 0.0)), 1);
         assert_eq!(allow_result_words(&allow_row(vec![3, 4, 5], 0.8)), 3);
     }
@@ -48,7 +47,7 @@ pub(super) mod tests {
     /// The host half maps the result back to the allowed token: the argmax's
     /// position, or the only position holding probability.
     #[test]
-    pub(in super::super) fn an_allow_row_finishes_on_its_allowed_token() {
+    fn an_allow_row_finishes_on_its_allowed_token() {
         assert_eq!(
             finish_allow_row(allow_row(vec![3, 4, 5], 0.0), AllowResult::Index(2)).unwrap(),
             5
@@ -71,7 +70,7 @@ pub(super) mod tests {
     /// beside it samples its spike, and each bitmap row its own allowed best: a
     /// bitmap read from the wrong offset takes one row's mask to another.
     #[test]
-    pub(in super::super) fn bitmaps_bind_their_own_rows_in_the_wave_on_cuda() {
+    fn bitmaps_bind_their_own_rows_in_the_wave_on_cuda() {
         let Ok(device) = candle::Device::new_cuda(0) else {
             return;
         };
@@ -103,7 +102,7 @@ pub(super) mod tests {
     /// on the allow-list the bitmap replaces. Prints timings.
     #[test]
     #[ignore = "a timing on a quiet card"]
-    pub(in super::super) fn a_bitmap_costs_a_step_this_much_on_cuda() {
+    fn a_bitmap_costs_a_step_this_much_on_cuda() {
         const VOCAB: usize = 248_077;
         let device = candle::Device::new_cuda(0).expect("a card");
         let sampler = BatchedSampler::new(device.clone(), VOCAB, VOCAB, 32, vec![2].into(), None);
@@ -139,7 +138,7 @@ pub(super) mod tests {
     /// position is never drawn however high its logit, and a row whose mass is
     /// nearly all on one token draws it.
     #[test]
-    pub(in super::super) fn a_sampled_allow_list_row_draws_inside_its_list_on_cuda() {
+    fn a_sampled_allow_list_row_draws_inside_its_list_on_cuda() {
         let Ok(device) = candle::Device::new_cuda(0) else {
             return;
         };

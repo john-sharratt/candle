@@ -10,7 +10,6 @@
 
 use super::*;
 
-// ────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 pub(super) mod tests {
     // Several tests pin a tuning constant inside a range. The assertion IS the
@@ -31,7 +30,7 @@ pub(super) mod tests {
     /// call keeps the model's own token, and the EOS ramp sees a length of 0.
     /// The call's own grammar and the turn's `max_tokens` bound it instead.
     #[test]
-    pub(in super::super) fn writing_a_call_stands_the_length_budget_down() {
+    fn writing_a_call_stands_the_length_budget_down() {
         let sampler = make_sampler();
         let mut config = SamplingConfig::argmax();
         config.graceful_eos_after = 10;
@@ -92,7 +91,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn hard_cap_plays_the_closer_script_to_the_close_token() {
+    fn hard_cap_plays_the_closer_script_to_the_close_token() {
         let config = closer_config();
         let mut state = in_segment_state(8, 42); // past force, mid-sentence
         let mut played = Vec::new();
@@ -111,7 +110,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn graceful_close_at_line_end_skips_the_script() {
+    fn graceful_close_at_line_end_skips_the_script() {
         let config = closer_config();
         // Past graceful (not force), last token IS a line end.
         let mut state = in_segment_state(5, 7);
@@ -127,7 +126,7 @@ pub(super) mod tests {
     /// that is not a line end — the one in `169.254` — leaves the block open;
     /// the close waits for the line to end.
     #[test]
-    pub(in super::super) fn graceful_close_does_not_fire_at_a_period_mid_line() {
+    fn graceful_close_does_not_fire_at_a_period_mid_line() {
         let config = closer_config();
         let mut state = in_segment_state(5, 8);
         assert_eq!(segment_close_override(&config, &mut state), None);
@@ -136,7 +135,7 @@ pub(super) mod tests {
     /// The graceful EOS still accepts a sentence end: an answer that is one
     /// paragraph must not wait for a newline it will never write.
     #[test]
-    pub(in super::super) fn the_answer_ends_at_a_sentence_or_a_line() {
+    fn the_answer_ends_at_a_sentence_or_a_line() {
         let config = closer_config();
         for last in [7, 8] {
             let mut state = make_state();
@@ -149,7 +148,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn continuation_span_gets_the_bare_close_not_the_script() {
+    fn continuation_span_gets_the_bare_close_not_the_script() {
         let config = closer_config();
         let mut state = in_segment_state(8, 42);
         // A span that retires into more content: the steering drops the close
@@ -160,7 +159,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn hard_cap_at_a_completed_sentence_closes_bare() {
+    fn hard_cap_at_a_completed_sentence_closes_bare() {
         let config = closer_config();
         // Past force, but the last token IS a sentence end — the amputation
         // rescue is for dangling fragments only.
@@ -170,7 +169,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn segment_close_override_is_inert_outside_a_segment_or_unconfigured() {
+    fn segment_close_override_is_inert_outside_a_segment_or_unconfigured() {
         let config = closer_config();
         let mut state = in_segment_state(8, 42);
         state.in_segment = false;
@@ -183,7 +182,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn below_both_caps_no_override() {
+    fn below_both_caps_no_override() {
         let config = closer_config();
         let mut state = in_segment_state(3, 7);
         assert_eq!(segment_close_override(&config, &mut state), None);
@@ -192,7 +191,7 @@ pub(super) mod tests {
     /// A call opened inside a think block closes the block first — the opener
     /// is committed as the close — and nowhere else does the opener change.
     #[test]
-    pub(in super::super) fn a_call_opened_inside_a_segment_closes_it_first() {
+    fn a_call_opened_inside_a_segment_closes_it_first() {
         let mut config = closer_config();
         config.tool_call_open_token_id = 70;
         let state = in_segment_state(3, 42);
@@ -220,7 +219,7 @@ pub(super) mod tests {
     /// Through the one authority both sampling paths resolve with: under the
     /// segment budget, a sampled opener inside the block commits as the close.
     #[test]
-    pub(in super::super) fn the_committed_token_for_a_call_inside_a_segment_is_the_close() {
+    fn the_committed_token_for_a_call_inside_a_segment_is_the_close() {
         let sampler = make_sampler();
         let mut config = closer_config();
         config.tool_call_open_token_id = 70;
@@ -229,7 +228,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn hard_cap_without_script_falls_back_to_bare_close() {
+    fn hard_cap_without_script_falls_back_to_bare_close() {
         let mut config = closer_config();
         config.segment_close_script = Vec::new();
         let mut state = in_segment_state(8, 42);
@@ -237,7 +236,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn script_in_flight_overrides_graceful_and_force_conditions() {
+    fn script_in_flight_overrides_graceful_and_force_conditions() {
         let config = closer_config();
         let mut state = in_segment_state(9, 7); // sentence end AND past force
         state.close_script_pos = Some(2);
@@ -248,7 +247,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn segment_close_wins_over_eos_failsafes_for_the_step() {
+    fn segment_close_wins_over_eos_failsafes_for_the_step() {
         let sampler = make_sampler();
         let mut config = closer_config();
         config.forced_eos_after = 5; // far exceeded — EOS wants to fire every step
@@ -285,7 +284,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn segment_boundaries_and_turn_end_cancel_a_stranded_script() {
+    fn segment_boundaries_and_turn_end_cancel_a_stranded_script() {
         let mut state = make_state();
         state.enter_segment();
         state.close_script_pos = Some(1);
@@ -312,7 +311,7 @@ pub(super) mod tests {
     // ── update_segment_state tests ────────────────────────────────────
 
     #[test]
-    pub(in super::super) fn test_open_token_enters_segment() {
+    fn test_open_token_enters_segment() {
         let mut state = make_state();
         let seg_open = 10i32;
         let seg_close = 11i32;
@@ -329,7 +328,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn test_close_token_exits_segment() {
+    fn test_close_token_exits_segment() {
         let mut state = make_state();
         let seg_open = 10i32;
         let seg_close = 11i32;
@@ -353,7 +352,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn test_close_token_without_open_segment_is_noop() {
+    fn test_close_token_without_open_segment_is_noop() {
         let mut state = make_state();
         let seg_open = 10i32;
         let seg_close = 11i32;
@@ -364,7 +363,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn test_segment_tracking_disabled_when_ids_negative() {
+    fn test_segment_tracking_disabled_when_ids_negative() {
         let mut state = make_state();
 
         // -1 means not configured
@@ -382,7 +381,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn test_segment_len_tracks_tokens() {
+    fn test_segment_len_tracks_tokens() {
         let mut state = make_state();
         let seg_open = 10i32;
         let seg_close = 11i32;

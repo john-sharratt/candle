@@ -12,7 +12,9 @@ use std::path::Path;
 
 use crate::layout::layout;
 
-/// The digest of every `.rs` file in `dir` but `mod.rs`, by file name.
+/// The digest of every `.rs` file in `dir` by file name, `mod.rs` last: its
+/// own doc as it stands, what it keeps, and the files of the module — what the
+/// module's overview is written from, once each file's doc is.
 pub fn digest_dir(dir: &Path) -> Result<String, String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
@@ -22,13 +24,40 @@ pub fn digest_dir(dir: &Path) -> Result<String, String> {
         .collect();
     names.sort();
     let mut out = String::new();
-    for name in names {
-        let path = dir.join(&name);
+    for name in &names {
+        let path = dir.join(name);
         let source = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         out.push_str(&format!("=== {name}\n"));
         out.push_str(&digest(&source)?);
         out.push('\n');
     }
+    let mod_rs = dir.join("mod.rs");
+    if let Ok(source) = fs::read_to_string(&mod_rs) {
+        out.push_str(&module_digest(&source, &names)?);
+    }
+    Ok(out)
+}
+
+/// `mod.rs`'s digest: the module doc it carries now, the items it keeps, and
+/// the module's files.
+pub fn module_digest(source: &str, files: &[String]) -> Result<String, String> {
+    let mut out = String::from("=== mod.rs\n  module doc now:\n");
+    for line in source
+        .lines()
+        .map(str::trim)
+        .take_while(|l| l.starts_with("//!") || l.is_empty())
+        .filter_map(|l| l.strip_prefix("//!"))
+    {
+        out.push_str(&format!("    {}\n", line.trim()));
+    }
+    let kept = digest(source)?;
+    if !kept.is_empty() {
+        out.push_str("  keeps:\n");
+        for line in kept.lines() {
+            out.push_str(&format!("    {line}\n"));
+        }
+    }
+    out.push_str(&format!("  files: {}\n", files.join(", ")));
     Ok(out)
 }
 
@@ -85,6 +114,18 @@ fn push_comments(out: &mut String, text: &str, indent: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **`mod.rs` gives its doc as it stands, what it keeps, and the files.**
+    #[test]
+    fn the_module_digest_names_its_doc_and_files() {
+        let src =
+            "//! A sampler.\n//!\n//! It samples.\n\nmod a;\nmod b;\n\n/// Shared.\nstruct S;\n";
+        assert_eq!(
+            module_digest(src, &["a.rs".into(), "b.rs".into()]).unwrap(),
+            "=== mod.rs\n  module doc now:\n    A sampler.\n    \n    It samples.\n  keeps:\n    struct S\n      Shared.\n  \
+             files: a.rs, b.rs\n"
+        );
+    }
 
     /// **A digest is each item's name and every comment on it and in it** —
     /// docs and inline comments alike, no code.

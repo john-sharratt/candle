@@ -7,7 +7,6 @@
 
 use super::*;
 
-// ────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 pub(super) mod tests {
     // Several tests pin a tuning constant inside a range. The assertion IS the
@@ -68,8 +67,6 @@ pub(super) mod tests {
         }
         rows
     }
-
-    // ── Per-row stencil / banned-token masking ─────────────────────────
 
     /// Build a `[batch, VOCAB]` logits tensor from per-row spikes.
     pub(in super::super) fn logits_from_rows(rows: &[&[(usize, f32)]]) -> Tensor {

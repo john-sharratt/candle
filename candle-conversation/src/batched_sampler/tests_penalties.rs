@@ -10,7 +10,6 @@
 
 use super::*;
 
-// ────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 pub(super) mod tests {
     // Several tests pin a tuning constant inside a range. The assertion IS the
@@ -30,7 +29,7 @@ pub(super) mod tests {
     /// the deliberating row token 90 and the narrator row -1 — the exact bleed
     /// `SeqDials` exists to remove, and the one a scalar `configs[0]` reintroduced.
     #[test]
-    pub(in super::super) fn seq_dials_carry_each_rows_own_segment_close_token() {
+    fn seq_dials_carry_each_rows_own_segment_close_token() {
         let mut deliberating = SamplingConfig::argmax();
         deliberating.temperature = 0.7;
         deliberating.segment_close_boost = 3.0;
@@ -73,7 +72,7 @@ pub(super) mod tests {
     /// whole segment-close path is gated off (token id -1), so a co-batched row
     /// with it genuinely on is unaffected.
     #[test]
-    pub(in super::super) fn seq_dials_gate_segment_close_off_when_token_missing() {
+    fn seq_dials_gate_segment_close_off_when_token_missing() {
         let mut c = SamplingConfig::argmax();
         c.segment_close_boost = 5.0;
         c.segment_close_token_id = -1; // boost set, but no token to boost
@@ -88,7 +87,7 @@ pub(super) mod tests {
     // ── Tool-call penalty suppression ──────────────────────────────────
 
     #[test]
-    pub(in super::super) fn tool_call_row_penalty_state_is_zeroed_and_think_row_is_not() {
+    fn tool_call_row_penalty_state_is_zeroed_and_think_row_is_not() {
         let sampler = make_sampler();
         let mut in_call = make_state();
         let mut thinking = make_state();
@@ -135,7 +134,7 @@ pub(super) mod tests {
     /// one that does not, stamps nothing the first time and its counts, window
     /// and DRY span the second.
     #[test]
-    pub(in super::super) fn an_unpenalized_step_reads_no_history_and_the_next_step_does() {
+    fn an_unpenalized_step_reads_no_history_and_the_next_step_does() {
         let sampler = make_sampler();
         let mut state = make_state();
         // Five tokens of one free-text value: the first opens it.
@@ -173,7 +172,7 @@ pub(super) mod tests {
     /// entering one starts it at the token that opened it; it counts only that
     /// value's tokens; leaving empties it, and the next value starts afresh.
     #[test]
-    pub(in super::super) fn dry_sees_only_the_value_being_written() {
+    fn dry_sees_only_the_value_being_written() {
         let sampler = make_sampler();
         let config = window_16().with_dry_penalty(0.8, 1.75, 4, 512);
         let mut state = make_state();
@@ -227,7 +226,7 @@ pub(super) mod tests {
     /// **The repeat penalty flips with DRY**: a row inside a free-text value
     /// samples on the config's DRY-time penalty, any other row on its own.
     #[test]
-    pub(in super::super) fn the_repeat_penalty_a_row_samples_on_flips_with_dry() {
+    fn the_repeat_penalty_a_row_samples_on_flips_with_dry() {
         let sampler = make_sampler();
         let config = SamplingConfig {
             repeat_penalty: 1.05,
@@ -257,7 +256,7 @@ pub(super) mod tests {
     /// With the cross-turn penalty off, the cross table is never read, so
     /// nothing is gathered for it.
     #[test]
-    pub(in super::super) fn the_cross_turn_table_is_gathered_only_when_its_penalty_is_on() {
+    fn the_cross_turn_table_is_gathered_only_when_its_penalty_is_on() {
         let sampler = make_sampler();
         let mut state = make_state();
         state.record_token(7, MAX_RECENT);
@@ -272,7 +271,7 @@ pub(super) mod tests {
     /// the device table is stamped from, so a token missing from them is a
     /// penalty silently not applied.
     #[test]
-    pub(in super::super) fn the_sparse_indexes_track_the_nonzero_counts_across_turns() {
+    fn the_sparse_indexes_track_the_nonzero_counts_across_turns() {
         fn nonzero(counts: &[i32]) -> Vec<u32> {
             (0..counts.len() as u32)
                 .filter(|&t| counts[t as usize] > 0)

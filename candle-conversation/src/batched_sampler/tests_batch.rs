@@ -9,7 +9,6 @@
 
 use super::*;
 
-// ────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 pub(super) mod tests {
     // Several tests pin a tuning constant inside a range. The assertion IS the
@@ -32,7 +31,7 @@ pub(super) mod tests {
     /// sampled allow-list rows: the clean one spread over its allowed tokens,
     /// the other NaN throughout, as a forward gone bad leaves it.
     #[test]
-    pub(in super::super) fn a_batch_failed_by_a_nan_row_leaves_the_clean_rows_state_untouched() {
+    fn a_batch_failed_by_a_nan_row_leaves_the_clean_rows_state_untouched() {
         let sampler = make_sampler();
         let config = sampled_config(7).with_stencil(vec![10, 20, 30]);
         let clean = logits_from_rows(&[&[(10, 2.0), (20, 2.2), (30, 1.9)]]);
@@ -64,7 +63,7 @@ pub(super) mod tests {
     /// CUDA when a card is present — the path the deferral is for — and on the
     /// CPU path always.
     #[test]
-    pub(in super::super) fn deferred_allow_list_rows_land_in_their_own_rows() {
+    fn deferred_allow_list_rows_land_in_their_own_rows() {
         let mut devices = vec![Device::Cpu];
         devices.extend(Device::new_cuda(0).ok());
         let first = SamplingConfig::argmax().with_stencil(vec![10, 20]);
@@ -106,7 +105,7 @@ pub(super) mod tests {
     /// first two rows of the block (which would give 70 and row 1's peak, 60).
     /// Every row peaks at a different token so a misread row cannot pass.
     #[test]
-    pub(in super::super) fn free_rows_beside_a_constrained_one_sample_their_own_logits() {
+    fn free_rows_beside_a_constrained_one_sample_their_own_logits() {
         let free = SamplingConfig::argmax();
         let constrained = SamplingConfig::argmax().with_stencil(vec![10, 20]);
         for device in devices() {
@@ -142,7 +141,7 @@ pub(super) mod tests {
     /// largest logit by far. Neither the argmax nor a sample may produce it,
     /// and a draft naming it is not accepted.
     #[test]
-    pub(in super::super) fn the_padded_tail_of_a_row_is_never_produced() {
+    fn the_padded_tail_of_a_row_is_never_produced() {
         for device in devices() {
             let sampler = make_sampler_on(&device, 50);
             let logits = logits_from_rows(&[&[(5, 20.0), (7, 20.0 + 0.25f32.ln()), (60, 90.0)]])

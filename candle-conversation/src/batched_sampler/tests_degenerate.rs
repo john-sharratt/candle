@@ -11,7 +11,6 @@
 
 use super::*;
 
-// ────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 pub(super) mod tests {
     // Several tests pin a tuning constant inside a range. The assertion IS the
@@ -28,7 +27,7 @@ pub(super) mod tests {
     /// A run of token 0 is counted, and any other token clears it — the guard
     /// must fire on a *consecutive* run, not on token 0 being frequent.
     #[test]
-    pub(in super::super) fn degenerate_run_counts_consecutive_zero_tokens() {
+    fn degenerate_run_counts_consecutive_zero_tokens() {
         let mut st = SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT);
         assert_eq!(st.degenerate_run, 0);
         for expected in 1..=DEGENERATE_TOKEN_RUN {
@@ -48,7 +47,7 @@ pub(super) mod tests {
 
     /// The run is per-turn: a fresh turn must not inherit a previous turn's tail.
     #[test]
-    pub(in super::super) fn degenerate_run_resets_at_turn_end() {
+    fn degenerate_run_resets_at_turn_end() {
         let mut st = SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT);
         for _ in 0..DEGENERATE_TOKEN_RUN {
             st.record_token(0, MAX_RECENT);
@@ -65,7 +64,7 @@ pub(super) mod tests {
     /// as an answer in production. A draft rewound past the bar unmarks it;
     /// the next turn starts unmarked.
     #[test]
-    pub(in super::super) fn crossing_the_degenerate_bar_marks_the_turn_until_it_ends() {
+    fn crossing_the_degenerate_bar_marks_the_turn_until_it_ends() {
         let mut st = SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT);
         for _ in 0..DEGENERATE_TOKEN_RUN - 1 {
             st.record_token(0, MAX_RECENT);
@@ -95,7 +94,7 @@ pub(super) mod tests {
     /// tells no act from any other. With a window, a turn that leaves takes its
     /// tokens with it.
     #[test]
-    pub(in super::super) fn the_cross_turn_window_forgets_turns_that_fall_out_of_it() {
+    fn the_cross_turn_window_forgets_turns_that_fall_out_of_it() {
         let mut st = SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT);
         for tok in [3u32, 4, 5] {
             st.record_token(tok, MAX_RECENT);
@@ -111,7 +110,7 @@ pub(super) mod tests {
 
     /// A token used again is still penalised until its *last* use leaves.
     #[test]
-    pub(in super::super) fn a_token_used_again_stays_counted_until_its_last_use_leaves() {
+    fn a_token_used_again_stays_counted_until_its_last_use_leaves() {
         let mut st = SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT);
         for tok in [3u32, 3, 4] {
             st.record_token(tok, MAX_RECENT);
@@ -129,7 +128,7 @@ pub(super) mod tests {
     /// `0` keeps every turn, which is what every caller that sets no window —
     /// all of them with the penalty off — has always had.
     #[test]
-    pub(in super::super) fn a_zero_window_remembers_every_turn() {
+    fn a_zero_window_remembers_every_turn() {
         let mut st = SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT);
         for tok in [3u32, 4, 5, 6] {
             st.record_token(tok, MAX_RECENT);
@@ -147,7 +146,7 @@ pub(super) mod tests {
     /// `end_turn` also runs at a conversation's first decode with nothing
     /// sampled yet. That must not use up a slot.
     #[test]
-    pub(in super::super) fn a_turn_that_sampled_nothing_takes_no_slot() {
+    fn a_turn_that_sampled_nothing_takes_no_slot() {
         let mut st = SequenceSamplingState::new(VOCAB_SIZE, MAX_RECENT);
         st.record_token(3, MAX_RECENT);
         st.end_turn(1);
@@ -158,7 +157,7 @@ pub(super) mod tests {
     /// The bar has to be low enough to stop a broken forward promptly, and high
     /// enough that ordinary text can never reach it.
     #[test]
-    pub(in super::super) fn degenerate_run_bar_is_small_but_out_of_language_range() {
+    fn degenerate_run_bar_is_small_but_out_of_language_range() {
         assert!(
             DEGENERATE_TOKEN_RUN >= 4,
             "must tolerate a brief coincidence"
@@ -181,7 +180,7 @@ pub(super) mod tests {
     /// polluted retrieval. Asserting on `resolve` is what keeps the guard
     /// device-independent: there is no second copy to be missing from.
     #[test]
-    pub(in super::super) fn degenerate_run_forces_eos_on_the_resolver_both_paths_share() {
+    fn degenerate_run_forces_eos_on_the_resolver_both_paths_share() {
         let sampler = make_sampler();
         let config = SamplingConfig::argmax();
         let mut state = make_state();
@@ -213,7 +212,7 @@ pub(super) mod tests {
     // ── EOS failsafe override tests ────────────────────────────────────
 
     #[test]
-    pub(in super::super) fn test_forced_eos_after_overrides_token() {
+    fn test_forced_eos_after_overrides_token() {
         let sampler = make_sampler();
         let config = SamplingConfig::argmax().with_eos_failsafe(0, 10);
         let mut state = make_state();
@@ -242,7 +241,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn test_graceful_eos_after_overrides_token() {
+    fn test_graceful_eos_after_overrides_token() {
         let sampler = make_sampler();
         let config = SamplingConfig::argmax().with_eos_failsafe(5, 0);
         let mut state = make_state();
@@ -268,7 +267,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn test_eos_failsafe_disabled_when_zero() {
+    fn test_eos_failsafe_disabled_when_zero() {
         let sampler = make_sampler();
         let config = SamplingConfig::argmax(); // both 0 = disabled
         let mut state = make_state();
@@ -290,7 +289,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn test_eos_failsafe_below_threshold_no_override() {
+    fn test_eos_failsafe_below_threshold_no_override() {
         let sampler = make_sampler();
         let config = SamplingConfig::argmax().with_eos_failsafe(100, 200);
         let mut state = make_state();
@@ -313,7 +312,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn test_eos_failsafe_records_eos_token_in_state() {
+    fn test_eos_failsafe_records_eos_token_in_state() {
         let sampler = make_sampler();
         let config = SamplingConfig::argmax().with_eos_failsafe(5, 10);
         let mut state = make_state();

@@ -9,7 +9,6 @@
 
 use super::*;
 
-// ────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 pub(super) mod tests {
     // Several tests pin a tuning constant inside a range. The assertion IS the
@@ -30,7 +29,7 @@ pub(super) mod tests {
     /// draft clears it. `[0.9, 0.05, 0.05]` has entropy 0.3944, the bar is again
     /// 0.09, and a 0.05 draft does not.
     #[test]
-    pub(in super::super) fn typical_rule_accepts_on_mass_against_the_entropy_bar() {
+    fn typical_rule_accepts_on_mass_against_the_entropy_bar() {
         let ln = |ps: &[f32]| ps.iter().map(|p| p.ln()).collect::<Vec<f32>>();
         let m = TypicalAcceptance::MEDUSA;
         let accepts =
@@ -52,7 +51,7 @@ pub(super) mod tests {
     /// 2 keeps the same two: the draft is outside either, has probability zero,
     /// and is not accepted — exactly as the kernel decides it.
     #[test]
-    pub(in super::super) fn typical_rule_is_measured_over_the_truncated_distribution() {
+    fn typical_rule_is_measured_over_the_truncated_distribution() {
         let row: Vec<f32> = [0.5f32, 0.3, 0.2].iter().map(|p| p.ln()).collect();
         let m = TypicalAcceptance::MEDUSA;
         assert!(typical_accepts_row(&row, 1.0, 0, 1.0, 2, m));
@@ -126,7 +125,7 @@ pub(super) mod tests {
     /// history on and sampling at temperature 0.8. Scoring alone leaves the
     /// state untouched.
     #[test]
-    pub(in super::super) fn a_block_scored_in_one_dispatch_commits_what_a_walk_does() {
+    fn a_block_scored_in_one_dispatch_commits_what_a_walk_does() {
         const ROWS: usize = 5;
         for device in devices() {
             let sampler = make_sampler_on(&device, VOCAB_SIZE);
@@ -187,7 +186,7 @@ pub(super) mod tests {
     /// it: the row that tests it commits the model's own pick, and the state is
     /// the one that pick leaves.
     #[test]
-    pub(in super::super) fn a_rejected_draft_stops_the_block_where_the_walk_stops() {
+    fn a_rejected_draft_stops_the_block_where_the_walk_stops() {
         for device in devices() {
             let sampler = make_sampler_on(&device, VOCAB_SIZE);
             let block = walk_logits(3).to_device(&device).expect("logits");
@@ -234,7 +233,7 @@ pub(super) mod tests {
     /// state's length, the third draft would be committed as EOS, so the rows
     /// after it are unreachable.
     #[test]
-    pub(in super::super) fn a_position_behind_a_forced_token_scores_unreachable() {
+    fn a_position_behind_a_forced_token_scores_unreachable() {
         let sampler = make_sampler();
         let mut config = penalised(3);
         let mut state = walked_state();
@@ -261,7 +260,7 @@ pub(super) mod tests {
     /// including the ~80% whose sample lands on 5. The sample is still drawn,
     /// so the row's RNG advances exactly as a plain row's.
     #[test]
-    pub(in super::super) fn a_draft_over_the_bar_is_committed_whatever_the_sample() {
+    fn a_draft_over_the_bar_is_committed_whatever_the_sample() {
         for device in devices() {
             let sampler = make_sampler_on(&device, VOCAB_SIZE);
             let logits = verify_row_logits().to_device(&device).expect("logits");
@@ -279,7 +278,7 @@ pub(super) mod tests {
     /// Across 32 seeds both turn up, which a correction pinned to the argmax
     /// could never produce.
     #[test]
-    pub(in super::super) fn a_draft_under_the_bar_commits_the_sample() {
+    fn a_draft_under_the_bar_commits_the_sample() {
         for device in devices() {
             let sampler = make_sampler_on(&device, VOCAB_SIZE);
             let logits = verify_row_logits().to_device(&device).expect("logits");
@@ -298,7 +297,7 @@ pub(super) mod tests {
     /// point mass on its argmax, so a 0.2 draft is not accepted and the row
     /// commits 5.
     #[test]
-    pub(in super::super) fn at_temperature_zero_only_the_argmax_is_committed() {
+    fn at_temperature_zero_only_the_argmax_is_committed() {
         for device in devices() {
             let sampler = make_sampler_on(&device, VOCAB_SIZE);
             let logits = verify_row_logits().to_device(&device).expect("logits");

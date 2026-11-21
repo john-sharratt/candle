@@ -8,7 +8,6 @@
 
 use super::*;
 
-// ────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 pub(super) mod tests {
     // Several tests pin a tuning constant inside a range. The assertion IS the
@@ -23,7 +22,7 @@ pub(super) mod tests {
     use super::super::tests_helpers::tests::*;
 
     #[test]
-    pub(in super::super) fn single_token_stencil_forces_that_token() {
+    fn single_token_stencil_forces_that_token() {
         // Token 90 dominates, but the stencil allows only 33 — it must win.
         let sampler = make_sampler();
         let config = SamplingConfig::argmax().with_stencil(vec![33]);
@@ -38,7 +37,7 @@ pub(super) mod tests {
     /// A row held off the span samples by name: a bitmap reads back as exactly
     /// its tokens.
     #[test]
-    pub(in super::super) fn a_bitmap_reads_back_as_its_tokens() {
+    fn a_bitmap_reads_back_as_its_tokens() {
         assert_eq!(
             tokens_of(&[0x8000_0001, 0, 1 << 3]),
             vec![0, 31, 67],
@@ -49,7 +48,7 @@ pub(super) mod tests {
 
     /// A row under a bitmap draws its best allowed token, on the host path.
     #[test]
-    pub(in super::super) fn a_row_under_a_bitmap_draws_inside_it() {
+    fn a_row_under_a_bitmap_draws_inside_it() {
         let sampler = make_sampler();
         let mut config = SamplingConfig::argmax();
         config.allowed_bits = Some(bits_of(&[10, 20]));
@@ -62,7 +61,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn stencil_picks_best_within_allow_list() {
+    fn stencil_picks_best_within_allow_list() {
         // Global best (50) is outside the stencil; best *inside* {10,20} is 20.
         let sampler = make_sampler();
         let config = SamplingConfig::argmax().with_stencil(vec![10, 20]);
@@ -75,7 +74,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn banned_token_excluded() {
+    fn banned_token_excluded() {
         let sampler = make_sampler();
         let mut config = SamplingConfig::argmax();
         config.banned_tokens = vec![50];
@@ -95,7 +94,7 @@ pub(super) mod tests {
     /// its token. On CUDA when a card is present — the path that had the defect
     /// — and on the CPU path always.
     #[test]
-    pub(in super::super) fn a_row_s_ban_stays_in_its_row_in_a_shared_launch() {
+    fn a_row_s_ban_stays_in_its_row_in_a_shared_launch() {
         let mut devices = vec![Device::Cpu];
         devices.extend(Device::new_cuda(0).ok());
         let free = SamplingConfig::argmax();
@@ -128,7 +127,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn stencil_and_banned_combine() {
+    fn stencil_and_banned_combine() {
         // Stencil {10,20,30}; 30 is best but banned → 20 wins.
         let sampler = make_sampler();
         let mut config = SamplingConfig::argmax().with_stencil(vec![10, 20, 30]);
@@ -142,7 +141,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn empty_stencil_is_unconstrained() {
+    fn empty_stencil_is_unconstrained() {
         let sampler = make_sampler();
         let config = SamplingConfig::argmax(); // no stencil, no bans
         let mut state = make_state();
@@ -154,7 +153,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn per_row_stencils_are_independent() {
+    fn per_row_stencils_are_independent() {
         // Two stenciled rows with disjoint allow-lists; the shared global best
         // (50) is outside both and must be masked in each.
         let sampler = make_sampler();
@@ -173,7 +172,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn mixed_batch_stencils_only_its_own_row() {
+    fn mixed_batch_stencils_only_its_own_row() {
         // THE per-row property the global-config kernel lacks: row 0 is forced
         // to token 10 while row 1 (free) keeps its global best 90 — the stencil
         // must not leak across rows.
@@ -190,7 +189,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    pub(in super::super) fn allow_list_gather_stays_in_set_under_temperature() {
+    fn allow_list_gather_stays_in_set_under_temperature() {
         // Stochastic sampling (temperature > 0) over the gathered allow-list must
         // never escape it, across many seeds.
         let sampler = make_sampler();
