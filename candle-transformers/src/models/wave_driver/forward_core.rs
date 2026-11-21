@@ -386,13 +386,16 @@ pub(super) fn forward_core<S: WaveSweep + ?Sized>(
     // the time this waits on it. That is the whole difference from a probe that
     // reads a scalar back per checkpoint: one fence at the end of a wave rather
     // than a hundred inside it.
+    //
+    // **The slots are read on the model's device, not an input's.** The
+    // inputs are token ids, which live on the host (the embedding lookup is a
+    // CPU `index_select`), so a drain of the first input's device drained the
+    // CPU: it read no sites, reset none, and every probe of every wave on
+    // WhiteWorld folded into slots nothing ever looked at while NaN logits
+    // were refused downstream of them.
     #[cfg(feature = "tensor-assert")]
     {
-        let dev = decode_inputs
-            .first()
-            .or_else(|| prefill_inputs.first())
-            .or_else(|| glue_inputs.first())
-            .map(|t| t.device().clone());
+        let dev = Some(model.device().clone()).filter(|d| d.is_cuda());
         if let Some(dev) = dev {
             let bad = candle::tensor_assert::report(&dev)?;
             if !bad.is_empty() {
