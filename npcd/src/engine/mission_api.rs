@@ -123,9 +123,7 @@ pub async fn lodge(
         });
         todo = steps_named_in(&prompt, &rooms, &machines, &people);
     }
-    if !todo.is_empty() {
-        todo.push(Todo::report("go back to the table and report it"));
-    }
+    close_with_report(&mut todo);
     let steps = todo.len();
     let mission = Mission::new(
         &prompt,
@@ -664,6 +662,26 @@ pub async fn discard_pool(
         .into_response()
 }
 
+/// End a lodged mission's steps with its report back.
+///
+/// **A last step that already reports is the report.** Given "… go back to the
+/// table in the watch room and report it" as its last step, a mission was handed
+/// a second "go back to the table and report it" after it: the carrier was told
+/// to report twice, and the engine signed the report off only on the one it
+/// appended. So a last step that speaks of reporting is marked as the report,
+/// and only a mission whose steps never say so is given one. No steps, no
+/// report: a mission carried on its ask alone has nothing to sign off.
+fn close_with_report(todo: &mut Vec<Todo>) {
+    let Some(last) = todo.last_mut() else {
+        return;
+    };
+    if last.text.to_lowercase().contains("report") {
+        last.reports = true;
+        return;
+    }
+    todo.push(Todo::report("go back to the table and report it"));
+}
+
 /// What a name in a brief is.
 #[derive(Clone, Copy)]
 enum Named {
@@ -744,7 +762,31 @@ fn mission_view(m: &Mission) -> MissionView {
 
 #[cfg(test)]
 mod tests {
-    use super::{mission_view, steps_named_in};
+    use super::{close_with_report, mission_view, steps_named_in};
+
+    /// **Steps that end in a report are given no second one**; steps that do
+    /// not are closed with one, and no steps are left with none.
+    #[test]
+    fn a_mission_is_closed_with_one_report() {
+        let mut given = vec![
+            Todo::new("go to the dispatch room"),
+            Todo::new("go back to the table in the watch room and report it"),
+        ];
+        close_with_report(&mut given);
+        assert_eq!(given.len(), 2, "a second report was appended");
+        assert!(given[1].reports, "the given report step is not the report");
+        assert!(!given[0].reports);
+
+        let mut drawn = vec![Todo::new("go to the plant room")];
+        close_with_report(&mut drawn);
+        assert_eq!(drawn.len(), 2);
+        assert_eq!(drawn[1].text, "go back to the table and report it");
+        assert!(drawn[1].reports);
+
+        let mut none: Vec<Todo> = Vec::new();
+        close_with_report(&mut none);
+        assert!(none.is_empty());
+    }
 
     /// A brief with no steps is given a journey to each room and a finding of
     /// each person it names, in its own order — the longer room name winning
