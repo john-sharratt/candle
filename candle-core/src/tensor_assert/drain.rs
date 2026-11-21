@@ -10,6 +10,8 @@
 //! first; the kernel's `seq` ticket does. A drained report sorted by `seq` reads
 //! as: this is where it started, and everything below is downstream of it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::cuda_backend::DeviceId;
 use crate::{Device, Result};
 
@@ -106,6 +108,13 @@ pub fn drain(device: &Device) -> Result<Vec<Finding>> {
 pub fn report(device: &Device) -> Result<Vec<Finding>> {
     let all = drain(device)?;
     if !all.iter().any(Finding::is_bad) {
+        static CLEAN: AtomicU64 = AtomicU64::new(0);
+        let n = CLEAN.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(HEARTBEAT_EVERY) {
+            if let Some(line) = heartbeat(n, &all) {
+                tracing::info!(target: "candle_core::tensor_assert", "{line}");
+            }
+        }
         return Ok(Vec::new());
     }
     let bad: Vec<Finding> = all.iter().filter(|f| f.is_bad()).cloned().collect();
@@ -135,6 +144,33 @@ pub fn report(device: &Device) -> Result<Vec<Finding>> {
     Ok(bad)
 }
 
+/// How many clean drains pass between two heartbeats.
+const HEARTBEAT_EVERY: u64 = 1000;
+
+/// The heartbeat of a drain that found nothing: how many clean drains so far,
+/// how many sites this one read and how many elements they had examined, and
+/// the site whose finite values ran widest — `None` when no site was read.
+///
+/// **A silent instrument has to say it is listening.** A diagnostic motherd on
+/// WhiteWorld refused a NaN logit while every probe stayed quiet, and nothing
+/// told "every site read finite" apart from "no site was ever read". The range
+/// is the other half: a widest site creeping towards f16's ceiling is an
+/// overflow story before any value goes non-finite.
+fn heartbeat(clean: u64, all: &[Finding]) -> Option<String> {
+    let elems: u64 = all.iter().map(|f| u64::from(f.elems)).sum();
+    let reach = |f: &Finding| match (f.min, f.max) {
+        (Some(lo), Some(hi)) => lo.abs().max(hi.abs()),
+        _ => 0.0,
+    };
+    let widest = all.iter().max_by(|a, b| reach(a).total_cmp(&reach(b)))?;
+    Some(format!(
+        "tensor_assert: {clean} clean drains — this one read {} sites over {elems} elements; \
+         widest {}",
+        all.len(),
+        widest
+    ))
+}
+
 /// The device a drain would read, for callers that only hold a [`DeviceId`].
 pub fn is_registered(dev: DeviceId, device: &Device) -> bool {
     matches!(device, Device::Cuda(d) if d.id() == dev)
@@ -148,7 +184,38 @@ pub fn find(device: &Device, name: &str) -> Result<Option<Finding>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{to_finding, Finding};
+    use super::{heartbeat, to_finding, Finding};
+
+    fn site(name: &str, min: f32, max: f32, elems: u32) -> Finding {
+        Finding {
+            name: name.into(),
+            seq: None,
+            nan: 0,
+            inf: 0,
+            min: Some(min),
+            max: Some(max),
+            elems,
+        }
+    }
+
+    /// **A clean drain's heartbeat names the sites read and the widest one**,
+    /// by its largest magnitude either side of zero — and says nothing when no
+    /// site was read at all.
+    #[test]
+    fn a_heartbeat_names_the_sites_and_the_widest() {
+        let all = [
+            site("q4e.mix.y.L3", -2.0, 3.0, 100),
+            site("q4e.post_moe.res.L19", -40.0, 7.0, 200),
+        ];
+        assert_eq!(
+            heartbeat(2000, &all).as_deref(),
+            Some(
+                "tensor_assert: 2000 clean drains — this one read 2 sites over 300 elements; \
+                 widest #- q4e.post_moe.res.L19: nan=0 inf=0 of 200 finite=[-4e1, 7e0]"
+            )
+        );
+        assert_eq!(heartbeat(1000, &[]), None);
+    }
     use crate::tensor_assert::names::slot_for;
     use crate::tensor_assert::slots::AssertSlot;
 
