@@ -1173,6 +1173,10 @@ impl GalleryArena {
             // both. Timing events: `None` flags would make them untimed.
             let ev_start = stream.record_event(Some(CU_EVENT_DEFAULT)).ok();
             let mut launched = false;
+            // The rungs whose host-side gate declined, named if none launched.
+            let mut declined: Vec<PagedBackend> = Vec::new();
+            // The rungs that failed on the device: backend, stage, CUDA error.
+            let mut failed = Vec::new();
             for &backend in &candidates {
                 match backend {
                     PagedBackend::Bmma | PagedBackend::Imma => {
@@ -1224,6 +1228,7 @@ impl GalleryArena {
                                 target: "candle_conversation::provenance",
                                 "paged scan: {backend:?} gate declined, next rung"
                             );
+                            declined.push(backend);
                             continue;
                         }
                         // Negative rc: a CUDA error mid-sequence — work may
@@ -1249,6 +1254,7 @@ impl GalleryArena {
                             n_cases,
                             "paged scan: launch failed; draining and trying next rung"
                         );
+                        failed.push((backend, stage_name, cuda_err));
                         continue;
                     }
                     PagedBackend::Scalar => {
@@ -1294,9 +1300,10 @@ impl GalleryArena {
                 }
             }
             if !launched {
-                return Err(candle::Error::Msg(
-                    "paged scan: no backend available for this device/geometry".into(),
-                ));
+                return Err(candle::Error::Msg(format!(
+                    "paged scan: no backend available for this device/geometry \
+                     (declined: {declined:?}, failed: {failed:?}, of {candidates:?})"
+                )));
             }
             profile::record("arena:launch_enqueue", t_kernel.elapsed());
             // The kernel's time is the events', so nothing waits for it alone:
@@ -2637,6 +2644,91 @@ mod tests {
         WideQSig {
             n_heads: 12,
             words: (0..24).map(|_| xorshift(state)).collect(),
+        }
+    }
+
+    /// **A segment of hundreds of cases, its agreements tied across them,
+    /// votes on every backend as the scalar kernel's one ascending pass
+    /// does.** The tensor finalize reads a segment's cases a warp at a time,
+    /// each lane every 32nd, and merges the lanes' best cases; the 700 cases
+    /// here are five turns repeated, so every agreement is shared by ~140
+    /// cases spread over every lane, and only the pass's tie order — the lowest
+    /// case first — picks the leader, the runner-up and the top-8. Bit for bit,
+    /// at one vote and at top-8.
+    #[test]
+    fn a_wide_segment_with_tied_cases_votes_as_the_scalar_pass() {
+        let device = match Device::new_cuda(0) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let _pool = gallery_pool();
+        let arena = GalleryArena::new(&device, 24, 3).unwrap();
+        let (has_bmma, has_imma) = arena.tensor_caps();
+        let mut rng = 0x71ED_CA5E_u64;
+        let mut turns: Vec<Vec<WideQSig>> = (0..5)
+            .map(|i| (0..(3 + 9 * i)).map(|_| rand_sig(&mut rng)).collect())
+            .collect();
+        // A probe whose tokens one case alone holds, deep in a high lane's
+        // stride: its leader is case 613, not one of the first lanes'.
+        let exact: Vec<WideQSig> = (0..4).map(|_| rand_sig(&mut rng)).collect();
+        turns.push(exact.clone());
+        const CASES: usize = 700;
+        const PLANTED: usize = 613;
+        let top_8 = VoteLaw {
+            top_k: 8,
+            power: 0.5,
+        };
+        let probe: Vec<WideQSig> = (0..41).map(|_| rand_sig(&mut rng)).collect();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for law in [VoteLaw::SINGLE, top_8] {
+            let seg = PagedSegment {
+                windows: (0..CASES)
+                    .map(|case| {
+                        let ti = if case == PLANTED { 5 } else { (case * 7) % 5 };
+                        PagedWindow {
+                            sid: turn_stream_id(9_100, ti as u32),
+                            fingerprint: ti as u64,
+                            turn: (&turns[ti]).into(),
+                            start: 0,
+                            end: turns[ti].len(),
+                            case,
+                        }
+                    })
+                    .collect(),
+                n_cases: CASES,
+                holder: Holder::Shared,
+                groups: GroupSet::all(3),
+                keep: Keep::All,
+                law,
+            };
+            let segs = [seg];
+            let probes = [probe.as_slice(), exact.as_slice()];
+            let weights = [0.5f32, 1.0, 2.0];
+            let scalar = arena
+                .scan_weighted_scalar(&segs, &probes, &weights)
+                .unwrap();
+            assert!(
+                scalar[1].iter().any(|&v| v > 0.0),
+                "{law:?}: the exact probe scores"
+            );
+            if has_bmma {
+                let bmma = arena.scan_weighted_bmma(&segs, &probes, &weights).unwrap();
+                for p in 0..probes.len() {
+                    assert_eq!(bits(&bmma[p]), bits(&scalar[p]), "{law:?} probe {p}: BMMA");
+                }
+            }
+            if has_imma {
+                let imma = arena.scan_weighted_imma(&segs, &probes, &weights).unwrap();
+                for p in 0..probes.len() {
+                    assert_eq!(bits(&imma[p]), bits(&scalar[p]), "{law:?} probe {p}: IMMA");
+                }
+            }
+            // The raw rows too: which cases each token voted for, in order.
+            let raw = arena.scan_votes(&segs, &probes).unwrap();
+            assert!(
+                raw.case.contains(&(PLANTED as i32)),
+                "{law:?}: the planted case leads its probe"
+            );
         }
     }
 

@@ -651,7 +651,8 @@ extern "C" int run_imma_bdp_scan(
                     d_max, d_sum, d_sq, seg_case_start, nq, n_groups, n_segments, n_cases,
                     out_stats + stats_at);
             } else {
-                bdp_bmma_finalize_kernel<<<blocks, 256, 0, s>>>(
+                // A warp a row: eight rows a 256-thread block.
+                bdp_bmma_finalize_kernel<<<(total + 7) / 8, 256, 0, s>>>(
                     d_max, d_sum, d_sq, seg_tok_count, seg_case_start, seg_top_k, nq,
                     n_groups, n_segments, n_cases, max_k, out_case + out_at, out_vote + out_at);
             }

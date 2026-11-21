@@ -121,6 +121,57 @@ __device__ __forceinline__ void bdp_ranks_offer(BdpRanks &r, int k, unsigned int
     }
 }
 
+// Take case `c` at agreement `m` from another lane's best `k + 1` into `r`. The
+// order is the ascending pass's — agreement descending, then case id
+// ascending — compared in full, because the two lists' cases interleave: the
+// best `k + 1` of the merged lists is then exactly the best `k + 1` one
+// ascending pass over all their cases keeps. An empty entry (`m == 0`) is no
+// case: the pass never places an agreement of zero.
+__device__ __forceinline__ void bdp_ranks_take(BdpRanks &r, int k, unsigned int m, int c) {
+    if (m == 0u) {
+        return;
+    }
+    unsigned int ca = m;
+    int cc = c;
+#pragma unroll
+    for (int j = 0; j <= BDP_MAX_TOP_K; j++) {
+        if (j <= k && ca != 0u && (ca > r.a[j] || (ca == r.a[j] && cc < r.c[j]))) {
+            const unsigned int ta = r.a[j];
+            const int tc = r.c[j];
+            r.a[j] = ca;
+            r.c[j] = cc;
+            ca = ta;
+            cc = tc;
+        }
+        if (j == k) {
+            r.floor = r.a[j];
+        }
+    }
+}
+
+// Merge the warp's per-lane best `k + 1` into every lane's: a butterfly over
+// the 32 lanes, each round taking the partner's entries. Every lane ends with
+// the same list, the one a single ascending pass over all the lanes' cases
+// keeps.
+__device__ __forceinline__ void bdp_ranks_warp_merge(BdpRanks &r, int k) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        unsigned int pa[BDP_MAX_TOP_K + 1];
+        int pc[BDP_MAX_TOP_K + 1];
+#pragma unroll
+        for (int j = 0; j <= BDP_MAX_TOP_K; j++) {
+            pa[j] = __shfl_xor_sync(0xFFFFFFFFu, r.a[j], off);
+            pc[j] = __shfl_xor_sync(0xFFFFFFFFu, r.c[j], off);
+        }
+#pragma unroll
+        for (int j = 0; j <= BDP_MAX_TOP_K; j++) {
+            if (j <= k) {
+                bdp_ranks_take(r, k, pa[j], pc[j]);
+            }
+        }
+    }
+}
+
 // Write a token's `max_k` votes in one segment: its best `k` cases, case `r`
 // voting `z_r * (a_r - a_k)` through `bdp_vote`, and `-1` / `0` for the rest
 // (fewer cases than `k` scored, or `k < max_k`). `case_base` turns a

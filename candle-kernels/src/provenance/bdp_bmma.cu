@@ -372,8 +372,17 @@ extern "C" __global__ void bdp_stats_finalize_kernel(
     bdp_stats_emit(case_max + base + c0, nc, c0, sum, sumsq, out_stats + idx);
 }
 
-// One thread per (query, group, segment): the segment's best cases -> the same
-// (out_case, z*margin) rows as the scalar kernel, `max_k` per thread.
+// One WARP per (query, group, segment): the segment's best cases -> the same
+// (out_case, z*margin) rows as the scalar kernel, `max_k` per warp.
+//
+// The lanes stride the segment's cases, so each step is one coalesced read of
+// 32 consecutive cases, and each lane keeps its own sums and best `k + 1` over
+// its cases in ascending order; the warp then adds the sums (exact integers)
+// and merges the lists in the pass's order (`bdp_ranks_warp_merge`), which is
+// the list one ascending pass over every case keeps — so the rows are the
+// serial pass's bit for bit. A thread a row walked a code-reading
+// competition's 6,678 cases alone, a dependent load at a time, with a launch
+// of a few tokens putting a handful of threads on the whole card.
 extern "C" __global__ void bdp_bmma_finalize_kernel(
     const unsigned int *__restrict__ case_max,
     const unsigned long long *__restrict__ case_sum,
@@ -389,8 +398,11 @@ extern "C" __global__ void bdp_bmma_finalize_kernel(
     int *__restrict__ out_case,   // n_probe * n_groups * n_segments * max_k
     float *__restrict__ out_vote) // n_probe * n_groups * n_segments * max_k
 {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int lane = threadIdx.x & 31;
+    const int idx = (int)((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
     const int total = n_probe_tokens * n_groups * n_segments;
+    // Whole warps leave together: `idx` is the warp's, so the shuffles below
+    // always run on a full warp.
     if (idx >= total) {
         return;
     }
@@ -406,56 +418,35 @@ extern "C" __global__ void bdp_bmma_finalize_kernel(
     const int c0 = seg_case_start[s];
     const int c1 = seg_case_start[s + 1];
     if (c1 <= c0 || n_gal <= 0) {
-        for (int r = 0; r < max_k; r++) {
+        for (int r = lane; r < max_k; r += 32) {
             out_case[oi + r] = -1;
             out_vote[oi + r] = 0.0f;
         }
         return;
     }
 
+    // One vote a token is the best two — a leader and its runner-up, the
+    // margin's floor — so the single-vote rows are the k = 1 list's.
+    const int k = seg_top_k ? seg_top_k[s] : 1;
     unsigned long long sum = 0ull;
     unsigned long long sumsq = 0ull;
     const size_t base = ((size_t)q * n_groups + g) * n_cases;
-    const int k = seg_top_k ? seg_top_k[s] : 1;
-    if (k == 1) {
-        // Leader/runner-up over the segment's cases, ascending with strict
-        // comparisons — identical tie behaviour to the scalar kernel's top-2 loop.
-        unsigned int top1 = 0u, top2 = 0u;
-        int top1c = -1;
-        for (int c = c0; c < c1; c++) {
-            const unsigned int m = case_max[base + c];
-            sum += case_sum[base + c];
-            sumsq += case_sumsq[base + c];
-            if (m > top1) {
-                top2 = top1;
-                top1 = m;
-                top1c = c;
-            } else if (m > top2) {
-                top2 = m;
-            }
-        }
-        if (top1c < 0) {
-            out_case[oi] = -1;
-            out_vote[oi] = 0.0f;
-        } else {
-            out_case[oi] = top1c; // already a GLOBAL case id
-            out_vote[oi] = bdp_vote(top1, top2, sum, sumsq, n_gal);
-        }
-        for (int r = 1; r < max_k; r++) {
-            out_case[oi + r] = -1;
-            out_vote[oi + r] = 0.0f;
-        }
-        return;
-    }
-    // A top-k segment: the best k+1 in registers, over the same ascending pass.
     BdpRanks ranks;
     bdp_ranks_init(ranks);
-    for (int c = c0; c < c1; c++) {
+    for (int c = c0 + lane; c < c1; c += 32) {
         sum += case_sum[base + c];
         sumsq += case_sumsq[base + c];
         bdp_ranks_offer(ranks, k, case_max[base + c], c - c0);
     }
-    bdp_ranks_emit(ranks, k, max_k, c0, sum, sumsq, n_gal, out_case + oi, out_vote + oi);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, off);
+        sumsq += __shfl_xor_sync(0xFFFFFFFFu, sumsq, off);
+    }
+    bdp_ranks_warp_merge(ranks, k);
+    if (lane == 0) {
+        bdp_ranks_emit(ranks, k, max_k, c0, sum, sumsq, n_gal, out_case + oi, out_vote + oi);
+    }
 }
 
 // Whether this backend can run on the current device: the hardware must have
@@ -602,7 +593,8 @@ extern "C" int run_bmma_bdp_scan(
                     d_max, d_sum, d_sq, seg_case_start, nq, n_groups, n_segments, n_cases,
                     out_stats + stats_at);
             } else {
-                bdp_bmma_finalize_kernel<<<blocks, 256, 0, s>>>(
+                // A warp a row: eight rows a 256-thread block.
+                bdp_bmma_finalize_kernel<<<(total + 7) / 8, 256, 0, s>>>(
                     d_max, d_sum, d_sq, seg_tok_count, seg_case_start, seg_top_k, nq,
                     n_groups, n_segments, n_cases, max_k, out_case + out_at, out_vote + out_at);
             }

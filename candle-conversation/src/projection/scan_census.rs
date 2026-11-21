@@ -25,12 +25,14 @@ pub struct ScanCensus {
     pub assemble_us: u64,
     pub score_us: u64,
     pub normalize_us: u64,
+    pub segments_us: u64,
     pub assemblies_reused: u64,
     pub groups_scanned: u64,
     pub windows: u64,
     pub launches: u64,
     pub fresh_tokens: u64,
     pub index_us: u64,
+    pub fingerprint_us: u64,
     pub upload_us: u64,
     pub kernel_us: u64,
     pub kernel_gpu_us: u64,
@@ -45,9 +47,10 @@ impl ScanCensus {
         let ms = |us: u64| format!("{:.1}", us as f64 / 1000.0);
         format!(
             "scans={} collections_ms={} groups_ms={} select_ms={} assemble_ms={} \
-             group_score_ms={} normalize_ms={} groups_scanned={} assemblies_reused={} \
-             windows={} launches={} fresh_tokens={} index_ms={} upload_ms={} kernel_ms={} \
-             kernel_gpu_ms={} readback_ms={} rows_ms={} tally_ms={}",
+             group_score_ms={} normalize_ms={} segments_ms={} groups_scanned={} \
+             assemblies_reused={} windows={} launches={} fresh_tokens={} index_ms={} \
+             fingerprint_ms={} upload_ms={} kernel_ms={} kernel_gpu_ms={} readback_ms={} \
+             rows_ms={} tally_ms={}",
             self.scans,
             ms(self.collections_us),
             ms(self.groups_us),
@@ -55,12 +58,14 @@ impl ScanCensus {
             ms(self.assemble_us),
             ms(self.score_us),
             ms(self.normalize_us),
+            ms(self.segments_us),
             self.groups_scanned,
             self.assemblies_reused,
             self.windows,
             self.launches,
             self.fresh_tokens,
             ms(self.index_us),
+            ms(self.fingerprint_us),
             ms(self.upload_us),
             ms(self.kernel_us),
             ms(self.kernel_gpu_us),
@@ -79,12 +84,14 @@ impl ScanCensus {
         self.assemble_us += g.assemble_us;
         self.score_us += g.score_us;
         self.normalize_us += g.normalize_us;
+        self.segments_us += g.segments_us;
         self.assemblies_reused += g.assemblies_reused;
         self.groups_scanned += g.scanned;
         self.windows += g.windows;
         self.launches += a.launches;
         self.fresh_tokens += a.fresh_tokens;
         self.index_us += a.index_us;
+        self.fingerprint_us += a.fingerprint_us;
         self.upload_us += a.upload_us;
         self.kernel_us += a.kernel_us;
         self.kernel_gpu_us += a.kernel_gpu_us;
