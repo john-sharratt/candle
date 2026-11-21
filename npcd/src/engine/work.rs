@@ -2322,7 +2322,17 @@ fn bench(
                     return Outcome::Refused(why);
                 }
                 match s.bench.edit(body, what, what, &edit, &*shelf) {
-                    Ok(reply) => Outcome::Did(reply),
+                    Ok(reply) => {
+                        let note = s
+                            .bench
+                            .read(body, what, &*shelf)
+                            .ok()
+                            .and_then(|text| gates::length_note(what, &text));
+                        Outcome::Did(match note {
+                            Some(note) => format!("{reply}\n{note}"),
+                            None => reply,
+                        })
+                    }
                     Err(why) => Outcome::Refused(why),
                 }
             })

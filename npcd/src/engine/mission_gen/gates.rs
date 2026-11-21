@@ -48,6 +48,29 @@ impl Form {
     }
 }
 
+/// Where `text`, written at `path`, stands against its form's length, for the
+/// answer to an edit — `None` for a form the gate leaves alone.
+///
+/// **An edit says where the length went.** Told his life was 811 words of 800,
+/// a Maker rewrote the same paragraph seven times in an hour, each edit taken
+/// and answered with the paragraph alone, and never learned whether he had cut
+/// anything — so he never committed.
+pub fn length_note(path: &str, text: &str) -> Option<String> {
+    let (min, max) = Form::of(path).bounds()?;
+    let words = prose(text).split_whitespace().count();
+    Some(match words {
+        w if w > max => format!(
+            "It is now {w} words; it must be at most {max} — {} more to cut.",
+            w - max
+        ),
+        w if w < min => format!("It is now {w} words; it needs at least {min}."),
+        w => format!(
+            "It is now {w} words, within the {min} to {max} it may run: when its other faults are \
+             put right, `bench_commit` it."
+        ),
+    })
+}
+
 /// A life event: about four hundred words are asked.
 pub const LIFE_MIN_WORDS: usize = 250;
 const LIFE_MAX_WORDS: usize = 800;
@@ -553,6 +576,30 @@ mod tests {
 
     fn words(n: usize, word: &str) -> String {
         vec![word; n].join(" ")
+    }
+
+    /// **An edit's answer says where the length stands**: over, under, or
+    /// within with the commit named — and nothing for a form the gate leaves
+    /// alone.
+    #[test]
+    fn a_length_note_says_where_the_length_stands() {
+        let life = "layers/life/keeper/2654-07 The Load-Bearing Lie.md";
+        assert_eq!(
+            length_note(life, &words(811, "we")).as_deref(),
+            Some("It is now 811 words; it must be at most 800 — 11 more to cut.")
+        );
+        assert_eq!(
+            length_note(life, &words(200, "we")).as_deref(),
+            Some("It is now 200 words; it needs at least 250.")
+        );
+        assert_eq!(
+            length_note(life, &words(420, "we")).as_deref(),
+            Some(
+                "It is now 420 words, within the 250 to 800 it may run: when its other faults \
+                 are put right, `bench_commit` it."
+            )
+        );
+        assert_eq!(length_note("layers/eras/the-vanishing.md", "x"), None);
     }
 
     /// Prose of `n` words, every sentence different: sentences of eight words
