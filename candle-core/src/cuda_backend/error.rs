@@ -4,6 +4,9 @@ use std::panic::Location;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(feature = "tensor-assert")]
+use cudarc::driver::last_stored_error;
+
+#[cfg(feature = "tensor-assert")]
 use super::last_cuda_kernel_launch;
 use crate::{DType, Layout};
 
@@ -79,10 +82,14 @@ fn name_failure(cuda: &CudaError, at: &Location<'static>, count: &AtomicUsize) -
     if count.fetch_add(1, Ordering::Relaxed) >= NAMED_CUDA_FAILURES {
         return false;
     }
+    // A failure handed on by `check_err` was raised by whichever call stored it
+    // — a drop, a guard, an event wait — not by the call it surfaced at.
+    let stored = last_stored_error().map_or_else(|| "none".to_string(), |s| s.to_string());
     tracing::error!(
         target: "candle_core::cuda_backend",
         at = %at,
         error = %cuda,
+        last_stored = %stored,
         last_kernels = %last_cuda_kernel_launch(),
         "a CUDA call failed"
     );

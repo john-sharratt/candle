@@ -8,9 +8,10 @@ use std::{
     ffi::CString,
     marker::PhantomData,
     ops::{Bound, RangeBounds},
+    panic::Location,
     string::String,
     sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-    sync::Arc,
+    sync::{Arc, Mutex},
     vec::Vec,
 };
 
@@ -33,6 +34,37 @@ pub struct CudaContext {
     pub(crate) num_streams: AtomicUsize,
     pub(crate) event_tracking: AtomicBool,
     pub(crate) error_state: AtomicU32,
+}
+
+/// Where the latest error any [`CudaContext::record_err`] stored was raised,
+/// kept past the [`CudaContext::check_err`] that hands the error on — see
+/// [`last_stored_error`].
+static LAST_STORED: Mutex<Option<StoredError>> = Mutex::new(None);
+
+/// The latest error [`CudaContext::record_err`] stored, with where it was
+/// raised — still there after [`CudaContext::check_err`] has handed the error to
+/// whichever call came next. That call is rarely the one that failed: a stored
+/// error surfaces at the next `bind_to_thread`, on any thread.
+pub fn last_stored_error() -> Option<StoredError> {
+    LAST_STORED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// An error a call with no result to return stored on its context: the error,
+/// the call site that stored it, and the thread it ran on.
+#[derive(Debug, Clone)]
+pub struct StoredError {
+    pub error: DriverError,
+    pub at: &'static Location<'static>,
+    pub thread: String,
+}
+
+impl std::fmt::Display for StoredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} stored at {} on thread {}", self.error, self.at, self.thread)
+    }
 }
 
 unsafe impl Send for CudaContext {}
@@ -306,9 +338,19 @@ impl CudaContext {
     }
 
     /// Records a result for later inspection when a Result can be returned.
+    #[track_caller]
     pub fn record_err<T>(&self, result: Result<T, DriverError>) {
         if let Err(err) = result {
-            self.error_state.store(err.0 as u32, Ordering::Relaxed)
+            self.error_state.store(err.0 as u32, Ordering::Relaxed);
+            let thread = std::thread::current();
+            let stored = StoredError {
+                error: err,
+                at: Location::caller(),
+                thread: thread
+                    .name()
+                    .map_or_else(|| format!("{:?}", thread.id()), str::to_string),
+            };
+            *LAST_STORED.lock().unwrap_or_else(|p| p.into_inner()) = Some(stored);
         }
     }
 }
@@ -2174,6 +2216,21 @@ mod tests {
             assert!(unsafe { view_mut.transmute_mut::<f32>(25) }.is_some());
             assert!(unsafe { view_mut.transmute_mut::<f32>(26) }.is_none());
         }
+    }
+
+    /// **A stored error remembers where it was stored** after `check_err` has
+    /// handed it on: the call it surfaces at is not the one that failed.
+    #[test]
+    fn a_stored_error_keeps_its_origin_past_check_err() {
+        let ctx = CudaContext::new(0).unwrap();
+        let refused = DriverError(sys::CUresult::CUDA_ERROR_INVALID_VALUE);
+        let line = line!() + 1;
+        ctx.record_err::<()>(Err(refused));
+        assert_eq!(ctx.check_err(), Err(refused), "handed on once");
+        assert_eq!(ctx.check_err(), Ok(()), "and cleared");
+        let stored = last_stored_error().expect("its origin is kept");
+        assert_eq!(stored.error, refused);
+        assert_eq!((stored.at.file(), stored.at.line()), (file!(), line));
     }
 
     #[test]
