@@ -715,9 +715,35 @@ pub fn answers(tool: &str) -> bool {
     is_mine(tool) && !ENDINGS.contains(&tool)
 }
 
+/// The terminal acts that open the way to a terminal's work and do none of it.
+const DOORS: &[&str] = &["terminal_connect"];
+
+/// Whether `tool` came back with something a person could have asked for — a
+/// reading, a list, whether a thing took the call — so telling them after it
+/// is an answer.
+///
+/// **Connecting is not working.** Counted as work, a connect followed by "I
+/// have posted the order" closed a request: Zen, asked to have a Drone read a
+/// panel, connected to the house network, told the Creator what it had not
+/// done, and was let rest with nothing posted.
+pub fn reads(tool: &str) -> bool {
+    answers(tool) && !DOORS.contains(&tool)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A connect is owed a turn but answers nobody**: it opens the way to a
+    /// reading and is not one, while a list is.
+    #[test]
+    fn connecting_is_owed_a_turn_and_answers_nothing() {
+        assert!(answers("terminal_connect"));
+        assert!(!reads("terminal_connect"));
+        assert!(reads("terminal_list"));
+        assert!(!reads("terminal_disconnect"));
+        assert!(!reads("rest"));
+    }
 
     /// **Every act a terminal is said to offer is in the catalogue**, and
     /// every act in it is offered by something.

@@ -296,8 +296,10 @@ carries the order table as it is (`runtime::orders_line`): each brief it posted
 and who has it, or that nothing of its posting is there. The entry is the
 conversation's own words, and a conversation that said "I have posted the
 order" kept that as done; the turns after believed it of an order never
-posted, so the table is read off every turn instead. It stands no longer once an act through a
-terminal has come back (`Scheduler::worked`) and the mind has then told that
+posted, so the table is read off every turn instead. It stands no longer
+once an act through a terminal that reads something has come back — not the
+connect that opens the way to one (`terminal::acts::reads`,
+`Scheduler::worked`) — and the mind has then told that
 person something (`Scheduler::told`); told before any act came back, they
 were promised an answer and are still owed one. One nothing comes of is
 dropped after twenty minutes (`tick::ASKED_FOR_MS`). It is held in memory:

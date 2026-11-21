@@ -130,6 +130,7 @@ use crate::engine::talk::runner::Talks;
 use crate::engine::talk::templates;
 use crate::engine::talk::voice::Post;
 use crate::engine::terminal::acts::answers as answers_through_a_terminal;
+use crate::engine::terminal::acts::reads as terminal_reads;
 use crate::engine::terminal::Machine;
 use crate::engine::tick::{Due, Pace, Scheduler, Shared as SharedScheduler};
 use crate::engine::tools::{self, Mode, Tool};
@@ -3245,10 +3246,11 @@ impl Runtime {
     /// it, Zen read the cluster and told John what it said minutes later,
     /// when a Drone posted on the channel.
     fn arm_followup(&self, npc_id: u64, act: &Act, landed: bool, moved: bool) {
-        let through_a_terminal = answers_through_a_terminal(act.tool)
-            || (is_of_the_bridge(act.tool) && self.is_bodiless(npc_id));
-        // A reading taken is what makes telling whoever asked an answer.
-        if through_a_terminal && landed {
+        let bridged = is_of_the_bridge(act.tool) && self.is_bodiless(npc_id);
+        let through_a_terminal = answers_through_a_terminal(act.tool) || bridged;
+        // A reading taken is what makes telling whoever asked an answer — not
+        // the connect that opened the way to it ([`terminal_reads`]).
+        if (terminal_reads(act.tool) || bridged) && landed {
             self.scheduler.worked(npc_id);
         }
         if moved || through_a_terminal || body::continues(act, landed) {
