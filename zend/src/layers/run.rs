@@ -33,6 +33,7 @@ use crate::branch_ingest::keys::branches_value;
 use crate::branch_ingest::reader::settles_here;
 use crate::calibrate::{calibrate_committed, CalibrateSpec};
 use crate::ingest_backlog::{self, Work};
+use crate::ingest_holdoff;
 use crate::ingest_lease::{self, Share};
 use crate::ingest_report::{Failures, IngestReport};
 use crate::ingest_snapshots::{finished, Unit};
@@ -222,6 +223,7 @@ pub fn ingest_units(
                             "unit stalled (read again next pass; not counted against the \
                              pass's cap): {e:#}",
                         );
+                        ingest_holdoff::cool_down(&job.subject, &format!("{e:#}"));
                     } else if !crate::ingest_cancel::cancelled() {
                         let n = failures.record(&job.subject, format!("{e:#}"));
                         tracing::warn!(
@@ -230,6 +232,7 @@ pub fn ingest_units(
                             subject = %job.subject,
                             "unit failed (read again next pass): {e:#}",
                         );
+                        ingest_holdoff::cool_down(&job.subject, &format!("{e:#}"));
                         if n > MAX_FAILURES {
                             failures.set_abort();
                         }

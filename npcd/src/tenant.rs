@@ -174,6 +174,14 @@ pub struct NpcdArgs {
     #[arg(long)]
     pub host_worlds: bool,
 
+    /// Whether this member writes the mind into the substrate at its start —
+    /// the layers' documents, the lives, and the retirement of what left the
+    /// record. `false` — `--no-ingest`, or `ingest: false` in `motherd.yaml` —
+    /// leaves that to another member of the cluster: this one reads the mind
+    /// they wrote, as it replicates.
+    #[arg(long = "no-ingest", action = ArgAction::SetFalse)]
+    pub ingest: bool,
+
     /// From how many invalid answers (`401`/`403`/`429`) from Discord in
     /// the last ten minutes every request to it is spaced out
     /// (`discord::limit`). Discord bans the public address past 10,000, for
@@ -246,6 +254,7 @@ impl Default for NpcdArgs {
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION_DAYS,
             characters: true,
             host_worlds: false,
+            ingest: true,
             discord_invalid_throttle: limit::THROTTLE,
             discord_invalid_ceiling: limit::CEILING,
         }
@@ -375,6 +384,12 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         anyhow::bail!(
             "--no-characters keeps a member out of the leases its cluster lends, and there is \
              no cluster: give it one, or let it run characters"
+        );
+    }
+    if !args.ingest && ctx.cluster.is_none() {
+        anyhow::bail!(
+            "--no-ingest leaves the mind's writing to another member of the cluster, and there \
+             is no cluster: give it one, or let it ingest"
         );
     }
     match &repo {
@@ -648,6 +663,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
             forget_dreams: args.forget_dreams,
             forget_journal: args.forget_journal,
             wipe_conversations: args.wipe_conversations,
+            ingest: args.ingest,
             cast,
             characters,
             authored: identities,
@@ -1286,6 +1302,16 @@ mod tests {
         assert!(!parse(&["--no-characters"]).characters);
         let yaml: NpcdArgs = serde_yaml::from_str("characters: false\n").unwrap();
         assert_eq!(yaml, parse(&["--no-characters"]));
+    }
+
+    /// **A member writes the mind unless told not to**, by flag or by
+    /// `motherd.yaml`, the two reading the same setting.
+    #[test]
+    fn the_mind_is_ingested_unless_turned_off() {
+        assert!(parse(&[]).ingest);
+        assert!(!parse(&["--no-ingest"]).ingest);
+        let yaml: NpcdArgs = serde_yaml::from_str("ingest: false\n").unwrap();
+        assert_eq!(yaml, parse(&["--no-ingest"]));
     }
 
     /// **A member hosts worlds without characters only when told to**, by flag

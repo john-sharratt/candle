@@ -68,6 +68,7 @@ use crate::branch_ingest::plan::Committed;
 use crate::branch_ingest::reader::{settles_here, whose, Whose};
 use crate::calibrate::{calibrate_committed, CalibrateSpec};
 use crate::ingest_backlog::{self, Work};
+use crate::ingest_holdoff;
 use crate::ingest_lease::{self, Share};
 use crate::ingest_report::Failures;
 use crate::ingest_snapshots::{finished, Unit};
@@ -727,6 +728,7 @@ pub fn ingest_jobs(
                             file = %file.path,
                             "file ingest failed (will retry next run): {e:#}",
                         );
+                        ingest_holdoff::cool_down(&file.path, &format!("{e:#}"));
                         if n > MAX_DECODE_FAILURES {
                             failures.set_abort();
                         }
@@ -1150,6 +1152,12 @@ fn process_one_file(
                     "file ingest failed (read again next pass; prior generation kept live; \
                      not counted against the pass's cap): {msg}",
                 );
+                // A stall is the card's, and the next file would stall on it
+                // too; a reading that wandered or answered nothing is this
+                // file's own, and the next one may read well.
+                if is_stall_message(&msg) {
+                    ingest_holdoff::cool_down(&file.path, &msg);
+                }
                 return Ok(());
             }
             let n = failures.record(&file.path, format!("{e:#}"));
@@ -1159,6 +1167,7 @@ fn process_one_file(
                 superseded_kept = superseded.len(),
                 "file ingest failed (will retry next run; prior generation kept live): {e:#}",
             );
+            ingest_holdoff::cool_down(&file.path, &msg);
             if n > MAX_DECODE_FAILURES {
                 tracing::error!(
                     target: "zend::code_read::ingest",

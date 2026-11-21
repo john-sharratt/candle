@@ -55,6 +55,8 @@ use cluster::replicate::{LeaseEvent, Replicator};
 use cluster::reserve::{machine as reservation, Reservation};
 use tokio::sync::broadcast::{self, Receiver};
 
+use crate::ingest_holdoff::{holdoff, Holdoff};
+
 /// How long a reading may hold its unit. A crash frees it when this runs out
 /// unrenewed, and another member's next pass takes it.
 const INGEST_TTL: Duration = Duration::from_secs(120);
@@ -314,16 +316,18 @@ pub fn share_worker(conv_id: &str) -> Share {
 }
 
 fn share_key(key: Vec<u8>) -> Share {
-    share_on(key, &reservation())
+    share_on(key, &reservation(), holdoff(), Instant::now())
 }
 
-/// [`share_key`] on `reservation`. **A reserved machine reads nothing**
-/// (`docs/house_modes.md` §4): every unit, calibration and face is left as one
-/// another member holds is, for the next pass after the reservation ends —
-/// or for a member elsewhere, whose pass finds it unread. A worker's turns are
-/// not leased here: they are Zen doing what someone asked of it.
-fn share_on(key: Vec<u8>, reservation: &Reservation) -> Share {
-    if reservation.holds() {
+/// [`share_key`] on `reservation` and `holdoff` at `now`. **A reserved machine
+/// reads nothing** (`docs/house_modes.md` §4), and neither does one whose
+/// ingest is off or whose last reading failed a moment ago
+/// ([`crate::ingest_holdoff`]): every unit, calibration and face is left as
+/// one another member holds is, for the next pass after the hold ends — or for
+/// a member elsewhere, whose pass finds it unread. A worker's turns are not
+/// leased here: they are Zen doing what someone asked of it.
+fn share_on(key: Vec<u8>, reservation: &Reservation, holdoff: &Holdoff, now: Instant) -> Share {
+    if reservation.holds() || holdoff.leaves(now) {
         return Share::Theirs;
     }
     let seat = SEAT.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -617,11 +621,45 @@ mod tests {
     fn a_reserved_machine_leaves_every_unit() {
         let reserved = Reservation::new();
         reserved.observe(Some("rekordbox is open".into()), Instant::now());
+        let free = Holdoff::new();
+        let now = Instant::now();
         assert!(matches!(
-            share_on(calibration_key("m"), &reserved),
+            share_on(calibration_key("m"), &reserved, &free, now),
             Share::Theirs
         ));
-        assert!(matches!(share_on(lease_key("k"), &reserved), Share::Theirs));
+        assert!(matches!(
+            share_on(lease_key("k"), &reserved, &free, now),
+            Share::Theirs
+        ));
+    }
+
+    /// **A member with ingest off, or cooling down after a failure, leaves
+    /// every unit** and asks no seat for it; once the cooldown runs out it
+    /// reads again.
+    #[test]
+    fn a_held_off_member_leaves_every_unit() {
+        let unreserved = Reservation::new();
+        let now = Instant::now();
+        let off = Holdoff::new();
+        off.set_enabled(false);
+        assert!(matches!(
+            share_on(lease_key("k"), &unreserved, &off, now),
+            Share::Theirs
+        ));
+        assert!(matches!(
+            share_on(face_key("k"), &unreserved, &off, now),
+            Share::Theirs
+        ));
+        let cooling = Holdoff::new();
+        let end = cooling.cool_down(now);
+        assert!(matches!(
+            share_on(calibration_key("m"), &unreserved, &cooling, now),
+            Share::Theirs
+        ));
+        assert!(matches!(
+            share_on(lease_key("k"), &unreserved, &cooling, end),
+            Share::Mine(_)
+        ));
     }
 
     #[test]

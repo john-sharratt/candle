@@ -58,6 +58,7 @@ use super::windows::{windows, WINDOW_TOKENS};
 use crate::branch_ingest::keys::{key_version, CONTENT_KEY, KEY_VERSION};
 use crate::code_read::PATH_KEY;
 use crate::ingest_backlog::{self, Work};
+use crate::ingest_holdoff;
 use crate::ingest_lease::{self, Share};
 use crate::layers::keys::{FILE_KEY, SUBJECT_KEY};
 use crate::layers::run::{answer_of, LAYER_PARALLELISM};
@@ -357,6 +358,7 @@ pub fn calibrate_layer(
                             subject = %unit.subject,
                             "calibration failed: {e:#}",
                         );
+                        ingest_holdoff::cool_down(&unit.subject, &format!("{e:#}"));
                     }
                 }
             });

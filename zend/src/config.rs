@@ -125,6 +125,9 @@ pub struct DaemonConfig {
     /// the user's next tool round waited behind it — 18 s on one conversation,
     /// most of a minute on another.
     pub summarize: bool,
+    /// `ingest:` / `--no-ingest`: whether this member reads units itself, or
+    /// leaves every one to another member ([`crate::ingest_holdoff`]).
+    pub ingest: bool,
     /// `--tombstone-retention <DAYS>`: how long the substrate keeps a deleted
     /// conversation's tombstone before a compaction may shrink it to its
     /// deleted-set entry (`ModelBuilder::tombstone_retention`).
@@ -162,6 +165,7 @@ impl DaemonConfig {
             qsa_selection_budget: None,
             qsa_strata: StrataTokens::DEFAULT,
             summarize: false,
+            ingest: true,
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION,
             roles: Roles::default(),
             cluster: None,

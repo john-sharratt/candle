@@ -4819,6 +4819,11 @@ pub struct LoadPlan {
     /// before the layers load — `--wipe-conversations`. See
     /// [`wipe_conversations`].
     pub wipe_conversations: bool,
+    /// Whether this member writes the mind into the substrate — its layers'
+    /// documents, the lives, and the retirement of what left the record
+    /// (`ingest:` in its config). One that does not reads the mind another
+    /// member wrote, as it arrives by replication.
+    pub ingest: bool,
     /// The mind repository the agents hold, with `--mind-repo`, read from the
     /// substrate (`docs/substrate_git.md` §8): its fetches and pushes go
     /// through the agents once joined, and a mind the log did not hold at
@@ -5529,7 +5534,20 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             // folder holds only published work — an operation's drafts are in
             // its store until its publish step lands them (§10.3) — so
             // everything on disk is memory's to take.
-            let out_of_record: Vec<PathBuf> = rt.ledger.missing(files);
+            //
+            // A member whose ingest is off writes none of this: another
+            // member's retirements and documents reach it by replication.
+            if !plan.ingest {
+                tracing::info!(
+                    "ingest: off — the mind's documents and lives are written by another member \
+                     and read here as they replicate"
+                );
+            }
+            let out_of_record: Vec<PathBuf> = if plan.ingest {
+                rt.ledger.missing(files)
+            } else {
+                Vec::new()
+            };
             if !out_of_record.is_empty() {
                 let e = &engine;
                 let retired: usize = out_of_record
@@ -5563,7 +5581,11 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
                     .and_then(|p| Some((p, shared_target(p, source)?)))
                 {
                     engine.mark_layer_append_only(layer);
-                    let moved = retire_misplaced(&engine, p.group, source, &rt.ledger);
+                    let moved = if plan.ingest {
+                        retire_misplaced(&engine, p.group, source, &rt.ledger)
+                    } else {
+                        0
+                    };
                     if moved > 0 {
                         tracing::info!(
                             "layer {}: {moved} document(s) were in the live group, where no \
@@ -5573,6 +5595,9 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
                         );
                     }
                     shared_groups.push((source.name.clone(), group));
+                }
+                if !plan.ingest {
+                    continue;
                 }
                 let (turns, mut report) = ingest::pending(files, source, &rt.ledger)?;
                 let total = turns.len();
@@ -5625,7 +5650,12 @@ fn load(rt: &Arc<Runtime>, plan: &LoadPlan, rt_handle: Option<Handle>) -> anyhow
             // `<tool_call>` blocks are executed as it lands — so a belief is
             // formed at the point in the life where it formed, by the same
             // mechanism a belief would be formed at run time.
-            for (who, dir) in life::lives(files, characters) {
+            let lives = if plan.ingest {
+                life::lives(files, characters)
+            } else {
+                Vec::new()
+            };
+            for (who, dir) in lives {
                 let (episodes, rejected) = life::episodes(files, &dir, &who);
                 for r in &rejected {
                     // A life with a hole in it is still a life, but the author

@@ -16,7 +16,7 @@ use candle_conversation::engine_slot::CoreRequests;
 use candle_conversation::models::{Recent, StrataTokens};
 use candle_conversation::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENTION;
 use candle_conversation::persistence::SUBSTRATE_DIR;
-use clap::Args;
+use clap::{ArgAction, Args};
 use host::{OneShot, MODEL};
 use serde::{Deserialize, Deserializer};
 
@@ -176,6 +176,14 @@ pub struct ZendArgs {
     /// launch.
     #[arg(long, value_name = "PATH")]
     pub secrets: Option<PathBuf>,
+
+    /// Whether this member reads units into the substrate — repository
+    /// folders and files, the layers' units, their calibrations and faces.
+    /// `false` — `--no-ingest`, or `ingest: false` in `motherd.yaml` — leaves
+    /// every unit to another member of the cluster (`crate::ingest_holdoff`):
+    /// this one replicates their readings and reads none itself.
+    #[arg(long = "no-ingest", action = ArgAction::SetFalse)]
+    pub ingest: bool,
 }
 
 impl Default for ZendArgs {
@@ -199,6 +207,7 @@ impl Default for ZendArgs {
             summarize: false,
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION_DAYS,
             secrets: None,
+            ingest: true,
         }
     }
 }
@@ -357,6 +366,7 @@ impl ZendArgs {
         config.qsa_selection_budget = self.qsa_selection_budget;
         config.qsa_strata = self.qsa_strata();
         config.summarize = self.summarize;
+        config.ingest = self.ingest;
         config.tombstone_retention =
             Duration::from_secs(self.tombstone_retention.saturating_mul(SECONDS_PER_DAY));
         Ok(ZendTenant::new(config))
@@ -514,6 +524,12 @@ mod tests {
         .unwrap();
         assert_eq!(flags, yaml);
         assert!(serde_yaml::from_str::<ZendArgs>("qsa_recent_mode: sometimes").is_err());
+        assert!(parse(&[]).ingest, "a member reads units unless told not to");
+        assert_eq!(
+            parse(&["--no-ingest"]),
+            serde_yaml::from_str::<ZendArgs>("ingest: false").unwrap()
+        );
+        assert!(!parse(&["--no-ingest"]).ingest);
         assert!(serde_yaml::from_str::<ZendArgs>("model: Qwen35_0_8B_Q8").is_err());
     }
 

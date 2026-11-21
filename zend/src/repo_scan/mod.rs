@@ -40,6 +40,7 @@ use crate::branch_ingest::reader::settles_here;
 use crate::branch_ingest::units::FolderUnit;
 use crate::held_paths;
 use crate::ingest_backlog::{self, Work};
+use crate::ingest_holdoff;
 use crate::ingest_lease::{self, Share};
 use crate::ingest_report::{Failures, IngestReport};
 use crate::ingest_snapshots::{finished, Unit};
@@ -1009,6 +1010,7 @@ fn run_dir_pool(
                                 dir = %job.unit.dir,
                                 "directory ingest failed (will retry next run): {e:#}",
                             );
+                            ingest_holdoff::cool_down(&job.unit.dir, &format!("{e:#}"));
                             if n > MAX_DECODE_FAILURES {
                                 failures.set_abort();
                             }
@@ -1276,6 +1278,7 @@ fn process_one_dir(
                     "directory ingest stalled (read again next pass; prior generation kept \
                      live; not counted against the pass's cap): {msg}",
                 );
+                ingest_holdoff::cool_down(&unit.dir, &msg);
                 return Ok(());
             }
             let n = failures.record(&unit.dir, format!("{e:#}"));
@@ -1285,6 +1288,7 @@ fn process_one_dir(
                 superseded_kept = superseded.len(),
                 "directory ingest failed (will retry next run; prior generation kept live): {e:#}",
             );
+            ingest_holdoff::cool_down(&unit.dir, &msg);
             if n > MAX_DECODE_FAILURES {
                 // Carry the CAUSE, not just the count: the fatal-looking line
                 // used to say only "N failed (cap = M)", so every diagnosis

@@ -42,6 +42,7 @@ pub mod held_values;
 pub mod ingest;
 pub mod ingest_backlog;
 pub mod ingest_cancel;
+pub mod ingest_holdoff;
 pub mod ingest_lease;
 pub mod ingest_report;
 pub mod ingest_snapshots;

@@ -28,6 +28,7 @@ use crate::access::{allowed_modes, default_mode};
 use crate::api::routes;
 use crate::config::DaemonConfig;
 use crate::ingest_backlog::BacklogSnapshot;
+use crate::ingest_holdoff::set_ingest;
 use crate::loading::LoadingSnapshot;
 use crate::schema_layers::{raw_layers, with_live_fields};
 use crate::session::ZendSession;
@@ -93,6 +94,20 @@ impl Tenant for ZendTenant {
             config.roles = ctx.roles.clone();
             config.cluster = ctx.cluster;
             config.agent = ctx.agent;
+            // With no cluster there is no other member to leave the units to.
+            if !config.ingest && config.cluster.is_none() {
+                anyhow::bail!(
+                    "--no-ingest leaves every unit to another member of the cluster, and there \
+                     is no cluster: give it one, or let it ingest"
+                );
+            }
+            set_ingest(config.ingest);
+            if !config.ingest {
+                tracing::info!(
+                    "ingest: off — every unit is left to another member, and their readings \
+                     replicate here"
+                );
+            }
             tracing::info!(
                 workspace = %config.workspace.root().display(),
                 repos = %config.workspace.names().join(", "),

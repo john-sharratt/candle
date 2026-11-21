@@ -3998,6 +3998,23 @@ ingests of one unit are the same content twice, so keeping one loses nothing.
 npcd's mind ingest is done only by the authority of the world that reads the mind, by
 the same rule.
 
+**A member may take no unit at all** (`zend/src/ingest_holdoff.rs`), for either of two
+reasons, both checked before a lease is asked for, so every reading, calibration and
+face lease is left as one another member holds is:
+
+- **Its ingest is off** — `ingest: false` in a tenant's section of `motherd.yaml`, or
+  `--no-ingest`. zend then leaves every unit to the others and replicates their
+  readings; npcd writes none of the mind's documents or lives at its start and reads
+  what another member wrote. A member whose card runs the cast turns it off, as one
+  turns `characters` off (§9.5). With no cluster there is nobody to leave it to, and
+  the start is refused.
+- **One of its readings failed or stalled a moment ago.** The lease goes back as the
+  reading ends; the member then takes no new unit for ten minutes
+  (`FAILURE_COOLDOWN`), because a card too full to move one turn fails the next unit
+  the same way. On 2026-11-21 WhiteWorld held seven folders' leases through a
+  25-minute pass that committed none, took all seven again on the next pass, and
+  BlackWorld, idle, was refused every one. Readings already holding a lease go on.
+
 ---
 
 ## 11. Agents
