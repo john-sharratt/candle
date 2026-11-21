@@ -10,7 +10,7 @@
 //! `docs/gallery_residency.md` §5.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -136,8 +136,9 @@ pub(super) struct PagedIndex {
     /// Turns referenced by this scan; pinned for the scan that builds the
     /// index, leased as a set by every scan that reuses it.
     pub(super) pinned_sids: Vec<StreamId>,
-    /// `pinned_sids` as a set — what a turn's eviction asks of a leased index.
-    pub(super) members: HashSet<StreamId>,
+    /// `pinned_sids` by their run ids — what a turn's eviction asks of a
+    /// leased index, and what a check looks a named turn's run up in.
+    pub(super) members: HashMap<StreamId, u64>,
     /// Each referenced turn's run id when its addresses were taken, parallel to
     /// `pinned_sids` — what a later reuse checks the arena against.
     pub(super) run_ids: Vec<u64>,
@@ -459,7 +460,11 @@ impl GalleryArena {
             max_seg_cases,
             seg_law,
             max_k,
-            members: pinned_sids.iter().copied().collect(),
+            members: pinned_sids
+                .iter()
+                .copied()
+                .zip(run_ids.iter().copied())
+                .collect(),
             pinned_sids,
             run_ids,
             hold: ScanHold::default(),
@@ -2605,7 +2610,7 @@ mod tests {
                 .indexes
                 .load()
                 .iter()
-                .filter(|(_, idx)| idx.members.contains(&sid))
+                .filter(|(_, idx)| idx.members.contains_key(&sid))
                 .map(|(_, idx)| idx.hold.stale())
                 .collect::<Vec<bool>>()
         };

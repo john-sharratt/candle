@@ -99,6 +99,7 @@ mod piece_identity;
 mod piece_splice;
 mod pinned_report;
 pub mod pool;
+mod pool_fetch;
 mod pool_linger;
 mod pool_read_ring;
 mod pool_refresh;

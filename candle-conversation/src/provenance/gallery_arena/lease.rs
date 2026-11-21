@@ -29,12 +29,26 @@
 //! (2026-11-18). A change therefore also marks [`ScanHold::stale`] every index
 //! naming the turn, before it reads that index's lease. A scan whose index is
 //! unmarked has had no turn of it changed since its last check, and trusts it
-//! without walking the turns; a marked one is checked as before.
+//! without walking the turns.
+//!
+//! **A marked index checks the turns it was marked for.** The mark names the
+//! turn, and every other turn of the index is as current as an unmarked
+//! index's are, by the same rule. The full walk was paid for every mark: one
+//! eviction among the 183,692 turns of `code_reading`'s index sent the next
+//! reprojection through all of them, 33–42 ms under the residency lock, about
+//! one reprojection in four on BlackWorld (2026-11-21). Only a new index, or
+//! one marked for more turns than [`MARKED_MAX`], is walked whole.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use crate::persistence::streams::StreamId;
 
 use super::scan::PagedIndex;
+
+/// The most turns a hold names between checks; past it the next check walks
+/// every turn, which is then the cheaper of the two.
+const MARKED_MAX: usize = 4096;
 
 /// What scans and the arena's changes agree through, per index.
 #[derive(Debug)]
@@ -47,16 +61,22 @@ pub(super) struct ScanHold {
     retired: AtomicBool,
     /// A change may have touched one of its turns since the last check.
     stale: AtomicBool,
+    /// The turns changes named since the last check — `None` when the next
+    /// check walks every turn: a new index, or one named past [`MARKED_MAX`].
+    /// Written and read under the arena's residency lock, which every change
+    /// and every check takes.
+    marked: Mutex<Option<Vec<StreamId>>>,
 }
 
 impl Default for ScanHold {
-    /// Unchecked and marked: the first reuse checks the turns.
+    /// Unchecked and marked: the first reuse checks every turn.
     fn default() -> Self {
         Self {
             leases: AtomicU32::new(0),
             verified: AtomicU64::new(u64::MAX),
             retired: AtomicBool::new(false),
             stale: AtomicBool::new(true),
+            marked: Mutex::new(None),
         }
     }
 }
@@ -93,14 +113,32 @@ impl ScanHold {
     /// and found current: the mark is cleared. Changes take the same lock, so
     /// none lands between the check and the clearing.
     pub fn checked(&self, changes: u64) {
+        *self.marked.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
         self.stale.store(false, SeqCst);
         self.verified.store(changes, SeqCst);
     }
 
-    /// A change is about to touch one of the index's turns. Marked before the
-    /// change reads [`Self::leased`] (module docs).
-    pub fn mark_stale(&self) {
+    /// A change is about to touch `sid`, one of the index's turns. Marked
+    /// before the change reads [`Self::leased`] (module docs).
+    pub fn mark_stale(&self, sid: StreamId) {
         self.stale.store(true, SeqCst);
+        let mut marked = self.marked.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(sids) = marked.as_mut() {
+            if sids.len() < MARKED_MAX {
+                sids.push(sid);
+            } else {
+                *marked = None;
+            }
+        }
+    }
+
+    /// The turns the next check has to look at: those changes named since the
+    /// last check, or `None` for every turn.
+    pub fn marked(&self) -> Option<Vec<StreamId>> {
+        self.marked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Whether a change may have touched one of its turns since the last
@@ -251,7 +289,7 @@ mod tests {
                 let (hold, start) = (hold.clone(), start.clone());
                 thread::spawn(move || {
                     start.wait();
-                    hold.mark_stale();
+                    hold.mark_stale(StreamId(7));
                     hold.leased()
                 })
             };
@@ -272,12 +310,37 @@ mod tests {
         assert!(hold.stale(), "a new index is checked once");
         hold.checked(4);
         assert!(!hold.stale());
-        hold.mark_stale();
+        hold.mark_stale(StreamId(9));
         assert!(hold.stale());
         hold.trusted(5);
         assert!(hold.stale(), "trusting clears nothing");
         let changes = AtomicU64::new(5);
         assert!(hold.current(&changes));
+    }
+
+    /// **A check looks at the turns named since the last one.** A new hold
+    /// names none and walks every turn; a check starts the list over; each
+    /// mark adds its turn; past [`MARKED_MAX`] the next check walks every turn
+    /// again, and the check after it starts over.
+    #[test]
+    fn marks_name_the_turns_the_next_check_looks_at() {
+        let hold = ScanHold::default();
+        assert_eq!(hold.marked(), None, "a new index is walked whole");
+        hold.mark_stale(StreamId(1));
+        assert_eq!(hold.marked(), None, "and stays so until checked");
+        hold.checked(0);
+        assert_eq!(hold.marked(), Some(vec![]));
+        hold.mark_stale(StreamId(5));
+        hold.mark_stale(StreamId(3));
+        assert_eq!(hold.marked(), Some(vec![StreamId(5), StreamId(3)]));
+        hold.checked(1);
+        assert_eq!(hold.marked(), Some(vec![]));
+        for i in 0..=MARKED_MAX as u64 {
+            hold.mark_stale(StreamId(i));
+        }
+        assert_eq!(hold.marked(), None, "too many to name: walked whole");
+        hold.checked(2);
+        assert_eq!(hold.marked(), Some(vec![]));
     }
 
     /// The same for an index leaving the cache: it stops being listed only if

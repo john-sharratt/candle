@@ -20,6 +20,7 @@ use crate::projection::{Conversation, TimelineId, TurnIndex, WorkingSetShare};
 use crate::sequence_handle::SequenceId;
 
 use super::pool::pool_order;
+use super::pool_fetch::fetch_pages;
 use super::pooled_rounds::PoolPages;
 use super::profile;
 use super::Scheduler;
@@ -139,6 +140,9 @@ impl Scheduler {
         let mut stats = PoolRefresh::default();
         let reading = profile::span("pool:index_read");
         let t_read = Instant::now();
+        // Each pooled conversation's prior layout and the turn its walk starts
+        // from, in pool order.
+        let mut plans = Vec::with_capacity(pool.len());
         for tl in pool {
             let turns = turns_of.get(&tl).copied().unwrap_or(0);
             // Held last refresh, or lingering since it left (`pool_linger`).
@@ -157,6 +161,18 @@ impl Scheduler {
                 .flatten()
                 .all(|(_, key)| model_held.contains(key));
             let from = walk_from(walked, turns, layout_held);
+            plans.push((tl, turns, from, prior_layout));
+        }
+        // Every page the walks below read, fetched at once: a page off the log
+        // waits on the disk, and one at a time they waited end to end.
+        let wanted: Vec<(TimelineId, TurnIndex)> = plans
+            .iter()
+            .flat_map(|&(tl, turns, from, _)| (from..turns).map(move |i| (tl, TurnIndex(i))))
+            .collect();
+        let t_fetch = Instant::now();
+        let mut pages_of = fetch_pages(conversation, &wanted);
+        stats.fetch_us = t_fetch.elapsed().as_micros() as u64;
+        for (tl, turns, from, prior_layout) in plans {
             let mut keys = Vec::new();
             let mut layout: HashMap<TurnIndex, Vec<(usize, PieceKey)>> = HashMap::new();
             if from > 0 {
@@ -167,9 +183,9 @@ impl Scheduler {
             let mut whole = true;
             for i in from..turns {
                 stats.walked += 1;
-                let t_fetch = Instant::now();
-                let fetched = conversation.turn_index_page(tl, TurnIndex(i));
-                stats.fetch_us += t_fetch.elapsed().as_micros() as u64;
+                let fetched = pages_of
+                    .remove(&(tl, TurnIndex(i)))
+                    .expect("every walked turn was fetched");
                 let pages = match fetched {
                     Ok(Some(p)) => p,
                     Ok(None) => continue,

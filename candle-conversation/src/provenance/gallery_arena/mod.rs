@@ -856,8 +856,8 @@ impl GalleryArena {
     fn leased(&self, sid: &StreamId) -> bool {
         let mut leased = false;
         for (_, idx) in self.indexes.load().iter() {
-            if idx.members.contains(sid) {
-                idx.hold.mark_stale();
+            if idx.members.contains_key(sid) {
+                idx.hold.mark_stale(*sid);
                 leased |= idx.hold.leased();
             }
         }
@@ -936,11 +936,19 @@ impl GalleryArena {
     ) -> StdResult<(), IndexMiss> {
         let res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
         let changes = self.changes.load(Ordering::SeqCst);
-        let current = idx
-            .pinned_sids
-            .iter()
-            .zip(&idx.run_ids)
-            .all(|(sid, run)| res.get(sid).is_some_and(|rt| rt.run_id == *run));
+        let resident = |sid: &StreamId, run: u64| res.get(sid).is_some_and(|rt| rt.run_id == run);
+        // The turns changes named since the last check, or every turn
+        // (`lease`): one no change named is as it was checked.
+        let current = match idx.hold.marked() {
+            Some(sids) => sids
+                .iter()
+                .all(|sid| idx.members.get(sid).is_none_or(|&run| resident(sid, run))),
+            None => idx
+                .pinned_sids
+                .iter()
+                .zip(&idx.run_ids)
+                .all(|(sid, &run)| resident(sid, run)),
+        };
         // Cleared under the lock every change takes, so no change's mark is
         // lost between the check and the clearing.
         if current {
