@@ -436,15 +436,22 @@ fn file_done(hosted: &Hosted, body: &str, account: &str) -> Outcome {
 }
 
 /// The account a finished mission is filed done with when its carrier
-/// reported it stuck: what the engine saw on it — the readings its scans
-/// took — or, with none, the carrier's own words.
+/// reported it stuck: the carrier's own words, then what the engine saw on it.
+///
+/// **What the engine saw is not the answer to every question.** Filed in the
+/// carrier's place, it answered "read the Concord's era and report its years"
+/// with "in the early range: nobody else" — the room's company on arrival,
+/// which only a who-is-there errand asks for. The carrier's words say what it
+/// found; the sightings are kept beside them as evidence.
 fn done_account(hosted: &Hosted, body: &str, said: &str) -> String {
     let seen = hosted
         .sim(|s| s.missions.active(body).map(|m| m.observed.clone()))
         .unwrap_or_default();
-    match seen.is_empty() {
-        true => said.trim().to_string(),
-        false => seen.join("; "),
+    let said = said.trim();
+    match (said.is_empty(), seen.is_empty()) {
+        (_, true) => said.to_string(),
+        (true, false) => seen.join("; "),
+        (false, false) => format!("{said} (seen: {})", seen.join("; ")),
     }
 }
 
@@ -2454,6 +2461,15 @@ mod tests {
             other => panic!("a finished routine was not filed: {other:?}"),
         }
         assert!(!h.sim(|s| s.missions.is_on_mission("m1")));
+        // Its words first, what the engine saw beside them as evidence.
+        assert_eq!(
+            h.sim(|s| s.missions.done("m1").and_then(|m| m.answer.clone()))
+                .as_deref(),
+            Some(
+                "I reported it already and the table still shows it (seen: in the plant room, \
+                 the breaker panel: closed)"
+            )
+        );
     }
 
     /// **A machine name is listed once**, though seven plant rooms each hold a
