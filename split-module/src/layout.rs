@@ -215,7 +215,10 @@ fn body_of(node: &Node, bytes: &[u8], start: usize) -> Result<Option<Body>, Stri
     let mut leading: Option<usize> = None;
     let mut cursor = list.walk();
     for child in list.children(&mut cursor).filter(|n| n.is_named()) {
-        if matches!(child.kind(), "line_comment" | "block_comment" | "attribute_item") {
+        if matches!(
+            child.kind(),
+            "line_comment" | "block_comment" | "attribute_item"
+        ) {
             leading.get_or_insert(child.start_byte());
             continue;
         }
@@ -285,7 +288,11 @@ mod tests {
         let src = "//! Docs.\n\nuse std::fmt;\nmod other;\n\nmacro_rules! m { () => {} }\n\n\
                    // ── a section ──\n\n/// A thing.\n#[derive(Debug)]\npub struct A;\n\nfn b() {}\n";
         let l = layout(src).unwrap();
-        let kept: Vec<(Stay, &str)> = l.kept.iter().map(|k| (k.stay, text(src, &k.span))).collect();
+        let kept: Vec<(Stay, &str)> = l
+            .kept
+            .iter()
+            .map(|k| (k.stay, text(src, &k.span)))
+            .collect();
         assert_eq!(
             kept,
             vec![

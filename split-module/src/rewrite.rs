@@ -47,7 +47,9 @@ pub fn edits(source: &str) -> Result<Vec<Edit>, String> {
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .map_err(|e| format!("the Rust grammar does not load: {e}"))?;
-    let tree = parser.parse(source, None).ok_or("the file does not parse")?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or("the file does not parse")?;
     let bytes = source.as_bytes();
     let mut out = Vec::new();
     let mut cursor = tree.root_node().walk();
@@ -209,7 +211,9 @@ pub fn share_edits(source: &str, seen: &str) -> Result<Vec<Edit>, String> {
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
         .map_err(|e| format!("the Rust grammar does not load: {e}"))?;
-    let tree = parser.parse(source, None).ok_or("the file does not parse")?;
+    let tree = parser
+        .parse(source, None)
+        .ok_or("the file does not parse")?;
     let mut out = Vec::new();
     let mut cursor = tree.root_node().walk();
     for node in tree.root_node().children(&mut cursor) {
@@ -223,7 +227,10 @@ pub fn share_edits(source: &str, seen: &str) -> Result<Vec<Edit>, String> {
         for m in list.children(&mut c) {
             if VISIBLE_ITEMS.contains(&m.kind()) {
                 let mut cc = m.walk();
-                if !m.children(&mut cc).any(|ch| ch.kind() == "visibility_modifier") {
+                if !m
+                    .children(&mut cc)
+                    .any(|ch| ch.kind() == "visibility_modifier")
+                {
                     let at = m.start_byte();
                     out.push(Edit {
                         range: at..at,

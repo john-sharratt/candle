@@ -3,10 +3,15 @@
 //!
 //! ```text
 //! file pool: The block pool and its growth.
+//! //! Blocks are handed out from one arena and grown in place when it fills;
+//! //! a grow never moves a block a reader holds.
 //! 1 2 3.4 3.5
 //! file mod: What stays in the module file itself.
 //! 7
 //! ```
+//!
+//! The `//!` lines after a `file` line are the rest of that file's module
+//! doc, written under its one-line summary as they are.
 //!
 //! `file mod` keeps its items in `mod.rs`, at the level they were written at.
 //! Every map id must be named exactly once — a whole item by `N`, or every one
@@ -24,8 +29,10 @@ pub enum Id {
 pub struct PlanFile {
     /// The module name: `pool` makes `pool.rs`; `mod` is `mod.rs` itself.
     pub name: String,
-    /// Its one-line purpose, its `//!` line.
+    /// Its one-line purpose, its first `//!` line.
     pub doc: String,
+    /// The rest of its module doc, a line each, without the `//!`.
+    pub more: Vec<String>,
     pub ids: Vec<Id>,
 }
 
@@ -38,6 +45,14 @@ pub fn parse(text: &str) -> Result<Vec<PlanFile>, String> {
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(doc) = line.strip_prefix("//!") {
+            let file = files
+                .last_mut()
+                .ok_or_else(|| format!("line {}: a doc line before any `file`", n + 1))?;
+            file.more
+                .push(doc.strip_prefix(' ').unwrap_or(doc).trim_end().to_string());
             continue;
         }
         if let Some(rest) = line.strip_prefix("file ") {
@@ -54,6 +69,7 @@ pub fn parse(text: &str) -> Result<Vec<PlanFile>, String> {
             files.push(PlanFile {
                 name,
                 doc: doc.trim().to_string(),
+                more: Vec::new(),
                 ids: Vec::new(),
             });
             continue;
@@ -65,9 +81,11 @@ pub fn parse(text: &str) -> Result<Vec<PlanFile>, String> {
             if word.is_empty() {
                 continue;
             }
-            file.ids.push(parse_id(word).ok_or_else(|| {
-                format!("line {}: `{word}` is not an id (`N` or `N.M`)", n + 1)
-            })?);
+            file.ids.push(
+                parse_id(word).ok_or_else(|| {
+                    format!("line {}: `{word}` is not an id (`N` or `N.M`)", n + 1)
+                })?,
+            );
         }
     }
     if files.is_empty() {
@@ -100,7 +118,8 @@ mod tests {
     #[test]
     fn a_plan_names_files_and_their_ids() {
         let p = parse(
-            "# comment\nfile pool: The pool.\n1 2, 3.4\n3.5\n\nfile mod: Stays.\n7\n",
+            "# comment\nfile pool: The pool.\n//! It grows in place.\n//!\n//! Readers keep their blocks.\n\
+             1 2, 3.4\n3.5\n\nfile mod: Stays.\n7\n",
         )
         .unwrap();
         assert_eq!(
@@ -109,14 +128,29 @@ mod tests {
                 PlanFile {
                     name: "pool".into(),
                     doc: "The pool.".into(),
-                    ids: vec![Id::Whole(1), Id::Whole(2), Id::Member(3, 4), Id::Member(3, 5)],
+                    more: vec![
+                        "It grows in place.".into(),
+                        String::new(),
+                        "Readers keep their blocks.".into()
+                    ],
+                    ids: vec![
+                        Id::Whole(1),
+                        Id::Whole(2),
+                        Id::Member(3, 4),
+                        Id::Member(3, 5)
+                    ],
                 },
                 PlanFile {
                     name: "mod".into(),
                     doc: "Stays.".into(),
+                    more: Vec::new(),
                     ids: vec![Id::Whole(7)],
                 },
             ]
+        );
+        assert_eq!(
+            parse("//! x\n").unwrap_err(),
+            "line 1: a doc line before any `file`"
         );
     }
 

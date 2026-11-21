@@ -93,7 +93,11 @@ pub fn assemble(
     for (item, place) in layout.items.iter().zip(placed) {
         match place {
             Placement::Whole(f) => {
-                let own = if Some(*f) == in_mod { &shares.none } else { edits };
+                let own = if Some(*f) == in_mod {
+                    &shares.none
+                } else {
+                    edits
+                };
                 let text = piece(source, item.span.clone(), own)?;
                 seen[*f] = seen[*f].max(seen_of(&source[item.span.clone()], &item.name));
                 test_only[*f] &= is_test(&source[item.span.clone()]);
@@ -101,14 +105,16 @@ pub fn assemble(
                 pieces[*f].push((item.span.start, text));
             }
             Placement::Members(to) => {
-                let body = item.body.as_ref().expect("members are placed only in a body");
+                let body = item
+                    .body
+                    .as_ref()
+                    .expect("members are placed only in a body");
                 let module = item.name.strip_prefix("mod ");
                 // The files the members go to, and what each share declares
                 // and uses — so a share of a `mod { }` imports the shares it
                 // calls into.
-                let files: Vec<usize> = (0..plan.len())
-                    .filter(|f| to.contains(&Some(*f)))
-                    .collect();
+                let files: Vec<usize> =
+                    (0..plan.len()).filter(|f| to.contains(&Some(*f))).collect();
                 let declares = |f: usize| -> HashSet<&str> {
                     body.members
                         .iter()
@@ -183,7 +189,18 @@ pub fn assemble(
         .enumerate()
         .filter(|(_, f)| f.name != MOD)
         .map(|(i, f)| {
-            let mut out = format!("//! {}\n\nuse super::*;\n", f.doc);
+            let mut out = format!("//! {}\n", f.doc);
+            if !f.more.is_empty() {
+                out.push_str("//!\n");
+                for l in &f.more {
+                    if l.is_empty() {
+                        out.push_str("//!\n");
+                    } else {
+                        out.push_str(&format!("//! {l}\n"));
+                    }
+                }
+            }
+            out.push_str("\nuse super::*;\n");
             let mut mine = pieces[i].clone();
             mine.sort_by_key(|(at, _)| *at);
             for (_, text) in mine {
@@ -201,7 +218,13 @@ pub fn assemble(
     let mut kept: Vec<(usize, Option<usize>, String)> = layout
         .kept
         .iter()
-        .map(|k| (k.span.start, Some(k.span.end), source[k.span.clone()].to_string()))
+        .map(|k| {
+            (
+                k.span.start,
+                Some(k.span.end),
+                source[k.span.clone()].to_string(),
+            )
+        })
         .collect();
     if let Some(m) = in_mod {
         kept.extend(pieces[m].iter().map(|(at, t)| (*at, None, t.clone())));
@@ -271,10 +294,13 @@ fn seen_of(text: &str, name: &str) -> Seen {
     if name.starts_with("impl ") || name.starts_with("mod ") {
         return Seen::Module;
     }
-    let code = text
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !l.starts_with("//") && !l.starts_with("#[") && !l.starts_with("/*") && !l.starts_with('*'));
+    let code = text.lines().map(str::trim).find(|l| {
+        !l.is_empty()
+            && !l.starts_with("//")
+            && !l.starts_with("#[")
+            && !l.starts_with("/*")
+            && !l.starts_with('*')
+    });
     match code {
         Some(l) if l.starts_with("pub(crate)") => Seen::Crate,
         Some(l) if l.starts_with("pub ") => Seen::Everywhere,
@@ -290,7 +316,10 @@ pub fn account(source: &str, layout: &Layout, placed: &[Placement]) -> Result<()
         match place {
             Placement::Whole(_) => claims.push(item.span.clone()),
             Placement::Members(_) => {
-                let body = item.body.as_ref().ok_or("a placement by member of an item with no body")?;
+                let body = item
+                    .body
+                    .as_ref()
+                    .ok_or("a placement by member of an item with no body")?;
                 claims.push(body.head.clone());
                 claims.extend(body.members.iter().map(|m| m.span.clone()));
                 claims.push(body.tail.clone());
@@ -301,7 +330,9 @@ pub fn account(source: &str, layout: &Layout, placed: &[Placement]) -> Result<()
     let mut at = 0usize;
     for r in &claims {
         if r.start < at {
-            return Err(format!("bytes {r:?} are claimed twice (the last claim ended at {at})"));
+            return Err(format!(
+                "bytes {r:?} are claimed twice (the last claim ended at {at})"
+            ));
         }
         if let Some(off) = source[at..r.start].find(|c: char| !c.is_whitespace()) {
             return Err(format!("byte {} belongs to no part", at + off));
@@ -337,7 +368,10 @@ mod tests {
     #[test]
     fn items_move_into_their_files() {
         let src = "//! The pool.\n\nuse std::fmt;\n\npub struct Pool;\n\nfn helper() {}\n";
-        let out = split(src, "file pool: The pool type.\n1\nfile help: Its helper.\n2\n");
+        let out = split(
+            src,
+            "file pool: The pool type.\n1\nfile help: Its helper.\n//! Sized for the card.\n2\n",
+        );
         assert_eq!(
             out.mod_rs,
             "//! The pool.\n\nuse std::fmt;\n\nmod pool;\nmod help;\n\npub use pool::*;\nuse help::*;\n"
@@ -351,7 +385,8 @@ mod tests {
                 ),
                 (
                     "help".to_string(),
-                    "//! Its helper.\n\nuse super::*;\n\npub(super) fn helper() {}\n".to_string()
+                    "//! Its helper.\n//!\n//! Sized for the card.\n\nuse super::*;\n\npub(super) fn helper() {}\n"
+                        .to_string()
                 ),
             ]
         );
@@ -371,7 +406,8 @@ mod tests {
             out.children,
             vec![(
                 "y".to_string(),
-                "//! The y.\n\nuse super::*;\n\nimpl A {\n    pub(super) fn y(&self) {}\n}\n".to_string()
+                "//! The y.\n\nuse super::*;\n\nimpl A {\n    pub(super) fn y(&self) {}\n}\n"
+                    .to_string()
             )]
         );
     }
@@ -382,7 +418,10 @@ mod tests {
     #[test]
     fn a_test_module_carries_its_uses_into_every_share() {
         let src = "#[cfg(test)]\nmod tests {\n    use super::*;\n\n    fn helper() -> u8 { 1 }\n\n    #[test]\n    fn b() { helper(); }\n}\n";
-        let out = split(src, "file one: The helper.\n1.2\nfile two: The test.\n1.3\n");
+        let out = split(
+            src,
+            "file one: The helper.\n1.2\nfile two: The test.\n1.3\n",
+        );
         assert_eq!(
             out.children[0].1,
             "//! The helper.\n\nuse super::*;\n\n#[cfg(test)]\npub(super) mod tests {\n    use super::*;\n\n    \

@@ -62,10 +62,21 @@ fn run(args: &[String]) -> Result<String, String> {
     let mut report = String::new();
     match cmd {
         "check" => {
-            report.push_str(&format!("{} files; every id placed once\n", outputs.children.len() + 1));
-            report.push_str(&format!("{}\t{}\n", outputs.mod_rs.len(), targets.mod_rs.display()));
+            report.push_str(&format!(
+                "{} files; every id placed once\n",
+                outputs.children.len() + 1
+            ));
+            report.push_str(&format!(
+                "{}\t{}\n",
+                outputs.mod_rs.len(),
+                targets.mod_rs.display()
+            ));
             for (name, text) in &outputs.children {
-                report.push_str(&format!("{}\t{}\n", text.len(), targets.dir.join(format!("{name}.rs")).display()));
+                report.push_str(&format!(
+                    "{}\t{}\n",
+                    text.len(),
+                    targets.dir.join(format!("{name}.rs")).display()
+                ));
             }
         }
         "apply" => {

@@ -33,7 +33,10 @@ pub fn targets(original: &Path) -> Result<Targets, String> {
     }
     let presplit = original.with_file_name(format!("{name}.presplit"));
     if name == "mod.rs" {
-        let dir = original.parent().ok_or("mod.rs has no folder")?.to_path_buf();
+        let dir = original
+            .parent()
+            .ok_or("mod.rs has no folder")?
+            .to_path_buf();
         return Ok(Targets {
             mod_rs: original.to_path_buf(),
             dir,
@@ -51,13 +54,20 @@ pub fn targets(original: &Path) -> Result<Targets, String> {
 
 /// Write `outputs` for `original` at `t`. Returns each file written and its
 /// size.
-pub fn write(original: &Path, t: &Targets, outputs: &Outputs) -> Result<Vec<(PathBuf, usize)>, String> {
+pub fn write(
+    original: &Path,
+    t: &Targets,
+    outputs: &Outputs,
+) -> Result<Vec<(PathBuf, usize)>, String> {
     let mut files: Vec<(PathBuf, &str)> = vec![(t.mod_rs.clone(), outputs.mod_rs.as_str())];
     for (name, text) in &outputs.children {
         files.push((t.dir.join(format!("{name}.rs")), text.as_str()));
     }
     if t.presplit.exists() {
-        return Err(format!("{} exists: finish or undo the last split first", t.presplit.display()));
+        return Err(format!(
+            "{} exists: finish or undo the last split first",
+            t.presplit.display()
+        ));
     }
     for (path, _) in &files {
         if path.exists() && path != original {
@@ -122,7 +132,10 @@ mod tests {
         assert_eq!(written.len(), 2);
         assert_eq!(fs::read_to_string(&t.presplit).unwrap(), "fn a() {}\n");
         assert_eq!(fs::read_to_string(&t.mod_rs).unwrap(), "mod a;\n");
-        assert_eq!(fs::read_to_string(root.join("pool/a.rs")).unwrap(), "fn a() {}\n");
+        assert_eq!(
+            fs::read_to_string(root.join("pool/a.rs")).unwrap(),
+            "fn a() {}\n"
+        );
         assert!(!original.exists());
         fs::write(&original, "fn b() {}\n").unwrap();
         assert!(write(&original, &t, &out).unwrap_err().contains("exists"));

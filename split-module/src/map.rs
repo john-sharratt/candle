@@ -26,7 +26,10 @@ pub fn render(source: &str, layout: &Layout) -> String {
         if let Some(body) = &item.body {
             for (j, m) in body.members.iter().enumerate() {
                 if let Some(n) = bare_name(&m.name) {
-                    declared.entry(n).or_default().push(format!("{}.{}", i + 1, j + 1));
+                    declared
+                        .entry(n)
+                        .or_default()
+                        .push(format!("{}.{}", i + 1, j + 1));
                 }
             }
         }
@@ -39,10 +42,27 @@ pub fn render(source: &str, layout: &Layout) -> String {
         layout.items.len(),
         kept_bytes
     );
-    let _ = writeln!(out, "# id\tlines\tbytes\tname\tuses");
+    // The file's own module doc, which each new file's doc is written from.
+    let module_doc: Vec<&str> = layout
+        .kept
+        .iter()
+        .flat_map(|k| source[k.span.clone()].lines())
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("//!"))
+        .map(str::trim)
+        .collect();
+    if !module_doc.is_empty() {
+        let _ = writeln!(out, "# module doc:");
+        for l in module_doc {
+            let _ = writeln!(out, "#   {l}");
+        }
+    }
+    let _ = writeln!(out, "# id\tlines\tbytes\tname\tuses\tdoc");
     for (i, item) in layout.items.iter().enumerate() {
         let id = format!("{}", i + 1);
-        line(&mut out, &id, &item.name, &item.span, source, &line_of, &declared);
+        line(
+            &mut out, &id, &item.name, &item.span, source, &line_of, &declared,
+        );
         if let Some(body) = &item.body {
             for (j, m) in body.members.iter().enumerate() {
                 let mid = format!("  {}.{}", i + 1, j + 1);
@@ -82,11 +102,42 @@ fn line(
     }
     let _ = writeln!(
         out,
-        "{id}\t{}-{}\t{}\t{name}\t{tail}",
+        "{id}\t{}-{}\t{}\t{name}\t{tail}\t{}",
         line_number(line_of, span.start),
         line_number(line_of, span.end.saturating_sub(1)),
-        span.len()
+        span.len(),
+        summary(&source[span.clone()])
     );
+}
+
+/// The most characters of an item's doc the map shows.
+const MAX_SUMMARY: usize = 110;
+
+/// The first line of an item's doc comment, or of the comment over it when it
+/// has no doc — what a planner reads of what the item is for.
+fn summary(text: &str) -> String {
+    let comments: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .take_while(|l| l.starts_with("//") || l.starts_with("#[") || l.is_empty())
+        .filter(|l| l.starts_with("//"))
+        .collect();
+    let first = comments
+        .iter()
+        .find_map(|l| l.strip_prefix("///"))
+        .or_else(|| {
+            comments
+                .iter()
+                .map(|l| {
+                    l.trim_start_matches('/')
+                        .trim()
+                        .trim_matches(|c| c == '─' || c == '-' || c == ' ')
+                })
+                .find(|l| !l.is_empty())
+        })
+        .unwrap_or("")
+        .trim();
+    first.chars().take(MAX_SUMMARY).collect()
 }
 
 /// The name a reference to an item is written as: `fn new` → `new`,
@@ -104,7 +155,11 @@ pub fn bare_name(name: &str) -> Option<&str> {
 /// The identifier-shaped words of `text`.
 pub fn identifiers(text: &str) -> impl Iterator<Item = &str> {
     text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|w| w.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_'))
+        .filter(|w| {
+            w.chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        })
 }
 
 /// The byte offset each line starts at.
@@ -128,18 +183,19 @@ mod tests {
     /// the file's other items it uses — never itself.
     #[test]
     fn the_map_names_what_each_item_uses() {
-        let src = "use std::fmt;\n\npub struct Pool {\n    n: usize,\n}\n\n\
+        let src = "//! The pool.\n\nuse std::fmt;\n\n/// Blocks, grown on demand.\npub struct Pool {\n    n: usize,\n}\n\n\
                    impl Pool {\n    fn grow(&mut self) {\n        self.n = width();\n    }\n}\n\n\
-                   fn width() -> usize {\n    4\n}\n";
+                   // ── sizing ──\nfn width() -> usize {\n    4\n}\n";
         let l = layout(src).unwrap();
         assert_eq!(
             render(src, &l),
-            "# 3 items; 13 bytes stay in mod.rs (docs, uses, macros)\n\
-             # id\tlines\tbytes\tname\tuses\n\
-             1\t3-5\t33\tstruct Pool\t\n\
-             2\t7-11\t70\timpl Pool\tPool, grow, width\n\
-             \x20\x202.1\t8-10\t56\tfn grow\twidth\n\
-             3\t13-15\t29\tfn width\t\n"
+            "# 3 items; 27 bytes stay in mod.rs (docs, uses, macros)\n\
+             # module doc:\n#   The pool.\n\
+             # id\tlines\tbytes\tname\tuses\tdoc\n\
+             1\t5-8\t62\tstruct Pool\t\tBlocks, grown on demand.\n\
+             2\t10-14\t70\timpl Pool\tPool, grow, width\t\n\
+             \x20\x202.1\t11-13\t56\tfn grow\twidth\t\n\
+             3\t16-19\t53\tfn width\t\tsizing\n"
         );
     }
 

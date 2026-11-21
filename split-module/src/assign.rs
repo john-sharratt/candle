@@ -45,13 +45,20 @@ pub fn assign(layout: &Layout, plan: &[PlanFile]) -> Result<Vec<Placement>, Stri
     for (i, item) in layout.items.iter().enumerate() {
         let n = i + 1;
         let named_whole = whole.get(&n).and_then(|f| f.first().copied());
-        let members = item.body.as_ref().map(|b| b.members.as_slice()).unwrap_or(&[]);
+        let members = item
+            .body
+            .as_ref()
+            .map(|b| b.members.as_slice())
+            .unwrap_or(&[]);
         let named_members: Vec<Option<usize>> = (1..=members.len())
             .map(|m| member.get(&(n, m)).and_then(|f| f.first().copied()))
             .collect();
         for (m, files) in member.range((n, 0)..(n + 1, 0)) {
             if m.1 == 0 || m.1 > members.len() {
-                errors.push(format!("{n}.{} is not a member of {n} ({})", m.1, item.name));
+                errors.push(format!(
+                    "{n}.{} is not a member of {n} ({})",
+                    m.1, item.name
+                ));
             } else if files.len() > 1 {
                 errors.push(format!("{n}.{} is named {} times", m.1, files.len()));
             }
