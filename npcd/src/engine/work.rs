@@ -294,13 +294,26 @@ fn mission(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                 // hours — each sure it had reported already, each told it was
                 // not stuck. An operation's step has a gate and, at review, a
                 // verdict to give, and is told so instead.
+                //
+                // **Told twice, the third is taken as the done report it
+                // matches.** A Maker on a canon check, every step done and its
+                // finding "no contradictions" said on the channel, sent
+                // `report_stuck` again and again for an hour, refused each time
+                // with the two verdicts it could give. The work stands in the
+                // engine's sight, so it is filed done — through the gate a done
+                // report passes, in the carrier's words.
                 let standalone = hosted.sim(|s| {
                     s.missions
                         .active(body)
                         .is_some_and(|m| m.operation().is_none())
                 });
                 if !standalone {
-                    return Outcome::Refused(done);
+                    if hosted.with_sim(|s| s.missions.refuse_stuck(body)) <= STUCK_REFUSALS {
+                        return Outcome::Refused(done);
+                    }
+                    if let Some(refusal) = report_block(hosted, body) {
+                        return Outcome::Refused(refusal);
+                    }
                 }
                 let account = done_account(hosted, body, &why);
                 return file_done(hosted, body, &account);
@@ -2857,9 +2870,31 @@ mod tests {
             }
             other => panic!("finished work was reported stuck: {other:?}"),
         }
+        let stuck = || {
+            perform(
+                &h,
+                "m1",
+                &act(
+                    "report_stuck",
+                    json!({"why": "the story stands, but I cannot file it"}),
+                ),
+            )
+        };
         assert!(
-            report().happened(),
-            "a committed document is a mission done"
+            matches!(stuck(), Outcome::Refused(ref why) if why.starts_with("Nothing here is stuck")),
+            "the second is turned away too"
+        );
+        // **Told twice, the third is the done report it matches.**
+        match stuck() {
+            Outcome::Did(line) => assert!(line.starts_with("Reported done"), "{line}"),
+            other => panic!("a third stuck report on finished work was not filed done: {other:?}"),
+        }
+        let answer = h
+            .sim(|s| s.missions.done("m1").and_then(|m| m.answer.clone()))
+            .expect("the mission is filed done");
+        assert!(
+            answer.starts_with("the story stands, but I cannot file it"),
+            "filed in the carrier's words: {answer}"
         );
     }
 
