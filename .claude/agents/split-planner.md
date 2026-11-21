@@ -25,7 +25,7 @@ Placing:
 - Split a container larger than ~40 KB by its members, sending each to the file of its concern. Keep a smaller one whole.
 - Group what works together, using `uses`: a type with its impls, related helpers together. Test-module members go to `tests_<concern>` files, the shared helpers with the tests that use most of them.
 - Aim for 15–60 KB per file. `file mod: ...` keeps items in mod.rs itself, for example the central type; it takes no `//!` lines.
-- Never name a file `self`, `super`, `crate`, `lib`, `main` or `mod` except as `file mod`.
+- Never name a file `self`, `super`, `crate`, `lib`, `main` or `mod` except as `file mod`, nor any name the map's `# names taken` line lists.
 
 The module docs:
 - Write them from the file's module doc and the `doc` of the items you put in the file. Name the file's main types or functions in backticks, and say what they do and the reason it matters, as the original doc does for the whole module.

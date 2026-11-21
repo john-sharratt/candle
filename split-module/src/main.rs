@@ -72,7 +72,23 @@ fn run(args: &[String]) -> Result<String, String> {
     let source = fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let layout = layout::layout(&source)?;
     if cmd == "map" {
-        return Ok(map::render(&source, &layout));
+        let mut out = String::new();
+        // A `mod.rs`'s children go beside the modules it already has: their
+        // names are taken.
+        if file.file_name().and_then(|n| n.to_str()) == Some("mod.rs") {
+            let dir = file.parent().ok_or("mod.rs has no folder")?;
+            let mut taken: Vec<String> = fs::read_dir(dir)
+                .map_err(|e| format!("{}: {e}", dir.display()))?
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n != "mod.rs")
+                .map(|n| n.trim_end_matches(".rs").to_string())
+                .collect();
+            taken.sort();
+            out.push_str(&format!("# names taken, never use them: {}\n", taken.join(", ")));
+        }
+        out.push_str(&map::render(&source, &layout));
+        return Ok(out);
     }
     let plan_path = args.get(2).ok_or("check and apply take a plan")?;
     let plan_text = fs::read_to_string(plan_path).map_err(|e| format!("{plan_path}: {e}"))?;
