@@ -1,0 +1,13 @@
+[package]
+name = "split-module"
+version = "0.1.0"
+edition = "2021"
+description = "Split an oversized Rust source file into a module folder by a plan: map its items, then move each one's exact bytes into the file the plan names."
+
+[[bin]]
+name = "split-module"
+path = "src/main.rs"
+
+[dependencies]
+tree-sitter      = "0.26"
+tree-sitter-rust = "0.24"

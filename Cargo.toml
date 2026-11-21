@@ -38,6 +38,7 @@ members = [
     "zend-vfs",
     "target-prune",
     "ram-balloon",
+    "split-module",
 ]
 exclude = [
     "candle-book",
