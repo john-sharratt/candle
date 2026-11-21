@@ -1,3 +1,6 @@
+#[cfg(feature = "tensor-assert")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::{DType, Layout};
 
 /// cudarc related errors
@@ -48,7 +51,64 @@ pub enum CudaError {
 impl From<CudaError> for crate::Error {
     fn from(val: CudaError) -> Self {
         note_sticky_cuda_fault(&val);
-        crate::Error::Cuda(Box::new(val)).bt()
+        traced(crate::Error::Cuda(Box::new(val)))
+    }
+}
+
+/// How many of a `tensor-assert` build's CUDA errors carry their stack.
+///
+/// **The first failing call names itself.** A diagnostic motherd on WhiteWorld
+/// failed its first wave on `CUDA_ERROR_INVALID_VALUE` and every wave after on
+/// the capture it left open, and the log said neither which call refused nor
+/// from where: services run without `RUST_BACKTRACE`. The first few errors of
+/// the process are the ones worth a stack; once a stream is wedged, thousands
+/// follow a second, and a stack on each would be the whole log.
+#[cfg(feature = "tensor-assert")]
+const TRACED_CUDA_ERRORS: usize = 32;
+
+/// `e` with its stack: forced for a `tensor-assert` build's first
+/// [`TRACED_CUDA_ERRORS`], as the environment says otherwise.
+fn traced(e: crate::Error) -> crate::Error {
+    #[cfg(feature = "tensor-assert")]
+    {
+        static TRACED: AtomicUsize = AtomicUsize::new(0);
+        traced_by(e, &TRACED)
+    }
+    #[cfg(not(feature = "tensor-assert"))]
+    e.bt()
+}
+
+/// [`traced`] against `count`, the errors traced so far.
+#[cfg(feature = "tensor-assert")]
+fn traced_by(e: crate::Error, count: &AtomicUsize) -> crate::Error {
+    match count.fetch_add(1, Ordering::Relaxed) < TRACED_CUDA_ERRORS {
+        true => e.bt_forced(),
+        false => e.bt(),
+    }
+}
+
+#[cfg(all(test, feature = "tensor-assert"))]
+mod traced_tests {
+    use super::*;
+
+    /// **A diagnostic build's first CUDA errors carry their stack** with no
+    /// `RUST_BACKTRACE` set, and once [`TRACED_CUDA_ERRORS`] have, the rest
+    /// carry what the environment asks for.
+    #[test]
+    fn the_first_cuda_errors_carry_their_stack() {
+        let count = AtomicUsize::new(0);
+        let error = || crate::Error::Cuda(Box::new(CudaError::InternalError("x".into())));
+        for _ in 0..TRACED_CUDA_ERRORS {
+            assert!(matches!(
+                traced_by(error(), &count),
+                crate::Error::WithBacktrace { .. }
+            ));
+        }
+        assert_eq!(
+            std::mem::discriminant(&traced_by(error(), &count)),
+            std::mem::discriminant(&error().bt()),
+            "past the first, what the environment asks for"
+        );
     }
 }
 
