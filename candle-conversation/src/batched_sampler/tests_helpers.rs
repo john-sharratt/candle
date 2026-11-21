@@ -1,8 +1,9 @@
-//! Shared fixtures for the sampler tests: the vocabulary constants, the sampler and state builders, and the logits builders.
+//! Fixtures shared by the sampler's unit tests.
 //!
-//! `make_sampler` and `make_sampler_on` build a `BatchedSampler`, and `make_state` builds a `SequenceSamplingState`.
-//! `logits_from_rows` builds a `[batch, VOCAB]` logits tensor from per-row spikes, and `gather` collects the kernel inputs for a set of rows.
-//! `VOCAB_SIZE`, `MAX_RECENT` and `EOS_TOKEN` are the fixture constants, and `window_16`, `sampled_config` and `devices` build the shared configs and devices.
+//! Each test builds its logits from per-row spikes, so the argmax of every row
+//! is set by the test, and sequence states and sampling configs are built with
+//! the same window sizes and EOS token. `make_sampler_on` runs a fixture on the
+//! CPU and on each CUDA device present, so one test body covers both paths.
 
 use super::*;
 

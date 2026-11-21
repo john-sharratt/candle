@@ -1,8 +1,13 @@
-//! Committing a scored row onto its sequence's state, including how the row's pick is resolved and logged.
+//! Committing a scored row onto its sequence's state, and resolving the raw
+//! sampled token into the token the sequence actually takes.
 //!
-//! `commit_row` resolves a free row's pick and commits it onto the sequence's state.
-//! `advance` moves a state on as committing a row would, and `free_rng_step` says how far a full-vocabulary row moves the RNG offset.
-//! `resolve` turns a raw sampled token into the token the sequence actually commits, and `log_resolution` writes the log line for it.
+//! A row is committed only onto the state it was scored against, since a
+//! speculative draft's row was priced against the state its earlier drafts
+//! leave; a mismatch is refused rather than committed. Resolution runs in one
+//! place for both the CPU and CUDA paths, so the segment-close override, the
+//! degenerate-decode abort and the EOS length failsafes hold whichever path the
+//! device selects. The advance that prices a row past without committing it
+//! records nothing and logs nothing.
 
 use super::*;
 

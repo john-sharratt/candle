@@ -1,9 +1,12 @@
-//! The `BatchedSampler` type, its constructors, and the batch entry point `sample_batch`.
+//! The batched sampler: the handle that drives the CUDA sampling kernel over
+//! sequences whose state the caller owns.
 //!
-//! Defines `BatchedSampler`, which samples one token per sequence in a batch by invoking the CUDA sampling kernel.
-//! `new` takes the vocabulary size and the recent-token history length, and clamps the live vocabulary to the vocabulary size.
-//! `with_reference_flags` sets the per-token flags DRY reads to leave a repeated reference alone.
-//! `sample_batch` flattens the logits to `[batch, vocab]` and samples a token for each sequence in the batch.
+//! The sampler holds what is shared across a dispatch: the device count tables,
+//! the argument buffer, and the DRY reference flags once they are uploaded. The
+//! logits row is `vocab_size` wide, which a checkpoint may pad, but a row may
+//! produce only the tokenizer's ids, so the padded tail carries no probability.
+//! `sample_batch` is the plain case of scoring rows and committing them, which a
+//! speculative step drives directly.
 
 use super::*;
 

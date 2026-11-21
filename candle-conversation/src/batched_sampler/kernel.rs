@@ -1,8 +1,13 @@
-//! The CUDA kernel launch, where `launch_rows` runs the kernel over every gathered row in one launch.
+//! Running the CUDA sampling kernel over a dispatch's full-vocabulary rows in
+//! one launch and one readback.
 //!
-//! `launch_rows` runs the kernel over every row that `KernelRows` gathered, in one launch and one dispatch.
-//! `invoke_cuda_kernel` builds the kernel's parameters from the gathered rows and invokes it.
-//! `write_penalty_log` writes the penalty log that the kernel reads for the rows.
+//! Each row samples on its own dials, read from a per-row array, so no row
+//! inherits the first row's settings. The count tables the penalties read are
+//! stamped for the launch and cleared afterwards whether or not it succeeded:
+//! a table left stamped would price the next dispatch's rows with this one's
+//! counts. The per-dispatch arrays go up in one copy and the outputs and the
+//! non-finite verdicts come back in one copy. A row the kernel judged non-finite
+//! fails the dispatch before any state moves, so no token it drew is recorded.
 
 use super::*;
 

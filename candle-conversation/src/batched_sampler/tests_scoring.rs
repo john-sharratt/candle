@@ -1,8 +1,11 @@
-//! Tests for scoring a block in one dispatch and for the speculative verify rows.
+//! Tests for scoring a block of draft tokens in one dispatch, and for the
+//! typical-acceptance rule that decides whether a draft is committed.
 //!
-//! Tests that one dispatch over a whole block commits what a position-at-a-time walk commits, and that a rejected draft stops the block where the walk stops.
-//! Tests that a position behind a forced token scores as unreachable, and that a draft over the typical bar is committed while a draft under it commits the sample.
-//! Tests the typical-acceptance rule on raw probabilities and over the truncated distribution, and that greedy verification is unchanged.
+//! One dispatch over a block must commit what scoring the block a position at a
+//! time commits, leaving the same counts, window and RNG. A rejected draft ends
+//! the walk where a position-at-a-time walk ends. A position behind a forced
+//! token is unreachable. A draft with enough probability mass is committed
+//! whatever the sample, and at temperature zero only the argmax is committed.
 
 use super::*;
 

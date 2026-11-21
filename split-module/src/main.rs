@@ -4,7 +4,13 @@
 //! split-module map   <file>          # the items a plan places, one a line
 //! split-module check <file> <plan>   # every output's size, nothing written
 //! split-module apply <file> <plan>   # write the split; the original is kept
+//! split-module docs  <folder>        # each file's items and comments, no code
+//! split-module redoc <folder> <docs> # write each file's new module doc
 //! ```
+//!
+//! A split is planned from the map and documented from the digest: once the
+//! files exist, each one's module doc is written from the comments in it
+//! (`digest`) and put in place (`redoc`), touching nothing but that doc.
 //!
 //! The map is what a planner reads in place of the file; the plan says which
 //! file each item goes to (`plan`). Applying moves every item's own bytes —
@@ -15,9 +21,11 @@
 
 mod assemble;
 mod assign;
+mod digest;
 mod layout;
 mod map;
 mod plan;
+mod redoc;
 mod rewrite;
 mod write;
 
@@ -44,8 +52,23 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<String, String> {
     let (cmd, file) = match args {
         [cmd, file, ..] => (cmd.as_str(), Path::new(file)),
-        _ => return Err("usage: split-module map|check|apply <file> [plan]".into()),
+        _ => {
+            return Err(
+                "usage: split-module map|check|apply <file> [plan] | docs <folder> | redoc <folder> <docs>"
+                    .into(),
+            )
+        }
     };
+    match cmd {
+        "docs" => return digest::digest_dir(file),
+        "redoc" => {
+            let docs_path = args.get(2).ok_or("redoc takes the docs to write")?;
+            let text = fs::read_to_string(docs_path).map_err(|e| format!("{docs_path}: {e}"))?;
+            let written = redoc::redoc(file, &redoc::parse_docs(&text)?)?;
+            return Ok(written.iter().map(|n| format!("{n}\n")).collect());
+        }
+        _ => {}
+    }
     let source = fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let layout = layout::layout(&source)?;
     if cmd == "map" {

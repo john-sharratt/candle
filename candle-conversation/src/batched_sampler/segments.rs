@@ -1,8 +1,14 @@
-//! The think-segment close policy: the closing script, its graceful and hard caps, and the rule for a call opened inside a segment.
+//! The segment-close override, the report of a degenerate logits row, and the
+//! close that precedes a tool call.
 //!
-//! `segment_close_override` returns the token that closes an open segment for one sampled step, applied after sampling.
-//! `describe_logit_row` summarises one logits row for the degenerate-decode report.
-//! `close_before_call` closes an open segment before a tool call that was opened inside it.
+//! A reasoning segment is closed by the override when its budget runs out: a
+//! closer script in flight plays to the end, a graceful cap closes at a line end,
+//! and the hard cap starts the configured closer script, falling back to the bare
+//! close where no script fits. When the override answers, the token it gives is
+//! authoritative for the step. A row that looks degenerate is described once, in
+//! the log, by whether its entries are non-finite or all equal, since those have
+//! different causes. A tool call opened inside a segment closes the segment
+//! first, so the call is written outside the reasoning block.
 
 use super::*;
 

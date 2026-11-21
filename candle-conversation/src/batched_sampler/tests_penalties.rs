@@ -1,8 +1,12 @@
-//! Tests for the history each row is priced by: the penalty flags, DRY's window, and the cross-turn table.
+//! Tests for the penalties and the per-row dials the kernel reads.
 //!
-//! Tests that an unpenalised step reads no history for that step alone, and that DRY's window is one free-text value.
-//! Tests that the repeat penalty flips with DRY, that the cross-turn table is gathered only when its penalty is on, and that the sparse indexes track the nonzero counts.
-//! Tests the per-row dials the kernel reads, including each config's own segment-close token and the gating when that token is missing.
+//! Each row must carry its own segment-close token, and a segment-close token
+//! that is missing turns that path fully off. A tool-call row stamps no
+//! penalty history, while a think-block row keeps full repetition control. The
+//! DRY window covers only the free-text value being written. The repeat penalty
+//! a row samples on flips with DRY, and the cross-turn table is gathered only
+//! when its penalty is on. The sparse indexes must name exactly the nonzero
+//! counts, since the device table is stamped from them.
 
 use super::*;
 

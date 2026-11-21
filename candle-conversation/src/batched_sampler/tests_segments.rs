@@ -1,8 +1,12 @@
-//! Tests for the think-segment close override and the segment state transitions.
+//! Tests for the segment-close override tiers and the segment state machine.
 //!
-//! Tests the closing script: a hard cap plays the script to the close token, and a graceful close waits for a line end.
-//! Tests the rule for a call opened inside a segment, and that a segment boundary or a turn end cancels a stranded script.
-//! Tests `update_segment_state`, where an open token enters a segment and a close token exits it.
+//! The override's tiers are checked one at a time: the closer script plays to
+//! its close token, a graceful close waits for a line end and not a mid-line
+//! period, and a continuation span gets the bare close rather than a closing
+//! statement. A call being written is not cut by the answer's length budget,
+//! and a call opened inside a segment closes it first. The segment state
+//! machine is tested on its own, so opening, closing and the length counter
+//! behave correctly without any sampler around them.
 
 use super::*;
 

@@ -1,8 +1,15 @@
-//! The per-sequence sampling state that persists across turns, and the marks used to roll back a speculative advance.
+//! The per-sequence sampling state that persists across turns, and the history
+//! the penalties read from it.
 //!
-//! `SequenceSamplingState` holds a sequence's recent tokens, its cross-turn counts, its segment position and its RNG offset.
-//! `SamplingMark` records what an advance changes so that `rewind` can undo it, and `RowKey` records the state a row was scored against.
-//! `end_turn` snapshots the turn's counts into the cross-turn window, and `clear` resets the state for a conversation reset.
+//! The state holds token counts for the current turn and a window of counts for
+//! earlier turns, so the cross-turn penalty forgets a turn once it leaves the
+//! window. Each turn is kept as its own pairs, so eviction takes exactly that
+//! turn back out. A speculative block's drafts can be priced and then undone
+//! with a mark and a rewind, which walks the counts back instead of copying the
+//! vocabulary. A row commits only onto a state whose row key matches the one it
+//! was scored against. Consecutive emissions of token 0 are counted, because
+//! argmax over a broken logits row returns 0; once the run reaches the bar, the
+//! turn stays marked degenerate until it ends.
 
 use super::*;
 

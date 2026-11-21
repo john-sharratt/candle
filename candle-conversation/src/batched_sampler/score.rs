@@ -1,7 +1,12 @@
-//! Scoring a dispatch, where `score_rows` runs one kernel dispatch over a block of rows and places the bitmaps those rows read.
+//! Scoring a block of rows in one dispatch without committing any of them.
 //!
-//! `score_rows` scores the rows against the logits block in one dispatch.
-//! `place_bitmaps` pairs each masked row's bitmap address with its dials, and `bitmaps_beside` checks that a row of logits can read a bitmap.
+//! A speculative step's row at position p is reached only after the sequence has
+//! committed its first p drafts, so each sequence is advanced through its rows'
+//! draft tokens here exactly as committing would advance it, each row is read off
+//! the state as it then stands, and the sequence is rewound afterwards. All rows
+//! go to the kernel together, one launch and one readback for the step. A row
+//! that the draft tokens cannot reach scores as `None`, and the state is left
+//! exactly as it was.
 
 use super::*;
 

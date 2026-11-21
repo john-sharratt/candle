@@ -1,8 +1,13 @@
-//! The host sampler for unconstrained rows, with the logit masks it applies before it picks a token.
+//! The host sampler's pick for one full-vocabulary row, used when the sampler is
+//! not on a CUDA device.
 //!
-//! `sample_row_cpu` picks a token for one full-vocabulary row on the host, against that row's logits and sequence state.
-//! `apply_banned` sets a row's banned logits to negative infinity, and `apply_suppression` subtracts the penalty from segment-suppressed tokens.
-//! `think_close_ban_active` says whether the structural think-close ban applies to a row right now.
+//! Each row is adjusted the way the kernel adjusts it, so the two paths agree:
+//! banned tokens go to -inf, suppressed tokens lose their penalty inside a
+//! segment, and a row inside a segment samples a touch hotter. A `</think>`
+//! outside a think block is never valid output, so it is banned there; the ban
+//! stays even on turns where it would otherwise be lifted, because an orphan
+//! close would cut a spurious index page into the turn's K/V. Candle's own
+//! sampler draws from the adjusted row.
 
 use super::*;
 

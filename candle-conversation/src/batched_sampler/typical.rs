@@ -1,7 +1,13 @@
-//! The kernel's candidate cap and floor, and the typical-acceptance rule for speculative verify rows.
+//! The typical-acceptance rule, computed on the host over the distribution the
+//! kernel samples.
 //!
-//! `KERNEL_MAX_TOP_K` is the kernel's candidate cap, and `KERNEL_DEAD_ZONE` is its candidate floor.
-//! `typical_accepts_row` applies the typical-acceptance rule to one row of logits and decides whether the row's draft is accepted.
+//! A draft is accepted when its probability exceeds the smaller of the rule's
+//! epsilon and delta times e^(-H), where H is the row's entropy. The distribution
+//! is the top-k candidates, none more than a fixed dead zone below the best,
+//! softmaxed at the row's temperature and cut to its nucleus, then renormalised.
+//! A draft outside that set has probability zero and is never accepted. The
+//! constants name the kernel's own candidate cap and dead zone, so this rule and
+//! the kernel's stay in step.
 
 use super::*;
 

@@ -1,8 +1,13 @@
-//! Tests for the degenerate-decode guard, the cross-turn penalty window, and the EOS failsafe overrides.
+//! Tests for the degenerate-decode guard, the cross-turn window, and the EOS
+//! failsafes.
 //!
-//! Tests that a run of zero tokens is counted, that a fresh turn does not inherit it, and that the run forces EOS on the resolver both sampling paths share.
-//! Tests the cross-turn window: a turn that crossed the bar stays marked, turns that fall out of the window are forgotten, and a zero window keeps every turn.
-//! Tests the forced and graceful EOS failsafes, and that a failsafe set to zero never overrides a token.
+//! The guard counts only consecutive token-0 emissions, so interleaved zeros
+//! never reach the bar and a real token clears the run. The run is per turn,
+//! and once a turn has crossed the bar it stays marked until the turn ends,
+//! even when a forced EOS or a rewound draft follows. The abort is tested on the
+//! shared resolver, so the CPU and CUDA paths cannot disagree about it. The
+//! cross-turn window tests check that a turn leaves with its tokens and that a
+//! token used again stays counted until its last use leaves.
 
 use super::*;
 

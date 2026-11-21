@@ -1,8 +1,11 @@
-//! Tests for allow-list rows: their read-back words, their host finish, and a sampled allow-list row on CUDA.
+//! Tests for the allow-list path, on the CUDA kernel where a card is present.
 //!
-//! Tests that an argmax allow-list row reads back one word, and a sampled row reads back one word per allowed token.
-//! Tests that the host half maps the result back to the allowed token, and that a bitmap binds its own row on the kernel path.
-//! Tests the step cost of a bitmap over a large vocabulary, and that a sampled allow-list row draws inside its list on CUDA.
+//! They check that an argmax row reads back one word and a sampled row one per
+//! allowed token, that the host half maps the result back to the right token,
+//! and that each bitmap row in a shared dispatch takes its own allowed best. A
+//! sampled allow-list row must draw only inside its list, even when a banned
+//! position carries the highest logit. One test times a bitmap against the
+//! allow-list it replaces and prints the figures.
 
 use super::*;
 

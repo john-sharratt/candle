@@ -1,8 +1,13 @@
-//! The stencil-constrained rows: their device dispatch, their host finish, and the result words they read back.
+//! Sampling a row constrained to its grammar's allow-list, in time that scales
+//! with the list rather than the vocabulary.
 //!
-//! `AllowRow` is a stencil-constrained row waiting for the dispatch that runs every such row, and `run_allow_rows` runs that dispatch in one launch.
-//! `issue_allow_list` enqueues a row's device work, and `finish_allow_list` reads its result back and maps it to the allowed token.
-//! `AllowResult` is what the device half of an allow-list row reads back, and `allow_sample_failure` describes a row that could not be sampled.
+//! The device gathers only the allowed logits and runs the row's strategy over
+//! them, so the cost is the size of the allow-list, never the full vocab. The
+//! result is read back later, by `finish_allow_list`, which maps it to its
+//! allowed token; the failure report is built only when a sample fails, so a row
+//! that samples pays for none of it. Every allow-list row of a step is run in
+//! one launch, and a row whose allowed logits held a NaN or +inf is refused
+//! before anything is drawn from it.
 
 use super::*;
 

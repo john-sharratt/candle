@@ -1,8 +1,12 @@
-//! The per-sequence sampling dials uploaded to the kernel as a `[batch_size]` array of flat 4-byte words.
+//! The per-row dials the kernel reads, in the exact layout of its C twin.
 //!
-//! `SeqDials` is the per-row dials struct the kernel reads as a flat run of 4-byte words, and `const _` pins that layout.
-//! `SeqDials::from_config` reads one row's dials from its `SamplingConfig`, resolving the Option and gate logic.
-//! `with_draft` marks a row as a speculative verify row testing a draft token.
+//! Each row samples on its own config, so one row's EOS ramp or temperature
+//! cannot reach another row in a wave that mixes configs. The kernel reads these
+//! entries back as the C struct, so every field is a 4-byte `f32` or `i32` with
+//! no padding, and a compile-time check pins the field count and size. Building
+//! a row resolves the same optional settings the scalar path resolves, so a
+//! row in a mixed wave behaves as it would in a uniform one. A segment-close
+//! token of -1 turns that path off for the row alone.
 
 use super::*;
 

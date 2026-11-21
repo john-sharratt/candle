@@ -1,8 +1,10 @@
-//! Tests for stencil allow-lists, bitmaps and per-row bans within a shared launch.
+//! Tests for the per-row allow-list and banned-token masking.
 //!
-//! Tests that a single-token stencil forces that token, that a stencil picks the best allowed token, and that an empty stencil leaves a row unconstrained.
-//! Tests that a bitmap reads back as exactly its tokens and that a row under a bitmap draws inside it.
-//! Tests that a row's ban is its own inside a shared launch, that stencils and bans combine, and that per-row stencils stay independent.
+//! A row's allow-list is its own: a stenciled row never leaks its mask into a
+//! free row beside it, and two stenciled rows with disjoint lists each mask the
+//! shared global best. A ban is also the row's own inside a shared launch, in
+//! either order of the rows. Stochastic draws over a gathered allow-list never
+//! leave the list, and a single allowed token is forced.
 
 use super::*;
 

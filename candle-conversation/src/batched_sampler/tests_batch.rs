@@ -1,8 +1,11 @@
-//! Tests for whole-batch behaviour: a NaN row failing the batch, deferred allow-list rows, free rows beside a constrained one, and padded tails.
+//! Tests for batches that mix sampled rows, constrained rows and bad rows.
 //!
-//! Tests that a batch failed by one NaN row leaves every sequence state as it found it.
-//! Tests that constrained rows are issued in the pass over the batch and land in their own rows, and that free rows read their own logits in place.
-//! Tests that the padded tail of a row is never produced as a token.
+//! A batch that fails on one NaN row must leave every state as it found it, so a
+//! clean row sampled again alone draws what it would have drawn from the start.
+//! Deferred allow-list rows must land in their own rows and advance their own
+//! states, with an unconstrained row between them. Free rows beside a constrained
+//! row must be read from their own rows of the block, and the padded tail of a
+//! row must never be produced, even when a draft names it.
 
 use super::*;
 

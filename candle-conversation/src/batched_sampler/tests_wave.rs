@@ -1,8 +1,12 @@
-//! Tests for the think-block close rules and for per-row budgets across a wave of rows.
+//! Tests that every row of a mixed wave resolves against its own config.
 //!
-//! Tests that a `</think>` outside a think block is banned, that one inside a block is free, and that no think protocol means no ban.
-//! Tests that a row's segment-close budget applies inside a shared launch, and that each row of a wave resolves against its own config.
-//! Tests that the kernel prices each row from its own device-resident counts.
+//! The kernel takes one set of scalar parameters per launch, and the host-side
+//! post-kernel loop must not inherit them from the first row. Each row keeps its
+//! own segment budget, its own EOS ramp and its own penalty history, whichever
+//! order the rows come in. The structural think-close ban applies outside a
+//! think block and not inside one, and a model with no think protocol is never
+//! banned from anything. The next dispatch starts from clean device counts
+//! rather than the last one's.
 
 use super::*;
 

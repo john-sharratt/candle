@@ -1,7 +1,12 @@
-//! The row descriptors of one dispatch, and the table of full-vocabulary rows that the kernel reads in place.
+//! Describing each row of a dispatch as the inputs the kernel reads for it.
 //!
-//! `RowSpec` describes one row of a dispatch, `RowKind` says how the row's token is committed, and `Scored` holds a row's pick before it is committed.
-//! `KernelRows` gathers the full-vocabulary rows of one dispatch, each read off its sequence's state as it stands, for the kernel's inputs.
+//! A row's inputs are read off its sequence's state as that state stood when the
+//! row was scored. Inside a tool call the repetition penalties are off, because
+//! a call's arguments reproduce prompt content verbatim, and a penalty would
+//! demote exactly the tokens the value needs. The recent-token window is as wide
+//! as the larger of the repeat and DRY windows, so each penalty sees the depth
+//! it was configured for, and a row that is writing a call reports no length, so
+//! the dynamic EOS ramp holds at zero.
 
 use super::*;
 
