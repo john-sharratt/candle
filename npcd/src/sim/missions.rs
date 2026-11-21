@@ -903,7 +903,15 @@ impl Missions {
     ///
     /// `None` in a world that draws nothing ([`Draw::None`]) with nothing set
     /// for this body: it waits at the table until work is posted.
+    ///
+    /// **One who gives orders takes nothing from the table, ever.** Its
+    /// missions come from the people who message it; the table is where it
+    /// puts work for those who take orders. Refused here, where the table hands
+    /// work out, not only by the callers that ask.
     pub fn collect(&mut self, body: &str, facts: &Facts) -> Option<&Mission> {
+        if self.is_unordered(body) {
+            return None;
+        }
         let mission = match self.take_lodged(body).or_else(|| self.take_pooled(body)) {
             Some(mission) => mission,
             None if self.draw == Draw::None => return None,
@@ -1755,8 +1763,9 @@ impl Missions {
     }
 
     /// A body starts over: what it carries is called off, every mission
-    /// waiting for it, whoever lodged it, is dropped — each poster told — and
-    /// the work it posted that nobody has taken up yet is taken off the table.
+    /// waiting for it, whoever lodged it, is dropped — each poster told — the
+    /// work it posted that nobody has taken up yet is taken off the table, and
+    /// the missions it finished are forgotten with the rest of its past.
     /// Returns how many missions went. The body stays in the world, taking
     /// orders or giving them as it did.
     pub fn start_over(&mut self, body: &str) -> usize {
@@ -1764,6 +1773,10 @@ impl Missions {
         while gone < START_OVER_MOST && self.cancel_for(body, STARTED_OVER) {
             gone += 1;
         }
+        // Called off, each went to what it finished last: started over, it
+        // has finished nothing.
+        self.done.remove(body);
+        self.last_closed.remove(body);
         for m in self.lodged.remove(body).unwrap_or_default() {
             self.called_off(body, &m, STARTED_OVER);
             gone += 1;
@@ -2258,6 +2271,38 @@ mod tests {
         assert!(drawn.is_open());
         assert!(!drawn.todo.is_empty(), "a routine gives steps to act on");
         assert!(matches!(drawn.origin, Origin::Random { .. }));
+    }
+
+    /// **One who gives orders collects nothing from the table** — not what is
+    /// lodged for it, not what waits for whoever takes it, not a routine.
+    #[test]
+    fn one_who_gives_orders_collects_nothing_from_the_table() {
+        let mut m = Missions::default();
+        m.set_routines(Vec::new(), Draw::Routines);
+        m.set_unordered("zen", true);
+        m.lodge("zen", a_mission("lodged for zen"));
+        m.post(a_mission("for whoever takes it"), None);
+        assert!(m.collect("zen", &Facts::default()).is_none());
+        assert!(!m.is_on_mission("zen"));
+        assert!(
+            m.collect("wick", &Facts::default()).is_some(),
+            "one who takes orders still collects"
+        );
+    }
+
+    /// **Starting over forgets what was finished**: nothing is carried, and
+    /// nothing is kept as done or as the last mission closed.
+    #[test]
+    fn starting_over_forgets_what_was_finished() {
+        let mut m = Missions::default();
+        m.assign("zen", a_mission("read the reports"));
+        m.report("zen", Outcome::Pass, "read", None).unwrap();
+        m.assign("zen", a_mission("watch earth"));
+        assert!(m.done("zen").is_some());
+        m.start_over("zen");
+        assert!(!m.is_on_mission("zen"));
+        assert!(m.done("zen").is_none(), "a finished mission was kept");
+        assert!(m.latest("zen").is_none(), "something was kept as latest");
     }
 
     /// A read struck wherever a mission stands — carried, lodged or pooled —
