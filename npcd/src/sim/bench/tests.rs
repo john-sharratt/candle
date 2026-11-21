@@ -406,6 +406,32 @@ fn an_edit_changes_the_paragraph_its_anchor_names() {
     );
 }
 
+/// An edit that leaves the paragraph as it was is refused, and nothing is
+/// opened: answered as a change, a Maker made the same edit again.
+#[test]
+fn an_edit_that_changes_nothing_is_refused() {
+    let (mut b, _, s) = rooted("edit-same");
+    let at = anchor_in(&b, "m1", "layers/eras/third.md", 0, &s);
+    let err = b
+        .edit(
+            "m1",
+            "layers/eras",
+            "layers/eras/third.md",
+            &change(at, "spring", "spring"),
+            &s,
+        )
+        .unwrap_err();
+    assert_eq!(
+        err,
+        "That changes nothing: layers/eras/third.md already reads that way there. If that \
+         fault is put right, go on to the next one."
+    );
+    assert!(
+        b.opened("m1").is_none_or(|w| w.is_empty()),
+        "an edit that changed nothing was opened"
+    );
+}
+
 /// An ambiguous edit is the one that silently does the wrong thing, so it
 /// is refused and says how many it found — and nothing lands.
 #[test]
