@@ -242,6 +242,20 @@ pub struct Sweep<'m> {
     ///
     /// One `Arc` clone per rewritten allocation, dropped with the sweep.
     originals: Vec<HeadGids>,
+    /// Allocations this sweep found naming no moved gid, by `alloc_id` — a
+    /// later visit to one is answered without scanning it again.
+    ///
+    /// **The same allocation is visited many times.** A residence's hot chunks
+    /// are Arc-injected into every slot that places them, a view shares its
+    /// parent's prefix, and the scheduler sweeps a shared substrate once per
+    /// slot; each visit scanned every gid of every chunk again. An allocation
+    /// never changes, so the first scan's answer stands for the sweep.
+    clean: AHashSet<usize>,
+    /// The allocations in [`Self::clean`], held alive until the sweep ends so
+    /// no key is recycled for another allocation — see [`Self::originals`].
+    clean_pins: Vec<HeadGids>,
+    /// Visits [`Self::clean`] answered.
+    clean_reused: usize,
     /// Allocations rewritten — the sweep's own progress figure.
     allocations_rewritten: usize,
     /// Destination gids some visited holder actually named.
@@ -306,6 +320,9 @@ impl<'m> Sweep<'m> {
             map,
             memo: AHashMap::new(),
             originals: Vec::new(),
+            clean: AHashSet::new(),
+            clean_pins: Vec::new(),
+            clean_reused: 0,
             allocations_rewritten: 0,
             witnessed: AHashSet::new(),
             #[cfg(feature = "cuda")]
@@ -335,6 +352,9 @@ impl<'m> Sweep<'m> {
             map,
             memo: AHashMap::new(),
             originals: Vec::new(),
+            clean: AHashSet::new(),
+            clean_pins: Vec::new(),
+            clean_reused: 0,
             allocations_rewritten: 0,
             witnessed: AHashSet::new(),
             forgone: AHashSet::new(),
@@ -531,6 +551,12 @@ impl<'m> Sweep<'m> {
         self.allocations_rewritten
     }
 
+    /// Visits answered by an earlier scan of the same unmoved allocation
+    /// ([`Self::clean`]).
+    pub fn clean_reused(&self) -> usize {
+        self.clean_reused
+    }
+
     /// Rewrite one `HeadGids`, or `None` when none of its gids moved.
     ///
     /// Visible to the pass driver so it can walk holders this module knows nothing
@@ -543,10 +569,19 @@ impl<'m> Sweep<'m> {
         // gids moved nowhere cannot be in it. The sweep visits every resident
         // chunk and nearly all of them name no moved gid: scanned first, they
         // are rejected on presence bytes alone, without a hash probe of the memo.
-        if !self.map.names_moved(gids.as_slice()) {
+        // An allocation already scanned clean is not scanned again
+        // ([`Self::clean`]).
+        let id = gids.alloc_id();
+        if self.clean.contains(&id) {
+            self.clean_reused += 1;
             return Ok(None);
         }
-        let id = gids.alloc_id();
+        if !self.map.names_moved(gids.as_slice()) {
+            // Pinned before the key is kept, as the memo's originals are.
+            self.clean_pins.push(gids.clone());
+            self.clean.insert(id);
+            return Ok(None);
+        }
         if let Some(done) = self.memo.get(&id) {
             return Ok(Some(done.clone()));
         }
@@ -739,6 +774,31 @@ mod tests {
 
     fn raw(arena: usize, chunk: usize) -> i64 {
         (arena * GID_STRIDE + chunk) as i64
+    }
+
+    /// **An unmoved allocation is scanned once a sweep.** Its later visits —
+    /// through any holder sharing it — are answered from the first, and say the
+    /// same: nothing moved. A moved allocation visited between them is rewritten
+    /// as ever, and an equal but distinct allocation is scanned for itself.
+    #[test]
+    fn an_unmoved_allocation_is_scanned_once_a_sweep() {
+        let mut map = CompactionMap::new();
+        map.insert(raw(3, 1), ChunkGid::detached(raw(0, 4)), 0x2000);
+        let still = HeadGids::uniform(ChunkGid::detached(raw(3, 2)), 4);
+        let shared = still.clone();
+        let moved = HeadGids::uniform(ChunkGid::detached(raw(3, 1)), 4);
+        let equal = HeadGids::uniform(ChunkGid::detached(raw(3, 2)), 4);
+        let mut sweep = Sweep::new(&map);
+        assert!(sweep.rewrite_gids(&still).unwrap().is_none());
+        assert_eq!(sweep.clean_reused(), 0);
+        let next = sweep.rewrite_gids(&moved).unwrap().expect("moved");
+        assert_eq!(next.as_slice()[0].raw(), raw(0, 4));
+        assert!(sweep.rewrite_gids(&shared).unwrap().is_none());
+        assert!(sweep.rewrite_gids(&still).unwrap().is_none());
+        assert_eq!(sweep.clean_reused(), 2);
+        assert!(sweep.rewrite_gids(&equal).unwrap().is_none());
+        assert_eq!(sweep.clean_reused(), 2, "another allocation is its own");
+        assert_eq!(sweep.allocations_rewritten(), 1);
     }
 
     /// A gid from an untouched arena is rejected without consulting the hash map

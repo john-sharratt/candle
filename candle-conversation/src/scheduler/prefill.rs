@@ -1736,7 +1736,7 @@ impl Scheduler {
                     target: "candle_conversation::scheduler::compaction",
                     "compaction sweep split sweep_ms={} substrates_ms={} projections_ms={} \
                      detached_ms={} reclaimed_ms={} backings_ms={} moves={} allocations={} \
-                     residences={swept}",
+                     clean_reused={} residences={swept}",
                     t.sweep.as_millis(),
                     ms(substrates_us),
                     ms(projections_us),
@@ -1747,6 +1747,7 @@ impl Scheduler {
                     )),
                     report.moves,
                     report.allocations_rewritten,
+                    report.clean_reused,
                 );
             }
             self.wave_stats

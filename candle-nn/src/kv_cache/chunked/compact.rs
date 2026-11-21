@@ -112,6 +112,9 @@ pub struct CompactionReport {
     pub first_source_rank: Option<usize>,
     /// `HeadGids` allocations rewritten. Lower than `moves` whenever holders share.
     pub allocations_rewritten: usize,
+    /// Holder visits the sweep answered from an earlier scan of the same unmoved
+    /// allocation (`Sweep::clean_reused`).
+    pub clean_reused: usize,
     /// Moves this pass declined because the slot claimed for them was one it had
     /// already planned to read.
     ///
@@ -1146,6 +1149,7 @@ impl super::backing::ChunkedKvBacking {
             );
         }
         report.allocations_rewritten = sweep_state.allocations_rewritten();
+        report.clean_reused = sweep_state.clean_reused();
         report.records_moved = map.records_len();
         report.records_unfollowed = sweep_state.records_unfollowed();
         report.timings.sweep = phase.elapsed();
