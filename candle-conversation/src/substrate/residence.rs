@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
-use candle_nn::kv_cache::{rewrite_sealed, SealedSequence, Sweep};
+use candle_nn::kv_cache::{rewrite_sealed, ArenaLocation, SealedSequence, Sweep};
 use crossbeam::queue::SegQueue;
 use serde::Serialize;
 
@@ -401,6 +401,12 @@ impl Residence {
     }
 }
 
+/// Whether any of `seqs` is located on the device — what a KV compaction's
+/// sweep can have moved anything of.
+fn any_on_device(seqs: &[SealedSequence]) -> bool {
+    seqs.iter().any(|s| s.location == ArenaLocation::Gpu)
+}
+
 /// What [`ResidenceSlab::gauge`] counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub struct ResidenceGauge {
@@ -418,6 +424,10 @@ pub struct ResidenceSlab {
     slots: boxcar::Vec<Residence>,
     hot: papaya::HashSet<usize>,
     warm: papaya::HashSet<usize>,
+    /// The residences whose warm copy holds a sequence located on the device —
+    /// the only warm copies a KV compaction can have moved anything of
+    /// ([`Self::compaction_members`]). Kept at every write of a warm cell.
+    warm_gpu: papaya::HashSet<usize>,
     /// The idle demote's clock: one tick per persistence pass.
     wave_epoch: AtomicU64,
     /// Recency clock behind [`Residence::touched`].
@@ -442,6 +452,7 @@ impl Default for ResidenceSlab {
             slots: boxcar::Vec::new(),
             hot: papaya::HashSet::new(),
             warm: papaya::HashSet::new(),
+            warm_gpu: papaya::HashSet::new(),
             wave_epoch: AtomicU64::new(0),
             clock: AtomicU64::new(0),
             published: papaya::HashMap::new(),
@@ -694,6 +705,7 @@ impl ResidenceSlab {
         r.warm.store(Some(Arc::new(seqs)));
         self.touch(r);
         self.warm.pin().insert(idx.0);
+        self.note_warm_location(idx);
         if r.is_dead() && r.has_flag(NO_COLD_PERSIST) {
             self.take_warm(idx);
             return false;
@@ -712,7 +724,49 @@ impl ResidenceSlab {
     ) -> bool {
         let r = self.get(idx);
         let prev = r.warm.compare_and_swap(expected, Some(Arc::new(seqs)));
-        prev.as_ref().is_some_and(|p| Arc::ptr_eq(p, expected))
+        let replaced = prev.as_ref().is_some_and(|p| Arc::ptr_eq(p, expected));
+        if replaced {
+            self.note_warm_location(idx);
+        }
+        replaced
+    }
+
+    /// Keep `idx` in [`Self::warm_gpu`] while its warm cell holds a
+    /// device-located sequence — read after the write that calls this, so of
+    /// two racing writes the one that reads last sets what the cell holds then.
+    fn note_warm_location(&self, idx: ResidenceIndex) {
+        let set = self.warm_gpu.pin();
+        let now = self
+            .get(idx)
+            .warm
+            .load()
+            .as_ref()
+            .is_some_and(|w| any_on_device(w));
+        if now {
+            set.insert(idx.0);
+        } else {
+            set.remove(&idx.0);
+        }
+    }
+
+    /// The residences a KV compaction's sweep must visit: every one whose hot
+    /// cell may hold a payload, and every one whose warm copy holds a sequence
+    /// on the device. A warm copy on the host names no chunk a compaction can
+    /// move (`candle_nn::kv_cache::rewrite_sealed` passes it by), so the rest of
+    /// the slab — most of it, on a long-lived substrate — has nothing for the
+    /// sweep. A superset, like [`Self::hot_members`]; the caller reads the
+    /// cells.
+    pub fn compaction_members(&self) -> Vec<ResidenceIndex> {
+        let hot = self.hot.pin();
+        let warm_gpu = self.warm_gpu.pin();
+        let mut out: Vec<ResidenceIndex> = hot.iter().map(|&i| ResidenceIndex(i)).collect();
+        out.extend(
+            warm_gpu
+                .iter()
+                .filter(|i| !hot.contains(*i))
+                .map(|&i| ResidenceIndex(i)),
+        );
+        out
     }
 
     /// Take `idx`'s warm copy, leaving none.
@@ -725,6 +779,7 @@ impl ResidenceSlab {
             if r.has_warm() {
                 set.insert(idx.0);
             }
+            self.note_warm_location(idx);
         }
         old
     }
@@ -928,6 +983,41 @@ mod tests {
             .map(|i| slab.alloc(StreamId(i as u64 + 1), None, 0))
             .collect();
         (slab, idx)
+    }
+
+    /// **A compaction visits the residences with a hot copy or a warm one on
+    /// the device, and no other**: a warm copy on the host, a cold-only and an
+    /// empty residence are left out, and a warm copy that leaves the device —
+    /// replaced, or taken — takes its residence out with it.
+    #[test]
+    fn a_compaction_visits_hot_and_device_warm_residences_alone() {
+        let (slab, idx) = slab_with(5);
+        let on_host = || SealedSequence {
+            location: ArenaLocation::Cpu,
+            ..seq()
+        };
+        assert!(slab.install_hot(idx[0], vec![seq()]));
+        assert!(slab.install_warm(idx[1], vec![on_host(), seq()]));
+        assert!(slab.install_warm(idx[2], vec![on_host()]));
+        slab.install_cold(idx[3], Vec::new());
+        let members = |slab: &ResidenceSlab| {
+            let mut m: Vec<usize> = slab.compaction_members().iter().map(|i| i.0).collect();
+            m.sort_unstable();
+            m
+        };
+        assert_eq!(members(&slab), [idx[0].0, idx[1].0]);
+        // Hot and warm on the device: visited once.
+        assert!(slab.install_hot(idx[1], vec![seq()]));
+        assert_eq!(members(&slab), [idx[0].0, idx[1].0]);
+        let _ = slab.take_hot(idx[1]);
+        let warm = slab.get(idx[1]).warm().expect("a warm copy");
+        assert!(slab.replace_warm(idx[1], &warm, vec![on_host()]));
+        assert_eq!(members(&slab), [idx[0].0]);
+        let warm = slab.get(idx[2]).warm().expect("a warm copy");
+        assert!(slab.replace_warm(idx[2], &warm, vec![seq()]));
+        assert_eq!(members(&slab), [idx[0].0, idx[2].0]);
+        let _ = slab.take_warm(idx[2]);
+        assert_eq!(members(&slab), [idx[0].0]);
     }
 
     /// **The gauge counts every slot ever allocated, and the dead among
