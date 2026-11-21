@@ -11,6 +11,7 @@
 //! as: this is where it started, and everything below is downstream of it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cuda_backend::DeviceId;
 use crate::{Device, Result};
@@ -109,8 +110,9 @@ pub fn report(device: &Device) -> Result<Vec<Finding>> {
     let all = drain(device)?;
     if !all.iter().any(Finding::is_bad) {
         static CLEAN: AtomicU64 = AtomicU64::new(0);
+        static LAST_BEAT_MS: AtomicU64 = AtomicU64::new(0);
         let n = CLEAN.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_multiple_of(HEARTBEAT_EVERY) {
+        if beat_due(now_ms(), &LAST_BEAT_MS) {
             if let Some(line) = heartbeat(n, &all) {
                 tracing::info!(target: "candle_core::tensor_assert", "{line}");
             }
@@ -144,8 +146,31 @@ pub fn report(device: &Device) -> Result<Vec<Finding>> {
     Ok(bad)
 }
 
-/// How many clean drains pass between two heartbeats.
-const HEARTBEAT_EVERY: u64 = 1000;
+/// The time between two heartbeats.
+///
+/// **By the clock, not by the count.** Every 1000th clean drain was an hour of
+/// WhiteWorld's waves, and the diagnostic run it was meant to vouch for was
+/// replaced by a rollout fifteen minutes in, having said nothing.
+const HEARTBEAT_MS: u64 = 5 * 60 * 1000;
+
+/// Whether a heartbeat is due at `now_ms`, claiming it if so: the first drain
+/// beats at once, and then one in each [`HEARTBEAT_MS`], whichever thread
+/// drains.
+fn beat_due(now_ms: u64, last: &AtomicU64) -> bool {
+    let prev = last.load(Ordering::Relaxed);
+    if prev != 0 && now_ms.saturating_sub(prev) < HEARTBEAT_MS {
+        return false;
+    }
+    last.compare_exchange(prev, now_ms.max(1), Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
 
 /// The heartbeat of a drain that found nothing: how many clean drains so far,
 /// how many sites this one read and how many elements they had examined, and
@@ -184,7 +209,19 @@ pub fn find(device: &Device, name: &str) -> Result<Option<Finding>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{heartbeat, to_finding, Finding};
+    use std::sync::atomic::AtomicU64;
+
+    use super::{beat_due, heartbeat, to_finding, Finding, HEARTBEAT_MS};
+
+    /// **The first drain beats at once, then one per interval.**
+    #[test]
+    fn a_heartbeat_is_due_once_per_interval() {
+        let last = AtomicU64::new(0);
+        assert!(beat_due(1_000, &last), "the first drain beats");
+        assert!(!beat_due(1_000 + HEARTBEAT_MS - 1, &last), "not again inside the interval");
+        assert!(beat_due(1_000 + HEARTBEAT_MS, &last), "once the interval has passed");
+        assert!(!beat_due(1_000 + HEARTBEAT_MS + 1, &last));
+    }
 
     fn site(name: &str, min: f32, max: f32, elems: u32) -> Finding {
         Finding {

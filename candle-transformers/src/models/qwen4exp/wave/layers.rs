@@ -1047,7 +1047,16 @@ impl Qwen4ExpBatched {
         // (`WaveBuffer::HeadScoredResidual`, `WaveBuffer::HeadScoredRows`).
         let r_total = sel.len();
         let scored_res = select_head_rows(&res, sel, 0, fwd_ticket)?;
+        // **The head is probed like a layer.** A NaN refused at the logits
+        // while the last recurrent layer's state stayed finite was born at or
+        // after the last attention layer — and the trunk's last probe is that
+        // layer's residual, so the head's own steps are what tell the attention
+        // from the mix and the projection after it.
+        #[cfg(feature = "tensor-assert")]
+        probe(site("q4e.head.res.L", num_layers), &scored_res);
         let (scored, _) = hc_mix(&scored_res, &m.out_hc, eps, fwd_ticket)?;
+        #[cfg(feature = "tensor-assert")]
+        probe(site("q4e.head.mix.L", num_layers), &scored);
         let acts = {
             let candle::Device::Cuda(cuda) = dev else {
                 candle::bail!("qwen4exp wave runs on CUDA");
@@ -1063,6 +1072,8 @@ impl Qwen4ExpBatched {
             .lm_head
             .forward_dynamic(acts.as_dynamic(), DType::F32)?
             .reshape((r_total, cfg.vocab_size))?;
+        #[cfg(feature = "tensor-assert")]
+        probe(site("q4e.head.logits.L", num_layers), &logits);
         // Keeping the session's per-layer lengths in step after the head is
         // the DRIVER's job (the default advance hook) — nothing more here.
         Ok((
