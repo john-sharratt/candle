@@ -293,7 +293,11 @@ A world's authority is wherever its lease is, and it stays there.
 - **Moved only by loss.** A holder that leaves the group, or is cut off, lets
   its lease run out, and the proposer among the rest takes the world from its
   records (§9.2's reload, unchanged). Back, the old holder follows. A member that
-  runs no characters hands each world it holds over, as before.
+  hosts no worlds hands each world it holds over, as before.
+- **Hosted without characters.** A member configured `characters: false` and
+  `host_worlds: true` is lent no character, and asks for a world nobody holds
+  while no ready member takes leases (`world_lease::asker`) — so a world goes on
+  running while the one member running characters drains to install a build.
 
 A character's act reaches its world's authority as one request wherever the
 world is, so a world on one card serves a cast on both.

@@ -3588,8 +3588,9 @@ holder, and a held world stays where it is (`docs/static_placement.md` §6).
 (`--no-characters`) says `power` 0 in its `HELLO`, so it is listed at weight 0, and
 **a member of weight 0 owns no key** — not even alone, with every other member away. A
 leaseholder says at least 1, so a weight of 0 never means "not measured yet". The
-member that takes none never proposes for a world, so it is never a world's authority
-and never keeps a Makers' table, and no character is lent to it. It refuses on its own
+member that takes none never proposes for a world — unless it hosts worlds, below —
+so it is never a world's authority and never keeps a Makers' table, and no character
+is lent to it. It refuses on its own
 account too, so leases from before it was configured so do not run there: a world
 lease it still holds it hands over at once, and a character lease still naming it is
 held, and not run. **The authority moves that character itself** as soon as it names
@@ -3603,17 +3604,26 @@ member it is judged by is the one `MEMBERS` lists at weight 0 — never one the 
 weighs 0, which still runs what it holds — and only while it is in the group: one away
 keeps its characters until it returns, as any holder does. Everything else is as for any member: it replicates the
 substrate, votes, applies the cast as records, and serves the routes the gateway places
-by its live power and reach (§5.3) — draws among them. With every member that takes
-leases away, the worlds wait for one to return; nothing moves to the member that takes
-none. The setting needs a cluster: an npcd with none is every world's authority, and is
-refused it.
+by its live power and reach (§5.3) — draws among them. The setting needs a cluster: an
+npcd with none is every world's authority, and is refused it.
+
+**A member that hosts worlds without characters.** Configured `host_worlds: true`
+(`--host-worlds`) beside `characters: false`, a member still says `power` 0 and is
+lent no character, but it may be a world's authority: while no ready member takes
+leases — the one that runs characters draining to install a build, or away — it
+proposes for each world nobody holds (`world_lease::asker`), and keeps any it gains
+as every holder does. The world's characters run on the members that run characters
+and reach it as one request each, wherever it is. Without it, with every member that
+takes leases away, the worlds wait for one to return: on 2026-11-21 WhiteWorld, the
+only member running characters, drained to install a build and both worlds stood
+still for five minutes beside a BlackWorld ready the whole time.
 
 ### 9.6 Moving a world and routing to it
 
 **A world stays where its lease is** (`docs/static_placement.md` §6): its holder
 renews it for as long as it runs, and no change of membership hands it over. It moves
-only when its holder lets it go — a member that runs no characters hands each world
-it holds over — or loses it:
+only when its holder lets it go — a member that hosts no worlds hands each world it
+holds over — or loses it:
 
 1. The authority finishes the beat, writes every pending state record, and sends
    `RELEASE { key, ballot, through }` to every member (§5.9). `through` is its `oseq`

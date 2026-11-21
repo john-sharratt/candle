@@ -31,6 +31,21 @@ pub fn proposer(ready: &[Weighted]) -> Option<u64> {
         .map(|m| m.node)
 }
 
+/// Who asks for a world nobody holds, as `me` reckons it: the [`proposer`] —
+/// or, with no member that runs characters ready, `me` when it `stands_in`, a
+/// member that runs none and hosts worlds (`host_worlds`).
+///
+/// **A world needs a host, not a cast.** Its authority keeps the world and
+/// answers every character's acts wherever the characters run. While the one
+/// member running characters drained to install a build, the member that ran
+/// none, though ready the whole time, took neither world, and every character
+/// in both stood frozen for five minutes (WhiteWorld, 2026-11-21). A
+/// stand-in asks only while no leaseholder can; once it holds a world it keeps
+/// it, as any holder does.
+pub fn asker(ready: &[Weighted], me: u64, stands_in: bool) -> Option<u64> {
+    proposer(ready).or_else(|| stands_in.then_some(me))
+}
+
 /// What to do about one world's lease this tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
@@ -113,6 +128,23 @@ mod tests {
         );
         assert_eq!(proposer(&[w(1, 0.0)]), None, "takes no lease");
         assert_eq!(proposer(&[]), None);
+    }
+
+    /// **A member that hosts worlds and runs no characters asks only while no
+    /// leaseholder is ready**; one that hosts none never asks.
+    #[test]
+    fn a_world_host_stands_in_only_with_no_leaseholder_ready() {
+        let w = |node, weight| Weighted { node, weight };
+        let both = [w(0xb1, 0.0), w(0xa2, 245.0)];
+        assert_eq!(asker(&both, 0xb1, true), Some(0xa2), "the leaseholder asks");
+        let draining = [w(0xb1, 0.0)];
+        assert_eq!(
+            asker(&draining, 0xb1, true),
+            Some(0xb1),
+            "the host stands in"
+        );
+        assert_eq!(asker(&draining, 0xb1, false), None, "one hosting no worlds");
+        assert_eq!(asker(&[], 0xb1, true), Some(0xb1));
     }
 
     #[test]

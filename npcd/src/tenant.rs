@@ -165,6 +165,15 @@ pub struct NpcdArgs {
     #[arg(long = "no-characters", action = ArgAction::SetFalse)]
     pub characters: bool,
 
+    /// Whether this member, running no characters, still hosts worlds —
+    /// `--host-worlds`, or `host_worlds: true` in `motherd.yaml`. It takes no
+    /// character lease, and is a world's authority while no member that runs
+    /// characters is ready to be (`authority::world_lease::asker`): the
+    /// characters run elsewhere and reach the world over the cluster. Without
+    /// it, a member running no characters hosts no world.
+    #[arg(long)]
+    pub host_worlds: bool,
+
     /// From how many invalid answers (`401`/`403`/`429`) from Discord in
     /// the last ten minutes every request to it is spaced out
     /// (`discord::limit`). Discord bans the public address past 10,000, for
@@ -236,6 +245,7 @@ impl Default for NpcdArgs {
             wipe_conversations: false,
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION_DAYS,
             characters: true,
+            host_worlds: false,
             discord_invalid_throttle: limit::THROTTLE,
             discord_invalid_ceiling: limit::CEILING,
         }
@@ -547,8 +557,15 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         // account too (`Standing::characters`), so one lent before this is
         // handed back.
         join.link().set_leaseholder(args.characters);
-        if !args.characters {
-            tracing::info!("characters: off — this member takes no world or character lease");
+        match (args.characters, args.host_worlds) {
+            (true, _) => {}
+            (false, true) => tracing::info!(
+                "characters: off, host_worlds: on — this member takes no character lease, and \
+                 hosts a world while no member that runs characters can"
+            ),
+            (false, false) => {
+                tracing::info!("characters: off — this member takes no world or character lease")
+            }
         }
     }
 
@@ -595,6 +612,7 @@ async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
         runtime.standing.set_clustered();
     }
     runtime.standing.set_characters(args.characters);
+    runtime.standing.set_host_worlds(args.host_worlds);
     host_worlds(&runtime, &authored, &authored_dir).await;
 
     // ── the routes ─────────────────────────────────────────────────────────
@@ -1268,6 +1286,18 @@ mod tests {
         assert!(!parse(&["--no-characters"]).characters);
         let yaml: NpcdArgs = serde_yaml::from_str("characters: false\n").unwrap();
         assert_eq!(yaml, parse(&["--no-characters"]));
+    }
+
+    /// **A member hosts worlds without characters only when told to**, by flag
+    /// or by `motherd.yaml`, the two reading the same setting.
+    #[test]
+    fn worlds_are_hosted_without_characters_only_when_turned_on() {
+        assert!(!parse(&[]).host_worlds);
+        let flags = parse(&["--no-characters", "--host-worlds"]);
+        assert!(!flags.characters && flags.host_worlds);
+        let yaml: NpcdArgs =
+            serde_yaml::from_str("characters: false\nhost_worlds: true\n").unwrap();
+        assert_eq!(yaml, flags);
     }
 
     /// Every one-shot flag is a real flag of the binary — a relaunch strips
