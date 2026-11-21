@@ -33,6 +33,7 @@ use super::ids::{
 use super::owned_sections::OwnedSection;
 use super::project::ProjectionTarget;
 use super::scan_census;
+use super::scan_plans::ScanPlans;
 use super::scan_stats::{scan_stats, GroupScan};
 use super::schema::{
     CorruptTurnPolicy, GatherScope, GroupSchema, LayerSchema, Recency, Schema, SectionCollection,
@@ -2531,6 +2532,7 @@ impl Conversation {
                 &probe_refs,
                 arena.map(|a| a as &dyn BeliefArena),
                 holder,
+                &ScanPlans::default(),
             );
             for (&p, per_file) in at.iter().zip(out) {
                 scanned[p] = per_file;
@@ -2772,6 +2774,7 @@ impl Conversation {
                         files,
                         n_timelines,
                         turns_walked,
+                        plans: ScanPlans::default(),
                     });
                     keep(&self.group_assemblies, key, Arc::clone(&built));
                     built
@@ -2811,8 +2814,10 @@ impl Conversation {
             // (empty ⇒ uniform — repo_map peaks on L46 (§83), configured in the
             // schema YAML). Per probe, per file: `(fused, mass_base)`, the tail and
             // question windows riding one launch. ──
-            let scan_files =
-                |probes: &[&[WideQSig]]| scan_file_scans(files, group, probes, arena, holder);
+            let plans = &assembly.plans;
+            let scan_files = |probes: &[&[WideQSig]]| {
+                scan_file_scans(files, group, probes, arena, holder, plans)
+            };
             // Concept F: the pinned question window scans as a second probe,
             // max-fused with the tail per exchange AFTER normalization.
             let question = match probe_q {
@@ -6257,7 +6262,7 @@ impl<'a> ContentResolver for TargetedRead<'a> {
 mod tests {
     use super::{
         collection_warm_plan, ingest_group, is_warmable, leave_out_rounds, subwindow_bounds,
-        warmable, Conversation, Observe,
+        warmable, Conversation, Observe, ScanPlans,
     };
 
     use std::collections::BTreeMap;
@@ -7475,7 +7480,14 @@ layers:
             .find(|g| g.id == scopes)
             .unwrap();
         let probe = vec![sig(question)];
-        let scanned = scan_file_scans(&files, group, &[probe.as_slice()], None, Holder::Shared);
+        let scanned = scan_file_scans(
+            &files,
+            group,
+            &[probe.as_slice()],
+            None,
+            Holder::Shared,
+            &ScanPlans::default(),
+        );
         let (x_score, y_score) = (scanned[0][0].0[0], scanned[0][1].0[0]);
         assert!(y_score > x_score, "x {x_score} y {y_score}");
 
