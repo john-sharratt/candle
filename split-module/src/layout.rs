@@ -61,6 +61,9 @@ pub struct Item {
     pub span: Range<usize>,
     /// An `impl` or a `mod { }` with members.
     pub body: Option<Body>,
+    /// For any `mod { }`: what lies between its braces. A plan can hoist the
+    /// module into a file of its own, which then holds exactly this.
+    pub inline: Option<Range<usize>>,
 }
 
 /// The whole file, in order.
@@ -113,9 +116,14 @@ pub fn layout(source: &str) -> Result<Layout, String> {
                 last_was_item = false;
             }
             Part::Item => {
+                let inline = (node.kind() == "mod_item")
+                    .then(|| node.child_by_field_name("body"))
+                    .flatten()
+                    .map(|list| list.start_byte() + 1..list.end_byte() - 1);
                 items.push(Item {
                     name: item_name(&node, bytes),
                     body: body_of(&node, bytes, start)?,
+                    inline,
                     span,
                 });
                 last_was_item = true;
@@ -201,9 +209,21 @@ fn item_name(node: &Node, bytes: &[u8]) -> String {
     }
 }
 
-/// The members of an `impl` or a `mod { }`, or `None` for any other item.
+/// The members of an inherent `impl` or a `#[cfg(test)] mod { }`, or `None`
+/// for any other item.
+///
+/// Only those two can be spread over several files. A trait impl is one
+/// block by the language's rules, and an ordinary `mod { }` spread over files
+/// becomes one module per file, whose glob re-exports then cancel out: a path
+/// through it (`tables::X`) names nothing. A test module's pieces are wired to
+/// each other by the shares instead.
 fn body_of(node: &Node, bytes: &[u8], start: usize) -> Result<Option<Body>, String> {
-    if !matches!(node.kind(), "impl_item" | "mod_item") {
+    let divisible = match node.kind() {
+        "impl_item" => node.child_by_field_name("trait").is_none(),
+        "mod_item" => is_cfg_test(&bytes[start..node.start_byte()]),
+        _ => false,
+    };
+    if !divisible {
         return Ok(None);
     }
     let Some(list) = node.child_by_field_name("body") else {
@@ -247,6 +267,33 @@ fn body_of(node: &Node, bytes: &[u8], start: usize) -> Result<Option<Body>, Stri
         members,
         tail: close..node.end_byte(),
     }))
+}
+
+/// Whether the attributes before an item gate it on `test`: `#[cfg(test)]`,
+/// or a `cfg` whose predicate names `test` as a word outside its quoted
+/// values, as `#[cfg(all(test, feature = "cuda"))]` does.
+pub fn is_cfg_test(leading: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(leading);
+    text.lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix("#[cfg("))
+        .any(|predicate| {
+            let mut quoted = false;
+            let bare: String = predicate
+                .chars()
+                .map(|c| {
+                    if c == '"' {
+                        quoted = !quoted;
+                    }
+                    if quoted || !(c.is_ascii_alphanumeric() || c == '_') {
+                        ' '
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            bare.split_whitespace().any(|word| word == "test")
+        })
 }
 
 /// `at`, moved back over the indentation before it to the start of its line
@@ -357,6 +404,31 @@ mod tests {
             vec![true, true, false]
         );
         assert_eq!(l.items[1].name, "impl Display for A");
+    }
+
+    /// **A trait impl and an ordinary `mod { }` stay whole**: neither opens
+    /// into members, so no plan can spread one over several files.
+    #[test]
+    fn trait_impls_and_ordinary_mods_are_indivisible() {
+        let src = "impl Display for A {\n    fn fmt(&self) {}\n}\n\n\
+                   pub mod tables {\n    pub const X: u8 = 1;\n}\n\n\
+                   #[cfg(test)]\nmod tests {\n    fn t() {}\n}\n\n\
+                   #[cfg(all(test, feature = \"cuda\"))]\nmod gpu_tests {\n    fn t() {}\n}\n\n\
+                   #[cfg(feature = \"test\")]\nmod featured {\n    fn t() {}\n}\n";
+        let l = layout(src).unwrap();
+        assert_eq!(
+            l.items
+                .iter()
+                .map(|i| (i.name.as_str(), i.body.is_some()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("impl Display for A", false),
+                ("mod tables", false),
+                ("mod tests", true),
+                ("mod gpu_tests", true),
+                ("mod featured", false),
+            ]
+        );
     }
 
     /// A file that does not build is refused.

@@ -42,7 +42,11 @@ const VISIBLE_MEMBERS: &[&str] = &["function_item", "const_item", "type_item"];
 /// Every edit moving any top-level item of `source` one module deeper would
 /// make, in source order. Kept parts (uses, docs, macros) get none: they do
 /// not move.
-pub fn edits(source: &str) -> Result<Vec<Edit>, String> {
+///
+/// `module_file` names the file a file-less `mod` declared inside an inline
+/// module is in, from its path below the split's folder without an extension
+/// (`tests/ledger`): `tests/ledger.rs`, or `tests/ledger/mod.rs`.
+pub fn edits(source: &str, module_file: &dyn Fn(&str) -> String) -> Result<Vec<Edit>, String> {
     let mut parser = Parser::new();
     parser
         .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -57,25 +61,13 @@ pub fn edits(source: &str) -> Result<Vec<Edit>, String> {
         if !node.is_named() || stays(&node) {
             continue;
         }
-        if VISIBLE_ITEMS.contains(&node.kind()) {
-            widen(&node, bytes, &mut out);
+        widen_item(&node, bytes, "pub(super)", &mut out);
+        // An inline module moved whole is reached at its old path, through
+        // the re-export of its file.
+        if node.kind() == "mod_item" {
+            widen(&node, bytes, "pub(super)", &mut out);
         }
-        if matches!(node.kind(), "struct_item" | "union_item") {
-            widen_fields(&node, bytes, &mut out);
-        }
-        if node.kind() == "impl_item" && node.child_by_field_name("trait").is_none() {
-            if let Some(list) = node.child_by_field_name("body") {
-                let mut c = list.walk();
-                for m in list.children(&mut c) {
-                    if VISIBLE_MEMBERS.contains(&m.kind()) {
-                        widen(&m, bytes, &mut out);
-                    }
-                }
-            }
-        }
-        if node.kind() != "mod_item" {
-            deepen(&node, bytes, &mut out);
-        }
+        deepen(&node, bytes, &mut Vec::new(), module_file, &mut out);
     }
     out.sort_by_key(|e| (e.range.start, e.range.end));
     Ok(out)
@@ -96,9 +88,31 @@ fn stays(node: &Node) -> bool {
     }
 }
 
-/// `pub(super) ` before `node` when it has no visibility of its own. A
-/// `const _` — a compile-time assertion — takes none.
-fn widen(node: &Node, bytes: &[u8], out: &mut Vec<Edit>) {
+/// `vis` before an item with no visibility of its own, before each of its
+/// fields with none if it is a struct or union, and before each of its
+/// members with none if it is an inherent impl.
+fn widen_item(node: &Node, bytes: &[u8], vis: &str, out: &mut Vec<Edit>) {
+    if VISIBLE_ITEMS.contains(&node.kind()) {
+        widen(node, bytes, vis, out);
+    }
+    if matches!(node.kind(), "struct_item" | "union_item") {
+        widen_fields(node, bytes, vis, out);
+    }
+    if node.kind() == "impl_item" && node.child_by_field_name("trait").is_none() {
+        if let Some(list) = node.child_by_field_name("body") {
+            let mut c = list.walk();
+            for m in list.children(&mut c) {
+                if VISIBLE_MEMBERS.contains(&m.kind()) {
+                    widen(&m, bytes, vis, out);
+                }
+            }
+        }
+    }
+}
+
+/// `vis` before `node` when it has no visibility of its own. A `const _` — a
+/// compile-time assertion — takes none.
+fn widen(node: &Node, bytes: &[u8], vis: &str, out: &mut Vec<Edit>) {
     let text = node.utf8_text(bytes).unwrap_or("");
     if node.kind() == "const_item"
         && text
@@ -116,13 +130,13 @@ fn widen(node: &Node, bytes: &[u8], out: &mut Vec<Edit>) {
         let at = node.start_byte();
         out.push(Edit {
             range: at..at,
-            with: "pub(super) ".to_string(),
+            with: format!("{vis} "),
         });
     }
 }
 
-/// `pub(super) ` before each of a struct's fields that has no visibility.
-fn widen_fields(node: &Node, bytes: &[u8], out: &mut Vec<Edit>) {
+/// `vis` before each of a struct's fields that has no visibility.
+fn widen_fields(node: &Node, bytes: &[u8], vis: &str, out: &mut Vec<Edit>) {
     let Some(list) = node.child_by_field_name("body") else {
         return;
     };
@@ -131,7 +145,7 @@ fn widen_fields(node: &Node, bytes: &[u8], out: &mut Vec<Edit>) {
         "field_declaration_list" => {
             for f in list.children(&mut c) {
                 if f.kind() == "field_declaration" {
-                    widen(&f, bytes, out);
+                    widen(&f, bytes, vis, out);
                 }
             }
         }
@@ -150,7 +164,7 @@ fn widen_fields(node: &Node, bytes: &[u8], out: &mut Vec<Edit>) {
                     let at = k.start_byte();
                     out.push(Edit {
                         range: at..at,
-                        with: "pub(super) ".to_string(),
+                        with: format!("{vis} "),
                     });
                 }
             }
@@ -159,14 +173,52 @@ fn widen_fields(node: &Node, bytes: &[u8], out: &mut Vec<Edit>) {
     }
 }
 
-/// Every `super` path and relative visibility in `node`, one module deeper —
-/// but nothing inside a nested `mod { }`, whose paths move with it.
-fn deepen(node: &Node, bytes: &[u8], out: &mut Vec<Edit>) {
+/// Every `super` path and relative visibility in `node` that leaves the file's
+/// module, one module deeper. `inside` names the `mod { }` bodies of the
+/// moved item that enclose `node`, outermost first: a path climbing `k`
+/// modules from there leaves the file's module when `k` is more than their
+/// number, and the file's module now lies one further down. A path that stays
+/// inside the moved item reaches what it did.
+///
+/// A file-less `mod x;` inside them is looked for under the new file's name,
+/// so it is given a `#[path]` back to its file: from the folder of
+/// `c.rs`'s `m` (`<split>/c/m/`) up to the split's folder and down to `m/x.rs`.
+fn deepen(
+    node: &Node,
+    bytes: &[u8],
+    inside: &mut Vec<String>,
+    module_file: &dyn Fn(&str) -> String,
+    out: &mut Vec<Edit>,
+) {
+    let depth = inside.len();
     match node.kind() {
-        "mod_item" => return,
+        "mod_item" if depth > 0 && node.child_by_field_name("body").is_none() => {
+            let has_path = node
+                .prev_named_sibling()
+                .filter(|p| p.kind() == "attribute_item")
+                .and_then(|p| p.utf8_text(bytes).ok())
+                .is_some_and(|t| t.trim_start_matches("#[").trim_start().starts_with("path"));
+            let name = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(bytes).ok());
+            if let (false, Some(name)) = (has_path, name) {
+                let below = format!("{}/{name}", inside.join("/"));
+                let at = node.start_byte();
+                out.push(Edit {
+                    range: at..at,
+                    with: format!(
+                        "#[path = \"{}{}\"]\n{}",
+                        "../".repeat(depth + 1),
+                        module_file(&below),
+                        indent_at(bytes, at)
+                    ),
+                });
+            }
+            return;
+        }
         "visibility_modifier" => {
             let text = node.utf8_text(bytes).unwrap_or("");
-            if let Some(with) = deeper_visibility(text) {
+            if let Some(with) = deeper_visibility(text, depth) {
                 out.push(Edit {
                     range: node.start_byte()..node.end_byte(),
                     with,
@@ -175,31 +227,96 @@ fn deepen(node: &Node, bytes: &[u8], out: &mut Vec<Edit>) {
             return;
         }
         "super" => {
-            out.push(Edit {
-                range: node.start_byte()..node.end_byte(),
-                with: "super::super".to_string(),
-            });
+            // Only the first `super` of a chain is edited, once for the chain.
+            let start = node.start_byte();
+            if !follows_path_separator(bytes, start) && super_chain(bytes, start) > depth {
+                out.push(Edit {
+                    range: start..node.end_byte(),
+                    with: "super::super".to_string(),
+                });
+            }
             return;
         }
         _ => {}
     }
+    let entered = node.kind() == "mod_item";
+    if entered {
+        let name = node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(bytes).ok())
+            .unwrap_or("");
+        inside.push(name.to_string());
+    }
     let mut c = node.walk();
     for ch in node.children(&mut c) {
-        deepen(&ch, bytes, out);
+        deepen(&ch, bytes, inside, module_file, out);
+    }
+    if entered {
+        inside.pop();
     }
 }
 
-/// A visibility written relative to its module, one module deeper; `None`
-/// for one that is not relative (`pub`, `pub(crate)`).
-fn deeper_visibility(text: &str) -> Option<String> {
-    let inner: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    match inner.as_str() {
-        "pub(self)" => Some("pub(super)".to_string()),
-        "pub(super)" => Some("pub(in super::super)".to_string()),
-        _ => inner
-            .strip_prefix("pub(insuper")
-            .map(|rest| format!("pub(in super::super{})", rest.trim_end_matches(')'))),
+/// The indentation of the line `at` is on, up to `at`.
+fn indent_at(bytes: &[u8], at: usize) -> String {
+    let start = bytes[..at]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |nl| nl + 1);
+    String::from_utf8_lossy(&bytes[start..at])
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .collect()
+}
+
+/// Whether the source before `at`, past whitespace, is `::` — so the `super`
+/// at `at` continues a chain rather than starting one.
+fn follows_path_separator(bytes: &[u8], at: usize) -> bool {
+    let before = String::from_utf8_lossy(&bytes[..at]);
+    before.trim_end().ends_with("::")
+}
+
+/// How many `super`s the path starting at `at` climbs: `super::super::x` is 2.
+fn super_chain(bytes: &[u8], at: usize) -> usize {
+    let text = String::from_utf8_lossy(&bytes[at..]);
+    let mut rest = text.as_ref();
+    let mut k = 0;
+    while let Some(after) = rest.strip_prefix("super") {
+        if after.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
+            break;
+        }
+        k += 1;
+        match after.trim_start().strip_prefix("::") {
+            Some(next) => rest = next.trim_start(),
+            None => break,
+        }
     }
+    k
+}
+
+/// A visibility written relative to its module, one module deeper when it
+/// reaches the file's module or past it from `depth` modules inside the item
+/// — the file's module is now the child, one further down; `None` for one
+/// that does not (`pub`, `pub(crate)`, a reach within the item).
+fn deeper_visibility(text: &str, depth: usize) -> Option<String> {
+    let inner: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let (k, path) = match inner.as_str() {
+        "pub(self)" => (0, "self".to_string()),
+        "pub(super)" => (1, "super".to_string()),
+        _ => {
+            let path = inner
+                .strip_prefix("pub(in")
+                .and_then(|p| p.strip_suffix(')'))?;
+            let k = path.split("::").take_while(|s| *s == "super").count();
+            (k, path.to_string())
+        }
+    };
+    if k < depth || (k == 0 && path != "self") {
+        return None;
+    }
+    Some(match path.as_str() {
+        "self" => "pub(super)".to_string(),
+        _ => format!("pub(in super::{path})"),
+    })
 }
 
 /// The edits that let the shares of a `mod { }` split across files see each
@@ -236,21 +353,14 @@ pub fn share_edits(source: &str, seen: &str) -> Result<Vec<Edit>, String> {
             if std::mem::take(&mut a_test) && m.kind() == "function_item" {
                 continue;
             }
-            if VISIBLE_ITEMS.contains(&m.kind()) {
-                let mut cc = m.walk();
-                if !m
-                    .children(&mut cc)
-                    .any(|ch| ch.kind() == "visibility_modifier")
-                {
-                    let at = m.start_byte();
-                    out.push(Edit {
-                        range: at..at,
-                        with: format!("{seen} "),
-                    });
-                }
+            widen_item(&m, source.as_bytes(), seen, &mut out);
+            // A module declared in one share is reached from the others.
+            if m.kind() == "mod_item" {
+                widen(&m, source.as_bytes(), seen, &mut out);
             }
         }
     }
+    out.sort_by_key(|e| (e.range.start, e.range.end));
     Ok(out)
 }
 
@@ -283,9 +393,35 @@ pub fn apply(source: &str, range: Range<usize>, edits: &[Edit]) -> Result<String
 mod tests {
     use super::*;
 
+    /// Each module's file as `<path>.rs`, as when none has a folder.
+    fn flat(below: &str) -> String {
+        format!("{below}.rs")
+    }
+
     fn moved(src: &str) -> String {
-        let e = edits(src).unwrap();
+        let e = edits(src, &flat).unwrap();
         apply(src, 0..src.len(), &e).unwrap()
+    }
+
+    /// **A file-less `mod` inside a moved module keeps its file**: it is given
+    /// the `#[path]` from the new file's folder back to where its file is,
+    /// and one that already has a `#[path]` is left.
+    #[test]
+    fn a_nested_file_module_keeps_its_file() {
+        let src = "mod tests {\n    mod ledger;\n    #[path = \"x.rs\"]\n    mod pinned;\n    mod inner {\n        mod deep;\n    }\n}\n";
+        assert_eq!(
+            moved(src),
+            "pub(super) mod tests {\n    #[path = \"../../tests/ledger.rs\"]\n    mod ledger;\n    #[path = \"x.rs\"]\n    mod pinned;\n    \
+             mod inner {\n        #[path = \"../../../tests/inner/deep.rs\"]\n        mod deep;\n    }\n}\n"
+        );
+        let folders = |below: &str| format!("{below}/mod.rs");
+        let e = edits("mod tests {\n    mod ledger;\n}\n", &folders).unwrap();
+        assert_eq!(
+            e.iter()
+                .find(|e| e.with.starts_with("#[path"))
+                .map(|e| e.with.as_str()),
+            Some("#[path = \"../../tests/ledger/mod.rs\"]\n    ")
+        );
     }
 
     /// **A private item, inherent method and field become `pub(super)`**;
@@ -307,18 +443,25 @@ mod tests {
         );
     }
 
-    /// **Relative paths reach one module further**, in code and in
-    /// visibilities; a nested `mod { }` keeps its own.
+    /// **Relative paths that leave the file reach one module further**, in
+    /// code and in visibilities, a chain gaining one `super` and not one per
+    /// link. Inside a `mod { }`, a path within the file is left; one climbing
+    /// out of it, and a visibility reaching the file's module — now the child
+    /// — are deepened; one reaching only within the item is left.
     #[test]
     fn relative_paths_go_one_module_deeper() {
         let src = "pub(super) fn a() -> super::X {\n    super::b()\n}\n\
-                   pub(in super::m) fn c() {}\n\
-                   mod tests {\n    use super::*;\n    pub(super) fn d() {}\n}\n";
+                   pub(in super::m) fn c() -> super :: super::Y {}\n\
+                   mod tests {\n    use super::*;\n    use super::super::lock;\n    \
+                   pub(super) fn d() {}\n    pub(in super::super::q) fn e() { super::super::f(); }\n    \
+                   pub(self) fn g() {}\n}\n";
         assert_eq!(
             moved(src),
             "pub(in super::super) fn a() -> super::super::X {\n    super::super::b()\n}\n\
-             pub(in super::super::m) fn c() {}\n\
-             mod tests {\n    use super::*;\n    pub(super) fn d() {}\n}\n"
+             pub(in super::super::m) fn c() -> super::super :: super::Y {}\n\
+             pub(super) mod tests {\n    use super::*;\n    use super::super::super::lock;\n    \
+             pub(in super::super) fn d() {}\n    pub(in super::super::super::q) fn e() { super::super::super::f(); }\n    \
+             pub(self) fn g() {}\n}\n"
         );
     }
 
@@ -327,13 +470,18 @@ mod tests {
     #[test]
     fn a_split_modules_items_are_seen_by_every_share() {
         let src = "fn top() {}\nmod tests {\n    use super::*;\n    const N: u8 = 1;\n    pub fn h() {}\n    fn t() {}\n    \
-                   #[test]\n    fn a_test() {}\n    #[tokio::test]\n    async fn b_test() {}\n}\n";
+                   #[test]\n    fn a_test() {}\n    #[tokio::test]\n    async fn b_test() {}\n    \
+                   struct Rig {\n        cfg: u8,\n    }\n    impl Rig {\n        fn new() -> Self { todo() }\n    }\n    \
+                   pub(super) fn fixture() {}\n}\n";
         let e = share_edits(src, "pub(in super::super)").unwrap();
         assert_eq!(
             apply(src, 0..src.len(), &e).unwrap(),
             "fn top() {}\nmod tests {\n    use super::*;\n    pub(in super::super) const N: u8 = 1;\n    \
              pub fn h() {}\n    pub(in super::super) fn t() {}\n    \
-             #[test]\n    fn a_test() {}\n    #[tokio::test]\n    async fn b_test() {}\n}\n"
+             #[test]\n    fn a_test() {}\n    #[tokio::test]\n    async fn b_test() {}\n    \
+             pub(in super::super) struct Rig {\n        pub(in super::super) cfg: u8,\n    }\n    \
+             impl Rig {\n        pub(in super::super) fn new() -> Self { todo() }\n    }\n    \
+             pub(super) fn fixture() {}\n}\n"
         );
     }
 
@@ -341,7 +489,7 @@ mod tests {
     #[test]
     fn kept_parts_are_not_edited() {
         let src = "use super::x;\nmacro_rules! m { () => { super::y() } }\n";
-        assert_eq!(edits(src).unwrap(), vec![]);
+        assert_eq!(edits(src, &flat).unwrap(), vec![]);
     }
 
     /// Only the edits inside a range apply to it; one across its edge is

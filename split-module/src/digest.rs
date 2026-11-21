@@ -15,7 +15,11 @@ use crate::layout::layout;
 /// The digest of every `.rs` file in `dir` by file name, `mod.rs` last: its
 /// own doc as it stands, what it keeps, and the files of the module — what the
 /// module's overview is written from, once each file's doc is.
-pub fn digest_dir(dir: &Path) -> Result<String, String> {
+///
+/// With `only`, the files digested are those it names — a split's own files,
+/// leaving the modules the folder held before it alone — while `mod.rs`'s
+/// digest still names every file of the module.
+pub fn digest_dir(dir: &Path, only: Option<&[String]>) -> Result<String, String> {
     let mut names: Vec<String> = fs::read_dir(dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
         .filter_map(|e| e.ok())
@@ -24,7 +28,10 @@ pub fn digest_dir(dir: &Path) -> Result<String, String> {
         .collect();
     names.sort();
     let mut out = String::new();
-    for name in &names {
+    let digested = names
+        .iter()
+        .filter(|n| only.is_none_or(|only| only.iter().any(|o| format!("{o}.rs") == **n)));
+    for name in digested {
         let path = dir.join(name);
         let source = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         out.push_str(&format!("=== {name}\n"));

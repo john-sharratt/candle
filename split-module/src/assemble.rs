@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 
 use crate::assign::Placement;
-use crate::layout::Layout;
+use crate::layout::{is_cfg_test, Item, Layout};
 use crate::map::{bare_name, identifiers};
 use crate::plan::{PlanFile, MOD};
 use crate::rewrite::{apply, share_edits, Edit};
@@ -60,12 +60,16 @@ pub struct Outputs {
     pub mod_rs: String,
     /// Each child module's name and text, in plan order.
     pub children: Vec<(String, String)>,
+    /// The children that are inline modules hoisted into their own files.
+    pub hoisted: Vec<String>,
 }
 
 /// How far a child's items are seen, for its re-export in `mod.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Seen {
     Module,
+    /// `pub(super)`: by the module above the split one.
+    Parent,
     Crate,
     Everywhere,
 }
@@ -90,8 +94,25 @@ pub fn assemble(
     // Whether a file declares anything a glob import of it can name — one
     // holding only methods of an `impl` declares nothing.
     let mut names: Vec<bool> = vec![false; plan.len()];
+    // Whether a file declares an item or a whole module of its own, not only
+    // shares of a split test module: a test-only file that does is
+    // re-exported, under `#[cfg(test)]`, for the tests that reach what it
+    // holds through the split module's path.
+    let mut test_names: Vec<bool> = vec![false; plan.len()];
+    // A file named for the inline `mod { }` placed in it holds that module's
+    // body; `mod.rs` keeps its declaration, at its place in the source.
+    let mut hoisted: Vec<Option<String>> = vec![None; plan.len()];
+    let mut declarations: Vec<(usize, String)> = Vec::new();
+    // The modules that gather a split test module's shares, at its place.
+    let mut gathers: Vec<(usize, String)> = Vec::new();
     for (item, place) in layout.items.iter().zip(placed) {
         match place {
+            Placement::Whole(f) if hoists(item, &plan[*f]) => {
+                let inner = item.inline.clone().expect("a hoisted module is inline");
+                let head = source[item.span.start..inner.start - 1].trim_end();
+                declarations.push((item.span.start, format!("{head};")));
+                hoisted[*f] = Some(dedent(&source[inner]));
+            }
             Placement::Whole(f) => {
                 let own = if Some(*f) == in_mod {
                     &shares.none
@@ -102,6 +123,8 @@ pub fn assemble(
                 seen[*f] = seen[*f].max(seen_of(&source[item.span.clone()], &item.name));
                 test_only[*f] &= is_test(&source[item.span.clone()]);
                 names[*f] |= bare_name(&item.name).is_some();
+                test_names[*f] |= item.name.starts_with("mod ") || bare_name(&item.name).is_some();
+                names[*f] |= item.name.starts_with("mod ");
                 pieces[*f].push((item.span.start, text));
             }
             Placement::Members(to) => {
@@ -115,11 +138,14 @@ pub fn assemble(
                 // calls into.
                 let files: Vec<usize> =
                     (0..plan.len()).filter(|f| to.contains(&Some(*f))).collect();
+                // A `#[test]` function is the harness's alone and stays
+                // private, so no other share imports it.
                 let declares = |f: usize| -> HashSet<&str> {
                     body.members
                         .iter()
                         .zip(to)
                         .filter(|(_, t)| **t == Some(f))
+                        .filter(|(m, _)| !is_test_fn(&source[m.span.clone()]))
                         .filter_map(|(m, _)| bare_name(&m.name))
                         .collect()
                 };
@@ -156,17 +182,70 @@ pub fn assemble(
                     }
                     for (j, m) in body.members.iter().enumerate() {
                         if to[j].is_none() {
+                            let mut line = piece(source, m.span.clone(), own_edits)?;
+                            // `use self::x::…` names a module another share
+                            // declares: from this share it lies in that one.
+                            if let Some(module) = module {
+                                let trimmed = line.trim_start();
+                                if let Some(rest) = trimmed.strip_prefix("use self::") {
+                                    let first: String = rest
+                                        .chars()
+                                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                                        .collect();
+                                    let as_mod = format!("mod {first}");
+                                    let owner = files.iter().copied().find(|&g| {
+                                        body.members
+                                            .iter()
+                                            .zip(to)
+                                            .any(|(m, t)| *t == Some(g) && m.name == as_mod)
+                                            || declares(g).contains(first.as_str())
+                                    });
+                                    if let Some(g) = owner.filter(|&g| g != f) {
+                                        let path = share_path(&plan[g].name, module, keep);
+                                        let at = line.len() - trimmed.len() + "use ".len();
+                                        line.replace_range(at..at + "self".len(), &path);
+                                    }
+                                }
+                            }
                             text.push('\n');
-                            text.push_str(&piece(source, m.span.clone(), own_edits)?);
+                            text.push_str(&line);
                             text.push('\n');
                         }
                     }
                     if let Some(module) = module {
                         let used = uses(f);
+                        let holds_file_module = body.members.iter().zip(to).any(|(m, t)| {
+                            *t == Some(f)
+                                && m.name.starts_with("mod ")
+                                && source[m.span.clone()].trim_end().ends_with(';')
+                        });
                         for &g in files.iter().filter(|&&g| g != f) {
-                            if declares(g).iter().any(|n| used.contains(n)) {
-                                let path = share_path(&plan[g].name, module, keep);
-                                text.push_str(&format!("\n    use {path}::*;\n"));
+                            let path = share_path(&plan[g].name, module, keep);
+                            if keep {
+                                // The share in `mod.rs` keeps the module's
+                                // path whole: everything another share holds
+                                // is reached through it, as before the split.
+                                text.push_str(&format!("\n    pub(super) use {path}::*;\n"));
+                            } else {
+                                // By name, not by glob: a name the module
+                                // declares outranks one its `use super::*`
+                                // brings in, and an explicit import keeps that.
+                                // A share declaring a module in a file of its
+                                // own (`mod golden;`) takes every name: that
+                                // file's `use super::*` reads them through it.
+                                let mut wanted: Vec<&str> = declares(g)
+                                    .into_iter()
+                                    .filter(|n| holds_file_module || used.contains(n))
+                                    .collect();
+                                wanted.sort_unstable();
+                                match wanted.as_slice() {
+                                    [] => {}
+                                    [one] => text.push_str(&format!("\n    use {path}::{one};\n")),
+                                    many => text.push_str(&format!(
+                                        "\n    use {path}::{{{}}};\n",
+                                        many.join(", ")
+                                    )),
+                                }
                             }
                         }
                     }
@@ -181,7 +260,29 @@ pub fn assemble(
                     let first = (0..to.len()).find(|&j| to[j] == Some(f)).expect("a share");
                     pieces[f].push((body.members[first].span.start, text));
                 }
+                // With no share left in `mod.rs`, the module is declared there
+                // still, gathering its shares: what other modules reach as
+                // `<module>::x` they reach as they did.
+                if let (Some(module), None) = (module, in_mod.filter(|m| files.contains(m))) {
+                    let mut gather = source[body.head.clone()].to_string();
+                    for &g in &files {
+                        gather.push_str(&format!(
+                            "\n    pub(super) use super::{}::{module}::*;",
+                            plan[g].name
+                        ));
+                    }
+                    gather.push_str("\n}");
+                    gathers.push((item.span.start, gather));
+                }
             }
+        }
+    }
+    for (i, f) in plan.iter().enumerate() {
+        if hoisted[i].is_some() && !pieces[i].is_empty() {
+            return Err(format!(
+                "file `{}` holds the module `{}` it is named for, and nothing else can go in it",
+                f.name, f.name
+            ));
         }
     }
     let children: Vec<(String, String)> = plan
@@ -200,9 +301,16 @@ pub fn assemble(
                     }
                 }
             }
+            if let Some(body) = &hoisted[i] {
+                out.push('\n');
+                out.push_str(body);
+                return (f.name.clone(), out);
+            }
             out.push_str("\nuse super::*;\n");
+            // In source order, with the tests after everything else: an item
+            // after a test module is one a reader of the file never reaches.
             let mut mine = pieces[i].clone();
-            mine.sort_by_key(|(at, _)| *at);
+            mine.sort_by_key(|(at, text)| (is_test(text), *at));
             for (_, text) in mine {
                 out.push('\n');
                 out.push_str(&text);
@@ -226,9 +334,21 @@ pub fn assemble(
             )
         })
         .collect();
+    // What `mod.rs` holds for tests — a test module `file mod` keeps, the
+    // module gathering a split one's shares — goes after its other items, in
+    // source order.
+    let mut tests_last: Vec<(usize, String)> = gathers;
     if let Some(m) = in_mod {
-        kept.extend(pieces[m].iter().map(|(at, t)| (*at, None, t.clone())));
+        for (at, t) in &pieces[m] {
+            if is_test(t) {
+                tests_last.push((*at, t.clone()));
+            } else {
+                kept.push((*at, None, t.clone()));
+            }
+        }
     }
+    tests_last.sort_by_key(|(at, _)| *at);
+    kept.extend(declarations.into_iter().map(|(at, d)| (at, None, d)));
     kept.sort_by_key(|(at, _, _)| *at);
     let mut mod_rs = String::new();
     for (i, (_, end, text)) in kept.iter().enumerate() {
@@ -251,28 +371,70 @@ pub fn assemble(
             }
         }
     }
-    for (i, f) in plan.iter().enumerate().filter(|(_, f)| f.name != MOD) {
+    for (i, f) in plan
+        .iter()
+        .enumerate()
+        .filter(|(i, f)| f.name != MOD && hoisted[*i].is_none())
+    {
         if test_only[i] {
             mod_rs.push_str("#[cfg(test)]\n");
         }
         mod_rs.push_str(&format!("mod {};\n", f.name));
     }
     mod_rs.push('\n');
-    // A test-only file is reached by the other shares of its test module,
-    // never through `mod.rs`.
-    for (i, f) in plan
-        .iter()
-        .enumerate()
-        .filter(|(i, f)| f.name != MOD && !test_only[*i] && names[*i])
-    {
+    // A test-only file holding only shares of test modules is reached
+    // through those modules, never through a glob of `mod.rs`; one declaring
+    // helpers or a whole module of its own is re-exported for the tests.
+    for (i, f) in plan.iter().enumerate().filter(|(i, f)| {
+        f.name != MOD && names[*i] && hoisted[*i].is_none() && (!test_only[*i] || test_names[*i])
+    }) {
         let vis = match seen[i] {
             Seen::Everywhere => "pub ",
             Seen::Crate => "pub(crate) ",
+            Seen::Parent => "pub(super) ",
             Seen::Module => "",
         };
+        if test_only[i] {
+            mod_rs.push_str("#[cfg(test)]\n");
+        }
         mod_rs.push_str(&format!("{vis}use {}::*;\n", f.name));
     }
-    Ok(Outputs { mod_rs, children })
+    for (_, text) in tests_last {
+        mod_rs.push('\n');
+        mod_rs.push_str(text.trim_end());
+        mod_rs.push('\n');
+    }
+    let hoisted = plan
+        .iter()
+        .zip(&hoisted)
+        .filter(|(_, h)| h.is_some())
+        .map(|(f, _)| f.name.clone())
+        .collect();
+    Ok(Outputs {
+        mod_rs,
+        children,
+        hoisted,
+    })
+}
+
+/// Whether `item` is an inline `mod { }` placed whole in the file named for
+/// it, which then becomes the module's own file.
+fn hoists(item: &Item, file: &PlanFile) -> bool {
+    item.inline.is_some() && file.name != MOD && item.name == format!("mod {}", file.name)
+}
+
+/// A module body as a file: its bytes as written, from its first line with
+/// anything on it through its last. The indentation it had inside the braces
+/// stays — `cargo fmt` re-indents code, and taking it off here would also
+/// change what a multi-line string literal holds.
+fn dedent(body: &str) -> String {
+    let start = body
+        .find(|c: char| !c.is_whitespace())
+        .map(|at| body[..at].rfind('\n').map_or(0, |nl| nl + 1));
+    match start {
+        Some(start) => format!("{}\n", body[start..].trim_end()),
+        None => String::new(),
+    }
 }
 
 /// `source[range]` with `edits` applied — none for what stays as it was — and
@@ -303,18 +465,31 @@ fn drop_bare_rules(text: &str) -> String {
     text.split_inclusive('\n').filter(|l| !is_rule(l)).collect()
 }
 
-/// Whether an item, by the attributes over it, is built only for tests.
-fn is_test(text: &str) -> bool {
+/// Whether a member, by the attributes over it, is a test the harness runs:
+/// `#[test]`, `#[tokio::test]` and the like.
+fn is_test_fn(text: &str) -> bool {
     text.lines()
         .map(str::trim)
         .take_while(|l| l.is_empty() || l.starts_with("//") || l.starts_with("#["))
-        .any(|l| l.starts_with("#[cfg(test)]"))
+        .any(|l| l.starts_with("#[") && (l.contains("test]") || l.contains("::test(")))
 }
 
-/// How far an item's own declaration says it is seen. An `impl` or a
-/// `mod { }` is re-exported by nothing.
+/// Whether an item, by the attributes over it, is built only for tests.
+fn is_test(text: &str) -> bool {
+    let leading: Vec<&str> = text
+        .lines()
+        .take_while(|l| {
+            let l = l.trim();
+            l.is_empty() || l.starts_with("//") || l.starts_with("#[")
+        })
+        .collect();
+    is_cfg_test(leading.join("\n").as_bytes())
+}
+
+/// How far an item's own declaration says it is seen. An `impl` is
+/// re-exported by nothing; a `mod { }` moved whole is seen as it says.
 fn seen_of(text: &str, name: &str) -> Seen {
-    if name.starts_with("impl ") || name.starts_with("mod ") {
+    if name.starts_with("impl ") {
         return Seen::Module;
     }
     let code = text.lines().map(str::trim).find(|l| {
@@ -324,8 +499,12 @@ fn seen_of(text: &str, name: &str) -> Seen {
             && !l.starts_with("/*")
             && !l.starts_with('*')
     });
+    // A glob re-export passes on each item only as far as the item itself is
+    // seen, so a wider one than an item's own reach is harmless; `pub(in …)`
+    // is re-exported crate-wide for that reason.
     match code {
-        Some(l) if l.starts_with("pub(crate)") => Seen::Crate,
+        Some(l) if l.starts_with("pub(crate)") || l.starts_with("pub(in ") => Seen::Crate,
+        Some(l) if l.starts_with("pub(super)") => Seen::Parent,
         Some(l) if l.starts_with("pub ") => Seen::Everywhere,
         _ => Seen::Module,
     }
@@ -376,11 +555,16 @@ mod tests {
     use crate::plan::parse;
     use crate::rewrite::edits;
 
+    /// Each module's file as `<path>.rs`.
+    fn flat(below: &str) -> String {
+        format!("{below}.rs")
+    }
+
     fn split(src: &str, plan: &str) -> Outputs {
         let l = layout(src).unwrap();
         let p = parse(plan).unwrap();
         let placed = assign(&l, &p).unwrap();
-        let e = edits(src).unwrap();
+        let e = edits(src, &flat).unwrap();
         let shares = Shares::new(src, &e).unwrap();
         assemble(src, &l, &p, &placed, &e, &shares).unwrap()
     }
@@ -413,6 +597,54 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// **An item seen by the module above is re-exported to it**: a
+    /// `pub(super)` item's file is globbed `pub(super)`, so a sibling of the
+    /// split module still reaches it through the module's path.
+    #[test]
+    fn a_parent_visible_item_is_re_exported_to_the_parent() {
+        let src = "pub(super) struct D;\n\npub(in crate::a) fn e() {}\n";
+        let out = split(src, "file d: The layout.\n1\nfile e: The e.\n2\n");
+        assert_eq!(
+            out.mod_rs,
+            "mod d;\nmod e;\n\npub(super) use d::*;\npub(crate) use e::*;\n"
+        );
+    }
+
+    /// **An inline module placed in the file named for it becomes that file**:
+    /// the file holds its body, at the same depth, and `mod.rs` keeps its
+    /// declaration where it stood.
+    #[test]
+    fn an_inline_module_is_hoisted_into_its_file() {
+        let src = "fn a() {}\n\n/// Tables.\n#[allow(dead_code)]\npub mod tables {\n    use super::*;\n\n    pub const X: &str = \"a\n  b\";\n}\n";
+        let out = split(src, "file mod: Stays.\n1\nfile tables: The tables.\n2\n");
+        assert_eq!(
+            out.mod_rs,
+            "fn a() {}\n\n/// Tables.\n#[allow(dead_code)]\npub mod tables;\n\n\n"
+        );
+        assert_eq!(
+            out.children,
+            vec![(
+                "tables".to_string(),
+                "//! The tables.\n\n    use super::*;\n\n    pub const X: &str = \"a\n  b\";\n"
+                    .to_string()
+            )]
+        );
+    }
+
+    /// A file named for a hoisted module holds nothing else.
+    #[test]
+    fn a_hoisted_module_has_its_file_to_itself() {
+        let src = "fn a() {}\n\nmod tables {\n    const X: u8 = 1;\n}\n";
+        let l = layout(src).unwrap();
+        let plan = parse("file tables: The tables.\n1 2\n").unwrap();
+        let placed = assign(&l, &plan).unwrap();
+        let edits = edits(src, &flat).unwrap();
+        let shares = Shares::new(src, &edits).unwrap();
+        assert!(assemble(src, &l, &plan, &placed, &edits, &shares)
+            .unwrap_err()
+            .contains("holds the module `tables` it is named for"));
     }
 
     /// **An impl's methods go to different files**, each inside the impl's
@@ -453,7 +685,59 @@ mod tests {
         assert_eq!(
             out.children[1].1,
             "//! The test.\n\nuse super::*;\n\n#[cfg(test)]\npub(super) mod tests {\n    use super::*;\n\n    \
-             use super::super::one::tests::*;\n\n    #[test]\n    fn b() { helper(); }\n}\n"
+             use super::super::one::tests::helper;\n\n    #[test]\n    fn b() { helper(); }\n}\n"
+        );
+        // The module's path still names its helpers: `mod.rs` gathers them.
+        assert_eq!(
+            out.mod_rs,
+            "#[cfg(test)]\nmod one;\n#[cfg(test)]\nmod two;\n\n\n#[cfg(test)]\nmod tests {\n    \
+             pub(super) use super::one::tests::*;\n    pub(super) use super::two::tests::*;\n}\n"
+        );
+    }
+
+    /// **A share's `use self::x` names the share that declares `x`**, whose
+    /// `mod x;` is seen by every share.
+    #[test]
+    fn a_use_of_a_sibling_module_names_its_share() {
+        let src = "#[cfg(test)]\nmod tests {\n    use self::ledger::L;\n\n    mod ledger;\n\n    #[test]\n    fn b() {}\n}\n";
+        let out = split(
+            src,
+            "file one: The ledger.\n1.2\nfile two: The test.\n1.3\n",
+        );
+        assert!(out.children[0].1.contains("\n    use self::ledger::L;\n"));
+        assert!(out.children[0]
+            .1
+            .contains("pub(in super::super) mod ledger;"));
+        assert!(out.children[1]
+            .1
+            .contains("\n    use super::super::one::tests::ledger::L;\n"));
+    }
+
+    /// **A share declaring a module file imports every other share's names**,
+    /// since that file reads them through its `use super::*`.
+    #[test]
+    fn a_share_with_a_file_module_imports_every_name() {
+        let src = "#[cfg(test)]\nmod tests {\n    fn bits() {}\n\n    fn other() {}\n\n    mod golden;\n}\n";
+        let out = split(
+            src,
+            "file one: The helpers.\n1.1 1.2\nfile two: The golden.\n1.3\n",
+        );
+        assert!(out.children[1]
+            .1
+            .contains("\n    use super::super::one::tests::{bits, other};\n"));
+    }
+
+    /// **A test-only helper declared at the top is re-exported for tests**,
+    /// which reach it through the split module's path.
+    #[test]
+    fn a_top_level_test_helper_is_re_exported_for_tests() {
+        let out = split(
+            "#[cfg(test)]\npub(crate) fn fixture() {}\n",
+            "file support: The fixture.\n1\n",
+        );
+        assert_eq!(
+            out.mod_rs,
+            "#[cfg(test)]\nmod support;\n\n#[cfg(test)]\npub(crate) use support::*;\n"
         );
     }
 

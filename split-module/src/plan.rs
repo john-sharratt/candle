@@ -44,7 +44,9 @@ pub fn parse(text: &str) -> Result<Vec<PlanFile>, String> {
     let mut files: Vec<PlanFile> = Vec::new();
     for (n, raw) in text.lines().enumerate() {
         let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+        // `=== <map>` heads a plan in the planner's answer; it says nothing
+        // about the plan.
+        if line.is_empty() || line.starts_with('#') || line.starts_with("===") {
             continue;
         }
         if let Some(doc) = line.strip_prefix("//!") {
@@ -55,7 +57,9 @@ pub fn parse(text: &str) -> Result<Vec<PlanFile>, String> {
                 .push(doc.strip_prefix(' ').unwrap_or(doc).trim_end().to_string());
             continue;
         }
-        if let Some(rest) = line.strip_prefix("file ") {
+        // A file line is `file <name>: <purpose>`; `<name>: <purpose>` without
+        // the keyword says the same, since no id holds a `:`.
+        if let Some(rest) = line.strip_prefix("file ").or_else(|| bare_file_line(line)) {
             let (name, doc) = rest
                 .split_once(':')
                 .ok_or_else(|| format!("line {}: `file <name>: <purpose>`", n + 1))?;
@@ -92,6 +96,12 @@ pub fn parse(text: &str) -> Result<Vec<PlanFile>, String> {
         return Err("the plan names no file".into());
     }
     Ok(files)
+}
+
+/// `line` itself when it reads `<module name>: <purpose>`.
+fn bare_file_line(line: &str) -> Option<&str> {
+    let (name, _) = line.split_once(':')?;
+    is_module_name(name.trim()).then_some(line)
 }
 
 fn parse_id(word: &str) -> Option<Id> {
@@ -170,5 +180,31 @@ mod tests {
             "line 2: `1.x` is not an id (`N` or `N.M`)"
         );
         assert_eq!(parse("").unwrap_err(), "the plan names no file");
+    }
+
+    /// **A planner's slips read as it meant them**: the `=== <map>` head of
+    /// its answer is skipped, and a file line without `file` is still one.
+    #[test]
+    fn a_map_head_and_a_bare_file_line_are_read() {
+        let p =
+            parse("=== maps/a.rs.map\n\nfile mod: Stays.\n1\ntests_rows: The tests.\n2.1 2.2\n")
+                .unwrap();
+        assert_eq!(
+            p.iter()
+                .map(|f| (f.name.as_str(), f.doc.as_str(), f.ids.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("mod", "Stays.", vec![Id::Whole(1)]),
+                (
+                    "tests_rows",
+                    "The tests.",
+                    vec![Id::Member(2, 1), Id::Member(2, 2)]
+                ),
+            ]
+        );
+        assert_eq!(
+            parse("file a: x\nNot a name: y\n").unwrap_err(),
+            "line 2: `Not` is not an id (`N` or `N.M`)"
+        );
     }
 }

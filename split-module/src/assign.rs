@@ -50,6 +50,26 @@ pub fn assign(layout: &Layout, plan: &[PlanFile]) -> Result<Vec<Placement>, Stri
             .as_ref()
             .map(|b| b.members.as_slice())
             .unwrap_or(&[]);
+        // An item that cannot be divided (a trait impl, an ordinary
+        // `mod { }`) but is named by members goes whole to the file that
+        // names most of them, the first such file on a tie.
+        if item.body.is_none() && named_whole.is_none() {
+            let mut votes: BTreeMap<usize, usize> = BTreeMap::new();
+            for (_, files) in member.range((n, 0)..(n + 1, 0)) {
+                for &f in files {
+                    *votes.entry(f).or_default() += 1;
+                }
+            }
+            let most = votes.values().copied().max();
+            if let Some(f) = votes
+                .iter()
+                .find(|&(_, &v)| Some(v) == most)
+                .map(|(&f, _)| f)
+            {
+                out.push(Placement::Whole(f));
+                continue;
+            }
+        }
         let named_members: Vec<Option<usize>> = (1..=members.len())
             .map(|m| member.get(&(n, m)).and_then(|f| f.first().copied()))
             .collect();
@@ -147,6 +167,19 @@ mod tests {
         assert_eq!(
             assign(&l, &p).unwrap_err(),
             "2.2 (fn y) is not placed\n3 (mod tests) is not placed"
+        );
+    }
+
+    /// **An indivisible item named by members goes whole** to the file that
+    /// names most of them — a trait impl cannot be spread over files.
+    #[test]
+    fn an_indivisible_item_named_by_members_goes_whole() {
+        let src = "struct A;\n\nimpl Clone for A {\n    fn clone(&self) -> A { A }\n}\n";
+        let l = layout(src).unwrap();
+        let p = parse("file a: A.\n1 2.1\nfile b: B.\n2.2 2.3\n").unwrap();
+        assert_eq!(
+            assign(&l, &p).unwrap(),
+            vec![Placement::Whole(0), Placement::Whole(1)]
         );
     }
 }
