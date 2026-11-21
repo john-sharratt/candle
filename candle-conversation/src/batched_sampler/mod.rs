@@ -23,28 +23,40 @@ use cudarc::driver::{DevicePtr, DevicePtrMut};
 use std::sync::Mutex;
 
 mod allow_list;
-mod dials;
-mod launch;
-mod mask;
+mod commit;
+mod host_sample;
+mod kernel;
 mod rows;
 mod sampler;
-mod state;
+mod score;
+mod segments;
+mod seq_dials;
+mod sequence_state;
 #[cfg(test)]
-mod tests_allow;
+mod tests_allow_list;
 #[cfg(test)]
-mod tests_close;
+mod tests_batch;
+#[cfg(test)]
+mod tests_degenerate;
+#[cfg(test)]
+mod tests_helpers;
+#[cfg(test)]
+mod tests_penalties;
 #[cfg(test)]
 mod tests_scoring;
 #[cfg(test)]
-mod tests_state;
+mod tests_segments;
 #[cfg(test)]
-mod tests_support;
+mod tests_stencil;
 #[cfg(test)]
 mod tests_wave;
+mod typical;
 
 use allow_list::*;
-use dials::*;
-use mask::*;
+use host_sample::*;
 pub use rows::*;
 pub use sampler::*;
-pub use state::*;
+use segments::*;
+use seq_dials::*;
+pub use sequence_state::*;
+use typical::*;

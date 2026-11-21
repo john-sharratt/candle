@@ -1,4 +1,8 @@
-//! Tests for per-row budgets and penalty windows across a wave, and for kernel pricing.
+//! Tests for the think-block close rules and for per-row budgets across a wave of rows.
+//!
+//! Tests that a `</think>` outside a think block is banned, that one inside a block is free, and that no think protocol means no ban.
+//! Tests that a row's segment-close budget applies inside a shared launch, and that each row of a wave resolves against its own config.
+//! Tests that the kernel prices each row from its own device-resident counts.
 
 use super::*;
 
@@ -14,188 +18,118 @@ pub(super) mod tests {
 
     use crate::config::SamplingConfig;
 
-    use super::super::tests_support::tests::*;
+    use super::super::tests_helpers::tests::*;
 
-    // ── Tool-call penalty suppression ──────────────────────────────────
+    // ── Structural think-close ban ─────────────────────────────────────
 
+    /// **A `</think>` outside a think block is never sampleable.** The stencil
+    /// owns the close inside a block; outside one there is nothing to close,
+    /// and a stray close after the stencil's walk has finished is exactly what
+    /// produced the doubled `</think>` that derailed a live turn — twice, on
+    /// the same turn shape.
     #[test]
-    pub(in super::super) fn tool_call_row_penalty_state_is_zeroed_and_think_row_is_not() {
+    pub(in super::super) fn a_think_close_outside_a_think_block_is_banned() {
         let sampler = make_sampler();
-        let mut in_call = make_state();
-        let mut thinking = make_state();
-        // Both rows generated the same tokens (e.g. digits reasoned in <think>).
-        for _ in 0..5 {
-            in_call.record_token(42, MAX_RECENT);
-            thinking.record_token(42, MAX_RECENT);
-        }
-        in_call.in_tool_call = true;
-        // A prior turn, so the cross-turn table has something to suppress.
-        in_call.end_turn(0);
-        thinking.end_turn(0);
-        for _ in 0..5 {
-            in_call.record_token(42, MAX_RECENT);
-            thinking.record_token(42, MAX_RECENT);
-        }
-
-        let config = window_16();
-        let rows = gather(&sampler, &[&in_call, &thinking], &config, true);
-
-        // Row 0 (tool call) stamps nothing, so its table rows read zero — the
-        // model is free to reproduce the query's tokens verbatim in the
-        // arguments. Row 1 (think block) keeps full repetition control.
-        let row1_42 = VOCAB_SIZE as u32 + 42;
-        assert_eq!(
-            rows.counts,
-            SparseCounts {
-                offsets: vec![row1_42],
-                values: vec![5],
-            }
-        );
-        assert_eq!(
-            rows.cross,
-            SparseCounts {
-                offsets: vec![row1_42],
-                values: vec![5],
-            }
-        );
-        assert_eq!(rows.recent_lens, vec![0, 10]);
-    }
-
-    /// **An unpenalized step is priced by no history, for that step alone**:
-    /// the same state, gathered under a config that marks the step and under
-    /// one that does not, stamps nothing the first time and its counts, window
-    /// and DRY span the second.
-    #[test]
-    pub(in super::super) fn an_unpenalized_step_reads_no_history_and_the_next_step_does() {
-        let sampler = make_sampler();
+        let mut config = SamplingConfig::argmax();
+        config.segment_open_token_id = 89;
+        config.segment_close_token_id = 90;
         let mut state = make_state();
-        // Five tokens of one free-text value: the first opens it.
-        state.record_token(42, MAX_RECENT);
-        state.set_free_text(true);
-        for _ in 0..4 {
-            state.record_token(42, MAX_RECENT);
-        }
-        let plain = window_16().with_dry_penalty(0.8, 1.75, 4, 512);
-        let lifted = SamplingConfig {
-            unpenalized_step: true,
-            ..plain.clone()
-        };
-        let mut rows = KernelRows::new(sampler.vocab_size, sampler.max_recent_len, false);
-        let spec = |r: usize| RowSpec {
-            seq: r,
-            logits_row: r,
-            draft: None,
-            ahead: &[],
-        };
-        rows.push(0, &state, &lifted, &spec(0), None, state.row_key());
-        rows.push(1, &state, &plain, &spec(1), None, state.row_key());
+        assert!(!state.in_segment, "a turn starts outside any think block");
+        assert!(think_close_ban_active(&config, &state));
+
+        let logits = logits_from_rows(&[&[(90, 100.0), (60, 50.0)]]);
+        let tokens = sampler
+            .sample_batch(&logits, &mut [&mut state], &[&config])
+            .expect("sample");
         assert_eq!(
-            rows.counts,
-            SparseCounts {
-                offsets: vec![VOCAB_SIZE as u32 + 42],
-                values: vec![5],
-            }
+            tokens[0], 60,
+            "the close token must be unreachable outside a block"
         );
-        assert_eq!(rows.recent_lens, vec![0, 5]);
-        assert_eq!(rows.dry_lens, vec![0, 5]);
     }
 
-    /// **DRY's window is one free-text value.** Outside a value it is empty;
-    /// entering one starts it at the token that opened it; it counts only that
-    /// value's tokens; leaving empties it, and the next value starts afresh.
+    // ── Per-row limits inside one shared launch ───────────────────────
+
+    /// **A row's own segment-close budget applies inside a shared launch.**
+    ///
+    /// The host-side post-kernel loop resolves the segment-close budget (and the
+    /// EOS failsafes) per row from `configs[i]`, never row 0. Both rows here go
+    /// through ONE launch: row 0 is greedy over a decisive logit row, row 1 is
+    /// mid-block with a hard cap of 1 and must still be forced closed on its own
+    /// config, not row 0's.
     #[test]
-    pub(in super::super) fn dry_sees_only_the_value_being_written() {
+    pub(in super::super) fn a_row_obeys_its_own_close_budget_in_a_shared_launch() {
         let sampler = make_sampler();
-        let config = window_16().with_dry_penalty(0.8, 1.75, 4, 512);
+        let greedy = SamplingConfig::argmax();
+        let mut forced = SamplingConfig::argmax();
+        forced.segment_open_token_id = 89;
+        forced.segment_close_token_id = 90;
+        forced.force_segment_close_after = 1;
+
+        let mut plain = make_state();
+        let mut in_block = make_state();
+        in_block.in_segment = true;
+        in_block.segment_len = 5;
+
+        let logits = logits_from_rows(&[&[(42, 100.0), (7, 1.0)], &[(42, 100.0), (7, 1.0)]]);
+        let tokens = sampler
+            .sample_batch(
+                &logits,
+                &mut [&mut plain, &mut in_block],
+                &[&greedy, &forced],
+            )
+            .expect("sample");
+
+        assert_eq!(tokens[0], 42, "the greedy row takes its own argmax");
+        assert_eq!(
+            tokens[1], 90,
+            "the forced-close row closes on ITS config, not row 0's"
+        );
+    }
+
+    /// Inside a block the ban is off: the model must stay free to emit the
+    /// close (the steering intercepts it — `TokenClosedDrop` — or the hard-cap
+    /// closer forces it; the sampler's job is only to not fight either).
+    #[test]
+    pub(in super::super) fn a_think_close_inside_a_think_block_is_free() {
+        let sampler = make_sampler();
+        let mut config = SamplingConfig::argmax();
+        config.segment_open_token_id = 89;
+        config.segment_close_token_id = 90;
         let mut state = make_state();
-        // Structure and reasoning before the value: no window.
-        for _ in 0..7 {
-            state.record_token(42, MAX_RECENT);
-        }
-        state.set_free_text(false);
-        assert_eq!(
-            gather(&sampler, &[&state], &config, false).dry_lens,
-            vec![0]
-        );
-        // The value's first token, then three more.
-        state.record_token(5, MAX_RECENT);
-        state.set_free_text(true);
-        assert_eq!(
-            gather(&sampler, &[&state], &config, false).dry_lens,
-            vec![1]
-        );
-        for t in [6, 7, 8] {
-            state.record_token(t, MAX_RECENT);
-            state.set_free_text(true);
-        }
-        assert_eq!(
-            gather(&sampler, &[&state], &config, false).dry_lens,
-            vec![4]
-        );
-        // The value closes; the structure after it is outside any window.
-        state.record_token(9, MAX_RECENT);
-        state.set_free_text(false);
-        state.record_token(10, MAX_RECENT);
-        assert_eq!(
-            gather(&sampler, &[&state], &config, false).dry_lens,
-            vec![0]
-        );
-        // The next value starts at one, not where the last left off.
-        state.record_token(11, MAX_RECENT);
-        state.set_free_text(true);
-        assert_eq!(
-            gather(&sampler, &[&state], &config, false).dry_lens,
-            vec![1]
-        );
-        // A tool call freed from the penalties is outside DRY even mid-value.
-        state.in_tool_call = true;
-        assert_eq!(
-            gather(&sampler, &[&state], &config, false).dry_lens,
-            vec![0]
-        );
+        state.enter_segment();
+        assert!(!think_close_ban_active(&config, &state));
+
+        let logits = logits_from_rows(&[&[(90, 100.0), (60, 50.0)]]);
+        let tokens = sampler
+            .sample_batch(&logits, &mut [&mut state], &[&config])
+            .expect("sample");
+        assert_eq!(tokens[0], 90, "inside a block the close samples normally");
     }
 
-    /// **The repeat penalty flips with DRY**: a row inside a free-text value
-    /// samples on the config's DRY-time penalty, any other row on its own.
+    /// Without segment tracking configured (close id < 0) the ban never
+    /// activates — reference models with no think protocol are untouched.
     #[test]
-    pub(in super::super) fn the_repeat_penalty_a_row_samples_on_flips_with_dry() {
-        let sampler = make_sampler();
-        let config = SamplingConfig {
-            repeat_penalty: 1.05,
-            ..window_16()
-        }
-        .with_dry_penalty(0.8, 1.75, 2, 512)
-        .with_dry_repeat_penalty(1.0);
-        let outside = make_state();
-        let mut inside = make_state();
-        inside.record_token(5, MAX_RECENT);
-        inside.set_free_text(true);
-        let rows = gather(&sampler, &[&outside, &inside], &config, false);
-        let repeat: Vec<f32> = rows.seq_dials.iter().map(|d| d.repeat_penalty).collect();
-        assert_eq!(repeat, vec![1.05, 1.0]);
-
-        // A config that cleared DRY keeps its own penalty inside a value too:
-        // it has nothing standing in for the 1.05.
-        let no_dry = SamplingConfig {
-            dry: None,
-            ..config
-        };
-        let rows = gather(&sampler, &[&inside], &no_dry, false);
-        assert_eq!(rows.seq_dials[0].repeat_penalty, 1.05);
-        assert_eq!(rows.dry_lens, vec![0]);
+    pub(in super::super) fn no_think_protocol_means_no_ban() {
+        let config = SamplingConfig::argmax();
+        let state = make_state();
+        assert!(!think_close_ban_active(&config, &state));
     }
 
-    /// With the cross-turn penalty off, the cross table is never read, so
-    /// nothing is gathered for it.
-    #[test]
-    pub(in super::super) fn the_cross_turn_table_is_gathered_only_when_its_penalty_is_on() {
-        let sampler = make_sampler();
+    // ── Per-row config in a mixed wave ────────────────────────────────────
+
+    /// A row inside a think block, `n` tokens deep, with `force` as its hard
+    /// segment-close cap. Close id 90, open id 80, no closer script and no
+    /// sentence-end ids — so the ONLY thing that can emit 90 is the force cap.
+    pub(in super::super) fn wave_row(force: i32) -> (SamplingConfig, SequenceSamplingState) {
+        let mut config = SamplingConfig::top_k(1, 1.0);
+        config.segment_close_token_id = 90;
+        config.segment_open_token_id = 80;
+        config.force_segment_close_after = force;
+        config.graceful_segment_close_after = 0;
         let mut state = make_state();
-        state.record_token(7, MAX_RECENT);
-        state.end_turn(0);
-        let config = window_16();
-        let rows = gather(&sampler, &[&state], &config, false);
-        assert_eq!(rows.cross, SparseCounts::default());
+        state.in_segment = true;
+        state.segment_len = 5;
+        (config, state)
     }
 
     /// **Every row of a wave resolves against its OWN config.**

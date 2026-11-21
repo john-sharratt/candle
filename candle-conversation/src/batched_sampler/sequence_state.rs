@@ -1,6 +1,44 @@
-//! The per-sequence sampling state: the degenerate-run bar, the rolling token history, turn and segment tracking, and the penalty windows.
+//! The per-sequence sampling state that persists across turns, and the marks used to roll back a speculative advance.
+//!
+//! `SequenceSamplingState` holds a sequence's recent tokens, its cross-turn counts, its segment position and its RNG offset.
+//! `SamplingMark` records what an advance changes so that `rewind` can undo it, and `RowKey` records the state a row was scored against.
+//! `end_turn` snapshots the turn's counts into the cross-turn window, and `clear` resets the state for a conversation reset.
 
 use super::*;
+
+/// What [`SequenceSamplingState::mark`] saves: every field an advance changes
+/// except the dense counts, which [`SequenceSamplingState::rewind`] walks back
+/// from the tokens recorded instead of copying a vocabulary.
+pub(super) struct SamplingMark {
+    pub(super) counted_len: usize,
+    pub(super) recent_tokens: Vec<i32>,
+    pub(super) current_len: i32,
+    pub(super) in_segment: bool,
+    pub(super) segment_len: i32,
+    pub(super) dry_span_len: i32,
+    pub(super) close_script_pos: Option<usize>,
+    pub(super) degenerate_run: u32,
+    pub(super) degenerate: bool,
+    pub(super) rng_offset: u64,
+}
+
+/// The state a row was scored against, as [`SequenceSamplingState::row_key`]
+/// reads it. A row commits only onto a state with the same key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowKey {
+    pub(super) counted: usize,
+    pub(super) current_len: i32,
+    pub(super) in_segment: bool,
+    pub(super) segment_len: i32,
+    pub(super) dry_span_len: i32,
+    pub(super) in_free_text: bool,
+    pub(super) in_tool_call: bool,
+    pub(super) writing_call: bool,
+    pub(super) close_script_pos: Option<usize>,
+    pub(super) degenerate_run: u32,
+    pub(super) rng_offset: u64,
+    pub(super) last: Option<i32>,
+}
 
 /// Per-sequence sampling state.
 ///

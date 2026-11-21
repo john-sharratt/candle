@@ -1,4 +1,8 @@
-//! The allow-list path: candidate-set rows the kernel constrains, their bitmaps, the deferred read-back, and the CPU finish of a sampled allow row.
+//! The stencil-constrained rows: their device dispatch, their host finish, and the result words they read back.
+//!
+//! `AllowRow` is a stencil-constrained row waiting for the dispatch that runs every such row, and `run_allow_rows` runs that dispatch in one launch.
+//! `issue_allow_list` enqueues a row's device work, and `finish_allow_list` reads its result back and maps it to the allowed token.
+//! `AllowResult` is what the device half of an allow-list row reads back, and `allow_sample_failure` describes a row that could not be sampled.
 
 use super::*;
 
@@ -137,61 +141,6 @@ pub(super) fn non_finite_count(probs: &Tensor) -> usize {
 }
 
 impl BatchedSampler {
-    /// Whether a row of `logits` can read a bitmap: the forward priced the
-    /// bitmaps on the span the logits stand on. Rows held off the span have
-    /// none, and sample by name.
-    pub(super) fn bitmaps_beside(logits: &Tensor) -> bool {
-        // The unit tests' logits stand on no wave, and they test the kernel.
-        cfg!(test) || logits.wave_ticket().is_some()
-    }
-
-    /// `rows`' dials with each masked row's bitmap address, and the buffer those
-    /// addresses name, carved beside `logits` and written from the host.
-    pub(super) fn place_bitmaps(
-        &self,
-        logits: &Tensor,
-        rows: &KernelRows<'_>,
-    ) -> candle::Result<(Vec<SeqDials>, Option<Tensor>)> {
-        let mut dials = rows.seq_dials.clone();
-        if rows.masked.is_empty() {
-            return Ok((dials, None));
-        }
-        let Device::Cuda(dev) = &self.device else {
-            candle::bail!("place_bitmaps: the kernel rows run on CUDA");
-        };
-        let width = rows.vocab.div_ceil(32);
-        let bitmaps = logits.empty_beside((rows.masked.len(), width), DType::U32)?;
-        let stream = dev.cuda_stream();
-        let base = {
-            let (storage, layout) = bitmaps.storage_and_layout();
-            let candle::Storage::Cuda(c) = &*storage else {
-                candle::bail!("place_bitmaps: bitmaps must be on CUDA");
-            };
-            c.slice.device_ptr(&stream) + (layout.start_offset() * 4) as u64
-        };
-        // SAFETY: `u32`s read as their bytes.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                rows.allowed_bits.as_ptr() as *const u8,
-                rows.allowed_bits.len() * 4,
-            )
-        };
-        dev.upload_raw(base, bytes)?;
-        tracing::debug!(
-            target: "candle_conversation::stencil",
-            rows = rows.masked.len(),
-            bytes = bytes.len(),
-            on_wave = logits.wave_ticket().is_some(),
-            "grammar bitmaps carved beside the logits"
-        );
-        for (i, &row) in rows.masked.iter().enumerate() {
-            let at = base + (i * width * 4) as u64;
-            dials[row].allowed_bits_lo = at as u32;
-            dials[row].allowed_bits_hi = (at >> 32) as u32;
-        }
-        Ok((dials, Some(bitmaps)))
-    }
-
     /// An allow-list row for [`Self::run_allow_rows`], with the processor its
     /// host half draws from — seeded from `state` as it stands now, as
     /// [`Self::issue_allow_list`] seeds one.
@@ -389,4 +338,35 @@ impl BatchedSampler {
         })? as usize;
         Ok(allow[local])
     }
+}
+
+/// Apply banned tokens within a gathered allow-list logit vector: any banned
+/// token that also appears in `allow` is set to `-inf` at its local position.
+/// A no-op when no banned token intersects the allow-list. Also returns how
+/// many allowed tokens it banned, counted in the pass that masks them.
+pub(super) fn apply_banned_local(
+    gathered: &Tensor,
+    allow: &[u32],
+    config: &SamplingConfig,
+) -> candle::Result<(Tensor, usize)> {
+    if config.banned_tokens.is_empty() {
+        return Ok((gathered.clone(), 0));
+    }
+    let banned: std::collections::HashSet<u32> =
+        config.banned_tokens.iter().map(|&b| b as u32).collect();
+    if !allow.iter().any(|t| banned.contains(t)) {
+        return Ok((gathered.clone(), 0));
+    }
+    let dtype = gathered.dtype();
+    let dims = gathered.dims().to_vec();
+    let mut v: Vec<f32> = gathered.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+    let mut banned_n = 0;
+    for (local, t) in allow.iter().enumerate() {
+        if banned.contains(t) {
+            v[local] = f32::NEG_INFINITY;
+            banned_n += 1;
+        }
+    }
+    let masked = Tensor::from_vec(v, dims, gathered.device())?.to_dtype(dtype)?;
+    Ok((masked, banned_n))
 }

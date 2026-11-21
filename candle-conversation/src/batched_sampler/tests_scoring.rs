@@ -1,4 +1,8 @@
-//! Tests for block scoring and speculative verification, including the typical-acceptance rule.
+//! Tests for scoring a block in one dispatch and for the speculative verify rows.
+//!
+//! Tests that one dispatch over a whole block commits what a position-at-a-time walk commits, and that a rejected draft stops the block where the walk stops.
+//! Tests that a position behind a forced token scores as unreachable, and that a draft over the typical bar is committed while a draft under it commits the sample.
+//! Tests the typical-acceptance rule on raw probabilities and over the truncated distribution, and that greedy verification is unchanged.
 
 use super::*;
 
@@ -16,7 +20,7 @@ pub(super) mod tests {
 
     use crate::config::SamplingConfig;
 
-    use super::super::tests_support::tests::*;
+    use super::super::tests_helpers::tests::*;
 
     /// The typical-acceptance rule on raw probabilities. `[0.5, 0.3, 0.2]` has
     /// entropy 1.0297, so `δ·e^(−H)` = 0.1071 and the bar is ε = 0.09: the 0.2
@@ -54,6 +58,60 @@ pub(super) mod tests {
         // Renormalised over the nucleus `[0.625, 0.375]` (entropy 0.6616, bar
         // 0.09), the 0.375 draft clears it.
         assert!(typical_accepts_row(&row, 1.0, 0, 0.75, 1, m));
+    }
+
+    /// One logits row with `p(5) = 0.8` and `p(7) = 0.2`; every other token
+    /// sits at logit 0, ~2e-9 each.
+    pub(in super::super) fn verify_row_logits() -> Tensor {
+        logits_from_rows(&[&[(5, 20.0), (7, 20.0 + 0.25f32.ln())]])
+    }
+
+    /// `n` rows that each spread their mass over tokens 40..45, ranked
+    /// differently per row, so a sampled walk wanders and the penalties move
+    /// its picks.
+    pub(in super::super) fn walk_logits(n: usize) -> Tensor {
+        let mut data = vec![-20.0f32; n * VOCAB_SIZE];
+        for r in 0..n {
+            for k in 0..5 {
+                data[r * VOCAB_SIZE + 40 + k] = 5.0 - 0.3 * ((k + r) % 5) as f32;
+            }
+        }
+        Tensor::from_vec(data, (n, VOCAB_SIZE), &Device::Cpu).expect("logits")
+    }
+
+    /// Sampled, with every history-reading penalty on.
+    pub(in super::super) fn penalised(seed: u64) -> SamplingConfig {
+        SamplingConfig {
+            temperature: 0.8,
+            top_k: 20,
+            top_p: 1.0,
+            repeat_penalty: 1.3,
+            frequency_penalty: 0.4,
+            presence_penalty: 0.5,
+            seed,
+            ..SamplingConfig::argmax()
+        }
+    }
+
+    /// A sequence some way into its turn.
+    pub(in super::super) fn walked_state() -> SequenceSamplingState {
+        let mut s = make_state();
+        for t in [40, 41, 40] {
+            s.record_token(t, MAX_RECENT);
+        }
+        s
+    }
+
+    /// Row `p` of a block whose committed token is followed by `drafts`.
+    pub(in super::super) fn block_specs(drafts: &[u32], rows: usize) -> Vec<RowSpec<'_>> {
+        (0..rows)
+            .map(|p| RowSpec {
+                seq: 0,
+                logits_row: p,
+                draft: drafts.get(p).copied(),
+                ahead: &drafts[..p],
+            })
+            .collect()
     }
 
     /// **One dispatch over a whole block commits exactly what scoring it a
@@ -247,27 +305,32 @@ pub(super) mod tests {
         }
     }
 
-    /// **The padded tail of a row is never a token.** The sampler's live
-    /// vocabulary ends at 50; token 60, in the padding, carries the row's
-    /// largest logit by far. Neither the argmax nor a sample may produce it,
-    /// and a draft naming it is not accepted.
-    #[test]
-    pub(in super::super) fn the_padded_tail_of_a_row_is_never_produced() {
-        for device in devices() {
-            let sampler = make_sampler_on(&device, 50);
-            let logits = logits_from_rows(&[&[(5, 20.0), (7, 20.0 + 0.25f32.ln()), (60, 90.0)]])
-                .to_device(&device)
-                .expect("logits");
-            let mut state = make_state();
-            let greedy = sampler
-                .sample_batch(&logits, &mut [&mut state], &[&SamplingConfig::argmax()])
-                .expect("sample");
-            assert_eq!(greedy, vec![5], "{device:?}");
-            for seed in 0..16 {
-                let mut state = make_state();
-                let token = verify_row(&sampler, &logits, &mut state, &sampled_config(seed), 60);
-                assert!(token == 5 || token == 7, "{device:?} seed {seed}: {token}");
-            }
-        }
+    /// One verify row testing `draft`, scored and committed as the accept walk
+    /// does.
+    pub(in super::super) fn verify_row(
+        sampler: &BatchedSampler,
+        logits: &Tensor,
+        state: &mut SequenceSamplingState,
+        config: &SamplingConfig,
+        draft: u32,
+    ) -> u32 {
+        let spec = [RowSpec {
+            seq: 0,
+            logits_row: 0,
+            draft: Some(draft),
+            ahead: &[],
+        }];
+        let scored = sampler
+            .score_rows(
+                logits,
+                &mut [&mut *state],
+                &[config],
+                &spec,
+                Some(TypicalAcceptance::MEDUSA),
+            )
+            .expect("score");
+        sampler
+            .commit_row(logits, 0, state, config, scored[0].expect("reached"))
+            .expect("commit")
     }
 }

@@ -1,117 +1,12 @@
-//! The two sampling paths for a wave: the CPU row sampler, and the batched CUDA kernel launch with its penalty log.
+//! The CUDA kernel launch, where `launch_rows` runs the kernel over every gathered row in one launch.
+//!
+//! `launch_rows` runs the kernel over every row that `KernelRows` gathered, in one launch and one dispatch.
+//! `invoke_cuda_kernel` builds the kernel's parameters from the gathered rows and invokes it.
+//! `write_penalty_log` writes the penalty log that the kernel reads for the rows.
 
 use super::*;
 
 impl BatchedSampler {
-    /// The host sampler's pick for one unconstrained (full-vocab) row, against
-    /// `state` as it stands — candle's built-in sampling, for a sampler that
-    /// is not on a CUDA device. Committing it is [`Self::commit_row`]'s.
-    pub(super) fn sample_row_cpu(
-        &self,
-        logits: &Tensor,
-        row: &RowSpec<'_>,
-        state: &SequenceSamplingState,
-        config: &SamplingConfig,
-        typical: Option<TypicalAcceptance>,
-    ) -> candle::Result<u32> {
-        // This sequence's row of the block.
-        let seq_logits = logits.i(row.logits_row)?;
-
-        // Apply this row's banned tokens (a small deny-list, e.g. a few EOS
-        // ids) by setting just those values to `-inf`.  Cheap on CPU — only the
-        // banned values change (apply_banned copies the row to host F32 to do
-        // it); a no-op when the list is empty.
-        let seq_logits = apply_banned(&seq_logits, config)?;
-
-        // Structural: ban the think-close token while outside a think block —
-        // there is nothing for it to close there, and a stray one derails the
-        // turn (see `think_close_ban_active`).
-        let seq_logits = if think_close_ban_active(config, state) {
-            let dtype = seq_logits.dtype();
-            let dims = seq_logits.dims().to_vec();
-            let mut v: Vec<f32> = seq_logits.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-            ban(&mut v, config.segment_close_token_id as u32);
-            Tensor::from_vec(v, dims, seq_logits.device())?.to_dtype(dtype)?
-        } else {
-            seq_logits
-        };
-
-        // Token suppression: while inside a segment, subtract the per-turn
-        // penalty from each suppress-token logit. Mirrors the kernel's
-        // in-segment gate, so tokens outside the segment are never touched.
-        let seq_logits = if state.in_segment
-            && config.segment_suppress_penalty != 0.0
-            && !config.segment_suppress_tokens.is_empty()
-        {
-            apply_suppression(&seq_logits, config)?
-        } else {
-            seq_logits
-        };
-        // The checkpoint's padded tail is not a token.
-        let seq_logits = seq_logits.narrow(0, 0, self.live_vocab)?;
-
-        // In-segment steering: while this sequence is inside a segment,
-        // sample a touch hotter (temperature + segment_temp_boost).
-        // Mirrors the kernel's per-seq gate so tokens outside the segment
-        // stay at the base temperature.  DRY is GPU-only — the CPU
-        // LogitsProcessor has no DRY path, so there is nothing to gate here for it.
-        let temperature = if state.in_segment {
-            config.temperature + config.segment_temp_boost
-        } else {
-            config.temperature
-        };
-        let sampling = if state.in_segment && config.segment_temp_boost != 0.0 {
-            let mut boosted = config.clone();
-            boosted.temperature += config.segment_temp_boost;
-            config_to_sampling(&boosted)
-        } else {
-            config_to_sampling(config)
-        };
-        let seed = config.seed.wrapping_add(state.rng_offset);
-        let mut processor = LogitsProcessor::from_sampling(seed, sampling);
-        let mut sampled = processor.sample(&seq_logits).map_err(|e| {
-            // Read only on a failure: which of the two ways a softmax goes
-            // NaN this row took — non-finite logits, or everything at −inf.
-            let (nan, inf, neg_inf) = seq_logits
-                .to_dtype(DType::F32)
-                .and_then(|l| l.to_vec1::<f32>())
-                .map(|v| {
-                    v.iter().fold((0, 0, 0), |(n, p, m), x| {
-                        (
-                            n + usize::from(x.is_nan()),
-                            p + usize::from(*x == f32::INFINITY),
-                            m + usize::from(*x == f32::NEG_INFINITY),
-                        )
-                    })
-                })
-                .unwrap_or((0, 0, 0));
-            candle::Error::Msg(format!(
-                "{e} — full row of {}: {nan} NaN, {inf} +inf, {neg_inf} −inf logits; \
-                 {} banned",
-                self.live_vocab,
-                config.banned_tokens.len()
-            ))
-        })?;
-        // A verify row's draft, accepted on the typical-acceptance rule over
-        // the same top-k/nucleus distribution the kernel measures it on.
-        if let (Some(draft), Some(typical)) = (row.draft, typical) {
-            if temperature > 0.0 {
-                let values: Vec<f32> = seq_logits.to_dtype(DType::F32)?.to_vec1()?;
-                if typical_accepts_row(
-                    &values,
-                    temperature,
-                    config.top_k,
-                    config.top_p,
-                    draft,
-                    typical,
-                ) {
-                    sampled = draft;
-                }
-            }
-        }
-        Ok(sampled)
-    }
-
     /// Run the kernel over every row `rows` gathered — one launch and one
     /// readback for the dispatch — answering with each row's pick and the RNG
     /// offset it leaves. `logits` is the `[rows, vocab]` block the rows name.

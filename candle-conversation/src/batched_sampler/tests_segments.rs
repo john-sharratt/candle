@@ -1,4 +1,8 @@
-//! Tests for the guard rails that end a sequence or a segment: the EOS failsafes, the segment closer script, and the length budget.
+//! Tests for the think-segment close override and the segment state transitions.
+//!
+//! Tests the closing script: a hard cap plays the script to the close token, and a graceful close waits for a line end.
+//! Tests the rule for a call opened inside a segment, and that a segment boundary or a turn end cancels a stranded script.
+//! Tests `update_segment_state`, where an open token enters a segment and a close token exits it.
 
 use super::*;
 
@@ -10,52 +14,13 @@ pub(super) mod tests {
     // even though it is constant-valued at any given commit.
     #![allow(clippy::assertions_on_constants)]
 
+    use std::sync::Arc;
+
     use super::*;
 
     use crate::config::SamplingConfig;
 
-    use super::super::tests_support::tests::*;
-
-    /// The degenerate-decode abort must live on the resolver BOTH sampling
-    /// paths run through, not in one path's copy of the overrides.
-    ///
-    /// It was once written into the CPU sampler alone, while every
-    /// unconstrained row went to the CUDA kernel whenever the device was CUDA —
-    /// so on the only configuration production runs, the guard was dead: a
-    /// forward emitting token 0 forever ran to the length cap instead of
-    /// stopping at `DEGENERATE_TOKEN_RUN`, writing hundreds of `!` into the
-    /// conversation and into the substrate, where the turn's signatures then
-    /// polluted retrieval. Asserting on `resolve` is what keeps the guard
-    /// device-independent: there is no second copy to be missing from.
-    #[test]
-    pub(in super::super) fn degenerate_run_forces_eos_on_the_resolver_both_paths_share() {
-        let sampler = make_sampler();
-        let config = SamplingConfig::argmax();
-        let mut state = make_state();
-
-        // One short of the bar: an ordinary sampled token is committed as-is.
-        for _ in 0..DEGENERATE_TOKEN_RUN - 1 {
-            state.record_token(0, MAX_RECENT);
-        }
-        assert_eq!(
-            sampler.resolve(7, &mut state, &config).0,
-            7,
-            "below the bar the sampler's own token stands"
-        );
-
-        // The next consecutive zero crosses it, and the turn is cut short.
-        state.record_token(0, MAX_RECENT);
-        assert_eq!(
-            sampler.resolve(7, &mut state, &config).0,
-            EOS_TOKEN,
-            "a degenerate run must force EOS whichever path sampled the row"
-        );
-
-        // A real token clears the run, and decoding resumes normally — the
-        // guard fires on a consecutive run, never on token 0 being frequent.
-        state.record_token(42, MAX_RECENT);
-        assert_eq!(sampler.resolve(7, &mut state, &config).0, 7);
-    }
+    use super::super::tests_helpers::tests::*;
 
     /// **A call being written is not cut by the answer's length budget.** Past
     /// both EOS thresholds a prose turn is ended; the same length inside a tool
@@ -93,6 +58,33 @@ pub(super) mod tests {
             state.record_token(0, MAX_RECENT);
         }
         assert_eq!(sampler.resolve(7, &mut state, &config).0, EOS_TOKEN);
+    }
+
+    // ── Hard-cap closer script (segment_close_override tiers) ──────────
+
+    /// Config with segment tracking on: close=90, graceful after 4 at a line
+    /// end (token 7), a sentence end that is not a line end (token 8, `.`),
+    /// hard cap at 8, closer phrase "A B C" (the sampler appends the close
+    /// token 90 itself).
+    pub(in super::super) fn closer_config() -> SamplingConfig {
+        let mut c = SamplingConfig::argmax();
+        c.segment_close_token_id = 90;
+        c.segment_open_token_id = 89;
+        c.graceful_segment_close_after = 4;
+        c.force_segment_close_after = 8;
+        c.sentence_end_token_ids = vec![8];
+        c.line_end_token_ids = Arc::from([7]);
+        c.segment_close_script = vec![100, 101, 102];
+        c
+    }
+
+    /// A state `n` tokens into an open segment, last token `last`.
+    pub(in super::super) fn in_segment_state(n: i32, last: u32) -> SequenceSamplingState {
+        let mut s = make_state();
+        s.record_token(last, MAX_RECENT);
+        s.in_segment = true;
+        s.segment_len = n;
+        s
     }
 
     #[test]
@@ -313,129 +305,93 @@ pub(super) mod tests {
         assert!(!state.close_would_continue);
     }
 
-    // ── EOS failsafe override tests ────────────────────────────────────
+    // ── update_segment_state tests ────────────────────────────────────
 
     #[test]
-    pub(in super::super) fn test_forced_eos_after_overrides_token() {
-        let sampler = make_sampler();
-        let config = SamplingConfig::argmax().with_eos_failsafe(0, 10);
+    pub(in super::super) fn test_open_token_enters_segment() {
+        let mut state = make_state();
+        let seg_open = 10i32;
+        let seg_close = 11i32;
+
+        assert!(!state.in_segment);
+        assert_eq!(state.segment_len, 0);
+
+        state.update_segment_state(seg_open as u32, seg_open, seg_close);
+        assert!(
+            state.in_segment,
+            "should enter the segment on the open token"
+        );
+        assert_eq!(state.segment_len, 0, "segment_len reset on enter");
+    }
+
+    #[test]
+    pub(in super::super) fn test_close_token_exits_segment() {
+        let mut state = make_state();
+        let seg_open = 10i32;
+        let seg_close = 11i32;
+
+        // Open the segment
+        state.update_segment_state(seg_open as u32, seg_open, seg_close);
+        assert!(state.in_segment);
+
+        // Generate some tokens inside the segment
+        state.record_token(42, MAX_RECENT);
+        state.record_token(43, MAX_RECENT);
+        assert_eq!(state.segment_len, 2);
+
+        // Close the segment
+        state.update_segment_state(seg_close as u32, seg_open, seg_close);
+        assert!(
+            !state.in_segment,
+            "should exit the segment on the close token"
+        );
+        assert_eq!(state.segment_len, 0, "segment_len reset on exit");
+    }
+
+    #[test]
+    pub(in super::super) fn test_close_token_without_open_segment_is_noop() {
+        let mut state = make_state();
+        let seg_open = 10i32;
+        let seg_close = 11i32;
+
+        // The close token outside a segment should be a no-op
+        state.update_segment_state(seg_close as u32, seg_open, seg_close);
+        assert!(!state.in_segment, "should remain outside a segment");
+    }
+
+    #[test]
+    pub(in super::super) fn test_segment_tracking_disabled_when_ids_negative() {
         let mut state = make_state();
 
-        // Simulate 10 tokens already generated
-        for _ in 0..10 {
-            state.record_token(42, MAX_RECENT);
-        }
-        assert_eq!(state.current_len, 10);
+        // -1 means not configured
+        state.update_segment_state(10, -1, 11);
+        assert!(
+            !state.in_segment,
+            "should not enter a segment when segment_open_id < 0"
+        );
 
-        // Build logits that strongly favor token 42
-        let mut logits_data = vec![0.0f32; VOCAB_SIZE];
-        logits_data[42] = 100.0;
-        let logits = candle::Tensor::from_vec(logits_data, (1, VOCAB_SIZE), &candle::Device::Cpu)
-            .expect("tensor");
-
-        let tokens = sampler
-            .sample_batch(&logits, &mut [&mut state], &[&config])
-            .expect("sample");
-
-        // Should have been overridden to EOS despite logits favoring 42
-        assert_eq!(
-            tokens[0], EOS_TOKEN,
-            "forced_eos_after should override to EOS"
+        state.update_segment_state(10, 10, -1);
+        assert!(
+            !state.in_segment,
+            "should not enter a segment when segment_close_id < 0"
         );
     }
 
     #[test]
-    pub(in super::super) fn test_graceful_eos_after_overrides_token() {
-        let sampler = make_sampler();
-        let config = SamplingConfig::argmax().with_eos_failsafe(5, 0);
+    pub(in super::super) fn test_segment_len_tracks_tokens() {
         let mut state = make_state();
+        let seg_open = 10i32;
+        let seg_close = 11i32;
 
-        // Generate 5 tokens
-        for _ in 0..5 {
-            state.record_token(42, MAX_RECENT);
+        state.update_segment_state(seg_open as u32, seg_open, seg_close);
+
+        for i in 0..5 {
+            state.record_token(40 + i, MAX_RECENT);
         }
+        assert_eq!(state.segment_len, 5);
 
-        let mut logits_data = vec![0.0f32; VOCAB_SIZE];
-        logits_data[42] = 100.0;
-        let logits = candle::Tensor::from_vec(logits_data, (1, VOCAB_SIZE), &candle::Device::Cpu)
-            .expect("tensor");
-
-        let tokens = sampler
-            .sample_batch(&logits, &mut [&mut state], &[&config])
-            .expect("sample");
-
-        assert_eq!(
-            tokens[0], EOS_TOKEN,
-            "graceful_eos_after should override to EOS"
-        );
-    }
-
-    #[test]
-    pub(in super::super) fn test_eos_failsafe_disabled_when_zero() {
-        let sampler = make_sampler();
-        let config = SamplingConfig::argmax(); // both 0 = disabled
-        let mut state = make_state();
-
-        for _ in 0..1000 {
-            state.record_token(42, MAX_RECENT);
-        }
-
-        let mut logits_data = vec![0.0f32; VOCAB_SIZE];
-        logits_data[42] = 100.0;
-        let logits = candle::Tensor::from_vec(logits_data, (1, VOCAB_SIZE), &candle::Device::Cpu)
-            .expect("tensor");
-
-        let tokens = sampler
-            .sample_batch(&logits, &mut [&mut state], &[&config])
-            .expect("sample");
-
-        assert_eq!(tokens[0], 42, "failsafe disabled: should sample normally");
-    }
-
-    #[test]
-    pub(in super::super) fn test_eos_failsafe_below_threshold_no_override() {
-        let sampler = make_sampler();
-        let config = SamplingConfig::argmax().with_eos_failsafe(100, 200);
-        let mut state = make_state();
-
-        // Only 50 tokens — under both thresholds
-        for _ in 0..50 {
-            state.record_token(42, MAX_RECENT);
-        }
-
-        let mut logits_data = vec![0.0f32; VOCAB_SIZE];
-        logits_data[42] = 100.0;
-        let logits = candle::Tensor::from_vec(logits_data, (1, VOCAB_SIZE), &candle::Device::Cpu)
-            .expect("tensor");
-
-        let tokens = sampler
-            .sample_batch(&logits, &mut [&mut state], &[&config])
-            .expect("sample");
-
-        assert_eq!(tokens[0], 42, "below threshold: should sample normally");
-    }
-
-    #[test]
-    pub(in super::super) fn test_eos_failsafe_records_eos_token_in_state() {
-        let sampler = make_sampler();
-        let config = SamplingConfig::argmax().with_eos_failsafe(5, 10);
-        let mut state = make_state();
-
-        for _ in 0..5 {
-            state.record_token(42, MAX_RECENT);
-        }
-
-        let mut logits_data = vec![0.0f32; VOCAB_SIZE];
-        logits_data[42] = 100.0;
-        let logits = candle::Tensor::from_vec(logits_data, (1, VOCAB_SIZE), &candle::Device::Cpu)
-            .expect("tensor");
-
-        let _ = sampler
-            .sample_batch(&logits, &mut [&mut state], &[&config])
-            .expect("sample");
-
-        // State should have recorded the EOS token (not the original 42)
-        assert_eq!(state.current_len, 6); // 5 + 1 for the overridden token
-        assert_eq!(*state.recent_tokens.last().unwrap(), EOS_TOKEN as i32);
+        // Re-opening the segment resets the counter
+        state.update_segment_state(seg_open as u32, seg_open, seg_close);
+        assert_eq!(state.segment_len, 0);
     }
 }
