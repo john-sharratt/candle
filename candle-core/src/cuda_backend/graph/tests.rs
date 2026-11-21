@@ -2263,3 +2263,42 @@ fn a_drain_inside_a_wave_finds_the_nan_and_leaves_the_stream_usable() -> Result<
     crate::tensor_assert::epoch(&device)?;
     Ok(())
 }
+
+/// **The process's first assert, issued inside a wave.** Nothing in a motherd
+/// asserts at load, so the slot table is made by the first assert of the first
+/// wave — while the wave records. Run alone (the table is per process), this
+/// is that first assert: it must find the NaN and leave the stream as the
+/// eager-table case does.
+#[cfg(feature = "tensor-assert")]
+#[test]
+fn a_first_assert_inside_a_wave_finds_the_nan_and_leaves_the_stream_usable() -> Result<()> {
+    use crate::{Device, Tensor};
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let device = Device::Cuda(dev.clone());
+    let t = Tensor::new(&[f32::NAN, 2f32, 3.0], &device)?;
+    dev.synchronize()?;
+
+    let capture = dev.begin_wave_capture()?;
+    dev.record_launches()?;
+    t.assert("graph::tests::first_assert_in_a_wave");
+    let bad = crate::tensor_assert::report(&device)?;
+    capture.finish()?;
+
+    assert_eq!(
+        bad.first().map(|f| (f.name.as_str(), f.nan)),
+        Some(("graph::tests::first_assert_in_a_wave", 1)),
+        "the first assert, made inside the wave, was counted"
+    );
+    let other = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            admit_this_thread();
+            BackendDevice::synchronize(&dev).map_err(|e| e.to_string())
+        })
+        .join()
+        .expect("the other thread")
+    });
+    assert_eq!(other, Ok(()), "another thread's synchronise after the wave");
+    crate::tensor_assert::epoch(&device)?;
+    Ok(())
+}
