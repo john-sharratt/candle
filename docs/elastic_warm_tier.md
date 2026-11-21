@@ -89,7 +89,7 @@ the process is quiet.
 A pure function of the signals and its own state, `elastic::policy`, called once
 a tick; it answers `Hold`, `Grow` or `Shrink(n)` in chunks of the pageable
 part (§5; the policy's code calls them segments). Every
-constant below is a starting value the balloon runs (§8) tune.
+constant below is the value the balloon runs (§8.1) tuned it to.
 
 ### 4.1 Shrink — fast, multiplicative
 
@@ -297,7 +297,35 @@ Run on BlackWorld and WhiteWorld, beside a serving motherd:
 | idle hog | the tier takes RAM from a minimized app | the tier grows while the balloon is idle; motherd's faults stay quiet |
 | build ramp | the tier gives RAM back to a build | shrink within 3 s of the ramp; motherd's faults back under the pressure line within 10 s; the balloon's own faults low |
 | square wave | no churn | under a repeating build, one grow and one shrink per cycle at most, back-off visible |
-| release | it comes back | after the build ends, the tier regrows after its back-off |
+| release | it comes back | after the build ends, the tier regrows once relief has held (§4.3), a segment per `GROW_DWELL` |
+
+### 8.1 Runs
+
+WhiteWorld (RTX 3090 box, 64 GB), 2026-11-20 and 2026-11-21, beside a serving
+motherd. Each run's one-second CSV is the balloon's own log; the figures are
+from those logs. Phases are written `A14` (14 GiB active, 15 s ramp),
+`P10` (10 GiB active pulse, 10 s ramp), `I10` (10 GiB idle, 10 s ramp).
+
+| Run | Build | Schedule | What it measured | What changed |
+|---|---|---|---|---|
+| 1 | 13d672a80 | A14 over 84 s, held | free RAM at 2.2–4 GiB for 2.5 min with the tier untouched, until the floor rule shed a quarter at 0.90 GiB (stopped early: the harness's schedule stalled) | the short rule (§4.1); the harness ends a phase on the clock |
+| 2 | b18bd59e2 | A14 120 s, release 150 s, I10 120 s, release 90 s | the first shed on the first second free RAM was under 3 GiB, then 1–3 GiB steps to t=21 (8.8 GiB in all); free RAM touched **0.23 GiB**; the first regrow 59 s after the last shed, then 1 GiB a minute; motherd's faults ≤ 56/s | the build rule sheds for `LEAD_TICKS` ahead (§4.1); relief lifts a RAM ceiling (§4.3) |
+| 3 | 09dd9f0c6 | A14 120 s, release 120 s, P10 60 s, release 60 s, P10 60 s, release 90 s, I10 120 s, release 60 s | the A14 ramp went unshed until t=24 and free RAM sat at **0.00 GiB** for 7 s (motherd's working set trimmed 34 → 17 GiB, faults ≤ 295/s); both pulses shed at ~5 GiB free (minimums 2.10 and 6.10 GiB) with no regrow after them; the final release regrew at 17 s, then 1 GiB per 5 s | a chunk's fill runs on its own thread, and a shrink decided mid-fill takes the filling chunk first (§5.2): the fill held the controller's ticks for 1.5–12 s |
+| 4 | 65487f34f | as run 3 | the A14 ramp shed at t=7 with 5.36 GiB free, 8 GiB over 14 s; minimum free RAM **1.78 / 4.10 / 3.14 / 5.79 GiB** (A14 / P10 / P10 / I10); motherd's working set 38 → 31 GiB, faults ≤ 208/s; ended at t=592 by a cluster install, not by the tier | none: the constants above are final |
+
+What run 4 shows of the design, as intended rather than as defects:
+
+- **Relief under a held build.** With the 14 GiB still held, free RAM stood at
+  10.2 GiB once the sheds and the OS's trim had made room, past `HEADROOM` +
+  `RELIEF_SPARE`; the tier regrew a segment at a time from t=67 to t=131, back to
+  its starting size, while free RAM fell to 6.4 GiB and never under the
+  headroom. Using RAM the build left free, without faults or a second shed, is
+  the steady state the tier is for.
+- **The back-off doubles only for a build that recurs within twice it.** The
+  first pulse came 181 s after the relief that preceded it — past 2 × 60 s — so
+  the back-off stayed at its minimum and the tier regrew in the release after
+  it. The second pulse came 60 s after the next lift, the back-off doubled, and
+  nothing regrew in the 90 s release after that one.
 
 ## 9. Build order
 
@@ -308,4 +336,5 @@ Run on BlackWorld and WhiteWorld, beside a serving motherd:
 4. Publish and withdraw in the stager, with the drain.
 5. The controller thread and the telemetry.
 6. The balloon harness.
-7. Runs on BlackWorld and WhiteWorld; constants tuned from them, recorded here.
+7. Runs on BlackWorld and WhiteWorld; constants tuned from them, recorded here
+   (§8.1).
