@@ -190,6 +190,7 @@ use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::persistence::thread::PersistenceTrigger;
 use crate::persistence::triggers::{PersistenceTriggers, FIRST_ATTACHMENT};
 use crate::projection::event::{group_name_of, layer_name_of_group};
+use crate::projection::scan_census::take as take_scan_census;
 use crate::projection::Content;
 use crate::projection::{
     decode_events, encode_events, summary_node_event, Builder, CompressionPrompt, Conversation,
@@ -12879,6 +12880,12 @@ impl Scheduler {
             tracing::info!(
                 target: "candle_conversation::scheduler::reproject",
                 "reprojection census apply {apply}"
+            );
+            // The belief scans behind the census's `score` part, by phase.
+            tracing::info!(
+                target: "candle_conversation::scheduler::reproject",
+                "reprojection census scan {}",
+                take_scan_census().line()
             );
         }
     }

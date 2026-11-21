@@ -32,6 +32,7 @@ use super::ids::{
 };
 use super::owned_sections::OwnedSection;
 use super::project::ProjectionTarget;
+use super::scan_census;
 use super::scan_stats::{scan_stats, GroupScan};
 use super::schema::{
     CorruptTurnPolicy, GatherScope, GroupSchema, LayerSchema, Recency, Schema, SectionCollection,
@@ -1712,6 +1713,7 @@ impl Conversation {
         profile::record("beliefs:arena:rows", us(arena.rows_us));
         profile::record("beliefs:arena:tally", us(arena.tally_us));
         let groups_us = t_groups.elapsed().as_micros() as u64;
+        scan_census::record(coll_us, groups_us, &groups, &arena);
         let group_part = || {
             format!(
                 "probe_windows={} collections_us={coll_us} groups_us={} groups_scanned={} \

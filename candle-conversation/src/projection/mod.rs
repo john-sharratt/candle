@@ -228,6 +228,7 @@ mod reconcile;
 pub mod replication;
 mod resolver;
 pub mod rounds;
+pub mod scan_census;
 pub mod scan_stats;
 mod schema;
 mod score;

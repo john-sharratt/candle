@@ -7,10 +7,11 @@
 //! and nothing about where a run's time went. The census adds every part of
 //! every reprojection, by how it ended, and the scheduler writes it when the
 //! first reprojection to end after its minute does — one minute's census while
-//! reprojections run, none while idle. It is two lines, short enough for a log
-//! reader to show whole: `reprojection census` with the outcomes and the
-//! prepare half (`probe` to `truncate`), and `reprojection census apply` with
-//! the apply half (`elevate` to `view`).
+//! reprojections run, none while idle. It is three lines, each short enough for
+//! a log reader to show whole: `reprojection census` with the outcomes and the
+//! prepare half (`probe` to `truncate`), `reprojection census apply` with the
+//! apply half (`elevate` to `view`), and `reprojection census scan` with the
+//! belief scans behind `score` by phase (`projection::scan_census`).
 
 use std::time::{Duration, Instant};
 
