@@ -939,7 +939,12 @@ impl GalleryArena {
         let resident = |sid: &StreamId, run: u64| res.get(sid).is_some_and(|rt| rt.run_id == run);
         // The turns changes named since the last check, or every turn
         // (`lease`): one no change named is as it was checked.
-        let current = match idx.hold.marked() {
+        let marked = idx.hold.marked();
+        let (looked, whole) = match &marked {
+            Some(sids) => (sids.len(), false),
+            None => (idx.pinned_sids.len(), true),
+        };
+        let current = match marked {
             Some(sids) => sids
                 .iter()
                 .all(|sid| idx.members.get(sid).is_none_or(|&run| resident(sid, run))),
@@ -949,6 +954,10 @@ impl GalleryArena {
                 .zip(&idx.run_ids)
                 .all(|(sid, &run)| resident(sid, run)),
         };
+        scan_split::add(|s| {
+            s.checked_turns += looked as u64;
+            s.checks_whole += u64::from(whole);
+        });
         // Cleared under the lock every change takes, so no change's mark is
         // lost between the check and the clearing.
         if current {

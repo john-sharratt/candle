@@ -12180,6 +12180,11 @@ impl Scheduler {
             &density,
         );
         let ws_us = t_ws.elapsed().as_micros() as u64;
+        let ws_tracked = policy
+            .substrate
+            .read()
+            .working_set(policy.target.timeline)
+            .map_or(0, |ws| ws.tracked());
         // The pool behind the slot: the pieces it places and the working
         // set's members (§7.2 step 1).
         let t_pool = Instant::now();
@@ -12202,6 +12207,7 @@ impl Scheduler {
         note("reproject observe split", || {
             format!(
                 "view={} observe_us={observe_us} hits_us={hits_us} ws_us={ws_us} \
+                 ws_tracked={ws_tracked} \
                  pool_us={pool_us} pooled={} pool_admitted={} pool_dropped={} \
                  pool_revived={} pool_lingering={} pool_cold={} pool_fetch_us={} \
                  pool_place_us={} \

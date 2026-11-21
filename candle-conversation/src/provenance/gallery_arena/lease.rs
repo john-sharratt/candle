@@ -39,6 +39,7 @@
 //! one reprojection in four on BlackWorld (2026-11-21). Only a new index, or
 //! one marked for more turns than [`MARKED_MAX`], is walked whole.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 
@@ -61,11 +62,13 @@ pub(super) struct ScanHold {
     retired: AtomicBool,
     /// A change may have touched one of its turns since the last check.
     stale: AtomicBool,
-    /// The turns changes named since the last check — `None` when the next
-    /// check walks every turn: a new index, or one named past [`MARKED_MAX`].
-    /// Written and read under the arena's residency lock, which every change
-    /// and every check takes.
-    marked: Mutex<Option<Vec<StreamId>>>,
+    /// The distinct turns changes named since the last check — `None` when the
+    /// next check walks every turn: a new index, or one named past
+    /// [`MARKED_MAX`]. A set: an eviction pass asks of the same turns again and
+    /// again, and listed each time they ran past the bound with a few hundred
+    /// turns. Written and read under the arena's residency lock, which every
+    /// change and every check takes.
+    marked: Mutex<Option<HashSet<StreamId>>>,
 }
 
 impl Default for ScanHold {
@@ -113,7 +116,7 @@ impl ScanHold {
     /// and found current: the mark is cleared. Changes take the same lock, so
     /// none lands between the check and the clearing.
     pub fn checked(&self, changes: u64) {
-        *self.marked.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+        *self.marked.lock().unwrap_or_else(|e| e.into_inner()) = Some(HashSet::new());
         self.stale.store(false, SeqCst);
         self.verified.store(changes, SeqCst);
     }
@@ -124,8 +127,8 @@ impl ScanHold {
         self.stale.store(true, SeqCst);
         let mut marked = self.marked.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(sids) = marked.as_mut() {
-            if sids.len() < MARKED_MAX {
-                sids.push(sid);
+            if sids.len() < MARKED_MAX || sids.contains(&sid) {
+                sids.insert(sid);
             } else {
                 *marked = None;
             }
@@ -134,7 +137,7 @@ impl ScanHold {
 
     /// The turns the next check has to look at: those changes named since the
     /// last check, or `None` for every turn.
-    pub fn marked(&self) -> Option<Vec<StreamId>> {
+    pub fn marked(&self) -> Option<HashSet<StreamId>> {
         self.marked
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -328,19 +331,27 @@ mod tests {
         assert_eq!(hold.marked(), None, "a new index is walked whole");
         hold.mark_stale(StreamId(1));
         assert_eq!(hold.marked(), None, "and stays so until checked");
+        let set = |ids: &[u64]| Some(ids.iter().map(|&i| StreamId(i)).collect::<HashSet<_>>());
         hold.checked(0);
-        assert_eq!(hold.marked(), Some(vec![]));
+        assert_eq!(hold.marked(), set(&[]));
         hold.mark_stale(StreamId(5));
         hold.mark_stale(StreamId(3));
-        assert_eq!(hold.marked(), Some(vec![StreamId(5), StreamId(3)]));
+        assert_eq!(hold.marked(), set(&[5, 3]));
         hold.checked(1);
-        assert_eq!(hold.marked(), Some(vec![]));
+        assert_eq!(hold.marked(), set(&[]));
+        // The same turns named over and over stay named once, and never
+        // reach the bound.
+        for _ in 0..=MARKED_MAX {
+            hold.mark_stale(StreamId(8));
+            hold.mark_stale(StreamId(9));
+        }
+        assert_eq!(hold.marked(), set(&[8, 9]));
         for i in 0..=MARKED_MAX as u64 {
-            hold.mark_stale(StreamId(i));
+            hold.mark_stale(StreamId(100 + i));
         }
         assert_eq!(hold.marked(), None, "too many to name: walked whole");
         hold.checked(2);
-        assert_eq!(hold.marked(), Some(vec![]));
+        assert_eq!(hold.marked(), set(&[]));
     }
 
     /// The same for an index leaving the cache: it stops being listed only if

@@ -201,6 +201,11 @@ impl WorkingSet {
         self.fresh.iter().map(|(&t, &s)| (t, s))
     }
 
+    /// Conversations with momentum — every one each observation ranks.
+    pub fn tracked(&self) -> usize {
+        self.momentum.len()
+    }
+
     /// Tokens every member together holds.
     pub fn tokens(&self) -> usize {
         self.members.iter().map(|m| m.tokens).sum()
@@ -287,10 +292,13 @@ impl WorkingSet {
     /// Members chosen again keep their order; newcomers enter after them,
     /// strongest first.
     fn choose(&mut self, pool: PoolSize, candidate: &dyn Fn(TimelineId) -> Option<Candidate>) {
+        // Every conversation with momentum is asked after: members by a set,
+        // not by walking the member list each time.
+        let is_member: HashSet<TimelineId> = self.members.iter().map(|m| m.timeline).collect();
         let mut ranked: Vec<(Member, f32)> = self
             .momentum
             .keys()
-            .filter(|t| self.is_member(**t) || !self.withheld.contains(t))
+            .filter(|t| is_member.contains(t) || !self.withheld.contains(t))
             .filter_map(|&timeline| {
                 let c = candidate(timeline)?;
                 let member = Member {
@@ -373,8 +381,9 @@ impl WorkingSet {
             .filter(|m| chosen.contains(&m.timeline))
             .map(|m| by_timeline[&m.timeline])
             .collect();
+        let kept: HashSet<TimelineId> = members.iter().map(|m| m.timeline).collect();
         for (m, _) in &ranked {
-            if chosen.contains(&m.timeline) && !members.iter().any(|x| x.timeline == m.timeline) {
+            if chosen.contains(&m.timeline) && !kept.contains(&m.timeline) {
                 members.push(*m);
             }
         }

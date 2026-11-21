@@ -73,6 +73,10 @@ pub struct ArenaScanSplit {
     pub widest_fresh: u64,
     pub widest_tokens: u64,
     pub widest_gpu_us: u64,
+    /// Turns a reused index's check looked up — the turns changes named, or
+    /// every turn when it was walked whole — and the checks that walked whole.
+    pub checked_turns: u64,
+    pub checks_whole: u64,
 }
 
 impl ArenaScanSplit {
@@ -116,6 +120,8 @@ thread_local! {
         widest_fresh: 0,
         widest_tokens: 0,
         widest_gpu_us: 0,
+        checked_turns: 0,
+        checks_whole: 0,
     }) };
 }
 
@@ -174,6 +180,8 @@ pub(crate) fn merge(other: ArenaScanSplit) {
         s.queue_us += other.queue_us;
         s.view_us += other.view_us;
         s.built_fresh_tokens += other.built_fresh_tokens;
+        s.checked_turns += other.checked_turns;
+        s.checks_whole += other.checks_whole;
         if other.widest_gpu_us > 0 || other.widest_fresh > 0 {
             s.note_launch(other.widest_fresh, other.widest_tokens, other.widest_gpu_us);
         }
@@ -259,6 +267,8 @@ mod tests {
             widest_fresh: 25,
             widest_tokens: 26,
             widest_gpu_us: 27,
+            checked_turns: 28,
+            checks_whole: 29,
         };
         merge(every);
         merge(every);
@@ -293,6 +303,8 @@ mod tests {
                 widest_fresh: 25,
                 widest_tokens: 26,
                 widest_gpu_us: 27,
+                checked_turns: 56,
+                checks_whole: 58,
             }
         );
     }
