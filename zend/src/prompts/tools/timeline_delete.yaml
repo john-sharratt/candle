@@ -6,7 +6,7 @@ questions:
 - the repo map timeline is broken, delete it
 - drop the stale reading of scan.rs
 - delete the conversation whose records are fine but whose content is wrong
-- rebuild the reading of session.rs from scratch
+- rebuild the reading of lifecycle.rs from scratch
 - get rid of the reading that quotes a deleted file
 - clear the bad analysis so ingest redoes it
 - delete that timeline on every member

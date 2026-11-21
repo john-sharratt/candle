@@ -126,7 +126,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "git_show", "arguments": {"repo": "candle", "what": "file", "path": "zend/src/session.rs", "rev": {"kind": "parent"}, "page": 1}}
+  <|projection|>{"name": "git_show", "arguments": {"repo": "candle", "what": "file", "path": "zend/src/session/lifecycle.rs", "rev": {"kind": "parent"}, "page": 1}}
   </tool_call><|projection|>
 - |-
   list what is in that folder on origin's main<|im_end|>

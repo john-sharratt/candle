@@ -125,7 +125,7 @@ examples:
   </think>
 
   <tool_call>
-  <|projection|>{"name": "git_log", "arguments": {"repo": "candle", "paths": ["zend/src/session.rs"], "page": 1}}
+  <|projection|>{"name": "git_log", "arguments": {"repo": "candle", "paths": ["zend/src/session/lifecycle.rs"], "page": 1}}
   </tool_call><|projection|>
 - |-
   how far ahead of main is this branch<|im_end|>

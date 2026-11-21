@@ -9,7 +9,7 @@ questions:
 - show me the next fifty entries of the layer
 - how many tokens does the repo map take
 - which code readings are archived
-- what branches is the reading of session.rs tied to
+- what branches is the reading of lifecycle.rs tied to
 - give me the timeline ids so I can open one with timeline_read
 - what did the background analysis store about the zend crate
 - is there a stored reading of the gateway's route table

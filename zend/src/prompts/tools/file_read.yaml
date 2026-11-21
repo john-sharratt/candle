@@ -1,6 +1,6 @@
 name: file_read
 questions:
-- show me lines 120 through 180 of candle-nn/src/kv_cache/chunked/compress.rs
+- show me lines 120 through 180 of candle-nn/src/kv_cache/chunked/compress/quantize_impl.rs
 - print the opening of candle-kernels/build.rs where the archive groups are registered
 - the panic points at line 512, show me the code around it
 - show me that file from line 900 onward
@@ -12,7 +12,7 @@ questions:
 - open src/lib.rs but only the top where the modules are declared
 - that excerpt cut off mid-function, show me the next stretch
 - skip ahead to line 300 and read from there
-- cat zend/src/session.rs
+- cat zend/src/session/lifecycle.rs
 - print docs/kv_tier_migration.md
 - open the Dockerfile so I can check the base image
 - show me what's in .gitignore
@@ -176,14 +176,14 @@ examples:
   <|projection|>{"name": "file_read", "arguments": {"repo": "app", "path": "src/auth/handler.rs", "lines": "199-391"}}
   </tool_call><|projection|>
 - |-
-  what does zend/src/session.rs set up at startup<|im_end|>
+  what does zend/src/session/lifecycle.rs set up at startup<|im_end|>
   <|im_start|>assistant
   <|projection|><think>
-  The path names zend/src, which is the candle workspace's daemon crate, so the repo is candle. session.rs is one of the largest modules in the daemon, so reading it through would cost far more than the question needs.<|projection|> The list of its parts names every function by its scope, so I can see which ones set things up and read those by their anchors.
+  The path names zend/src, which is the candle workspace's daemon crate, so the repo is candle. lifecycle.rs holds the session's start-up and shutdown, so reading it through would cost far more than the question needs.<|projection|> The list of its parts names every function by its scope, so I can see which ones set things up and read those by their anchors.
   </think>
 
   <tool_call>
-  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/session.rs", "list": 1}}
+  <|projection|>{"name": "file_read", "arguments": {"repo": "candle", "path": "zend/src/session/lifecycle.rs", "list": 1}}
   </tool_call><|projection|>
 - |-
   so what does that function actually do<|im_end|>
