@@ -298,7 +298,11 @@ broken. The loop guard counts `message` as speech, and never strikes the lift (`
 `lift_call`), which is movement.
 `report_stuck` is turned away twice while the next step's room, machine or person is within
 reach — or, for a step that reads or writes a document, a desk is (`file_read` offered there) —
-with the way there, and taken the third time. `report_done` is turned away — with the way
+with the way there, and taken the third time. On work every step of which is done, a
+`report_stuck` is filed done in the carrier's words (with what the engine saw beside them) — at
+once for a mission with no operation behind it; for an operation's step, after it has been turned
+away twice with the verdicts it can give, and then only through the gate a `report_done` passes.
+`report_done` is turned away — with the way
 — whenever the next step is one the engine can see and it is still within reach. A character standing at the table with only the report left is told to report it every
 tick it stands there (`REPORT_AT_THE_TABLE`). `report_done` is refused while a reading of a
 machine the world holds is still unmade. What the engine saw —
