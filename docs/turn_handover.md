@@ -116,7 +116,11 @@ as a first round over the turns that are whole, its tools again under
 its last sealed round (`resume::abandon`).
 
 **A request cut off with no entry left** — its entries retracted, as the build
-before re-asking did — is resumed on asking: `POST /v1/conversations/:id/resume`
+before re-asking did — is recovered by the boot scan from its history alone,
+when its last turn is under a day old (`resume::RECOVER_WITHIN_MS`) and recorded
+no error (`resume::recovers_unasked`): a request cut off by a stop is taken up
+at the next start, and one left from long before, or one that failed, is not.
+It can also be resumed on asking: `POST /v1/conversations/:id/resume`
 (`api::resume`, `ZendSession::resume_request`) resumes by the entries when they
 stand, and otherwise reads the history: a last message that made tool calls,
 or a tool round's results, with no answer after it, is cut off and asked again

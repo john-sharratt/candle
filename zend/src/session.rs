@@ -5780,7 +5780,28 @@ fn resumable_conversations(
 fn resume_unfinished_turns(session: Arc<ZendSession>, state: Arc<InferenceState>) {
     tokio::spawn(async move {
         let mut resumed = 0usize;
+        let now = now_ms();
         for (timeline, conv_id) in resumable_conversations(&state, |_| true) {
+            // **A request cut off with no entry left is recovered too.** The
+            // entry is what a stop leaves, but a request can lose it — the
+            // build that ended a request over a lost turn retracted it — and
+            // without it nothing ever looked at the conversation again
+            // (9a7088fa, 2026-11-21). Its history says the same: a call or a
+            // tool round with no answer after it. Only a recent one whose last
+            // turn did not fail is taken up unasked
+            // (`resume::recovers_unasked`).
+            if resume::unfinished(&state.engine, timeline).is_none() {
+                let turns = state.engine.timeline_turn_wall_ms(timeline);
+                let last_ms = turns.iter().map(|&(_, ms)| ms).max();
+                let last_turn = turns.iter().map(|&(t, _)| t.0).max();
+                let errors = session.conversation_turn_errors(&conv_id);
+                let last_failed = last_turn.is_some_and(|t| errors.contains_key(&t));
+                if !resume::recovers_unasked(last_ms, now, last_failed)
+                    || !rearm_cut_off(&state, &conv_id, timeline)
+                {
+                    continue;
+                }
+            }
             if resume_conversation(&session, &state, timeline, &conv_id).await {
                 resumed += 1;
             }
@@ -5819,6 +5840,24 @@ fn resume_handed_turns(session: Arc<ZendSession>, state: Arc<InferenceState>) {
     });
 }
 
+/// Re-arm `conv_id`'s request when its history shows it cut off with no entry
+/// left (`resume::cut_off_request`): its opening message is recorded to be
+/// asked again. `false` for a request that ended.
+fn rearm_cut_off(state: &InferenceState, conv_id: &str, timeline: TimelineId) -> bool {
+    let history = dialogue_history(state, conv_id);
+    let made_calls = |text: &str| !extract_tool_calls(text).is_empty();
+    let Some(message) = resume::cut_off_request(&history, made_calls) else {
+        return false;
+    };
+    tracing::warn!(
+        conv_id = %conv_id,
+        "resume: a request cut off with no entry left; it is asked again from its opening \
+         message",
+    );
+    resume::reask(&state.engine, timeline, &message);
+    true
+}
+
 /// What `POST /v1/conversations/:id/resume` found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeAsked {
@@ -5847,20 +5886,10 @@ impl ZendSession {
             return ResumeAsked::Live;
         }
         let timeline = timeline_for(conv_id);
-        if resume::unfinished(&state.engine, timeline).is_none() {
-            let history = dialogue_history(&state, conv_id);
-            let made_calls = |text: &str| !extract_tool_calls(text).is_empty();
-            match resume::cut_off_request(&history, made_calls) {
-                Some(message) => {
-                    tracing::info!(
-                        conv_id = %conv_id,
-                        "resume: asked to resume a request cut off with no entry; it is asked \
-                         again from its opening message",
-                    );
-                    resume::reask(&state.engine, timeline, &message);
-                }
-                None => return ResumeAsked::Finished,
-            }
+        if resume::unfinished(&state.engine, timeline).is_none()
+            && !rearm_cut_off(&state, conv_id, timeline)
+        {
+            return ResumeAsked::Finished;
         }
         let (session, conv_id) = (Arc::clone(self), conv_id.to_string());
         tokio::spawn(async move {

@@ -326,6 +326,19 @@ pub fn cut_off_request(
     cut.then(|| opening_message(history)).flatten()
 }
 
+/// How long ago a cut-off request's last turn may be for the boot scan to ask
+/// it again unasked: a request cut off by a stop is recovered at the next
+/// start, and one left from long before — written before resume entries
+/// existed, or ended some other way — is not taken up again on its own.
+pub const RECOVER_WITHIN_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Whether the boot scan recovers a request with no entry left, from its last
+/// turn's time `last_ms` (`None`: no stamp) and whether that turn failed: a
+/// turn that recorded an error ended its request, which is not run again.
+pub fn recovers_unasked(last_ms: Option<u64>, now_ms: u64, last_failed: bool) -> bool {
+    !last_failed && last_ms.is_some_and(|at| now_ms.saturating_sub(at) <= RECOVER_WITHIN_MS)
+}
+
 /// Ask `timeline`'s request again from its opening `message`: the pending
 /// message is recorded and the call turn retracted, so the resume runs the
 /// request as a first round, over the turns that are whole.
@@ -337,8 +350,8 @@ pub fn reask(engine: &ConversationEngine, timeline: TimelineId, message: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        answered, cut_off_request, opening_message, unfinished_of, wholeness, Resuming, Unfinished,
-        Wholeness,
+        answered, cut_off_request, opening_message, recovers_unasked, unfinished_of, wholeness,
+        Resuming, Unfinished, Wholeness, RECOVER_WITHIN_MS,
     };
     use candle_conversation::projection::TimelineId;
     use candle_conversation::{RecoveredMessage, Role};
@@ -352,6 +365,26 @@ mod tests {
             thinking: None,
             tool_tokens: if tool_results { vec![10] } else { Vec::new() },
         }
+    }
+
+    /// **Only a recent request that did not fail is recovered unasked**: one
+    /// cut off by tonight's stop is, one from last week or one whose last turn
+    /// recorded an error is not, nor one with no stamp to date it.
+    #[test]
+    fn only_a_recent_request_that_did_not_fail_is_recovered_unasked() {
+        let now = 10 * RECOVER_WITHIN_MS;
+        assert!(recovers_unasked(Some(now - 60_000), now, false));
+        assert!(recovers_unasked(Some(now - RECOVER_WITHIN_MS), now, false));
+        assert!(!recovers_unasked(
+            Some(now - RECOVER_WITHIN_MS - 1),
+            now,
+            false
+        ));
+        assert!(
+            !recovers_unasked(Some(now - 60_000), now, true),
+            "it failed"
+        );
+        assert!(!recovers_unasked(None, now, false));
     }
 
     /// **The opening message is the last one the user wrote**, never a tool
