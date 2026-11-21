@@ -400,7 +400,19 @@ impl Benches {
             ));
         }
         let current = self.read(body, raw, shelf)?;
-        let done = apply(&Doc::new(&key, &current), edit).map_err(|e| format!("In {key}, {e}."))?;
+        let before = Doc::new(&key, &current);
+        let done = apply(&before, edit).map_err(|e| format!("In {key}, {e}."))?;
+        // **An edit that changes nothing is no edit.** Answered as a change, a
+        // Maker mending a story replaced a paragraph with the words it already
+        // held, was told it had changed it, and made the same edit again three
+        // minutes later instead of going on to the next fault. Said so, and
+        // nothing is written.
+        if done.doc.text() == before.text() {
+            return Err(format!(
+                "That changes nothing: {key} already reads that way there. If that fault is \
+                 put right, go on to the next one."
+            ));
+        }
         self.write(body, about, raw, &done.doc.text(), shelf)?;
         let source = Source {
             file: &key,

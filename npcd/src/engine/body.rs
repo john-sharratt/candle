@@ -1588,6 +1588,40 @@ mod tests {
             &act("lift_use", json!({"floor": "the chronicle level"})),
         );
         assert!(!ride.happened(), "{ride:?}");
+        assert!(
+            ride.line()
+                .unwrap()
+                .contains("`move_to` the room you are going to"),
+            "{ride:?}"
+        );
+    }
+
+    /// **A body on its way is told the lift is part of the journey**, never to
+    /// go to it: told to, a Maker set off back to the room it had just left.
+    #[test]
+    fn asking_for_the_lift_on_the_way_is_told_the_ride_is_coming() {
+        let h = vault();
+        h.with(|w| {
+            w.enter("m1", "Maker-01", at("green-room")).unwrap();
+            w.set_off("m1", Where::new("vault-command", "command-room"))
+                .unwrap();
+        });
+        let ride = perform(
+            &h,
+            "m1",
+            &act("lift_use", json!({"floor": "the chronicle level"})),
+        );
+        assert!(!ride.happened(), "{ride:?}");
+        assert!(
+            ride.line()
+                .unwrap()
+                .starts_with("You are on your way to the command room, and the lift is part"),
+            "{ride:?}"
+        );
+        assert!(
+            h.read(|w| w.actor("m1").unwrap().walk.is_some()),
+            "the refusal ended the journey"
+        );
     }
 
     /// Somebody genuinely gone — not one doorway away, not walking — is still

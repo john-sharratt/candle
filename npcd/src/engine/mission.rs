@@ -868,9 +868,18 @@ impl Mission {
     /// File the completion report, closing the mission. `answer` overwrites the
     /// built answer when the character supplies a final one; a `None` keeps
     /// whatever was already built.
+    ///
+    /// **Filing the report is the report step.** It was left open, so every
+    /// finished mission read back with its last step unticked under a filed
+    /// report — a pass that looked unfinished. A report filed is a report made,
+    /// whatever its verdict: the step is achieved.
     pub fn complete(&mut self, outcome: Outcome, notes: impl Into<String>, answer: Option<String>) {
         if let Some(a) = answer {
             self.answer = Some(a);
+        }
+        for step in self.todo.iter_mut().filter(|t| t.reports && !t.done) {
+            step.done = true;
+            step.outcome = Some(StepOutcome::Achieved);
         }
         self.report = Some(Report {
             outcome,
@@ -1962,6 +1971,28 @@ pub mod bank {
 mod tests {
     use super::bank::{random, Duty, Facts, ROUTINES};
     use super::{Mission, Origin, Outcome, StepOutcome, Todo, Work, UNTRIED_TURN_AWAYS};
+
+    /// **A filed report signs off the report step**, achieved whatever the
+    /// verdict, and leaves the other steps as they were.
+    #[test]
+    fn filing_the_report_ticks_the_report_step() {
+        for outcome in [Outcome::Pass, Outcome::Fail] {
+            let mut m = Mission::new(
+                "Read the board.",
+                vec![
+                    Todo::new("scan the status board"),
+                    Todo::report("go back to the table and report it"),
+                ],
+                Origin::Lodged {
+                    by: "u_op".to_string(),
+                },
+            );
+            m.complete(outcome, "it is raised", None);
+            assert!(m.todo[1].done, "the report step was left open");
+            assert_eq!(m.todo[1].outcome, Some(StepOutcome::Achieved));
+            assert!(!m.todo[0].done, "a step never taken was signed off");
+        }
+    }
 
     fn makers() -> Vec<String> {
         vec!["Wren".to_string(), "Pax".to_string(), "Soren".to_string()]

@@ -291,8 +291,15 @@ something (its `Meaning to:` part), the scheduler holds it
 (`Scheduler::ask`). While it stands it is restated at the head of every turn
 that is not itself the entry's (`runtime::still_asked`) — a turn begun on a
 Drone taking up work would otherwise read nothing of it — and `rest` is
-refused with the same words. It stands no longer once an act through a
-terminal has come back (`Scheduler::worked`) and the mind has then told that
+refused with the same words. For a character that gives orders the restating
+carries the order table as it is (`runtime::orders_line`): each brief it posted
+and who has it, or that nothing of its posting is there. The entry is the
+conversation's own words, and a conversation that said "I have posted the
+order" kept that as done; the turns after believed it of an order never
+posted, so the table is read off every turn instead. It stands no longer
+once an act through a terminal that reads something has come back — not the
+connect that opens the way to one (`terminal::acts::reads`,
+`Scheduler::worked`) — and the mind has then told that
 person something (`Scheduler::told`); told before any act came back, they
 were promised an answer and are still owed one. One nothing comes of is
 dropped after twenty minutes (`tick::ASKED_FOR_MS`). It is held in memory:

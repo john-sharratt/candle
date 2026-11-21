@@ -215,7 +215,10 @@ impl Runtime {
             // And refused outright while what a person asked on the phone is
             // still to be done and told.
             "rest" => match self.scheduler.asked(npc, self.world_ms(npc)) {
-                Some((party, request)) => (false, still_asked(&party, &request)),
+                Some((party, request)) => (
+                    false,
+                    still_asked(&party, &request, self.orders_out(npc).as_deref()),
+                ),
                 None => match self.scheduler.acted_since_news(npc) {
                     true => (true, RESTED.into()),
                     false => (false, REST_REFUSED.into()),
