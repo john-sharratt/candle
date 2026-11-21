@@ -218,8 +218,14 @@ mod tests {
     fn a_heartbeat_is_due_once_per_interval() {
         let last = AtomicU64::new(0);
         assert!(beat_due(1_000, &last), "the first drain beats");
-        assert!(!beat_due(1_000 + HEARTBEAT_MS - 1, &last), "not again inside the interval");
-        assert!(beat_due(1_000 + HEARTBEAT_MS, &last), "once the interval has passed");
+        assert!(
+            !beat_due(1_000 + HEARTBEAT_MS - 1, &last),
+            "not again inside the interval"
+        );
+        assert!(
+            beat_due(1_000 + HEARTBEAT_MS, &last),
+            "once the interval has passed"
+        );
         assert!(!beat_due(1_000 + HEARTBEAT_MS + 1, &last));
     }
 
