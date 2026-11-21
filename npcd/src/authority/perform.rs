@@ -355,8 +355,8 @@ impl Runtime {
                 npc,
                 act = act.tool,
                 source = ?source,
-                tried = %act.summary(),
                 answer = %performed.recorded.answer,
+                tried = %act.summary(),
                 "an act was refused"
             ),
         }
