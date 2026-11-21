@@ -94,6 +94,10 @@ pub(crate) fn split_readback(tail: &[u32], n: usize) -> Readback {
     }
 }
 
+/// What every non-finite refusal says, so the step that sees one can tell it
+/// from any other sampling failure ([`is_nonfinite_refusal`]).
+const NONFINITE_REFUSAL: &str = "sampling refused: the logits of row(s)";
+
 /// Refuse a dispatch any of whose rows the kernel judged non-finite, naming
 /// them. Such a row came from a forward gone bad — a NaN or a +inf in its
 /// logits — and the token drawn from it means nothing, so the rows fail rather
@@ -110,10 +114,16 @@ pub(crate) fn refuse_nonfinite(verdicts: &[u32]) -> candle::Result<()> {
         return Ok(());
     }
     candle::bail!(
-        "sampling refused: the logits of row(s) {bad:?} of {} held a NaN or a +inf — \
+        "{NONFINITE_REFUSAL} {bad:?} of {} held a NaN or a +inf — \
          the forward that produced them is broken, so no token is drawn from them",
         verdicts.len()
     )
+}
+
+/// Whether `e` is a [`refuse_nonfinite`] refusal: the forward produced a
+/// non-finite logit, rather than the sampler failing on its own account.
+pub(crate) fn is_nonfinite_refusal(e: &candle::Error) -> bool {
+    e.to_string().contains(NONFINITE_REFUSAL)
 }
 
 #[cfg(test)]
@@ -176,5 +186,15 @@ mod tests {
         assert!(refuse_nonfinite(&[]).is_ok());
         let e = refuse_nonfinite(&[0, 1, 0, 1]).unwrap_err().to_string();
         assert!(e.contains("row(s) [1, 3] of 4"), "{e}");
+    }
+
+    /// A refusal is told apart from any other sampling failure.
+    #[test]
+    fn a_nonfinite_refusal_is_told_apart() {
+        let refused = refuse_nonfinite(&[1]).unwrap_err();
+        assert!(is_nonfinite_refusal(&refused));
+        assert!(!is_nonfinite_refusal(&candle::Error::Msg(
+            "a weight is negative".into()
+        )));
     }
 }

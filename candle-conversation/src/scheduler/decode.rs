@@ -11,6 +11,7 @@ use super::wave_retry::{Next, WaveRetry};
 use super::*;
 use crate::batched_sampler::DEGENERATE_TOKEN_RUN;
 use crate::recorded_reply::{departure, replayed_step};
+use crate::sampler_args::is_nonfinite_refusal;
 use crate::stats::streams_committed;
 use candle_nn::kv_cache::{
     is_arena_exhausted, is_ground_refusal_message, is_span_full, is_tier_refusal,
@@ -535,6 +536,7 @@ impl Scheduler {
                 return;
             }
             Err(e) => {
+                self.describe_nonfinite_step("stencil", &ids, &e);
                 self.fail_all_decodes(&ids, &format!("stencil continuation sample failed: {e}"));
                 return;
             }
@@ -1206,6 +1208,7 @@ impl Scheduler {
                 self.sampling_states.insert(id, state);
             }
             self.model.abort_verify(&spec_seqs);
+            self.describe_nonfinite_step("score", &seq_ids, &e);
             self.fail_all_decodes(&seq_ids, &format!("sampling failed: {e}"));
             return;
         }
@@ -1300,6 +1303,7 @@ impl Scheduler {
                 // step's verify took are still held. Drop them: they name
                 // offsets inside a block whose accept never happened.
                 self.model.abort_verify(&spec_seqs);
+                self.describe_nonfinite_step("choose", &seq_ids, &e);
                 self.fail_all_decodes(&seq_ids, &format!("sampling failed: {e}"));
                 return;
             }
@@ -2599,6 +2603,29 @@ impl Scheduler {
             )));
         }
         true
+    }
+
+    /// A dispatch refused for non-finite logits ([`is_nonfinite_refusal`]):
+    /// say which step it was and the sequences it carried, then whether each
+    /// one's carried recurrent state is non-finite and from which layer
+    /// ([`describe_recurrent_state`]). A refusal is otherwise only its rows'
+    /// positions in the dispatch — no sequence, no layer, nothing that says
+    /// whether the fault was carried in or made by this wave. Fault path only:
+    /// nothing runs when the step is well.
+    fn describe_nonfinite_step(&self, step: &str, seqs: &[SequenceId], e: &candle::Error) {
+        if !is_nonfinite_refusal(e) {
+            return;
+        }
+        let ids: Vec<usize> = seqs.iter().map(|s| s.0).collect();
+        tracing::error!(
+            target: "candle_conversation::eos",
+            step,
+            seqs = ?ids,
+            "non-finite logits refused a dispatch: {e}"
+        );
+        for &id in seqs {
+            describe_recurrent_state(self.model.as_ref(), id);
+        }
     }
 
     /// Fail every listed decode: each caller gets the error, and what each turn
