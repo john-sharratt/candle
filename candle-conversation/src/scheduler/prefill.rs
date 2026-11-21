@@ -138,6 +138,9 @@ fn owes_decode(work: DecodePriority, decodes: impl IntoIterator<Item = DecodePri
 /// it stands in a placed turn's way (`LearnedRates::high_backlog_tokens`).
 const STALLED_PROMPT: Duration = Duration::from_secs(30);
 
+/// A compaction sweep this long is logged by holder (`compaction sweep split`).
+const SLOW_SWEEP: Duration = Duration::from_millis(50);
+
 /// `R` for a `High` creep beside a `High` decode — see [`throttle_ratio`].
 const HIGH_BESIDE_HIGH_RATIO: u32 = 2;
 
@@ -1655,25 +1658,37 @@ impl Scheduler {
             })
             .collect();
         let mut idle_us = 0u128;
+        // The sweep's holders by kind, so a slow sweep names the one it was
+        // spent on; the backings' own block tables are the rest of `sweep_us`.
+        let (mut substrates_us, mut projections_us, mut detached_us, mut reclaimed_us) =
+            (0u128, 0u128, 0u128, 0u128);
         let outcome = {
             let _g = super::profile::span("compact:kv");
             self.session.compact_kv(goal.budget(), &mut |sweep| {
                 for (s, idle) in substrates.iter().zip(&idle) {
                     let t = std::time::Instant::now();
                     swept += s.rewrite_for_compaction(sweep)?;
+                    let us = t.elapsed().as_micros();
+                    substrates_us += us;
                     if *idle {
-                        idle_us += t.elapsed().as_micros();
+                        idle_us += us;
                     }
                 }
+                let t = std::time::Instant::now();
                 for state in projections.values_mut() {
                     swept += state.rewrite_for_compaction(sweep)?;
                 }
+                projections_us += t.elapsed().as_micros();
+                let t = std::time::Instant::now();
                 for substrate in &detached {
                     swept += substrate.rewrite_for_compaction(sweep)?;
                 }
+                detached_us += t.elapsed().as_micros();
                 // Last, so a hot copy any thread let go of while the residences
                 // were walked is still named by the sweep.
+                let t = std::time::Instant::now();
                 swept += rewrite_reclaimed(sweep)?;
+                reclaimed_us += t.elapsed().as_micros();
                 Ok(())
             })
         };
@@ -1713,6 +1728,27 @@ impl Scheduler {
                 },
             );
             let t = report.timings;
+            // A sweep long enough to be felt, by holder — one short line, so a
+            // log reader shows it whole.
+            if t.sweep >= SLOW_SWEEP {
+                let ms = |us: u128| us / 1000;
+                tracing::info!(
+                    target: "candle_conversation::scheduler::compaction",
+                    "compaction sweep split sweep_ms={} substrates_ms={} projections_ms={} \
+                     detached_ms={} reclaimed_ms={} backings_ms={} moves={} allocations={} \
+                     residences={swept}",
+                    t.sweep.as_millis(),
+                    ms(substrates_us),
+                    ms(projections_us),
+                    ms(detached_us),
+                    ms(reclaimed_us),
+                    ms(t.sweep.as_micros().saturating_sub(
+                        substrates_us + projections_us + detached_us + reclaimed_us
+                    )),
+                    report.moves,
+                    report.allocations_rewritten,
+                );
+            }
             self.wave_stats
                 .compaction_split
                 .kv_lowered(report.frontier_before, report.frontier_after);
@@ -1830,6 +1866,10 @@ impl Scheduler {
                     // slot is bound to.
                     sweep_us = report.timings.sweep.as_micros(),
                     idle_substrates_us = idle_us,
+                    substrates_us,
+                    projections_us,
+                    detached_us,
+                    reclaimed_us,
                     // **The figure that says whether the pass was complete.** A relocated
                     // slot no holder the sweep reached names: its claim is wasted, its
                     // source is not reclaimed, and because nothing names it the census
