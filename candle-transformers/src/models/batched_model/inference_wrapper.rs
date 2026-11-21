@@ -1,0 +1,802 @@
+//! Wraps a model with its RoPE schedule and runs one co-batched wave of decode,
+//! prefill and glue rows through it.
+//!
+//! The RoPE rungs are built once at load, and the paged kernels rotate from them,
+//! so no sequence needs a table rebuilt for a longer length. A wave packs its rows
+//! into one buffer and runs the layer sweep. Its transient tier is reserved once,
+//! before the sweep, and from that point the forward owns the arena partition. The
+//! previous forward's tier is handed back first, and the boundary moves only in
+//! the gap between forwards, so a reservation a finished forward still holds
+//! cannot refuse the new one. Decode and prefill rows return logits. Glue rows
+//! only scatter their K/V. The logits sit on the forward's span, which is returned
+//! with them so the span is not reclaimed while the caller holds them.
+
+use super::*;
+
+/// Concrete wrapper for batched inference with RoPE caching.
+///
+/// This struct owns the RoPE cache and provides the `forward_batch` implementation.
+/// Using a concrete wrapper instead of a trait default ensures:
+/// - RoPE tables are cached once at the model level (not per-layer)
+/// - No duplication of forward_batch logic across models
+/// - Easy to add shared state (attention mask cache, etc.) in the future
+pub struct BatchedInference<M: BatchedModelCore> {
+    pub(super) model: M,
+    /// Rung 0's cos/sin by position, for the non-paged paths only; they refuse
+    /// a row past rung 0 (`batched_layer::refuse_rung_past_zero`).
+    pub(super) rope_cache: RwLock<CisPrecomputations>,
+    /// Every rung of the model's RoPE schedule, which the paged kernels rotate
+    /// from — built once at load, never rebuilt for a longer sequence.
+    pub(super) rope: RopeRungs,
+    /// When true, `forward_batch` projects ALL token positions through the LM head
+    /// instead of only the last token. Used for perplexity evaluation.
+    /// Default: false (near-zero cost when off).
+    pub(super) all_logits: bool,
+}
+
+impl<M: BatchedModelCore> BatchedInference<M> {
+    /// Wrap `model` with its RoPE `schedule`.
+    ///
+    /// `max_seq_len` is the non-paged cos/sin table's initial size (it grows on
+    /// demand); the paged kernels' rungs cover the schedule's whole reach from
+    /// load.
+    pub fn new_with_schedule(
+        model: M,
+        schedule: &RopeSchedule,
+        max_seq_len: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let rung0 = schedule
+            .rungs()
+            .into_iter()
+            .next()
+            .ok_or_else(|| candle::Error::Msg("rope schedule: no rungs".into()))?;
+        let rope_cache = RwLock::new(CisPrecomputations::new_growable_with_inv_freq(
+            rung0.inv_freq,
+            max_seq_len,
+            ROPE_EXTEND_CHUNK,
+            device,
+        )?);
+        Ok(Self {
+            model,
+            rope_cache,
+            rope: RopeRungs::new(schedule, device)?,
+            all_logits: false,
+        })
+    }
+
+    /// The model's RoPE rungs.
+    pub fn rope(&self) -> &RopeRungs {
+        &self.rope
+    }
+
+    /// When true, `forward_batch` returns logits for ALL positions, not just last.
+    pub fn set_all_logits(&mut self, enabled: bool) {
+        self.all_logits = enabled;
+    }
+
+    /// Access the underlying model.
+    pub fn model(&self) -> &M {
+        &self.model
+    }
+
+    /// Access the underlying model mutably.
+    pub fn model_mut(&mut self) -> &mut M {
+        &mut self.model
+    }
+
+    /// Consume the wrapper and return the inner model.
+    pub fn into_inner(self) -> M {
+        self.model
+    }
+
+    /// Get RoPE (cos, sin) tables for the given dtype and length.
+    pub(super) fn get_rope_tables(
+        &self,
+        dtype: DType,
+        required_len: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        // Check if extension is needed
+        let needs_extend = {
+            let cache = self
+                .rope_cache
+                .read()
+                .map_err(|_| candle::Error::Msg("poisoned RoPE lock".into()))?;
+            required_len > cache.max_seq_len()
+        };
+
+        if needs_extend {
+            let mut cache = self
+                .rope_cache
+                .write()
+                .map_err(|_| candle::Error::Msg("poisoned RoPE lock".into()))?;
+            cache.ensure_len(required_len)?;
+        }
+
+        // Get tables for the requested dtype
+        let cache = self
+            .rope_cache
+            .read()
+            .map_err(|_| candle::Error::Msg("poisoned RoPE lock".into()))?;
+        let cis = cache.get_for_dtype(dtype)?;
+        Ok((cis.cos.clone(), cis.sin.clone()))
+    }
+
+    /// Co-batched continuous-fair-wave forward (`docs/continuous_fair_waves.md`).
+    ///
+    /// Packs decode (q=1), prefill (q=N) and glue (q=G) rows into ONE flat
+    /// activation buffer and runs the re-entrant layer range with the 3-group
+    /// mixed dispatch — each row-type's own attention kernel over its slice, then
+    /// the **single shared FFN/MoE grouped GEMM** over the whole buffer (one expert
+    /// load per layer serves all three). Since attention is per-type, o_proj is
+    /// linear, and the FFN/MoE is token-flat, this is bit-identical to running the
+    /// three types as separate forwards through a shared MoE.
+    ///
+    /// The uniform transformer's [`crate::models::wave_driver::WaveSweep`] body:
+    /// `wave` carries the internal-order `[decode… | prefill… | glue…]` groups,
+    /// and this sweep builds its own attention metadata (headers describe live
+    /// arena state, so they belong to the sweep's phase order — see the wave
+    /// driver's module docs) before borrowing its contexts from the session.
+    /// When the range reaches the head, returns logits for the **decode +
+    /// prefill** rows only (glue rows scatter K/V, they carry no logits).
+    pub fn forward_wave_contexts(
+        &self,
+        session: &mut BatchedInferenceSession,
+        wave: WaveGroups<'_>,
+    ) -> Result<(WavePhase, Option<WaveGuard>)> {
+        let WaveGroups {
+            n_decode,
+            n_prefill,
+            seq_ids,
+            inputs,
+            pending_glue,
+            generation,
+            layer_start,
+            layer_end,
+            x_in,
+            mode,
+            act_dtype: _,
+            adapter,
+        } = wave;
+        if seq_ids.is_empty() {
+            candle::bail!("forward_wave: empty batch");
+        }
+        let preparing = matches!(mode, SweepMode::Prepare);
+        let in_step = matches!(mode, SweepMode::InStep(_));
+        // Read before the contexts borrow the session: whether the caller's
+        // accept walk will select on this wave's head span.
+        #[cfg(feature = "cuda")]
+        let accept_in_place = session.accept_in_place();
+        let stencil_rows = session.stencil_rows();
+        // Refused rather than ignored. Dropping the name here would serve the
+        // BASE model under an adapter's name, which reads as a bad fine-tune
+        // rather than as an unsupported architecture.
+        if let Some(name) = adapter {
+            candle::bail!(
+                "forward_wave: this architecture has no LoRA support, so adapter \
+                 `{name}` cannot be applied"
+            );
+        }
+        let num_layers = self.model.num_layers();
+        if layer_start > layer_end || layer_end > num_layers {
+            candle::bail!("forward_wave: bad layer range [{layer_start}, {layer_end})");
+        }
+        let n_glue = seq_ids
+            .len()
+            .checked_sub(n_decode + n_prefill)
+            .ok_or_else(|| candle::Error::Msg("forward_wave: group bounds exceed batch".into()))?;
+
+        // Per-group offsets + query lengths, in [decode | prefill | glue] order
+        // — read from the session BEFORE the contexts borrow it mutably.
+        let offsets: Vec<usize> = seq_ids
+            .iter()
+            .map(|&s| session.sequence_offset(s).unwrap_or(0))
+            .collect();
+        let q_lens: Vec<usize> = inputs
+            .iter()
+            .map(|t| t.dims().get(1).copied().unwrap_or(1))
+            .collect();
+        let (dec_off, rest_off) = offsets.split_at(n_decode);
+        let (pre_off, glue_off) = rest_off.split_at(n_prefill);
+        let (dec_q, rest_q) = q_lens.split_at(n_decode);
+        let (pre_q, glue_q) = rest_q.split_at(n_prefill);
+        // Flat token-row counts per group (decode is one row per sequence).
+        let pre_rows: usize = pre_q.iter().sum();
+        let glue_rows: usize = glue_q.iter().sum();
+
+        // Attention metadata, from the session's shared borrow. Decode gets its
+        // packed SlotHeader buffer; prefill/glue get ragged cu_seqlens; glue
+        // additionally translates the staged per-token scatter descriptors.
+        // The uniform stack's arena state does not move before the layer loop
+        // reads it, so building here — before phase 0 — matches the order the
+        // wave driver used when it built these. A segment being prepared runs no
+        // layer, so it builds none — but it claims the decode rows' write chunks
+        // the build would, here, before the step's span stands.
+        #[cfg(feature = "cuda")]
+        if preparing {
+            session.ensure_decode_writes(&seq_ids[..n_decode])?;
+        }
+        #[cfg(feature = "cuda")]
+        let decode_headers = if n_decode > 0 && !preparing {
+            let (buf, stride) = session.build_decode_metadata(&seq_ids[..n_decode], generation)?;
+            DecodeHeaders::Decode { buf, stride }
+        } else {
+            DecodeHeaders::Decode {
+                buf: None,
+                stride: 0,
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
+        let decode_headers = DecodeHeaders::Decode {
+            buf: None,
+            stride: 0,
+        };
+        let dev = self.model.device();
+
+        let t_assemble = profile_now();
+        let mut contexts = assemble_wave_contexts(session, seq_ids, inputs)?;
+        let contexts = contexts.as_mut_slice();
+        pipeline_record("wave:assemble", t_assemble);
+
+        let cache_dtype = contexts
+            .first()
+            .map(|c| c.kv_caches.dtype())
+            .unwrap_or(DType::F32);
+        let embed_dtype = activation_dtype(cache_dtype);
+
+        // **Phase 0: hand back the previous forward's tier.**
+        //
+        // It is held past its guards on purpose (`release_if_last`), and
+        // `plan_wave_transient` used to be what returned it — one phase too
+        // late. Admit runs first and claims against a pool the old tier is still
+        // capping, so it can be refused by a reservation belonging to a forward
+        // that has already finished. Invisible while every wave succeeds, fatal
+        // the moment one fails: the failed wave's tier stands, every retry's
+        // admit is refused by it, and the engine spins.
+        //
+        // A segment of a step skips this and the admit below: the step ran both
+        // for every segment before it placed the tier its segments share
+        // (`docs/wave_step.md` §2.1), and its forward span is live.
+        let t_reclaim = profile_now();
+        #[cfg(feature = "cuda")]
+        if let (Device::Cuda(d), false) = (self.model.device(), in_step) {
+            end_wave_transient(&d.cuda_stream());
+            // **And the boundary's growing direction, in the one gap it is legal
+            // in.** Every guard from the previous forward is dropped and this
+            // one has opened none, so no wave generation is live — the condition
+            // `set_weight_floor` checks, and the condition a retraction's
+            // evictions and relocations actually need. It runs after the tier is
+            // handed back because a placed tier caps the pool at a fixed address
+            // that the boundary cannot move, which would make the spare-region
+            // count this reads an underestimate.
+            //
+            self.model.reclaim_spare_ground();
+
+            // **And the shrinking direction, which used to be missing entirely.**
+            //
+            // The comment that stood here said the KV side's direction was not
+            // needed, because "a claim that runs out buys its ground on the spot
+            // (`request_kv_ground`)". That is true only for a claim that runs out
+            // of *owned* ground. A claim refused by the transient tier's ceiling
+            // takes `Claim::TierBlocked`, which returns without buying anything —
+            // deliberately, because a tier standing on the ground wants a
+            // narrower wave rather than more ground. So the zone was never asked,
+            // and the two directions were not symmetric: growth ran here every
+            // forward while retraction ran only on a failure mode that could not
+            // reach it.
+            //
+            // Measured on the 27B: the zone grew to 10,498 MiB during the first
+            // 4-context config and held it across all ten, KV pinned at 162
+            // regions with 80 live at *one* context. C8 then arrived with twenty
+            // sessions and 24 free regions — 384 MiB — and took
+            // `CUDA_ERROR_OUT_OF_MEMORY` on a slot-state upload.
+            //
+            // The demand is scaled by the wave about to run rather than fixed:
+            // what makes ground spare is that no one needs it, and how many
+            // sequences are about to write KV is the best available statement of
+            // who needs it. Asking here is legal for the same reason growth is —
+            // every guard from the previous forward is dropped and this one has
+            // opened none, so `set_weight_floor` will not refuse.
+            let want_free = KV_FREE_SLACK_REGIONS + contexts.len();
+            if let candle::DeviceLocation::Cuda { gpu_id } = self.model.device().location() {
+                if let Some(rs) = candle_nn::kv_cache::region_stats(gpu_id) {
+                    let deficit = want_free.saturating_sub(rs.free);
+                    if deficit > 0 {
+                        let got = self.model.request_kv_ground(deficit);
+                        tracing::debug!(
+                            target: "candle_transformers::batched_model",
+                            free = rs.free,
+                            want_free,
+                            deficit,
+                            conceded_mib = got >> 20,
+                            "KV is short before the wave; asked the weight side for ground"
+                        );
+                    }
+                }
+            }
+        }
+
+        pipeline_record("wave:reclaim", t_reclaim);
+
+        // **Phase 1: admit.** Claim every KV slot this wave will write, for
+        // every layer in the range, before a single byte of it computes — so the
+        // arena frontier is final when the transient tier is reserved against it
+        // (`docs/archived/elastic_vram_partition.md` §7, `wave_admit`). Decode's claims
+        // were made by the caller when it built the position map; this covers
+        // the multi-token rows.
+        let t_admit = profile_now();
+        if !in_step {
+            admit_wave_kv(contexts, n_decode, n_prefill, layer_start, layer_end)?;
+        }
+        pipeline_record("wave:admit", t_admit);
+
+        // **Phase 2: price and reserve this wave's transient tier.**
+        //
+        // After admit, so the partition it measures against is the one the whole
+        // forward will run on. The tier is sized to *this* wave rather than to
+        // the widest one the engine can run: a twenty-session decode prices at a
+        // few megabytes where the old fixed constants reserved 912 MiB, and the
+        // difference is ground the weight side gets to hold — which is the entire
+        // point of the tier sitting between the arenas and the weights (§2).
+        //
+        // Reserved **once**, for the forward. `begin_wave` lays the three spans
+        // out inside the reservation on every phase but never chooses its
+        // address, which is what keeps layer *N*'s extents and layer *N+1*'s at
+        // the same offsets (§13b).
+        //
+        // A segment of a step prices itself and returns: the step places one tier
+        // for all of its segments. A segment running inside the step places
+        // nothing — the step's tier stands under it.
+        let t_plan = profile_now();
+        #[cfg(feature = "cuda")]
+        {
+            let rows = n_decode + pre_rows + glue_rows;
+            if rows > 0 && !in_step {
+                if let Device::Cuda(d) = self.model.device() {
+                    let geometry = self.model.wave_geometry(embed_dtype);
+                    let plan = WavePlan::new(geometry);
+                    // The plan prices all three phases from the wave's
+                    // composition, the forward one included — it knows what the
+                    // head's logits cost because the geometry carries `vocab`.
+                    //
+                    // **Each group at its own width.** The head scores every
+                    // decode row and the last row of each prefill sequence, so
+                    // the forward phase is priced by those — a wave that stops
+                    // short of the head scores none. Priced as one sequence, a
+                    // four-context wave ran out of span four logits rows deep.
+                    let scored_rows = if layer_end == num_layers {
+                        n_decode + n_prefill
+                    } else {
+                        0
+                    };
+                    let width = WaveWidth {
+                        prefill_rows: pre_rows + glue_rows,
+                        decode_rows: n_decode,
+                        scored_rows,
+                        // Every prefill and glue sequence: the ragged tables
+                        // hold an entry for each, whatever its length.
+                        prefill_spans: n_prefill + n_glue,
+                        // The caller's accept walk selects on the head's span
+                        // only when it reads the logits there.
+                        accept_rows: if accept_in_place { scored_rows } else { 0 },
+                        stencil_rows,
+                        // This stack's attention is dense: no sparse selection.
+                        qsa_bytes: 0,
+                        // No look-ahead routers on this path.
+                        look_ahead_hops: 0,
+                        // The prefill launch's carve: up to one key chunk of
+                        // each bulk chunk's sequence, and the carry beside it.
+                        // Glue rows take their own kernel, which stages nothing.
+                        kv_stage: PrefillKvStageLayout::new(
+                            pre_q,
+                            pre_off,
+                            geometry.n_head,
+                            geometry.n_kv_head,
+                            geometry.head_dim,
+                            PrefillLaunchBounds::PRODUCTION,
+                        ),
+                    };
+                    let per_phase = [
+                        plan.phase_bytes(LayerPhase::Attention, width),
+                        plan.phase_bytes(LayerPhase::Ffn, width),
+                        plan.phase_bytes(LayerPhase::Forward, width),
+                    ];
+                    // The tier packs directly against the arena frontier, with no
+                    // room reserved above it. Nothing claims a region after this
+                    // point: a region claim creates an arena, and arena creation
+                    // waits for the gap between forwards
+                    // (`BackingInner::arena_window`), which `plan_wave_transient`
+                    // in turn waits on before it reads the frontier. The
+                    // compressor keeps running through the forward — it fills
+                    // arenas that already exist, which moves nothing.
+                    if preparing {
+                        return Ok((WavePhase::Priced(per_phase), None));
+                    }
+                    plan_wave_transient(&d.cuda_stream(), per_phase)?;
+                }
+            }
+        }
+        pipeline_record("wave:plan", t_plan);
+        if preparing {
+            return Ok((WavePhase::Priced([0; 3]), None));
+        }
+
+        // **From here to the end of this function, the forward owns the
+        // partition.**
+        //
+        // Held rather than inferred, because the obvious inference is wrong: a
+        // wave generation is *not* live for the whole forward — it drops at
+        // every phase boundary — so both `enter_arena_window` and the boundary
+        // latch (`wave_is_live`) read this flag, and `live_generations` covers
+        // only the tail after this returns, where the logits still sit on the
+        // head span.
+        //
+        // **After phase 2, and that is not a detail — in either direction.**
+        // Admit is the forward creating its own arenas through the same gate
+        // the sealing thread uses, so opening the flag before admit had the
+        // forward waiting on itself (the daemon froze mid-load). And phase 2's
+        // tier placement may *buy ground* from the weight side, whose
+        // `set_weight_floor` refuses while `wave_is_live` — which now reads
+        // this flag — so opening it before the placement would refuse the
+        // tier's own purchase. The sweep is what needs the partition frozen;
+        // the flag opens exactly where the sweep begins.
+        #[cfg(feature = "cuda")]
+        let _forward_open = match self.model.device() {
+            Device::Cuda(d) => Some(begin_forward(&d.cuda_stream())),
+            _ => None,
+        };
+
+        // The forward's span, open from here to the head: the wave's token ids
+        // are laid on it before the embedding reads them, and the head's norm
+        // and logits are carved from it after the last layer. It is reset per
+        // *forward* — the lifetime all three actually have. A segment of a step
+        // carves from the step's span instead, which outlives its segments.
+        #[cfg(feature = "cuda")]
+        let head_span = match (self.model.device(), mode) {
+            (_, SweepMode::InStep(_)) => None,
+            (Device::Cuda(d), _) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Forward)?),
+            _ => None,
+        };
+        #[cfg(feature = "cuda")]
+        let fwd_ticket = match mode {
+            SweepMode::InStep(ticket) => ticket,
+            _ => head_span.as_ref().map(|g| g.ticket()),
+        };
+        #[cfg(not(feature = "cuda"))]
+        let (head_span, fwd_ticket): (Option<WaveGuard>, Option<WaveTicket>) = (None, None);
+
+        // The prefill and glue groups' ragged tables, built once and read by
+        // every layer — on the forward span, which is what it holds
+        // (`WaveBuffer::{PrefillCuSeqlens, PrefillQLens, PrefillKvLens,
+        // GlueWriteTables}`). Pure functions of the offsets and the staged glue,
+        // so building them here rather than ahead of the tier reads the same
+        // values.
+        let prefill_headers = DecodeHeaders::Prefill(BatchedPrefillMeta::new_ragged(
+            pre_off, pre_q, dev, fwd_ticket,
+        )?);
+        #[allow(unused_mut)]
+        let mut glue_meta = BatchedPrefillMeta::new_ragged(glue_off, glue_q, dev, fwd_ticket)?;
+        #[cfg(feature = "cuda")]
+        if let Some(pending) = pending_glue {
+            glue_meta.glue = build_glue_meta(pending, glue_q, dev, fwd_ticket)?;
+        }
+        #[cfg(not(feature = "cuda"))]
+        let _ = pending_glue;
+        let glue_headers = DecodeHeaders::Prefill(glue_meta);
+
+        // Combined residual: embed every row flat `[1, total, hidden]`, or resume
+        // a paused wave from the residual it was handed.
+        let t_embed = profile_now();
+        let mut x = match x_in {
+            None => {
+                // One buffer of every row's id on the forward span — one upload
+                // for ids handed over on the host, a copy for ids already on the
+                // device (`WaveBuffer::RowTokenIds`). The resident table's gather
+                // inherits the ids' arena, so the residual it produces lands
+                // there too (`WaveBuffer::ForwardResidual`), and every layer adds
+                // into it in place. A window that stops short hands it on from
+                // there (below).
+                let inputs: Vec<&Tensor> = contexts.iter().map(|c| c.input_ids).collect();
+                let ids = device_token_ids(&inputs, self.model.device(), fwd_ticket)?;
+                let xt = ids.reshape((1, ids.elem_count()))?;
+                // Prefer the host-served table when the model has one: the rows
+                // are gathered from the mmap over PCIe, so the embedding never
+                // occupies VRAM. Falls back to the resident lookup otherwise.
+                #[cfg(feature = "cuda")]
+                let host = self.model.host_embedding();
+                #[cfg(not(feature = "cuda"))]
+                let host: Option<&()> = None;
+                let embedded = match host {
+                    #[cfg(feature = "cuda")]
+                    Some(he) => {
+                        let flat = xt.flatten_all()?;
+                        let n = flat.elem_count();
+                        // A scope of its own for the gather's staging bytes. The
+                        // embedding runs before layer 0, so no phase span is open
+                        // and the attention arena is idle — its bytes are already
+                        // reserved, so the staging is free. The guard drops here,
+                        // before the layer loop opens the same span for real work.
+                        let staging = match self.model.device() {
+                            Device::Cuda(d) => {
+                                Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?)
+                            }
+                            _ => None,
+                        };
+                        let rows = he.embed(
+                            &flat,
+                            self.model.device(),
+                            wave_root(staging.as_ref()),
+                            embed_dtype,
+                            fwd_ticket,
+                        )?;
+                        rows.reshape((1, n, he.layout().ncols))?
+                    }
+                    #[cfg(not(feature = "cuda"))]
+                    Some(_) => unreachable!("host embedding requires the cuda feature"),
+                    None => self
+                        .model
+                        .embeddings()
+                        .ok_or_else(|| {
+                            candle::Error::Msg(
+                                "model has neither a resident nor a host embedding".into(),
+                            )
+                        })?
+                        .forward_as_dtype(&xt, embed_dtype)?
+                        .contiguous()?,
+                };
+                // No `to_dtype` here: both arms already emit `embed_dtype` — the
+                // host gather because its dequantize takes the type, the resident
+                // table because `forward_as_dtype` does.
+                TensorCat::from_cat_tensor(embedded, 0)?
+            }
+            // The residual this forward resumes is gathered into a buffer of its
+            // own on the forward span (`WaveBuffer::ForwardResidual`), in this
+            // forward's row order: every layer adds into it in place, and what
+            // it was gathered from is left as it was, so a failed forward can be
+            // retried from the same input (`docs/wave_step.md` §3.1).
+            Some(resume) => {
+                let total = n_decode + pre_rows + glue_rows;
+                let buf =
+                    wave_empty_ticketed((1, total, resume.width()), embed_dtype, dev, fwd_ticket)?;
+                resume.gather_into(&buf)?;
+                TensorCat::from_cat_tensor(buf, 0)?
+            }
+        };
+        pipeline_record("wave:embed", t_embed);
+
+        // Per-group model-side RoPE (built only if a layer takes the non-paged
+        // path) + prefill position-map caches, all alive for the whole layer loop.
+        let dec_rope = LazyRope::new(|| self.compute_rope_for_batch(dec_off, dec_q, embed_dtype));
+        let pre_rope = LazyRope::new(|| self.compute_rope_for_batch(pre_off, pre_q, embed_dtype));
+        let glue_rope =
+            LazyRope::new(|| self.compute_rope_for_batch(glue_off, glue_q, embed_dtype));
+        let dec_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
+        let pre_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
+        let glue_pm: std::cell::RefCell<Option<SharedPm>> = std::cell::RefCell::new(None);
+        let interleaved = self.model.rope_interleaved();
+        let dec_params = BatchedAttentionParams::new(
+            &dec_rope,
+            interleaved,
+            &self.rope,
+            decode_headers,
+            dec_q,
+            generation,
+            &dec_pm,
+        );
+        let pre_params = BatchedAttentionParams::new(
+            &pre_rope,
+            interleaved,
+            &self.rope,
+            prefill_headers,
+            pre_q,
+            generation,
+            &pre_pm,
+        );
+        let glue_params = BatchedAttentionParams::new(
+            &glue_rope,
+            interleaved,
+            &self.rope,
+            glue_headers,
+            glue_q,
+            generation,
+            &glue_pm,
+        );
+
+        // The rows the routed experts' residency scores as decode: the decode
+        // rows and each prompt's last row (`residency_rows`; this lineage has
+        // no verify segments).
+        let decode_like =
+            residency_decode_rows(n_decode, pre_q.iter().map(|&rows| (0, rows)), |_| false);
+        // Everything above — admission, the tier, the tables, the embedding — ran
+        // eagerly. The layers and the head are recorded as a chain of graphs
+        // (`docs/decode_graphs.md`), cut where a layer meets the host.
+        dev.record_launches()?;
+        for layer_idx in layer_start..layer_end {
+            let mut cache_refs: Vec<&mut KvCache> = contexts
+                .iter_mut()
+                .map(|c| &mut c.kv_caches.caches[layer_idx])
+                .collect();
+            let (dec_c, rest_c) = cache_refs.split_at_mut(n_decode);
+            let (pre_c, glue_c) = rest_c.split_at_mut(n_prefill);
+            let mut groups: Vec<WaveAttnGroup> = Vec::with_capacity(3);
+            if n_decode > 0 {
+                groups.push(WaveAttnGroup {
+                    caches: dec_c,
+                    offsets: dec_off,
+                    params: &dec_params,
+                    rows: n_decode,
+                    decode_layout: true,
+                    // No QSA: this lineage's attention reads the whole causal
+                    // prefix (the selection is Qwen3.8-Flash-Next's own).
+                    qsa: None,
+                });
+            }
+            if n_prefill > 0 {
+                groups.push(WaveAttnGroup {
+                    caches: pre_c,
+                    offsets: pre_off,
+                    params: &pre_params,
+                    rows: pre_rows,
+                    decode_layout: false,
+                    qsa: None,
+                });
+            }
+            if n_glue > 0 {
+                groups.push(WaveAttnGroup {
+                    caches: glue_c,
+                    offsets: glue_off,
+                    params: &glue_params,
+                    rows: glue_rows,
+                    decode_layout: false,
+                    qsa: None,
+                });
+            }
+            forward_layer_batched_mixed(
+                self.model.layer(layer_idx),
+                &mut groups,
+                &mut x,
+                embed_dtype,
+                layer_idx,
+                &decode_like,
+            )?;
+            // A forward recorded as one segment leaves the GPU idle until the
+            // host has recorded every layer, where eager launches had it start
+            // on the first; so each layer is handed over as it is recorded.
+            // Measured on the RTX 3090: as one segment, decode ran 5–9% under
+            // eager (Llama-3.2-3B F16×1 150.5 against 165.2 t/s); a segment a
+            // layer ran above it (178.5), and one every two layers the same or
+            // slightly under. An MoE layer is cut the same way: its dispatch
+            // flushes only on `expert_lre::flush_schedule`'s doubling cadence,
+            // which was measured for Flash-Next's own sweep, not this one.
+            dev.flush_launches()?;
+        }
+
+        // A window that stops short hands its residual on as it stands, on the
+        // forward span, with the span's guard: the driver moves it to the next
+        // segment or the creep's arena while the guard still holds it.
+        if layer_end < num_layers {
+            return Ok((WavePhase::Residual(x), head_span));
+        }
+
+        // Head over the rows that need logits: every decode row (one token each,
+        // flat positions `0..n_decode`) and the last token of every prefill row
+        // (within the prefill slice `[n_decode, n_decode + pre_rows)`). Glue rows
+        // are excluded — they only scattered K/V.
+        let x_tensor = x.to_tensor();
+        let hidden = x_tensor.dim(2)?;
+        let x_flat = x_tensor.reshape((x_tensor.dim(1)?, hidden))?;
+        let mut idx: Vec<u32> = Vec::with_capacity(n_decode + n_prefill);
+        for d in 0..n_decode {
+            idx.push(d as u32);
+        }
+        let mut acc = n_decode as u32;
+        for &l in pre_q {
+            acc += l as u32;
+            idx.push(acc - 1);
+        }
+        // A glue-only wave (no decode/prefill rows) has nothing to head — the K/V
+        // scatter already happened in the layer loop. Return the residual buffer;
+        // the glue caller discards the `WaveStep` (it only needs the side effect).
+        // It is on the forward span, so the span's guard goes back with it.
+        if idx.is_empty() {
+            return Ok((WavePhase::Residual(x), head_span));
+        }
+        let pre_norm = select_head_rows(&x_flat, idx, 0, fwd_ticket)?;
+        // The head runs on the forward's span, opened before the embedding.
+        //
+        // Seeded from `wave_root`, which yields a `Backing` carrying a ticket
+        // rather than a borrow of the guard. That distinction is the whole
+        // mechanism: a borrow would bind `'w` to this scope and the logits could
+        // not be returned at all, while a ticket leaves them `'static`-typed and
+        // physically on the span. What makes that sound is handing the guard back
+        // with them, so the span cannot be reclaimed while the caller holds the
+        // values — see `WaveResult`.
+        let logits = {
+            #[cfg(feature = "cuda")]
+            {
+                let proj = self.model.output_proj();
+                let acts = self.model.final_norm().forward_dynamic(
+                    &pre_norm,
+                    proj.int8mode(),
+                    wave_root_ticketed(fwd_ticket),
+                )?;
+                proj.forward_dynamic(acts.as_dynamic(), pre_norm.dtype())?
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let normed = self.model.final_norm().forward(&pre_norm)?;
+                self.model.output_proj().forward(&normed)?
+            }
+        };
+        Ok((
+            WavePhase::Logits(TensorCat::from_cat_tensor(logits, 0)?),
+            head_span,
+        ))
+    }
+
+    /// Compute RoPE (cos, sin) for a batch of sequences.
+    ///
+    /// For decode (seq_len == 1): Returns gathered (cos, sin) at each offset position.
+    /// For prefill (seq_len > 1): Returns (cos, sin) reshaped for batch processing.
+    pub(super) fn compute_rope_for_batch(
+        &self,
+        offsets: &[usize],
+        q_lens: &[usize],
+        dtype: DType,
+    ) -> Result<(Tensor, Tensor)> {
+        use super::super::decode_utils;
+
+        // Required RoPE table length = max over sequences of (offset + q_len).
+        let required_len = offsets
+            .iter()
+            .zip(q_lens.iter())
+            .map(|(&o, &l)| o + l)
+            .max()
+            .unwrap_or(1);
+
+        // RoPE doesn't support F8E4M3, use BF16 instead
+        let rope_dtype = if dtype == DType::F8E4M3 {
+            DType::BF16
+        } else {
+            dtype
+        };
+
+        // Get RoPE tables (may extend if needed)
+        let (cos_all, sin_all) = self.get_rope_tables(rope_dtype, required_len)?;
+
+        // Decode is the uniform single-token case (every q_len == 1): gather the
+        // (cos, sin) at the per-sequence offsets → [b_sz, rotary].
+        if q_lens.iter().all(|&l| l == 1) {
+            let offsets_t = decode_utils::offsets_to_u32_tensor(offsets, self.model.device())?;
+            return decode_utils::gather_rope_cos_sin(&cos_all, &sin_all, &offsets_t);
+        }
+
+        // Prefill: ragged per-token positions flat-packed in cu_seqlens order.
+        // Sequence i's new tokens occupy absolute positions [off_i, off_i+q_len_i).
+        let total: usize = q_lens.iter().sum();
+        let mut pos = Vec::with_capacity(total);
+        for (&off, &l) in offsets.iter().zip(q_lens.iter()) {
+            for i in 0..l {
+                pos.push((off + i) as u32);
+            }
+        }
+        let pos_flat = Tensor::from_vec(pos, (total,), self.model.device())?;
+
+        let mut cos = cos_all.index_select(&pos_flat, 0)?;
+        let mut sin = sin_all.index_select(&pos_flat, 0)?;
+        if !cos.is_contiguous() {
+            cos = cos.contiguous()?;
+        }
+        if !sin.is_contiguous() {
+            sin = sin.contiguous()?;
+        }
+
+        // [total, rotary] -> [1, total, rotary] to match the flat [1, total, …]
+        // activation (batch-of-one); the non-paged rope() consumes it directly.
+        let rotary_dim = cos.dim(1)?;
+        let cos = cos.reshape((1, total, rotary_dim))?;
+        let sin = sin.reshape((1, total, rotary_dim))?;
+
+        Ok((cos, sin))
+    }
+}

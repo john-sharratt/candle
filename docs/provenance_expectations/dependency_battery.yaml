@@ -41,16 +41,16 @@ messages:
     should:
       - candle/candle-core/src/quantized/cuda/bucketize.rs
       - candle/candle-kernels/src/simple/moe_bucketize.cu
-      - candle/candle-transformers/src/models/expert_lre/dispatch.rs
+      - candle/candle-transformers/src/models/expert_lre/dispatch/launch.rs
     should_not: ["candle/docs/results/*"]
   - starts: "In the expert cache, where is `set_eviction_costs` defined"
     should:
-      - candle/candle-transformers/src/models/expert_lre/cache.rs
-      - candle/candle-transformers/src/models/expert_lre/pipeline.rs
+      - candle/candle-transformers/src/models/expert_lre/cache/bookkeeping.rs
+      - candle/candle-transformers/src/models/expert_lre/pipeline/ring.rs
     should_not: ["candle/docs/results/*"]
   - starts: "What is the value of `PINNED_LAYERS`"
     should:
-      - candle/candle-transformers/src/models/expert_lre/cache.rs
+      - candle/candle-transformers/src/models/expert_lre/cache/policy.rs
       - candle/candle-transformers/src/models/qwen35/layer_loader.rs
     should_not: ["candle/docs/results/*"]
   - starts: "Where is `FoldParams::derive` defined"
@@ -79,13 +79,13 @@ messages:
   - starts: "Trace how a MoE layer's routing reaches the expert kernels"
     should:
       - candle/candle-kernels/src/simple/moe_bucketize.cu
-      - candle/candle-transformers/src/models/expert_lre/dispatch.rs
+      - candle/candle-transformers/src/models/expert_lre/dispatch/launch.rs
       - candle/candle-transformers/src/models/expert_lre/stager.rs
       - candle/docs/moe_live_dispatch_design.md
     should_not: ["candle/docs/results/*"]
   - starts: "Trace why the experts of the first two MoE layers"
     should:
-      - candle/candle-transformers/src/models/expert_lre/cache.rs
+      - candle/candle-transformers/src/models/expert_lre/cache/policy.rs
       - candle/candle-transformers/src/models/expert_lre/startup.rs
     should_not: ["candle/docs/results/*"]
   - starts: "Which configuration fields decide when a conversation reprojects"
@@ -136,7 +136,7 @@ messages:
     should_not: ["candle/docs/results/*"]
   - starts: "When a decoded turn is sealed, what happens to its thinking tokens"
     should:
-      - candle/candle-conversation/src/turn_layout.rs
+      - candle/candle-conversation/src/turn_layout/mod.rs
     should_not: ["candle/docs/results/*"]
   - starts: "Persistence is mandatory for the conversation substrate"
     should:

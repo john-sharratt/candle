@@ -66,11 +66,11 @@ questions:
       Where is the Rust wrapper `moe_bucketize` defined, which CUDA source
       holds the kernel it launches, and which model code calls it to dispatch
       experts?
-    expect: [bucketize.rs, moe_bucketize.cu, dispatch.rs, dspark_experts.rs]
+    expect: [bucketize.rs, moe_bucketize.cu, launch.rs, dspark_experts.rs]
     files:
       - candle-core/src/quantized/cuda/bucketize.rs
       - candle-kernels/src/simple/moe_bucketize.cu
-      - candle-transformers/src/models/expert_lre/dispatch.rs
+      - candle-transformers/src/models/expert_lre/dispatch/launch.rs
       - candle-transformers/src/models/latent_moe/dspark_experts.rs
 
   - id: d6
@@ -78,16 +78,16 @@ questions:
     question: >-
       In the expert cache, where is `set_eviction_costs` defined and which
       file calls it?
-    expect: [cache.rs, pipeline.rs]
-    files: [candle-transformers/src/models/expert_lre/cache.rs, candle-transformers/src/models/expert_lre/pipeline.rs]
+    expect: [bookkeeping.rs, ring.rs]
+    files: [candle-transformers/src/models/expert_lre/cache/bookkeeping.rs, candle-transformers/src/models/expert_lre/pipeline/ring.rs]
 
   - id: d7
     category: direct
     question: >-
       What is the value of `PINNED_LAYERS`, where is it defined, and which
       model loader uses it?
-    expect: ["= 2|is 2|of 2|two", cache.rs, layer_loader.rs]
-    files: [candle-transformers/src/models/expert_lre/cache.rs, candle-transformers/src/models/qwen35/layer_loader.rs]
+    expect: ["= 2|is 2|of 2|two", policy.rs, layer_loader.rs]
+    files: [candle-transformers/src/models/expert_lre/cache/policy.rs, candle-transformers/src/models/qwen35/layer_loader.rs]
 
   - id: d8
     category: direct
@@ -147,7 +147,8 @@ questions:
     expect: [bucketize, "mapped|pinned", stager, cold]
     files:
       - candle-kernels/src/simple/moe_bucketize.cu
-      - candle-transformers/src/models/expert_lre/dispatch.rs
+      - candle-transformers/src/models/expert_lre/dispatch/launch.rs
+      - candle-transformers/src/models/expert_lre/dispatch/ring.rs
       - candle-transformers/src/models/expert_lre/stager.rs
 
   - id: t5
@@ -157,7 +158,7 @@ questions:
       from the constant, through the victim search that skips them, to the
       startup code that places them.
     expect: [PINNED_LAYERS, best_victim, startup.rs]
-    files: [candle-transformers/src/models/expert_lre/cache.rs, candle-transformers/src/models/expert_lre/startup.rs]
+    files: [candle-transformers/src/models/expert_lre/cache/policy.rs, candle-transformers/src/models/expert_lre/startup.rs]
 
   - id: t6
     category: transitive
@@ -236,7 +237,7 @@ questions:
       Which hot-path invariant forbids reading MoE routing back to the host,
       and which kernel's output replaces that readback?
     expect: ["readback|GPU→CPU|GPU-to-CPU|host", bucketize]
-    files: [candle-kernels/src/simple/moe_bucketize.cu, candle-transformers/src/models/expert_lre/dispatch.rs]
+    files: [candle-kernels/src/simple/moe_bucketize.cu, candle-transformers/src/models/expert_lre/dispatch/launch.rs]
 
   - id: a6
     category: architectural
@@ -252,7 +253,7 @@ questions:
       When a decoded turn is sealed, what happens to its thinking tokens, and
       which module states that contract?
     expect: ["re-prefill|reprefill|prefill", think, turn_layout]
-    files: [candle-conversation/src/turn_layout.rs]
+    files: [candle-conversation/src/turn_layout/mod.rs]
 
   - id: a8
     category: architectural

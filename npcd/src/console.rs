@@ -540,11 +540,24 @@ mod tests {
     /// what it must not do is stand behind a daemon that means it.
     #[test]
     fn the_daemon_has_no_fixture_behind_it() {
-        // `main.rs` parses the flags; `tenant.rs` assembles the routes.
-        for file in ["src/main.rs", "src/tenant.rs"] {
-            let source =
-                std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(file))
-                    .expect(file);
+        // `main.rs` parses the flags; the `tenant` module assembles the routes.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec!["src/main.rs".to_string()];
+        let mut tenant: Vec<String> = std::fs::read_dir(root.join("src/tenant"))
+            .expect("src/tenant")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".rs"))
+            .map(|n| format!("src/tenant/{n}"))
+            .collect();
+        tenant.sort();
+        assert!(
+            tenant.iter().any(|f| f.ends_with("/mod.rs")),
+            "the tenant module"
+        );
+        files.extend(tenant);
+        for file in files.iter().map(String::as_str) {
+            let source = std::fs::read_to_string(root.join(file)).expect(file);
             for line in source.lines() {
                 // Comments explaining the removal are the point; code is not.
                 let code = line.trim_start();

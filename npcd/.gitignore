@@ -10,8 +10,9 @@
 # Worlds and personalities have no such problem: they are fiction, and being
 # diffable and reviewable is the whole point of putting them here. They live in
 # a mind now (`--mind`), so what lands here is whatever a daemon run without one
-# is given.
-accounts/
+# is given. Anchored, like `/images/` below: it names the data directory's
+# `accounts/` and no other, and `src/accounts/` is code.
+/accounts/
 
 # Effector device tokens — one opaque secret per character, the whole of the
 # device surface's auth (see `src/effector/token.rs`). A token is a credential,

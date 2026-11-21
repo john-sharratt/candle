@@ -51,7 +51,8 @@ messages:
       - candle/docs/unbounded_agents.md
       - candle/docs/performance.md
       - candle/candle-nn/src/kv_cache/chunked/compression_policy.rs
-      - candle/candle-nn/src/kv_cache/chunked/sampled_selection/params.rs
+      - candle/candle-nn/src/kv_cache/chunked/sampled_selection/params/moe_factors.rs
+      - candle/candle-nn/src/kv_cache/chunked/sampled_selection/params/dense_factors.rs
       - candle/candle-conversation/src/provenance/wide_sig.rs
       - candle/candle-conversation/src/projection/project/emit.rs
       - candle/candle-conversation/src/config/sequence_config.rs
