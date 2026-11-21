@@ -110,7 +110,7 @@ pub fn report(device: &Device) -> Result<Vec<Finding>> {
     if !all.iter().any(Finding::is_bad) {
         static CLEAN: AtomicU64 = AtomicU64::new(0);
         let n = CLEAN.fetch_add(1, Ordering::Relaxed) + 1;
-        if n % HEARTBEAT_EVERY == 0 {
+        if n.is_multiple_of(HEARTBEAT_EVERY) {
             if let Some(line) = heartbeat(n, &all) {
                 tracing::info!(target: "candle_core::tensor_assert", "{line}");
             }
