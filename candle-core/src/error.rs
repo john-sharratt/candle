@@ -252,16 +252,7 @@ impl Error {
     }
 
     pub fn bt(self) -> Self {
-        self.with_backtrace(std::backtrace::Backtrace::capture())
-    }
-
-    /// [`Self::bt`] whatever the environment says: the stack is taken even
-    /// when `RUST_BACKTRACE` is unset, as it is in every service keep runs.
-    pub fn bt_forced(self) -> Self {
-        self.with_backtrace(std::backtrace::Backtrace::force_capture())
-    }
-
-    fn with_backtrace(self, backtrace: std::backtrace::Backtrace) -> Self {
+        let backtrace = std::backtrace::Backtrace::capture();
         match backtrace.status() {
             std::backtrace::BacktraceStatus::Disabled
             | std::backtrace::BacktraceStatus::Unsupported => self,

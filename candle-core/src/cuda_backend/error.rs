@@ -1,6 +1,10 @@
 #[cfg(feature = "tensor-assert")]
+use std::panic::Location;
+#[cfg(feature = "tensor-assert")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[cfg(feature = "tensor-assert")]
+use super::last_cuda_kernel_launch;
 use crate::{DType, Layout};
 
 /// cudarc related errors
@@ -51,77 +55,78 @@ pub enum CudaError {
 impl From<CudaError> for crate::Error {
     fn from(val: CudaError) -> Self {
         note_sticky_cuda_fault(&val);
-        traced(crate::Error::Cuda(Box::new(val)))
+        crate::Error::Cuda(Box::new(val)).bt()
     }
 }
 
-/// How many of a `tensor-assert` build's CUDA errors carry their stack.
+/// How many of a `tensor-assert` build's failed CUDA calls are logged with the
+/// call site that made them.
 ///
 /// **The first failing call names itself.** A diagnostic motherd on WhiteWorld
 /// failed its first wave on `CUDA_ERROR_INVALID_VALUE` and every wave after on
 /// the capture it left open, and the log said neither which call refused nor
-/// from where: services run without `RUST_BACKTRACE`. The first few errors of
-/// the process are the ones worth a stack; once a stream is wedged, thousands
-/// follow a second, and a stack on each would be the whole log.
+/// where it was made: a release stack has no symbols, and the error carries no
+/// site. The first few failures of the process are the ones worth naming; once
+/// a stream is wedged, thousands follow a second. The error itself is returned
+/// unchanged, so nothing that matches on it behaves differently.
 #[cfg(feature = "tensor-assert")]
-const TRACED_CUDA_ERRORS: usize = 32;
+const NAMED_CUDA_FAILURES: usize = 32;
 
-/// `e` with its stack: forced for a `tensor-assert` build's first
-/// [`TRACED_CUDA_ERRORS`], as the environment says otherwise.
-fn traced(e: crate::Error) -> crate::Error {
-    #[cfg(feature = "tensor-assert")]
-    {
-        static TRACED: AtomicUsize = AtomicUsize::new(0);
-        traced_by(e, &TRACED)
-    }
-    #[cfg(not(feature = "tensor-assert"))]
-    e.bt()
-}
-
-/// [`traced`] against `count`, the errors traced so far.
+/// Log `cuda`, raised by the call at `at`, while fewer than
+/// [`NAMED_CUDA_FAILURES`] have been — counted by `count`. Says whether it did.
 #[cfg(feature = "tensor-assert")]
-fn traced_by(e: crate::Error, count: &AtomicUsize) -> crate::Error {
-    match count.fetch_add(1, Ordering::Relaxed) < TRACED_CUDA_ERRORS {
-        true => e.bt_forced(),
-        false => e.bt(),
+fn name_failure(cuda: &CudaError, at: &Location<'static>, count: &AtomicUsize) -> bool {
+    if count.fetch_add(1, Ordering::Relaxed) >= NAMED_CUDA_FAILURES {
+        return false;
     }
+    tracing::error!(
+        target: "candle_core::cuda_backend",
+        at = %at,
+        error = %cuda,
+        last_kernels = %last_cuda_kernel_launch(),
+        "a CUDA call failed"
+    );
+    true
 }
 
 #[cfg(all(test, feature = "tensor-assert"))]
-mod traced_tests {
+mod named_tests {
     use super::*;
 
-    /// **A diagnostic build's first CUDA errors carry their stack** with no
-    /// `RUST_BACKTRACE` set, and once [`TRACED_CUDA_ERRORS`] have, the rest
-    /// carry what the environment asks for.
+    /// **A diagnostic build names its first failed CUDA calls, and only
+    /// those**: once [`NAMED_CUDA_FAILURES`] have been logged, a wedged stream's
+    /// thousands of refusals a second are not.
     #[test]
-    fn the_first_cuda_errors_carry_their_stack() {
+    fn the_first_failed_cuda_calls_are_named() {
         let count = AtomicUsize::new(0);
-        let error = || crate::Error::Cuda(Box::new(CudaError::InternalError("x".into())));
-        for _ in 0..TRACED_CUDA_ERRORS {
-            assert!(matches!(
-                traced_by(error(), &count),
-                crate::Error::WithBacktrace { .. }
-            ));
+        let cuda = CudaError::InternalError("refused".into());
+        let at = Location::caller();
+        for _ in 0..NAMED_CUDA_FAILURES {
+            assert!(name_failure(&cuda, at, &count));
         }
-        assert_eq!(
-            std::mem::discriminant(&traced_by(error(), &count)),
-            std::mem::discriminant(&error().bt()),
-            "past the first, what the environment asks for"
-        );
+        assert!(!name_failure(&cuda, at, &count), "past the first, unnamed");
     }
 }
 
 pub trait WrapErr<O> {
+    #[track_caller]
     fn w(self) -> std::result::Result<O, crate::Error>;
 }
 
 impl<O, E: Into<CudaError>> WrapErr<O> for std::result::Result<O, E> {
+    #[track_caller]
     fn w(self) -> std::result::Result<O, crate::Error> {
+        #[cfg(feature = "tensor-assert")]
+        let at = Location::caller();
         // Route through `From<CudaError>` so the poison detection below runs on
         // every CUDA error path, not just the direct `?`/`From` ones.
         self.map_err(|e| {
             let cuda: CudaError = e.into();
+            #[cfg(feature = "tensor-assert")]
+            {
+                static NAMED: AtomicUsize = AtomicUsize::new(0);
+                name_failure(&cuda, at, &NAMED);
+            }
             crate::Error::from(cuda)
         })
     }
