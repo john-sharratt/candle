@@ -104,13 +104,24 @@ eviction only. Deferred while pinned, an active conversation's own turns
 reached the redo log only once it went quiet, and a member killed mid-answer
 came back with their tokens and no K/V (BlackWorld, 2026-11-21).
 
-**A hole no catch-up fills ends the request.** Resume waits up to 120 s only
-for a *gap* — another member's turn still arriving. A turn that is empty and no
-gap — this member's own, sealed in the second or two before a crash with its
-K/V still queued, or retired in place — no member holds. Resumed over, the
-round would answer as if it had never been said; left to "one that does", it
-stayed unfinished forever. Its entries are retracted (`resume::abandon`) and the
-conversation stands at its last sealed round for the next message.
+**A hole no catch-up fills is asked over.** Resume waits up to 120 s only for
+a *gap* — another member's turn still arriving. A turn that is empty and no gap
+— this member's own, sealed in the second or two before a crash with its K/V
+still queued, or retired in place — no member holds. A round cannot carry on
+over a history missing turns, and left to "one that does" it stayed unfinished
+forever. So the request is **asked again**: its opening message — the last one
+the user wrote, never a tool round's results (`resume::opening_message`) — runs
+as a first round over the turns that are whole, its tools again under
+`Dispatch::Resumed` (`resume::reask`). A request with no message to ask ends at
+its last sealed round (`resume::abandon`).
+
+**A request cut off with no entry left** — its entries retracted, as the build
+before re-asking did — is resumed on asking: `POST /v1/conversations/:id/resume`
+(`api::resume`, `ZendSession::resume_request`) resumes by the entries when they
+stand, and otherwise reads the history: a last message that made tool calls,
+or a tool round's results, with no answer after it, is cut off and asked again
+from its opening message (`resume::cut_off_request`). A request whose last
+answer called nothing ended, and is refused (`409`).
 
 ## 7. Tests
 

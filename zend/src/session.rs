@@ -5819,6 +5819,57 @@ fn resume_handed_turns(session: Arc<ZendSession>, state: Arc<InferenceState>) {
     });
 }
 
+/// What `POST /v1/conversations/:id/resume` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeAsked {
+    /// Its request is resuming here.
+    Resuming,
+    /// A turn of it is running now.
+    Live,
+    /// Its request ended: nothing to resume.
+    Finished,
+    /// The model is not loaded yet.
+    NotLoaded,
+}
+
+impl ZendSession {
+    /// Resume `conv_id`'s request if it was cut off: by its entries, as the
+    /// boot scan does, or — when they were retracted — by its history, a last
+    /// message that is a call no turn answers or a tool round no answer
+    /// follows, asked again from its opening message
+    /// (`resume::cut_off_request`). Started in the background; a request that
+    /// ended is never asked twice.
+    pub fn resume_request(self: &Arc<Self>, conv_id: &str) -> ResumeAsked {
+        let Some(state) = self.inference.load_full() else {
+            return ResumeAsked::NotLoaded;
+        };
+        if self.live_turn(conv_id).is_some() {
+            return ResumeAsked::Live;
+        }
+        let timeline = timeline_for(conv_id);
+        if resume::unfinished(&state.engine, timeline).is_none() {
+            let history = dialogue_history(&state, conv_id);
+            let made_calls = |text: &str| !extract_tool_calls(text).is_empty();
+            match resume::cut_off_request(&history, made_calls) {
+                Some(message) => {
+                    tracing::info!(
+                        conv_id = %conv_id,
+                        "resume: asked to resume a request cut off with no entry; it is asked \
+                         again from its opening message",
+                    );
+                    resume::reask(&state.engine, timeline, &message);
+                }
+                None => return ResumeAsked::Finished,
+            }
+        }
+        let (session, conv_id) = (Arc::clone(self), conv_id.to_string());
+        tokio::spawn(async move {
+            resume_conversation(&session, &state, timeline, &conv_id).await;
+        });
+        ResumeAsked::Resuming
+    }
+}
+
 /// Resume what `conv_id`'s request left unfinished — a tool round, or its
 /// first round's message — on this member, under the conversation's claim.
 /// `true` when a turn ran. A conversation with nothing unfinished has its
@@ -5833,7 +5884,7 @@ async fn resume_conversation(
         return false;
     };
     let engine = &state.engine;
-    let Some(unfinished) = resume::unfinished(engine, timeline) else {
+    let Some(mut unfinished) = resume::unfinished(engine, timeline) else {
         // The round's response turn is in the substrate, so the round
         // completed and the entry outlived it. Retract it.
         if let Some(call_turn) = resume::marked_call_turn(engine, timeline) {
@@ -5928,24 +5979,48 @@ async fn resume_conversation(
             turn_claims::release(claim, conv_id).await;
             return false;
         }
-        // **A hole only this member could have filled ends the request.** Its
-        // own turn whose K/V died with the process before it was written, or
-        // one retired in place: no member holds it, so leaving the request to
-        // "one that does" left it unfinished forever — the chat looking
-        // mid-answer to its reader, and every sweep passing it over
-        // (BlackWorld, 2026-11-21). The conversation stands at its last sealed
-        // round for the next message.
-        Wholeness::Lost => {
-            tracing::warn!(
+        // **A hole only this member could have filled is asked over, not
+        // waited for.** Its own turn whose K/V died with the process before it
+        // was written, or one retired in place: no member holds it, so leaving
+        // the request to "one that does" left it unfinished forever — the chat
+        // looking mid-answer to its reader, and every sweep passing it over
+        // (BlackWorld, 2026-11-21). A round cannot carry on over a history
+        // missing turns, but the request can be asked again: its opening
+        // message runs as a first round, over the turns that are whole, its
+        // tools again under `Dispatch::Resumed`. A request with no message to
+        // ask ends at its last sealed round.
+        Wholeness::Lost => match &unfinished {
+            Unfinished::Message(_) => tracing::warn!(
                 conv_id = %conv_id,
-                ?unfinished,
-                "resume: a turn of the conversation is lost here and no member holds it; the \
-                 request is ended at its last sealed round",
-            );
-            resume::abandon(engine, timeline);
-            turn_claims::release(claim, conv_id).await;
-            return false;
-        }
+                "resume: a turn of the conversation is lost here; its request is asked again \
+                 over the turns that are whole",
+            ),
+            Unfinished::Round(_) => {
+                match resume::opening_message(&dialogue_history(state, conv_id)) {
+                    Some(message) => {
+                        tracing::warn!(
+                            conv_id = %conv_id,
+                            ?unfinished,
+                            "resume: a turn of the conversation is lost here and no member \
+                             holds it; the request is asked again from its opening message",
+                        );
+                        resume::reask(engine, timeline, &message);
+                        unfinished = Unfinished::Message(message);
+                    }
+                    None => {
+                        tracing::warn!(
+                            conv_id = %conv_id,
+                            ?unfinished,
+                            "resume: a turn of the conversation is lost here and its request \
+                             has no message to ask again; it is ended at its last sealed round",
+                        );
+                        resume::abandon(engine, timeline);
+                        turn_claims::release(claim, conv_id).await;
+                        return false;
+                    }
+                }
+            }
+        },
     }
     // Read again under the claim: a member that held it until a moment ago
     // may have finished the request in between.

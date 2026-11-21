@@ -73,6 +73,30 @@ pub(crate) fn chunk_members(
     (first, &order[first.min(end)..end])
 }
 
+/// Fill `records` in order with `read(i, row, expert)`, stopping before the
+/// next one once `cancel` is set. Whether every record landed.
+pub(crate) fn fill(
+    records: &[(usize, usize)],
+    cancel: &AtomicBool,
+    mut read: impl FnMut(usize, usize, usize) -> Result<(), String>,
+) -> bool {
+    for (i, &(row, expert)) in records.iter().enumerate() {
+        if cancel.load(Ordering::Acquire) {
+            return false;
+        }
+        if let Err(e) = read(i, row, expert) {
+            tracing::warn!(
+                target: "candle_transformers::expert_lre",
+                row,
+                expert,
+                "elastic warm tier: a fill's pack read failed: {e}"
+            );
+            return false;
+        }
+    }
+    true
+}
+
 /// What the controller is given.
 pub(crate) struct ControllerCtx {
     pub(crate) warm: Arc<WarmTier>,
@@ -153,10 +177,35 @@ impl Change {
     }
 }
 
+/// A grown chunk being filled from the pack, on a thread of its own.
+///
+/// **The controller never waits on a fill.** A gigabyte of pack reads takes
+/// 1.5–12 s, longer on a machine short of RAM, and a fill run on the
+/// controller's thread stopped its ticks for as long: on WhiteWorld
+/// (2026-11-21, balloon run 3) a 14 GiB build took free RAM from 8.6 GiB to
+/// none in 11 s while a fill held the controller, and the first shed came 13 s
+/// after the RAM was gone. Shed while filling, the chunk is the first to go:
+/// the fill stops at its next record and the chunk is freed unpublished.
+struct Filling {
+    chunk: usize,
+    first: usize,
+    experts: Vec<(usize, usize)>,
+    cancel: Arc<AtomicBool>,
+    /// `true` once every record landed, `false` when the fill stopped short.
+    done: mpsc::Receiver<bool>,
+    started: Instant,
+    /// A shrink decided while filling: segments still to give back once the
+    /// filling chunk has gone, and why.
+    owed: Option<(usize, ShrinkReason)>,
+    /// The held count the grow was decided at, for a refusal.
+    held: usize,
+}
+
 struct Controller {
     ctx: ControllerCtx,
     policy: Policy,
     draining: Option<Draining>,
+    filling: Option<Filling>,
     pressed: bool,
     available: u64,
     ticks: u64,
@@ -168,6 +217,7 @@ impl Controller {
             ctx,
             policy: Policy::new(),
             draining: None,
+            filling: None,
             pressed: false,
             available: 0,
             ticks: 0,
@@ -210,6 +260,9 @@ impl Controller {
     /// One tick. `false` once the stager is gone.
     fn tick(&mut self) -> bool {
         self.ticks += 1;
+        if !self.poll_fill() {
+            return false;
+        }
         if self.draining.is_some() && !self.nudge() {
             return false;
         }
@@ -232,20 +285,25 @@ impl Controller {
         );
         let change = match decision {
             Decision::Hold => Change::None,
-            Decision::Grow { press } if self.draining.is_none() => {
-                match self.grow(press, limits.held) {
-                    Some(c) => c,
-                    None => return false,
-                }
+            Decision::Grow { press } if self.draining.is_none() && self.filling.is_none() => {
+                self.grow(press, limits.held)
             }
-            // A grow while a shrink drains waits for the next quiet tick.
+            // A grow while a shrink drains, or a fill runs, waits for a later
+            // quiet tick.
             Decision::Grow { .. } => Change::None,
             Decision::Shrink { segments, reason } => {
-                match &mut self.draining {
-                    Some(d) => d.remaining += segments,
-                    None => {
-                        if !self.begin_shrink(segments - 1, reason) {
-                            return false;
+                if let Some(f) = &mut self.filling {
+                    // The filling chunk goes first, once its fill has stopped.
+                    f.cancel.store(true, Ordering::Release);
+                    let owed = f.owed.map_or(0, |o| o.0);
+                    f.owed = Some((owed + segments, reason));
+                } else {
+                    match &mut self.draining {
+                        Some(d) => d.remaining += segments,
+                        None => {
+                            if !self.begin_shrink(segments - 1, reason) {
+                                return false;
+                            }
                         }
                     }
                 }
@@ -258,10 +316,11 @@ impl Controller {
         true
     }
 
-    /// Take one chunk: allocate it, fill it from the pack, then hand its
-    /// experts to the stager, which publishes them. `press` first, when free
-    /// RAM alone cannot pay for it. `None` once the stager is gone.
-    fn grow(&mut self, press_first: bool, held: usize) -> Option<Change> {
+    /// Take one chunk: allocate it and start its fill from the pack on a
+    /// thread of its own ([`Filling`]); [`Self::poll_fill`] hands its experts
+    /// to the stager once it lands. `press` first, when free RAM alone cannot
+    /// pay for it.
+    fn grow(&mut self, press_first: bool, held: usize) -> Change {
         let paged = self.ctx.warm.paged();
         if press_first {
             self.pressed = press(paged.chunk_bytes() as usize);
@@ -271,7 +330,7 @@ impl Controller {
             let after = available_physical_ram().unwrap_or(0);
             if !press_made_room(after, paged.chunk_bytes()) {
                 self.policy.refused(held);
-                return Some(Change::Refused);
+                return Change::Refused;
             }
         }
         let chunk = paged.chunks();
@@ -279,40 +338,106 @@ impl Controller {
         let (first, experts) = chunk_members(&self.ctx.order, pinned, paged.per_chunk(), chunk);
         if experts.len() < paged.per_chunk() || !paged.grow() {
             self.policy.refused(held);
-            return Some(Change::Refused);
-        }
-        let started = Instant::now();
-        for (i, &(row, expert)) in experts.iter().enumerate() {
-            // SAFETY: the chunk was appended above and nothing names its slots
-            // until the stager publishes them; this thread is the only writer.
-            let dest = unsafe { paged.slot_mut(first - pinned + i) };
-            if let Err(e) = self.ctx.pack.read_into(row, expert, dest) {
-                tracing::warn!(
-                    target: "candle_transformers::expert_lre",
-                    "elastic warm tier: a grow's pack read failed, the chunk is given back: {e}"
-                );
-                paged.pop();
-                self.policy.refused(held);
-                return Some(Change::Refused);
-            }
+            return Change::Refused;
         }
         let experts = experts.to_vec();
-        if self
-            .ctx
-            .stager
-            .send(StagerMsg::PagedGrown { first, experts })
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, done) = mpsc::channel();
+        let filler = {
+            let (warm, pack, cancel) = (
+                Arc::clone(&self.ctx.warm),
+                Arc::clone(&self.ctx.pack),
+                Arc::clone(&cancel),
+            );
+            let records = experts.clone();
+            let slot0 = first - pinned;
+            move || {
+                let filled = fill(&records, &cancel, |i, row, expert| {
+                    // SAFETY: the chunk was appended before this thread began
+                    // and nothing names its slots until the stager publishes
+                    // them; this thread is their only writer, and the chunk is
+                    // freed only once it has said it is done.
+                    let dest = unsafe { warm.paged().slot_mut(slot0 + i) };
+                    pack.read_into(row, expert, dest).map_err(|e| e.to_string())
+                });
+                let _ = tx.send(filled);
+            }
+        };
+        if std::thread::Builder::new()
+            .name("warm-tier-fill".into())
+            .spawn(filler)
             .is_err()
         {
-            return None;
+            paged.pop();
+            self.policy.refused(held);
+            return Change::Refused;
         }
-        tracing::info!(
-            target: "candle_transformers::expert_lre",
+        self.filling = Some(Filling {
             chunk,
-            fill_ms = started.elapsed().as_millis() as u64,
-            "warm tier: elastic chunk filled"
-        );
-        self.gauges(|s| s.warm_grown += 1);
-        Some(Change::Grow)
+            first,
+            experts,
+            cancel,
+            done,
+            started: Instant::now(),
+            owed: None,
+            held,
+        });
+        Change::Grow
+    }
+
+    /// Look at a fill in flight: landed, its experts go to the stager to
+    /// publish; stopped short — cancelled by a shrink, or a read that failed —
+    /// the chunk is freed unpublished, and a shrink owed drains on. `false`
+    /// once the stager is gone.
+    fn poll_fill(&mut self) -> bool {
+        let landed = match self.filling.as_ref().map(|f| f.done.try_recv()) {
+            None | Some(Err(mpsc::TryRecvError::Empty)) => return true,
+            Some(Ok(landed)) => landed,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => false,
+        };
+        let Some(f) = self.filling.take() else {
+            return true;
+        };
+        if landed && f.owed.is_none() {
+            tracing::info!(
+                target: "candle_transformers::expert_lre",
+                chunk = f.chunk,
+                fill_ms = f.started.elapsed().as_millis() as u64,
+                "warm tier: elastic chunk filled"
+            );
+            self.gauges(|s| s.warm_grown += 1);
+            return self
+                .ctx
+                .stager
+                .send(StagerMsg::PagedGrown {
+                    first: f.first,
+                    experts: f.experts,
+                })
+                .is_ok();
+        }
+        self.ctx.warm.paged().pop();
+        match f.owed {
+            Some((segments, reason)) => {
+                tracing::info!(
+                    target: "candle_transformers::expert_lre",
+                    chunk = f.chunk,
+                    fill_ms = f.started.elapsed().as_millis() as u64,
+                    reason = reason.name(),
+                    "warm tier: elastic fill stopped for a shrink; its chunk is freed unpublished"
+                );
+                // The filling chunk was the first of them.
+                segments <= 1 || self.begin_shrink(segments - 2, reason)
+            }
+            None => {
+                tracing::warn!(
+                    target: "candle_transformers::expert_lre",
+                    chunk = f.chunk,
+                    "elastic warm tier: a grow's pack read failed, the chunk is given back"
+                );
+                self.policy.refused(f.held);
+                true
+            }
+        }
     }
 
     /// Ask the stager to drain the last chunk, `then` more after it. `false`
@@ -452,6 +577,42 @@ mod tests {
             0,
             "all pinned"
         );
+    }
+
+    /// **A fill stops at the record after a cancel**, and at a read that
+    /// fails; one that runs to the end says so.
+    #[test]
+    fn a_fill_stops_at_the_next_record_once_cancelled() {
+        let records: Vec<(usize, usize)> = (0..5).map(|e| (1, e)).collect();
+        let cancel = AtomicBool::new(false);
+        let mut read = Vec::new();
+        assert!(fill(&records, &cancel, |i, _, _| {
+            read.push(i);
+            Ok(())
+        }));
+        assert_eq!(read, vec![0, 1, 2, 3, 4]);
+
+        let mut read = Vec::new();
+        assert!(!fill(&records, &cancel, |i, _, _| {
+            read.push(i);
+            if i == 1 {
+                cancel.store(true, Ordering::Release);
+            }
+            Ok(())
+        }));
+        assert_eq!(read, vec![0, 1], "no record read past the cancel");
+
+        let cancel = AtomicBool::new(false);
+        let mut read = Vec::new();
+        assert!(!fill(&records, &cancel, |i, _, _| {
+            read.push(i);
+            if i == 2 {
+                Err("the pack is gone".into())
+            } else {
+                Ok(())
+            }
+        }));
+        assert_eq!(read, vec![0, 1, 2]);
     }
 
     /// A press made room only if the headroom and a whole chunk are free

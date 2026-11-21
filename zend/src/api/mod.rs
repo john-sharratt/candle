@@ -46,6 +46,7 @@ pub mod projections;
 pub mod prompt_tokens;
 mod repo_map;
 pub mod restore;
+pub mod resume;
 pub mod scan;
 pub mod substrate;
 pub mod worker_continue;
@@ -345,6 +346,14 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             conversation(),
             post(restore::restore),
         )
+        // A request a stop cut off, resumed — asked again from its opening
+        // message when its resume entries were retracted.
+        .route(
+            "/v1/conversations/:id/resume",
+            Role::User,
+            conversation(),
+            post(resume::resume),
+        )
         .route(
             "/v1/conversations/:id/prompt-tokens",
             Role::User,
@@ -503,6 +512,7 @@ mod tests {
                 ("/v1/conversations/:id/diag/decode", "user"),
                 ("/v1/conversations/:id/diag/decode/:run", "user"),
                 ("/v1/conversations/:id/restore", "user"),
+                ("/v1/conversations/:id/resume", "user"),
                 ("/v1/conversations/:id/prompt-tokens", "user"),
                 ("/v1/conversations/:id/journal", "user"),
                 ("/v1/conversations/:id/journal/draft", "user"),

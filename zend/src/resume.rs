@@ -57,7 +57,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use candle_conversation::projection::TimelineId;
-use candle_conversation::ConversationEngine;
+use candle_conversation::{ConversationEngine, RecoveredMessage, Role};
 
 /// The conversations this member is resuming now. A second resume of one —
 /// the boot scan's and the handed sweep's — would run its round twice: the
@@ -298,10 +298,102 @@ pub fn abandon(engine: &ConversationEngine, timeline: TimelineId) {
     clear_handed(engine, timeline);
 }
 
+/// The message that opened the conversation's latest request: its last user
+/// message that carries no tool results. `None` for a conversation with none.
+pub fn opening_message(history: &[RecoveredMessage]) -> Option<String> {
+    history
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User && m.tool_tokens.is_empty() && !m.text.is_empty())
+        .map(|m| m.text.clone())
+}
+
+/// The opening message of a request cut off mid-round with no entry left to
+/// resume it by: the conversation's last message is the assistant's and made
+/// tool calls (`made_calls`), or is a tool round's results — either way no
+/// answer follows. `None` for a request that ended — its last answer called
+/// nothing — or one with no opening message.
+pub fn cut_off_request(
+    history: &[RecoveredMessage],
+    made_calls: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let last = history.last()?;
+    let cut = match last.role {
+        Role::Assistant => made_calls(&last.text),
+        Role::User => !last.tool_tokens.is_empty(),
+        Role::System => false,
+    };
+    cut.then(|| opening_message(history)).flatten()
+}
+
+/// Ask `timeline`'s request again from its opening `message`: the pending
+/// message is recorded and the call turn retracted, so the resume runs the
+/// request as a first round, over the turns that are whole.
+pub fn reask(engine: &ConversationEngine, timeline: TimelineId, message: &str) {
+    mark_message(engine, timeline, message);
+    clear_call_turn(engine, timeline);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{answered, unfinished_of, wholeness, Resuming, Unfinished, Wholeness};
+    use super::{
+        answered, cut_off_request, opening_message, unfinished_of, wholeness, Resuming, Unfinished,
+        Wholeness,
+    };
     use candle_conversation::projection::TimelineId;
+    use candle_conversation::{RecoveredMessage, Role};
+
+    fn msg(role: Role, text: &str, tool_results: bool) -> RecoveredMessage {
+        RecoveredMessage {
+            role,
+            text: text.into(),
+            turn: 0,
+            no_think: false,
+            thinking: None,
+            tool_tokens: if tool_results { vec![10] } else { Vec::new() },
+        }
+    }
+
+    /// **The opening message is the last one the user wrote**, never a tool
+    /// round's results, which reach the model as a user message too.
+    #[test]
+    fn the_opening_message_is_the_users_not_a_tool_rounds() {
+        let history = vec![
+            msg(Role::User, "first question", false),
+            msg(Role::Assistant, "answer", false),
+            msg(Role::User, "Give me a tour", false),
+            msg(Role::Assistant, "<tool_call>read</tool_call>", false),
+            msg(Role::User, "<tool_response>…</tool_response>", true),
+            msg(Role::Assistant, "<tool_call>list</tool_call>", false),
+        ];
+        assert_eq!(opening_message(&history).as_deref(), Some("Give me a tour"));
+        assert_eq!(opening_message(&[]), None);
+    }
+
+    /// **A request whose last answer made calls no turn answers is cut off;
+    /// one whose last answer called nothing ended**, and is never asked twice.
+    #[test]
+    fn a_request_is_cut_off_only_while_its_calls_are_unanswered() {
+        let calls = |t: &str| t.contains("<tool_call>");
+        let mut history = vec![
+            msg(Role::User, "Give me a tour", false),
+            msg(Role::Assistant, "<tool_call>read</tool_call>", false),
+            msg(Role::User, "<tool_response>…</tool_response>", true),
+            msg(Role::Assistant, "<tool_call>list</tool_call>", false),
+        ];
+        assert_eq!(
+            cut_off_request(&history, calls).as_deref(),
+            Some("Give me a tour")
+        );
+        history.push(msg(Role::User, "<tool_response>…</tool_response>", true));
+        assert_eq!(
+            cut_off_request(&history, calls).as_deref(),
+            Some("Give me a tour"),
+            "its results landed and no answer followed"
+        );
+        history.push(msg(Role::Assistant, "Here is the tour.", false));
+        assert_eq!(cut_off_request(&history, calls), None, "the request ended");
+    }
 
     /// **Only a gap is waited for.** A conversation whole resumes; one with a
     /// gap waits for catch-up; one with an empty turn and no gap holds a hole

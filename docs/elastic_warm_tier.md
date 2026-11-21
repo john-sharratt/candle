@@ -206,11 +206,18 @@ involved in moving one.
 The stager owns the residency places, so it publishes and withdraws; the
 controller allocates, fills and frees.
 
-- **Grow**: the controller appends a chunk, fills each slot from the pack with
-  a positioned direct read (`ExpertPack::read_into`), then sends the stager
+- **Grow**: the controller appends a chunk and fills each slot from the pack
+  with a positioned direct read (`ExpertPack::read_into`) **on a thread of its
+  own** (`controller::Filling`), then, once it lands, sends the stager
   `PagedGrown`: each expert gets its warm slot (`Residency::set_warm`), its
   CPU-pool copy (`PagedImages::set`) and its host-backed mark for the VRAM
-  eviction. Nothing names a slot until its bytes are written.
+  eviction. Nothing names a slot until its bytes are written. The controller
+  keeps ticking through a fill — a gigabyte of pack reads takes 1.5–12 s, and a
+  fill on its own thread held the controller while a 14 GiB build emptied
+  WhiteWorld's free RAM in 11 s, the first shed coming 13 s after the RAM was
+  gone (balloon run 3, 2026-11-21). A shrink decided during a fill takes the
+  filling chunk first: the fill stops at its next record and the chunk is freed
+  unpublished.
 - **Shrink**: the controller sends `PagedShrink` for the last chunk. The stager
   withdraws its experts — no warm slot, no CPU-pool copy, host-backed only if a
   resident pad slot still holds one — and reads the readers' key
