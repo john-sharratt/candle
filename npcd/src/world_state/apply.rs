@@ -171,7 +171,6 @@ mod tests {
     use super::*;
     use crate::discord::dm::record::Dm;
     use crate::discord::server::record::{Channel, Server};
-    use crate::engine::mission_gen::round::parse;
     use crate::sim::seed;
     use crate::world_state::records_of;
 
@@ -369,32 +368,6 @@ mod tests {
                 name: "zenworld".into()
             })
         );
-    }
-
-    /// **The round is the mind's, and outlives a take-in**: a world given a
-    /// round from its mind keeps it when records holding a Sim are applied.
-    #[test]
-    fn the_round_survives_an_apply() {
-        let source = vault();
-        let records = records_of(&source);
-        assert!(sim_of(&records).is_some());
-
-        let replica = vault();
-        let round = parse(
-            "missions/vault/round.yaml",
-            "round:\n  - id: watch-earth\n    brief: Watch Earth.\n    steps:\n      - go to the watch room\n",
-        )
-        .unwrap();
-        replica.with_sim(|s| s.missions.set_round(round));
-        apply(&replica, &records);
-        let ids: Vec<String> = replica.sim(|s| {
-            s.missions
-                .round_items()
-                .iter()
-                .map(|i| i.id.clone())
-                .collect()
-        });
-        assert_eq!(ids, ["watch-earth"]);
     }
 
     /// **A take-in leaves the world not local; a change marks it local.**

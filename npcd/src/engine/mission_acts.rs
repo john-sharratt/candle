@@ -307,7 +307,7 @@ pub fn carrying(s: &Sim, body: &str) -> Carrying {
             .is_some_and(|w| !w.edit_optional),
         unordered: s.missions.is_unordered(body),
         unread: s.missions.unread_for(body),
-        own: mission.is_some_and(|m| matches!(m.origin, Origin::Round { .. } | Origin::Own)),
+        own: mission.is_some_and(|m| matches!(m.origin, Origin::Own)),
         given: mission.is_some_and(|m| m.writes_given()),
         authoring: s.missions.authoring(),
     }

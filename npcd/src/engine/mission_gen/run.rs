@@ -24,7 +24,6 @@ use super::corpus::Corpus;
 use super::gates;
 use super::material;
 use super::reading;
-use super::round;
 use super::standing;
 use super::step;
 use super::target::{self, Kind, Target};
@@ -758,7 +757,7 @@ pub fn call_off_gone_documents(hosted: &Hosted) -> Vec<String> {
 }
 
 /// Carry every hosted world's open work along while the daemon runs: its
-/// standing missions, round and house table, the table's own steps of its open
+/// standing missions, agendas and house table, the table's own steps of its open
 /// operations and their Makers' steps put on the table.
 ///
 /// **Only while the table is open.** A shut table hands out nothing, so a step
@@ -769,7 +768,6 @@ pub fn spawn(rt: Arc<Runtime>) {
         let mut told: Option<String> = None;
         let mut told_world: BTreeMap<String, String> = BTreeMap::new();
         let mut told_standing: BTreeMap<String, String> = BTreeMap::new();
-        let mut told_round: BTreeMap<String, String> = BTreeMap::new();
         let mut told_house: BTreeMap<String, String> = BTreeMap::new();
         loop {
             tokio::time::sleep(TICK).await;
@@ -827,38 +825,13 @@ pub fn spawn(rt: Arc<Runtime>) {
                         }
                     }
                 }
-                // **The round** (`docs/zen_moon_mind.md` §17.3): read on every
-                // member, since whether a world has one decides how a body that
-                // takes no orders is woken and what the table gives it; what
-                // the agendas have seen done is closed and stamped by the
-                // world's authority.
-                match round::load(&mind, &id) {
-                    Ok(items) => {
-                        told_round.remove(&id);
-                        let settles = rt.standing.role(&id).is_authority();
-                        // A suspended character's round mission is held, so
-                        // the hour it is given runs only while it can work.
-                        let suspended = rt.suspended_bodies(&id);
-                        let closed = hosted.with_sim(|s| {
-                            s.missions.set_round(items);
-                            if !settles {
-                                return Vec::new();
-                            }
-                            let now = now_ms();
-                            s.missions.hold_round(&suspended, now);
-                            let closed = s.missions.settle_agendas(now);
-                            s.missions.stamp_round(now);
-                            closed
-                        });
-                        for (body, item, outcome) in closed {
-                            tracing::info!(world = %id, %body, %item, ?outcome, "agenda: closed");
-                        }
-                    }
-                    Err(e) => {
-                        if told_round.get(&id) != Some(&e) {
-                            tracing::warn!(world = %id, "a world's round: {e}");
-                            told_round.insert(id.clone(), e);
-                        }
+                // **What the agendas have seen done** is closed by the world's
+                // authority (`docs/zen_moon_mind.md` §17.5): a mission of an
+                // order-giver's own whose steps are all signed off.
+                if rt.standing.role(&id).is_authority() {
+                    let closed = hosted.with_sim(|s| s.missions.settle_agendas());
+                    for (body, item, outcome) in closed {
+                        tracing::info!(world = %id, %body, %item, ?outcome, "agenda: closed");
                     }
                 }
                 // **The house's table** (`docs/house_modes.md` §3): read on
