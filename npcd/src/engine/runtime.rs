@@ -755,15 +755,48 @@ pub const ROUND_TAKEN: &str = "Nothing was on your agenda, so your round has giv
                                item, and it is what you are working on now.";
 
 /// What a character reads at the head of a turn while `request`, which
-/// `party` made of it on the phone, is still to be done and told.
-pub fn still_asked(party: &str, request: &str) -> String {
+/// `party` made of it on the phone, is still to be done and told — with
+/// `table`, for a character that gives orders, what the order table holds of
+/// its posting ([`orders_line`]).
+pub fn still_asked(party: &str, request: &str, table: Option<&str>) -> String {
+    let table = table.map(|t| format!("\n{t}")).unwrap_or_default();
     format!(
         "Still yours to do, and nothing comes before it: what {party} asked of you on the \
-         phone.\n{}\nDo it yourself, now, with the act that answers it, then tell {party} what \
-         came of it — what you read, or that you could not. Telling them you are about to is \
-         not an answer.",
+         phone.\n{}{table}\nDo it yourself, now, with the act that answers it, then tell \
+         {party} what came of it — what you read, or that you could not. Telling them you are \
+         about to is not an answer.",
         request.trim()
     )
+}
+
+/// The order table as it stands for one who posts on it: each of `out` — a
+/// brief and who carries it, `None` while nobody has taken it — or that
+/// nothing of theirs is there.
+///
+/// **The table, not the memory of it.** Zen told the Creator, from a
+/// conversation that can only talk, "I have posted the order for a Drone"; the
+/// conversation's journal kept that as done, and the turns after read the
+/// journal, believed it, and told him the Drone had not reported yet — of an
+/// order that was never posted. What is on the table is read off it every turn
+/// the request stands, so a claim cannot stand in for the act.
+pub fn orders_line(out: &[(String, Option<String>)]) -> String {
+    if out.is_empty() {
+        return "Nothing you have posted is on the order table: no Drone has been given any of \
+                it. If it is theirs to do, `order_post` it; until it is posted, nobody is doing \
+                it."
+        .to_string();
+    }
+    let each: Vec<String> = out
+        .iter()
+        .map(|(brief, with)| {
+            let brief = brief.trim().trim_end_matches('.');
+            match with {
+                Some(name) => format!("\"{brief}\" — {name} has it"),
+                None => format!("\"{brief}\" — waiting to be taken"),
+            }
+        })
+        .collect();
+    format!("On the order table, of yours: {}.", each.join("; "))
 }
 
 /// Put the round's next due item on `body`'s empty agenda and say what it was
@@ -1682,6 +1715,30 @@ impl Runtime {
             tracing::info!(npc = %body, %room, arrived, read, "mission steps signed off on arrival");
             Some(progress_line(&lead, next, &names))
         })
+    }
+
+    /// What the order table holds of this character's posting
+    /// ([`orders_line`]) — `None` for one that takes orders rather than gives
+    /// them, which posts nothing.
+    pub fn orders_out(&self, npc_id: u64) -> Option<String> {
+        let (hosted, body) = self.body_of(npc_id)?;
+        let out = hosted.sim(|s| {
+            s.missions
+                .is_unordered(&body)
+                .then(|| s.missions.out_for(&body))
+        })?;
+        let named: Vec<(String, Option<String>)> = out
+            .into_iter()
+            .map(|(brief, with)| {
+                let with = with.map(|b| {
+                    hosted
+                        .read(|w| w.actor(&b).map(|a| a.name.clone()))
+                        .unwrap_or(b)
+                });
+                (brief, with)
+            })
+            .collect();
+        Some(orders_line(&named))
     }
 
     /// The mission compass for this character as things stand — its mission's
@@ -6934,12 +6991,13 @@ async fn character_loop(rt: Arc<Runtime>, id: u64) {
                 .set_band(id, asked.as_ref().map(|_| DecodePriority::Urgent))
                 .await;
             if let Some((party, request)) = asked.filter(|_| !fresh) {
+                let table = rt.orders_out(id);
                 start.events.push(Event::new(
                     rt.scheduler.next_seq(),
                     world_ms,
                     Salience::URGENT,
                     EventKind::Nudge {
-                        text: still_asked(&party, &request),
+                        text: still_asked(&party, &request, table.as_deref()),
                     },
                 ));
             }
@@ -10333,6 +10391,33 @@ mod tests {
             specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()
         );
         assert!(shown_wherever_offered(&LIFT_USE));
+    }
+
+    /// **One who gives orders is told what the table holds of theirs, every
+    /// turn a request stands** — nothing, or each brief and who has it — so a
+    /// remembered "I posted it" cannot stand in for the post.
+    #[test]
+    fn a_standing_request_reads_the_order_table_as_it_is() {
+        let none = orders_line(&[]);
+        assert!(
+            none.starts_with("Nothing you have posted is on the order table"),
+            "{none}"
+        );
+        assert!(none.contains("`order_post` it"), "{none}");
+        assert_eq!(
+            orders_line(&[
+                ("Read the sensor panel.".into(), Some("Jitter".into())),
+                ("Watch Earth".into(), None),
+            ]),
+            "On the order table, of yours: \"Read the sensor panel\" — Jitter has it; \"Watch \
+             Earth\" — waiting to be taken."
+        );
+        let told = still_asked("John", "Have a Drone read the panel.", Some(&none));
+        assert!(
+            told.contains("Have a Drone read the panel.\nNothing you have posted"),
+            "{told}"
+        );
+        assert!(!still_asked("John", "x", None).contains("order table"));
     }
 
     /// **A room on another floor is one `move_to` away, and the grammar offers

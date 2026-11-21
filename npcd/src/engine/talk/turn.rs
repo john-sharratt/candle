@@ -759,7 +759,9 @@ fn to_party(tool: &'static str, party: &str) -> Act {
 const ANSWERING: &str = "On the phone you only talk. Whatever they ask you to do, find out or \
                          check is done by you once you have answered, away from the phone, where \
                          everything you can work is to hand — so never say you cannot or have no \
-                         way to: say what you will do, and it becomes yours to do.";
+                         way to: say what you will do, and it becomes yours to do. Never say it \
+                         is done, posted or sent: nothing is, until you have done it away from \
+                         the phone.";
 
 /// What the mind reads once the words it asked for have been said: the words,
 /// that saying them again adds nothing, and that what they promised is still

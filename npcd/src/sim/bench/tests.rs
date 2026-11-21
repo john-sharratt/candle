@@ -406,20 +406,22 @@ fn an_edit_changes_the_paragraph_its_anchor_names() {
     );
 }
 
-/// An edit that leaves the paragraph as it was is refused, and nothing is
-/// opened: answered as a change, a Maker made the same edit again.
+/// A paragraph replaced whole by the words it already holds is refused, and
+/// nothing is opened: answered as a change, a Maker made the same edit again.
 #[test]
 fn an_edit_that_changes_nothing_is_refused() {
     let (mut b, _, s) = rooted("edit-same");
     let at = anchor_in(&b, "m1", "layers/eras/third.md", 0, &s);
+    let whole = Edit {
+        at,
+        op: Op::Replace {
+            text: "the third era\nburned in the spring".into(),
+            old: None,
+            to: None,
+        },
+    };
     let err = b
-        .edit(
-            "m1",
-            "layers/eras",
-            "layers/eras/third.md",
-            &change(at, "spring", "spring"),
-            &s,
-        )
+        .edit("m1", "layers/eras", "layers/eras/third.md", &whole, &s)
         .unwrap_err();
     assert_eq!(
         err,
