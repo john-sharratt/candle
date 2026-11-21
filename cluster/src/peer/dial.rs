@@ -56,6 +56,7 @@ impl Peering {
                 Attempt::Session(Ended::Closed(c) | Ended::Refused(c)) => c.to_string(),
                 Attempt::Session(Ended::Dropped) => "the socket dropped".into(),
                 Attempt::Session(Ended::Dead) => "no frame for 45 s".into(),
+                Attempt::Session(Ended::Stalled) => "this end took no frame for 45 s".into(),
             };
             let state = if wait.is_some() {
                 "retrying"

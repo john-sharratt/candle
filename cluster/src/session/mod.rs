@@ -93,6 +93,9 @@ pub enum Ended {
     Dropped,
     /// No frame for 45 s.
     Dead,
+    /// This end's owner took no frame for 45 s: the reader, waiting to hand
+    /// one on, read nothing behind it.
+    Stalled,
 }
 
 /// The session ended before the request could be queued.

@@ -2138,5 +2138,6 @@ fn describe(how: &Ended) -> String {
         Ended::Refused(c) => format!("closed by this gateway, {c}"),
         Ended::Dropped => "the transport dropped".into(),
         Ended::Dead => "no frame for 45 s".into(),
+        Ended::Stalled => "this gateway took no frame from it for 45 s".into(),
     }
 }

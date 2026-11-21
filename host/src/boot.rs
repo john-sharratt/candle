@@ -18,6 +18,7 @@ use futures::future::join_all;
 use serde_json::Value;
 use web::Roots;
 
+use crate::blocking_canary::view as blocking_view;
 use crate::cluster::Cluster;
 use crate::endpoints::status::{assemble, Head};
 use crate::model::ModelView;
@@ -92,6 +93,7 @@ async fn status(State(boot): State<Arc<Boot>>) -> Json<Value> {
         model: &boot.model,
         cluster: boot.cluster.as_deref(),
         device_failing: device_failing(),
+        blocking_pool: blocking_view(),
     };
     Json(assemble(&head, &boot.build, named))
 }

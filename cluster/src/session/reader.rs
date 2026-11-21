@@ -109,7 +109,9 @@ pub async fn run<R: PipeRx>(
                     commands.clone(),
                     registry.clone(),
                 );
-                let _ = incoming.send(Incoming::Stream(conn)).await;
+                if hand_on(&incoming, Incoming::Stream(conn)).await.is_err() {
+                    break stalled(&commands);
+                }
             }
             Frame::Data(data) => {
                 let stream = registry.lock().unwrap().get(&data.stream).cloned();
@@ -143,13 +145,14 @@ pub async fn run<R: PipeRx>(
                 }
                 match reassembly.accept(event) {
                     Ok(Some(whole)) => {
-                        let _ = incoming
-                            .send(Incoming::Event {
-                                catchup,
-                                whole,
-                                frame: number,
-                            })
-                            .await;
+                        let event = Incoming::Event {
+                            catchup,
+                            whole,
+                            frame: number,
+                        };
+                        if hand_on(&incoming, event).await.is_err() {
+                            break stalled(&commands);
+                        }
                     }
                     Ok(None) => {}
                     Err(e) => break violation(e.to_string()),
@@ -159,7 +162,9 @@ pub async fn run<R: PipeRx>(
                 if matches!(other, Frame::Headers(_) | Frame::Done(_)) {
                     hearing.catchup();
                 }
-                let _ = incoming.send(Incoming::Frame(other)).await;
+                if hand_on(&incoming, Incoming::Frame(other)).await.is_err() {
+                    break stalled(&commands);
+                }
             }
         }
     };
@@ -167,6 +172,41 @@ pub async fn run<R: PipeRx>(
         stream.reset();
     }
     ended
+}
+
+/// The owner took nothing within [`DEAD_AFTER`].
+struct OwnerStalled;
+
+/// Hand `item` to the session's owner, unless it takes nothing for
+/// [`DEAD_AFTER`].
+///
+/// **The hand-off is bounded like the read.** While the reader waits here it
+/// reads nothing: no ping is answered, no close is seen, and the silence check
+/// around the read never runs. Unbounded, an owner that stopped taking frames
+/// held its sessions open forever — on WhiteWorld (2026-11-20) npcd's and
+/// zend's both reported `admitted` with no close for an hour, the gateway long
+/// gone, while 27,229 events queued unsent. A dropped receiver — the owner
+/// gone — is no stall: the item has nowhere to go, and the session ends as
+/// its owner does.
+async fn hand_on(incoming: &Sender<Incoming>, item: Incoming) -> Result<(), OwnerStalled> {
+    match timeout(DEAD_AFTER, incoming.send(item)).await {
+        Ok(_) => Ok(()),
+        Err(_) => Err(OwnerStalled),
+    }
+}
+
+/// Close a session whose owner stalled, saying so.
+fn stalled(commands: &UnboundedSender<Command>) -> Ended {
+    tracing::warn!(
+        "this member took no frame from its session for 45 s: closing it, so it is redialled \
+         and the stall is seen"
+    );
+    let close = Close::new(
+        CloseCode::GoingAway,
+        "this member took no frame from its session for 45 s",
+    );
+    let _ = commands.send(Command::Close(close));
+    Ended::Stalled
 }
 
 /// The next message, unless the peer has gone [`DEAD_AFTER`] without being

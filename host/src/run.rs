@@ -32,6 +32,7 @@ use web::Roots;
 
 use crate::access::{roles, LocalSignin};
 use crate::agent_hold::with_hold;
+use crate::blocking_canary::start as start_blocking_canary;
 use crate::boot::{router as boot_router, Boot, BootLine};
 use crate::cli::HostArgs;
 use crate::cluster::in_flight::IN_FLIGHT_WAIT;
@@ -579,6 +580,9 @@ async fn serve_tenants(
     }
 
     accept_ctrl_c();
+    // A wedged blocking pool runs nothing queued on it while the async routes
+    // answer: its canary is what `/v1/status` and the log say it with.
+    start_blocking_canary();
     // The boot server has released the ports. The real server is about to
     // accept, and a tenant's `start` returns while its model is still loading.
     // The line `keep` waits for is printed once every tenant reports ready.

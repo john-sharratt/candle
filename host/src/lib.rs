@@ -29,6 +29,7 @@
 
 pub mod access;
 pub mod agent_hold;
+pub mod blocking_canary;
 pub mod boot;
 pub mod build_info;
 pub mod calibration;

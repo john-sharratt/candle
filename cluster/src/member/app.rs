@@ -508,6 +508,9 @@ impl AppMember {
                 Attempt::Session(Ended::Closed(c) | Ended::Refused(c)) => Some(c.to_string()),
                 Attempt::Session(Ended::Dropped) => Some("the socket dropped".into()),
                 Attempt::Session(Ended::Dead) => Some("no frame from the gateway for 45 s".into()),
+                Attempt::Session(Ended::Stalled) => {
+                    Some("this member took no frame from the gateway for 45 s".into())
+                }
             };
             // Logged as well as shown: the next admission clears the view, so
             // a socket that ends and is readmitted at once left no trace of why.

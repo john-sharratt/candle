@@ -287,6 +287,45 @@ async fn a_peer_still_sending_a_message_is_alive_until_its_bytes_stop() {
     assert_eq!(tokio::time::Instant::now() - last, DEAD_AFTER);
 }
 
+/// **An owner that takes no frame for 45 s ends its session as stalled**,
+/// though the peer keeps talking: the reader, blocked handing a frame on, reads
+/// nothing behind it, so neither the peer's close nor its own silence check
+/// would ever end it. The session closes 1001 and says why.
+#[tokio::test(start_paused = true)]
+async fn an_owner_that_takes_no_frame_ends_its_session_as_stalled() {
+    let (mut s, mut tx, mut rx) = against_raw(Role::Gateway);
+    let receipt = Frame::Receipt(Receipt { through: 1 }).encode();
+    // A full queue and one more: the reader now waits on the owner, who never
+    // reads `s.incoming`.
+    for _ in 0..=INCOMING_DEPTH {
+        tx.send(Message::Frame(receipt.clone())).await.unwrap();
+    }
+    let started = tokio::time::Instant::now();
+    // The peer stays alive throughout.
+    let pinging = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let ping = Frame::Ping([7; 8]).encode();
+            if tx.send(Message::Frame(ping)).await.is_err() {
+                return;
+            }
+        }
+    });
+    assert_eq!((&mut s.ended).await.unwrap(), Ended::Stalled);
+    assert!(started.elapsed() >= DEAD_AFTER);
+    let mut closed = None;
+    while let Some(m) = rx.recv().await {
+        if let Message::Close(c) = m {
+            closed = Some(c);
+            break;
+        }
+    }
+    let close = closed.expect("the session closes");
+    assert_eq!(close.code, 1001);
+    assert!(close.reason.contains("took no frame"), "{close:?}");
+    pinging.abort();
+}
+
 /// A peer that sends nothing for 45 s is dead: the session closes 1001.
 #[tokio::test(start_paused = true)]
 async fn a_silent_peer_is_dead_after_45_s() {

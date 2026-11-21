@@ -306,6 +306,13 @@ Counting only whole frames closed such a socket every 45 s, and the catch-up it 
 started over on each redial and never finished. A transport that cannot report its reads
 counts whole frames. The handshake
 holds to the same 45 s: a peer silent that long mid-handshake is closed 4400.
+**This end's owner is held to it too.** The reader hands each frame to the session's
+owner through a bounded queue, and while it waits there it reads nothing — answers no
+`PING`, sees no close, runs no silence check. An owner that takes no frame for 45 s
+closes the session 1001 (`Ended::Stalled`, "this member took no frame … for 45 s"), so
+the member redials and the stall is logged each time. Unbounded, a WhiteWorld whose
+tenants stopped taking frames reported both sockets `admitted` with no close for an
+hour, the gateway long gone and 27,229 events queued (2026-11-20).
 
 **Paths.** A cluster's URLs, in order, are its *endpoints*. Each endpoint's host is
 resolved afresh at every dial, and every address it resolves to is one *path*: a name

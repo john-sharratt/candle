@@ -28,6 +28,7 @@ use serde_json::{json, Map, Value};
 
 use super::quorum_wait::with_quorum_wait;
 use super::Shared;
+use crate::blocking_canary::{view as blocking_view, PoolView};
 use crate::cluster::view::status_block;
 use crate::cluster::Cluster;
 use crate::loading::LoadingView;
@@ -68,6 +69,8 @@ pub struct Head<'a> {
     pub cluster: Option<&'a Cluster>,
     /// The device cannot take a turn (`candle::gpu_poison::device_failing`).
     pub device_failing: bool,
+    /// The blocking pool, as its canary last saw it (`blocking_canary`).
+    pub blocking_pool: PoolView,
 }
 
 fn head_of(s: &Shared) -> Head<'_> {
@@ -76,6 +79,7 @@ fn head_of(s: &Shared) -> Head<'_> {
         model: &s.model,
         cluster: s.cluster.as_deref(),
         device_failing: device_failing(),
+        blocking_pool: blocking_view(),
     }
 }
 
@@ -153,6 +157,7 @@ pub fn assemble(head: &Head<'_>, build: &str, tenants: Vec<(&str, TenantStatus)>
         "loading": loading,
         "tenants": lines,
         "cluster": head.cluster.map(status_block),
+        "blocking_pool": head.blocking_pool,
     })
 }
 
@@ -190,8 +195,15 @@ mod tests {
     #[test]
     fn all_ready_is_ready() {
         let s = shared(vec![]);
+        let head = Head {
+            blocking_pool: PoolView {
+                last_start_ms: None,
+                waiting_ms: None,
+            },
+            ..head_of(&s)
+        };
         let body = assemble(
-            &head_of(&s),
+            &head,
             "0123456789abcdef",
             vec![
                 ("zend", TenantStatus::of(None)),
@@ -213,6 +225,7 @@ mod tests {
                     "npcd": {"state": "ready", "loading": null, "maintenance": null},
                 },
                 "cluster": null,
+                "blocking_pool": {"last_start_ms": null, "waiting_ms": null},
             })
         );
     }
