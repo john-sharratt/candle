@@ -162,9 +162,7 @@ fn heartbeat(clean: u64, all: &[Finding]) -> Option<String> {
         (Some(lo), Some(hi)) => lo.abs().max(hi.abs()),
         _ => 0.0,
     };
-    let widest = all
-        .iter()
-        .max_by(|a, b| reach(a).total_cmp(&reach(b)))?;
+    let widest = all.iter().max_by(|a, b| reach(a).total_cmp(&reach(b)))?;
     Some(format!(
         "tensor_assert: {clean} clean drains — this one read {} sites over {elems} elements; \
          widest {}",
