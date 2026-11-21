@@ -9,9 +9,9 @@ pub(crate) mod profile;
 pub(crate) mod unified_memory;
 
 pub use self::core::{
-    CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, CudaView, CudaViewMut,
-    DevicePtr, DevicePtrMut, DeviceRepr, DeviceSlice, HostSlice, PinnedHostSlice, SyncOnDrop,
-    ValidAsZeroBits,
+    last_stored_error, CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream,
+    CudaView, CudaViewMut, DevicePtr, DevicePtrMut, DeviceRepr, DeviceSlice, HostSlice,
+    PinnedHostSlice, StoredError, SyncOnDrop, ValidAsZeroBits,
 };
 pub use self::alloc_watch::{install_alloc_watch, AllocWatch};
 pub use self::external_memory::{ExternalMemory, MappedBuffer};
