@@ -407,10 +407,17 @@ impl Benches {
         // held, was told it had changed it, and made the same edit again three
         // minutes later instead of going on to the next fault. Said so, and
         // nothing is written.
+        //
+        // **And how to cut.** Told its life was 811 words of 800, a Maker
+        // replaced paragraphs whole with the words they held, six times over in
+        // half an hour, and never cut one: the scoped `old` cuts exactly the
+        // words named, which is the edit a length fault wants.
         if done.doc.text() == before.text() {
             return Err(format!(
-                "That changes nothing: {key} already reads that way there. If that fault is \
-                 put right, go on to the next one."
+                "That changes nothing: {key} already reads that way there — the text you gave \
+                 is the text it holds. If that fault is put right, go on to the next one. To cut \
+                 words, `replace` with the words to cut as `old` and what stands in their place, \
+                 shorter, as `text`; or `delete` a paragraph that says again what another says."
             ));
         }
         self.write(body, about, raw, &done.doc.text(), shelf)?;
