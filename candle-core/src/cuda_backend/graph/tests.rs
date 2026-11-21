@@ -2219,3 +2219,47 @@ fn a_fence_wait_inside_a_capture() -> Result<()> {
     );
     Ok(())
 }
+
+/// **The finiteness instrument inside a wave.** An assert recorded into a
+/// wave's segment and a drain at the wave's end — where the wave driver reads
+/// its report — find the NaN, finish the wave, and leave the device's stream
+/// to every other thread. A tensor-assert motherd on WhiteWorld left the stream
+/// capturing at its first wave: every other thread's synchronise, cold load
+/// and arena recycle was refused "operation not permitted when stream is
+/// capturing" from then on, and no character decoded.
+#[cfg(feature = "tensor-assert")]
+#[test]
+fn a_drain_inside_a_wave_finds_the_nan_and_leaves_the_stream_usable() -> Result<()> {
+    use crate::{Device, Tensor};
+    let _wave = wave_lock();
+    let dev = CudaDevice::new(0)?;
+    let device = Device::Cuda(dev.clone());
+    let t = Tensor::new(&[1f32, f32::NAN, 3.0], &device)?;
+    // The slot table is made eagerly, as at load: a recorded call never
+    // allocates.
+    crate::tensor_assert::epoch(&device)?;
+    dev.synchronize()?;
+
+    let capture = dev.begin_wave_capture()?;
+    dev.record_launches()?;
+    t.assert("graph::tests::drain_in_a_wave");
+    let bad = crate::tensor_assert::report(&device)?;
+    capture.finish()?;
+
+    assert_eq!(
+        bad.first().map(|f| (f.name.as_str(), f.nan)),
+        Some(("graph::tests::drain_in_a_wave", 1)),
+        "the drain inside the wave found the NaN"
+    );
+    let other = std::thread::scope(|sc| {
+        sc.spawn(|| {
+            admit_this_thread();
+            BackendDevice::synchronize(&dev).map_err(|e| e.to_string())
+        })
+        .join()
+        .expect("the other thread")
+    });
+    assert_eq!(other, Ok(()), "another thread's synchronise after the wave");
+    crate::tensor_assert::epoch(&device)?;
+    Ok(())
+}
