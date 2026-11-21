@@ -78,7 +78,9 @@ impl SlotOwners {
         unsafe { std::ptr::write_volatile(self.host.add(slot), owner_tag(row, expert)) };
     }
 
-    /// The tag slot `slot` holds.
+    /// The tag slot `slot` holds — read by the tests; the device reads the
+    /// tags through [`Self::check`].
+    #[cfg(test)]
     pub(crate) fn get(&self, slot: usize) -> u32 {
         assert!(
             slot < self.slots,

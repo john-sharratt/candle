@@ -5496,17 +5496,6 @@ impl Qwen4ExpBatched {
                 )?,
             };
             g_acts.end();
-            #[cfg(feature = "tensor-assert")]
-            {
-                use crate::models::qwen35::quantized_moe::shared_expert_contribution;
-                let sh = shared_expert_contribution(
-                    &layer.moe.shared,
-                    &layer.moe.shared_gate,
-                    &acts,
-                    DType::F32,
-                )?;
-                probe(site("q4e.moe.shared.L", li), &sh);
-            }
             #[cfg(feature = "cuda")]
             let moe_wave = ffn_wave.as_ref();
             #[cfg(not(feature = "cuda"))]
@@ -5548,6 +5537,13 @@ impl Qwen4ExpBatched {
                     .forward_parts(acts, DType::F32, &decode_like, moe_wave, &look_ahead)?;
             let routed = parts.routed.reshape((total_rows, n_embd))?;
             g_moe.end();
+            // **The shared expert is probed where the combine reads it**, not
+            // computed a second time to be probed: an F32 recompute through
+            // ordinary tensor ops allocated inside the recording wave and freed
+            // its temporaries there, a free the capture refuses — and the
+            // refused capture wedged the device's stream for every thread.
+            #[cfg(feature = "tensor-assert")]
+            probe(site("q4e.moe.shared.L", li), &parts.shared.y);
             #[cfg(feature = "tensor-assert")]
             probe(site("q4e.moe.routed.L", li), &routed);
             let g_comb2 = crate::models::profile::gpu_span("q4e:gr_combine_ffn", dev);
