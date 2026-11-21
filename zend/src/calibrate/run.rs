@@ -336,8 +336,12 @@ pub fn calibrate_layer(
                         failed.fetch_add(1, Ordering::Relaxed);
                         // Only the unit's own failure counts against it: a
                         // decode lost to a full card says nothing about the
-                        // unit, and is simply tried again.
-                        if units_own_failure(&format!("{e:#}")) {
+                        // unit, and is simply tried again. The other way
+                        // round for the member: a unit's own failure says
+                        // nothing about the card, so only the card's holds
+                        // this member off the next unit.
+                        let own = units_own_failure(&format!("{e:#}"));
+                        if own {
                             let tries = failures_of(unit.prior_failures.as_deref(), &unit.marker)
                                 .saturating_add(1);
                             if let Err(err) = engine.set_conversation_metadata(
@@ -358,7 +362,9 @@ pub fn calibrate_layer(
                             subject = %unit.subject,
                             "calibration failed: {e:#}",
                         );
-                        ingest_holdoff::cool_down(&unit.subject, &format!("{e:#}"));
+                        if !own {
+                            ingest_holdoff::cool_down(&unit.subject, &format!("{e:#}"));
+                        }
                     }
                 }
             });
