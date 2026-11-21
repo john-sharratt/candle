@@ -2346,6 +2346,11 @@ impl Substrate {
             };
             let mut any = false;
             while let Some(hot) = r.hot() {
+                // A copy in arenas this pass touched nothing of is passed by
+                // without a chunk read: `rewrite_sealed` would find nothing.
+                if !sweep.may_touch(hot.arenas()) {
+                    break;
+                }
                 let Some(next) = rewrite_sealed(&hot, sweep)? else {
                     break;
                 };

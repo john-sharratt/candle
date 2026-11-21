@@ -30,10 +30,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwapOption;
-use candle_nn::kv_cache::{rewrite_sealed, ArenaLocation, SealedSequence, Sweep};
+use candle_nn::kv_cache::{rewrite_sealed, ArenaLocation, ArenaSet, SealedSequence, Sweep};
 use crossbeam::queue::SegQueue;
 use serde::Serialize;
 
@@ -205,6 +205,9 @@ static LINEAGES: AtomicU64 = AtomicU64::new(0);
 pub struct HotKv {
     seqs: Vec<SealedSequence>,
     lineage: u64,
+    /// The arenas its chunks and records are in, taken at its first sweep — it
+    /// never changes, so neither do they ([`ArenaSet`]).
+    arenas: OnceLock<ArenaSet>,
 }
 
 impl HotKv {
@@ -213,6 +216,7 @@ impl HotKv {
         Self {
             seqs,
             lineage: LINEAGES.fetch_add(1, Ordering::Relaxed),
+            arenas: OnceLock::new(),
         }
     }
 
@@ -222,7 +226,14 @@ impl HotKv {
         Self {
             seqs,
             lineage: from.lineage,
+            arenas: OnceLock::new(),
         }
+    }
+
+    /// The arenas its chunks and records are in — what a compaction's sweep
+    /// asks before reading a chunk of it ([`Sweep::may_touch`]).
+    pub fn arenas(&self) -> &ArenaSet {
+        self.arenas.get_or_init(|| ArenaSet::of(&self.seqs))
     }
 
     /// **Which content this is, wherever it sits.** Two copies of one lineage

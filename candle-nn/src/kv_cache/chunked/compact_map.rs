@@ -63,6 +63,7 @@
 
 use ahash::{AHashMap, AHashSet};
 
+use super::arena_set::ArenaSet;
 #[cfg(feature = "cuda")]
 use super::backing::ChunkedKvBacking;
 #[cfg(feature = "cuda")]
@@ -100,6 +101,9 @@ pub struct CompactionMap {
     /// `meta`. A record's bytes name band addresses, not its own slot, so a copy of it is
     /// a correct record for as long as its bands have not moved — see `Sweep::follow_record`.
     records: AHashMap<i64, (ChunkGid, u64)>,
+    /// One byte per arena index: non-zero when a record in that arena was
+    /// copied lower — [`Self::touched`]'s counterpart for [`Self::records`].
+    records_touched: Vec<u8>,
 }
 
 impl CompactionMap {
@@ -110,6 +114,7 @@ impl CompactionMap {
             moved: AHashMap::new(),
             new_addr: AHashMap::new(),
             records: AHashMap::new(),
+            records_touched: Vec::new(),
         }
     }
 
@@ -117,7 +122,20 @@ impl CompactionMap {
     /// whose device address is `addr`.
     pub fn insert_record(&mut self, old_raw: i64, replacement: ChunkGid, addr: u64) {
         debug_assert!(old_raw >= 0, "a sentinel record never moves");
+        mark(&mut self.records_touched, old_raw);
         self.records.insert(old_raw, (replacement, addr));
+    }
+
+    /// Whether this pass can have moved anything of a payload in `set`'s
+    /// arenas: a gid in an arena that gave up a chunk, or a record in one that
+    /// gave up a record. `false` means every chunk of it would be left as it is.
+    pub fn may_touch(&self, set: &ArenaSet) -> bool {
+        let hit = |bytes: &[u8], arenas: &[u32]| {
+            arenas
+                .iter()
+                .any(|&a| bytes.get(a as usize).copied().unwrap_or(0) != 0)
+        };
+        hit(&self.touched, set.chunk_arenas()) || hit(&self.records_touched, set.record_arenas())
     }
 
     /// The copy of the record at `raw`, or `None` when that record did not move.
@@ -138,11 +156,7 @@ impl CompactionMap {
     /// address is `addr`.
     pub fn insert(&mut self, old_raw: i64, replacement: ChunkGid, addr: u64) {
         debug_assert!(old_raw >= 0, "a sentinel gid never moves");
-        let arena = old_raw as usize / super::types::GID_STRIDE;
-        if self.touched.len() <= arena {
-            self.touched.resize(arena + 1, 0);
-        }
-        self.touched[arena] = 1;
+        mark(&mut self.touched, old_raw);
         self.new_addr.insert(replacement.raw(), addr);
         self.moved.insert(old_raw, replacement);
     }
@@ -210,6 +224,15 @@ impl Default for CompactionMap {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Mark `raw`'s arena in a per-arena byte table.
+fn mark(bytes: &mut Vec<u8>, raw: i64) {
+    let arena = raw as usize / super::types::GID_STRIDE;
+    if bytes.len() <= arena {
+        bytes.resize(arena + 1, 0);
+    }
+    bytes[arena] = 1;
 }
 
 /// State threaded across every holder in one sweep.
@@ -555,6 +578,13 @@ impl<'m> Sweep<'m> {
     /// ([`Self::clean`]).
     pub fn clean_reused(&self) -> usize {
         self.clean_reused
+    }
+
+    /// Whether this sweep can have anything to rewrite in a payload whose
+    /// arenas are `set` ([`CompactionMap::may_touch`]): `false`, and
+    /// [`rewrite_sealed`] would return `None` for it.
+    pub fn may_touch(&self, set: &ArenaSet) -> bool {
+        self.map.may_touch(set)
     }
 
     /// Rewrite one `HeadGids`, or `None` when none of its gids moved.
@@ -1274,6 +1304,69 @@ mod tests {
         assert!(!map.is_empty());
         assert_eq!(map.len(), 0, "no band moved");
         assert_eq!(map.records_len(), 1);
+    }
+
+    /// **A payload in arenas a pass touched nothing of is one the sweep finds
+    /// nothing in.** Its set names the arenas of its device chunks' gids and
+    /// records and none of a host sequence's; a pass that moved a chunk in
+    /// another arena — even another chunk of one of its arenas — may touch it
+    /// only when an arena it names gave something up, and whenever the answer
+    /// is `no`, [`rewrite_sealed`] returns `None` for it.
+    #[test]
+    fn a_payload_in_untouched_arenas_is_passed_by() {
+        let gpu = sealed(chunk_with(HeadGids::uniform(
+            ChunkGid::detached(raw(3, 1)),
+            4,
+        )));
+        let host = SealedSequence {
+            location: ArenaLocation::Cpu,
+            ..sealed(chunk_with(HeadGids::uniform(
+                ChunkGid::detached(raw(8, 1)),
+                4,
+            )))
+        };
+        let payload = [gpu, host];
+        let set = ArenaSet::of(&payload);
+        assert_eq!(set.chunk_arenas(), &[3]);
+        assert!(set.record_arenas().is_empty());
+        let check = |map: &CompactionMap, touches: bool| {
+            let mut sweep = Sweep::new(map);
+            assert_eq!(sweep.may_touch(&set), touches);
+            let found = rewrite_sealed(&payload, &mut sweep).unwrap().is_some();
+            assert!(touches || !found, "passed by, yet the sweep found a change");
+        };
+        let mut elsewhere = CompactionMap::new();
+        elsewhere.insert(raw(4, 1), ChunkGid::detached(raw(0, 1)), 0x100);
+        check(&elsewhere, false);
+        let mut host_only = CompactionMap::new();
+        host_only.insert(raw(8, 1), ChunkGid::detached(raw(0, 2)), 0x200);
+        check(&host_only, false);
+        let mut same_arena = CompactionMap::new();
+        same_arena.insert(raw(3, 7), ChunkGid::detached(raw(0, 3)), 0x300);
+        check(&same_arena, true);
+        let mut moved = CompactionMap::new();
+        moved.insert(raw(3, 1), ChunkGid::detached(raw(0, 4)), 0x400);
+        check(&moved, true);
+    }
+
+    /// **A record in a touched arena is reason enough to read the payload.**
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn a_payload_whose_record_arena_gave_one_up_is_read() {
+        let bands = HeadGids::uniform(ChunkGid::detached(raw(5, 2)), 1);
+        let record = MetaGid::from_slot(ChunkGid::detached(raw(9, 9)), bands.clone(), 0xFEED);
+        let payload = [sealed(SealedChunk {
+            meta: Some(record),
+            ..chunk_with(bands)
+        })];
+        let set = ArenaSet::of(&payload);
+        assert_eq!(set.record_arenas(), &[9]);
+        let mut map = CompactionMap::new();
+        map.insert_record(raw(9, 9), ChunkGid::detached(raw(1, 4)), 0xBEEF);
+        assert!(Sweep::new(&map).may_touch(&set));
+        let mut other = CompactionMap::new();
+        other.insert_record(raw(10, 1), ChunkGid::detached(raw(1, 5)), 0xBEEF);
+        assert!(!Sweep::new(&other).may_touch(&set));
     }
 
     fn chunk_with(gids: HeadGids) -> SealedChunk {

@@ -29,6 +29,7 @@
 // Submodules
 mod alloc;
 mod arena;
+mod arena_set;
 /// Device work between forwards, on a bump of held ground.
 #[cfg(feature = "cuda")]
 mod aside;
@@ -157,6 +158,7 @@ mod write_placement;
 mod tests;
 
 // Re-export public types
+pub use arena_set::ArenaSet;
 pub use backing::{global_arena_gpu_bytes, global_arena_memory_report, global_print_arena_table};
 pub use backing::{
     is_arena_exhausted, is_device_oom, is_ground_refusal_message, is_span_full, is_tier_refusal,
