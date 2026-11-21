@@ -1,0 +1,192 @@
+// `extern "C"` wrappers for comparisons, in-place binary arithmetic, additional
+// unary ops and the parametric unary ops.
+//
+// Covers `eq_`..`ge_` comparisons for every dtype, the `*_inplace` binary
+// kernels that write their left operand, the extra unary functions (`uerf`,
+// `uceil`, `ugelu_erf`, `uabs` and others), and the `uelu`/`upowf` parametric
+// kernels.
+// Grouped so that the comparison and in-place families stay together.
+
+// --- Binary comparison kernels ---
+extern "C" __global__ void eq_f32(const size_t, const size_t, const size_t*, const float*, const float*, uint8_t*);
+extern "C" __global__ void eq_f64(const size_t, const size_t, const size_t*, const double*, const double*, uint8_t*);
+extern "C" __global__ void eq_f16(const size_t, const size_t, const size_t*, const __half*, const __half*, uint8_t*);
+extern "C" __global__ void eq_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, const __nv_bfloat16*, uint8_t*);
+extern "C" __global__ void eq_u8(const size_t, const size_t, const size_t*, const uint8_t*, const uint8_t*, uint8_t*);
+extern "C" __global__ void eq_u32(const size_t, const size_t, const size_t*, const uint32_t*, const uint32_t*, uint8_t*);
+extern "C" __global__ void eq_i64(const size_t, const size_t, const size_t*, const int64_t*, const int64_t*, uint8_t*);
+extern "C" __global__ void ne_f32(const size_t, const size_t, const size_t*, const float*, const float*, uint8_t*);
+extern "C" __global__ void ne_f64(const size_t, const size_t, const size_t*, const double*, const double*, uint8_t*);
+extern "C" __global__ void ne_f16(const size_t, const size_t, const size_t*, const __half*, const __half*, uint8_t*);
+extern "C" __global__ void ne_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, const __nv_bfloat16*, uint8_t*);
+extern "C" __global__ void ne_u8(const size_t, const size_t, const size_t*, const uint8_t*, const uint8_t*, uint8_t*);
+extern "C" __global__ void ne_u32(const size_t, const size_t, const size_t*, const uint32_t*, const uint32_t*, uint8_t*);
+extern "C" __global__ void ne_i64(const size_t, const size_t, const size_t*, const int64_t*, const int64_t*, uint8_t*);
+extern "C" __global__ void lt_f32(const size_t, const size_t, const size_t*, const float*, const float*, uint8_t*);
+extern "C" __global__ void lt_f64(const size_t, const size_t, const size_t*, const double*, const double*, uint8_t*);
+extern "C" __global__ void lt_f16(const size_t, const size_t, const size_t*, const __half*, const __half*, uint8_t*);
+extern "C" __global__ void lt_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, const __nv_bfloat16*, uint8_t*);
+extern "C" __global__ void lt_u8(const size_t, const size_t, const size_t*, const uint8_t*, const uint8_t*, uint8_t*);
+extern "C" __global__ void lt_u32(const size_t, const size_t, const size_t*, const uint32_t*, const uint32_t*, uint8_t*);
+extern "C" __global__ void lt_i64(const size_t, const size_t, const size_t*, const int64_t*, const int64_t*, uint8_t*);
+extern "C" __global__ void le_f32(const size_t, const size_t, const size_t*, const float*, const float*, uint8_t*);
+extern "C" __global__ void le_f64(const size_t, const size_t, const size_t*, const double*, const double*, uint8_t*);
+extern "C" __global__ void le_f16(const size_t, const size_t, const size_t*, const __half*, const __half*, uint8_t*);
+extern "C" __global__ void le_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, const __nv_bfloat16*, uint8_t*);
+extern "C" __global__ void le_u8(const size_t, const size_t, const size_t*, const uint8_t*, const uint8_t*, uint8_t*);
+extern "C" __global__ void le_u32(const size_t, const size_t, const size_t*, const uint32_t*, const uint32_t*, uint8_t*);
+extern "C" __global__ void le_i64(const size_t, const size_t, const size_t*, const int64_t*, const int64_t*, uint8_t*);
+extern "C" __global__ void gt_f32(const size_t, const size_t, const size_t*, const float*, const float*, uint8_t*);
+extern "C" __global__ void gt_f64(const size_t, const size_t, const size_t*, const double*, const double*, uint8_t*);
+extern "C" __global__ void gt_f16(const size_t, const size_t, const size_t*, const __half*, const __half*, uint8_t*);
+extern "C" __global__ void gt_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, const __nv_bfloat16*, uint8_t*);
+extern "C" __global__ void gt_u8(const size_t, const size_t, const size_t*, const uint8_t*, const uint8_t*, uint8_t*);
+extern "C" __global__ void gt_u32(const size_t, const size_t, const size_t*, const uint32_t*, const uint32_t*, uint8_t*);
+extern "C" __global__ void gt_i64(const size_t, const size_t, const size_t*, const int64_t*, const int64_t*, uint8_t*);
+extern "C" __global__ void ge_f32(const size_t, const size_t, const size_t*, const float*, const float*, uint8_t*);
+extern "C" __global__ void ge_f64(const size_t, const size_t, const size_t*, const double*, const double*, uint8_t*);
+extern "C" __global__ void ge_f16(const size_t, const size_t, const size_t*, const __half*, const __half*, uint8_t*);
+extern "C" __global__ void ge_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, const __nv_bfloat16*, uint8_t*);
+extern "C" __global__ void ge_u8(const size_t, const size_t, const size_t*, const uint8_t*, const uint8_t*, uint8_t*);
+extern "C" __global__ void ge_u32(const size_t, const size_t, const size_t*, const uint32_t*, const uint32_t*, uint8_t*);
+extern "C" __global__ void ge_i64(const size_t, const size_t, const size_t*, const int64_t*, const int64_t*, uint8_t*);
+// f8_e4m3 binary comparison kernels
+extern "C" __global__ void eq_f8_e4m3(const size_t, const size_t, const size_t*, const __nv_fp8_e4m3*, const __nv_fp8_e4m3*, uint8_t*);
+extern "C" __global__ void ne_f8_e4m3(const size_t, const size_t, const size_t*, const __nv_fp8_e4m3*, const __nv_fp8_e4m3*, uint8_t*);
+extern "C" __global__ void lt_f8_e4m3(const size_t, const size_t, const size_t*, const __nv_fp8_e4m3*, const __nv_fp8_e4m3*, uint8_t*);
+extern "C" __global__ void le_f8_e4m3(const size_t, const size_t, const size_t*, const __nv_fp8_e4m3*, const __nv_fp8_e4m3*, uint8_t*);
+extern "C" __global__ void gt_f8_e4m3(const size_t, const size_t, const size_t*, const __nv_fp8_e4m3*, const __nv_fp8_e4m3*, uint8_t*);
+extern "C" __global__ void ge_f8_e4m3(const size_t, const size_t, const size_t*, const __nv_fp8_e4m3*, const __nv_fp8_e4m3*, uint8_t*);
+
+// --- In-place binary arithmetic kernels ---
+// Signature: (numel, num_dims, dims_and_strides, lhs_mut, rhs)
+extern "C" __global__ void badd_f32_inplace(const size_t, const size_t, const size_t*, float*, const float*);
+extern "C" __global__ void bsub_f32_inplace(const size_t, const size_t, const size_t*, float*, const float*);
+extern "C" __global__ void bmul_f32_inplace(const size_t, const size_t, const size_t*, float*, const float*);
+extern "C" __global__ void bdiv_f32_inplace(const size_t, const size_t, const size_t*, float*, const float*);
+extern "C" __global__ void bmin_f32_inplace(const size_t, const size_t, const size_t*, float*, const float*);
+extern "C" __global__ void bmax_f32_inplace(const size_t, const size_t, const size_t*, float*, const float*);
+extern "C" __global__ void badd_f64_inplace(const size_t, const size_t, const size_t*, double*, const double*);
+extern "C" __global__ void bsub_f64_inplace(const size_t, const size_t, const size_t*, double*, const double*);
+extern "C" __global__ void bmul_f64_inplace(const size_t, const size_t, const size_t*, double*, const double*);
+extern "C" __global__ void bdiv_f64_inplace(const size_t, const size_t, const size_t*, double*, const double*);
+extern "C" __global__ void bmin_f64_inplace(const size_t, const size_t, const size_t*, double*, const double*);
+extern "C" __global__ void bmax_f64_inplace(const size_t, const size_t, const size_t*, double*, const double*);
+extern "C" __global__ void badd_u8_inplace(const size_t, const size_t, const size_t*, uint8_t*, const uint8_t*);
+extern "C" __global__ void bsub_u8_inplace(const size_t, const size_t, const size_t*, uint8_t*, const uint8_t*);
+extern "C" __global__ void bmul_u8_inplace(const size_t, const size_t, const size_t*, uint8_t*, const uint8_t*);
+extern "C" __global__ void bdiv_u8_inplace(const size_t, const size_t, const size_t*, uint8_t*, const uint8_t*);
+extern "C" __global__ void badd_u32_inplace(const size_t, const size_t, const size_t*, uint32_t*, const uint32_t*);
+extern "C" __global__ void bsub_u32_inplace(const size_t, const size_t, const size_t*, uint32_t*, const uint32_t*);
+extern "C" __global__ void bmul_u32_inplace(const size_t, const size_t, const size_t*, uint32_t*, const uint32_t*);
+extern "C" __global__ void bdiv_u32_inplace(const size_t, const size_t, const size_t*, uint32_t*, const uint32_t*);
+extern "C" __global__ void badd_i64_inplace(const size_t, const size_t, const size_t*, int64_t*, const int64_t*);
+extern "C" __global__ void bsub_i64_inplace(const size_t, const size_t, const size_t*, int64_t*, const int64_t*);
+extern "C" __global__ void bmul_i64_inplace(const size_t, const size_t, const size_t*, int64_t*, const int64_t*);
+extern "C" __global__ void bdiv_i64_inplace(const size_t, const size_t, const size_t*, int64_t*, const int64_t*);
+extern "C" __global__ void badd_f16_inplace(const size_t, const size_t, const size_t*, __half*, const __half*);
+extern "C" __global__ void bsub_f16_inplace(const size_t, const size_t, const size_t*, __half*, const __half*);
+extern "C" __global__ void bmul_f16_inplace(const size_t, const size_t, const size_t*, __half*, const __half*);
+extern "C" __global__ void bdiv_f16_inplace(const size_t, const size_t, const size_t*, __half*, const __half*);
+extern "C" __global__ void bmin_f16_inplace(const size_t, const size_t, const size_t*, __half*, const __half*);
+extern "C" __global__ void bmax_f16_inplace(const size_t, const size_t, const size_t*, __half*, const __half*);
+extern "C" __global__ void badd_bf16_inplace(const size_t, const size_t, const size_t*, __nv_bfloat16*, const __nv_bfloat16*);
+extern "C" __global__ void bsub_bf16_inplace(const size_t, const size_t, const size_t*, __nv_bfloat16*, const __nv_bfloat16*);
+extern "C" __global__ void bmul_bf16_inplace(const size_t, const size_t, const size_t*, __nv_bfloat16*, const __nv_bfloat16*);
+extern "C" __global__ void bdiv_bf16_inplace(const size_t, const size_t, const size_t*, __nv_bfloat16*, const __nv_bfloat16*);
+extern "C" __global__ void bmin_bf16_inplace(const size_t, const size_t, const size_t*, __nv_bfloat16*, const __nv_bfloat16*);
+extern "C" __global__ void bmax_bf16_inplace(const size_t, const size_t, const size_t*, __nv_bfloat16*, const __nv_bfloat16*);
+extern "C" __global__ void badd_f8_e4m3_inplace(const size_t, const size_t, const size_t*, __nv_fp8_e4m3*, const __nv_fp8_e4m3*);
+extern "C" __global__ void bsub_f8_e4m3_inplace(const size_t, const size_t, const size_t*, __nv_fp8_e4m3*, const __nv_fp8_e4m3*);
+extern "C" __global__ void bmul_f8_e4m3_inplace(const size_t, const size_t, const size_t*, __nv_fp8_e4m3*, const __nv_fp8_e4m3*);
+extern "C" __global__ void bdiv_f8_e4m3_inplace(const size_t, const size_t, const size_t*, __nv_fp8_e4m3*, const __nv_fp8_e4m3*);
+extern "C" __global__ void bmin_f8_e4m3_inplace(const size_t, const size_t, const size_t*, __nv_fp8_e4m3*, const __nv_fp8_e4m3*);
+extern "C" __global__ void bmax_f8_e4m3_inplace(const size_t, const size_t, const size_t*, __nv_fp8_e4m3*, const __nv_fp8_e4m3*);
+
+// --- Additional unary kernels ---
+extern "C" __global__ void ucopy_u8(const size_t, const size_t, const size_t*, const uint8_t*, uint8_t*);
+extern "C" __global__ void ucopy_u32(const size_t, const size_t, const size_t*, const uint32_t*, uint32_t*);
+extern "C" __global__ void ucopy_i64(const size_t, const size_t, const size_t*, const int64_t*, int64_t*);
+extern "C" __global__ void uneg_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void uneg_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void uneg_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void urecip_f32(const size_t, const size_t, const size_t*, const float*, float*);
+extern "C" __global__ void urecip_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void urecip_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void urecip_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void uexp_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void uexp_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void uexp_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void ulog_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void ulog_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void ulog_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void usin_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void usin_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void usin_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void ucos_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void ucos_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void ucos_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void utanh_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void utanh_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void utanh_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void uerf_f32(const size_t, const size_t, const size_t*, const float*, float*);
+extern "C" __global__ void uerf_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void uerf_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void uerf_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void uceil_f32(const size_t, const size_t, const size_t*, const float*, float*);
+extern "C" __global__ void uceil_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void uceil_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void uceil_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void ufloor_f32(const size_t, const size_t, const size_t*, const float*, float*);
+extern "C" __global__ void ufloor_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void ufloor_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void ufloor_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void uround_f32(const size_t, const size_t, const size_t*, const float*, float*);
+extern "C" __global__ void uround_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void uround_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void uround_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void unormcdf_f32(const size_t, const size_t, const size_t*, const float*, float*);
+extern "C" __global__ void unormcdf_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void unormcdf_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void unormcdf_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void uabs_f32(const size_t, const size_t, const size_t*, const float*, float*);
+extern "C" __global__ void uabs_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void uabs_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void uabs_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void usqr_f32(const size_t, const size_t, const size_t*, const float*, float*);
+extern "C" __global__ void usqr_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void usqr_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void usqr_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void usqrt_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void usqrt_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void usqrt_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void ugelu_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void ugelu_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void ugelu_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void ugelu_erf_f32(const size_t, const size_t, const size_t*, const float*, float*);
+extern "C" __global__ void ugelu_erf_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void ugelu_erf_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void ugelu_erf_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void urelu_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void urelu_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void urelu_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void usilu_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void usilu_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void usilu_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void usign_f32(const size_t, const size_t, const size_t*, const float*, float*);
+extern "C" __global__ void usign_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void usign_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void usign_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void usigmoid_f64(const size_t, const size_t, const size_t*, const double*, double*);
+extern "C" __global__ void usigmoid_f16(const size_t, const size_t, const size_t*, const __half*, __half*);
+extern "C" __global__ void usigmoid_bf16(const size_t, const size_t, const size_t*, const __nv_bfloat16*, __nv_bfloat16*);
+
+// --- Parametric unary kernels ---
+extern "C" __global__ void uelu_f32(const size_t, const size_t, const size_t*, float, const float*, float*);
+extern "C" __global__ void uelu_f64(const size_t, const size_t, const size_t*, double, const double*, double*);
+extern "C" __global__ void uelu_f16(const size_t, const size_t, const size_t*, __half, const __half*, __half*);
+extern "C" __global__ void uelu_bf16(const size_t, const size_t, const size_t*, __nv_bfloat16, const __nv_bfloat16*, __nv_bfloat16*);
+extern "C" __global__ void upowf_f32(const size_t, const size_t, const size_t*, float, const float*, float*);
+extern "C" __global__ void upowf_f64(const size_t, const size_t, const size_t*, double, const double*, double*);
+extern "C" __global__ void upowf_f16(const size_t, const size_t, const size_t*, __half, const __half*, __half*);
+extern "C" __global__ void upowf_bf16(const size_t, const size_t, const size_t*, __nv_bfloat16, const __nv_bfloat16*, __nv_bfloat16*);
