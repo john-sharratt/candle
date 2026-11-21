@@ -425,8 +425,10 @@ fn an_edit_that_changes_nothing_is_refused() {
         .unwrap_err();
     assert_eq!(
         err,
-        "That changes nothing: layers/eras/third.md already reads that way there. If that \
-         fault is put right, go on to the next one."
+        "That changes nothing: layers/eras/third.md already reads that way there — the text you \
+         gave is the text it holds. If that fault is put right, go on to the next one. To cut \
+         words, `replace` with the words to cut as `old` and what stands in their place, \
+         shorter, as `text`; or `delete` a paragraph that says again what another says."
     );
     assert!(
         b.opened("m1").is_none_or(|w| w.is_empty()),
