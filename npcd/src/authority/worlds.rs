@@ -62,6 +62,10 @@ pub struct Standing {
     /// that does not runs none, is never a world's authority, and hands back
     /// any lease still naming it (`docs/replicated_substrate.md` §9.5).
     characters: AtomicBool,
+    /// Whether this member, running no characters, still hosts worlds
+    /// (`host_worlds:` in its config): their authority while no member that
+    /// runs characters is ready to be (`world_lease::asker`).
+    host_worlds: AtomicBool,
     roles: Roles,
     /// When each world took its role, in wall-clock milliseconds.
     since: Mutex<BTreeMap<String, u64>>,
@@ -116,6 +120,7 @@ impl Standing {
         let standing = Self {
             clustered: AtomicBool::new(false),
             characters: AtomicBool::new(true),
+            host_worlds: AtomicBool::new(false),
             roles: Roles::new(Role::Authority { epoch: 0 }),
             since: Mutex::new(BTreeMap::new()),
             written: Mutex::new(BTreeMap::new()),
@@ -158,6 +163,25 @@ impl Standing {
     /// Whether this member runs characters. Set before any world is hosted.
     pub fn set_characters(&self, characters: bool) {
         self.characters.store(characters, Ordering::Relaxed);
+    }
+
+    /// Whether this member, when it runs no characters, still hosts worlds.
+    /// Set before any world is hosted.
+    pub fn set_host_worlds(&self, host_worlds: bool) {
+        self.host_worlds.store(host_worlds, Ordering::Relaxed);
+    }
+
+    /// Whether this member may be a world's authority: it runs characters, or
+    /// hosts worlds without them.
+    pub fn hosts_worlds(&self) -> bool {
+        self.characters() || self.host_worlds.load(Ordering::Relaxed)
+    }
+
+    /// Whether this member hosts worlds and runs no characters: it asks for a
+    /// world only while no member that runs characters is ready to
+    /// (`world_lease::asker`).
+    pub fn stands_in(&self) -> bool {
+        !self.characters() && self.host_worlds.load(Ordering::Relaxed)
     }
 
     /// The cluster this member joined.
@@ -514,6 +538,20 @@ mod tests {
         assert!(w.characters() && w.runs(42));
         w.set_characters(false);
         assert!(!w.runs(42));
+    }
+
+    /// **A member that runs no characters hosts worlds only when told to**, and
+    /// then stands in for the members that do; one that runs characters hosts
+    /// worlds and never stands in.
+    #[test]
+    fn a_member_hosts_worlds_with_characters_or_when_told() {
+        let w = Standing::new(false);
+        assert!(w.hosts_worlds() && !w.stands_in());
+        w.set_characters(false);
+        assert!(!w.hosts_worlds() && !w.stands_in());
+        w.set_host_worlds(true);
+        assert!(w.hosts_worlds() && w.stands_in());
+        assert!(!w.runs(42), "hosting worlds runs no character");
     }
 
     /// The old objects go once each converted world has written its records,

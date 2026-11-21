@@ -27,7 +27,7 @@ use tokio::time::{interval, MissedTickBehavior};
 
 use super::npc_lease::hex;
 use super::role::Role;
-use super::world_lease::{epoch_for, lease_key, proposer, step, world_of, Step};
+use super::world_lease::{asker, epoch_for, lease_key, step, world_of, Step};
 use crate::api::now_ms;
 use crate::engine::runtime::Runtime;
 use crate::world::Hosted;
@@ -127,8 +127,8 @@ impl Runtime {
             }
             let key = lease_key(&world);
             let held = r.holds(&key);
-            if !self.standing.characters() {
-                // **A member that runs no characters is never a world's
+            if !self.standing.hosts_worlds() {
+                // **A member that hosts no worlds is never a world's
                 // authority.** It never asks; one it holds — taken before it
                 // was told so — it hands over at once, to whichever member
                 // rendezvous names, or to none until one returns.
@@ -151,7 +151,7 @@ impl Runtime {
                     continue;
                 }
             }
-            let asks = proposer(&ready);
+            let asks = asker(&ready, me, self.standing.stands_in());
             let since = asked.get(&world).map_or(Duration::MAX, |at| at.elapsed());
             match step(me, asks, held, since, RENEW_EVERY) {
                 Step::Acquire => {

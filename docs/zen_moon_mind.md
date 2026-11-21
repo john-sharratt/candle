@@ -519,7 +519,10 @@ done, stamped, and the agenda moves on. Each step is signed off by the act it na
 
 A mission of Zen's own is closed the same way when its steps are seen done; one whose steps the
 engine cannot see (a step that is Zen's to judge) is closed by Zen with `mission_done`, saying what
-it found — never filed as dropped. A round mission carried for an hour (`round::STALE_MS`) without every step signed off
+it found — never filed as dropped. A step the engine *can* see — a journey, a reading — is never
+closed by `mission_done` while it stands unseen (`Missions::agenda_done`): asked to have a Drone
+read a panel, Zen put "go to the watch room" on its own agenda, closed it with a reading it never
+took, and told the Creator it had read the panel. A round mission carried for an hour (`round::STALE_MS`) without every step signed off
 is called off as failed, rests as a failure does, and the round moves on — so a step Zen cannot do
 holds the round up for an hour, never for good.
 

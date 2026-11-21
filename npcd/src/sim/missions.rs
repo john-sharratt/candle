@@ -39,7 +39,7 @@ use super::orders::{Filed, Notice, Orders, EVERY_POSTER};
 use super::round::RoundState;
 use crate::engine::authorize::Authorizer;
 use crate::engine::mission::bank::{self, Duty, Facts};
-use crate::engine::mission::{Mission, MissionPrompt, Origin, Outcome, StepOutcome};
+use crate::engine::mission::{Aim, Mission, MissionPrompt, Origin, Outcome, StepOutcome};
 use crate::engine::mission_gen::round::{Item as RoundItem, STALE_MS};
 use crate::engine::mission_gen::world::{self, Draw, Routine};
 use crate::engine::workflow::{Next, Taker, Where, Workflow, STUCK};
@@ -511,6 +511,34 @@ impl Missions {
                  they sign it."
             ));
         }
+        // **A step the world sees done is not done by saying so.** A journey or a
+        // reading is signed off as it happens; only a step the engine cannot see
+        // is the agenda's to judge. Asked to have a Drone read a panel, Zen put
+        // "go to the watch room" on its own agenda from a conversation, closed it
+        // a turn later with "the sensor panel is active and reading stable", and
+        // told the Creator it had read it — of a panel nobody had looked at.
+        let unseen = self
+            .agenda(body)
+            .into_iter()
+            .find(|m| {
+                m.agendum
+                    .as_ref()
+                    .is_some_and(|a| a.title.eq_ignore_ascii_case(title))
+            })
+            .and_then(|m| {
+                m.todo
+                    .iter()
+                    .find(|t| !t.done && !t.reports && Aim::of(&t.text).is_some())
+            })
+            .map(|t| t.text.clone());
+        if let Some(step) = unseen {
+            return Err(format!(
+                "\"{title}\" is not done: \"{step}\" is a step the world sees done, and it has \
+                 not seen it. Do it — `focus` on the room, and its machines are read as your \
+                 attention arrives — or, if it is a Drone's to do, post it at the order table \
+                 (`order_post`), and it is done when they report it."
+            ));
+        }
         if let Some(step) = round_step {
             let next = match step {
                 Some(step) => {
@@ -875,7 +903,15 @@ impl Missions {
     ///
     /// `None` in a world that draws nothing ([`Draw::None`]) with nothing set
     /// for this body: it waits at the table until work is posted.
+    ///
+    /// **One who gives orders takes nothing from the table, ever.** Its
+    /// missions come from the people who message it; the table is where it
+    /// puts work for those who take orders. Refused here, where the table hands
+    /// work out, not only by the callers that ask.
     pub fn collect(&mut self, body: &str, facts: &Facts) -> Option<&Mission> {
+        if self.is_unordered(body) {
+            return None;
+        }
         let mission = match self.take_lodged(body).or_else(|| self.take_pooled(body)) {
             Some(mission) => mission,
             None if self.draw == Draw::None => return None,
@@ -1727,8 +1763,9 @@ impl Missions {
     }
 
     /// A body starts over: what it carries is called off, every mission
-    /// waiting for it, whoever lodged it, is dropped — each poster told — and
-    /// the work it posted that nobody has taken up yet is taken off the table.
+    /// waiting for it, whoever lodged it, is dropped — each poster told — the
+    /// work it posted that nobody has taken up yet is taken off the table, and
+    /// the missions it finished are forgotten with the rest of its past.
     /// Returns how many missions went. The body stays in the world, taking
     /// orders or giving them as it did.
     pub fn start_over(&mut self, body: &str) -> usize {
@@ -1736,6 +1773,10 @@ impl Missions {
         while gone < START_OVER_MOST && self.cancel_for(body, STARTED_OVER) {
             gone += 1;
         }
+        // Called off, each went to what it finished last: started over, it
+        // has finished nothing.
+        self.done.remove(body);
+        self.last_closed.remove(body);
         for m in self.lodged.remove(body).unwrap_or_default() {
             self.called_off(body, &m, STARTED_OVER);
             gone += 1;
@@ -2230,6 +2271,38 @@ mod tests {
         assert!(drawn.is_open());
         assert!(!drawn.todo.is_empty(), "a routine gives steps to act on");
         assert!(matches!(drawn.origin, Origin::Random { .. }));
+    }
+
+    /// **One who gives orders collects nothing from the table** — not what is
+    /// lodged for it, not what waits for whoever takes it, not a routine.
+    #[test]
+    fn one_who_gives_orders_collects_nothing_from_the_table() {
+        let mut m = Missions::default();
+        m.set_routines(Vec::new(), Draw::Routines);
+        m.set_unordered("zen", true);
+        m.lodge("zen", a_mission("lodged for zen"));
+        m.post(a_mission("for whoever takes it"), None);
+        assert!(m.collect("zen", &Facts::default()).is_none());
+        assert!(!m.is_on_mission("zen"));
+        assert!(
+            m.collect("wick", &Facts::default()).is_some(),
+            "one who takes orders still collects"
+        );
+    }
+
+    /// **Starting over forgets what was finished**: nothing is carried, and
+    /// nothing is kept as done or as the last mission closed.
+    #[test]
+    fn starting_over_forgets_what_was_finished() {
+        let mut m = Missions::default();
+        m.assign("zen", a_mission("read the reports"));
+        m.report("zen", Outcome::Pass, "read", None).unwrap();
+        m.assign("zen", a_mission("watch earth"));
+        assert!(m.done("zen").is_some());
+        m.start_over("zen");
+        assert!(!m.is_on_mission("zen"));
+        assert!(m.done("zen").is_none(), "a finished mission was kept");
+        assert!(m.latest("zen").is_none(), "something was kept as latest");
     }
 
     /// A read struck wherever a mission stands — carried, lodged or pooled —
