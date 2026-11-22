@@ -609,7 +609,10 @@ fn the_captured_moe_gemm_replays_identically() -> Result<()> {
                     (rn + ri > 0).then(|| format!("{row}:{}/{cols}", rn + ri))
                 })
                 .collect();
-            println!("  {label}: {rows}×{cols}, non-finite rows [{}]", bad.join(" "));
+            println!(
+                "  {label}: {rows}×{cols}, non-finite rows [{}]",
+                bad.join(" ")
+            );
         };
         rows_report("out", &out, dt, shape_of("out_shape"));
         for operand in ["gate_out", "up_out", "down_out"] {
