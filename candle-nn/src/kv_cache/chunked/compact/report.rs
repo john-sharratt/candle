@@ -55,6 +55,10 @@ pub struct CompactionReport {
     /// carried no record: a live writer window is addressed from its gids and is given
     /// none. Zero with a non-zero `moves` means the pass relocated only writer windows.
     pub records_minted: usize,
+    /// Time the sweep spent minting those records — claiming each slot and computing
+    /// its address, host-side, inside the sweep. Microseconds; part of
+    /// `timings.sweep`.
+    pub mint_us: u64,
     /// Relocated chunks that wanted a fresh record and could not have one, because the
     /// pre-provisioned record slots ran out mid-sweep.
     ///

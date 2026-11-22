@@ -14,6 +14,9 @@
 //! - `sweep`: the state one sweep carries across all holders.
 //! - Tests: `tests_compact`.
 
+#[cfg(feature = "cuda")]
+use std::time::Instant;
+
 use ahash::{AHashMap, AHashSet};
 
 use super::arena_set::ArenaSet;

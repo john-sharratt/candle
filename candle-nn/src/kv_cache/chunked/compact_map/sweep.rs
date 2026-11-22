@@ -113,6 +113,10 @@ pub struct Sweep<'m> {
     /// side's completeness figure, as [`Self::witnessed`] is the band side's.
     #[cfg(feature = "cuda")]
     pub(super) records_followed: AHashSet<i64>,
+    /// Time [`Self::mint_record`] spent in the minter, in microseconds — the sweep's
+    /// share that is record claims rather than gid rewrites.
+    #[cfg(feature = "cuda")]
+    pub(super) mint_us: u64,
 }
 
 impl<'m> Sweep<'m> {
@@ -142,6 +146,8 @@ impl<'m> Sweep<'m> {
             minted: AHashSet::new(),
             #[cfg(feature = "cuda")]
             records_followed: AHashSet::new(),
+            #[cfg(feature = "cuda")]
+            mint_us: 0,
         }
     }
 
@@ -171,6 +177,7 @@ impl<'m> Sweep<'m> {
             retired: Vec::new(),
             minted: AHashSet::new(),
             records_followed: AHashSet::new(),
+            mint_us: 0,
         }
     }
 
@@ -191,10 +198,12 @@ impl<'m> Sweep<'m> {
         next: &HeadGids,
         src: RecordInputs<'_>,
     ) -> candle::Result<Option<MetaGid>> {
+        let t = Instant::now();
         let minted = match self.mint.as_mut() {
             Some((mint, backing)) => mint.mint(backing, next, src)?,
             None => None,
         };
+        self.mint_us += t.elapsed().as_micros() as u64;
         if let Some(record) = &minted {
             self.note_minted(record.raw());
         }
@@ -376,6 +385,12 @@ impl<'m> Sweep<'m> {
 
     pub fn allocations_rewritten(&self) -> usize {
         self.allocations_rewritten
+    }
+
+    /// Time spent minting records — see [`Self::mint_us`].
+    #[cfg(feature = "cuda")]
+    pub(in super::super) fn mint_us(&self) -> u64 {
+        self.mint_us
     }
 
     /// Visits answered by an earlier scan of the same unmoved allocation

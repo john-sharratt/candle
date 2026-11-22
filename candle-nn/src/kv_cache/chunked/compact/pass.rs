@@ -655,6 +655,7 @@ impl super::super::backing::ChunkedKvBacking {
         report.clean_reused = sweep_state.clean_reused();
         report.records_moved = map.records_len();
         report.records_unfollowed = sweep_state.records_unfollowed();
+        report.mint_us = sweep_state.mint_us();
         report.timings.sweep = phase.elapsed();
         phase = Instant::now();
 

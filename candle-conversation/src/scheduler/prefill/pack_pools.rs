@@ -697,8 +697,8 @@ impl Scheduler {
                 tracing::info!(
                     target: "candle_conversation::scheduler::compaction",
                     "compaction sweep split sweep_ms={} substrates_ms={} projections_ms={} \
-                     detached_ms={} reclaimed_ms={} backings_ms={} moves={} allocations={} \
-                     clean_reused={} residences={swept}",
+                     detached_ms={} reclaimed_ms={} backings_ms={} mint_ms={} minted={} \
+                     moves={} allocations={} clean_reused={} residences={swept}",
                     t.sweep.as_millis(),
                     ms(substrates_us),
                     ms(projections_us),
@@ -707,6 +707,8 @@ impl Scheduler {
                     ms(t.sweep.as_micros().saturating_sub(
                         substrates_us + projections_us + detached_us + reclaimed_us
                     )),
+                    report.mint_us / 1000,
+                    report.records_minted,
                     report.moves,
                     report.allocations_rewritten,
                     report.clean_reused,
