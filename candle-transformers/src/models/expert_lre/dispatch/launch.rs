@@ -11,6 +11,8 @@
 //! readback this path avoids.
 
 use super::*;
+#[cfg(feature = "tensor-assert")]
+use crate::models::nan_capture::{fill_sentinel, watch_fault};
 
 impl Dispatch {
     /// The CPU pool's doorbell and `done` words as the host reads them now:
@@ -94,6 +96,10 @@ impl Dispatch {
         #[cfg(feature = "profile")]
         let stall = device.memcpy_stod(&vec![0u64; table.n_rows() * STALL_WORDS])?;
         let fault = Arc::new(FaultWord::new()?);
+        // A capture downstream of a given-up expert would dump the rows the
+        // give-up left unwritten as corruption; it asks this word first.
+        #[cfg(feature = "tensor-assert")]
+        watch_fault(&fault);
         // The pool waits on a cold expert's publish where a GPU worker would,
         // and gives it up through the same words (§5.4).
         if let Some(c) = &cpu {
@@ -720,7 +726,7 @@ impl Dispatch {
         // (invariant 6).
         let ys = wave_empty((num_tokens, hidden_dim), out_dtype, &device, wave)?;
         #[cfg(feature = "tensor-assert")]
-        crate::models::nan_capture::fill_sentinel(&ys, cuda_dev)?;
+        fill_sentinel(&ys, cuda_dev)?;
         let g = gpu_span("moe:scatter", &device);
         fused_deterministic_scatter(
             &ys,

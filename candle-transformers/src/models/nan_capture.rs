@@ -66,9 +66,10 @@ use candle::tensor_assert::{check_now, check_now_quant, Dump, Finding, QTYPE_Q8A
 use candle::{cuda_backend::CudaDevice, LiveTensor, Result};
 
 use super::expert_lre::slot_integrity::{check_watch, watching};
+use super::expert_lre::FaultWord;
 use cudarc::driver::result::memset_d8_async;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once, OnceLock, Weak};
 
 /// Where the dump goes.
 ///
@@ -117,6 +118,57 @@ pub fn set_shard_scan(f: impl Fn(usize) -> Vec<String> + Send + Sync + 'static) 
     if let Ok(mut s) = shard_scan().write() {
         *s = Some(Box::new(f));
     }
+}
+
+/// The expert caches' fault words, held weakly: a cache that drops takes its
+/// word out of the question.
+fn fault_words() -> &'static Mutex<Vec<Weak<FaultWord>>> {
+    static W: OnceLock<Mutex<Vec<Weak<FaultWord>>>> = OnceLock::new();
+    W.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register an expert cache's fault word, so no capture dumps a forward a
+/// given-up expert has already doomed.
+///
+/// **A give-up is not a corruption.** A worker that gives a cold expert up
+/// leaves its rows unwritten and claims the word, every later cold wait in the
+/// forward gives its expert up at once, and the forward is discarded and run
+/// again once it synchronises. A checkpoint's fence sees those rows first: on
+/// WhiteWorld one give-up early in a decode sweep left the whole MoE input of
+/// layer 24 NaN, and the capture stopped the process over a forward the engine
+/// was about to throw away.
+pub(crate) fn watch_fault(word: &Arc<FaultWord>) {
+    if let Ok(mut w) = fault_words().lock() {
+        w.retain(|f| f.strong_count() > 0);
+        w.push(Arc::downgrade(word));
+    }
+}
+
+/// Whether any live expert cache's fault word is claimed — the forward the
+/// caller is checking is then one that will be discarded. Every cache's word,
+/// not only the checkpoint's own: a capture only ever stands down for this,
+/// and standing down for another engine's fault costs one missed capture,
+/// never a wrong one.
+fn forward_faulted() -> bool {
+    fault_words()
+        .lock()
+        .map(|w| w.iter().filter_map(Weak::upgrade).any(|f| f.is_set()))
+        .unwrap_or(false)
+}
+
+/// Stand a capture down over a forward a given-up expert has doomed, saying
+/// so once; `true` when it should.
+fn stands_down(name: &str) -> bool {
+    if !forward_faulted() {
+        return false;
+    }
+    tracing::warn!(
+        target: "candle_transformers::nan_capture",
+        site = name,
+        "capture stood down: an expert was given up in this forward, which is discarded — \
+         its unwritten rows are not a corruption"
+    );
+    true
 }
 
 /// Run the registered probe and record its answer in the dump.
@@ -339,7 +391,7 @@ pub fn armed_finding(name: &'static str, out: &LiveTensor<'_>) -> Option<Finding
     }
     let mut found: Option<Finding> = None;
     check_now(out, name, |f| found = Some(f.clone()));
-    found
+    found.filter(|_| !stands_down(name))
 }
 
 /// The second half of [`checkpoint`]: dump `out`, the `extras` and whatever
@@ -431,6 +483,9 @@ pub unsafe fn checkpoint_q8a128(
         return Ok(());
     }
     let f = found.expect("check_now_quant reports bad only through the callback");
+    if stands_down(name) {
+        return Ok(());
+    }
 
     let mut d = Dump::create(DUMP_DIR)?;
     d.note("checkpoint", name);
@@ -519,6 +574,29 @@ pub fn fill_sentinel(t: &LiveTensor<'_>, dev: &CudaDevice) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::expert_lre::ExpertFault;
+    use candle::Device;
+
+    /// **A capture stands down while a watched fault word is claimed**, and
+    /// not once it is cleared or its cache is gone.
+    #[test]
+    fn a_claimed_fault_word_stands_every_capture_down() -> Result<()> {
+        let _context = Device::new_cuda(0)?;
+        let word = Arc::new(FaultWord::new()?);
+        watch_fault(&word);
+        assert!(!stands_down("test.site"), "nothing claimed");
+        word.claim(ExpertFault::decode((3u64 << 48) | (7u64 << 32) | 1_000_000).unwrap());
+        assert!(stands_down("test.site"), "a give-up dooms the forward");
+        word.clear();
+        assert!(!stands_down("test.site"), "the forward was failed");
+        word.claim(ExpertFault::decode((3u64 << 48) | (7u64 << 32) | 1).unwrap());
+        drop(word);
+        assert!(
+            !stands_down("test.site"),
+            "a dropped cache's word is not asked"
+        );
+        Ok(())
+    }
 
     /// **Each report's first bad finding is told from the rest** by its
     /// ticket: rising within a report, restarting with the next, and an

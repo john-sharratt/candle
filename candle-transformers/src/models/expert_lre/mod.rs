@@ -266,6 +266,10 @@ pub use cache::PINNED_LAYERS;
 /// leaves nothing to predict.
 #[cfg(feature = "cuda")]
 pub(crate) use dispatch::PREFILL_LAUNCH_TOKENS as LOOK_AHEAD_MAX_TOKENS;
+#[cfg(all(test, feature = "tensor-assert"))]
+pub(crate) use fault::ExpertFault;
+#[cfg(feature = "tensor-assert")]
+pub(crate) use fault::FaultWord;
 #[cfg(feature = "cuda")]
 pub use fault::{is_expert_stall, EXPERT_STALL_MARKER};
 pub use handle::ExpertCache;
