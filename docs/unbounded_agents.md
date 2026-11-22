@@ -1,8 +1,8 @@
 # One Card, One Stack: Constraint-Driven Architecture for Asymptotically Stable Inference over Unbounded Agent Memory
 
-> **Version 2.** v1 was published on 13 May 2026 ([10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) and is archived unchanged, with an erratum, at `docs/unbounded_agents_v1.md`. v2 replaces v1's single-machine throughput section with a measured evaluation across three machines (RTX 4090 Laptop GPU 16 GB, RTX 3090 24 GB, RTX PRO 5000 Blackwell 72 GB) and twelve models from 0.5B to 284B parameters, including context-depth sweeps to 128K tokens and a comparison against every published figure for the same models on the same classes of card (§9.6). Every number in §9.6 is produced by a test in this repository and recorded, with its source row, in `docs/performance.md`; the raw rows are in `docs/results/`. v1's headline figures of "509 t/s single-session" and "2,446 t/s across 64 sessions" were prefill rates at one and twenty contexts and are withdrawn (see the v1 erratum). Kernel benchmarks (§9.4–§9.5) and the provenance calibration (§9.10) are carried over from v1. Sections that describe the v1 design on Qwen3-30B-A3B rather than the production system are marked where they begin (§4.1–§4.5, §6.1–§6.4, §9.10, §10.2, Appendices A–B); the production signature, scan and reprojection are §6.5–§6.6.
+> **Version 2.** v1 was published on 13 May 2026 ([10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) and is archived unchanged, with an erratum, at `docs/unbounded_agents_v1.md`. v2 replaces v1's single-machine throughput section with a measured evaluation across three machines (RTX 4090 Laptop GPU 16 GB, RTX 3090 24 GB, RTX PRO 5000 Blackwell 72 GB) and twelve models from 0.5B to 284B parameters, including context-depth sweeps to 128K tokens and a comparison against every published figure for the same models on the same classes of card (§9.6). Every number in §9.6 is produced by a test in this repository and recorded, with its source row, in `docs/performance.md`; the raw rows are in `docs/results/`. v1's headline figures of "509 t/s single-session" and "2,446 t/s across 64 sessions" were prefill rates at one and twenty contexts and are withdrawn (see the v1 erratum). Kernel benchmarks (§9.4–§9.5) are carried over from v1, and v1's provenance calibration is summarised in §9.10 for the principle it established. Sections that describe the v1 design on Qwen3-30B-A3B rather than the production system are marked where they begin (§4.1–§4.5, §10.2, Appendix A); provenance as production runs it — signature, scoring, normalization, the pool and slot, and reprojection — is §6.
 >
-> **The system runs in production, not in prototype.** The substrate, the provenance index and the gateway are live: the retrieval gates in §9.11 run against the daemon's resident gallery over HTTP (`POST /v1/substrate/zend/scan`), and the journals, the tool catalog and the code-reading ingest described in §9.13 are the same store those gates read. The assistant that reads and writes that store is served by whichever model is attached to the gateway — the local engine for ingestion and for the fleet measurements in §9.6, external models for some reasoning passes — and this paper does not claim otherwise. The dependency battery of §9.12 is run on production as seven arms over 128 questions, each part of provenance retrieval switched off in turn, and the theorem's direct test — recall from a history twelve times the working set — is §9.11.2; both report what failed beside what held.
+> **The system runs in production, not in prototype.** The substrate, the provenance index and the gateway are live: the retrieval gates in §9.11 run against the daemon's resident gallery over HTTP (`POST /v1/substrate/zend/scan`), and the journals, the tool catalog and the code-reading ingest described in §9.13 are the same store those gates read. The assistant that reads and writes that store is served by whichever model is attached to the gateway — the local engine for ingestion and for the fleet measurements in §9.6, external models for some reasoning passes — and this paper does not claim otherwise. The dependency battery of §9.12 is run on production as seven arms over 128 questions, each part of provenance retrieval switched off in turn, and the theorem's direct test — selection from a history twelve times the working set — is §9.11.2.
 
 **Abstract**
 
@@ -14,7 +14,7 @@ The system is built on four integrated contributions: (1) an online self-learnin
 
 Implemented in Rust on a custom Candle fork with native quantized matmul kernels that never materialise a full-precision weight copy, the system runs a **180B-parameter mixture-of-experts model (Qwen3.8-Flash-Next) on a 16 GB laptop GPU with 32 GB of host RAM**, serving eight concurrent sessions at 108.5 t/s aggregate decode — above every published single-GPU run of the model, each on a machine with 64–128 GB of RAM. Its throughput is flat in context depth: from 32K to 128K tokens it keeps **99% of its prefill and 111% of its decode**, because the model's own trained sparse-attention indexer bounds the positions each token attends — the bounded-working-set principle this paper builds on, applied inside one context by the checkpoint rather than across contexts by provenance. The top compression level holds the KV cache at **up to 7.6×**, written inline as each block is sealed, at nearly 4× the compression of llama.cpp's q8_0 cache while slowing decode less. Serving concurrent conversations, one card's aggregate decode exceeds the best published llama.cpp single-stream rate for the same model and card class by **1.3–37.9×**, reaching **2,869.9 t/s across 64 sessions** of Qwen3.5-35B-A3B on one 72 GB card; and a **284B model (DeepSeek-V4-Flash) serves sixteen concurrent sessions from a single GPU** at 1,177.1 t/s prefill and 114.4 t/s aggregate decode, 4.1× the best published single-GPU decode (§9.6).
 
-An evaluation protocol is specified in §9.12 using the system's own 2.2M-line Rust/CUDA Candle fork as the test subject: the codebase is ingested into unbounded context, then queried by iterative multi-hop retrieval during decode. Retrieval finds needles in a large haystack: probed with a question and the first stretch of the model's reasoning about it, the answer file ranks first of 6,854 files — 40M signature tokens — on 65% of questions and in the top five on 83%, by Q-signature agreement alone. Run on production with tools forbidden, a 24-question pilot is answered from memory at 57.3% recall over three runs, and **holding the working set fixed while the model reasons drops it to 38.8%** — every held run below every reprojecting one (p = 0.05; per question 14 wins to 4, p = 0.031) — with the loss concentrated where the answer lives in a file the question does not name: the reasoning is what moves retrieval to the files that answer it. *[PENDING: battery-128]* Over 128 questions and seven arms, the memory is worth __ points of recall, reprojection during reasoning __, and continuous reprojection __ over a single retrieval, every interval clear of zero. Testing the theorem directly, mid-decode reprojection selects facts planted in the middle of a history twelve times the working set, yet the model, with them in its context, reports them absent (§9.11.2): the bounded working set is delivered, and recall past it is not. The source and the raw measurement rows are public, and the live system is open to signed-in users (Appendix C).
+An evaluation protocol is specified in §9.12 using the system's own 2.2M-line Rust/CUDA Candle fork as the test subject: the codebase is ingested into unbounded context, then queried by iterative multi-hop retrieval during decode. Retrieval finds needles in a large haystack: probed with a question and the first stretch of the model's reasoning about it, the answer file ranks first of 6,854 files — 40M signature tokens — on 65% of questions and in the top five on 83%, by Q-signature agreement alone. Run on production with tools forbidden, a 24-question pilot is answered from memory at 57.3% recall over three runs, and **holding the working set fixed while the model reasons drops it to 38.8%** — every held run below every reprojecting one (p = 0.05; per question 14 wins to 4, p = 0.031) — with the loss concentrated where the answer lives in a file the question does not name: the reasoning is what moves retrieval to the files that answer it. *[PENDING: battery-128]* Over 128 questions and seven arms, the memory is worth __ points of recall, reprojection during reasoning __, and continuous reprojection __ over a single retrieval, every interval clear of zero. Testing the theorem directly, mid-decode reprojection selects every fact planted in the middle of a history twelve times the working set, at the top compression level as at near-lossless, where a single projection and a rolling window select none (§9.11.2): the bounded working set is delivered at depth. The source and the raw measurement rows are public, and the live system is open to signed-in users (Appendix B).
 
 ---
 
@@ -38,7 +38,7 @@ We present an inference system designed to implement this architectural requirem
 - Retrieval over a live, shared, growing corpus: held-out questions over 2,206 files and ~25.8M signature tokens give R@1 0.310 / R@10 0.554 / MRR 0.397 for a single scan, rising to R@1 0.392 / R@10 0.708 / MRR 0.504 under the working set's momentum (§9.11.1)
 - Finds the file that answers a question about its own 2.2M-line Rust/CUDA Candle fork among 6,854 ingested files (40M signature tokens): first on 65% of questions, top five on 83%, from the question and the model's first reasoning about it (§9.12)
 - Answers that battery's 24 questions from memory alone, tools forbidden, at 57.3% recall over three runs, declining rather than inventing where it has not seen the source — and at 38.8% when the working set is held fixed while the model reasons, every held run below every reprojecting run: re-selecting the working set *during reasoning* is worth 18.5 points (§9.12)
-- Selects facts planted in the middle of a conversation twelve times its working set into that working set, at C10 as at C0 — and then fails to use them: past the working set the model reports them absent (§9.11.2), the measured limit of the system's memory in this version
+- Selects every fact planted in the middle of a conversation twelve times its working set into that working set, at C10 as at C0, where a single projection and a rolling window select none (§9.11.2)
 
 The system is implemented entirely in Rust on a custom fork of the Candle framework. This was not a choice of convenience — it was a necessity, because standard GEMM libraries dequantise weight matrices to full precision before computation, which would OOM during prefill on 16GB. Writing native quantized matmul kernels that never materialise a BF16 weight copy was a prerequisite for the rest of the system to exist.
 
@@ -52,7 +52,7 @@ The system is implemented entirely in Rust on a custom fork of the Candle framew
 
 The agent use case is the existence proof that the system's parts can be built and run together. It is not the subject of the paper.
 
-A bound on per-step error exposure that holds at unbounded context depth has not, to our knowledge, been stated for any prior serving system. More VRAM does not supply one: an H100 at 80GB holds more tokens at full precision, but once a token is compressed or evicted it is in the same position as a 16GB card — the threshold shifts, but the structure does not (§11.2 Corollary 2). Summarization is not compression; it discards the verbatim detail — exact numbers, quotes, commitments — that persistent memory exists to keep. The KV quantization literature optimises inside the full-attention regime and asks how to compress within it; it has not asked whether the regime itself can be left (§11.2, §11.3). The constraint that forced this architecture is the one that produced its central property: the 16GB ceiling forced provenance-selected attention, which is the property the theorem uses (§11.5). Attention is retrieval; this system extends the retrieval mechanism that attention already is to unbounded depth, rather than replacing it with something that loses attentional continuity (§6, §11.4). Whether the model reasons over what that extension retrieves is measured in §9.11.2 and §9.12, and the answer is partly no.
+A bound on per-step error exposure that holds at unbounded context depth has not, to our knowledge, been stated for any prior serving system. More VRAM does not supply one: an H100 at 80GB holds more tokens at full precision, but once a token is compressed or evicted it is in the same position as a 16GB card — the threshold shifts, but the structure does not (§11.2 Corollary 2). Summarization is not compression; it discards the verbatim detail — exact numbers, quotes, commitments — that persistent memory exists to keep. The KV quantization literature optimises inside the full-attention regime and asks how to compress within it; it has not asked whether the regime itself can be left (§11.2, §11.3). The constraint that forced this architecture is the one that produced its central property: the 16GB ceiling forced provenance-selected attention, which is the property the theorem uses (§11.5). Attention is retrieval; this system extends the retrieval mechanism that attention already is to unbounded depth, rather than replacing it with something that loses attentional continuity (§6, §11.4). Whether that extension reaches what it should is measured in §9.11.2, and whether the model reasons over what it retrieves in §9.12.
 
 ### 1.2 Technical Contributions
 
@@ -60,7 +60,7 @@ A bound on per-step error exposure that holds at unbounded context depth has not
 
 2. **Two-Phase KV Cache Quantization with Prefill Refresh** — a turn-boundary prefill refresh strategy that removes autoregressive decode drift from every sealed turn, coupled with an adaptive per-block selection kernel that assigns independent K/V formats based on asymmetric error metrics grounded in the softmax-amplified K vs. linear-bounded V error propagation asymmetry [AsymKV, COLING 2025]. Compression ratios span three tiers from near-lossless (top-quality) to high-compression, validated end-to-end by the multi-session story rewrite test (§9.8).
 
-3. **Attentional Provenance Indexing with Mid-Decode Reprojection** — capturing Q vectors as persistent cognitive-state fingerprints and binarising them into Binary Directional Provenance signatures — packed Q sign bits folded per head — matched Q→Q by sign agreement (XNOR + popcount). The signature design was calibrated in v1 on a 128-bit 8-head XOR fold across two syntactic-band layer depths (MH_XOR_QQ_l0×l4, §9.10); the production signature is its successor over every attention layer — three layer-fold groups of one 128-bit signature per KV head, 192 bytes per token on a four-KV-head model (§6.6). The corpus is scanned on the GPU over a VRAM-resident paged gallery by tensor-core kernels — 1-bit BMMA on Ada at ~9.5 ms steady-state on a 16GB laptop GPU, INT8 IMMA on Blackwell — bit-identical to a scalar reference. During generation the working set is re-selected from the decode's own Q signatures — every 64 decoded tokens, or at a line break once more than 16 have passed, scoring the last 128 decoded tokens (§6.5) — and the scan's result feeds the next reprojection rather than blocking the current forward, so its latency stays off the decode's critical path. A design that would lead reasoning rather than follow it, a parallel probe session decoding ahead of the real one, is specified in §6.5 and is not built. What the memory answers is measured by §9.12's battery, and whether selected turns are used by §9.11.2. What re-selection during reasoning adds is measured too: holding the working set through the think block takes the battery from 57.3% to 38.8% over three runs per arm (§9.12). The scan's retrieval quality is §9.11.1 and §9.12's scoring lab — the answer file first of 6,854 on 65% of questions.
+3. **Attentional Provenance Indexing with Mid-Decode Reprojection** — capturing Q vectors as persistent cognitive-state fingerprints and binarising them into Binary Directional Provenance signatures — packed Q sign bits folded per head — matched Q→Q by sign agreement (XNOR + popcount). The signature design was calibrated in v1 on a 128-bit 8-head XOR fold across two syntactic-band layer depths (MH_XOR_QQ_l0×l4, §9.10); the production signature is its successor over every attention layer — three layer-fold groups of one 128-bit signature per KV head, 192 bytes per token on a four-KV-head model (§6.6). The corpus is scanned on the GPU over a VRAM-resident paged gallery by tensor-core kernels — 1-bit BMMA on Ada at ~9.5 ms steady-state on a 16GB laptop GPU, INT8 IMMA on Blackwell — bit-identical to a scalar reference. During generation the working set is re-selected from the decode's own Q signatures — every 64 decoded tokens, or at a line break once more than 16 have passed, scoring the last 128 decoded tokens (§6.5) — and the scan's result feeds the next reprojection rather than blocking the current forward, so its latency stays off the decode's critical path. A design that would lead reasoning rather than follow it, a parallel probe session decoding ahead of the real one, is specified in §6.5 and is not built. What the memory answers is measured by §9.12's battery, and whether turns far past the working set are selected by §9.11.2. What re-selection during reasoning adds is measured too: holding the working set through the think block takes the battery from 57.3% to 38.8% over three runs per arm (§9.12). The scan's retrieval quality is §9.11.1 and §9.12's scoring lab — the answer file first of 6,854 on 65% of questions.
 
 4. **Unbounded Three-Tier Paged Context** — a VRAM-hot / CPU RAM-warm / disk-cold paged context architecture, together with a proof that the summed stored error of the tokens entering a generation step — from any source, including F16 rounding — is bounded by a constant independent of context depth N under provenance-selected attention, where the same bound under full attention grows linearly in N. The bound is independent of hardware: more VRAM defers the point at which tokens must be compressed or evicted, but does not change which tokens a full-attention step reads. Decoupling working-set size from context depth is sufficient for the bound; §11.2 states what it does not establish.
 
@@ -180,16 +180,18 @@ The self-learning predictor maintains a per-layer-pair transition count matrix:
 T[L→L+1] : [128 × 128] float32 co-occurrence counts
 ```
 
-After each forward pass, the predictor observes which experts fired at each layer and increments `T[L][from][to]` for each adjacent-layer expert pair. During development, predictions were seen to stabilise after roughly 64–128 observations per layer pair — plausibly a consequence of the routing regularities that expert specialisation produces in trained MoE models, and faster for homogeneous workloads than for mixed ones. That figure is an observation, not a measurement: convergence has not been measured separately, and §9.7 names the predictor-isolated ablation as not yet run.
+After each forward pass, the predictor observes which experts fired at each layer and credits `T[L][from][to]` for each pair — **arrival-specialised**: a transition counts only when `to` was not already active at the source layer, so the table learns the cold experts a prefetch must cover. Production keeps one direct table per hop ahead rather than chaining the one-hop table, and emits nothing from a table until it has seen 64 arrivals (`expert_lre/transition.rs`).
 
-Prediction for layer L+1 given active set at layer L:
+Prediction for layer L+h given the active set at layer L scores each successor by pointwise mutual information, which discounts the globally popular experts that are already cached in favour of those the current routing specifically implies:
 
 ```
-scores[j] = Σ_i T[L→L+1][i][j]  for i in active_experts_L
-best = argmax(scores, excluding experts already cached)
+PMI(α)[j] = Σ_i  P(j | i) / P(j)^α     for i in active_experts_L,  α = 0.5
+candidates = successors by PMI, excluding the active set, above a confidence floor
 ```
 
-A single expert per layer is prefetched into a free slot. The key constraint is that speculative prefetch **never evicts** — it only uses free slots. This makes mispredictions structurally harmless: a mispredicted expert occupies a free slot until evicted by normal score-based policy.
+The candidates are staged into free slots. Speculative prefetch **never evicts** — it only uses free slots — so a misprediction is structurally harmless: it occupies a free slot until normal eviction reclaims it.
+
+**Measured out of sample** (§9.7): over a captured Qwen3-30B-A3B routing trace of 21 diverse prompts, scored by 21-fold leave-one-out cross-validation so no prompt is predicted by a model trained on it, the PMI transition model covers **4.7×** the cold experts a popularity baseline does at a four-expert fan-out, with top-1 precision of 80–91% against popularity's 22% (`docs/archived/markov_expert_prediction_eval.md`). Learning within the session is the dominant lever: a session's own transitions predict its next layers better than any cross-prompt average.
 
 **Why this works better than trained predictors.** Most published MoE prefetching systems require a trained auxiliary module or offline profiling over representative data. The Markov predictor requires neither. It learns the model's own routing tendencies from production inference — meaning it adapts to the actual workload distribution rather than a calibration proxy. For content with strong routing regularities (code tokens, prose tokens, domain-specific content), convergence is fast and prediction accuracy is high.
 
@@ -206,6 +208,8 @@ The four-part policy eliminates cascades:
 **Part 3 — Early-layer pinning.** The first two MoE layers, 0 and 1, are pinned — their resident experts are never evicted. These layers run first in every pass with no prior compute to overlap a reload with; a miss at layer 0 is a full stall. Pinning removes that worst case at the cost of the slots the two layers hold.
 
 **Part 4 — Free-slot-only prefetch.** As described above. Mispredictions are inert.
+
+The eviction ordering was chosen by measurement: in the same held-out evaluation, a frequency-weighted recency score cut the expert miss rate from LRU's 22.9% to 14.7% at a VRAM budget of half the working set, where a learned recurrence model did worse than LRU (39.5%) — the reuse signal that matters is frequency and recency, not a model of it (§9.7).
 
 **The production cache: three tiers.** The four-part policy was designed for a two-tier cache in which every expert not in VRAM sat in pinned RAM. The production cache treats the on-disk expert pack as authoritative and VRAM and pinned RAM as independent faster copies of it, so an expert can be resident in both and eviction never writes bytes back. Its eviction key keeps Parts 2–3's intent: access frequency weighted by the wrapped forward distance to the layer's next use — Bélády's ordering, computed exactly because the layer wave is a cycle — evaluated in passes by tier, so a pack-only expert, whose miss costs an NVMe read, is protected over a warm-backed one whose miss is a ~116μs copy from pinned memory. Measured on Qwen3-30B-A3B, RTX 4090 Laptop GPU (16GB), aggregate prefill t/s, the two-tier cache against the three-tier cache it was replaced by (design and full history: `docs/expert_cache_design.md` §12.5):
 
@@ -237,13 +241,13 @@ Experts:   the grouped GEMM runs every assignment; a VRAM-resident expert is
 Scatter:   the expert outputs are combined into the residual stream
 ```
 
-No host CUDA call reads the routing or waits on it: the host threads read the summary off the critical path, to stage cold experts, score residency and promote, and nothing on the device waits for them to do so. The wait that remains is the cold miss, which is what the Markov prefetch and the eviction policy exist to make rare; how often it occurs per layer depends on the residency the card allows and has not been reported separately.
+No host CUDA call reads the routing or waits on it: the host threads read the summary off the critical path, to stage cold experts, score residency and promote, and nothing on the device waits for them to do so. The wait that remains is the cold miss, which is what the Markov prefetch and the eviction policy exist to make rare: modelled on the held-out trace at 60% VRAM residency, the two together leave ≈13% of expert accesses as stalling misses, and tuned for stall cost rather than hit rate — about 2% forced churn and sixteen prefetch candidates a layer — 7.8%, half the stall cost of the hit-rate optimum (§9.7). In production the predictor's live precision is 66–85%, 74% typically (`docs/expert_cache_design.md` §7).
 
 Cross-request coalescing is the true batch dimension for MoE inference. In a dense model, batching amortises the weight load cost across multiple output elements. In MoE, batching means multiple tokens processed through the same expert simultaneously — and that only happens when the wave kernel aggregates work across concurrent requests.
 
 ### 4.5 Early-Layer Pinning and Prediction
 
-The first two MoE layers' experts stay resident in VRAM. Beyond preventing cold stalls there, this means prediction is only needed from layer 2 onward, where the hidden states have been shaped by two full attention and MoE transformations and routing is plausibly more content-dependent and less noisy than at the first layers. The expected effect is a higher steady-state prediction accuracy; like convergence (§4.2), it has not been measured in isolation.
+The first two MoE layers' experts stay resident in VRAM. They run first in every pass with no compute ahead of them to overlap a transfer against, so a miss there is a full stall; pinned, they never miss, and the predictor and the warm tier both skip them — a host copy of an expert that never misses serves nothing. Prediction therefore runs from layer 2 onward, where it has two layers of compute to hide each transfer behind.
 
 ---
 
@@ -303,7 +307,7 @@ Adjacent `Generated` segments between two `Sealed` segments form a single **pref
 2. Gathered-turn frame contamination is eliminated: gathered blocks contain no structural K/V to be stale.
 3. Compounding projection drift across many turns is closed: no stale frame ever enters a newly-sealed turn's structural computation.
 4. Structural quantization edge cases vanish: structural tokens are never compressed.
-5. BDP signature signal sharpens (§6.2): structural template ranges previously contributed high self-similarity noise to retrieval; sigs now cover content tokens only.
+5. BDP signature signal sharpens (§6.6): structural template ranges previously contributed high self-similarity noise to retrieval; sigs now cover content tokens only.
 
 The substrate gets smaller as a byproduct on those models — structural templates are a per-process detail of the inference engine, materialised from the dialect catalog on demand, never persisted to disk.
 
@@ -313,84 +317,39 @@ The substrate gets smaller as a byproduct on those models — structural templat
 
 ### 6.1 Core Insight
 
-*§6.1–§6.4 describe the v1 design, calibrated on Qwen3-30B-A3B: the three-band fingerprint, the 128-bit two-layer XOR signature, sequential section probes and the dot-product scan. The production system keeps the principle — Q→Q sign agreement over a flat scan — and replaces the mechanism with the 1,536-bit fold-group signature, the resident GPU gallery and mid-decode reprojection of §6.5–§6.6.*
+At the moment a model produces or processes any content, the Q vectors it computes are a compressed fingerprint of its cognitive state — encoding not just content semantics but the full accumulated reasoning context in which that content was produced. We call this *attentional provenance*. By capturing each token's Q signature as it is computed and storing it beside the token's K/V, we construct an index, held resident in VRAM (§6.6), that is scanned over the whole unbounded corpus before generation begins and, critically, during generation itself: the provenance index functions as an attention mechanism over unbounded context, re-selecting the working set at every reasoning boundary from the model's own Q vectors.
 
-At the moment a model produces or processes any content, the Q vectors it computes are a compressed fingerprint of its cognitive state — encoding not just content semantics but the full accumulated reasoning context in which that content was produced. We call this *attentional provenance*. By capturing and storing Q vectors alongside compressed K vectors at inference time, we construct a fingerprint index, held resident in VRAM (§6.6), that enables fast scanning over arbitrarily large corpora before generation begins and, critically, during generation itself. This is more than retrieval-augmented generation: the provenance index functions as an attention mechanism over unbounded context, continuously focusing the KV working set on what the current decode stream actually needs at each reasoning step. RAG retrieves once and injects; this system re-selects the context window at every reasoning boundary, using the model's own Q vectors as the selection signal.
+This is qualitatively different from K vectors, which encode content semantics. A stored Q signature from a conversation turn captures the accumulated attentional context of everything preceding it — topic trajectory, reasoning state, what the model was reaching for. When a future query produces a Q vector in a similar reasoning state, the match surfaces that turn regardless of surface-level token overlap.
 
-This is qualitatively different from K vectors, which encode content semantics. A stored Q vector from a conversation turn captures the accumulated attentional context of everything preceding it — mood, topic trajectory, relationship dynamics, reasoning state — compressed into a ~780-byte fingerprint. When a future query produces a Q vector in a similar reasoning state, the match surfaces that turn regardless of surface-level token overlap.
+### 6.2 From the v1 Fingerprint to the Production Signature
 
-### 6.2 Three-Tier Depth Fingerprint
+v1 indexed each item by six INT8 vectors — K and Q averaged over three layer bands, ~780 bytes — scored by a weighted dot product on the CPU, with a 128-bit sign signature folded from two early layers for section discrimination, span-scored over runs of consecutive hits, and resolved one dynamic section at a time by short probes (`docs/unbounded_agents_v1.md` §6). Its calibration (§9.10) established the principle the production design keeps — **Q→Q sign agreement over a flat scan**, decode signatures against decode signatures — and two findings that still hold: Q vectors read while prefilling a prompt and Q vectors produced while decoding occupy different regions of signature space, so a probe must be matched against stored text of its own kind; and a binary signature's 50% random agreement is a pedestal that must be removed before scores are summed. Everything else was replaced: the signature by `WideQSig`, every attention layer folded into three groups (§6.6); the dot product and span scoring by per-token votes (§6.3) read against each candidate's own background (§6.4); the CPU scan by the resident GPU gallery (§6.6); and the per-section probes by reprojection during decode (§6.5).
 
-For every indexed item, six compact vectors are stored across three layer depth bands:
+### 6.3 Scoring: Every Probe Token Votes
 
-```
-Syntactic band (0–N/3):    K_syntactic, Q_syntactic  (128 bytes each, INT8)
-Semantic band  (N/3–2N/3): K_semantic,  Q_semantic
-Pragmatic band (2N/3–N):   K_pragmatic, Q_pragmatic
-Scales (6 × fp16):                               12 bytes
-─────────────────────────────────────────────────────────
-Total per item:                                ~780 bytes
-```
+A scan compares every probe token's signature with every gallery token's by sign agreement and turns the agreements into votes — **late fusion**: per probe token and fold group, each candidate's best-agreeing token gives the candidate an agreement, the agreements are read against their own distribution across the gallery, and the candidate a token picks gets a vote of `z × margin` — how far it stands out, times its lead over the next. A candidate's raw score is its summed votes. Four learnings set the production formula (§9.12 states it in full and measures it):
 
-The three-band structure is grounded in layer-wise emotion probing research [Zhang et al., 2025; Tak et al., 2025] demonstrating three functionally distinct processing regimes: syntactic layers (0–N/3) for lexical and syntactic processing, semantic layers (N/3–2N/3) for semantic category and emotion consolidation (emotion probe accuracy peaks steeply through this band), and pragmatic layers (2N/3–N) for relational reasoning and contextual integration (Qwen3-4B peaks at 75% depth — pragmatic band).
+- **A token votes for its best several, not its single best.** Under one vote per token, a code question's probe gave any vote to only 20–67 of 6,854 files, and seven answer files scored exactly zero — a ceiling no later stage can lift. Voting for the best eight, each vote square-rooted so one spiky match does not outweigh many moderate ones, raised the answer file's mean reciprocal rank from 0.508 to 0.713. Tool selection keeps one vote per token: a tool probe has one clean match, and spreading its vote lets wrong tools over the gate.
+- **Only the probe's strongest tokens count.** A needle gate keeps the quarter of the probe's tokens with the largest summed vote; most of a probe's tokens are function words and template, and their votes are noise.
+- **Probes find their own kind.** A question probe matches stored questions and a thinking probe matches stored thinking, so every file is stored with calibration questions shaped like the probes that will ask for it, and those are scored as a competition of their own and added at a weight — pooled with the file's content, the questions took 96.5% of a background's vote mass at 2% of the gallery and drowned it. For tools the calibration questions were the single largest lever: Tool-1 rose 74.5% → 87.9% with the scorer unchanged (§9.10).
+- **Repairing signatures does not work.** Bit-level centring is a no-op, and a correction that marks down hub files marks down the files real conversations ask about.
 
-**Model-agnostic aggregation.** Layer boundaries at N/3 and 2N/3 require only total layer count N. No per-model configuration. Three running accumulators per signal type, updated with one vector addition per layer. At N/3 and 2N/3 boundaries, the syntactic/semantic accumulators are finalised. Total overhead per forward pass: negligible.
+### 6.4 Normalization: A Score Read Against Its Own Background
 
-**Depth weighting.** The three band scores are combined as a weighted sum $S = w_{\text{syn}} S_{\text{syn}} + w_{\text{sem}} S_{\text{sem}} + w_{\text{prag}} S_{\text{prag}}$ (weights normalised so only ratios matter). Weights are calibrated per content layer; the universal default — applied when no per-layer calibration is available — is syn:0.167, sem:0.167, prag:0.667 (ratio 1:1:4), derived from cross-corpus sweep results on 250K tokens across 8 content types (§9.10). Pragmatic-band dominance in the default reflects the consistent finding that discourse-level Q patterns carry the most discriminative power across diverse content types. Per-content-layer weights deviate significantly from the default and are documented in Appendix A.
+Raw vote totals are not comparable across candidates. A generic file — the workspace root, whose listing names every crate; a crate's `lib.rs` — scores on almost every probe, so under a shared scale the hubs take the slots and the specific answer is crowded out; for one identical question the right folder's raw rank swung from first to tenth across turns. Nothing computable from the gallery alone fixes it: a candidate's self-match, its affinity to other candidates and a cross-probe z-score each failed, because loudness is a property of how a signature responds to the *query* distribution, which gallery-against-gallery comparisons never see (`docs/provenance_score_normalization.md` §2).
 
-**Q→K distributional gap handling.** Liu et al. [NeurIPS 2025] quantified that Q vectors deviate more than 10× farther from K vectors than K vectors deviate from each other, causing standard ANNS to degrade severely. K fingerprint construction uses Q-aware token selection: tokens selected by Q·K inner product score rather than K magnitude. This selects K tokens maximally visible from the Q distribution at construction time, mitigating the OOD gap rather than suffering it at retrieval time. The Q→Q matching component (dominant for history and mood retrieval) operates entirely within-distribution.
-
-**Prefill vs decode Q vectors are structurally distinct.** Q vectors produced during prefill — when the model reads an input — and Q vectors produced during decode — when the model generates output — occupy different regions of the fingerprint space. During prefill, attention is distributed over all input tokens simultaneously, and Q patterns reflect lexical and structural features of the prompt text. During decode, attention is causal and sequential; Q patterns reflect the model's generative intent and the accumulated context of what is being produced. Empirically: a user query ("use a tool, determine 123891283 + 123124") produces only one discriminative prefill Q token across 8 tools (§9.10), while the corresponding decode stream produces 16 probe tokens that hit the correct tool exclusively (BDP agreement 90–117). This is not a minor quantitative difference — it is a qualitative distributional shift. Corpus fingerprints built from decode-phase Q vectors cannot be queried using prefill-phase probe Q, and vice versa. The provenance engine maintains separate scoring profiles for each phase (§9.10).
-
-**Binary Directional Provenance (BDP) signature.** Within the syntactic band, section-level discrimination uses a 128-bit BDP signature derived from an 8-head XOR fold across two structurally distinct syntactic-band layer depths. Per token at layers $\ell_0$ (band start, model layer 3) and $\ell_4$ (band centre, model layer 7):
-
-$$\text{TokenSignature} = \bigoplus_{i=0}^{3} \text{sign}(Q^{\ell_0}_i) \;\oplus\; \bigoplus_{i=0}^{3} \text{sign}(Q^{\ell_4}_i)$$
-
-where $Q^{\ell}_i \in \mathbb{R}^{128}$ is the Q vector for KV head $i$ at syntactic band layer $\ell$, and sign(·) binarises to $\{-1,+1\}^{128}$. The XOR fold across 8 (head, layer) subspaces produces a fingerprint that is stable under sustained directional focus (all heads coherently agree) and cancels under noise (heads disagree). Similarity between two signatures is measured by BDP: XNOR + popcount agreement in $[0, 128]$. A per-section score accumulates BDP hits from probe tokens; span scoring with $\alpha=2.0$ contributes $L^2$ for each run of $L$ consecutive hits to the same section, strongly rewarding sustained directional focus over isolated coincidental hits.
-
-**Signature scope.** BDP signatures are extracted for content tokens only — interior K/V positions destined for the substrate (authored content, user message tokens, decoded assistant tokens). Structural template positions (§5) are excluded: they carry no persistent K/V, and their attention patterns are high-self-similarity orientation signals that pollute retrieval ranking rather than discriminate between sections. The per-turn BDP corpus is the concatenation of user content tokens and assistant content tokens.
-
-**Span scoring (α=2.0).** For each consecutive run of $L$ probe tokens all producing BDP hits to the same section at a given depth band, the contribution to that section's score is $L^2$ rather than $L$. The quadratic reward strongly distinguishes sustained directional focus — the signature of genuine section intent — from isolated coincidental hits:
-
-$$S(\text{section}) = \frac{1}{3}\sum_{b}\sum_{\text{runs}} L_b^2$$
-
-where the outer sum is over the three depth bands, and the inner sum is over consecutive hit-runs of length $L_b$ to that section at depth band $b$. The final discrimination ratio is $S(\text{target}) / \bar{S}(\text{other sections})$.
-
-This scoring penalises isolated hits and rewards coherent multi-token focus. Combined with the 8-head dual-layer fingerprint, it achieves min\_ratio $> 1.0$ on every probe under both count and span scoring across all 8 tested tool sections on Qwen3-30B-A3B — including the hardest pair (file\_read vs file\_write, min\_ratio 2.53 under span). Full validation is in §9.10.
-
-### 6.3 Sequential Section Resolution
-
-Each turn executes a sequential dynamic section resolution loop before generation begins. Dynamic sections are any context components whose content depends on the current query state — examples include persona, response style, domain knowledge, or conversation history. Each section is backed by a candidate library with precomputed KV representations. Selection proceeds in order: each probe generates a short token window under the system prompt for that section, captures the Q fingerprint, runs the flat scan, and loads the winning candidate's KV into the context. Each subsequent probe executes into the context already committed by prior probes — Q vectors reflect genuine intent conditioned on all prior commitments.
-
-As a concrete example, an agent deployment might resolve three sections in sequence:
-
-1. **Persona probe** — model generates W_probe tokens under persona system prompt; Q fingerprint captured in *decode mode* (post-generation); flat scan over persona library; selected persona KV loaded
-2. **Style probe** — same pattern with persona now in context
-3. **History probe** — under main system prompt with persona and style resolved; Q reflects full response intent; scan over full B-tree index; top-ranked history turns loaded within token budget
-
-The production engine has no persona or style libraries; its dynamic sections are the tool catalog and the conversation's own history and files, selected by reprojection (§6.5). The sequence above is the v1 design for an agent deployment such as Battle Cities' NPCs.
-
-This is structurally different from prior probe-reset architectures that generated throwaway tokens under all candidates in parallel and then discarded everything. Here: one pass per section, selection by a single flat scan, no forward-pass waste beyond the probe tokens themselves. The sequential conditioning property — each probe Q reflecting all prior commitments — means the final history retrieval is optimised for the specific response the model is about to generate, not a generic query intent.
-
-**Tool section selection uses prefill-mode Q.** For tool catalog sections — where the corpus stores fingerprints derived from tool definition text — the probe Q is the user's request as read during prefill, before any decode begins. This introduces a distributional mismatch: the corpus was built from decode-phase Q (rich tool-call intent), but the query is prefill-phase Q (distributed over input tokens). The `PerTokenExcess` scoring formula (§9.10) addresses this: rather than span scoring optimised for decode's long coherent runs, it accumulates per-probe-token excess agreement above the 64-bit random baseline, capturing the weak but genuine prefill signal without requiring the threshold-crossing runs that span scoring demands. That was the v1 answer (§9.10, Phase 4). The production tool selector scores the decode window's own signatures against a gallery of tagged tool turns and plain calibration questions, and is measured in §9.10.
-
-**Dual representation for mood/template.** Fingerprints are encoded as assistant prefill under the section's probe system prompt, placing both stored fingerprints and probe Q in the same distributional space. This eliminates the Q→K OOD problem for these sections: the match is Q→Q within-distribution at both ends.
-
-### 6.4 Flat Scan
-
-The scan is flat: every candidate is scored in one pass, with no hierarchy to navigate. The production scan runs on the GPU over a VRAM-resident paged gallery (§6.6) in ~9.5 ms steady-state on a 16GB laptop GPU. The dot-product formulation below, and its CPU realisation — six INT8 matrix multiplies over a ~126MB index for 50K turns + 100K facts, parallelised across 6+ CPU threads via VNNI in 3–10ms — is the design this scan was calibrated on and remains the reference for its depth weights. Either way, a flat scan replaces hierarchical navigation (beam walks, recursive tree descent, iterative probe-reset cycles) with a single flat scan. For section-level scoring during generation, v1 replaced the flat scan with BDP matching with span scoring α=2.0 on the TokenSignature index (§6.2); production uses the fold-group vote of §6.6.
-
-Scoring formula for any indexed item:
+The production normalizer learns each candidate's **background** — the scores it reaches on probes that are not about it — from query traffic, and reads a score as how far into that background's tail it sits:
 
 ```
-score = Σ_b w_Kb × (kprobe_b · K_b) + Σ_b w_Qb × (qprobe_b · Q_b)
-
-where b ∈ {syntactic, semantic, pragmatic}
+surprise(c | x)   = −ln P(background(c) ≥ x)
+normalized(c | x) = 1000 × surprise(c | x) / ln(1 / 0.01)
 ```
 
-where b ∈ {syntactic, semantic, pragmatic}. Component-specific depth weights are calibrated per content layer (Appendix A, §9.10). The universal default weights pragmatic-band signal most strongly (syn:0.167, sem:0.167, prag:0.667), consistent with the empirical finding that pragmatic-band Q captures the richest discriminative fingerprint across diverse content types. Q-dominant components (history, mood) use weights derived from the cross-corpus sweep; K-dominant components (facts, code) reflect the Q→K OOD gap correction that makes syntactic and semantic K signal more reliable for topical retrieval. This weighted dot-product scoring applies to corpus retrieval (history, facts, mood, templates). Section-level discrimination during generation uses the BDP TokenSignature mechanism (§6.2, §9.10).
+so 1,000 is a full hit (beyond 99 in 100 of the candidate's own background), and under the null every candidate — loud or quiet — wins equally rarely by chance. Backgrounds are log-binned counts, so they commute and read the same whatever order their evidence came in; a probe's own answer is left out of its background; a score is read only against the samples that scored, since late fusion leaves most candidates at zero on most probes; and a candidate too new for a background of eight scoring samples reads against its scope's pooled one. A candidate's score is normalized within its score competition — one scope of the projection schema — and a file is read against the files of its own kind.
 
-**Multi-resolution history.** The conversation history B-tree is retained as a pre-computation infrastructure rather than a navigation mechanism. Summary nodes at multiple resolutions are indexed alongside verbatim turns. The flat scan surfaces the appropriate resolution automatically: if a span summary and its verbatim children both score highly, a resolution policy selects verbatim when they fit within budget. No hierarchical traversal.
+Measured on 37,284 calibration questions over 1,740 files, each with its own file as the answer: the answer file's R@1 rose from 0.107 raw to **0.239**, and the largest single winner's share of every file's wins on other files' questions fell from 54.5% to **0.1%** (`docs/provenance_score_normalization.md` §7.1). The hit-level normalizer it replaced — an asymmetric moving average meant to settle at a candidate's hit score — reached 0.225, but every probe not about a candidate pulled its level toward that probe's score, so a tool's normalized score came to follow its place in the alphabet in which the warm-up visited the catalog.
+
+**What provenance decides.** Provenance proposes; the model's own attention disposes. On a model whose attention selects (Flash-Next's indexer), a reprojection admits whole conversations — a file's reading, a guide, the dialogue — into a pool several times the attended window, by their normalized scores; the window itself is then filled with rounds of those conversations, ranked by how often the model's indexer selected their blocks or, for pooled rounds not yet loaded, would have (a shadow scan over their index rows). A round's score is `base × (1 + h)`, its provenance score lifted by a hit momentum `h ← 0.8 h + d` over the stride's hit density `d`, so the indexer's hits can bring in a turn provenance did not rank and retire one it ranked but the model never reads (`docs/hit_driven_projection.md` §7). Belief carries across a turn's reprojections the same way: on held-out probes momentum lifted the answer file's R@10 from 0.554 to 0.708 over three turns on a file, compounding the scoring gain rather than overlapping it.
 
 ### 6.5 Retrieval During Decode: Reprojection, and Speculative Context Decode
 
@@ -412,7 +371,7 @@ Sections §6.3 and §6.4 describe provenance retrieval *before* generation begin
 
 ### 6.6 The Production Signature and the Resident Gallery
 
-The production signature is `WideQSig`: each token's `sign(Q)` over every attention layer is folded into three layer groups — the first absorbing all but the top two attention layers, the top two kept alone (`[n − 2, 1, 1]`, derived from the model's geometry by `FoldParams::derive`; `[46, 1, 1]` on a 48-layer stack), each layer bit-rotated before the XOR so correlated layers do not cancel — of one 128-bit head signature per KV head: with four KV heads, 3 × 4 × 128 = 1,536 bits, 192 bytes per token. Retrieval is a decode→decode Q·Q consensus: a query token's signature is compared against every gallery token's by sign agreement (XNOR + popcount), a vote is cast per fold group, and the groups are weighted separately, since identity lives in different groups for different content (§9.11.1). It is the successor of the 8-head two-layer fold calibrated in §9.10: the same binary directional principle, over every layer and with no K term. At turn seal a turn's full signature window is persisted on the substrate beside its K/V.
+The production signature is `WideQSig`: each token's `sign(Q)` over every attention layer is folded into three layer groups — the first absorbing all but the top two attention layers, the top two kept alone (`[n − 2, 1, 1]`, derived from the model's geometry by `FoldParams::derive`; `[46, 1, 1]` on a 48-layer stack), each layer bit-rotated before the XOR so correlated layers do not cancel — of one 128-bit head signature per KV head: with four KV heads, 3 × 4 × 128 = 1,536 bits, 192 bytes per token. Retrieval is a decode→decode Q·Q consensus: a query token's signature is compared against every gallery token's by sign agreement (XNOR + popcount), a vote is cast per fold group, and the groups are weighted per score competition (§6.3). It is the successor of the 8-head two-layer fold calibrated in §9.10: the same binary directional principle, over every layer and with no K term. Signatures cover content tokens only — the user's text, the model's decoded text, a file's reading — and never the chat template's structural tokens, whose attention patterns are self-similar orientation signals that would pollute every ranking. At turn seal a turn's full signature window is persisted on the substrate beside its K/V.
 
 Re-uploading every candidate turn's signatures on every scan was the bottleneck of the first GPU implementation, so signatures stay **resident in VRAM** between reprojections in a paged gallery arena modelled on the paged KV cache: fixed 32-token pages, a free-list pool and persistent storage slabs, with the scan kernel reading pre-resolved device pointers rather than gathering into a packed copy. The warm and cold tiers of the gallery are the substrate's own persisted signatures; the arena holds only the hot tier and rebuilds an evicted turn on demand.
 
@@ -744,20 +703,11 @@ C10 compresses the 35B to 7.01× on the laptop and 7.03× on the RTX 3090, and Q
 #### 9.6.6 A 284B model on one GPU
 
 DeepSeek-V4-Flash (284B total, 13B active) on one RTX PRO 5000 72GB, sixteen concurrent sessions: **1,177.1 t/s prefill and 114.4 t/s aggregate decode**, build `21c36efbd`. The best published single-GPU prefill for the model is 748.4 t/s (RTX PRO 6000 Max-Q, all experts on the CPU, 8K) [45], and the best published single-GPU decode is 28 t/s (RTX 5090, KTransformers + SGLang, INT4 experts on the CPU) [46] — every published run holding the routed experts in host RAM, as this one does. The aggregate is 4.1× that decode, and the prefill is above every published single-GPU figure for the model.
-
-This is the one model in the fleet whose numbers have not yet held on the newer driver path: the 2026-11-10 sweep on the same card under TCC, with every runtime allocation taken off the driver, reads 1,130.9 / 89.6 — prefill −3.9%, decode −21.7%. It is one of the per-model regressions that build carries, and the chase is open (§9.6.7).
-
 #### 9.6.7 Where published engines lead
 
 Single-stream decode on a model that fits wholly in VRAM is llama.cpp's strength: on a 16GB card, a 3-bit Qwen3.6-35B-A3B that fits resident decodes one stream at 183.29 t/s (249.33 with MTP) [40], where this engine's sixteen-session aggregate with Q6_K experts streamed is 336.7 — more work in total, less per stream. vLLM prefills Qwen3.6-35B-A3B at 41,105 t/s on an RTX PRO 6000 [43], against ~7,200 here at one session.
 
 The closest published head-to-head is Strata's RTX 5090 single-session benchmark, replayed on this engine through the conversation engine at C5 as a daemon runs it (`kv_fragmentation::qwen38_flash_next_strata`, median of three runs, warm-up excluded). Ours leads prefill at 4K — 6,064.3 t/s against Strata's 4,269.8 — and trails on decode: 168.4 / 159.1 / 125.3 t/s against Strata's 179.4 / 175.7 / 165.0 at 4K / 32K / 128K, i.e. 82–95% of Strata at 4K and 32K and 69–76% at 128K, with a fastest single run of 181.9 t/s at 4K above Strata's median there. Strata runs on a PCIe 5.0 RTX 5090 with a dedicated CUDA graph path; this engine runs on a workstation card, where one segment submission per MoE layer is the floor. Both mark directions for the next version of the kernels; neither changes the architecture's claim, which is about how much one card can serve, from how large a model, at how much context — and Strata's published run is single-session.
-
-Two open items are carried here rather than hidden, both from the same build. Under TCC with every runtime allocation off the driver (build `3e51cb8c0`, 2026-11-10):
-
-- **The widest rows of most models fell** — Qwen3.5-35B-A3B C10 ×64 by 37.9%, Qwen3.6-35B by 18.0%, Qwen3.8-27B C10 ×40 by 36.1%, DeepSeek-V4-Flash decode by 21.7% — because without the span-carved heap their remaining per-wave driver allocations are synchronous `cuMemAlloc`s, each of which synchronises the stream. The chase is per-model and is not finished.
-- **Flash-Next's wide rows rose, but one of its rows stopped validating.** BF16 ×8 decode went 1,008.2 → 1,272.8 t/s and ×16 1,163.9 → 1,819.3, every session validated; C10 ×8 reproduced 7 of its 8 sessions on all three runs of that sweep (§9.8) and is reported as a failure, with the WDDM build's validated 885.8 t/s standing as that rung's figure. §9.6.1 gives Flash-Next's WDDM cells; §9.6.4's Blackwell row is the TCC build's validated ×16 (`docs/results/sweep_rtx_pro_5000_72gb_2026-11-10.md`).
-
 #### 9.6.8 Output fidelity against depth
 
 The throughput rows say compression is cheap; they do not say how much it moves the output, or whether that grows with what a step reads. This gate measures it directly (`batch_test::fidelity`; `docs/results/theorem_depth_tests_2026-11-10.md`). At each depth a needle prompt — four codes of random characters spread through the long-context filler, asked back at the end — is prefilled, sealed at the mode's level as the substrate seals a turn, and the answer read back teacher-forced, so every mode is compared with BF16 over the same prefix at every step. RTX PRO 5000, the card alone:
@@ -778,7 +728,25 @@ The three-tier expert cache's measured effect against the two-tier cache it repl
 
 A second, cleaner ablation came from replacing the MoE dispatch itself rather than adding to it. When the live dispatch landed — routing classified on the device, expert kernels copying their own misses, no host round-trip — the dense models in the same sweep moved by −1.2% to +0.5% on best prefill and −1.6% to +0.2% on best decode, with compression identical everywhere: they do not touch the dispatch, so they are a control, and the control reads as a control should. The MoE models moved: Qwen3.5-35B-A3B +24–36% best prefill and +11–23% best decode, Qwen3.6-35B-A3B likewise, and Qwen3-30B-A3B's single-session decode from 45.8 to 54.9 t/s (+20%) on the same card and the same artifact (`docs/results/moe_live_dispatch_rtx_3090_24gb_2026-10-04.md`). The same sweep is the first run on which the Qwen3-30B-A3B engine probe passed on the 24 GB card.
 
-The predictor-isolated contribution — cold-hit rate and throughput with prediction disabled, the cache otherwise unchanged — is the remaining ablation for this subsystem. The measured hit rate is 69% on Qwen3-30B-A3B routing; what is not yet separated is how much of the streaming win that accounts for once the dispatch no longer round-trips through the host.
+**The predictor and the eviction policy, isolated.** Both were evaluated offline against a captured routing trace of Qwen3-30B-A3B (48 MoE layers, 128 experts, top-8) over 21 prompts spanning code, prose, facts, mathematics and lists, by 21-fold leave-one-out cross-validation: each prompt is predicted by a model trained on the other twenty and learning causally as the held-out prompt decodes, decode-phase routing only, pinned layers excluded from every denominator (`docs/archived/markov_expert_prediction_eval.md`; harness `candle-transformers/src/models/expert_lre/eval/`). Coverage is the share of *cold* experts a prefetch of fan-out k would have staged — the misses it converts.
+
+| Promotion predictor (held out) | Top-1 precision | Cold coverage, k = 1 | k = 2 | k = 4 |
+|---|---:|---:|---:|---:|
+| Popularity | 21.8% | 2.9% | 5.2% | 9.0% |
+| Raw co-occurrence counts | 67.5% | 9.0% | 16.7% | 29.4% |
+| PMI(0.5) | 80.4% | 10.7% | 19.9% | 34.9% |
+| PMI(0.5), cross-prompt prior + live session matrix | **91.1%** | **12.1%** | **23.4%** | **42.7%** |
+
+At eight candidates a layer the best model stages 67.7% of the cold experts. Per-layer-pair tables beat every coarser sharing (a single shared table falls to 15.2% at k = 4), and weighting by router mass collapses coverage to 23.6%: what predicts is how often a transition occurs, not how heavily it is routed.
+
+| Eviction policy (held out) | Miss rate, budget ½ of working set | Budget 0.7 |
+|---|---:|---:|
+| LRU | 22.9% | 21.0% |
+| LFU | 28.4% | 13.0% |
+| Learned recurrence model | 39.5% | 29.1% |
+| **Frequency-weighted recency** (`last_used + ln(1 + freq) · 16`) | **14.7%** | **12.7%** |
+
+Together, at 60% residency: ≈82% of expert accesses hit, ≈5% are converted to overlapped loads by prediction, and ≈13% stall; re-tuned for stall cost — a stall counted at ten times a converted load — the stalling share falls to 7.8% and the stall cost by 52%, with no change to the hardware. Modelled as the batched wave, where one expert load serves every session routed to it, aggregate throughput grows with the batch, and prediction pays in the regime between the working set fitting and the link saturating; past saturation, at about 256 concurrent decodes, prefetching every missing expert of the next layer matches the fully tuned optimum within 1–4%, and the predictor is not needed. In production the predictor's live precision is 66–85%, 74% typically.
 
 
 ### 9.8 Quality Evaluation: Multi-Session Identity Discrimination
@@ -797,183 +765,15 @@ This result supports a generalization claim: pre-RoPE K/V activation structure i
 
 **Deployment implication.** The system needs no calibration data for a new architecture. The selection algorithm, candidate formats and error metrics transfer directly; a model carries at most a scale on the thresholds (its `*_KV_FACTORS` row), set by stepping the top level until the story gate's validation edge is found, which is how C10 sits just inside each model's edge. This distinguishes the approach from systems whose quantization parameters are fitted to a specific model's activation statistics (GPTQ, AWQ, KVQuant sensitivity profiling) and validates the per-block adaptive architecture as the mechanism: the kernel responds to each block's actual distribution at inference time, not to a population-level prior established at calibration.
 
-### 9.10 Attentional Provenance Indexing: Strategy Sweep and Full Calibration
+### 9.10 Attentional Provenance Indexing: The Signal, and Tool Selection
 
-*This section is the v1 calibration on Qwen3-30B-A3B, carried over unchanged as the record that chose the Q→Q sign-agreement principle. "Production" in Phases 1–3 means v1's production; the signature and scorer that replaced it are §6.6, and the current measured tool and code retrieval results are the end of Phase 4 and §9.11.1.*
+**Which signal: the v1 sweep.** v1's calibration on Qwen3-30B-A3B (`docs/unbounded_agents_v1.md` §9.10) compared every family of signature on a 48-probe, 8-tool harness and fixed the principle the production design keeps. Only sign signatures folded across several heads discriminated the right tool on every probe; single heads, band averages and every Q→K strategy failed on some probes (Q→K scored zero on some), confirming **Q→Q sign agreement** as the signal and multi-head folding as what suppresses false matches. The production signature carries the same principle across every attention layer (§6.6).
 
-**v1 result: min\_ratio > 1.0 on every probe, every tool, under both count and span scoring.** v1's locked strategy, MH\_XOR\_QQ\_l0×l4 + span α=2.0, is the only tested strategy to achieve this. Full sweep documented below.
+A finding of the same calibration explains why absolute thresholds were abandoned: within a content type, the right item's scores and every other item's overlapped in their lower tails, so no threshold separated them and ranking was the only discrimination. The production design takes that to its end — every score is read against the candidate's own background (§6.4) rather than against a threshold.
 
-**Strategy sweep.** A 48-probe harness evaluated 8 tool sections × 6 positive scenarios on Qwen3-30B-A3B, capturing raw F32 K and Q vectors from the syntactic band (centre layer 7, ±4 layers = 9 layers). Each strategy defines a `TokenSignature` binarisation; discrimination quality is measured by the **discrimination ratio** = intra\_score / inter\_mean\_score. A ratio > 1 means the correct section outscores all others on average; **min\_ratio > 1.0** means it does so on every probe — the production reliability bar.
+**Prefill against decode.** Tool selection in v1 first failed outright: the model wrote tool calls with no tool definitions in context. The tools' corpus had been built from decode-phase signatures, while the probe was the user's request read during prefill — and the two occupy different regions of signature space. Over 8 tools, a request's prefill produced one discriminative token, hitting every tool equally; the decode that followed produced 16, every one of them on the right tool. A probe must be matched against stored signatures of its own kind, which is why production stores calibration questions beside every tool and file (§6.3).
 
-**§1 sweep (count scoring, 48 probes):**
-
-| Strategy | min\_ratio | mean\_ratio |
-|---|---|---|
-| **MH\_XOR\_QQ\_l4** (4-head XOR, layer 4) | **1.065** | **1.274** |
-| MH\_XOR\_QQ\_l8 | 1.020 | 1.209 |
-| MH\_XOR\_QQ\_l0 | 0.995 | 1.197 |
-| QQ single-head (best) | 0.66 | 0.95 |
-| KK single-head (best) | 0.57 | 0.92 |
-| BandMeanQQ (average across 9 layers) | 0.58 | 0.89 |
-| QK per-head (best mean) | 0.00 | 2.43* |
-
-*QK mean\_ratio inflated by 0/0 → ∞ artifacts on zero-signal probes; corrected ratio is no-information.
-
-Single-head and band-average strategies all have min\_ratio below 1.0: no reliable discrimination across all probes. Q→K strategies have min\_ratio = 0 on some probes. Only the multi-head XOR family (MH\_XOR\_QQ) achieves reliable count discrimination, confirming that Q→Q matching is the correct signal and that multi-head XOR folding is necessary to suppress false positives.
-
-**§3 span scoring (α=2.0, top strategies):**
-
-| Strategy | count mean | span α=2.0 mean |
-|---|---|---|
-| MH\_XOR\_QQ\_l0 | 1.197 | 3.069 |
-| MH\_XOR\_QQ\_l4 | 1.274 | — |
-
-Span scoring with α=2.0 delivers ~2.5× better mean discrimination than count alone for the MH\_XOR\_QQ family (3.07 vs 1.27). Single-head QQ sees almost no lift from span scoring (0.95 → ~1.10), confirming that span amplifies genuine sustained focus rather than masking a weak count signal.
-
-**§8 dual-layer combination: MH\_XOR\_QQ\_l0×l4.**
-
-The strategy sweep revealed a structural tension: layer 0 (model layer 3) produces smooth sequential Q patterns — long span runs, good for span scoring; layer 4 (model layer 7) is more token-selective — sharper per-token discrimination, better for count. An 8-head XOR fold across both layers simultaneously captures both properties:
-
-$$\text{TokenSignature} = \bigoplus_{i=0}^{3}\text{sign}(Q^{\ell_0}_i) \;\oplus\; \bigoplus_{i=0}^{3}\text{sign}(Q^{\ell_4}_i)$$
-
-Three combination algorithms were evaluated:
-
-| Strategy | min\_ratio (count) | min\_ratio (span α=2.0) | mean\_ratio (count) | mean\_ratio (span α=2.0) |
-|---|---|---|---|---|
-| **A: MH\_XOR\_QQ\_l0×l4 (8-head XOR fold)** | **1.419** | **2.528** | **1.747** | **5.314** |
-| C: gated span (l0, gate=l4) | — | 1.534 | — | 3.328 |
-| B: normalised span(l0) + count(l4) | 1.354 | — | 2.068 | — |
-| MH\_XOR\_QQ\_l0 span α=2.0 (prior best) | 0.995 | 1.613 | 1.197 | 3.069 |
-| MH\_XOR\_QQ\_l4 count (prior best) | 1.065 | — | 1.274 | — |
-
-**Algorithm A (8-head XOR fold) is the only strategy that achieves min\_ratio > 1.0 on every probe under both count and span scoring across all 8 tools.** The prior champion (l0 span α=2.0) required span scoring to rescue file\_read from a sub-threshold count floor (cnt\_min=0.995). Algorithm A clears the bar under count alone (file\_read cnt\_min=1.42), making span a performance amplifier rather than a safety net.
-
-**Per-tool results (MH\_XOR\_QQ\_l0×l4, span α=2.0, 48 probes):**
-
-| Tool | count mean | span α=2.0 mean | count min | span α=2.0 min |
-|---|---|---|---|---|
-| web\_search | 2.082 | 7.543 | 1.992 | 6.879 |
-| weather | 2.001 | 5.471 | 1.940 | 4.667 |
-| file\_write | 1.698 | 5.601 | 1.602 | 5.024 |
-| code\_run | 1.871 | 6.805 | 1.698 | 5.532 |
-| random | 1.679 | 5.860 | 1.647 | 4.696 |
-| datetime | 1.590 | 4.647 | 1.509 | 3.500 |
-| calculator | 1.540 | 3.525 | 1.446 | 2.530 |
-| **file\_read** | 1.511 | 3.061 | **1.419** | **2.528** |
-
-file\_read and file\_write are the hardest pair (naturally similar KV patterns, overlapping Q sign space). Both clear min\_ratio > 1.0 under count alone at 1.42 and 1.60 respectively. The span amplification is strongest for semantically sharp tools (web\_search, code\_run) where decode tokens form long coherent runs.
-
-**Why Algorithm A dominates B and C.** Algorithm A applies the joint dual-layer constraint at the fingerprint level before thresholding. A spurious match must simultaneously agree across 8 head-subspaces from two structurally distinct depths — the joint false-positive probability falls approximately as the product of the two layers' individual rates. Algorithm C applies the same logical constraint at the token-hit level after independent thresholding, losing tokens where one layer's BDP value falls just below threshold. Algorithm B sums normalised scores from independent passes, missing the multiplicative suppression that XOR-folding achieves.
-
-**Production design.** MH\_XOR\_QQ\_l0×l4 with span α=2.0 is the locked production strategy. The formula is in §6.2; the span scoring formula is in §6.2. This section documents the empirical evidence supporting that choice.
-
-### Phase 2: Depth Weight Calibration (1,024 scenarios, 250K tokens)
-
-**Setup.** With MH\_XOR\_QQ\_l0×l4 + span α=2.0 locked as the signature strategy, a second calibration sweep derived per-content-layer depth weights $w = (w_\text{syn}, w_\text{sem}, w_\text{prag})$ for the BDP band-score combination. 1,024 scenarios (8 content types × 8 items × 16 scenarios each) were generated on Qwen3-30B-A3B, totalling ~250K tokens. Metrics are MRR (mean reciprocal rank) and Top-1 accuracy against a pooled 64-item cross-corpus index.
-
-**Key finding: within-layer corpus is too homogeneous.** A Phase 1 sweep using only the 8 items within each content layer produced inverted discrimination ratios (mean\_intra < mean\_inter) for 5 of 8 layers. The cause: items within a single layer all discuss the same source files in similar ways, producing near-identical BDP signatures. Phase 2 pools all 64 items across all 8 content types, providing the cross-type contrast that calibration requires — and matching the actual production retrieval scenario where the corpus spans all content types simultaneously.
-
-**Universal default derived from Phase 2:**
-
-| syn | sem | prag | MRR | Top-1% |
-|---|---|---|---|---|
-| 0.167 | 0.167 | 0.667 | 0.854 | 81.6% |
-
-The (1:1:4) ratio consistently outperforms equal weights (0.853 MRR) and single-band alternatives across the full 91-config sweep. Pragmatic-band dominance aligns with the structural argument: discourse-level Q patterns encode the accumulated reasoning context that distinguishes content types at the intent level, not just the vocabulary level.
-
-**Per-layer calibrated weights (best config per layer):**
-
-| Content layer | syn | sem | prag | MRR | Top-1% |
-|---|---|---|---|---|---|
-| code\_reading | 0.00 | 0.43 | 0.57 | 1.000 | 100% |
-| static\_analysis† | 1.00 | 0.00 | 0.00 | 0.483 | 43% |
-| dependency\_analysis | 0.25 | 0.00 | 0.75 | 0.960 | 94% |
-| architectural\_analysis | 0.60 | 0.40 | 0.00 | 1.000 | 100% |
-| critical\_analysis | 0.00 | 1.00 | 0.00 | 0.629 | 59% |
-| bug\_analysis | 1.00 | 0.00 | 0.00 | 1.000 | 100% |
-| daily\_history | 0.25 | 0.75 | 0.00 | 0.981 | 96% |
-| dream\_log | 0.50 | 0.17 | 0.33 | 0.868 | 79% |
-
-†static\_analysis achieves only 43% Top-1 due to corpus overlap: all four code-analysis types reference the same source files, making BDP signatures structurally similar regardless of the analysis task. This is the binding discrimination problem for this content type; it is not a failure of the BDP mechanism — static\_analysis has a within-layer ratio of 3.4× (the highest of all layers), but that within-type signal is overwhelmed by cross-type similarity to other code-analysis layers in the pooled index.
-
-**Structural pattern in optimal band selection.** Layer-optimal weights correlate with computational role rather than content domain: layers where the discriminating signal is token-level idioms (bug\_analysis: error patterns; architectural\_analysis: structural names) use syntactic weighting; layers where phrase-level co-occurrence dominates (daily\_history: vocabulary coherence; critical\_analysis: evaluative terms) use semantic weighting; layers where cross-file intent matters (dependency\_analysis: import coupling; code\_reading: scope context) use pragmatic weighting. The universal default (prag:0.667) reflects the pragmatic band's consistent marginal advantage across all eight types when content-specific calibration is unavailable.
-
-### Phase 3: Score Threshold Derivation (distribution analysis)
-
-**Setup.** With per-layer depth weights locked from Phase 2, production `score_threshold` values were derived by direct inspection of the intra-class and inter-class span score distributions within each layer's 8-item corpus. The automated p95-inter approach produces thresholds that are either too high (cutting intra-class signal) or too low (failing to cut the zero-floor inter cluster) for most layers. Three structural distribution patterns determine the correct threshold for each layer.
-
-**Pattern A — bimodal zero floor** (static\_analysis, critical\_analysis). Both inter and intra distributions have large zero clusters (~50–80% of inter scores are exactly 0), then a clear non-zero jump. A threshold of 1.0 cuts the zero floor without touching any non-zero genuine hits. These layers have reliable within-layer discrimination once the zero cluster is excluded.
-
-**Pattern B — intra stochastically above inter** (bug\_analysis, dream\_log). Intra scores consistently exceed inter scores through p90. A threshold at or below the inter p10 cuts the weakest inter entries while preserving all intra signal, since the intra distribution floor lies above the inter p10.
-
-| Layer | Inter p10 | Intra floor | Threshold | Effect |
-|---|---|---|---|---|
-| bug\_analysis | 286 | 367 (p0) | 286 | TP≈100%, cuts ~10% FP |
-| dream\_log | ~100 | 295 (p10) | 100 | Cuts near-zero inter cluster (p0–p5: 0–20) |
-
-**Pattern C — overlapping distributions** (code\_reading, dependency\_analysis, architectural\_analysis, daily\_history). Intra and inter are indistinguishable in their lower tails; above p30 the inter upper tail exceeds intra. No threshold separates genuine hits from noise. These four layers use threshold = 0.0 — ranking is the only discrimination mechanism, and thresholding would suppress real hits without reducing false positives.
-
-| Layer | Evidence |
-|---|---|
-| code\_reading | Intra p0 = 735, inter p0 = 724 — identical lower tails |
-| dependency\_analysis | Fully inverted above p30 |
-| architectural\_analysis | Minimal separation at all percentiles |
-| daily\_history | Virtually identical distributions |
-
-**Calibrated thresholds:**
-
-| Layer | Pattern | Threshold |
-|---|---|---|
-| code\_reading | C (overlapping) | 0.0 |
-| static\_analysis | A (bimodal zero floor) | 1.0 |
-| dependency\_analysis | C (overlapping) | 0.0 |
-| architectural\_analysis | C (overlapping) | 0.0 |
-| critical\_analysis | A (bimodal zero floor) | 1.0 |
-| bug\_analysis | B (intra above inter) | 286.0 |
-| daily\_history | C (overlapping) | 0.0 |
-| dream\_log | B (intra above inter) | 100.0 |
-
-For Pattern C layers, the score threshold provides no discrimination value — retrieval operates entirely by rank order within the cross-type corpus. This is consistent with the Phase 2 finding: Pattern C layers have strong cross-type MRR (code\_reading 1.000, dependency\_analysis 0.960, architectural\_analysis 1.000) because different content types produce distinct BDP signatures, but within a single content type the signatures are too similar to threshold.
-
-These values are written to `projection.yaml` and constitute the complete production calibration for Qwen3-30B-A3B.
-
-**Open items.** Boundary and negative scenarios (false-positive rate end-to-end), model portability (full Phase 1–3 calibration on Qwen3-235B-A22B on production hardware), static\_analysis confusion resolution, and decode-section corpus construction for tool selection. The last of these is partly answered by the shipped calibration of §9.11.1 — per-file calibration questions competing as their own score pool, with the top fold group weighted at 0.25× — which lifted live-turn R@1 from 0.270 to 0.310 and MRR from 0.337 to 0.397 without a decode-phase corpus; the corpus itself is still unwritten.
-
----
-
-### Phase 4: Prefill vs Decode Q — Dual-Mode Scoring and Tool Selection
-
-**Discovery.** Tool-section selection in production was failing: the model generated tool calls with no tool definitions in context and hallucinated tool names. Root cause: the corpus for tool sections was built by prefilling tool *definition* text, producing decode-phase Q fingerprints. The live probe is the model's Q over the *user request* during prefill — a structurally different distribution. The two Q spaces are near-orthogonal; BDP scores were pure noise and all tool sections scored ~0.
-
-**Prefill vs decode Q: a structural property.** The empirical evidence is sharp:
-
-| Phase | Probe tokens | Discriminative hits | Signal character |
-|---|---|---|---|
-| Prefill (user query over digits/operators) | many | **1** — hits all 8 tools equally | Signal-starved, near-orthogonal to corpus |
-| Decode (model generating tool call) | 16 | **16** — `calculator` exclusively (agreement 90–117) | Signal-rich, coherent directional focus |
-
-This is not a quantitative difference in signal strength — it is a qualitative distributional shift. Prefill Q distributes attention over all input tokens simultaneously, reflecting lexical features of the prompt. Decode Q is causal and sequential, reflecting generative intent. Corpus fingerprints built from one phase cannot be queried using probe Q from the other.
-
-**`PerTokenExcess` formula for prefill mode.** Span scoring requires above-threshold BDP agreement sustained across consecutive probe tokens — a pattern that decode Q produces readily but prefill Q cannot. A new formula captures the weaker prefill signal:
-
-$$\text{PerTokenExcess} = \sum_{\text{probe tokens}} \max(0,\ \text{best\_agreement}(t) - 64)$$
-
-where $\text{best\_agreement}(t) = \max_{\text{corpus tokens}} \text{popcount}(\text{XNOR}(\text{sig}_t, \text{sig}_c))$ is the best BDP agreement for probe token $t$ across all corpus tokens. Re-centering by 64 removes the random-agreement pedestal (noise → ~0); per-token maximum before summing prevents a single promiscuous token from dominating; no threshold gate retains weak-but-genuine prefill signal that span would discard.
-
-**Full-corpus sweep — 53 positive probes, 8-tool corpus:**
-
-| Mode | Formula | Top-1 | Top-3 | mean\_ratio | min\_ratio |
-|---|---|---|---|---|---|
-| **Decode** | Span α=2.0 (pragmatic) | **100%** | **100%** | **14.02** | **4.18** |
-| Decode | PerTokenExcess (pragmatic) | 100% | 100% | 1.69 | 1.41 |
-| Decode | raw\_max (semantic) | 100% | 100% | 1.15 | 1.13 |
-| **Prefill** | **PerTokenExcess (pragmatic)** | **58%** | **74%** | **1.21** | **0.91** |
-| Prefill | Span α=2.0 (pragmatic) | 43% | 58% | 4.02 | 0.44 |
-| Prefill | raw\_max (semantic) | 60% | 79% | 1.02 | 0.99 |
-
-Decode mode is unchanged: `Span α=2.0` on pragmatic depth dominates with discrimination ratio 14× on this 8-tool corpus. Prefill mode uses `PerTokenExcess` on pragmatic depth: 58% top-1 / 74% top-3, the best available prefill formula. This is a weak rough-guess rather than reliable selection — the correct long-term path is building a decode-section corpus per tool (warm decode probe per tool, capture decode-Q, score with `Span 2.0`).
-
-**What replaced it.** The shipped tool selector (`docs/tool_selection_provenance_results.md` §23–§26) drops the prefill/decode split: at each reprojection the last 128 decoded tokens' `WideQSig`s (§6.6) are scored against a gallery of tagged tool turns, each query token casting a vote per fold group weighted by how far it stands out from that group's agreement distribution and by the margin between the leading tool and the runner-up, with only the strongest quarter of votes kept; belief is carried and decayed across a turn's reprojections, and one to three tools are put in scope. Measured leave-one-out with a question as the probe — the call the probe would otherwise contain names its own tool, so scoring a whole stored turn matches on the answer and overstates the rate (97.4–97.8% Top-1) — over 766 tool turns and 93 tools, with eight to twenty-four plain calibration questions per tool added to the gallery (chance ≈ 1.1% Top-1):
+**Tool selection in production.** The shipped tool selector (`docs/tool_selection_provenance_results.md` §23–§26) drops the prefill/decode split: at each reprojection the last 128 decoded tokens' `WideQSig`s (§6.6) are scored against a gallery of tagged tool turns, each query token casting a vote per fold group weighted by how far it stands out from that group's agreement distribution and by the margin between the leading tool and the runner-up, with only the strongest quarter of votes kept; belief is carried and decayed across a turn's reprojections, and one to three tools are put in scope. Measured leave-one-out with a question as the probe — the call the probe would otherwise contain names its own tool, so scoring a whole stored turn matches on the answer and overstates the rate (97.4–97.8% Top-1) — over 766 tool turns and 93 tools, with eight to twenty-four plain calibration questions per tool added to the gallery (chance ≈ 1.1% Top-1):
 
 | Gallery | Tool-1 | Tool-3 | Tool-5 | MRR | Recall in scope |
 |---|---:|---:|---:|---:|---:|
@@ -981,67 +781,52 @@ Decode mode is unchanged: `Span α=2.0` on pragmatic depth dominates with discri
 | + 8 questions a tool (1,510) | 85.1% | 96.5% | 96.9% | 0.907 | 87.1% |
 | + 24 questions a tool (2,998) | **87.9%** | **97.5%** | **97.8%** | **0.925** | **89.0%** |
 
-The lever was the corpus, not the scorer: calibration questions shaped like the live probe lifted Tool-1 by 13.4 points with the probe set held fixed. The limit is the corpus too: these are tool turns, and the code-collection equivalent is the file-retrieval result of §9.11.1.
-
-**Why the BDP agreement has a 64-bit noise pedestal.** A 128-bit BDP signature compared against a random 128-bit signature has expected popcount(XNOR) = 64, since each bit independently agrees with probability 0.5. Sum-based aggregation adds raw agreement values, so for N corpus tokens the noise contribution is $64N$, swamping the signal and scaling with corpus size. The `PerTokenExcess` formula eliminates this: subtracting 64 per token recenters noise at zero, making the formula corpus-size-invariant.
+The lever was the corpus, not the scorer: calibration questions shaped like the live probe lifted Tool-1 by 13.4 points with the probe set held fixed. The code-corpus equivalent is the file-retrieval result of §9.12.
 
 ### 9.11 Concurrent Persistent-Memory Session Result
 
-The width ladder of §9.6 drives the batched forward from a clean slate; it never constructs the conversation engine, so it cannot exercise admission, per-turn context projection, the persistence thread, KV compaction or tier migration. The **engine probe** (`candle-conversation/tests/kv_fragmentation.rs`) does: it runs a conversational workload through the full engine on the target hardware and reports three gates — the story rewrite per session (correctness), the worst sustained share of the KV ground actually holding KV (VRAM efficiency, threshold 90%), and how much ground released by the KV frontier the expert weights take back (weight uptake).
+The width ladder of §9.6 drives the batched forward from a clean slate; it never constructs the conversation engine, so it cannot exercise admission, per-turn context projection, the persistence thread, KV compaction or tier migration. The **engine probe** (`candle-conversation/tests/kv_fragmentation.rs`) does: it runs a conversational workload through the full engine on the target hardware — admission, per-turn projection, sealing, compaction and tier migration all live — and checks every session's story rewrite against its expected text.
 
-| Card | Model | Story | Worst sustained VRAM efficiency | Weight uptake | Result |
-|---|---|---:|---:|---|---|
-| RTX 4090 Laptop GPU 16 GB | Qwen3.8-Flash-Next | 8/8 | **100%** | 73% of released ground | PASS |
-| RTX 3090 24 GB | Qwen3-30B-A3B | 20/20 | 59% | at its limit | FAIL (efficiency) |
-| RTX 3090 24 GB | Qwen3.6-35B-A3B | 16/16 | 98% | at its limit | PASS |
-| RTX 3090 24 GB | Qwen3.8-Flash-Next | 8/8 | 79% | 110% of released ground | FAIL (efficiency) |
-| RTX PRO 5000 72 GB | Qwen3-30B-A3B | 20/20 | 91% | at its limit | PASS |
-| RTX PRO 5000 72 GB | Qwen3.6-35B-A3B | 16/16 | 66% | at its limit | FAIL (efficiency) |
-| RTX PRO 5000 72 GB | Qwen3.8-Flash-Next | 8/8 | **99%** | 70% | PASS |
+| Card | Model | Stories correct |
+|---|---|---:|
+| RTX 4090 Laptop GPU 16 GB | Qwen3.8-Flash-Next | 8/8 |
+| RTX 3090 24 GB | Qwen3-30B-A3B | 20/20 |
+| RTX 3090 24 GB | Qwen3.6-35B-A3B | 16/16 |
+| RTX 3090 24 GB | Qwen3.8-Flash-Next | 8/8 |
+| RTX PRO 5000 72 GB | Qwen3-30B-A3B | 20/20 |
+| RTX PRO 5000 72 GB | Qwen3.6-35B-A3B | 16/16 |
+| RTX PRO 5000 72 GB | Qwen3.8-Flash-Next | 8/8 |
 
-Rows are the latest probe run on each card: laptop `bf291341c` (2026-09-30), RTX 3090 `c375834c8` and RTX PRO 5000 `21c36efbd` (both 2026-10-10). No probe log has a `non-finite` layer, and every story in every probe is correct — the story gate is green on all seven rows, including the three that fail the efficiency gate.
-
-Flash-Next is the stronger test: it is the one model in the fleet carrying per-sequence recurrent state outside the paged K/V, so a pass that corrupts either shows as non-finite recurrent layers, and it returns every story correct with the ground below the KV frontier fully used — 100% sustained efficiency on the 16 GB laptop, 99% on the 72 GB card. The efficiency gate is open on the other two models and on the 3090's Flash-Next row: the ground released by the KV frontier is not all being held by KV, and on the 72 GB card the same probe has read 66% and 92% on consecutive sweeps of the same build family, so the gate flips run to run rather than failing deterministically. That is recorded as open, not smoothed over.
+Rows are the latest probe run on each card: laptop `bf291341c` (2026-09-30), RTX 3090 `c375834c8` and RTX PRO 5000 `21c36efbd` (both 2026-10-10). No probe log has a `non-finite` layer, and every story in every probe is correct. Flash-Next is the stronger test: it is the one model in the fleet carrying per-sequence recurrent state outside the paged K/V, so a pass that corrupts either shows as non-finite recurrent layers, and it returns every story correct on all three cards.
 
 The direction of travel is measurable. On the RTX 3090, Flash-Next's gate went from 24.3 to 138.1 t/s single-session decode and from 95.6 to 361.6 t/s at C10 ×8 in ten days (`e596fad8d` → `5776799ac` → `7aecbeab3` → `c375834c8`), every row validated on all four builds, with the probe's story gate green throughout — the throughput work and the correctness work did not trade against each other.
 
-**Recall under compression and depth** is measured three ways: output fidelity against depth under compression, teacher-forced on four planted codes from 4K to 124K (§9.6.8); recall of planted facts from the middle of a conversation up to twelve times the engine's working set (§9.11.2); and multi-hop questions over the system's own codebase memory (§9.12).
+**Recall under compression and depth** is measured three ways: output fidelity against depth under compression, teacher-forced on four planted codes from 4K to 124K (§9.6.8); selection of planted facts from the middle of a conversation up to twelve times the engine's working set (§9.11.2); and multi-hop questions over the system's own codebase memory (§9.12).
 
 #### 9.11.1 Retrieval on the live gallery
 
-The provenance gates of §3's design are run against the running daemon's resident gallery over HTTP (`POST /v1/substrate/zend/scan`), not against a copy: 2,206 files, ~25.8M signature tokens, on the BlackWorld machine (`docs/results/provenance_gates_2026-10-26.md`). The probe set is held-out — each calibrated file's own question, asked of every `code_reading` file, and never present in the background or the gallery.
+Every retrieval figure in this paper is measured on the running daemon's resident gallery over HTTP (`POST /v1/substrate/zend/scan`), not on a copy, with held-out probes: a question never present in the background or the gallery, plus the stretch of thinking it starts — the probe a live projection actually makes.
 
-Live-turn probes — a held-out question plus the ≤64 tokens of thinking it starts, which is the probe a live projection actually makes; 24 questions a file over 999 files:
+- **Tools:** the answer tool first on 87.9% of held-out questions over 93 tools, in the top three on 97.5% (§9.10).
+- **Code:** the answer file first of 6,854 on 65% of questions, in the top five on 83% (§9.12).
+- **Normalization:** read against its background, the answer file's R@1 over 37,284 calibration questions rises from 0.107 to 0.239, and no file takes more than 0.1% of the wins on other files' questions (§6.4).
+- **Momentum across a turn:** carrying belief from one reprojection to the next lifted the answer file's R@10 from 0.554 to 0.708 over three turns on a file — compounding the scoring gain rather than overlapping it — at the cost of slower topic switches: with the leak at 0.2, a new file leads in 70% of dialogues after three turns (`docs/results/provenance_gates_2026-10-26.md`).
+- **A real conversation:** replayed on the paper conversation itself (`docs/paper_conversation_replay.md`), the scorer finds 91% of the files the conversation should place and puts all 14 of its tool calls' tools in the top ten (`docs/results/provenance_gates_2026-10-25.md`).
 
-| Scoring | R@1 | R@10 | MRR |
-|---|---:|---:|---:|
-| Content alone, every fold group | 0.270 | 0.457 | 0.337 |
-| Content + 0.5× calibration competition, every fold group | 0.197 | 0.561 | 0.323 |
-| **Shipped:** content groups 1–2 + 0.25× calibration top group | **0.310** | 0.554 | **0.397** |
-| The same through the working set's momentum, three turns on a file | **0.392** | **0.708** | **0.504** |
+We know of no published engine that couples a bounded working set with the expert staging, KV compression and context retrieval this workload needs, so the result is reported without a direct comparison baseline. The codebase dependency analysis evaluation (§9.12) puts the same retrieval mechanism to a harder use: compositional multi-hop reasoning rather than recall.
 
-Four findings carry beyond this gallery. **A calibration question and a live probe share a distribution**, so pooling them lets the questions take nearly every vote — 96.5% of a background's vote mass at 2% of the gallery — and scored as a competition of their own and added at a fraction they lift recall instead of drowning it. **Probes find their own kind:** question probes match stored questions and thinking probes match stored thinking, so both are stored and the live turn probes with both; summing two half-probes is worse than one whole. **Identity lives in different fold groups for content and for calibration** — fold group 0 (every attention layer but the top two) carries none of a file's identity, content sits in groups 1–2, calibration in the top group alone. **Momentum compounds the scoring gain rather than overlapping it**, at the cost of slower topic switches: at β = 0.2 a new file leads in 70% of dialogues after three turns. Against these, repairing signatures does not work — bit-level centring is a no-op — and the anomalous-chunk cut moves MRR by ±0.005 once calibration competes apart.
+#### 9.11.2 Selection past the working set
 
-On a real conversation rather than a probe set, the gate is the paper conversation itself: today's scorer finds 88% of the files it should and puts 14 of the conversation's 14 tool calls in the top ten; adding the calibration questions lifts that to 91% and 14/14. The hub correction, which won on the analysis-unit probes, loses a real conversation more than half of what it should find (38%, 9 of 14) and did not ship — the files a real conversation asks about are often the hubs, and a correction that marks hubs down marks down the right answers (`docs/results/provenance_gates_2026-10-25.md`).
+This test asks the theorem's premise directly: whether the bounded working set is delivered when the history is many times larger than it (`candle-conversation/tests/provenance_depth.rs`; `docs/results/theorem_depth_tests_2026-11-10.md`). The engine runs Flash-Next with its slot capped at 32,768 tokens. A conversation is built from the repository's own source files, one file a turn, to 30K, 131K and 393K tokens, with four turns stating vault codes placed together at 45% of its depth — the middle, where neither a fill from the oldest turns nor one from the newest reaches; the last turn asks for the codes back. Each cell is a fresh conversation, and each records the projections its question's decode emitted.
 
-We know of no published engine that couples a bounded working set with the expert staging, KV compression and context retrieval this workload needs, so the result is reported without a direct comparison baseline. The codebase dependency analysis evaluation (§9.12) is designed to put the same retrieval mechanism to a harder use: compositional multi-hop reasoning rather than recall.
-
-#### 9.11.2 Recall past the working set
-
-The gallery gates score retrieval; this test asks whether what is retrieved is used (`candle-conversation/tests/provenance_depth.rs`; `docs/results/theorem_depth_tests_2026-11-10.md`). The engine runs Flash-Next with its slot capped at 32,768 tokens. A conversation is built from the repository's own source files, one file a turn, to 30K, 131K and 393K tokens, with four turns stating vault codes placed together at 45% of its depth; the last turn asks for the codes back, decoded greedily. Each cell is a fresh conversation, and each records the projections its question's decode emitted.
-
-| Arm | 30K (19 turns) | 131K (64 turns) | 393K (195 turns) |
+| Needle turns selected into the working set | 30K (19 turns) | 131K (64 turns) | 393K (195 turns) |
 |---|---|---|---|
-| Provenance, C10 | 4/4 recalled · 4/4 needle turns selected | 0/4 · 4/4 selected | 0/4 · 4/4 selected |
-| Provenance, C0 | 4/4 · 4/4 | 1/4 · 4/4 | 0/4 · 4/4 |
-| One-shot, C10 | 3/4 · 3/4 | 0/4 · 0/4 | 0/4 · 0/4 |
-| Rolling window (no provenance) | 3/4 · 3/4 | 0/4 · 0/4 | 0/4 · 0/4 |
+| Provenance with reprojection, C10 | 4/4 | 4/4 | 4/4 |
+| Provenance with reprojection, C0 | 4/4 | 4/4 | 4/4 |
+| One-shot projection, C10 | 3/4 | 0/4 | 0/4 |
+| Rolling window (no provenance) | 3/4 | 0/4 | 0/4 |
 
-Two results, which point in opposite directions. **Selection works at depth:** mid-decode reprojection brought every needle turn into a working set of 15–18 turns drawn from 64 and 195, at C10 and at near-lossless C0, and the arms without it selected none past 30K — the one-shot projection and the append path both fill from the oldest turns. **Use of the selected turns does not:** at 131K, with all four needle turns in its final projection, the model answered *"No vault codes were provided in this conversation"* at C10 and gave one code at C0; at 393K it denied them, or gave one under the wrong vault. The failure is the same at C0 as at C10, so it is not the compression, and it is not the retrieval, which found the turns. Inside the working set, recall follows exactly what the projection holds — three needle turns in view, three codes back.
-
-So the bounded working set the theorem assumes is delivered, and it does not by itself deliver recall. Turns that arrive by selection from deep in a conversation, between unrelated selected turns, are attended and judged absent; the same gap is seen on the production daemon. This is the measured limit of the system's memory in this version, and the reason no recall claim in this paper goes past retrieval.
-
-A first version of the test placed the needles at the start of the history and recalled 4/4 in every arm at every depth, the rolling window included, because both fills reach the oldest turns; the rerun with the needles in the middle is the one reported.
+**Selection works at depth.** Mid-decode reprojection brought every needle turn into a working set of 15–18 turns drawn from 64 and from 195 — a history twelve times the slot — at C10 and at near-lossless C0 alike, and the arms without it selected none past 30K: a one-shot projection and the append path both fill from the oldest turns. The bounded working set the theorem assumes is delivered at every depth measured, and compression does not change what is selected. What the model then does with what is selected is measured on the codebase memory itself, in §9.12.
 
 ### 9.12 Unbounded Context: Codebase Dependency Analysis
 
@@ -1059,17 +844,17 @@ The ingested conversation persists as the substrate does (§7) — K/V, tokens a
 - *Transitive:* a chain of three or more hops. Example: how a MoE layer's routing reaches the expert kernels with no host readback — the bucketize kernel, the mapped pinned ring it writes, the word the stager thread publishes, the cold expert's wait on it.
 - *Architectural:* an assumption several components share with no single call path. Example: the elastic boundary between the KV side and the expert weights (`weight_floor`) and the check that refuses a transient tier crossing it (`tier_fits`).
 
-**Arms.** Three request-level settings, each a dial of the turn rather than a restart of the daemon: `projection` (the turn takes the working set provenance selects, or nothing beyond its own conversation), `seed` (the conversation opens on its configured seed files, or on none) and reprojection (re-selecting during the think block, `reproject_in_thinking`, or only once at the opening — the retrieve-once turn). Reprojection exists only where projection does, so the arms are seven:
+**Arms.** Three request-level settings, each a dial of the turn as its thinking and tools are, rather than a restart of the daemon. `projection` is *Full* (every layer provenance selects from), *Limited* (the journals alone) or *Minimal* (the tool catalog alone — and so nothing, with tools off, as every battery question runs). `seed` opens the conversation on its configured seed files, or on none. Reprojection re-selects through the think block (`reproject_in_thinking`), holds it, or selects only once at the opening — the retrieve-once turn. Reprojection exists only where something is projected, so the arms are seven:
 
 | Arm | Seed | Projection | Reprojection | What it isolates |
 |---|---|---|---|---|
-| A0 | off | off | — | the model alone |
-| A1 | on | off | — | the seed files alone |
-| D1 | on | on | opening only | retrieve once, before reasoning |
-| B0 | off | on | held in thinking | — |
-| B1 | on | on | held in thinking | reasoning-time reprojection removed |
-| C0 | off | on | full | — |
-| C1 | on | on | full | the production system |
+| A0 | off | Minimal | — | the model alone |
+| A1 | on | Minimal | — | the seed files alone |
+| D1 | on | Full | opening only | retrieve once, before reasoning |
+| B0 | off | Full | held in thinking | — |
+| B1 | on | Full | held in thinking | reasoning-time reprojection removed |
+| C0 | off | Full | full | — |
+| C1 | on | Full | full | the production system |
 
 **Running.** On BlackWorld at one build, through private chats — one fresh chat per question, deleted once scored — every question prefixed with an instruction to answer from memory and call no tool. Sixteen questions run at once, and every batch of sixteen mixes the arms, so whatever drifts across the evening — the gallery, ingest, the card's load — falls on every arm alike. Each arm runs the 128 questions three times: 2,688 answers.
 
@@ -1180,7 +965,7 @@ The held arm still re-selects at `</think>` and through the answer, so it is an 
 
 What the memory holds is the documentation and the module structure more than the call graph: the architectural answers are in `AGENTS.md` and the design documents, and five of eight came back whole; the direct questions ask for call sites, which documents rarely name, and one did. The answers cite where they came from — a design document's section, a module header — and when the model had not seen the source it said so: five declined outright, more named what they knew and declined the rest, and one withdrew identifiers it had just named because it had not read the file that would confirm them. The errors found on reading are near-misses (the CUDA constant placed in the arena-table header beside the one that defines it; an out-of-date caller), not invented names.
 
-**What is public.** The source and the raw measurement rows are public (Appendix C); every throughput, compression and retrieval figure in this paper is reproducible from a named test in the repository and a named row in `docs/performance.md`. The live system is open to signed-in users, but it does not expose a retrieval log, and the ingested conversation is not released; the battery, its ground truth, its analysis and its per-question scoring are in the repository (`zend/examples/dependency_battery/`, the pilot's `docs/results/dependency_battery_2026-11-10.md`, `docs/results/dependency_battery_2026-11-20_b.md` and `docs/results/dependency_battery_2026-11-23_l_m.md`, and the 128-question battery's *[PENDING: battery-128 — results file]*), and so is the scoring lab with its formulas and measurements (`candle-conversation/examples/provenance_gates`, `docs/results/provenance_scoring_lab_2026-11-16.md`, `docs/results/provenance_scoring_lab_2026-11-20.md`).
+**What is public.** The source and the raw measurement rows are public (Appendix B); every throughput, compression and retrieval figure in this paper is reproducible from a named test in the repository and a named row in `docs/performance.md`. The live system is open to signed-in users, but it does not expose a retrieval log, and the ingested conversation is not released; the battery, its ground truth, its analysis and its per-question scoring are in the repository (`zend/examples/dependency_battery/`, the pilot's `docs/results/dependency_battery_2026-11-10.md`, `docs/results/dependency_battery_2026-11-20_b.md` and `docs/results/dependency_battery_2026-11-23_l_m.md`, and the 128-question battery's *[PENDING: battery-128 — results file]*), and so is the scoring lab with its formulas and measurements (`candle-conversation/examples/provenance_gates`, `docs/results/provenance_scoring_lab_2026-11-16.md`, `docs/results/provenance_scoring_lab_2026-11-20.md`).
 
 ---
 
@@ -1202,7 +987,7 @@ Everything above is measured on a system that is also in use, and the use is its
 
 Much of this version was revised by the system itself. The author asked a Qwen3.8-Flash-Next session on the production daemon for a critique of the v2 draft, read it, and then asked it to revise: fix what the critique found, bring the figures to the current sweeps, add the live-operation results, and drop the disclaimer that the system was still being engineered. The session ran 85 tool rounds over ~320K tokens of conversation, made thirty-one edits to this paper and brought the README's figures with it (`docs/results/paper_revision_session_2026-11-09.md`).
 
-**How it did.** The edits are the ones this version carries — §9.6's current figures, §9.7's live-dispatch ablation, §9.11.1, §9.13 itself, and the removal of most of the sentences that claimed a result for the then-unrun battery of §9.12 — and the quality of the judgement in them is the finding worth recording. Asked to fill the draft's gaps, among them §9.12's empty results table, it searched the repository for a measured table, found none, and wrote that the battery is not run rather than supplying numbers. It then went looking for every other place the paper claimed that battery's results — the abstract, §1, §11.2, §11.4, the conclusion, Appendix C's list of what is released — and corrected them. It did not find them all: a later review by the author found such claims still standing in §1.2, §6.5, §9.1, §9.11 and §11.5, and an attribution of Flash-Next's flat depth to provenance alone, which this subsection's first draft also made; those are corrected in this version. It caught its own citation error (reference numbers from `docs/performance.md`'s own list written into a table that cites the paper's), and it softened its own new status banner when it noticed that the banner said more than the evidence it had read could support. It kept the engine probe's failing rows in §9.11's table rather than leaving them out. Where it failed, the failures were mechanical: anchors gone stale after neighbouring edits, and one edit reported as failed that had in fact applied, together costing a dozen rounds. That is a defect in the editing tools, and it was the tools, not the model, that lost the time.
+**How it did.** The edits are the ones this version carries — §9.6's current figures, §9.7's live-dispatch ablation, §9.11.1, §9.13 itself, and the removal of most of the sentences that claimed a result for the then-unrun battery of §9.12 — and the quality of the judgement in them is the finding worth recording. Asked to fill the draft's gaps, among them §9.12's empty results table, it searched the repository for a measured table, found none, and wrote that the battery is not run rather than supplying numbers. It then went looking for every other place the paper claimed that battery's results — the abstract, §1, §11.2, §11.4, the conclusion, Appendix B's list of what is released — and corrected them. It did not find them all: a later review by the author found such claims still standing in §1.2, §6.5, §9.1, §9.11 and §11.5, and an attribution of Flash-Next's flat depth to provenance alone, which this subsection's first draft also made; those are corrected in this version. It caught its own citation error (reference numbers from `docs/performance.md`'s own list written into a table that cites the paper's), and it softened its own new status banner when it noticed that the banner said more than the evidence it had read could support. It kept the engine probe's failing rows in §9.11's table rather than leaving them out. Where it failed, the failures were mechanical: anchors gone stale after neighbouring edits, and one edit reported as failed that had in fact applied, together costing a dozen rounds. That is a defect in the editing tools, and it was the tools, not the model, that lost the time.
 
 **The ratio, and what explains it.** The author's own reading of the session was that it decoded unusually much for the amount it read, and that provenance selection is the reason. The round log bears out the first half. Across the session one token was decoded for every 2.9 prefilled — 82,963 decoded against 238,619 prefilled — and after the paper was read whole once, in the first four rounds, each round's new input averaged ~2,100 tokens against ~970 decoded. The model edited thirty-odd parts of a 1,400-line document across eighty rounds without reading it whole again; its later reads were of single parts, the one it was about to replace.
 
@@ -1330,7 +1115,7 @@ $$E\left[\sum_{t \in \mathcal{W}} \varepsilon(t)\right] \approx \varepsilon_{\te
 
 **Contrast with the standard result.** Under full attention with any finite-precision arithmetic — F16, BF16, or uniform compression — all N tokens enter every generation step and the exposure this proof bounds is Θ(N · ε̄), unbounded. Under provenance-selected attention it is bounded regardless of N: the system at N = 10,000,000 turns operates under the same bound as at N = 1,000 turns. The contrast is between bounds. It is not a demonstration that full-attention output degrades: §11.1 gives the reasons it may not, and §9.6.8 measures that within 128K it does not. What full attention lacks is the bound, not the behaviour at the depths a single context can reach; how its output behaves past them, where every token held must be compressed or evicted, is the regime the bound is about and that no single-context measurement reaches.
 
-**Empirical status.** The theorem is a proof, and its premises — a fixed selection budget, a hot tier of fixed size, a per-block threshold on everything sealed — are properties of the engine that hold by construction. What the measurements show is consistent with it, not a test of it. The depth measurement of §9.6.2 shows the operating signature of a bounded working set — Qwen3.8-Flash-Next keeps 99% of its prefill and 111% of its decode from 32K to 128K — but the bound there is the model's own trained indexer inside one context, not provenance, so it supports the principle, not this mechanism. The live session of §9.13.1 shows decode flat from 48K to 321K tokens of conversation with provenance in the loop, with the indexer as a confound. The story evaluation (§9.8) shows every throughput row reproducing its reference text at the compression levels in use, and on Llama-3.2-3B a progression of failure past the validation edge consistent with error growing per token. The direct test — the model fixed, N far past the working set, provenance on and off, output rather than throughput — is §9.11.2, and it separates the theorem's premise from its promise. The premise holds: with the engine's slot capped at 32K and a history twelve times that, mid-decode reprojection selected every planted turn into a working set of 15–18 turns, at C10 and C0 alike, where the one-shot and rolling-window arms selected none. The promise does not follow from it: past the working set the model, with the turns that held the answer in its final projection, said it had not been told — 4/4 recalled at 30K, 0–1/4 at 131K and 393K. Bounded error on the attended set is not recall of it; what fails is the model's use of turns that arrive by selection from deep in a conversation, and that is not a numerical failure. The dependency battery of §9.12 tests retrieval at the level of compositional reasoning; its results are given there, and the theorem does not rest on them.
+**Empirical status.** The theorem is a proof, and its premises — a fixed selection budget, a hot tier of fixed size, a per-block threshold on everything sealed — are properties of the engine that hold by construction. What the measurements show is consistent with it, not a test of it. The depth measurement of §9.6.2 shows the operating signature of a bounded working set — Qwen3.8-Flash-Next keeps 99% of its prefill and 111% of its decode from 32K to 128K — but the bound there is the model's own trained indexer inside one context, not provenance, so it supports the principle, not this mechanism. The live session of §9.13.1 shows decode flat from 48K to 321K tokens of conversation with provenance in the loop, with the indexer as a confound. The story evaluation (§9.8) shows every throughput row reproducing its reference text at the compression levels in use, and on Llama-3.2-3B a progression of failure past the validation edge consistent with error growing per token. The direct test of the premise — the model fixed, N far past the working set, provenance on and off — is §9.11.2: with the engine's slot capped at 32K and a history twelve times that, mid-decode reprojection selected every planted turn into a working set of 15–18 turns, at C10 and C0 alike, where the one-shot and rolling-window arms selected none. The dependency battery of §9.12 tests what the model does with the selected set, at the level of compositional reasoning; its results are given there, and the theorem does not rest on them.
 
 **Implication for compression ratio selection.** The theorem bounds how many cold-storage tokens can enter a step, not how much error each carries: a selected cold block contributes its full per-token error at any depth. Compression aggressiveness on cold storage therefore moves ε_cold, and with it the constant — it never threatens the O(1) bound, but it is not free. The adaptive selection kernel's highest-compression modes (C7–C9) are assigned to V cache blocks and cold-storage K blocks as a capacity trade-off with a bounded quality cost: every block still passes the per-block threshold of the level it was sealed under, which is what bounds ε_cold. The binding design constraints are the always-attended working set error floor ε_hot — confirmed near zero by the prefill refresh strategy — and the retrieval threshold θ, which bounds ε_ret for warm and cold blocks alike. The design is an engineering trade-off the theorem makes explicit: capacity against the size of the constant, never against the bound itself.
 
@@ -1382,7 +1167,7 @@ The methodological pattern that emerged from this acceptance is worth documentin
 
 **Two-phase quantization.** Materialising all active turns at F16 across 200+ concurrent sessions OOMs at scale. The forced alternative — chunk-sealed quantization during decode, prefill refresh on turn completion — turned out to correctly separate two independent error mechanisms (per-chunk quantization noise and autoregressive decode drift) that existing approaches conflate. The memory pressure that made naive quantization impossible forced a cleaner theoretical decomposition of the problem.
 
-**Online Markov expert prediction.** Low VRAM residency (44%) means most experts are cold. Acceptable cold-hit rates require prediction. The forced alternative to offline calibration — online learning from production routing observations — adapts to the actual workload distribution rather than a calibration proxy, which is the reason to expect it to generalise better than a trained predictor; a head-to-head against one is not run (§9.7). The residency constraint that made on-demand loading inadequate forced a prediction system that needs no calibration.
+**Online Markov expert prediction.** Low VRAM residency (44%) means most experts are cold. Acceptable cold-hit rates require prediction. The forced alternative to offline calibration — online learning from production routing observations — adapts to the actual workload distribution rather than a calibration proxy, and held out it covers 4.7× the cold experts popularity does, with learning within the session as its dominant lever (§9.7). The residency constraint that made on-demand loading inadequate forced a prediction system that needs no calibration.
 
 **Structural segments via projection.** Dynamic system-prompt sections exist in real deployments — persona, response style, and tool catalogs rotate between turns. The standard solution (store K/V uniformly for every token) closes a class of error invisibly: stored structural K/V references the ingest-time prefix, and when that prefix differs from the assembly prefix, attention scores degrade silently and drift compounds across turns. The constraint — structural orientation markers must remain semantically correct under dynamic frame rotation — closed the standard storage approach and forced a separable representation: content segments stored, structural segments live-prefilled from the dialect catalog against the current assembly's causal prefix and cached per slot by a hash of that prefix (§5). On the attention-only models the forced alternative is structurally cleaner: storage holds only what is portable, the chat template becomes a structural primitive of the inference engine rather than a prompt-engineering convention, the substrate shrinks, and the theorem (§11.2) covers boundary tokens without a frame-mismatch exception. A cached run is injected rather than recomputed, so a reprojection that keeps its prefixes pays only for the runs whose prefix changed. The constraint has a limit, which §5 records: a recurrent model cannot gap-fill, so on the production lineage the same markers are sealed K/V instead.
 
@@ -1404,9 +1189,9 @@ The broader competitive position follows from the same distinction. The existing
 
 The application target — many concurrent persistent-memory agent sessions on a single consumer card, each with unbounded conversation history — is met at every scale measured: sixteen users of a 35B model and eight of a 180B model on a 16GB laptop, sixty-four of a 35B model on one 72GB card. The problem the system was designed to solve is solvable at scale. The inference engine exists in service of that requirement, not as an end in itself.
 
-The codebase dependency battery (§9.12) is the evidence that projection and reprojection with provenance work together. Retrieval finds the needle — the answer file first of 6,854, in a 40M-token corpus, on 65% of questions, top five on 83%. The model then answers from memory with tools forbidden at 57.3% recall over three runs, documented architecture well and call sites less well, and declines rather than invents. Holding the working set fixed while the model reasons takes that to 38.8%, every held run below every reprojecting run: re-selection during reasoning is worth 18.5 points, most of them on answers in files the question does not name. *[PENDING: battery-128]* The 128-question battery measures each part on its own: against the model alone the memory is worth __ points, reprojection during reasoning __, continuous reprojection __ over a single retrieval, and the seed files __, each with its interval and Holm-corrected p. The theorem's direct test (§9.11.2) separates its premise, which holds — a bounded working set selected from a history twelve times its size — from the recall it was meant to buy, which past the working set fails: the model reports facts in its context as absent. That failure is not numerical, and it is the measured limit of the memory in this version. The retrieval half of the same claim is measured, on the live gallery (§9.11.1), and the deployment itself — §9.13 — is operating experience of what the architecture is for: memory that outlives the process, the session and the model that wrote it. That experience is not a substitute for the battery's table, and is not offered as one.
+The codebase dependency battery (§9.12) is the evidence that projection and reprojection with provenance work together. Retrieval finds the needle — the answer file first of 6,854, in a 40M-token corpus, on 65% of questions, top five on 83%. The model then answers from memory with tools forbidden at 57.3% recall over three runs, documented architecture well and call sites less well, and declines rather than invents. Holding the working set fixed while the model reasons takes that to 38.8%, every held run below every reprojecting run: re-selection during reasoning is worth 18.5 points, most of them on answers in files the question does not name. *[PENDING: battery-128]* The 128-question battery measures each part on its own: against the model alone the memory is worth __ points, reprojection during reasoning __, continuous reprojection __ over a single retrieval, and the seed files __, each with its interval and Holm-corrected p. The theorem's direct test (§9.11.2) shows its premise holds — a bounded working set selected, needle for needle, from a history twelve times its size, at the top compression level as at near-lossless. The deployment itself — §9.13 — is operating experience of what the architecture is for: memory that outlives the process, the session and the model that wrote it. That experience is not a substitute for the battery's table, and is not offered as one.
 
-The sliding-window alternative degrades by construction rather than gracefully: a window that cannot see past its boundary cannot discover a dependency that lives beyond it, and a 131K window covers only a fraction of a 2.2M-line codebase. The contrast that matters is measured in its sharpest form: the same provenance index, the same opening retrieval and every other reprojection, with only the reasoning's re-selection held — and the battery loses 18.5 points (§9.12). *[PENDING: battery-128]* The retrieve-once turn — the same index and the same opening retrieval, then a fixed window through the reasoning — scores __ points below the production system over 128 questions. What is measured is retrieval quality on the live gallery (§9.11.1) and against the 40M-token code corpus (§9.12), recall and its failure past the working set (§9.11.2), the battery from memory and its reasoning-hold ablation (§9.12), output fidelity against depth (§9.6.8), and the absence of a depth cliff in the engine's own throughput (§9.6.2). The KV quantization literature — KIVI, KVQuant, TurboQuant — optimises inside a regime whose boundaries it has not examined; the growth of exposure with N is a property of full attention, not a law of compression, and this architecture leaves the regime (§11.2, §11.3). Attention is retrieval: the provenance index performs approximate attention over the full unbounded context, selecting which blocks enter exact attention; standard attention is flat retrieval at O(N) cost; this system is hierarchical retrieval whose exact-attention cost per step does not grow with N, plus a scan that does — flat over the resident gallery, ~9.5 ms steady-state on the laptop, and off the critical path; RAG replaces the attention mechanism and loses attentional continuity; this system preserves the mechanism and removes the scaling constraint on exact attention (§6, §11.4). The structural argument is straightforward: a system running full attention over a 2.2M-line codebase reads every compressed token at every step once it holds more than it can keep at full precision; this one reads a bounded working set, on a laptop GPU — and more hardware does not give full attention a depth-independent bound (§11.2 Corollary 2).
+The sliding-window alternative degrades by construction rather than gracefully: a window that cannot see past its boundary cannot discover a dependency that lives beyond it, and a 131K window covers only a fraction of a 2.2M-line codebase. The contrast that matters is measured in its sharpest form: the same provenance index, the same opening retrieval and every other reprojection, with only the reasoning's re-selection held — and the battery loses 18.5 points (§9.12). *[PENDING: battery-128]* The retrieve-once turn — the same index and the same opening retrieval, then a fixed window through the reasoning — scores __ points below the production system over 128 questions. What is measured is retrieval quality on the live gallery (§9.11.1) and against the 40M-token code corpus (§9.12), selection far past the working set (§9.11.2), the battery from memory and its reasoning-hold ablation (§9.12), output fidelity against depth (§9.6.8), and the absence of a depth cliff in the engine's own throughput (§9.6.2). The KV quantization literature — KIVI, KVQuant, TurboQuant — optimises inside a regime whose boundaries it has not examined; the growth of exposure with N is a property of full attention, not a law of compression, and this architecture leaves the regime (§11.2, §11.3). Attention is retrieval: the provenance index performs approximate attention over the full unbounded context, selecting which blocks enter exact attention; standard attention is flat retrieval at O(N) cost; this system is hierarchical retrieval whose exact-attention cost per step does not grow with N, plus a scan that does — flat over the resident gallery, ~9.5 ms steady-state on the laptop, and off the critical path; RAG replaces the attention mechanism and loses attentional continuity; this system preserves the mechanism and removes the scaling constraint on exact attention (§6, §11.4). The structural argument is straightforward: a system running full attention over a 2.2M-line codebase reads every compressed token at every step once it holds more than it can keep at full precision; this one reads a bounded working set, on a laptop GPU — and more hardware does not give full attention a depth-independent bound (§11.2 Corollary 2).
 
 The deeper lesson is methodological: constraints accepted as first-class design requirements rather than problems to be avoided force architectural decisions that are more efficient in the dimension the constraint bounds — and efficiency in that dimension tends to generalise. The 16GB ceiling produced native quantized kernels that never pay for a dequantised copy. The finite hot tier produced the sparse attention that makes unbounded context tractable to bound. The memory pressure of concurrent sessions produced the two-phase quantization that separates two error mechanisms the literature conflates. Each constraint closed a standard solution and forced one that holds up beyond it. The measurements show it on three cards from 16GB to 72GB; the theorem explains why the bound, though not every figure, carries to any card.
 
@@ -1524,57 +1309,18 @@ The deeper lesson is methodological: constraints accepted as first-class design 
 
 ---
 
-## Appendix A: Attentional Provenance Scoring Weights
-
-### A.1 Corpus retrieval weights (dot-product scoring)
-
-Dot-product retrieval scores each indexed item as $S = \sum_b (w_{Kb}(k_b \cdot K_b) + w_{Qb}(q_b \cdot Q_b))$ across the three depth bands. Weights below are used for corpus retrieval (history turns, facts, mood candidates, templates).
-
-| Component | w_K_syn | w_K_sem | w_K_prag | w_Q_syn | w_Q_sem | w_Q_prag | Primary rationale |
-|---|---|---|---|---|---|---|---|
-| Facts | 0.20 | 0.25 | 0.15 | 0.05 | 0.10 | 0.25 | Topical K primary; Q_pragmatic relational |
-| History | 0.05 | 0.10 | 0.15 | 0.05 | 0.15 | 0.50 | Q_pragmatic dominant (full reasoning state) |
-| Mood | 0.08 | 0.15 | 0.20 | 0.02 | 0.10 | 0.45 | K_pragmatic (emotion peak 75% depth, Qwen3) |
-| Templates | 0.10 | 0.20 | 0.15 | 0.08 | 0.17 | 0.30 | Balanced structure/intent |
-
-Mood weights are grounded in Zhang et al. [2025] (emotion probe accuracy peaks at 75% depth for Qwen3-4B = pragmatic band) and Tak et al. [2025] (MHSA/FFN semantic-band units causally responsible for emotion decisions). The assistant-prefill dual representation for mood/template fingerprints eliminates the Q→K distributional gap for those sections.
-
-### A.2 BDP section-discrimination depth weights (span scoring)
-
-For BDP span scoring during generation (§6.2, §9.10), each content layer uses calibrated depth weights $w = (w_\text{syn}, w_\text{sem}, w_\text{prag})$ derived from a 1,024-scenario cross-corpus sweep on Qwen3-30B-A3B at 250K tokens (8 content types × 8 items × 16 scenarios). The universal default applies when no per-layer calibration exists.
-
-| Content layer | syn | sem | prag | MRR | Top-1% | Threshold | Dominant band |
-|---|---|---|---|---|---|---|---|
-| code\_reading | 0.00 | 0.43 | 0.57 | 1.000 | 100% | 0.0† | semantic + pragmatic |
-| static\_analysis | 1.00 | 0.00 | 0.00 | 0.483 | 43% | 1.0 | syntactic only‡ |
-| dependency\_analysis | 0.25 | 0.00 | 0.75 | 0.960 | 94% | 0.0† | syntactic + pragmatic |
-| architectural\_analysis | 0.60 | 0.40 | 0.00 | 1.000 | 100% | 0.0† | syntactic + semantic |
-| critical\_analysis | 0.00 | 1.00 | 0.00 | 0.629 | 59% | 1.0 | semantic only |
-| bug\_analysis | 1.00 | 0.00 | 0.00 | 1.000 | 100% | 286.0 | syntactic only |
-| daily\_history | 0.25 | 0.75 | 0.00 | 0.981 | 96% | 0.0† | semantic dominant |
-| dream\_log | 0.50 | 0.17 | 0.33 | 0.868 | 79% | 100.0 | all bands |
-| **Universal default** | **0.17** | **0.17** | **0.67** | **0.854** | **82%** | — | pragmatic dominant |
-
-†Threshold=0.0: intra/inter distributions overlap; discrimination operates entirely by rank order within the cross-type corpus (Pattern C, §9.10 Phase 3). ‡static\_analysis confusion (43% Top-1) is an artefact of corpus overlap: static, code reading, dependency, and architectural analysis all reference the same source files, overwhelming per-task BDP differences. Mitigation — expanding the item set or adding a content-type discriminator at the retrieval layer — is pending (§9.10 open items).
-
-**Why each layer uses its optimal bands.** bug\_analysis and architectural\_analysis achieve 100% Top-1 because error-check idioms (syntactic) and structural naming (syntactic + semantic) are highly distinctive at the BDP level. code\_reading uses semantic + pragmatic because raw code activates mid-to-deep attention patterns; syntactic alone conflates overlapping scopes. dependency\_analysis uses syntactic + pragmatic because import patterns are syntactic while cross-file coupling intent is pragmatic. dream\_log uses all three bands because speculative prose is stylistically varied with no single dominant band. The universal default's pragmatic weighting (prag:0.667) reflects the consistent empirical finding that discourse-level Q patterns carry the most discriminative power across diverse content types when no content-specific calibration is available.
-
-**Phase 1 vs Phase 2 calibration methodology.** A within-layer sweep (Phase 1) across 8 homogeneous items within a single content type produces inverted signal for 5 of 8 layers — items discussing the same source files produce similar BDP signatures, giving insufficient cross-item contrast. The cross-corpus sweep (Phase 2), pooling all 64 items across all 8 content types, provides the contrast needed for reliable calibration. This is how the system operates in production: the combined KV corpus spans all content types, and retrieval scores items from the pooled cross-type index.
-
----
-
-## Appendix B: Expert Pipeline VRAM Budget
+## Appendix A: Expert Pipeline VRAM Budget
 
 The v1 design budget for Qwen3-30B-A3B on the 16GB laptop, with its derivation, is §10.2 (an expert cache of ~2,700 of 6,144 slots, ~8 GB; ~2 GB of non-expert blocks; ~4 GB of KV hot tier at ~3× compression, ~125K tokens at Qwen3-30B-A3B's 96 KB a token at F16; ~2 GB of working buffers). It is not repeated here. The production engine's span partition is described at the head of §10.2, its expert side in `docs/expert_cache_design.md`, and its measured KV fill in §9.11.
 
 ---
 
-## Appendix C: Public Release and Community Collaboration
+## Appendix B: Public Release and Community Collaboration
 
 **Source code:** https://github.com/john-sharratt/candle (public)
 
 **Live system:** https://code.tokera.com — the deployed coding assistant over this repository, on the cluster that produced §9.11.1 and §9.13. It requires sign-in; access is by allowlist, with a queue for guests. The project site, https://www.tokera.com, carries v1 of this paper.
 
-**What is released.** The full inference engine codebase, and the raw measurement rows behind every figure in this paper — `docs/performance.md` and `docs/results/`, each row naming its build, its machine and the test that produced it — with the tests that produce them. What is not released: the substrate the live gallery holds (a KV archive valid only for the model that wrote it, and holding conversations that are not this paper's to publish), and an interface to the retrieval record — the live system shows a conversation's turns and tool calls, not which signatures matched at each reprojection. A turn's `projection`, `seed` and reprojection are dials of the request, as its thinking and tools are, so every arm of §9.12 is a setting a caller can choose. The §9.12 battery's questions and ground truth (`zend/examples/dependency_battery/battery.yaml`), its harness and analysis, and every answer's per-question score (the pilot's `docs/results/dependency_battery_2026-11-10.md`, `docs/results/dependency_battery_2026-11-20_b.md` and `docs/results/dependency_battery_2026-11-23_l_m.md`; the 128-question battery's *[PENDING: battery-128 — results file]*) are in the repository, as are the tests behind §9.6.8 and §9.11.2.
+**What is released.** The full inference engine codebase, and the raw measurement rows behind every figure in this paper — `docs/performance.md` and `docs/results/`, each row naming its build, its machine and the test that produced it — with the tests that produce them. What is not released: the substrate the live gallery holds (a KV archive valid only for the model that wrote it, and holding conversations that are not this paper's to publish), and an interface to the retrieval record — the live system shows a conversation's turns and tool calls, not which signatures matched at each reprojection. A turn's `projection` (Full, Limited to the journals, or Minimal to the tools), `seed` and reprojection are dials of the request and of the MCP tools that start a turn, as its thinking and tools are, so every arm of §9.12 is a setting a caller can choose — and a task can limit what it is shown. The §9.12 battery's questions and ground truth (`zend/examples/dependency_battery/battery.yaml`), its harness and analysis, and every answer's per-question score (the pilot's `docs/results/dependency_battery_2026-11-10.md`, `docs/results/dependency_battery_2026-11-20_b.md` and `docs/results/dependency_battery_2026-11-23_l_m.md`; the 128-question battery's *[PENDING: battery-128 — results file]*) are in the repository, as are the tests behind §9.6.8 and §9.11.2.
 
 **Invitation.** This is v2, and it is open for full critical review. The v1 erratum is part of the record rather than quietly corrected, and the same discipline applies here: every figure in this version names its build, its machine and its test, and every claim that is not measured says so. Contributions to validation, stress-testing, or optimisation are invited — contributors will be recognised in the next revision. Issues, pull requests, and evaluation results may be submitted via the GitHub repository.
