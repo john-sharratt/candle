@@ -152,6 +152,11 @@ kv-zero-check = []
 # diagnosing prompt/format/role-marker bugs; off by default because
 # the per-token recording allocates and the dump itself is large.
 context-dump = []
+# CRC-verify every record payload a read returns (`record::verify_record_crc`)
+# and every replicated record's. Off by default: writers always stamp the CRC,
+# so a build with it verifies every record ever written, and a build without
+# it pays for no checksum. `substrate_inspect` checks CRCs in every build.
+crc-check = []
 hub = ["dep:hf-hub", "candle-transformers/hub"]
 # Exposes test-introspection methods (warm_pool, warm_turn_slots,
 # hot/warm_turn_ids_sorted, tiered_store()) that are otherwise hidden from the

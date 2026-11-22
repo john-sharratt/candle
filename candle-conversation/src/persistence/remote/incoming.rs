@@ -6,7 +6,7 @@
 use serde_json::Value;
 
 use super::super::content_hash::ContentHasher;
-use super::super::record::{crc32, decode_header, padded_record_len, RecordHeader, RecordType};
+use super::super::record::{decode_header, padded_record_len, verify_record_crc, RecordHeader};
 use super::super::{PersistenceError, Result};
 use super::outcome::{Checked, Refusal};
 
@@ -59,7 +59,8 @@ impl Incoming {
     }
 
     /// Check the payload against what its header says of it: the `digest`
-    /// over the whole payload, and for any record but a `Chunk` its CRC.
+    /// over the whole payload, and — in a build with the `crc-check` feature
+    /// (`record::verify_record_crc`) — for any record but a `Chunk` its CRC.
     ///
     /// **A `Chunk`'s golden is not recomputed here.** The digest has already
     /// read every byte of the payload and proved it is what its writer wrote,
@@ -73,7 +74,7 @@ impl Incoming {
         if hasher.finish() != self.header.digest {
             return Err(Refusal::Digest);
         }
-        if self.header.record_type != RecordType::Chunk && crc32(&self.payload) != self.header.crc {
+        if verify_record_crc(&self.header, &self.payload).is_err() {
             return Err(Refusal::Checksum);
         }
         Ok(())
@@ -84,7 +85,7 @@ impl Incoming {
 mod tests {
     use super::*;
     use crate::persistence::identity::RecordIdentity;
-    use crate::persistence::record::encode_record;
+    use crate::persistence::record::{encode_record, RecordType};
 
     fn header() -> RecordHeader {
         RecordHeader {
@@ -160,7 +161,8 @@ mod tests {
     }
 
     /// A payload changed in flight fails its digest; a header whose CRC was
-    /// changed fails the checksum.
+    /// changed fails the checksum in a `crc-check` build and passes without
+    /// one, its digest intact.
     #[test]
     fn a_changed_record_fails_verification() {
         let bytes = encode_record(&header(), &[1, 2, 3]);
@@ -169,6 +171,11 @@ mod tests {
         assert_eq!(incoming.verify(), Err(Refusal::Digest));
         let mut incoming = Incoming::parse(&bytes).unwrap();
         incoming.header.crc ^= 1;
-        assert_eq!(incoming.verify(), Err(Refusal::Checksum));
+        let want = if cfg!(feature = "crc-check") {
+            Err(Refusal::Checksum)
+        } else {
+            Ok(())
+        };
+        assert_eq!(incoming.verify(), want);
     }
 }

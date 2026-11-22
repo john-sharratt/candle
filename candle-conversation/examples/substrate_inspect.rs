@@ -5485,7 +5485,7 @@ fn headers(log: &mut LogFile) -> Result<()> {
 /// verification against a golden checksum computed on-GPU (which does catch that)
 /// is the follow-on work; this same command verifies it once the golden lands.
 fn validate(log: &mut LogFile, layers_override: Option<usize>) -> Result<()> {
-    use candle_conversation::persistence::record::verify_record_crc;
+    use candle_conversation::persistence::record::check_record_crc;
 
     // ── Pass 1: metadata-record CRC (streaming — no full-log RAM load) ────────
     let mut crc_ok = 0usize;
@@ -5495,7 +5495,7 @@ fn validate(log: &mut LogFile, layers_override: Option<usize>) -> Result<()> {
         if e.record.payload.is_empty() {
             return;
         }
-        match verify_record_crc(&e.record.header, &e.record.payload) {
+        match check_record_crc(&e.record.header, &e.record.payload) {
             Ok(()) => crc_ok += 1,
             Err(err) => {
                 crc_bad += 1;
@@ -5560,7 +5560,7 @@ fn validate(log: &mut LogFile, layers_override: Option<usize>) -> Result<()> {
 /// looks truncated. Merging first is what turns "this segment holds part of the
 /// turn" back into "the substrate holds the turn".
 fn validate_merged(segs: &[(u64, PathBuf, bool)], layers_override: Option<usize>) -> Result<()> {
-    use candle_conversation::persistence::record::verify_record_crc;
+    use candle_conversation::persistence::record::check_record_crc;
 
     let mut crc_ok = 0usize;
     let mut crc_bad = 0usize;
@@ -5577,7 +5577,7 @@ fn validate_merged(segs: &[(u64, PathBuf, bool)], layers_override: Option<usize>
             if e.record.payload.is_empty() {
                 return;
             }
-            match verify_record_crc(&e.record.header, &e.record.payload) {
+            match check_record_crc(&e.record.header, &e.record.payload) {
                 Ok(()) => crc_ok += 1,
                 Err(err) => {
                     crc_bad += 1;

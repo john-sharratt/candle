@@ -650,9 +650,10 @@ impl LogSource for MemLog {
 /// Read, decode, and CRC-verify the whole record at `offset`.
 /// `record_size` is the exact padded on-disk size from a `RecordLoc` /
 /// `ChunkLoc` — captured at walk time or write time. Single read, no
-/// probe. Bit-rot in the payload surfaces here as `BadChecksum` — the
-/// random-access reads this serves (singletons, tokens, signatures,
-/// compaction's live-set copy) all consume the payload immediately.
+/// probe. In a `crc-check` build, bit-rot in the payload surfaces here as
+/// `BadChecksum` — the random-access reads this serves (singletons, tokens,
+/// signatures, compaction's live-set copy) all consume the payload
+/// immediately.
 ///
 /// Returns an owned [`Record`] — the on-disk bytes go out of scope at
 /// return time. Callers on the hot path that want to read the payload
@@ -1192,19 +1193,25 @@ mod tests {
         assert_eq!(record.payload, b"alpha");
     }
 
-    /// A flipped payload byte surfaces as `BadChecksum` at the
-    /// consumption point — `read_record_at` CRC-verifies every payload
-    /// it returns.
+    /// In a `crc-check` build a flipped payload byte surfaces as
+    /// `BadChecksum` at the consumption point — `read_record_at`
+    /// CRC-verifies every payload it returns. Without the feature the read
+    /// returns the bytes as they are.
     #[test]
     fn read_record_at_rejects_payload_bit_rot() {
         let mut r0 = rec(5, 0, b"alpha-payload");
         let newline = r0.iter().position(|&b| b == b'\n').unwrap();
         r0[newline + 1] ^= 0x5A;
         let mut mem = MemLog::with_records(&r0);
-        let err = read_record_at(&mut mem, SUPERBLOCK_SIZE, r0.len() as u64).unwrap_err();
-        assert!(
-            matches!(err, PersistenceError::BadChecksum { .. }),
-            "expected BadChecksum, got {err:?}"
-        );
+        let read = read_record_at(&mut mem, SUPERBLOCK_SIZE, r0.len() as u64);
+        if cfg!(feature = "crc-check") {
+            let err = read.unwrap_err();
+            assert!(
+                matches!(err, PersistenceError::BadChecksum { .. }),
+                "expected BadChecksum, got {err:?}"
+            );
+        } else {
+            assert_eq!(read.unwrap().payload[0], b'a' ^ 0x5A);
+        }
     }
 }

@@ -75,8 +75,9 @@ impl SubstratePersistence {
 
     /// Read the tokenizer bytes embedded in the active log's `Tokenizer`
     /// record. `Ok(None)` when the log has no such record yet (no model
-    /// has ever called `set_tokenizer` against this substrate). The read
-    /// CRC-verifies the payload, so bit rot surfaces as `BadChecksum`.
+    /// has ever called `set_tokenizer` against this substrate). In a
+    /// `crc-check` build the read CRC-verifies the payload, so bit rot
+    /// surfaces as `BadChecksum`.
     pub fn read_tokenizer_bytes(&mut self) -> Result<Option<Vec<u8>>> {
         let Some(loc) = self.manifest.tokenizer else {
             return Ok(None);

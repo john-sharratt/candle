@@ -95,7 +95,21 @@ pub fn decode_record(buf: &[u8]) -> Result<(RecordHeader, &[u8], usize)> {
 /// off this path also keeps the restart/recovery read — which only verifies
 /// metadata — from ever putting chunk bytes on the golden path, protecting
 /// restart time.
+///
+/// **Only in a build with the `crc-check` feature.** Without it nothing is
+/// computed and every payload passes: a read pays for no checksum it does not
+/// ask for. Every writer still stamps its CRC into the header, so a build with
+/// the feature verifies every record ever written. A tool whose job is the
+/// check calls [`check_record_crc`], which verifies in every build.
 pub fn verify_record_crc(header: &RecordHeader, payload: &[u8]) -> Result<()> {
+    if !cfg!(feature = "crc-check") {
+        return Ok(());
+    }
+    check_record_crc(header, payload)
+}
+
+/// [`verify_record_crc`] in every build, whatever its features.
+pub fn check_record_crc(header: &RecordHeader, payload: &[u8]) -> Result<()> {
     if header.record_type == RecordType::Unknown || header.record_type == RecordType::Chunk {
         return Ok(());
     }

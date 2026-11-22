@@ -240,7 +240,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn flipped_payload_byte_caught_by_verify_record_crc() {
+    fn flipped_payload_byte_caught_by_check_record_crc() {
         // A metadata (non-chunk) record: crc32 over the whole payload catches
         // any flipped byte.
         let payload = [1u8, 2, 3, 4, 5, 6, 7, 8];
@@ -260,11 +260,16 @@ pub(super) mod tests {
         bytes[newline_pos + 2] ^= 0x01;
         // decode_record itself no longer CRC-verifies; the parse succeeds.
         let (header, payload_slice, _) = decode_record(&bytes).unwrap();
-        // The dedicated verifier surfaces the bit rot.
+        // The dedicated check surfaces the bit rot in every build; the read
+        // path's verifier does only in a `crc-check` build.
         assert!(matches!(
-            verify_record_crc(&header, payload_slice),
+            check_record_crc(&header, payload_slice),
             Err(PersistenceError::BadChecksum { .. })
         ));
+        assert_eq!(
+            verify_record_crc(&header, payload_slice).is_err(),
+            cfg!(feature = "crc-check")
+        );
     }
 
     /// The digest wire tag is the enum discriminant — pinned by raw
@@ -340,7 +345,7 @@ pub(super) mod tests {
 
         let caught = match decode_record(&bytes) {
             Err(_) => true,
-            Ok((header, payload_slice, _)) => verify_record_crc(&header, payload_slice).is_err(),
+            Ok((header, payload_slice, _)) => check_record_crc(&header, payload_slice).is_err(),
         };
         assert!(
             caught,

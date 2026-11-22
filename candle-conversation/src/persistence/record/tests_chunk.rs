@@ -67,6 +67,7 @@ pub(super) mod tests {
             token_count: 32,
             ..RecordHeader::NONE
         };
+        assert!(check_record_crc(&header, &payload).is_ok());
         assert!(verify_record_crc(&header, &payload).is_ok());
     }
 

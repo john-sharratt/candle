@@ -439,9 +439,10 @@ mod tests {
             .expect("the payload is on disk");
         bytes[at] ^= 0xFF;
         std::fs::write(&path, &bytes).expect("rewrite segment");
-        assert!(
+        assert_eq!(
             reader.read_payload_into(&loc, 9, none, &mut dest).is_none(),
-            "a changed payload fails its crc"
+            cfg!(feature = "crc-check"),
+            "a changed payload fails its crc in a crc-check build"
         );
     }
 
@@ -584,9 +585,10 @@ mod tests {
             .expect_err("misaligned");
     }
 
-    /// **A record whose bytes changed on disk is refused by its CRC**, exactly
-    /// as the log's own read refuses it: the lock-free path does not skip the
-    /// integrity check the locked one applies.
+    /// **A record whose bytes changed on disk is refused by its CRC** in a
+    /// `crc-check` build, exactly as the log's own read refuses it: the
+    /// lock-free path does not skip the integrity check the locked one
+    /// applies. Without the feature, neither path computes one.
     #[test]
     fn a_corrupted_payload_fails_its_crc() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -613,10 +615,12 @@ mod tests {
         bytes[at] ^= 0xFF;
         std::fs::write(&path, &bytes).expect("rewrite segment");
 
-        reader
-            .read_record_payload(&loc)
-            .expect("sealed")
-            .expect_err("a changed payload fails its crc");
+        let read = reader.read_record_payload(&loc).expect("sealed");
+        assert_eq!(
+            read.is_err(),
+            cfg!(feature = "crc-check"),
+            "a changed payload fails its crc in a crc-check build"
+        );
     }
 
     /// **The read does not wait for whoever holds the log.** This is the
