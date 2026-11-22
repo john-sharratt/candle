@@ -51,9 +51,9 @@ pub const PENDING_QUANTIZE: u32 = 1 << 0;
 /// `elevate_to_hot` pulls it back. Set for collection-member sections (nothing
 /// attends back over them during the build) and completed-ingest turns (not
 /// attended again until retrieval). Live dialogue turns never carry it.
-/// A retrieval's hot copy outlives the working set that recalled it by one
-/// projection (`ResidenceSlab::projected_lately`), so a selection that moves
-/// between adjacent boundaries does not read it off the log again.
+/// A retrieval's hot copy outlives the working set that recalled it by one of
+/// that slot's projections, through the pin on the slot's previous working set
+/// (`SlotState::previous_working_set`).
 pub const EVICT_WHEN_COLD: u32 = 1 << 1;
 /// A warm→cold write is queued on the writer and has not landed, so the next
 /// persistence pass must not gather and write the same KV again. Distinct from
@@ -303,9 +303,6 @@ pub struct Residence {
     byte_size: AtomicU64,
     /// Wave epoch of the last forward that resolved its hot KV.
     last_used_epoch: AtomicU64,
-    /// The last working-set publication that named it, from the slab's
-    /// projection clock; 0 when none has.
-    last_projected: AtomicU64,
     /// Recency stamp from the slab's clock: higher is more recent.
     touched: AtomicU64,
 }
@@ -338,7 +335,6 @@ impl Residence {
             // that will attend it publishes its pins, so a zero stamp would make it
             // stale from birth and let the idle demote take it before its first use.
             last_used_epoch: AtomicU64::new(epoch),
-            last_projected: AtomicU64::new(0),
             touched: AtomicU64::new(0),
         }
     }
@@ -413,12 +409,6 @@ impl Residence {
     pub fn stamp_used(&self, epoch: u64) {
         self.last_used_epoch.fetch_max(epoch, Ordering::Relaxed);
     }
-
-    /// The last working-set publication that named it; 0 when none has.
-    pub fn last_projected(&self) -> u64 {
-        self.last_projected.load(Ordering::Relaxed)
-    }
-
     pub fn touched(&self) -> u64 {
         self.touched.load(Ordering::Relaxed)
     }
@@ -453,8 +443,6 @@ pub struct ResidenceSlab {
     warm_gpu: papaya::HashSet<usize>,
     /// The idle demote's clock: one tick per persistence pass.
     wave_epoch: AtomicU64,
-    /// One tick per working-set publication ([`Self::publish_pins`]).
-    projection: AtomicU64,
     /// Recency clock behind [`Residence::touched`].
     clock: AtomicU64,
     /// Each pin publisher's last published set — see [`Self::publish_pins`].
@@ -479,7 +467,6 @@ impl Default for ResidenceSlab {
             warm: papaya::HashSet::new(),
             warm_gpu: papaya::HashSet::new(),
             wave_epoch: AtomicU64::new(0),
-            projection: AtomicU64::new(0),
             clock: AtomicU64::new(0),
             published: papaya::HashMap::new(),
         }
@@ -564,16 +551,6 @@ impl ResidenceSlab {
     pub fn tick_epoch(&self) -> u64 {
         self.wave_epoch.fetch_add(1, Ordering::SeqCst) + 1
     }
-
-    /// Whether `r` was named by the latest working-set publication or the one
-    /// before it — what holds an offload-only residence's hot copy through one
-    /// projection after it leaves the working set, so a re-selection at the
-    /// next boundary finds it still in VRAM.
-    pub fn projected_lately(&self, r: &Residence) -> bool {
-        let last = r.last_projected();
-        last != 0 && last + 1 >= self.projection.load(Ordering::SeqCst)
-    }
-
     fn touch(&self, r: &Residence) {
         let t = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
         r.touched.store(t, Ordering::Relaxed);
@@ -892,7 +869,6 @@ impl ResidenceSlab {
     /// counts — and a publisher's own calls come from its one thread.
     pub fn publish_pins(&self, owner: u64, keep: HashSet<usize>) {
         let epoch = self.wave_epoch();
-        let projection = self.projection.fetch_add(1, Ordering::SeqCst) + 1;
         let map = self.published.pin();
         let before = map.get(&owner).cloned().unwrap_or_default();
         for &i in keep.difference(&before) {
@@ -910,7 +886,6 @@ impl ResidenceSlab {
         for &i in &keep {
             if let Some(r) = self.slots.get(i) {
                 r.stamp_used(epoch);
-                r.last_projected.fetch_max(projection, Ordering::Relaxed);
             }
         }
         map.insert(owner, Arc::new(keep));

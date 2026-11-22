@@ -412,10 +412,7 @@ impl Substrate {
             // residence with neither is simply left for a later pass, by which
             // time the migrate will have made one.
             let backed = r.has_warm() || r.has_cold();
-            // An offload waits out one projection after the residence leaves the
-            // working set: a recall the next boundary selects again is still hot.
-            let offload =
-                r.has_flag(EVICT_WHEN_COLD) && backed && !self.residences.projected_lately(r);
+            let offload = r.has_flag(EVICT_WHEN_COLD) && backed;
             let take = r.has_hot()
                 && !r.is_pinned()
                 && !r.has_flag(PENDING_QUANTIZE | SPLICE_SOURCE)

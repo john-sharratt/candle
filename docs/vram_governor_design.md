@@ -443,10 +443,12 @@ minute would permanently condemn ordinary KV to be dropped rather than persisted
 Dropping `hot` directly says exactly what is meant, is undone by the next
 `elevate_to_hot`, and leaves the flag to mean the one thing it means.
 
-**An offload waits out one projection** (`ResidenceSlab::projected_lately`).
-Every working-set publication ticks a projection clock and stamps the
-residences it names. A flagged residence is offloaded only once neither the
-latest publication nor the one before it named it. Without that hold, a recall
+**A slot's dropped units are held for one of its projections**
+(`SlotState::previous_working_set`). Each slot keeps the working set its latest
+projection replaced, and the pin publication holds it beside the current one
+until that slot projects again. Another slot's projection cannot end the hold:
+a global count of publications would, and on a busy member every other slot's
+elevate ticked it within the same boundary. Without the hold, a recall
 was shed on the first pass after it left the working set, so a projection that
 re-selected the same `code_read` turn one boundary later read it off the log
 again. Measured on BlackWorld on 2026-11-22: 15–36 turns and 120–236 MiB

@@ -117,8 +117,9 @@ impl Scheduler {
             state.placed_pieces.clear();
         }
         // Record the sealed working set this projection attends over, so relief
-        // eviction can protect it (see `evict_cold_tail`).
-        state.working_set = projection_assembler::working_set_from_segments(segments);
+        // eviction can protect it (see `evict_cold_tail`); the one it replaces
+        // is held for one projection.
+        state.set_working_set(projection_assembler::working_set_from_segments(segments));
 
         projection_assembler::apply_segments(
             state,
@@ -166,7 +167,7 @@ impl Scheduler {
         // stamp it here where the segments are in hand.
         let pass_budget = self.prefill_pass_budget();
         let state = self.slot_projection_state.entry(parent_id).or_default();
-        state.working_set = projection_assembler::working_set_from_segments(segments);
+        state.set_working_set(projection_assembler::working_set_from_segments(segments));
         let mut ctx = projection_assembler::ApplyContext {
             session: &mut self.session,
             model: &mut self.model,
@@ -417,6 +418,15 @@ impl Scheduler {
         extra_turns: &[TurnKey],
     ) {
         let (mut keep_sections, mut keep_turns) = self.live_working_sets();
+        // What each live slot's last projection dropped is held through that
+        // slot's next one (`SlotState::previous_working_set`).
+        for (&slot, st) in &self.slot_projection_state {
+            if self.slot_idle(slot) {
+                continue;
+            }
+            keep_sections.extend(st.previous_working_set.sections.iter().copied());
+            keep_turns.extend(st.previous_working_set.turns.iter().copied());
+        }
         keep_sections.extend(extra_sections.iter().copied());
         keep_turns.extend(extra_turns.iter().copied());
         // The publish stamps the active set with the substrate's wave clock —

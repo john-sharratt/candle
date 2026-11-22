@@ -25,6 +25,13 @@ pub(in super::super) struct SlotState {
     /// an in-flight prefill/decode is attending. Lives on `SlotState` so it
     /// inherits the slot's lifecycle (removal + fork re-keying) for free.
     pub(in super::super) working_set: SlotWorkingSet,
+    /// The working set the current one replaced, held until this slot's next
+    /// projection replaces it in turn ([`Self::set_working_set`]). Pinned with
+    /// the current one, so a sealed unit this slot's projection dropped stays
+    /// in VRAM for one projection of its own: a selection that moves between
+    /// adjacent boundaries finds it hot instead of reading it off the log, and
+    /// no other slot's projection can end the hold early.
+    pub(in super::super) previous_working_set: SlotWorkingSet,
     /// Captured glue-island K/V from the previous gap-fill wave, keyed by the
     /// island's content-context hash (every preceding piece's identity + length,
     /// the island's own tokens, and its forward-bridge target — see
@@ -336,6 +343,8 @@ impl SlotState {
         Self {
             pending_user_part: None,
             working_set: self.working_set.clone(),
+            // What the fork's own projections drop is the fork's to hold.
+            previous_working_set: SlotWorkingSet::default(),
             glue_islands: self.glue_islands.clone(),
             glue_generation: self.glue_generation,
             placed: self.placed,
@@ -416,6 +425,12 @@ impl SlotState {
     /// Drop the in-flight `NewUserMessage` capture after a successful seal.
     pub(in super::super) fn trim_post_turn(&mut self) {
         self.pending_user_part = None;
+    }
+
+    /// Install a projection's working set; the one it replaces is held as
+    /// [`Self::previous_working_set`] until the next install.
+    pub(in super::super) fn set_working_set(&mut self, working_set: SlotWorkingSet) {
+        self.previous_working_set = std::mem::replace(&mut self.working_set, working_set);
     }
 
     /// Advance the island-cache generation for a capture pass and prune every

@@ -666,15 +666,16 @@ pub(super) mod tests {
         assert!(sub.residence(kept).has_warm(), "kept stays warm");
     }
 
-    /// **A recall stays hot for one projection after it leaves the working
-    /// set.** A completed-ingest turn, offloaded to cold-only, is pulled back
+    /// **A recall stays hot while a pin names it, and never takes a warm
+    /// copy.** A completed-ingest turn, offloaded to cold-only, is pulled back
     /// hot by `install_promoted`. It is never queued for a hot→warm copy — the
-    /// log already holds its bytes. The projection that drops it does not shed
-    /// it, so a re-selection at the next boundary finds it hot; the one after
-    /// that, still not naming it, lets the offload take it back to cold-only.
-    /// A flagged turn no projection ever named is offloaded at once.
+    /// log already holds its bytes. While the published pins name it (the
+    /// scheduler holds a slot's previous working set for one projection) the
+    /// pass leaves it hot, so a re-selection finds it there; once no pin
+    /// names it, the offload takes it back to cold-only. A flagged turn no
+    /// pin names is offloaded at once.
     #[test]
-    fn a_recall_stays_hot_for_one_projection() {
+    fn a_recall_stays_hot_while_pinned_and_takes_no_warm_copy() {
         let (_, _, timeline, mut sub) = make_timeline();
         let cold = || {
             vec![StoredSequence {
@@ -719,21 +720,11 @@ pub(super) mod tests {
         );
         assert_eq!(sub.pending_warm_bytes(), 0);
 
-        // The next projection drops it: held, the pass does not shed it.
-        sub.set_working_set_pins(&[], &[]);
+        // Held by a pin, a pass leaves it hot for the next selection.
         assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 0);
-        assert!(
-            sub.residence(recalled).has_hot(),
-            "hot through one projection"
-        );
-
-        // Re-selected at the boundary after: still hot, nothing to read.
-        sub.set_working_set_pins(&[key], &[]);
         assert!(sub.turn_tier_state(timeline, recalled_idx).unwrap().hot);
 
-        // Dropped again, and a second projection still without it: offloaded.
-        sub.set_working_set_pins(&[], &[]);
-        assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 0);
+        // No pin names it any more: offloaded back to cold-only.
         sub.set_working_set_pins(&[], &[]);
         assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 1);
         assert!(!sub.residence(recalled).has_hot(), "back to cold-only");

@@ -128,6 +128,39 @@ pub(super) mod tests {
         assert!(none.sections.is_empty() && none.turns.is_empty());
     }
 
+    /// **A projection's working set is held one projection past it.** Each
+    /// install moves the current set to `previous_working_set`, so what one
+    /// projection dropped is still named until the slot's next projection;
+    /// a fork starts with nothing held of its own.
+    #[test]
+    fn the_replaced_working_set_is_held_for_one_projection() {
+        let turn = |i| TurnKey::new(TimelineId::for_test(5), TurnIndex(i));
+        let mut s = SlotState::default();
+        s.set_working_set(working_set_from_segments(&[
+            turn_seg(0, 5, 1),
+            turn_seg(0, 5, 2),
+        ]));
+        assert!(s.previous_working_set.turns.is_empty());
+
+        s.set_working_set(working_set_from_segments(&[
+            turn_seg(0, 5, 2),
+            turn_seg(0, 5, 3),
+        ]));
+        assert_eq!(s.working_set.turns, vec![turn(2), turn(3)]);
+        assert_eq!(s.previous_working_set.turns, vec![turn(1), turn(2)]);
+
+        s.set_working_set(working_set_from_segments(&[turn_seg(0, 5, 4)]));
+        assert_eq!(s.previous_working_set.turns, vec![turn(2), turn(3)]);
+        assert!(
+            !s.previous_working_set.turns.contains(&turn(1)),
+            "dropped two projections ago: no longer held"
+        );
+
+        let fork = s.fork();
+        assert_eq!(fork.working_set.turns, vec![turn(4)]);
+        assert!(fork.previous_working_set.turns.is_empty());
+    }
+
     /// **Records laid end to end learn where they now stand.** After a splice
     /// the pieces keep their own widths and contributions and nothing else:
     /// each one's ends are the sums of the widths before it, and its prefix
