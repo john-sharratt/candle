@@ -72,7 +72,7 @@ use candle_kernels::simple::tensor_assert::{run_tensor_assert, AssertDType, MAX_
 
 pub use callback::on_bad;
 pub use candle_kernels::simple::tensor_assert::AssertDType as RawDType;
-pub use drain::{drain, find, report, Finding};
+pub use drain::{discard, drain, find, report, Finding};
 // `check_now` is defined below; re-exported here so the site-level API reads as
 // one surface.
 pub use dump::{Dump, Replay};

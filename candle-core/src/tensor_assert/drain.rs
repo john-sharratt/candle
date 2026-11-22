@@ -146,6 +146,34 @@ pub fn report(device: &Device) -> Result<Vec<Finding>> {
     Ok(bad)
 }
 
+/// Drop a failed forward's findings: read them, say in one line what they
+/// were, fire no callback, and start a fresh epoch.
+///
+/// **A forward that failed is rolled back whole, so nothing its asserts saw
+/// survives it.** A cold expert given up mid-layer leaves that layer's rows
+/// unwritten by design and the wave is discarded and run again; drained by the
+/// next wave instead, those rows were reported as that wave's corruption and
+/// armed captures on it — on WhiteWorld, every non-finite report of a run was a
+/// give-up the engine had already handled.
+pub fn discard(device: &Device) -> Result<()> {
+    let bad: Vec<Finding> = drain(device)?.into_iter().filter(Finding::is_bad).collect();
+    if let Some(line) = discarded_line(&bad) {
+        tracing::warn!(target: "candle_core::tensor_assert", "{line}");
+    }
+    super::epoch(device)
+}
+
+/// The line a discarded forward's findings are logged as, `None` when they
+/// were all finite.
+fn discarded_line(bad: &[Finding]) -> Option<String> {
+    let first = bad.first()?;
+    Some(format!(
+        "tensor_assert: a failed forward's {} non-finite site(s) were discarded with it, \
+         first {first}",
+        bad.len()
+    ))
+}
+
 /// The time between two heartbeats.
 ///
 /// **By the clock, not by the count.** Every 1000th clean drain was an hour of
@@ -211,7 +239,41 @@ pub fn find(device: &Device, name: &str) -> Result<Option<Finding>> {
 mod tests {
     use std::sync::atomic::AtomicU64;
 
-    use super::{beat_due, heartbeat, to_finding, Finding, HEARTBEAT_MS};
+    use super::{beat_due, discarded_line, heartbeat, to_finding, Finding, HEARTBEAT_MS};
+
+    /// **A discarded forward is named by its first bad site**, and a forward
+    /// whose sites were all finite says nothing.
+    #[test]
+    fn a_discarded_forward_names_its_first_bad_site() {
+        let bad = [
+            Finding {
+                name: "moe.routed_out.L3".into(),
+                seq: Some(4),
+                nan: 2560,
+                inf: 0,
+                min: Some(-0.5),
+                max: Some(0.25),
+                elems: 5120,
+            },
+            Finding {
+                name: "q4e.post_moe.res.L3".into(),
+                seq: Some(9),
+                nan: 10240,
+                inf: 0,
+                min: None,
+                max: None,
+                elems: 20480,
+            },
+        ];
+        assert_eq!(
+            discarded_line(&bad).as_deref(),
+            Some(
+                "tensor_assert: a failed forward's 2 non-finite site(s) were discarded with it, \
+                 first #4 moe.routed_out.L3: nan=2560 inf=0 of 5120 finite=[-5e-1, 2.5e-1]"
+            )
+        );
+        assert_eq!(discarded_line(&[]), None);
+    }
 
     /// **The first drain beats at once, then one per interval.**
     #[test]

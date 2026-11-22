@@ -240,6 +240,17 @@ pub(super) fn forward_core<S: WaveSweep + ?Sized>(
     // re-assembles the contexts it needs. An assembly failure here is the same
     // unrecoverable shape as a failed rollback: report both.
     let fail = |session: &mut BatchedInferenceSession, e: Error| -> Error {
+        // The failed forward's asserts go with it: drained by the next wave
+        // instead, a cold expert's given-up rows read as that wave's NaN.
+        #[cfg(feature = "tensor-assert")]
+        if let Some(dev) = Some(model.device().clone()).filter(|d| d.is_cuda()) {
+            if let Err(d) = candle::tensor_assert::discard(&dev) {
+                tracing::warn!(
+                    target: "candle_transformers::wave_driver",
+                    "tensor_assert: the failed forward's findings could not be discarded: {d}"
+                );
+            }
+        }
         let (kv_start, kv_end) = model.kv_layer_range(layer_start, layer_end);
         let rolled = assemble_wave_contexts(session, &all_seqs, &all_inputs)
             .and_then(|mut contexts| model.rollback_wave(&mut contexts, kv_start, kv_end));
