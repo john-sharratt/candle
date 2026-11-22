@@ -52,6 +52,7 @@ use candle::quantized::pinned_staging::{Generation, GpuBuf};
 use candle::{DType, Result, Tensor};
 
 use super::batched_attention::Qwen4ExpAttentionLayer;
+use super::sum_scale::ACT_SUM_SCALE;
 use super::capture_rows::CaptureRows;
 use super::engine::GpuLayerMix;
 use super::hyper::{hc_combine, hc_combine_gated, hc_mix, hc_mix_with_operand};
@@ -536,9 +537,8 @@ impl Qwen4ExpBatched {
                 &h2.reshape((1, n, n_embd))?,
                 m.lm_head.int8mode(),
                 cuda,
-                // Raw Σx — a language model's block sums stay far below f16's
-                // ceiling.
-                candle::quantized::SumScale::Raw,
+                // Σx by amax, the model's convention.
+                ACT_SUM_SCALE,
             )?,
         };
         // The layer's output in its three parts, assembled by the combine as
@@ -567,7 +567,7 @@ impl Qwen4ExpBatched {
             &narrow,
             head.lm_head.int8mode(),
             cuda,
-            candle::quantized::SumScale::Raw,
+            head.lm_head.sum_scale(),
         )?;
         let logits = head
             .lm_head
