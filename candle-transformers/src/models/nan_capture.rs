@@ -63,7 +63,7 @@ use candle::{cuda_backend::CudaDevice, LiveTensor, Result, Shape};
 
 use super::expert_lre::slot_integrity::{check_watch, watching};
 use cudarc::driver::{CudaSlice, DevicePtr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Once;
 
 /// Where the dump goes.
@@ -231,11 +231,17 @@ static ARMED_SITE: AtomicUsize = AtomicUsize::new(0);
 /// The drain reports bad sites first-bad-first by the kernel's own ticket, so
 /// the first one it hands us is the earliest site that went non-finite in that
 /// wave. That is the site worth paying a fence for on the next wave.
+///
+/// **Each report re-arms at its own first bad site.** Armed once and for good,
+/// the capture on WhiteWorld held the first site that ever went bad
+/// (`moe.up_out.L31`, which did not go bad again) while the gate output of
+/// layers 43 and 47 went non-finite in nearly every wave after it, and nothing
+/// was ever dumped. The site that keeps failing is the one worth the fence.
 fn arm_from_drain() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         candle::tensor_assert::on_bad(|f: &Finding| {
-            if ARMED_SITE.load(Ordering::Relaxed) != 0 {
+            if !first_of_report(f.seq, &LAST_TICKET) {
                 return;
             }
             // Recover the interned `&'static str` for this name so the armed
@@ -243,19 +249,32 @@ fn arm_from_drain() {
             let Some(s) = candle::tensor_assert::interned(&f.name) else {
                 return;
             };
-            if ARMED_SITE
-                .compare_exchange(0, s.as_ptr() as usize, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
+            let site = s.as_ptr() as usize;
+            if ARMED_SITE.swap(site, Ordering::SeqCst) != site {
                 tracing::error!(
                     target: "candle_transformers::nan_capture",
                     site = %f.name, nan = f.nan, inf = f.inf,
-                    "capture ARMED at the first bad site — the next wave reaching it pays one \
-                     fence and dumps its operands"
+                    "capture ARMED at this report's first bad site — the next wave reaching it \
+                     pays one fence and dumps its operands"
                 );
             }
         });
     });
+}
+
+/// The last bad finding's kernel ticket plus one; zero before any.
+static LAST_TICKET: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the bad finding with kernel ticket `ticket` opens a report. A
+/// report hands its bad sites over first bad first — tickets rising, the
+/// unticketed after them — and the slots' tickets restart each epoch, so a
+/// ticket no higher than the last one handed over is the next report's first.
+fn first_of_report(ticket: Option<u32>, last: &AtomicU64) -> bool {
+    let Some(t) = ticket.map(|s| u64::from(s) + 1) else {
+        return last.load(Ordering::Relaxed) == 0;
+    };
+    let prev = last.swap(t, Ordering::Relaxed);
+    prev == 0 || t <= prev
 }
 
 /// Whether `name` is the site a drain has named. One relaxed load and a compare.
@@ -591,4 +610,24 @@ fn dump(call: &GemmCall<'_>, f: &Finding, dev: &CudaDevice) -> Result<()> {
         f.min,
         f.max,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Each report's first bad finding is told from the rest** by its
+    /// ticket: rising within a report, restarting with the next, and an
+    /// unticketed finding opens a report only when nothing came before it.
+    #[test]
+    fn a_report_opens_where_the_tickets_restart() {
+        let last = AtomicU64::new(0);
+        assert!(first_of_report(None, &last), "nothing before it");
+        assert!(first_of_report(Some(4), &last), "the first ticketed finding");
+        assert!(!first_of_report(Some(9), &last), "later in the same report");
+        assert!(!first_of_report(None, &last), "the unticketed tail of a report");
+        assert!(first_of_report(Some(2), &last), "the tickets restarted: a new report");
+        assert!(first_of_report(Some(2), &last), "the same ticket again: a new report");
+        assert!(!first_of_report(Some(3), &last));
+    }
 }
