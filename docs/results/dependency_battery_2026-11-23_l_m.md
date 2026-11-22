@@ -71,10 +71,15 @@ hash, `GLUE_ISLAND_RETAIN_GENERATIONS = 4`), and t8 named `elevate.rs`.
 - **Gains and losses cross.** t1 rose 1 → 3 and t5 1 → 2, while t6 fell 4 → 0 and a2 2 → 0.
   That is the per-question selection noise (j) and (k) recorded, where identical configurations
   moved categories by ±25 points.
-- **The overall spread is the question.** The other six runs, (h) to (l) and (n), span 46.9% to
-  57.6%. (m)'s 39.9% is the only run below that range.
+- **The overall spread is the question.** The seven runs that reproject in thinking, (h) to (l)
+  and (n), span 46.9% to 57.6%. Both runs that hold the think block, (m) at 39.9% and (o) at
+  37.5%, fall below that whole range.
 - **(n) separates the two settings.** With the probe at 128 and the think block reprojecting,
   the battery scored 53.8% with seven full marks, level with or above (l) at 256. The 128-token
-  probe costs nothing measurable here, and (m)'s drop goes with holding the think block on its
-  opening projection. It is one run per arm, so the hold's cost is a strong indication, not a
-  measured figure.
+  probe costs nothing measurable here.
+- **(o) repeats (m), and the hold's cost stands.** At the same probe, the two held runs average
+  38.7% against (n)'s 53.8%, a drop of about 15 points. It falls on direct (20.8%, 14.6% against
+  26.0%) and architectural (47.9% twice against 70.8%). The answers decline rather than err: a
+  think block held on its opening projection reasons over what the question alone selected, and
+  the reprojection at `</think>` comes after the reasoning that needed the answer files.
+  Reprojecting during thinking is what brings the files in for the thought that uses them.
