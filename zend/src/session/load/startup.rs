@@ -288,8 +288,8 @@ impl InferenceState {
             ))
         });
         // The model load, phase by phase: the builder says when it begins —
-        // as soon as the substrate is open — and each phase names the line
-        // under the bar and what its counts are.
+        // before the weights, and before the substrate opens — and each phase
+        // names the line under the bar and what its counts are.
         let model_progress = Arc::clone(&progress);
         let model_status = status_tx.clone();
         let model_phase: Mutex<Option<LoadPhase>> = Mutex::new(None);
@@ -309,11 +309,11 @@ impl InferenceState {
         // tenant's requests merged, when zend ranks highest of the tenants that
         // arrive; otherwise zend's substrate is bound and attached to the engine
         // the higher one built. Building loads the model weights (blocking,
-        // per-layer hook above) AND spawns the scheduler thread, which kicks off
-        // the substrate reload (redo-log replay) to run CONCURRENTLY in the
-        // background. So this timing is the model-weight load; the reload's cost
-        // shows up as the `LoadStep::Substrate` wait below (its overhang past the
-        // weight load) — the two together are the opaque "Loading model" span.
+        // per-layer hook above), then opens zend's substrate (the `Opening`
+        // step), then spawns the scheduler thread, which kicks off the
+        // substrate reload (redo-log replay) in the background. So this timing
+        // is the weight load plus the open; the reload's cost shows up as the
+        // `LoadStep::Substrate` wait below.
         let t_engine = Instant::now();
         let waiting_progress = Arc::clone(&progress);
         let engine = engine_source

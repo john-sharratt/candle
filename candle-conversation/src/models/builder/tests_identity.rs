@@ -2,7 +2,7 @@
 //!
 //! A pack without a tokenizer refuses to start. A fine-tune swapped in under the
 //! same name and vocabulary is refused, since the tokenizer check alone passed
-//! exactly that case, and the refusal comes before any weight is loaded. Every
+//! exactly that case, and the refusal comes at bind, before an engine is built. Every
 //! Flash-Next rung names the same release, so a substrate written under one rung
 //! opens under another.
 
@@ -68,7 +68,7 @@ pub(super) mod identity_tests {
     /// **A fine-tune swapped in under the same name and vocabulary is refused.**
     /// The tokenizer check alone passed exactly this case: same file name, same
     /// `tokenizer.json`, different weights — and every stored K/V was the other
-    /// model's. The refusal comes at bind, before any weight is loaded, and
+    /// model's. The refusal comes at bind, before an engine is built, and
     /// leaves the substrate bound to the model that wrote it.
     #[test]
     fn a_checkpoint_with_the_same_tokenizer_cannot_open_anothers_substrate() {

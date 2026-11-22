@@ -326,6 +326,12 @@ expert_pinned = tier_pool
   next to nothing. No reserve derived from the machine is right for both — one
   sized for WhiteWorld leaves the laptop no expert pool — so WhiteWorld states
   its pin, 28 GiB, in the table.
+- **The pin is taken before the substrate opens.** The model loads first
+  (`ModelBuilder::engine_from_prepared`), so the pin is sized against a machine
+  that holds the model and not the substrate's in-memory index. Opened first,
+  zend's index — ~36 GB on WhiteWorld on 2026-11-22, almost all of it cold —
+  left 11.5 GB free and the tier pinned 8.3 GB, sending most of decode's misses
+  to the pack. With the pin taken first, what pages is that cold index.
 
 ## 8. Placement never runs out of places
 

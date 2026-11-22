@@ -1,7 +1,7 @@
 //! Holds the engine-wide and scheduler settings the conversation engine is built
 //! with.
 //!
-//! The substrate is opened and bound to the model before any weight loads, so
+//! The substrate is opened and bound to the model before the engine is built, so
 //! the engine cannot run against a substrate another model wrote. The
 //! ingest-cancel latch is the daemon's, so a shutdown reaches an ingest that
 //! began before the engine existed. The dialect supplies the structural strings
@@ -54,7 +54,8 @@ pub struct EngineConfig {
     /// The substrate the engine persists to, already bound to the model it
     /// runs ([`BoundSubstrate::bind`]): the engine never opens one itself, so it
     /// cannot run on a substrate another model wrote. `ModelBuilder` opens and
-    /// binds it before any weight is loaded.
+    /// binds it once the model has loaded, so the expert cache pins its warm
+    /// tier against a machine the substrate's index does not yet fill.
     pub substrate: BoundSubstrate,
 
     /// The substrate's ingest-cancel latch — the daemon's, handed over through

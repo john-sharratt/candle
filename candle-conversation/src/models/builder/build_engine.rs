@@ -3,9 +3,10 @@
 //! The host-to-device link is measured before the model loads, while the card is
 //! empty and the bus idle, because a reading taken during the load would compete
 //! with the load's own reservation. The engine configuration is sized to the card
-//! where it is made, and the substrate is bound to the model before any weight is
-//! loaded, so a substrate another model wrote is refused in milliseconds rather
-//! than after a long load. An engine attached from another tenant takes that
+//! where it is made. The model loads before the substrate opens, so the expert
+//! cache pins its warm tier against a machine that holds only the model, not the
+//! substrate's in-memory index; a substrate another model wrote is refused when
+//! it opens, after the load. An engine attached from another tenant takes that
 //! engine's RoPE schedule and its merged settings, not the builder's own.
 
 use super::*;
@@ -183,8 +184,7 @@ impl ModelBuilder {
     /// Open this builder's substrate — the one [`Self::substrate`] handed over,
     /// or the one under [`Self::workspace_path`] (the process working directory
     /// when unset), read-only when [`Self::read_only_substrate`] says so — and
-    /// bind it to `identity`. A substrate another model wrote is refused here,
-    /// before anything is loaded onto the device.
+    /// bind it to `identity`. A substrate another model wrote is refused here.
     pub fn bind_substrate(&self, identity: &ModelIdentity) -> crate::Result<BoundSubstrate> {
         let shared = match &self.substrate {
             Some(shared) => shared.clone(),
@@ -230,8 +230,8 @@ impl ModelBuilder {
     }
 
     /// Same as [`Self::engine`] but told how the model load goes: each
-    /// [`LoadPhase`] as it begins — the first as soon as the substrate is open —
-    /// and how far through it is. A loader that counts nothing within a phase
+    /// [`LoadPhase`] as it begins — the first before the weights load — and how
+    /// far through it is. A loader that counts nothing within a phase
     /// still says when it begins.
     pub fn engine_with_progress(
         &mut self,
@@ -329,61 +329,28 @@ impl ModelBuilder {
             gguf_vocab_size,
         } = prepared;
 
-        // ── Bind the substrate before a weight is loaded ───────────────
         // The model's identity comes from the pack's header — its sources'
-        // digests and its tokenizer — in milliseconds. A substrate another
-        // model wrote is refused here, not after a load measured in minutes.
+        // digests and its tokenizer — in milliseconds, and nothing from here
+        // to the load needs more than that.
         let weights = self.weight_files(&pack)?;
         let identity = self.model_identity(&weights)?;
-        let substrate = self.bind_substrate(&identity)?;
-        // The substrate is open, and everything from here is the model: say
-        // so now, before the setup below and the load, rather than at the
-        // loader's first count.
+        // Everything up to the substrate open is the model: say so now, before
+        // the load, rather than at the loader's first count.
         if let Some(report) = progress {
             report(LoadPhase::Weights, 0, 0);
         }
 
-        let mut config = self.engine_config(&tokenizer, device, substrate);
-
-        // Override vocab_size with the authoritative value from GGUF metadata
-        // if available.  Models often pad vocab to a power-of-2 / multiple of
-        // 128 for GPU efficiency, so tokenizer.get_vocab().len() can be smaller
-        // than the model's actual logits dimension.
-        if let Some(model_vocab) = gguf_vocab_size {
-            if model_vocab != config.vocab_size {
-                tracing::info!(
-                    "Overriding vocab_size: tokenizer={} → GGUF metadata={}",
-                    config.vocab_size,
-                    model_vocab
-                );
-            }
-            config.vocab_size = model_vocab;
-        }
-
-        // ── Log effective configuration before loading weights ─────────
-        {
-            let model_name = self
-                .spec
-                .model_filename
-                .strip_suffix(".gguf")
-                .unwrap_or(&self.spec.model_filename);
-            tracing::info!("Engine config · {}", model_name);
-            tracing::info!(
-                "  Arch: {:?}   vocab: {}   max_seq: {}",
-                self.spec.arch,
-                config.vocab_size,
-                self.max_seq_len
-            );
-            tracing::info!(
-                "  Sampling: temp={:.3}  top_k={}  top_p={:.3}  repeat_penalty={:.3}",
-                self.sampling.temperature,
-                self.sampling.top_k,
-                self.sampling.top_p,
-                self.sampling.repeat_penalty,
-            );
-            tracing::info!("  Max response tokens: {}", self.max_response_tokens);
-        }
-
+        // ── Load the model before the substrate opens ──────────────────
+        // The expert cache sizes its pinned warm tier from the host RAM free
+        // when it loads (`expert_lre::handle::sizing`), and pinned pages are
+        // never given back. A substrate opened first takes its in-memory index
+        // — tens of GB on a long-lived store, nearly all of it cold — out of
+        // that figure for good: on WhiteWorld (2026-11-22) zend's open left
+        // 11.5 GB free, the tier pinned 4,161 of 24,064 experts, and decode
+        // missed to the pack. Loaded first, the tier takes its pin from a
+        // machine that holds only the model, and the substrate's cold pages are
+        // the ones the OS moves to the pagefile instead.
+        //
         // Every driver allocation the load makes, by site: most are scratch the
         // load frees again, and the ones it keeps are what the CUDA pool still
         // holds outside the reservation once serving starts.
@@ -412,6 +379,52 @@ impl ModelBuilder {
                 pool_reserved_mib = after >> 20,
                 "post-load: returned the load's pool high-water to the OS"
             );
+        }
+
+        // ── Bind the substrate ─────────────────────────────────────────
+        // A substrate another model wrote is refused here, when its walk ends
+        // (`SubstratePersistence::admit`), and the loaded model is dropped
+        // with the error.
+        let substrate = self.bind_substrate(&identity)?;
+        let mut config = self.engine_config(&tokenizer, device, substrate);
+
+        // Override vocab_size with the authoritative value from GGUF metadata
+        // if available.  Models often pad vocab to a power-of-2 / multiple of
+        // 128 for GPU efficiency, so tokenizer.get_vocab().len() can be smaller
+        // than the model's actual logits dimension.
+        if let Some(model_vocab) = gguf_vocab_size {
+            if model_vocab != config.vocab_size {
+                tracing::info!(
+                    "Overriding vocab_size: tokenizer={} → GGUF metadata={}",
+                    config.vocab_size,
+                    model_vocab
+                );
+            }
+            config.vocab_size = model_vocab;
+        }
+
+        // ── Log the effective configuration ────────────────────────────
+        {
+            let model_name = self
+                .spec
+                .model_filename
+                .strip_suffix(".gguf")
+                .unwrap_or(&self.spec.model_filename);
+            tracing::info!("Engine config · {}", model_name);
+            tracing::info!(
+                "  Arch: {:?}   vocab: {}   max_seq: {}",
+                self.spec.arch,
+                config.vocab_size,
+                self.max_seq_len
+            );
+            tracing::info!(
+                "  Sampling: temp={:.3}  top_k={}  top_p={:.3}  repeat_penalty={:.3}",
+                self.sampling.temperature,
+                self.sampling.top_k,
+                self.sampling.top_p,
+                self.sampling.repeat_penalty,
+            );
+            tracing::info!("  Max response tokens: {}", self.max_response_tokens);
         }
 
         // Auto-derive max_hot_turns from arena geometry unless the caller
