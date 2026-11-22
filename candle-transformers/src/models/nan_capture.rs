@@ -505,28 +505,39 @@ pub struct GemmCall<'a> {
     pub out: &'a LiveTensor<'a>,
 }
 
-/// Check this call's output and, if it is non-finite, dump the call and panic.
+/// Dump this call and panic, once a drain has named the same row's routed
+/// output (`moe.routed_out.L<row>`) as the first bad site.
 ///
-/// Returns normally — having done nothing beyond one launch and one fence —
-/// whenever the output is finite, which is every call in a healthy run.
+/// **The gate GEMM's own output is never asserted.** It is `[total_batch,
+/// nrows]` with its padding rows unwritten (`grouped_qmatmul_dev_q8a128`), and
+/// the padding sits between the experts' tiles, so a whole-buffer assert reads
+/// whatever the arena held before: on WhiteWorld it named the gate output of
+/// rows 43 and 47 in nearly every wave — values near ±2.5e38 and scattered
+/// NaNs — while the logits stayed finite. The routed output is the dense
+/// scatter of the written rows alone, so a NaN there is a real one, and this
+/// row's next gate call is where its operands are dumped.
 pub fn capture_gate_gemm(call: &GemmCall<'_>, dev: &CudaDevice) -> Result<()> {
     arm_from_drain();
-    let site = candle::tensor_assert::site("moe.capture.gate_out.L", call.layer);
-    // Asynchronous by default so the GEMM keeps its throughput; the fence and
-    // the 400 MB dump are paid only once a drain has named this site. See
-    // [`checkpoint`].
-    call.out.assert(site);
-    if !armed_for(site) {
+    if !armed_for(candle::tensor_assert::site("moe.routed_out.L", call.layer)) {
         return Ok(());
     }
+    let site = candle::tensor_assert::site("moe.capture.gate_out.L", call.layer);
     let mut found: Option<Finding> = None;
     // The callback fires the instant the kernel's verdict is read, and the
     // operands are still live in this scope — which is what makes the dump
-    // below describe *this* call rather than some later one.
+    // below describe *this* call rather than some later one. The verdict
+    // covers the padding too; the replay reads the tile tables to tell them
+    // apart.
     check_now(call.out, site, |f| found = Some(f.clone()));
-    let Some(f) = found else {
-        return Ok(());
-    };
+    let f = found.unwrap_or(Finding {
+        name: site.to_string(),
+        seq: None,
+        nan: 0,
+        inf: 0,
+        min: None,
+        max: None,
+        elems: 0,
+    });
     dump(call, &f, dev)
 }
 

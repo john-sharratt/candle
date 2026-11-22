@@ -693,17 +693,6 @@ impl Dispatch {
             cuda_dev,
         )?;
         g.end();
-        #[cfg(feature = "tensor-assert")]
-        {
-            use crate::models::nan_capture::checkpoint;
-            use candle::tensor_assert::site;
-            checkpoint(
-                site("moe.up_out.L", row),
-                &up_out,
-                &[("gate_out", &gate_out)],
-                cuda_dev,
-            )?;
-        }
         let g = gpu_span("moe:silu", &device);
         // Raw Σx — a language model's SwiGLU intermediate stays orders of
         // magnitude below f16's 65504; the down matmul reads this operand's own
@@ -738,13 +727,6 @@ impl Dispatch {
         if cpu.is_some() {
             expect_dtype(&down_out, DType::F32, "moe down (CPU result rows)")?;
         }
-        #[cfg(feature = "tensor-assert")]
-        crate::models::nan_capture::checkpoint(
-            candle::tensor_assert::site("moe.down_out.L", row),
-            &down_out,
-            &[],
-            cuda_dev,
-        )?;
         // The int8 matmul emits F32 and the scatter reads F32, narrowing once
         // at its store into `ys`'s dtype (hot-path invariant 1). The combine
         // target is defined in full by the scatter, so it is uninitialised
@@ -762,6 +744,15 @@ impl Dispatch {
             cuda_dev,
         )?;
         g.end();
+        // **The expert GEMMs are checked through what they scatter.** Each is
+        // `[total_batch, nrows]` with its padding rows unwritten, between the
+        // experts' tiles, so an assert of the whole buffer reads stale arena
+        // bytes; `ys` is the dense scatter of the written rows alone. A NaN
+        // here arms this row's gate capture for its next call
+        // (`nan_capture::capture_gate_gemm`), which dumps the gate GEMM's own
+        // operands; `down_out` rides this dump whole for the replay to read
+        // through the tile tables. The gate and up outputs are not dumped
+        // here: the SwiGLU writes its operand onto the gate output's ground.
         #[cfg(feature = "tensor-assert")]
         crate::models::nan_capture::checkpoint(
             candle::tensor_assert::site("moe.routed_out.L", row),
