@@ -20,6 +20,8 @@ use candle::quantized::cuda::{DynamicActs, Q8a128Operand};
 use candle::quantized::decode_rows::DecodeRows;
 use candle::quantized::pinned_staging::{Generation, GpuBuf};
 use candle::quantized::Int8Mode;
+#[cfg(feature = "cuda")]
+use candle::quantized::SumScale;
 use candle::{DType, Device, Result, Tensor};
 use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]

@@ -3,6 +3,7 @@
 //! The residual is one buffer that every combine updates in place, and each layer's attention and FFN run as two phases that share their ground in turn. A window that stops short of the last layer hands its residual back, and the draft head runs behind the window that completes the trunk. Numerical faults are reported through the wave's drain rather than read back here, since a readback is the fence those faults stop reproducing under. Look-ahead votes for the next rows' experts are cast beside each layer's own routing, so the expert cache can copy them before they are needed.
 
 use super::*;
+use crate::models::qwen4exp::sum_scale::ACT_SUM_SCALE;
 
 /// Later rows a MoE layer's router look-ahead votes on, for a wave of
 /// `total_rows`: [`LOOK_AHEAD_HOPS`] at decode width, for the device's
@@ -869,18 +870,13 @@ impl Qwen4ExpBatched {
             // gather copies the 20 tiles of each 2560-wide row it routes. Handed
             // over as float, the experts gathered float rows and quantized the
             // stacked `rows × top_k` block themselves, once per layer.
-            // Raw Σx — a language model's block sums stay far below f16's
-            // ceiling.
+            // Σx by amax (`sum_scale::ACT_SUM_SCALE`): this block's sums pass
+            // f16 after a full-attention layer.
             let g_acts = crate::models::profile::gpu_span("q4e:moe_acts", dev);
             let acts = match h2_q8 {
                 // The mix's own operand, at the flat layout's leading dims.
                 Some(op) => DynamicActs::Int8(op.with_lead(vec![1, total_rows])),
-                None => to_dynamic(
-                    &h2_3d,
-                    m.lm_head.int8mode(),
-                    cuda,
-                    candle::quantized::SumScale::Raw,
-                )?,
+                None => to_dynamic(&h2_3d, m.lm_head.int8mode(), cuda, ACT_SUM_SCALE)?,
             };
             g_acts.end();
             #[cfg(feature = "cuda")]
@@ -1061,12 +1057,7 @@ impl Qwen4ExpBatched {
             let candle::Device::Cuda(cuda) = dev else {
                 candle::bail!("qwen4exp wave runs on CUDA");
             };
-            to_dynamic(
-                &scored,
-                m.lm_head.int8mode(),
-                cuda,
-                candle::quantized::SumScale::Raw,
-            )?
+            to_dynamic(&scored, m.lm_head.int8mode(), cuda, m.lm_head.sum_scale())?
         };
         let logits = m
             .lm_head

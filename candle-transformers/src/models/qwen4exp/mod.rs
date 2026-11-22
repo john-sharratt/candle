@@ -90,6 +90,8 @@ pub mod sequence_pools;
 pub mod shadow;
 pub mod spec;
 pub mod state_slots;
+/// How the model's int8 activations store their block sums.
+pub mod sum_scale;
 #[cfg(feature = "cuda")]
 pub mod wave;
 

@@ -29,6 +29,7 @@ use candle::{DType, LiveTensor, Result, Tensor};
 
 use super::{HcProject, HcProjectQ8, HcWeights};
 use crate::models::quantized_matmul::QMatMul;
+use crate::models::qwen4exp::sum_scale::ACT_SUM_SCALE;
 
 /// K tile of the int8 matmul; the padded gate rank is a multiple of it.
 const K_TILE: usize = 128;
@@ -91,6 +92,7 @@ impl HcWeightsKo {
 
         let quantize = |t: &Tensor| -> Result<QMatMul> {
             QMatMul::from_qtensor_with_mode(QTensor::quantize(t, GgmlDType::Q8_0)?, mode)
+                .map(|m| m.with_sum_scale(ACT_SUM_SCALE))
         };
         Ok(Self {
             norm: w.norm.clone(),
@@ -114,8 +116,9 @@ impl HcWeightsKo {
         let candle::Device::Cuda(dev) = x.device() else {
             candle::bail!("hc projections run on CUDA");
         };
-        // Raw Σx — the mix's block sums stay far below f16's ceiling.
-        let acts = to_dynamic(x, self.mode, dev, SumScale::Raw)?;
+        // Under the consuming weight's convention, the model's
+        // (`sum_scale::ACT_SUM_SCALE`).
+        let acts = to_dynamic(x, self.mode, dev, w.sum_scale())?;
         w.forward_dynamic(acts.as_dynamic(), DType::F32)
     }
 }

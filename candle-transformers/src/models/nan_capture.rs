@@ -554,6 +554,9 @@ fn dump(call: &GemmCall<'_>, f: &Finding, dev: &CudaDevice) -> Result<()> {
     d.note("layer", call.layer);
     d.note("rows", call.stacked.rows);
     d.note("cols", call.stacked.cols);
+    // `SumScale::as_code()`: how the stacked blocks store `Σx`, which the
+    // replay must hand the kernel to read them as production did.
+    d.note("sum_scale", call.stacked.sum_scale.as_code());
     d.note("expert_base", call.expert_base);
     d.note("num_experts", call.num_experts);
     d.note("weight_dtype", format!("{:?}", call.weight_dtype));

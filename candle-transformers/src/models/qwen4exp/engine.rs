@@ -44,6 +44,7 @@ use super::mtp::{MtpDense, MtpHead};
 use super::ple::PleWeights;
 use super::ple_fused::PleFusedWeights;
 use super::qsa::IndexerWeights;
+use super::sum_scale::ACT_SUM_SCALE;
 use crate::models::delta_net::{KvLayerMap, QuantDeltaNetWeights};
 use crate::models::dense_span;
 use crate::models::device_embedding::DeviceEmbedding;
@@ -181,9 +182,13 @@ impl Qwen4ExpGpu {
                     .is_some_and(|info| dense_span::bands_from_host(info, int8mode))
             })
         };
+        // Every weight declares the model's activation sum convention, so every
+        // operand quantized for it — by `forward`, a fused producer, or the
+        // wave — stores `Σx` the one way (`sum_scale::ACT_SUM_SCALE`).
         let qm = |g: &mut GgufModel, name: &str| -> Result<QMatMul> {
             let read = |g: &mut GgufModel| {
                 QMatMul::from_qtensor_with_mode(g.qtensor(name, device)?, int8mode)
+                    .map(|m| m.with_sum_scale(ACT_SUM_SCALE))
             };
             if twins(g, &[name]) {
                 dense_span::transient(|| read(g))
@@ -213,6 +218,7 @@ impl Qwen4ExpGpu {
                     .collect::<Result<Vec<_>>>()?;
                 let refs: Vec<&QTensor> = parts.iter().collect();
                 QMatMul::from_qtensor_with_mode(QTensor::concat_rows_cuda(&refs)?, int8mode)
+                    .map(|m| m.with_sum_scale(ACT_SUM_SCALE))
             };
             let parts: Vec<&str> = names.iter().map(String::as_str).collect();
             if twins(g, &parts) {
@@ -290,7 +296,7 @@ impl Qwen4ExpGpu {
             None => None,
         };
         let lm_head = match banded {
-            Some(head) => head,
+            Some(head) => head.with_sum_scale(ACT_SUM_SCALE),
             None => qm(&mut gguf, lm_head_name)?,
         };
         let out_hc = hc(&mut gguf, "output_hc", false)?;
@@ -442,11 +448,13 @@ impl Qwen4ExpGpu {
                     g.qtensor(&format!("{p}.ffn_up_shexp.weight"), device)?,
                     g.qtensor(&format!("{p}.ffn_down_shexp.weight"), device)?,
                     int8mode,
-                )?,
+                )?
+                .with_sum_scale(ACT_SUM_SCALE),
                 QMatMul::from_qtensor_with_mode(
                     QTensor::quantize(&gate_vec, GgmlDType::F32)?,
                     int8mode,
-                )?,
+                )?
+                .with_sum_scale(ACT_SUM_SCALE),
             ));
 
             trunk.push((hc_attn, hc_ffn, mix));

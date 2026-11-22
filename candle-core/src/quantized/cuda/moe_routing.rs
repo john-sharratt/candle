@@ -334,6 +334,9 @@ pub fn fused_moe_gather_q8a128<'w>(
             Ok(())
         })?;
     }
+    // The gather copies blocks verbatim, header and all, so its rows store `Σx`
+    // the way its source's did. Labelled with any other convention every expert
+    // GEMM reading them would misread each block's sum.
     q8a128_from_out(
         owned,
         out_ptr_planned,
@@ -341,6 +344,7 @@ pub fn fused_moe_gather_q8a128<'w>(
         out_bytes,
         total_rows,
         hidden,
+        xs_q8.sum_scale,
         device,
     )
 }

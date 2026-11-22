@@ -160,8 +160,9 @@ pub(super) fn forward_attn_batched_single<'w, L: BatchedAttentionLayer>(
     let attn_out = if want_q8 {
         // The gate, if any, was folded into the decode kernel's combine pass
         // (`sigmoid(g) ⊙ ctx` before the quantize), so the q8a1024 bytes are
-        // already the gated context.
-        let op = Q8a128Operand::from_tensor(outputs, b_sz, n_head * head_dim)
+        // already the gated context. The decode kernel's emit (the split-KV
+        // combine's `int8_decode_emit_row`) stores raw `Σx`.
+        let op = Q8a128Operand::from_tensor(outputs, b_sz, n_head * head_dim, SumScale::Raw)
             .with_lead(vec![b_sz, seq_len]);
         layer.output_projection(DynamicActs::Int8(op), x_tensor.dtype())?
     } else {

@@ -27,7 +27,7 @@
 #![cfg(all(feature = "cuda", feature = "tensor-assert"))]
 
 use candle::quantized::cuda::{grouped_qmatmul_dev_q8a128, Q8a128Operand};
-use candle::quantized::GgmlDType;
+use candle::quantized::{GgmlDType, SumScale};
 use candle::tensor_assert::Replay;
 use candle::{DType, Device, Result};
 use candle_transformers::models::nan_capture::DUMP_DIR;
@@ -672,7 +672,13 @@ fn the_captured_moe_gemm_replays_identically() -> Result<()> {
     let stacked_dev = cu
         .memcpy_stod(&stacked_bytes)
         .map_err(candle::Error::wrap)?;
-    let stacked = Q8a128Operand::new(stacked_dev, rows, cols);
+    let sum_code: i32 = r.get("sum_scale")?;
+    let sum_scale = match sum_code {
+        0 => SumScale::Raw,
+        1 => SumScale::ByAmax,
+        other => candle::bail!("dump names sum_scale code {other}"),
+    };
+    let stacked = Q8a128Operand::new(stacked_dev, rows, cols, sum_scale);
 
     let mut weights: Vec<CudaSlice<u8>> = Vec::with_capacity(num_experts);
     for e in 0..num_experts {
