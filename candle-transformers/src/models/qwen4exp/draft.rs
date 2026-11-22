@@ -52,13 +52,13 @@ use candle::quantized::pinned_staging::{Generation, GpuBuf};
 use candle::{DType, Result, Tensor};
 
 use super::batched_attention::Qwen4ExpAttentionLayer;
-use super::sum_scale::ACT_SUM_SCALE;
 use super::capture_rows::CaptureRows;
 use super::engine::GpuLayerMix;
 use super::hyper::{hc_combine, hc_combine_gated, hc_mix, hc_mix_with_operand};
 use super::indexer::{IndexCache, IndexSnapshot};
 use super::mtp::MtpHead;
 use super::spec::SpecCapture;
+use super::sum_scale::ACT_SUM_SCALE;
 use super::wave::Qwen4ExpBatched;
 use crate::models::batched_inference::BatchedInferenceSession;
 use crate::models::batched_inference::ManagedBatchedModel;
