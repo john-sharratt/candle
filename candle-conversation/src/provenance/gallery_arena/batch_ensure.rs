@@ -206,6 +206,9 @@ impl GalleryArena {
                 total,
             )?
         };
+        // The host's work on the batch, timed without the residency lock it
+        // waits for before its copies (`evict::fold_upload`).
+        let t_host = Instant::now();
         let mut host = vec![0u64; total * stride_words];
         {
             let mut parts: Vec<(&Staged, &mut [u64])> = Vec::with_capacity(turns.len());
@@ -228,9 +231,15 @@ impl GalleryArena {
                 );
             });
         }
+        let prepared = t_host.elapsed();
         let mut res = self.residency.lock().unwrap_or_else(|e| e.into_inner());
         if !slots.is_empty() {
+            let t_copy = Instant::now();
             page_io::write_pages(&self.device, &slots, &host)?;
+            self.note_upload(
+                total as u64 * self.page_bytes_for(groups),
+                prepared + t_copy.elapsed(),
+            );
         }
         let current_book = self.dedup.book().as_deref().map(|b| b.id());
         let mut slots = slots.into_iter();

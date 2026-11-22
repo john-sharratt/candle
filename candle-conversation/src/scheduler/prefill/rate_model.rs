@@ -104,14 +104,13 @@ impl Scheduler {
         let weight_us_per_byte_sec = self
             .gallery_price
             .weight_us_per_byte_sec(window, slot_bytes);
-        // The rebuild a scan waits for, as timed on the scans that rebuilt;
-        // before one has, its least part — the copy over the link — so a cold
+        // What re-uploading a byte costs: the host's least measured work on it
+        // (`GalleryArena::upload_us_per_byte`) and its copy over the link at
+        // the link's rate — the copy is enqueued async, so the host's clock
+        // cannot see it. Before an upload is timed, the copy alone, so a cold
         // gallery is priced rather than kept whole.
-        let upload = match arena.upload_us_per_byte() {
-            u if u > 0.0 => u,
-            _ if link > 0.0 => 1e6 / link,
-            _ => 0.0,
-        };
+        let copy = if link > 0.0 { 1e6 / link } else { 0.0 };
+        let upload = arena.upload_us_per_byte() + copy;
         let keep = keep_within(upload, weight_us_per_byte_sec);
         arena.set_keep_within(keep);
         // The trade's inputs, once a minute: a gallery that never gives a turn

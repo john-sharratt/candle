@@ -116,15 +116,6 @@ impl GalleryArena {
                     s.index_built += 1;
                     s.index_build_us += build_us;
                 });
-                // What a scan waits for when its working set is not all
-                // resident: the uploads of the turns it finds evicted and the
-                // index over them, per byte of the set — the stall a turn's
-                // residency spares (`eviction`).
-                self.note_upload(
-                    super::super::pages_for(built.n_tokens) as u64
-                        * self.page_bytes_for(built.groups),
-                    t_index.elapsed(),
-                );
                 self.store_index(fp, built.clone());
                 (built, None)
             }

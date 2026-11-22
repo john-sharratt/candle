@@ -10,6 +10,35 @@
 
 use super::*;
 
+/// The fewest page bytes an upload must hold to be timed: under it, a clock
+/// tick is a large share of the work, and a fast clock read of a small
+/// upload as nothing would set the cost at zero for good.
+pub(super) const MIN_UPLOAD_SAMPLE: u64 = 1 << 20;
+
+/// The per-byte upload cost after `was` (µs, zero for none yet) meets an
+/// upload of `bytes` that took `host`: **the least seen**, of uploads of
+/// [`MIN_UPLOAD_SAMPLE`] or more.
+///
+/// The least, because nothing makes an upload faster than its work and
+/// everything else makes it slower: a residency lock waited on, a busy CPU, a
+/// stream queued behind a wave. Each of those is the moment's load, not what
+/// evicting a turn costs, and an average of them priced uploads at 25× their
+/// work on WhiteWorld's busy card (8 → 200 µs/KiB in a minute, 2026-11-22),
+/// lifting the keep time with it. It is timed on the upload alone — not on
+/// the index rebuild around it, which divided by the whole scanned set read a
+/// rebuild that uploaded nothing as a near-free upload.
+pub(super) fn fold_upload(was: f64, bytes: u64, host: Duration) -> f64 {
+    if bytes < MIN_UPLOAD_SAMPLE || host.is_zero() {
+        return was;
+    }
+    let sample = host.as_secs_f64() * 1e6 / bytes as f64;
+    if was > 0.0 {
+        was.min(sample)
+    } else {
+        sample
+    }
+}
+
 impl GalleryArena {
     /// Give up every unpinned turn, working set and all, and answer the
     /// reservation bytes that went back to the span. **Only for a guest's
@@ -96,28 +125,24 @@ impl GalleryArena {
         }
     }
 
-    /// What a scan waits per byte of its working set when that set is not all
-    /// resident — the uploads of the turns it finds evicted and the index over
-    /// them, in microseconds, timed on the scans that rebuilt — and so what a
-    /// turn's residency spares per byte at each scan. Zero until one has.
+    /// The host's part of re-uploading a turn, per page byte, in microseconds:
+    /// decoding its signatures, transposing them into pages and enqueueing the
+    /// copies — the least any upload of [`MIN_UPLOAD_SAMPLE`] or more has
+    /// taken ([`fold_upload`]). The copy over the link is the caller's to add
+    /// at the link's rate. Zero until an upload is timed.
     pub fn upload_us_per_byte(&self) -> f64 {
         f64::from_bits(self.upload_us_per_byte.load(Ordering::Relaxed))
     }
 
-    /// An upload of `bytes` took `elapsed`: it joins the per-byte average.
-    pub(super) fn note_upload(&self, bytes: u64, elapsed: Duration) {
-        if bytes == 0 {
-            return;
-        }
-        let sample = elapsed.as_secs_f64() * 1e6 / bytes as f64;
+    /// An upload of `bytes` page bytes took `host` of host work: it joins the
+    /// least per-byte cost seen ([`fold_upload`]).
+    pub(super) fn note_upload(&self, bytes: u64, host: Duration) {
         let was = self.upload_us_per_byte();
-        let next = if was > 0.0 {
-            was + UPLOAD_WEIGHT * (sample - was)
-        } else {
-            sample
-        };
-        self.upload_us_per_byte
-            .store(next.to_bits(), Ordering::Relaxed);
+        let next = fold_upload(was, bytes, host);
+        if next != was {
+            self.upload_us_per_byte
+                .store(next.to_bits(), Ordering::Relaxed);
+        }
     }
 
     /// Give up every turn not worth its ground ([`eviction::past_keep`]) — the
@@ -176,5 +201,39 @@ impl GalleryArena {
             );
         }
         freed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: u64 = 1 << 20;
+
+    /// **The cost is the least seen**: a slower upload — the card busy, the
+    /// lock waited on — never raises it, a faster one lowers it.
+    #[test]
+    fn the_upload_cost_keeps_the_fastest_upload() {
+        let first = fold_upload(0.0, 4 * MIB, Duration::from_micros(4_194_304));
+        assert_eq!(first, 1.0, "4 MiB in 4.19 s: 1 µs a byte");
+        let slower = fold_upload(first, 4 * MIB, Duration::from_secs(100));
+        assert_eq!(slower, 1.0, "a contended upload changes nothing");
+        let faster = fold_upload(slower, 2 * MIB, Duration::from_micros(524_288));
+        assert_eq!(faster, 0.25);
+    }
+
+    /// An upload under a MiB, or timed at nothing, is no sample: a clock that
+    /// read a small upload as instant would price every upload at zero for
+    /// good.
+    #[test]
+    fn a_small_or_untimed_upload_is_no_sample() {
+        assert_eq!(fold_upload(0.0, MIB - 1, Duration::from_nanos(1)), 0.0);
+        assert_eq!(fold_upload(0.5, 64 << 10, Duration::from_nanos(1)), 0.5);
+        assert_eq!(fold_upload(0.5, 8 * MIB, Duration::ZERO), 0.5);
+        assert_eq!(
+            fold_upload(0.0, MIB, Duration::from_micros(1_048_576)),
+            1.0,
+            "a MiB exactly is a sample"
+        );
     }
 }

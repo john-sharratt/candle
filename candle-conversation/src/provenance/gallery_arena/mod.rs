@@ -100,7 +100,8 @@ pub struct GalleryArena {
     next_run_id: AtomicU64,
     /// `T*` in nanoseconds, `u64::MAX` for none — see [`Self::set_keep_within`].
     keep_within_ns: AtomicU64,
-    /// Measured upload cost per byte, microseconds, as `f64` bits.
+    /// The least host cost of an upload per page byte, microseconds, as `f64`
+    /// bits (`evict::fold_upload`).
     upload_us_per_byte: AtomicU64,
     /// This arena's device tensor capabilities `(b1 BMMA, INT8 IMMA)`, queried
     /// once on first scan. Cached PER ARENA (not per process) so heterogeneous
@@ -154,9 +155,6 @@ pub struct GalleryArena {
     /// Words a token holds per fold group.
     gw: usize,
 }
-
-/// Weight of the newest upload in the arena's per-byte upload cost.
-const UPLOAD_WEIGHT: f64 = 0.25;
 
 mod accounting;
 mod compaction;

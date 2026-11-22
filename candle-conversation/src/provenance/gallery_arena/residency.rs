@@ -65,9 +65,14 @@ impl GalleryArena {
             n_pages,
         )?;
         let stride_words = slots[0].stride() / std::mem::size_of::<u64>();
+        let t_host = Instant::now();
         let host_pages =
             sigs.with_decoded(|sigs| transpose_to_pages(sigs, mask, self.gw, groups, stride_words));
         page_io::write_pages(&self.device, &slots, &host_pages)?;
+        self.note_upload(
+            n_pages as u64 * self.page_bytes_for(groups),
+            t_host.elapsed(),
+        );
         Ok(PageRun { slots })
     }
 
