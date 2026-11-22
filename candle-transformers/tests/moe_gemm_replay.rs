@@ -583,9 +583,56 @@ fn the_captured_moe_gemm_replays_identically() -> Result<()> {
             r.get::<String>("saw.min")?,
             r.get::<String>("saw.max")?
         );
+        // Row by row, for the output and every operand the checkpoint named:
+        // a row that is wholly non-finite came out of a computation that read
+        // something wholly bad, and an operand whose same rows are finite is
+        // not where it came from.
+        let shape_of = |key: &str| -> Option<(usize, usize)> {
+            let s: String = r.get(key).ok()?;
+            let dims: Vec<usize> = s
+                .trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .filter_map(|d| d.trim().parse().ok())
+                .collect();
+            let cols = *dims.last()?;
+            Some((dims.iter().product::<usize>() / cols.max(1), cols))
+        };
+        let rows_report = |label: &str, bytes: &[u8], dt: DType, shape: Option<(usize, usize)>| {
+            let Some((rows, cols)) = shape else {
+                return;
+            };
+            let width = bytes.len() / (rows * cols).max(1);
+            let bad: Vec<String> = (0..rows)
+                .filter_map(|row| {
+                    let at = row * cols * width;
+                    let (rn, ri, _, _) = stats(&bytes[at..at + cols * width], dt);
+                    (rn + ri > 0).then(|| format!("{row}:{}/{cols}", rn + ri))
+                })
+                .collect();
+            println!(
+                "  {label}: {rows}×{cols}, non-finite rows [{}]",
+                bad.join(" ")
+            );
+        };
+        rows_report("out", &out, dt, shape_of("out_shape"));
+        for operand in ["gate_out", "up_out", "down_out"] {
+            if !r.has(&format!("{operand}.shape")) {
+                continue;
+            }
+            let bytes = r.bytes(operand)?;
+            let odt = parse_out_dtype(&r.get::<String>(&format!("{operand}.dtype"))?)?;
+            let (on, oi, olo, ohi) = stats(&bytes, odt);
+            println!("  operand {operand}: nan={on} inf={oi} finite=[{olo:e}, {ohi:e}]");
+            rows_report(operand, &bytes, odt, shape_of(&format!("{operand}.shape")));
+        }
         let saw_nan: usize = r.get("saw.nan")?;
         let saw_inf: usize = r.get("saw.inf")?;
-        if (saw_nan, saw_inf) != (n, i) {
+        let saw_elems: usize = r.get("saw.elems")?;
+        let elems = out.len() / dt.size_in_bytes();
+        // The slot folds every assert of its site since the epoch began, so a
+        // site asserted twice in a pass counts each element twice; only a
+        // count over exactly the dumped elements can be held against them.
+        if saw_elems == elems && (saw_nan, saw_inf) != (n, i) {
             panic!(
                 "THE BUFFER CHANGED UNDER THE CAPTURE: assert counted nan={saw_nan} \
                  inf={saw_inf}, re-reading the dumped bytes gives nan={n} inf={i}. Same \

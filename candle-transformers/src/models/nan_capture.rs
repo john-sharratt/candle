@@ -395,6 +395,7 @@ pub fn capture(
 /// `ptr` must name a complete q8a128 buffer of `rows × cols` logical elements.
 pub unsafe fn checkpoint_q8a128(
     name: &'static str,
+    armed_by: &'static str,
     ptr: u64,
     rows: usize,
     cols: usize,
@@ -406,8 +407,15 @@ pub unsafe fn checkpoint_q8a128(
     // operand into staging before it can look at it, which is a full pass over
     // the buffer on top of the fence. Unarmed it does nothing at all — there is
     // no asynchronous form for a raw quantized buffer, so the drain cannot name
-    // this site and it is reached only when an adjacent tensor site names it.
-    if !armed_for(name) {
+    // this site — and it is armed by `armed_by`, the tensor site downstream of
+    // it that a drain can name.
+    //
+    // **Armed by what a drain can name, or never armed at all.** Keyed to its
+    // own name, this check never ran: on WhiteWorld an expert call's gate and
+    // up outputs came out NaN in every element of every row while the layer's
+    // dense probes upstream stayed finite, and the quantized input between
+    // them — the one place left — had never been looked at.
+    if !armed_for(name) && !armed_for(armed_by) {
         return Ok(());
     }
     let mut found: Option<Finding> = None;
