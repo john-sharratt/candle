@@ -11,13 +11,13 @@
 //! under a short hold of the persistence lock, not a header read per record
 //! under a long one.
 //!
-//! **Forty-eight bytes a record.** An origin's `oseq`s are dense, so each origin
-//! is a vector indexed by `oseq` from the first one held. A location packs into
-//! one `u64`: the segment in the top 24 bits and the record's offset in
+//! **Forty-eight bytes a record.** An origin's `oseq`s are dense where records
+//! are held, so the index is pages of [`PAGE_SLOTS`] consecutive `oseq`s, a
+//! page allocated only while it holds a record. A location packs into one
+//! `u64`: the segment in the top 24 bits and the record's offset in
 //! [`ALIGN`]-sized blocks in the low 40. Records are always aligned.
 
 use std::collections::HashMap;
-use std::iter::repeat_n;
 use std::mem::size_of;
 
 use serde::Serialize;
@@ -82,17 +82,51 @@ impl Slot {
     };
 }
 
-/// One origin's entries, indexed by `oseq - base`.
-#[derive(Clone, Debug, Default)]
-struct OriginLocations {
-    base: u64,
-    slots: Vec<Slot>,
+/// `oseq`s a page holds, as a power of two.
+const PAGE_BITS: u32 = 10;
+
+/// Slots in one page: 48 KiB of them.
+const PAGE_SLOTS: usize = 1 << PAGE_BITS;
+
+/// [`PAGE_SLOTS`] consecutive `oseq`s' slots, and how many of them name a
+/// record.
+#[derive(Clone, Debug)]
+struct Page {
+    slots: Box<[Slot]>,
+    held: u32,
+}
+
+impl Page {
+    fn new() -> Self {
+        Self {
+            slots: vec![Slot::EMPTY; PAGE_SLOTS].into_boxed_slice(),
+            held: 0,
+        }
+    }
 }
 
 /// See the module documentation.
+///
+/// **Pages, allocated only where a record is held.** An origin's `oseq`s are
+/// dense when written, but maintenance drops whole segments, and with them
+/// runs of `oseq`s from the middle of an origin's range; a load then indexes
+/// only the records left. One vector per origin spanning the first `oseq` to
+/// the last kept a slot for every gap: on WhiteWorld (2026-11-22) zend's own
+/// origin held 65.9 M slots, 3.43 GB, to name 22.1 M records. Keyed by
+/// `(origin, oseq >> PAGE_BITS)`, a page goes when its last record does, and a
+/// gap costs nothing. A lookup that finds no page, and one that finds an
+/// empty slot, answer alike: not held.
 #[derive(Clone, Debug, Default)]
 pub struct LocationIndex {
-    origins: HashMap<u64, OriginLocations>,
+    pages: HashMap<(u64, u64), Page>,
+}
+
+/// The page key and the slot within it of `(origin, oseq)`.
+fn place(origin: u64, oseq: u64) -> ((u64, u64), usize) {
+    (
+        (origin, oseq >> PAGE_BITS),
+        (oseq & (PAGE_SLOTS as u64 - 1)) as usize,
+    )
 }
 
 impl LocationIndex {
@@ -107,26 +141,20 @@ impl LocationIndex {
             loc: at.pack(),
             listed: ListedHeader::of(header),
         };
-        let o = self.origins.entry(origin).or_default();
-        if o.slots.is_empty() {
-            o.base = oseq;
+        let (key, i) = place(origin, oseq);
+        let page = self.pages.entry(key).or_insert_with(Page::new);
+        if page.slots[i].loc == 0 {
+            page.held += 1;
         }
-        if oseq < o.base {
-            let grow = (o.base - oseq) as usize;
-            o.slots.splice(0..0, repeat_n(Slot::EMPTY, grow));
-            o.base = oseq;
-        }
-        let i = (oseq - o.base) as usize;
-        if i >= o.slots.len() {
-            o.slots.resize(i + 1, Slot::EMPTY);
-        }
-        o.slots[i] = slot;
+        page.slots[i] = slot;
     }
 
     fn slot(&self, origin: u64, oseq: u64) -> Option<&Slot> {
-        let o = self.origins.get(&origin)?;
-        let i = oseq.checked_sub(o.base)? as usize;
-        o.slots.get(i).filter(|s| s.loc != 0)
+        let (key, i) = place(origin, oseq);
+        self.pages
+            .get(&key)
+            .map(|p| &p.slots[i])
+            .filter(|s| s.loc != 0)
     }
 
     /// Where `(origin, oseq)` is, if this member holds it.
@@ -140,35 +168,51 @@ impl LocationIndex {
     }
 
     /// Forget every record in a segment `gone` names — what dropping those
-    /// segments leaves of them is nothing.
+    /// segments leaves of them is nothing — and every page left holding none.
     pub fn forget_segments(&mut self, gone: &[SegmentId]) {
-        for o in self.origins.values_mut() {
-            for slot in &mut o.slots {
+        for page in self.pages.values_mut() {
+            for slot in page.slots.iter_mut() {
                 if slot.loc != 0 && gone.contains(&Located::unpack(slot.loc).segment) {
                     *slot = Slot::EMPTY;
+                    page.held -= 1;
                 }
             }
         }
+        self.pages.retain(|_, p| p.held > 0);
     }
 
     pub fn clear(&mut self) {
-        self.origins.clear();
+        self.pages.clear();
     }
 
     /// What the index holds, origin by origin, for the memory census
-    /// (`docs/memory_census.md` §5): its slots, the capacity behind them, and
-    /// how many still name a record. The vector never shrinks, so `len` past
-    /// `held` is space kept for records no longer here. O(slots).
+    /// (`docs/memory_census.md` §5): the span from its first record held to
+    /// its last, the slots its pages allocate, and how many name a record.
+    /// `capacity` past `held` is the empty slots of pages still holding one.
+    /// O(slots).
     pub fn gauge(&self) -> Vec<OriginGauge> {
-        let mut out: Vec<OriginGauge> = self
-            .origins
-            .iter()
-            .map(|(&origin, o)| OriginGauge {
+        let mut by_origin: HashMap<u64, (u64, u64, u64, u64)> = HashMap::new();
+        for (&(origin, page_no), page) in &self.pages {
+            let base = page_no << PAGE_BITS;
+            let mut held = page.slots.iter().enumerate().filter(|(_, s)| s.loc != 0);
+            let Some((first, _)) = held.next() else {
+                continue;
+            };
+            let last = held.next_back().map_or(first, |(i, _)| i);
+            let g = by_origin.entry(origin).or_insert((u64::MAX, 0, 0, 0));
+            g.0 = g.0.min(base + first as u64);
+            g.1 = g.1.max(base + last as u64);
+            g.2 += PAGE_SLOTS as u64;
+            g.3 += page.held as u64;
+        }
+        let mut out: Vec<OriginGauge> = by_origin
+            .into_iter()
+            .map(|(origin, (first, last, capacity, held))| OriginGauge {
                 origin,
-                len: o.slots.len() as u64,
-                capacity: o.slots.capacity() as u64,
-                held: o.slots.iter().filter(|s| s.loc != 0).count() as u64,
-                bytes: (o.slots.capacity() * SLOT_BYTES) as u64,
+                len: last - first + 1,
+                capacity,
+                held,
+                bytes: capacity * SLOT_BYTES as u64,
             })
             .collect();
         out.sort_by_key(|g| g.origin);
@@ -185,7 +229,7 @@ pub struct OriginGauge {
     pub origin: u64,
     /// Slots, from the first `oseq` held to the last.
     pub len: u64,
-    /// Slots allocated.
+    /// Slots its pages allocate.
     pub capacity: u64,
     /// Slots naming a record this member holds.
     pub held: u64,
@@ -230,14 +274,15 @@ mod tests {
         assert_eq!(SLOT_BYTES, 48);
     }
 
-    /// **The gauge counts what the index keeps, held or not**: a thousand
-    /// records indexed and their segment dropped leave a thousand slots that
-    /// name nothing — the index never shrinks, and the gauge says so.
+    /// **The gauge counts what the index keeps, held or not**: the gaps
+    /// between records still held are slots that name nothing, and the gauge
+    /// says so.
     #[test]
-    fn the_gauge_counts_slots_kept_for_records_gone() {
+    fn the_gauge_counts_the_gaps_between_records_held() {
         let mut idx = LocationIndex::default();
         for oseq in 1..=1000 {
-            idx.insert(&head(7, oseq), at(1, oseq));
+            let segment = if oseq == 1 || oseq == 1000 { 2 } else { 1 };
+            idx.insert(&head(7, oseq), at(segment, oseq));
         }
         idx.insert(&head(9, 5), at(2, 0));
         let g = idx.gauge();
@@ -249,7 +294,101 @@ mod tests {
 
         idx.forget_segments(&[SegmentId(1)]);
         let g = idx.gauge();
-        assert_eq!((g[0].len, g[0].held), (1000, 0), "kept for records gone");
+        assert_eq!((g[0].len, g[0].held), (1000, 2), "the gap between the two");
+    }
+
+    /// **A gap in the middle costs nothing**: an origin whose middle pages'
+    /// records are all dropped keeps only the pages still holding one —
+    /// exactly what a load of the records left indexes.
+    #[test]
+    fn a_dropped_run_gives_its_pages_back() {
+        let mut idx = LocationIndex::default();
+        let pages = 6 * PAGE_SLOTS as u64;
+        for oseq in 1..pages {
+            let page = oseq >> PAGE_BITS;
+            let segment = if page == 0 || page == 5 { 2 } else { 1 };
+            idx.insert(&head(7, oseq), at(segment, oseq));
+        }
+        assert_eq!(idx.gauge()[0].capacity, pages);
+        idx.forget_segments(&[SegmentId(1)]);
+        let g = idx.gauge();
+        assert_eq!(g[0].capacity, 2 * PAGE_SLOTS as u64, "two pages left");
+        assert_eq!(g[0].held, 2 * PAGE_SLOTS as u64 - 1);
+        assert_eq!((g[0].len, g[0].bytes), (pages - 1, g[0].capacity * 48));
+
+        // The same records indexed into a fresh index — a load — allocate
+        // the same two pages.
+        let mut loaded = LocationIndex::default();
+        for oseq in (1..PAGE_SLOTS as u64).chain(5 * PAGE_SLOTS as u64..pages) {
+            loaded.insert(&head(7, oseq), at(2, oseq));
+        }
+        assert_eq!(loaded.gauge(), g);
+    }
+
+    /// A record relocated in place is counted once, and a page goes only
+    /// when its last record does.
+    #[test]
+    fn a_page_counts_its_records_once() {
+        let mut idx = LocationIndex::default();
+        idx.insert(&head(7, 3), at(1, 0));
+        idx.insert(&head(7, 3), at(2, 0));
+        idx.insert(&head(7, 4), at(1, 1));
+        assert_eq!(idx.gauge()[0].held, 2);
+        idx.forget_segments(&[SegmentId(1)]);
+        assert_eq!(idx.gauge()[0].held, 1);
+        assert_eq!(idx.get(7, 3), Some(at(2, 0)));
+        idx.forget_segments(&[SegmentId(2)]);
+        assert!(idx.gauge().is_empty());
+        assert_eq!(idx.get(7, 3), None);
+    }
+
+    /// **A trim changes no answer**: every record held is found where it
+    /// was, everything else is not held — below, inside and above the run —
+    /// and a record indexed after the trim, at either end, is found too.
+    #[test]
+    fn lookups_answer_the_same_after_a_trim() {
+        let mut idx = LocationIndex::default();
+        for oseq in 1..=100 {
+            let segment = if (40..=60).contains(&oseq) && oseq % 2 == 0 {
+                2
+            } else {
+                1
+            };
+            idx.insert(&head(7, oseq), at(segment, oseq));
+        }
+        idx.forget_segments(&[SegmentId(1)]);
+        for oseq in 1..=100 {
+            let held = (40..=60).contains(&oseq) && oseq % 2 == 0;
+            assert_eq!(idx.get(7, oseq), held.then(|| at(2, oseq)), "oseq {oseq}");
+            assert_eq!(
+                idx.listed(7, oseq),
+                held.then(|| ListedHeader::of(&head(7, oseq))),
+                "oseq {oseq}"
+            );
+        }
+        idx.insert(&head(7, 5), at(3, 0));
+        idx.insert(&head(7, 200), at(3, 1));
+        assert_eq!(idx.get(7, 5), Some(at(3, 0)));
+        assert_eq!(idx.get(7, 200), Some(at(3, 1)));
+        assert_eq!(idx.get(7, 40), Some(at(2, 40)));
+        assert_eq!(idx.get(7, 41), None);
+    }
+
+    /// An origin with nothing left is gone from the index, and comes back
+    /// whole when its records are indexed again.
+    #[test]
+    fn an_origin_with_nothing_held_is_dropped() {
+        let mut idx = LocationIndex::default();
+        for oseq in 1..=10 {
+            idx.insert(&head(7, oseq), at(1, oseq));
+        }
+        idx.insert(&head(9, 1), at(2, 0));
+        idx.forget_segments(&[SegmentId(1)]);
+        let g = idx.gauge();
+        assert_eq!(g.iter().map(|g| g.origin).collect::<Vec<_>>(), vec![9]);
+        idx.insert(&head(7, 3), at(3, 0));
+        assert_eq!(idx.get(7, 3), Some(at(3, 0)));
+        assert_eq!(idx.get(7, 2), None);
     }
 
     #[test]

@@ -36,7 +36,7 @@ record at 0.2–1 KB:
 
 | Structure | Per record | Bounded? |
 |---|---|---|
-| Replica location index (`persistence/replica/location_index.rs`) | 48 B | No: never shrinks; `forget_segments` empties slots and keeps the length |
+| Replica location index (`persistence/replica/location_index.rs`) | 48 B | Was not: one vector per origin kept a slot for every gap (WhiteWorld, 2026-11-22: 65.9 M slots, 3.43 GB, for 22.1 M records). Now pages of 1,024 `oseq`s, each allocated only while it holds a record |
 | Record accounting `live_sizes` (`persistence/accounting.rs`) | ~100 B per chunk key | Reset at compaction |
 | `StreamRuntime.chunks` (`substrate/entries.rs`) | ~56 B + node | Bounded by live chunks |
 | `ResidenceSlab.slots` (`substrate/residence.rs`) | 72–80 B per turn | No: discard flags a slot dead and keeps it |
