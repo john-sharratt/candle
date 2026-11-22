@@ -29,7 +29,7 @@ use crate::working_set::PoolSize;
 /// ~780 pages on BlackWorld (2026-11-18), about 40% of its 2M-token pool, and
 /// nearly every refresh's reads still came off the log. Two KiB a token holds
 /// the pool and the pieces at its edge: 4 GB of the 72 GB card's 189 GB host,
-/// 2 GB on the 24 GB card, 1 GB on the 16 GB one.
+/// 1 GB on the 24 GB card, 512 MB on the 16 GB one.
 const RING_BYTES_PER_POOL_TOKEN: usize = 2 << 10;
 
 /// See the module documentation.
@@ -136,8 +136,8 @@ mod tests {
     fn a_cards_ring_holds_its_pool() {
         let ring = |gib: u64| PoolReadRing::for_pool(PoolSize::for_card(gib << 30)).cap;
         assert_eq!(ring(72), 4_096_000_000);
-        assert_eq!(ring(24), 2_048_000_000);
-        assert_eq!(ring(16), 1_048_576_000);
+        assert_eq!(ring(24), 1_024_000_000);
+        assert_eq!(ring(16), 524_288_000);
     }
 
     /// A page larger than the whole budget is not kept, and keeps nothing out.

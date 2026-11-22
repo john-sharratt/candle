@@ -47,7 +47,7 @@ The findings this answers are in
 |---|---|
 | **Rotation** | Every sequence on rung 1, the trained RoPE. The slot stays inside the trained window unless one exchange's floors alone pass it. |
 | **Pinned ranges** | Declared ranges of the system prompt that every attention query attends, outside the selection budget, in their declared place. |
-| **Pool** | Whole conversations as candidates — the dialogue, its inherited lineage, and every reading provenance proposes — up to 2M / 1M / 512K tokens by card, at least 6 / 4 / 4 of each kind. Index rows only, at the sampled layers; no K/V moves until the fill places a round. |
+| **Pool** | Whole conversations as candidates — the dialogue, its inherited lineage, and every reading provenance proposes — up to 2M / 500K / 256K tokens by card, at least 6 / 4 / 4 of each kind. Index rows only, at the sampled layers; no K/V moves until the fill places a round. |
 | **Rounds** | The carving unit: one whole turn. Every slot of rounds opens each exchange on its request and closes it on its answer. |
 | **Slot** | The pool's best rounds, K/V loaded, at most the trained window (262,144 positions) less one append's reserve, seated at compact positions and selected as one window. |
 | **Hits** | Per round, how often the indexer selected its blocks (loaded) or would have (unloaded, the shadow scan), on a sample of the selecting layers, over every prefilled and decoded query. |
@@ -385,8 +385,11 @@ At each boundary:
      during the opening — a seed, or whatever else the slot held — out-ranked
      by its lifted strength a piece the question named.
    - **Size, per card: the larger of a token budget and a count per kind.**
-     2,000,000 tokens on the 72 GB card, 1,000,000 on the 24 GB card, 512,000
-     on the 16 GB card (`working_set::PoolSize::for_card`), and at least 6
+     2,000,000 tokens on the 72 GB card, 500,000 on the 24 GB card, 256,000
+     on the 16 GB card (`working_set::PoolSize::for_card`) — the smaller
+     cards' pools give their index rows' device memory back to the expert
+     zone, which on the 24 GB card sat on its floor while the QSA index held
+     3.7 GiB — and at least 6
      pieces of each kind on the 72 GB card and 4 on the others — readings,
      folder summaries, guides and journal notes each filled to its count by
      its own strength before the token budget is spent by strength across
@@ -991,7 +994,7 @@ the slot's held turns recorded at each scanned boundary
     (`docs/zend_working_set.md` §4.3, §4.5); whole-file membership charged
     against a budget, the two admits per reprojection, the dislodge margin
     and the `max_file_tokens` refusal go.
-19. **Pool size and kinds (§7.2 step 1).** 2M / 1M / 512K tokens by card, and
+19. **Pool size and kinds (§7.2 step 1).** 2M / 500K / 256K tokens by card, and
     at least 6 / 4 / 4 pieces of each kind; type shares on the pooled
     readings.
 20. **Unthrottled pool admission (§7.2 step 1).** `POOL_ADMITS_PER_BOUNDARY`

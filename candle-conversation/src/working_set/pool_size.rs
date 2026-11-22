@@ -15,8 +15,16 @@ pub struct PoolSize {
 
 impl PoolSize {
     /// The pool a card of `total_bytes` of device memory holds: 2M tokens and
-    /// 6 of each kind on the 72 GB card, 1M and 4 on the 24 GB card, 512K and
+    /// 6 of each kind on the 72 GB card, 500K and 4 on the 24 GB card, 256K and
     /// 4 on the 16 GB card.
+    ///
+    /// **The smaller cards' pools are a quarter and an eighth of the 72 GB
+    /// card's, not a half and a quarter.** A pooled piece's index rows stand in
+    /// device memory beside the expert zone, and on the 24 GB card the QSA
+    /// index tenant held 3.7 GiB while the zone sat on its 1,537-slot floor —
+    /// under 7% of the experts resident, 1,000–2,000 cold reads a wave
+    /// (WhiteWorld, 2026-11-22). Every MiB the pool gives back is about a third
+    /// of an expert slot.
     pub fn for_card(total_bytes: u64) -> Self {
         const GIB: u64 = 1 << 30;
         match total_bytes {
@@ -25,11 +33,11 @@ impl PoolSize {
                 per_kind: 6,
             },
             b if b >= 20 * GIB => Self {
-                tokens: 1_000_000,
+                tokens: 500_000,
                 per_kind: 4,
             },
             _ => Self {
-                tokens: 512_000,
+                tokens: 256_000,
                 per_kind: 4,
             },
         }
@@ -59,14 +67,14 @@ mod tests {
         assert_eq!(
             PoolSize::for_card(24_576 << 20),
             PoolSize {
-                tokens: 1_000_000,
+                tokens: 500_000,
                 per_kind: 4
             }
         );
         assert_eq!(
             PoolSize::for_card(16_376 << 20),
             PoolSize {
-                tokens: 512_000,
+                tokens: 256_000,
                 per_kind: 4
             }
         );
