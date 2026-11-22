@@ -106,16 +106,22 @@ impl Qwen4ExpBatched {
         let cfg = &self.model.cfg;
         let want = cfg.kv_layers().total();
         let ratios = self.attention_ratios();
-        // Resolved before the lock is taken: a placement is a launch.
+        // Resolved before the lock is taken, every page piece in one launch.
+        let paged: Vec<(&[u8], PieceKey)> = pieces
+            .iter()
+            .filter_map(|p| match p {
+                PositionalPiece::Page { bytes, key } => Some((&bytes[..], *key)),
+                PositionalPiece::Gap(_) => None,
+            })
+            .collect();
+        let mut placed = self.resident_pages_of(&paged, |_| true)?.into_iter();
         let resolved: Vec<Option<Vec<Option<Arc<ResidentPage>>>>> = pieces
             .iter()
             .map(|p| match p {
-                PositionalPiece::Page { bytes, key } => {
-                    self.resident_pages(bytes, key, |_| true).map(Some)
-                }
-                PositionalPiece::Gap(_) => Ok(None),
+                PositionalPiece::Page { .. } => placed.next(),
+                PositionalPiece::Gap(_) => None,
             })
-            .collect::<Result<_>>()?;
+            .collect();
         let mut taken: Vec<Arc<ResidentPage>> = Vec::new();
         {
             let mut map = self
@@ -476,12 +482,7 @@ impl Qwen4ExpBatched {
         Ok(blobs)
     }
 
-    /// The resident pages of a piece at the KV layers `wanted` names, one per
-    /// KV layer (`None` where the layer indexes nothing or is not wanted): the
-    /// ones already standing when any slot or pool still holds them, the rest
-    /// decoded and placed now — every missing layer in one launch, into slots
-    /// of the index tenant. A piece pooled at its sampled layers and then
-    /// placed in a slot shares the sampled layers' rows and places the others.
+    /// [`Self::resident_pages_of`] for one piece.
     #[cfg(feature = "cuda")]
     pub(super) fn resident_pages(
         &self,
@@ -489,59 +490,93 @@ impl Qwen4ExpBatched {
         key: &PieceKey,
         wanted: impl Fn(usize) -> bool,
     ) -> Result<Vec<Option<Arc<ResidentPage>>>> {
+        let mut out = self.resident_pages_of(&[(blob, *key)], wanted)?;
+        Ok(out.pop().expect("one piece asked, one answered"))
+    }
+
+    /// The resident pages of each `(blob, key)` piece at the KV layers `wanted`
+    /// names, one per KV layer (`None` where the layer indexes nothing or is
+    /// not wanted): the ones already standing when any slot or pool still
+    /// holds them, the rest decoded and placed now — every missing layer of
+    /// every piece in one launch, into slots of the index tenant. A piece named
+    /// twice is placed once. A piece pooled at its sampled layers and then
+    /// placed in a slot shares the sampled layers' rows and places the others.
+    #[cfg(feature = "cuda")]
+    pub(super) fn resident_pages_of(
+        &self,
+        pieces: &[(&[u8], PieceKey)],
+        wanted: impl Fn(usize) -> bool,
+    ) -> Result<Vec<Vec<Option<Arc<ResidentPage>>>>> {
         let cfg = &self.model.cfg;
         let want = cfg.kv_layers().total();
         let ratios = self.attention_ratios();
-        let mut layers: Vec<Option<Arc<ResidentPage>>> = vec![None; want];
-        let mut missing: Vec<usize> = Vec::new();
-        for (kv, &r) in ratios.iter().enumerate() {
-            if r == 0 || !wanted(kv) {
-                continue;
-            }
-            match self.pages.layer(key, kv) {
-                Some(p) => layers[kv] = Some(p),
-                None => missing.push(kv),
+        let mut out: Vec<Vec<Option<Arc<ResidentPage>>>> = vec![vec![None; want]; pieces.len()];
+        // `(piece, layer)` to place, each `(key, layer)` once; and the
+        // `(piece, layer, job)` that a repeat of a key takes from that job.
+        let mut jobs: Vec<(usize, usize)> = Vec::new();
+        let mut repeats: Vec<(usize, usize, usize)> = Vec::new();
+        let mut first: HashMap<(PieceKey, usize), usize> = HashMap::new();
+        for (p, (_, key)) in pieces.iter().enumerate() {
+            for (kv, &r) in ratios.iter().enumerate() {
+                if r == 0 || !wanted(kv) {
+                    continue;
+                }
+                if let Some(page) = self.pages.layer(key, kv) {
+                    out[p][kv] = Some(page);
+                } else if let Some(&j) = first.get(&(*key, kv)) {
+                    repeats.push((p, kv, j));
+                } else {
+                    first.insert((*key, kv), jobs.len());
+                    jobs.push((p, kv));
+                }
             }
         }
-        if missing.is_empty() {
-            return Ok(layers);
+        if jobs.is_empty() {
+            return Ok(out);
         }
         let _place = span("qsa:page:decode_place");
         // Only the layers to place are decoded: a container holds every layer,
         // and the pool places the sampled few.
-        let (_, sections) = paged_index::aux_parts(blob)?;
-        if sections.len() != want {
-            candle::bail!(
-                "qwen4exp: an injected piece carries {} index pages but this checkpoint has \
-                 {want} KV layers — the layers it does not cover would select against an \
-                 empty candidate set",
-                sections.len()
-            );
+        let mut sections: HashMap<usize, Vec<&[u8]>> = HashMap::new();
+        for &(p, _) in &jobs {
+            if sections.contains_key(&p) {
+                continue;
+            }
+            let (_, layers) = paged_index::aux_parts(pieces[p].0)?;
+            if layers.len() != want {
+                candle::bail!(
+                    "qwen4exp: an injected piece carries {} index pages but this checkpoint \
+                     has {want} KV layers — the layers it does not cover would select against \
+                     an empty candidate set",
+                    layers.len()
+                );
+            }
+            sections.insert(p, layers);
         }
-        // Placed from the page's own bytes, read in place. They may be the
+        // Placed from the pages' own bytes, read in place. They may be the
         // index page cache's pinned memory, which the copies read
-        // asynchronously, so the stream is waited for before `blob` is let go:
-        // the caller's borrow then covers every copy out of it.
-        let planes: Vec<(KeyPlanes<'_>, usize)> = missing
+        // asynchronously, so the stream is waited for — once, for every copy —
+        // before the pieces are let go: the caller's borrow then covers them.
+        let planes: Vec<(KeyPlanes<'_>, usize)> = jobs
             .iter()
-            .map(|&kv| paged_index::page_planes(sections[kv]))
+            .map(|&(p, kv)| paged_index::page_planes(sections[&p][kv]))
             .collect::<Result<_>>()?;
-        let placed: Vec<(usize, Arc<ResidentPage>)> = missing
-            .iter()
-            .copied()
-            .zip(ResidentPage::place_planes(
-                &planes,
-                cfg.indexer.head_dim,
-                &self.model.device,
-            )?)
-            .collect();
+        let placed = ResidentPage::place_planes(&planes, cfg.indexer.head_dim, &self.model.device)?;
         self.model.device.synchronize()?;
-        for (kv, page) in &placed {
-            page.placed_from(*key);
-            layers[*kv] = Some(Arc::clone(page));
+        let mut by_piece: HashMap<usize, Vec<(usize, Arc<ResidentPage>)>> = HashMap::new();
+        for (&(p, kv), page) in jobs.iter().zip(placed) {
+            page.placed_from(pieces[p].1);
+            out[p][kv] = Some(Arc::clone(&page));
+            by_piece.entry(p).or_default().push((kv, page));
         }
-        self.pages.insert(*key, want, &placed);
-        Ok(layers)
+        for (p, placed) in &by_piece {
+            self.pages.insert(pieces[*p].1, want, placed);
+        }
+        for (p, kv, j) in repeats {
+            let (from, _) = jobs[j];
+            out[p][kv] = out[from][kv].clone();
+        }
+        Ok(out)
     }
 
     /// Device bytes pushing `blob` would newly place: each attention layer's
@@ -578,21 +613,20 @@ impl Qwen4ExpBatched {
         Ok(bytes)
     }
 
-    /// Hold `blob`'s pages at the sampled layers in `seq`'s pool — a piece the
-    /// pool admits with no K/V in the slot (`docs/hit_driven_projection.md`
-    /// §7.2). Placed once per card and shared: a piece another sequence pools
-    /// or places is not placed again. Returns the bytes newly placed.
+    /// Hold each `(blob, key)`'s pages at the sampled layers in `seq`'s pool —
+    /// pieces the pool admits with no K/V in the slot
+    /// (`docs/hit_driven_projection.md` §7.2) — every missing page of all of
+    /// them placed in one launch. Placed once per card and shared: a piece
+    /// another sequence pools or places is not placed again.
     #[cfg(feature = "cuda")]
-    pub fn pool_positional_state(&self, seq: usize, blob: &[u8], key: &PieceKey) -> Result<usize> {
+    pub fn pool_positional_states(&self, seq: usize, pages: &[(&[u8], PieceKey)]) -> Result<()> {
         let sampled = self.hit_kv.clone();
-        let before = self.positional_lift_bytes_at(blob, key, |kv| sampled.contains(&kv))?;
-        let layers: Vec<Arc<ResidentPage>> = self
-            .resident_pages(blob, key, |kv| sampled.contains(&kv))?
-            .into_iter()
-            .flatten()
-            .collect();
-        self.pooled.hold(seq, *key, layers)?;
-        Ok(before)
+        let placed = self.resident_pages_of(pages, |kv| sampled.contains(&kv))?;
+        for ((_, key), layers) in pages.iter().zip(placed) {
+            self.pooled
+                .hold(seq, *key, layers.into_iter().flatten().collect())?;
+        }
+        Ok(())
     }
 
     /// Let go of `seq`'s pooled pieces not in `keep`: the pool dropped them,

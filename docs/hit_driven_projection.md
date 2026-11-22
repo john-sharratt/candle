@@ -672,6 +672,11 @@ one eviction rule.
   copies before it returns: the caller's borrow of the bytes covers the
   copy, and an entry is evicted only when nothing holds it. No block is ever
   re-tenanted while a copy reads it, and nothing else has to know.
+- **A refresh places its pages together** (`pool_positional_states`): the
+  pool reads every page its walks need, holds them, and hands them over in
+  one call, which places every missing layer of every page in one launch and
+  waits for the copies once. Placing page by page cost one launch and one
+  wait each, 8–35 ms of a steady boundary and ~240 ms of a first one.
 - **The cache's state is reported** in the memory report's host section:
   the slab's pinned and pageable bytes, bytes in use, entries, and hits and
   misses since start.

@@ -529,8 +529,8 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Ok(true)
     }
 
-    fn pool_positional_state(&self, seq: usize, blob: &[u8], key: &PieceKey) -> Result<usize> {
-        Qwen4ExpBatched::pool_positional_state(self, seq, blob, key)
+    fn pool_positional_states(&self, seq: usize, pages: &[(&[u8], PieceKey)]) -> Result<()> {
+        Qwen4ExpBatched::pool_positional_states(self, seq, pages)
     }
 
     fn retain_pooled(&self, seq: usize, keep: &[PieceKey]) -> Result<()> {

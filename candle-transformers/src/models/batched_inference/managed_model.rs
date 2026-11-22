@@ -1057,12 +1057,14 @@ pub trait ManagedBatchedModel {
         Ok(false)
     }
 
-    /// Hold `page`'s rows at the sampled layers in `seq`'s pool: a piece its
-    /// projection pools with no K/V in the slot, whose rows the shadow scan
-    /// reads (`docs/hit_driven_projection.md` §7.2). Returns the device bytes
-    /// newly placed; a model that selects nothing holds none.
-    fn pool_positional_state(&self, _seq: usize, _page: &[u8], _key: &PieceKey) -> Result<usize> {
-        Ok(0)
+    /// Hold each `(page, key)`'s rows at the sampled layers in `seq`'s pool:
+    /// pieces its projection pools with no K/V in the slot, whose rows the
+    /// shadow scan reads (`docs/hit_driven_projection.md` §7.2). All of a
+    /// refresh's pages at once, so a model places them in one launch and waits
+    /// for its copies once; the pages are borrowed until it returns. A model
+    /// that selects nothing holds none.
+    fn pool_positional_states(&self, _seq: usize, _pages: &[(&[u8], PieceKey)]) -> Result<()> {
+        Ok(())
     }
 
     /// The pieces `seq`'s pool holds now — what a refresh may keep without

@@ -10,12 +10,13 @@
 //! for a pooled piece: its rounds' K/V comes up only when the fill places one.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 use candle_transformers::models::piece_key::PieceKey;
 
 use crate::index_page_cache;
-use crate::index_pages;
+use crate::index_pages::{self, StoredPages};
 use crate::projection::{Conversation, TimelineId, TurnIndex, WorkingSetShare};
 use crate::sequence_handle::SequenceId;
 
@@ -49,7 +50,8 @@ pub(super) struct PoolRefresh {
     /// Of `read_us`, fetching the turns' index pages — from memory when held,
     /// off the log when cold.
     pub fetch_us: u64,
-    /// Of `read_us`, placing the sampled layers' pages on the device.
+    /// Of `read_us`, placing the sampled layers' pages on the device — every
+    /// page the refresh read, in one call.
     pub place_us: u64,
     /// Of `walked`, the turns whose pages came off the log: in neither the
     /// substrate nor the index page cache.
@@ -58,6 +60,42 @@ pub(super) struct PoolRefresh {
     pub revived: usize,
     /// Pieces lingering after it (`pool_linger`).
     pub lingering: usize,
+}
+
+/// One pooled conversation's walk in a refresh: the pages of the turns it
+/// reads, held until the refresh has placed them all, and the layout it
+/// extends.
+struct PoolWalk {
+    tl: TimelineId,
+    turns: u32,
+    /// The layout kept from the last refresh when the walk resumes there;
+    /// empty when it walks the conversation whole.
+    prior_layout: HashMap<TurnIndex, Vec<(usize, PieceKey)>>,
+    pages: Vec<(TurnIndex, Arc<StoredPages>)>,
+    /// False once a page could not be read, decoded or held: the
+    /// conversation is left out of this pool.
+    whole: bool,
+}
+
+impl PoolWalk {
+    fn new(
+        tl: TimelineId,
+        turns: u32,
+        from: u32,
+        prior_layout: HashMap<TurnIndex, Vec<(usize, PieceKey)>>,
+    ) -> Self {
+        Self {
+            tl,
+            turns,
+            prior_layout: if from > 0 {
+                prior_layout
+            } else {
+                HashMap::new()
+            },
+            pages: Vec::new(),
+            whole: true,
+        }
+    }
 }
 
 /// The turns of a pooled conversation a refresh reads: from `walked`, the
@@ -172,66 +210,98 @@ impl Scheduler {
         let t_fetch = Instant::now();
         let mut pages_of = fetch_pages(conversation, &wanted);
         stats.fetch_us = t_fetch.elapsed().as_micros() as u64;
-        for (tl, turns, from, prior_layout) in plans {
-            let mut keys = Vec::new();
-            let mut layout: HashMap<TurnIndex, Vec<(usize, PieceKey)>> = HashMap::new();
-            if from > 0 {
-                keys.extend(prior_layout.values().flatten().map(|(_, key)| *key));
-                layout = prior_layout;
-                stats.reused += 1;
-            }
-            let mut whole = true;
-            for i in from..turns {
-                stats.walked += 1;
-                let fetched = pages_of
-                    .remove(&(tl, TurnIndex(i)))
-                    .expect("every walked turn was fetched");
-                let (fetched, from_log) = fetched;
-                let pages = match fetched {
-                    Ok(Some(p)) => p,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        tracing::warn!(timeline = tl.raw(), turn = i, error = %e,
-                            "pool: a turn's index page could not be read; the conversation is \
-                             left out of this pool");
-                        whole = false;
-                        break;
-                    }
-                };
-                stats.read_bytes += pages.bytes().len();
-                if from_log {
-                    stats.cold += 1;
+        // Walk: each conversation's new turns, their pages held until every
+        // one of them is placed.
+        let walks: Vec<PoolWalk> = plans
+            .into_iter()
+            .map(|(tl, turns, from, prior_layout)| {
+                let mut walk = PoolWalk::new(tl, turns, from, prior_layout);
+                if from > 0 {
+                    stats.reused += 1;
                 }
-                let Ok(framed) = index_pages::decode(pages.bytes()) else {
-                    whole = false;
-                    break;
-                };
-                for ((width, bytes), key) in framed.iter().zip(pages.page_keys()) {
-                    let t_place = Instant::now();
-                    let placed = self.model.pool_positional_state(slot.0, bytes, key);
-                    stats.place_us += t_place.elapsed().as_micros() as u64;
-                    match placed {
-                        Ok(_) => {
-                            keys.push(*key);
-                            layout.entry(TurnIndex(i)).or_default().push((*width, *key));
-                        }
+                for i in from..turns {
+                    stats.walked += 1;
+                    let (fetched, from_log) = pages_of
+                        .remove(&(tl, TurnIndex(i)))
+                        .expect("every walked turn was fetched");
+                    let pages = match fetched {
+                        Ok(Some(p)) => p,
+                        Ok(None) => continue,
                         Err(e) => {
-                            tracing::warn!(timeline = tl.raw(), error = %e,
-                                "pool: a page could not be held; the conversation is left out");
-                            whole = false;
+                            tracing::warn!(timeline = tl.raw(), turn = i, error = %e,
+                                "pool: a turn's index page could not be read; the conversation \
+                                 is left out of this pool");
+                            walk.whole = false;
                             break;
                         }
+                    };
+                    stats.read_bytes += pages.bytes().len();
+                    if from_log {
+                        stats.cold += 1;
                     }
+                    walk.pages.push((TurnIndex(i), pages));
                 }
-                if !whole {
+                walk
+            })
+            .collect();
+        // Place: every page of every walk in one call, so the model places them
+        // in one launch and waits for its copies once.
+        let mut walks = walks;
+        let mut entries: Vec<Vec<(TurnIndex, usize, PieceKey)>> = vec![Vec::new(); walks.len()];
+        let mut items: Vec<(&[u8], PieceKey)> = Vec::new();
+        let mut placing: Vec<usize> = Vec::new();
+        for (w, walk) in walks.iter_mut().enumerate() {
+            if !walk.whole {
+                continue;
+            }
+            let mut walk_items = Vec::new();
+            for (i, pages) in &walk.pages {
+                let Ok(framed) = index_pages::decode(pages.bytes()) else {
+                    walk.whole = false;
                     break;
+                };
+                for ((width, bytes), key) in framed.into_iter().zip(pages.page_keys()) {
+                    entries[w].push((*i, width, *key));
+                    walk_items.push((bytes, *key));
                 }
             }
-            if whole {
-                keep.extend(keys);
-                kept.insert(tl, layout);
-                kept_walked.insert(tl, turns);
+            if walk.whole && !walk_items.is_empty() {
+                items.extend(walk_items);
+                placing.push(w);
             }
+        }
+        let mut refused = false;
+        if !items.is_empty() {
+            let t_place = Instant::now();
+            let placed = self.model.pool_positional_states(slot.0, &items);
+            stats.place_us = t_place.elapsed().as_micros() as u64;
+            if let Err(e) = placed {
+                tracing::warn!(slot = slot.0, conversations = placing.len(), error = %e,
+                    "pool: the refresh's pages could not be held; the conversations they \
+                     belong to are left out of this pool");
+                refused = true;
+            }
+        }
+        drop(items);
+        if refused {
+            for &w in &placing {
+                walks[w].whole = false;
+            }
+        }
+        // Build: each whole walk's layout, its prior one extended by what it
+        // placed.
+        for (walk, entries) in walks.into_iter().zip(entries) {
+            if !walk.whole {
+                continue;
+            }
+            let mut layout = walk.prior_layout;
+            keep.extend(layout.values().flatten().map(|(_, key)| *key));
+            for (i, width, key) in entries {
+                keep.push(key);
+                layout.entry(i).or_default().push((width, key));
+            }
+            kept.insert(walk.tl, layout);
+            kept_walked.insert(walk.tl, walk.turns);
         }
         stats.read_us = t_read.elapsed().as_micros() as u64;
         reading.end();
