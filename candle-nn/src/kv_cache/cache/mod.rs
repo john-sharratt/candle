@@ -631,6 +631,24 @@ impl Cache {
         Ok(())
     }
 
+    /// Take back a failed forward's writes to this layer: its chunked storage cut
+    /// back to `offset` as [`Self::truncate_chunked_to_tokens`] cuts it, by
+    /// [`ChunkedKvBacking::rollback_sequence_to_tokens`].
+    pub(crate) fn rollback_chunked_to_tokens(&mut self, offset: usize) -> Result<()> {
+        match &mut self.storage {
+            CacheStorage::Chunked(c) => {
+                c.backing.rollback_sequence_to_tokens(c.batch_idx, offset)?;
+            }
+            CacheStorage::Contiguous { all_data } => {
+                if offset == 0 {
+                    *all_data = None;
+                }
+            }
+        }
+        self.current_seq_len = offset;
+        Ok(())
+    }
+
     /// Fork this cache, creating a new cache that shares data via copy-on-write.
     ///
     /// For chunked (paged) caches: complete blocks are shared via COW, partial

@@ -394,4 +394,32 @@ impl ChunkedKvBacking {
         }
         Ok(())
     }
+
+    /// Take back a failed forward's writes: [`Self::truncate_sequence_to_tokens`]
+    /// to `target_tokens`, the length the sequence stood at before it, and the
+    /// cached decode slot buffer's writer chunk marked for re-serialisation
+    /// from the host state.
+    ///
+    /// **The cut alone leaves the device ahead.** The decode kernel commits its
+    /// token's length on the device and the host counts it only after the step,
+    /// so a forward that failed after its decode attention ran — a cold expert
+    /// given up later in the sweep — leaves a host already at `target_tokens`
+    /// and a device one token past it. The cut finds nothing to trim, and on
+    /// WhiteWorld (2026-11-22) the retry reused the buffer and attended the
+    /// failed attempt's token, NaN at every layer after the given-up expert.
+    pub fn rollback_sequence_to_tokens(
+        &self,
+        batch_idx: usize,
+        target_tokens: usize,
+    ) -> Result<()> {
+        self.truncate_sequence_to_tokens(batch_idx, target_tokens)?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        if let Some(slot) = state.sequences.get_mut(batch_idx).and_then(|s| s.as_mut()) {
+            slot.mark_decode_rolled_back();
+        }
+        Ok(())
+    }
 }

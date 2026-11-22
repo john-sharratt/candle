@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use candle::cuda_backend::cudarc::driver::result::memcpy_dtod_async;
+use candle::cuda_backend::cudarc::driver::result::{memcpy_dtod_async, memcpy_htod_async};
 use candle::cuda_backend::cudarc::driver::{CudaSlice, DevicePtr};
 use candle::{DType, Device, Tensor};
 
@@ -206,6 +206,53 @@ fn a_commit_leaves_the_buffer_to_the_next_sync() {
     assert_eq!(live_slot(&backing, seq, 12), (ptr, n_slices));
     assert_eq!(read_lens(&dev, ptr, n_slices), vec![12]);
     drop(kv);
+}
+
+/// Set slice `slice`'s `len` in the live slot buffer at `ptr` on the device —
+/// what the decode kernel's own write-length commit does for its token.
+fn commit_on_device(dev: &Device, ptr: u64, slice: usize, len: u16) {
+    let Device::Cuda(cuda) = dev else {
+        unreachable!("a CUDA test");
+    };
+    let stream = cuda.cuda_stream();
+    let at = ptr + (slice * SLICE_BYTES + 2) as u64;
+    // SAFETY: `at` is the two-byte `len` field of a live slot buffer's slice
+    // header, and the host bytes outlive the copy (synchronised below).
+    unsafe {
+        memcpy_htod_async(at, &len.to_le_bytes(), stream.cu_stream()).unwrap();
+    }
+    dev.synchronize().unwrap();
+}
+
+/// **A rolled-back decode leaves the device's writer length where the host
+/// stands.** The decode kernel commits its token's length on the device, and
+/// the host counts the token only once the step has run. A forward that failed
+/// after its decode attention ran — a cold expert given up later in the sweep —
+/// has the device one token ahead of a host that never moved, so the rollback's
+/// cut to the host's own length found nothing to trim and marked nothing. The
+/// retry reused the buffer, attended the failed attempt's token past the host's
+/// length, and on WhiteWorld that token was NaN at every layer after the
+/// given-up expert (2026-11-22, layers 19 and 7).
+#[test]
+fn a_rolled_back_decode_brings_the_device_length_back_to_the_host() {
+    let _gpu = gpu_serial();
+    let dev = Device::new_cuda(0).unwrap();
+    let (backing, mut cache, seq) = setup(&dev);
+
+    write_outside_decode(&mut cache, &dev, 0, 8);
+    let (ptr, n_slices) = live_slot(&backing, seq, 8);
+    assert_eq!(read_lens(&dev, ptr, n_slices), vec![8]);
+
+    // The failed forward's decode kernel committed its token on the device.
+    commit_on_device(&dev, ptr, 0, 9);
+    assert_eq!(read_lens(&dev, ptr, n_slices), vec![9]);
+
+    cache.rollback_to_offset(8).unwrap();
+    assert_eq!(
+        device_lens(&dev, &backing, seq, 8),
+        vec![8],
+        "the retry must read the host's length, not the failed attempt's"
+    );
 }
 
 /// A slot-state buffer whose last upload went through pinned staging fences that

@@ -581,6 +581,16 @@ impl KvCache {
         k.and(v)
     }
 
+    /// Take back a failed forward's writes: K and V back to the `offset` the
+    /// sequence stood at before it, as [`Self::truncate_to_offset`] cuts them,
+    /// and the device's decode slot buffer brought back with them — see
+    /// `ChunkedKvBacking::rollback_sequence_to_tokens`.
+    pub fn rollback_to_offset(&mut self, offset: usize) -> Result<()> {
+        let k = self.k.rollback_chunked_to_tokens(offset);
+        let v = self.v.rollback_chunked_to_tokens(offset);
+        k.and(v)
+    }
+
     /// Fork this KV cache, creating a new cache that shares data via copy-on-write.
     ///
     /// For chunked (paged) caches: complete blocks are shared via COW, partial

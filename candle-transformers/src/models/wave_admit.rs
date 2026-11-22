@@ -153,7 +153,9 @@ pub(crate) fn admit_wave_kv(
 ///
 /// Covers every row including decode — admit skips decode because decode's
 /// claims were made by the caller, but the *advance* happens for decode rows
-/// too, so the rollback cannot.
+/// too, so the rollback cannot. A decode row's attention has already committed
+/// its token's length on the device, so the cut is a rollback
+/// (`KvCache::rollback_to_offset`), which brings the device back with the host.
 /// **Every layer is attempted, even after one fails.** Returning at the first
 /// error — which this did — leaves the rollback itself holding the shape it
 /// exists to erase: layers `0..k` truncated against `k..n` still advanced, from
@@ -170,7 +172,7 @@ pub(crate) fn rollback_wave_kv(
     for c in contexts.iter_mut() {
         let offset = c.offset;
         for layer_idx in layer_start..layer_end {
-            if let Err(e) = c.kv_caches.caches[layer_idx].truncate_to_offset(offset) {
+            if let Err(e) = c.kv_caches.caches[layer_idx].rollback_to_offset(offset) {
                 tracing::warn!(
                     layer = layer_idx,
                     offset,
@@ -202,7 +204,7 @@ pub(crate) fn rollback_step_kv(
     let mut first_err: Option<candle::Error> = None;
     for (_, offset, caches) in session.caches_for_sequences_mut(seqs) {
         for layer_idx in layer_start..layer_end.min(caches.caches.len()) {
-            if let Err(e) = caches.caches[layer_idx].truncate_to_offset(offset) {
+            if let Err(e) = caches.caches[layer_idx].rollback_to_offset(offset) {
                 tracing::warn!(
                     layer = layer_idx,
                     offset,

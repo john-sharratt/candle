@@ -74,6 +74,24 @@ impl SequenceState {
         }
     }
 
+    /// A rollback: the forward taken back may have committed lengths on the
+    /// device that the host never recorded, so the decode writer chunk is
+    /// re-serialised from the host state by the next sync.
+    ///
+    /// The decode kernel advances its write chunk's length on the device as it
+    /// writes, and the host counts the token only once the step has run. A
+    /// forward that fails after its decode attention ran therefore leaves the
+    /// device a token ahead of a host that never moved, and a cut to the host's
+    /// own length has nothing to trim — so it marks nothing, and the next decode
+    /// reused the buffer and attended the failed attempt's token. Only the
+    /// writer chunk can be ahead: one decoded token lands in it.
+    pub(crate) fn mark_decode_rolled_back(&mut self) {
+        if !self.chunks.is_empty() {
+            self.note_fill_from(self.decode_write_chunk_idx());
+        }
+        self.mark_decode_writer_stale();
+    }
+
     /// Record that a host-side length commit changed chunk `idx` first — the
     /// earliest of every such commit since the last sync is kept.
     pub(crate) fn note_fill_from(&mut self, idx: usize) {

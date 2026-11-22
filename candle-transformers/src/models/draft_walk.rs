@@ -242,7 +242,7 @@ pub fn draft_walk(
     for (i, &seq) in seqs.iter().enumerate() {
         if let Some(caches) = session.sequence_caches_mut(seq) {
             if let Some(c) = caches.caches.get_mut(kv_layer) {
-                let r = c.truncate_to_offset(base[i]);
+                let r = c.rollback_to_offset(base[i]);
                 if rolled_back.is_ok() {
                     rolled_back = r;
                 }

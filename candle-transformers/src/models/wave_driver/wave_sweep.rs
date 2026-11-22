@@ -134,7 +134,7 @@ pub trait WaveSweep {
                 for c in contexts[..=i].iter_mut() {
                     let off = c.offset;
                     for (li, cache) in c.kv_caches.caches.iter_mut().enumerate() {
-                        if let Err(te) = cache.truncate_to_offset(off) {
+                        if let Err(te) = cache.rollback_to_offset(off) {
                             tracing::warn!(
                                 layer = li,
                                 offset = off,
