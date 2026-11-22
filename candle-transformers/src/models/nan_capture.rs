@@ -63,7 +63,7 @@ use candle::{cuda_backend::CudaDevice, LiveTensor, Result, Shape};
 
 use super::expert_lre::slot_integrity::{check_watch, watching};
 use cudarc::driver::{CudaSlice, DevicePtr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Once;
 
 /// Where the dump goes.
@@ -231,11 +231,17 @@ static ARMED_SITE: AtomicUsize = AtomicUsize::new(0);
 /// The drain reports bad sites first-bad-first by the kernel's own ticket, so
 /// the first one it hands us is the earliest site that went non-finite in that
 /// wave. That is the site worth paying a fence for on the next wave.
+///
+/// **Each report re-arms at its own first bad site.** Armed once and for good,
+/// the capture on WhiteWorld held the first site that ever went bad
+/// (`moe.up_out.L31`, which did not go bad again) while the gate output of
+/// layers 43 and 47 went non-finite in nearly every wave after it, and nothing
+/// was ever dumped. The site that keeps failing is the one worth the fence.
 fn arm_from_drain() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         candle::tensor_assert::on_bad(|f: &Finding| {
-            if ARMED_SITE.load(Ordering::Relaxed) != 0 {
+            if !first_of_report(f.seq, &LAST_TICKET) {
                 return;
             }
             // Recover the interned `&'static str` for this name so the armed
@@ -243,19 +249,32 @@ fn arm_from_drain() {
             let Some(s) = candle::tensor_assert::interned(&f.name) else {
                 return;
             };
-            if ARMED_SITE
-                .compare_exchange(0, s.as_ptr() as usize, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
+            let site = s.as_ptr() as usize;
+            if ARMED_SITE.swap(site, Ordering::SeqCst) != site {
                 tracing::error!(
                     target: "candle_transformers::nan_capture",
                     site = %f.name, nan = f.nan, inf = f.inf,
-                    "capture ARMED at the first bad site — the next wave reaching it pays one \
-                     fence and dumps its operands"
+                    "capture ARMED at this report's first bad site — the next wave reaching it \
+                     pays one fence and dumps its operands"
                 );
             }
         });
     });
+}
+
+/// The last bad finding's kernel ticket plus one; zero before any.
+static LAST_TICKET: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the bad finding with kernel ticket `ticket` opens a report. A
+/// report hands its bad sites over first bad first — tickets rising, the
+/// unticketed after them — and the slots' tickets restart each epoch, so a
+/// ticket no higher than the last one handed over is the next report's first.
+fn first_of_report(ticket: Option<u32>, last: &AtomicU64) -> bool {
+    let Some(t) = ticket.map(|s| u64::from(s) + 1) else {
+        return last.load(Ordering::Relaxed) == 0;
+    };
+    let prev = last.swap(t, Ordering::Relaxed);
+    prev == 0 || t <= prev
 }
 
 /// Whether `name` is the site a drain has named. One relaxed load and a compare.
@@ -486,28 +505,39 @@ pub struct GemmCall<'a> {
     pub out: &'a LiveTensor<'a>,
 }
 
-/// Check this call's output and, if it is non-finite, dump the call and panic.
+/// Dump this call and panic, once a drain has named the same row's routed
+/// output (`moe.routed_out.L<row>`) as the first bad site.
 ///
-/// Returns normally — having done nothing beyond one launch and one fence —
-/// whenever the output is finite, which is every call in a healthy run.
+/// **The gate GEMM's own output is never asserted.** It is `[total_batch,
+/// nrows]` with its padding rows unwritten (`grouped_qmatmul_dev_q8a128`), and
+/// the padding sits between the experts' tiles, so a whole-buffer assert reads
+/// whatever the arena held before: on WhiteWorld it named the gate output of
+/// rows 43 and 47 in nearly every wave — values near ±2.5e38 and scattered
+/// NaNs — while the logits stayed finite. The routed output is the dense
+/// scatter of the written rows alone, so a NaN there is a real one, and this
+/// row's next gate call is where its operands are dumped.
 pub fn capture_gate_gemm(call: &GemmCall<'_>, dev: &CudaDevice) -> Result<()> {
     arm_from_drain();
-    let site = candle::tensor_assert::site("moe.capture.gate_out.L", call.layer);
-    // Asynchronous by default so the GEMM keeps its throughput; the fence and
-    // the 400 MB dump are paid only once a drain has named this site. See
-    // [`checkpoint`].
-    call.out.assert(site);
-    if !armed_for(site) {
+    if !armed_for(candle::tensor_assert::site("moe.routed_out.L", call.layer)) {
         return Ok(());
     }
+    let site = candle::tensor_assert::site("moe.capture.gate_out.L", call.layer);
     let mut found: Option<Finding> = None;
     // The callback fires the instant the kernel's verdict is read, and the
     // operands are still live in this scope — which is what makes the dump
-    // below describe *this* call rather than some later one.
+    // below describe *this* call rather than some later one. The verdict
+    // covers the padding too; the replay reads the tile tables to tell them
+    // apart.
     check_now(call.out, site, |f| found = Some(f.clone()));
-    let Some(f) = found else {
-        return Ok(());
-    };
+    let f = found.unwrap_or(Finding {
+        name: site.to_string(),
+        seq: None,
+        nan: 0,
+        inf: 0,
+        min: None,
+        max: None,
+        elems: 0,
+    });
     dump(call, &f, dev)
 }
 
@@ -591,4 +621,36 @@ fn dump(call: &GemmCall<'_>, f: &Finding, dev: &CudaDevice) -> Result<()> {
         f.min,
         f.max,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Each report's first bad finding is told from the rest** by its
+    /// ticket: rising within a report, restarting with the next, and an
+    /// unticketed finding opens a report only when nothing came before it.
+    #[test]
+    fn a_report_opens_where_the_tickets_restart() {
+        let last = AtomicU64::new(0);
+        assert!(first_of_report(None, &last), "nothing before it");
+        assert!(
+            first_of_report(Some(4), &last),
+            "the first ticketed finding"
+        );
+        assert!(!first_of_report(Some(9), &last), "later in the same report");
+        assert!(
+            !first_of_report(None, &last),
+            "the unticketed tail of a report"
+        );
+        assert!(
+            first_of_report(Some(2), &last),
+            "the tickets restarted: a new report"
+        );
+        assert!(
+            first_of_report(Some(2), &last),
+            "the same ticket again: a new report"
+        );
+        assert!(!first_of_report(Some(3), &last));
+    }
 }
