@@ -666,15 +666,15 @@ pub(super) mod tests {
         assert!(sub.residence(kept).has_warm(), "kept stays warm");
     }
 
-    /// **A projection's recall ends the offload.** A completed-ingest turn,
-    /// offloaded to cold-only, is pulled back hot by `install_promoted`. Once
-    /// it leaves the working set it must not be shed the next pass: it keeps
-    /// hot through the idle grace, takes a warm copy from the migrate without
-    /// losing hot, and is shed to warm — never to cold-only — only once the
-    /// grace runs out. A flagged turn that was never recalled is still
-    /// offloaded at once.
+    /// **A recall stays hot for one projection after it leaves the working
+    /// set.** A completed-ingest turn, offloaded to cold-only, is pulled back
+    /// hot by `install_promoted`. It is never queued for a hot→warm copy — the
+    /// log already holds its bytes. The projection that drops it does not shed
+    /// it, so a re-selection at the next boundary finds it hot; the one after
+    /// that, still not naming it, lets the offload take it back to cold-only.
+    /// A flagged turn no projection ever named is offloaded at once.
     #[test]
-    fn a_recalled_offload_turn_ages_like_any_residence() {
+    fn a_recall_stays_hot_for_one_projection() {
         let (_, _, timeline, mut sub) = make_timeline();
         let cold = || {
             vec![StoredSequence {
@@ -709,39 +709,45 @@ pub(super) mod tests {
             Vec::new(),
         );
         assert_eq!(installed, 1);
-        assert!(
-            !sub.residence(recalled).has_flag(EVICT_WHEN_COLD),
-            "the recall cleared the offload"
-        );
 
-        // It leaves the working set; the next pass must not shed it.
+        // Its hot copy is the stored form the log holds: no hot→warm copy.
+        assert!(
+            sub.snapshot_pending_warm()
+                .iter()
+                .all(|(idx, _, _)| *idx != recalled),
+            "a recall is never queued for a warm copy"
+        );
+        assert_eq!(sub.pending_warm_bytes(), 0);
+
+        // The next projection drops it: held, the pass does not shed it.
         sub.set_working_set_pins(&[], &[]);
         assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 0);
-        assert!(sub.residence(recalled).has_hot(), "hot through the grace");
+        assert!(
+            sub.residence(recalled).has_hot(),
+            "hot through one projection"
+        );
 
-        // The migrate's warm copy lands beside hot, not instead of it.
-        let read = sub.residence(recalled).hot().unwrap();
-        assert!(sub.install_copied(recalled, &read, vec![minimal_sealed_layer()]));
-        assert!(sub.residence(recalled).has_hot() && sub.residence(recalled).has_warm());
+        // Re-selected at the boundary after: still hot, nothing to read.
+        sub.set_working_set_pins(&[key], &[]);
+        assert!(sub.turn_tier_state(timeline, recalled_idx).unwrap().hot);
 
-        // Past the grace, hot goes and warm stays: RAM, not the log. The pass
-        // above was the first of the grace's sixteen.
-        for _ in 1..IDLE_DEMOTE_GRACE_EPOCHS {
-            assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 0);
-        }
+        // Dropped again, and a second projection still without it: offloaded.
+        sub.set_working_set_pins(&[], &[]);
+        assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 0);
+        sub.set_working_set_pins(&[], &[]);
         assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 1);
-        assert!(
-            !sub.residence(recalled).has_hot(),
-            "hot shed past the grace"
-        );
-        assert!(
-            sub.residence(recalled).has_warm(),
-            "warm kept for the next recall"
-        );
+        assert!(!sub.residence(recalled).has_hot(), "back to cold-only");
+        assert!(!sub.residence(recalled).has_warm(), "no warm copy made");
         assert!(sub.residence(recalled).has_cold());
+        assert!(sub.residence(recalled).has_flag(EVICT_WHEN_COLD));
+
+        // A flagged turn no projection ever named is offloaded on the spot.
+        let (_, ingested) = install_hot_and_warm(&mut sub, timeline, 10);
+        sub.residence(ingested).set_flag(EVICT_WHEN_COLD);
+        assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 1);
+        assert!(!sub.residence(ingested).has_hot());
 
         // The turn no projection recalled is still offload-only.
-        assert!(sub.residence(untouched).has_flag(EVICT_WHEN_COLD));
         assert!(!sub.residence(untouched).has_hot() && !sub.residence(untouched).has_warm());
     }
 

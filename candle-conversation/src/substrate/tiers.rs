@@ -353,16 +353,16 @@ impl Substrate {
     }
 
     /// Drop the hot copy of residences that no wave has attended for `grace`
-    /// epochs and that already have a warm one
+    /// epochs and that already have a warm or a cold one
     /// (`docs/vram_governor_design.md` §8.1). Returns how many were shed.
     ///
     /// **Sets no flag.** An earlier version latched `evict_when_cold`, which was
     /// wrong twice over: that flag is a statement about a residence's *kind*
     /// (collection members and completed-ingest turns are offload-only by
-    /// nature) and only a recall clears it (`install_promoted`). Latching it on
-    /// a live dialogue turn that merely went quiet made the residence
-    /// offload-only until something retrieved it, so every later warm purge cost
-    /// it its hot copy where an unflagged residence would have kept it. Dropping
+    /// nature) and nothing in the tree ever clears it — every write is
+    /// `= true`. Latching it on a live dialogue turn that merely went quiet made
+    /// the residence permanently offload-only, so every later warm purge cost it
+    /// its hot copy where an unflagged residence would have kept it. Dropping
     /// hot directly says exactly what is meant, is undone by the next elevate,
     /// and leaves no state to reset.
     ///
@@ -406,15 +406,20 @@ impl Substrate {
             let Some(r) = self.residences.try_get(idx) else {
                 continue;
             };
-            // `has_warm()` is the safety condition AND the whole mechanism: the
-            // copy the drop falls back on must already exist. A residence without
-            // one is simply left for a later pass, by which time the migrate will
-            // have made it.
-            let offload = r.has_flag(EVICT_WHEN_COLD) && (r.has_warm() || r.has_cold());
+            // A lower copy is the safety condition AND the whole mechanism: the
+            // copy the drop falls back on must already exist — warm, or cold for
+            // a residence that never takes a warm copy (`pin_defers_warm`). A
+            // residence with neither is simply left for a later pass, by which
+            // time the migrate will have made one.
+            let backed = r.has_warm() || r.has_cold();
+            // An offload waits out one projection after the residence leaves the
+            // working set: a recall the next boundary selects again is still hot.
+            let offload =
+                r.has_flag(EVICT_WHEN_COLD) && backed && !self.residences.projected_lately(r);
             let take = r.has_hot()
                 && !r.is_pinned()
                 && !r.has_flag(PENDING_QUANTIZE | SPLICE_SOURCE)
-                && (offload || (r.has_warm() && idle_for(r.last_used_epoch(), epoch) > grace));
+                && (offload || (backed && idle_for(r.last_used_epoch(), epoch) > grace));
             if !take || self.residences.take_hot(idx).is_none() {
                 continue;
             }
@@ -640,7 +645,7 @@ impl Substrate {
     ) -> impl Iterator<Item = (ResidenceIndex, Arc<HotKv>, Option<ConvCompression>)> + '_ {
         self.hot_turns_oldest_first().into_iter().filter_map(|idx| {
             let r = self.residences.get(idx);
-            if r.has_warm() || self.pin_defers_warm(idx) {
+            if r.has_warm() || r.has_cold() || self.pin_defers_warm(idx) {
                 return None;
             }
             r.hot().map(|hot| (idx, hot, r.compression))
@@ -649,11 +654,20 @@ impl Substrate {
 
     /// Whether the working set's pin on `idx` defers its warm copy.
     ///
-    /// **Only for a residence already persisted** — one recalled hot from its
-    /// cold record, or whose cold write is in flight. Its hot copy is the stored
-    /// form already, and backing it up hot→warm while the in-flight decode
-    /// attends it is redundant work that monopolises the persistence thread and
-    /// stream against the elevation the decode is blocked on: the tier-migration
+    /// **A residence with a cold copy never takes one at all** — one recalled
+    /// hot from its cold record, or whose warm copy the RAM budget purged while
+    /// it was hot. Its hot copy is the stored form, and the log already holds
+    /// those bytes: a hot→warm copy of it is a device-to-pageable transfer on
+    /// the primary stream that buys nothing the cold read does not. Measured on
+    /// BlackWorld (2026-11-22), once recalls stopped being shed straight back to
+    /// cold: 145–382 MiB copied per pass at ~0.7 GB/s, 100–540 ms of the stream
+    /// a thinking block's decode shares. [`Self::pending_warm`] skips them, and
+    /// the idle demote sheds their hot copy onto the cold one.
+    ///
+    /// **Deferred while pinned for one whose cold write is in flight.**
+    /// Backing it up hot→warm while the in-flight decode attends it is
+    /// redundant work that monopolises the persistence thread and stream
+    /// against the elevation the decode is blocked on: the tier-migration
     /// livelock, the same working set churning every pass while the decode lands
     /// zero forwards. Its warm copy waits until it leaves the working set.
     ///
@@ -667,7 +681,7 @@ impl Substrate {
     /// copy, so it is never a candidate again.
     pub(super) fn pin_defers_warm(&self, idx: ResidenceIndex) -> bool {
         let r = self.residences.get(idx);
-        r.is_pinned() && (r.has_cold() || r.has_flag(COLD_PENDING))
+        r.is_pinned() && r.has_flag(COLD_PENDING)
     }
 
     /// Total VRAM byte footprint of hot residences that lack a warm copy — the
@@ -761,7 +775,7 @@ impl Substrate {
         let (mut dc, mut db, mut pc, mut pb) = (0usize, 0u64, 0usize, 0u64);
         for idx in self.hot_turns_oldest_first() {
             let r = self.residences.get(idx);
-            if !r.has_hot() || r.has_warm() {
+            if !r.has_hot() || r.has_warm() || r.has_cold() {
                 continue;
             }
             if self.pin_defers_warm(idx) {

@@ -116,10 +116,10 @@ pub(super) mod tests {
     /// **A pinned fresh seal is migrated; a pinned persisted residence is not.**
     /// The migrate is what swaps a seal's native hot copy for its quantized one,
     /// so deferring it while pinned left a turn its own conversation keeps
-    /// attending native for the conversation's whole life. Only a residence
-    /// already persisted — recalled from cold, or with its cold write in
-    /// flight — is held back while the working set names it, and every count
-    /// that mirrors the work list agrees.
+    /// attending native for the conversation's whole life. A residence with its
+    /// cold write in flight is held back while the working set names it; one
+    /// recalled from cold is never migrated, pinned or not — the log already
+    /// holds its bytes. Every count that mirrors the work list agrees.
     #[test]
     fn a_pinned_fresh_seal_is_migrated_and_a_pinned_recall_is_not() {
         let (_, _, timeline, mut sub) = make_timeline();
@@ -176,12 +176,10 @@ pub(super) mod tests {
             .map(|(idx, _)| idx)
             .collect();
         pending.sort_unstable_by_key(|r| r.0);
-        let mut want = vec![fresh, unpinned_recall];
-        want.sort_unstable_by_key(|r| r.0);
-        assert_eq!(pending, want);
-        assert_eq!(sub.pending_warm_count(), 2);
-        assert_eq!(sub.pending_warm_bytes(), 1_004);
-        assert_eq!(sub.warm_backlog_split(), (2, 1_004, 2, 230));
+        assert_eq!(pending, vec![fresh]);
+        assert_eq!(sub.pending_warm_count(), 1);
+        assert_eq!(sub.pending_warm_bytes(), 1_000);
+        assert_eq!(sub.warm_backlog_split(), (1, 1_000, 1, 30));
     }
 
     /// `mark_timeline_evict_when_cold`'s immediate hot-drop skips a pinned
