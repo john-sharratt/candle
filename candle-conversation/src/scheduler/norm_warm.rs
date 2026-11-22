@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 
 use flume::Sender;
 
+use super::warm_split::WarmKind;
 use super::Scheduler;
 use crate::conversation::cap_probe_window;
 use crate::persistence::streams::StreamId;
@@ -196,9 +197,9 @@ impl Scheduler {
     }
 
     /// Score one queued replay turn — or, with none left, one raw group scan,
-    /// then one background launch, then one ingest slice. Returns whether one
-    /// was scored.
-    pub(super) fn step_norm_warm(&mut self) -> bool {
+    /// then one background launch, then one ingest slice. Returns the kind it
+    /// ran, `None` with nothing queued.
+    pub(super) fn step_norm_warm(&mut self) -> Option<WarmKind> {
         let Some(job) = self.norm_warm.backlog.pop_front() else {
             if self.norm_warm.scans.is_empty() {
                 if let Some(held) = self.norm_warm.held.pop_front() {
@@ -208,7 +209,7 @@ impl Scheduler {
                     };
                     // A caller that has gone away has nothing left to wait for.
                     let _ = held.response_tx.send(reply);
-                    return true;
+                    return Some(WarmKind::Held);
                 }
             }
             if let Some(scan) = self.norm_warm.scans.pop_front() {
@@ -226,11 +227,9 @@ impl Scheduler {
                 });
                 // A caller that has gone away has nothing left to wait for.
                 let _ = scan.response_tx.send(votes);
-                return true;
+                return Some(WarmKind::Scan);
             }
-            let Some(slice) = self.norm_warm.ingest.pop_front() else {
-                return false;
-            };
+            let slice = self.norm_warm.ingest.pop_front()?;
             let warmed = self.gallery_arena.as_deref().map(|arena| {
                 slice.conversation.warm_ingest_timelines(
                     &slice.schema,
@@ -242,7 +241,7 @@ impl Scheduler {
             });
             // A warmer that has gone away has nothing left to wait for.
             let _ = slice.response_tx.send(warmed);
-            return true;
+            return Some(WarmKind::Ingest);
         };
         job.substrate.score_warm_probe(
             job.projection.schema(),
@@ -270,7 +269,7 @@ impl Scheduler {
             warm.probes = 0;
             warm.probe_windows = 0;
         }
-        true
+        Some(WarmKind::Replay)
     }
 }
 
@@ -318,10 +317,10 @@ mod tests {
         );
 
         assert_eq!(sched.norm_warm_wait(), Some(Duration::ZERO));
-        assert!(sched.step_norm_warm());
+        assert!(sched.step_norm_warm().is_some());
         assert_eq!(sched.norm_warm.backlog.len(), 1);
-        assert!(sched.step_norm_warm());
-        assert!(!sched.step_norm_warm(), "the backlog is drained");
+        assert!(sched.step_norm_warm().is_some());
+        assert!(sched.step_norm_warm().is_none(), "the backlog is drained");
         assert_eq!(sched.norm_warm_wait(), None);
 
         conv.reset_normalization_warm();
@@ -370,9 +369,9 @@ mod tests {
         );
         assert_eq!(sched.norm_warm.backlog.len(), 2);
         assert_eq!(conv.warm_replay_progress(), Some((0, 2)));
-        assert!(sched.step_norm_warm());
+        assert!(sched.step_norm_warm().is_some());
         assert_eq!(conv.warm_replay_progress(), Some((1, 2)));
-        assert!(sched.step_norm_warm());
+        assert!(sched.step_norm_warm().is_some());
         assert_eq!(conv.warm_replay_progress(), None, "drained: no bar");
     }
 
@@ -393,7 +392,7 @@ mod tests {
         );
         let (mut sched, _tx) = make_test_scheduler();
         sched.queue_norm_warm(&conv, &builder, target, WHOLE);
-        assert!(sched.step_norm_warm());
+        assert!(sched.step_norm_warm().is_some());
         assert_eq!(conv.warm_replay_progress(), Some((1, 2)));
         sched.forget_norm_warm(&conv);
         assert_eq!(conv.warm_replay_progress(), None);
@@ -454,12 +453,15 @@ mod tests {
         assert_eq!(sched.norm_warm_wait(), Some(Duration::ZERO));
         assert!(reply_rx.try_recv().is_err(), "the caller is still waiting");
 
-        assert!(sched.step_norm_warm());
+        assert!(sched.step_norm_warm().is_some());
         assert!(
             reply_rx.try_recv().unwrap().is_none(),
             "no arena on this scheduler"
         );
-        assert!(!sched.step_norm_warm(), "the scan was the whole backlog");
+        assert!(
+            sched.step_norm_warm().is_none(),
+            "the scan was the whole backlog"
+        );
         assert_eq!(sched.norm_warm_wait(), None);
     }
 
@@ -485,15 +487,19 @@ mod tests {
         assert!(replies.iter().all(|r| r.try_recv().is_err()), "both wait");
         assert_eq!(sched.norm_warm_wait(), Some(Duration::ZERO));
 
-        assert!(sched.step_norm_warm());
+        assert_eq!(
+            sched.step_norm_warm(),
+            Some(super::WarmKind::Held),
+            "a step names the kind it ran"
+        );
         assert!(matches!(
             replies[0].try_recv().unwrap().answer,
             ScanAnswer::Stats(Err(_))
         ));
         assert!(replies[1].try_recv().is_err(), "the second waits a step");
-        assert!(sched.step_norm_warm());
+        assert!(sched.step_norm_warm().is_some());
         assert!(replies[1].try_recv().is_ok());
-        assert!(!sched.step_norm_warm());
+        assert!(sched.step_norm_warm().is_none());
         assert_eq!(sched.norm_warm_wait(), None);
     }
 
@@ -520,13 +526,16 @@ mod tests {
         assert_eq!(sched.norm_warm_wait(), Some(Duration::ZERO));
         assert!(reply_rx.try_recv().is_err(), "the warmer is still waiting");
 
-        assert!(sched.step_norm_warm());
+        assert!(sched.step_norm_warm().is_some());
         assert_eq!(
             reply_rx.try_recv().unwrap(),
             None,
             "no arena on this scheduler"
         );
-        assert!(!sched.step_norm_warm(), "the slice was the whole backlog");
+        assert!(
+            sched.step_norm_warm().is_none(),
+            "the slice was the whole backlog"
+        );
         assert_eq!(sched.norm_warm_wait(), None);
     }
 }

@@ -103,6 +103,9 @@ pub(super) struct WaveStats {
     /// Warm phase this window: the background scan the loop runs a pass
     /// (`step_norm_warm`), outside every quantum. Microseconds.
     pub(super) warm_us: u64,
+    /// What the warm band was spent on, by kind of launch, logged at the
+    /// window's close.
+    pub(super) warm_split: warm_split::WarmSplit,
     /// What the compaction band was spent on, logged at the window's close.
     pub(super) compaction_split: compaction_split::CompactionSplit,
     /// What the allocation band was spent on, logged at the window's close.
@@ -180,6 +183,7 @@ impl WaveStats {
             quantize_us: 0,
             compaction_us: 0,
             warm_us: 0,
+            warm_split: warm_split::WarmSplit::default(),
             compaction_split: compaction_split::CompactionSplit::default(),
             admission_split: admission_split::AdmissionSplit::default(),
             telemetry_us: 0,

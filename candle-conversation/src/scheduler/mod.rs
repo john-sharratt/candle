@@ -88,6 +88,7 @@ mod creep_slice;
 mod decode;
 mod detached;
 mod diag;
+mod warm_split;
 
 mod ephemeral_fork;
 mod expert_counters;

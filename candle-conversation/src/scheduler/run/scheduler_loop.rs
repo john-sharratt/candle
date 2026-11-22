@@ -221,11 +221,14 @@ impl Scheduler {
             // 2a. One background scan (see `norm_warm`): a warm-up's replayed
             // turn or ingest slice, or a group-vote scan — its own band.
             let t_warm = Instant::now();
-            self.step_norm_warm();
+            let ran = self.step_norm_warm();
+            let took = t_warm.elapsed();
             self.step_census
-                .spend(super::super::step_census::Activity::Warm, t_warm.elapsed());
-            self.wave_stats
-                .add_warm(t_warm.elapsed().as_micros() as u64);
+                .spend(super::super::step_census::Activity::Warm, took);
+            self.wave_stats.add_warm(took.as_micros() as u64);
+            if let Some(kind) = ran {
+                self.wave_stats.warm_split.add(kind, took);
+            }
 
             // 2b. A turn whose prefill stands still is told what it waits
             // behind, so its caller can show it rather than look hung

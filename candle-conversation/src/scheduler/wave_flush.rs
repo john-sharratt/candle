@@ -324,6 +324,7 @@ impl WaveStats {
         self.quantize_us = 0;
         self.compaction_us = 0;
         self.warm_us = 0;
+        self.warm_split = warm_split::WarmSplit::default();
         self.compaction_split = compaction_split::CompactionSplit::default();
         self.admission_split = admission_split::AdmissionSplit::default();
         self.telemetry_us = 0;
@@ -555,6 +556,19 @@ impl WaveStats {
         }
         if warm_dur > 0 {
             push(&mut phases, PhaseKind::Warm, warm_dur, 0, 0);
+            // Which kind of background launch the band went to, and the
+            // longest single one: a live turn waits on at most one a pass, so
+            // the longest is the pause it can see.
+            let parts = self.warm_split.parts_ms();
+            tracing::info!(
+                target: "candle_conversation::scheduler::warm",
+                total_ms = warm_dur,
+                parts = %parts,
+                "warm split"
+            );
+            note("warm split", || {
+                format!("total_ms={warm_dur} parts={parts}")
+            });
         }
         if compaction_dur > 0 {
             push(&mut phases, PhaseKind::Compaction, compaction_dur, 0, 0);
@@ -576,6 +590,20 @@ impl WaveStats {
                 tenants_frontier_drop = s.tenants_frontier_drop,
                 "compaction split"
             );
+            note("compaction split", || {
+                format!(
+                    "total_ms={compaction_dur} gate_ms={} kv_ms={} kv_passes={} kv_moves={} \
+                     kv_stages=[{}] tenants_ms={} tenant_passes={} tenant_parts=[{}]",
+                    s.gate_us / 1000,
+                    s.kv_us / 1000,
+                    s.kv_passes,
+                    s.kv_moves,
+                    s.kv_stages_ms(),
+                    s.tenants_us / 1000,
+                    s.tenant_passes,
+                    s.tenant_parts_ms(),
+                )
+            });
         }
         if telemetry_dur > 0 {
             push(&mut phases, PhaseKind::Telemetry, telemetry_dur, 0, 0);
