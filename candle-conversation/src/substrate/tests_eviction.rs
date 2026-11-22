@@ -709,7 +709,14 @@ pub(super) mod tests {
             }],
             Vec::new(),
         );
-        assert_eq!(installed, 1);
+        assert_eq!(
+            installed,
+            Promoted {
+                installed: 1,
+                recalled_again: 0
+            },
+            "a first recall"
+        );
 
         // Its hot copy is the stored form the log holds: no hot→warm copy.
         assert!(
@@ -731,6 +738,25 @@ pub(super) mod tests {
         assert!(!sub.residence(recalled).has_warm(), "no warm copy made");
         assert!(sub.residence(recalled).has_cold());
         assert!(sub.residence(recalled).has_flag(EVICT_WHEN_COLD));
+
+        // Recalled once more: the log is read again for the same bytes.
+        let again = sub.install_promoted(
+            vec![ColdRecall {
+                kind: PromotionItemKind::Turn(key),
+                residence: recalled,
+                hot: vec![minimal_sealed_layer()],
+            }],
+            Vec::new(),
+        );
+        assert_eq!(
+            again,
+            Promoted {
+                installed: 1,
+                recalled_again: 1
+            }
+        );
+        sub.set_working_set_pins(&[], &[]);
+        assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 1);
 
         // A flagged turn no projection ever named is offloaded on the spot.
         let (_, ingested) = install_hot_and_warm(&mut sub, timeline, 10);

@@ -215,19 +215,24 @@ impl Substrate {
     /// drops its own, so copies never stack. A residence whose owner was
     /// tombstoned while its copy was being built takes nothing. Empty payloads
     /// are skipped: a phase that produced nothing usable leaves the residence
-    /// as it was. Returns how many were installed.
-    pub fn install_promoted(&self, recalls: Vec<ColdRecall>, lifts: Vec<WarmLift>) -> usize {
-        let mut installed = 0usize;
+    /// as it was. Answers how many were installed, and how many of the recalls
+    /// read the log again for a residence recalled before.
+    pub fn install_promoted(&self, recalls: Vec<ColdRecall>, lifts: Vec<WarmLift>) -> Promoted {
+        let mut out = Promoted::default();
         let promoted = recalls
             .into_iter()
-            .map(|r| (r.residence, r.hot))
-            .chain(lifts.into_iter().map(|l| (l.residence, l.hot)));
-        for (residence, hot) in promoted {
-            if !hot.is_empty() && self.residences.install_hot_if_absent(residence, hot) {
-                installed += 1;
+            .map(|r| (r.residence, r.hot, true))
+            .chain(lifts.into_iter().map(|l| (l.residence, l.hot, false)));
+        for (residence, hot, recall) in promoted {
+            if hot.is_empty() || !self.residences.install_hot_if_absent(residence, hot) {
+                continue;
+            }
+            out.installed += 1;
+            if recall && self.residences.get(residence).note_recall() > 0 {
+                out.recalled_again += 1;
             }
         }
-        installed
+        out
     }
 
     /// The residence-slab index that a turn addresses: what a tier

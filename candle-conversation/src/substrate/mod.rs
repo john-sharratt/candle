@@ -824,6 +824,17 @@ pub struct WarmLift {
     pub hot: Vec<SealedSequence>,
 }
 
+/// What one [`Substrate::install_promoted`] landed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Promoted {
+    /// Promotions installed, from either leg.
+    pub installed: usize,
+    /// Of the cold recalls installed, those of a residence a projection had
+    /// already recalled before — the log read again for bytes it had already
+    /// given. A projection that keeps re-reading what it dropped shows here.
+    pub recalled_again: usize,
+}
+
 /// Per-call summary from [`Substrate::evict_hot_except`].
 /// `count` is the number of residences evicted, `bytes` is the total
 /// VRAM freed (sum of each residence's cached `byte_size`).

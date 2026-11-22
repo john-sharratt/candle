@@ -34,8 +34,8 @@ use super::cold_load::ColdLoadStager;
 use crate::projection::{Conversation, SectionId, TurnKey};
 use crate::scheduler::relief_trace;
 use crate::substrate::{
-    ColdRecall, EvictionReport, PromotionItemKind, PromotionPlan, ResidenceIndex, WarmLift,
-    WarmToHotEntry,
+    ColdRecall, EvictionReport, Promoted, PromotionItemKind, PromotionPlan, ResidenceIndex,
+    WarmLift, WarmToHotEntry,
 };
 use candle_nn::kv_cache::SealedSequence;
 
@@ -387,15 +387,18 @@ pub fn elevate_to_hot(
     // (`Substrate::install_promoted`).
     let warm_hot_ms = t_warm_hot.elapsed().as_millis() as u64;
     let t_install = Instant::now();
-    if !recalls.is_empty() || !lifts.is_empty() {
-        conversation.read().install_promoted(recalls, lifts);
-    }
+    let promoted = if !recalls.is_empty() || !lifts.is_empty() {
+        conversation.read().install_promoted(recalls, lifts)
+    } else {
+        Promoted::default()
+    };
     // Where a lift's time went, phase by phase: a dialogue's projection waits
     // on all of it, and the phases move different bytes over different paths.
     if report.warm_to_hot > 0 || report.cold_to_hot > 0 {
         tracing::debug!(
             target: "candle_conversation::persistence::tier",
             cold_items = report.cold_to_hot,
+            cold_again = promoted.recalled_again,
             cold_bytes = report.bytes_cold_to_hot,
             cold_ms,
             warm_items = report.warm_to_hot,

@@ -303,6 +303,9 @@ pub struct Residence {
     byte_size: AtomicU64,
     /// Wave epoch of the last forward that resolved its hot KV.
     last_used_epoch: AtomicU64,
+    /// How many times a projection has recalled it hot from its cold copy —
+    /// what tells a re-read of the log from a first one.
+    recalls: AtomicU32,
     /// Recency stamp from the slab's clock: higher is more recent.
     touched: AtomicU64,
 }
@@ -335,6 +338,7 @@ impl Residence {
             // that will attend it publishes its pins, so a zero stamp would make it
             // stale from birth and let the idle demote take it before its first use.
             last_used_epoch: AtomicU64::new(epoch),
+            recalls: AtomicU32::new(0),
             touched: AtomicU64::new(0),
         }
     }
@@ -408,6 +412,11 @@ impl Residence {
 
     pub fn stamp_used(&self, epoch: u64) {
         self.last_used_epoch.fetch_max(epoch, Ordering::Relaxed);
+    }
+
+    /// Count one recall from cold, answering how many came before it.
+    pub fn note_recall(&self) -> u32 {
+        self.recalls.fetch_add(1, Ordering::Relaxed)
     }
     pub fn touched(&self) -> u64 {
         self.touched.load(Ordering::Relaxed)
