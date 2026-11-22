@@ -25,7 +25,7 @@ use std::mem;
 use candle::backend::BackendStorage;
 use candle::cuda_backend::cudarc::driver::DevicePtr;
 use candle::quantized::cuda::to_dynamic;
-use candle::quantized::{GgmlDType, Int8Mode, QTensor, SumScale};
+use candle::quantized::{GgmlDType, Int8Mode, QTensor};
 use candle::wave_provenance::WaveTicket;
 use candle::{DType, Device, LiveTensor, Result, Storage, Tensor};
 use candle_kernels::simple::ple_fused::{run_ple_conv, run_ple_gate, PLE_SPAN_WORDS};
@@ -34,6 +34,7 @@ use super::config::PleConfig;
 use super::device_operand::{with_operand, Operand};
 use super::model::PleSource;
 use super::ple::{ple_row_ids, PleSpan, PleWeights};
+use super::sum_scale::ACT_SUM_SCALE;
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
 
@@ -89,7 +90,8 @@ impl PleFusedWeights {
             key_value: QMatMul::from_qtensor_with_mode(
                 QTensor::quantize(&key_value, dtype)?,
                 mode,
-            )?,
+            )?
+            .with_sum_scale(ACT_SUM_SCALE),
             mode,
             norm_key: w.norm_key.clone(),
             norm_query: w.norm_query.clone(),
@@ -151,7 +153,7 @@ pub fn ple_apply_spans_fused(
     let Device::Cuda(cuda) = &dev else {
         candle::bail!("ple: the fused block runs on CUDA");
     };
-    let acts = to_dynamic(&emb, w.mode, cuda, SumScale::Raw)?;
+    let acts = to_dynamic(&emb, w.mode, cuda, w.key_value.sum_scale())?;
     let kv = w.key_value.forward_dynamic(acts.as_dynamic(), DType::F32)?;
     let normalized = wave_empty_ticketed((total, hcd), DType::F32, &dev, root)?;
     launch_gate(&kv, res, w, &normalized, eps)?;

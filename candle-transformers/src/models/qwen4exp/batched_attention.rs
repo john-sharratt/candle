@@ -18,7 +18,7 @@
 
 use candle::quantized::cuda::{to_dynamic, DynamicActs};
 use candle::quantized::decode_rows::DecodeRows;
-use candle::quantized::{Int8Mode, SumScale};
+use candle::quantized::Int8Mode;
 use candle::{DType, Result, Tensor};
 use candle_nn::kv_cache::WaveGeneration;
 
@@ -27,6 +27,7 @@ use crate::models::lora::LayerLora;
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::qwen35::quantized_attention::project_qkv_gated;
 use crate::models::qwen35::quantized_weights::QuantAttentionWeights;
+use crate::models::qwen4exp::sum_scale::ACT_SUM_SCALE;
 use crate::models::rotary_layout::RotaryLayout;
 
 /// One qwen4exp attention layer, bound to its geometry. Borrows the engine's
@@ -69,8 +70,8 @@ impl BatchedAttentionLayer for Qwen4ExpAttentionLayer<'_> {
         let candle::Device::Cuda(dev) = x.device() else {
             candle::bail!("qwen4exp attention runs on CUDA");
         };
-        // Raw Σx — a language model's block sums stay far below f16's ceiling.
-        to_dynamic(x, mode, dev, SumScale::Raw)
+        // Σx by amax, the model's convention (`sum_scale::ACT_SUM_SCALE`).
+        to_dynamic(x, mode, dev, ACT_SUM_SCALE)
     }
 
     fn ffn_norm<'w>(
