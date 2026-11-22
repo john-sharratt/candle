@@ -42,9 +42,11 @@ pub enum Int8Mode {
 /// one `fmaf` whose two coefficients are hoisted from this choice — so it is a
 /// runtime argument, never a template parameter, and adds no kernel variants.
 ///
-/// [`SumScale::Raw`] is the default and is what every language model here uses;
-/// its bytes and its arithmetic are bit-identical to the unparameterised path
-/// that preceded this.
+/// [`SumScale::Raw`] is the default; its bytes and its arithmetic are
+/// bit-identical to the unparameterised path that preceded this. A model whose
+/// activations can carry an outlier large enough to sum a block past f16 says
+/// [`SumScale::ByAmax`] — Qwen3.8-Flash-Next does (`qwen4exp::sum_scale`), and
+/// so does every expert SwiGLU intermediate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SumScale {
     /// `ds[0].y = Σx` — the raw per-128 sum.
@@ -55,9 +57,10 @@ pub enum SumScale {
     /// **For activations whose block sums overflow f16.** Both header fields are
     /// f16 and `|Σx|` can reach `128 · amax`, so any activation whose per-128
     /// sums pass 65504 stores `+inf` and every dot product touching that block
-    /// becomes NaN. An LLM's stay under 10³ and never come near it; Z-Image's
-    /// SwiGLU intermediate reaches ≈2×10⁵, which produced a black image with no
-    /// other symptom.
+    /// becomes NaN. Z-Image's SwiGLU intermediate reaches ≈2×10⁵, which produced
+    /// a black image with no other symptom; on Qwen3.8-Flash-Next a single
+    /// outlier channel in the FFN input after a full-attention layer does it,
+    /// and an expert call came out NaN in every element from a finite input.
     ///
     /// Normalising bounds the field at `|Σx/amax| ≤ 128` whatever the
     /// activation's magnitude, and costs no precision — f16's relative precision

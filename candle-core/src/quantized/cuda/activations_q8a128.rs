@@ -131,16 +131,16 @@ pub fn quantize_acts_q8a128<'w>(
             device.cuda_stream().cu_stream() as *mut std::ffi::c_void,
         );
     }
-    Ok(q8a128_from_out(
+    q8a128_from_out(
         owned,
         out_ptr_planned,
         out_backing,
         bytes,
         rows,
         cols,
+        sum_scale,
         device,
-    )?
-    .with_sum_scale(sum_scale))
+    )
 }
 
 /// A q8a128 operand for `[rows, cols]` written by a caller's own fused producer.
@@ -172,7 +172,7 @@ pub fn produce_q8a128<'w>(
     let bytes = q8a1024_byte_len(rows, cols);
     let (ptr, owned, backing) = resolve_u8_out(origin, &device, bytes)?;
     fill(ptr)?;
-    Ok(q8a128_from_out(owned, ptr, backing, bytes, rows, cols, &device)?.with_sum_scale(sum_scale))
+    q8a128_from_out(owned, ptr, backing, bytes, rows, cols, sum_scale, &device)
 }
 
 /// Fused RMSNorm → q8a128: normalize each row of `xs` `[.. × K]` by `alpha` `[K]` and emit the
@@ -295,9 +295,10 @@ pub fn rms_norm_q8a128<'w>(
         bytes,
         rows,
         cols,
+        sum_scale,
         device,
     )
-    .map(|o| o.with_lead(lead).with_sum_scale(sum_scale))
+    .map(|o| o.with_lead(lead))
 }
 
 /// Fused SwiGLU → q8a128: compute `silu(gate) · up` element-wise and emit the q8a128 activation
@@ -429,9 +430,10 @@ pub fn silu_mul_q8a128<'w>(
         bytes,
         rows,
         cols,
+        sum_scale,
         device,
     )
-    .map(|o| o.with_lead(lead).with_sum_scale(sum_scale))
+    .map(|o| o.with_lead(lead))
 }
 
 /// `(start offset, row stride)` of a [`silu_mul_q8a128`] operand: unit column

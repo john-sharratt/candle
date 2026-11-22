@@ -204,7 +204,10 @@ pub(super) fn check_matmul_status(code: i32, op: &str) -> Result<()> {
 ///
 /// Kept next to [`resolve_u8_out`] because the two are halves of one decision:
 /// resolve picks where the bytes go, this wraps them without the caller having
-/// to re-derive which arm was taken.
+/// to re-derive which arm was taken. `sum_scale` is the convention the kernel
+/// just wrote the blocks under — a kernel that copies blocks (the MoE gather)
+/// passes its source's.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn q8a128_from_out<'w>(
     owned: Option<CudaSlice<u8>>,
     ptr: u64,
@@ -212,10 +215,11 @@ pub(super) fn q8a128_from_out<'w>(
     bytes: usize,
     rows: usize,
     cols: usize,
+    sum_scale: SumScale,
     device: &CudaDevice,
 ) -> Result<Q8a128Operand<'w>> {
     match owned {
-        Some(slice) => Ok(Q8a128Operand::new(slice, rows, cols)),
+        Some(slice) => Ok(Q8a128Operand::new(slice, rows, cols, sum_scale)),
         None => {
             let dev = crate::Device::Cuda(device.clone());
             let origin = match backing {
@@ -228,7 +232,12 @@ pub(super) fn q8a128_from_out<'w>(
             let backing_tensor = unsafe {
                 crate::LiveTensor::from_leased_cuda_ptr(ptr, crate::DType::U8, bytes, &dev, origin)?
             };
-            Ok(Q8a128Operand::from_tensor(backing_tensor, rows, cols))
+            Ok(Q8a128Operand::from_tensor(
+                backing_tensor,
+                rows,
+                cols,
+                sum_scale,
+            ))
         }
     }
 }
@@ -280,7 +289,9 @@ pub struct Q8a128Operand<'w> {
     /// only changes how a kernel tiles the same bytes, so the dispatcher derives
     /// it; the sum convention changes what the bytes *mean*, so it travels with
     /// them and the matmul never has to guess. Whoever quantized the activation
-    /// chose it — see [`SumScale`].
+    /// chose it — see [`SumScale`]. Every constructor takes it and none
+    /// defaults it: a kernel that copies blocks and labels its result with the
+    /// wrong one produces wrong numbers, not an error.
     pub sum_scale: SumScale,
 }
 
@@ -325,36 +336,34 @@ impl<'w> Q8a128Operand<'w> {
     /// `[rows]` (a 2D `[M, N]` output); use [`Self::with_lead`] to preserve higher activation
     /// ranks. The matmul mode (mode-1 vs mode-2 weight-reuse) is NOT stored here — it is a
     /// kernel/tiling property the dispatcher derives from the token count, not an attribute of
-    /// the (mode-independent) activation bytes.
-    pub fn new(data: CudaSlice<u8>, rows: usize, cols: usize) -> Self {
+    /// the (mode-independent) activation bytes. `sum_scale` is how the blocks
+    /// store their per-128 `Σx` — the producer's to name, since a mismatch is read
+    /// by the matmul as a wrong number rather than refused.
+    pub fn new(data: CudaSlice<u8>, rows: usize, cols: usize, sum_scale: SumScale) -> Self {
         Self {
             data: Q8a128Data::Owned(data),
             rows,
             cols,
             lead: vec![rows],
-            sum_scale: SumScale::default(),
+            sum_scale,
         }
     }
 
-    /// Declare how these blocks store their per-128 `Σx`.
-    ///
-    /// Set by the producer, not the consumer: a mismatch here is read as a wrong
-    /// number by the matmul, not as an error, so it belongs next to the kernel
-    /// that wrote the bytes. The default is [`SumScale::Raw`].
-    pub fn with_sum_scale(mut self, sum_scale: SumScale) -> Self {
-        self.sum_scale = sum_scale;
-        self
-    }
-
     /// Wrap a contiguous `U8` [`Tensor`] of q8a1024 bytes as an operand, no copy. For producers
-    /// that emit through `apply_op1` (the B2 decode context), whose result is a tensor.
-    pub fn from_tensor(data: crate::LiveTensor<'w>, rows: usize, cols: usize) -> Self {
+    /// that emit through `apply_op1` (the B2 decode context), whose result is a tensor, with
+    /// the `Σx` convention that producer wrote.
+    pub fn from_tensor(
+        data: crate::LiveTensor<'w>,
+        rows: usize,
+        cols: usize,
+        sum_scale: SumScale,
+    ) -> Self {
         Self {
             data: Q8a128Data::Tensor(data),
             rows,
             cols,
             lead: vec![rows],
-            sum_scale: SumScale::default(),
+            sum_scale,
         }
     }
 
