@@ -13,7 +13,7 @@ Both were codebase tours, 9 and 7 model rounds, run on build 4819-e022ff2f.
 K/V is written to VRAM native (R16/F16) and stays native until the persistence
 thread's hot→warm pass reaches it. That pass quantizes the K/V, copies the
 quantized bytes to host RAM, and swaps each residence's hot copy for its
-quantized form (`persistence/thread.rs`, `migrate_group_hot_to_warm` and
+quantized form (`persistence/thread/mod.rs`, `migrate_group_hot_to_warm` and
 `install_hot_to_warm`). Four costs follow from that.
 
 | Symptom | Cause | Measured |
@@ -52,7 +52,7 @@ outside it.
 
 ### 1.2 The test sees it
 
-The batched test (`batch_test/utils.rs`) runs the scheduler's gap quantize on
+The batched test (`batch_test/gap_tally.rs`) runs the scheduler's gap quantize on
 the forward thread, inside its timed windows (§7), so its rates carry these
 costs; its `ex-gap` columns take the gap's host time back out. A boundary seal
 outside the timed windows, which is what the test ran before, hid every one of
@@ -116,7 +116,7 @@ A gap does these things, in this order:
    leased slot no installed block took to its pool. The lease is then empty.
 2. **Demand** (§3.2): the classes and slot counts this gap's table needs.
 3. The arena creation and the compaction the gap already does
-   (`scheduler/run.rs`), with this gap's demand set aside as ground, so that
+   (`scheduler/run/scheduler_loop.rs`), with this gap's demand set aside as ground, so that
    nothing is released that the lease would grow straight back.
 4. **Lease** (§3.2): allocate the demand from the pools, the lowest-placed
    arena first.
@@ -336,7 +336,7 @@ signature is the same bits whichever side of the gap it is read on.
 ### 3.4 The summary
 
 The kernels write the gap's summary into one mapped pinned buffer, as the MoE
-dispatch writes its routing summary (`expert_lre/dispatch.rs`, `SummaryRing`).
+dispatch writes its routing summary (`expert_lre/dispatch/ring.rs`, `SummaryRing`).
 It holds:
 - one flag per block: converted or deferred;
 - for each head, its destination record exactly as the convert read it, and
@@ -348,7 +348,7 @@ It holds:
 That is what the selection reads back to the host today, delivered through
 mapped memory. The record carries the palette maps packed, two bits a channel
 as `PalMapBytes` holds them (`head_dim / 4` bytes per head for K and for V), not
-one byte a channel as today's readback widens them (`sampled_selection/gpu.rs`),
+one byte a channel as today's readback widens them (`sampled_selection/gpu/mod.rs`),
 so a head is `head_dim / 2 + 136` bytes. The host reads it only once the completion word matches, by
 reading the mapped word at the head of a gap. No host CUDA call reads or waits
 on the buffer. The buffer is sized at start for the largest table a gap can
@@ -548,7 +548,7 @@ per-block quantization. Every gate and the sweep are run on it:
 - the §9.12 battery.
 
 A level that falls outside its validation edge has its `*_KV_FACTORS` row
-re-derived by measurement (`sampled_selection/params.rs`). It does not get a
+re-derived by measurement (`sampled_selection/params/`). It does not get a
 second path that keeps the turn native.
 
 Attention-sink protection is unchanged. Positions 0–3 take the dedicated fine
@@ -645,7 +645,7 @@ scale whichever gap quantizes them.
 
 ## 6. What is deleted
 
-- From `persistence/thread.rs`: the hot→warm quantize and convert phases
+- From `persistence/thread/mod.rs`: the hot→warm quantize and convert phases
   (the `quantize_layers_deferred` and `convert_deferred_descs` calls), the
   install of a quantized hot copy (`Substrate::install_migrated`, replaced by
   `install_copied`, which installs warm over the content it read), the fence
@@ -667,7 +667,7 @@ scale whichever gap quantizes them.
   sweep's hysteresis band above them. A reserve is one arena (§3.2).
 - `MigrateFlight` as a quantize lock (§5).
 - The selection's host readback of palettes, scales and maps
-  (`sampled_selection/gpu.rs`). The summary row carries them (§3.4).
+  (`sampled_selection/gpu/mod.rs`). The summary row carries them (§3.4).
 - `BatchedInferenceSession::quantize_and_seal_sequences`, its seal by
   truncate and re-inject, and its `SealTiming` (`models/seal_timing.rs`).
   Deleted. The batched test runs the scheduler's gap quantize inside its timed
@@ -776,23 +776,23 @@ Line numbers are as of commit `dc04b62ac`.
 **2. The descriptor table and the cursor (§3.1).**
 - New `candle-nn/src/kv_cache/chunked/gap/table.rs`: the row type and the
   builder. One concern, tested alone.
-- `candle-nn/src/kv_cache/chunked/sequence_ops.rs`: the per-sequence cursor
+- `candle-nn/src/kv_cache/chunked/sequence_ops/tail.rs`: the per-sequence cursor
   beside `writer_start_idx`; `truncate_sequence_to_tokens` (`:2134`) keeps the
   cursor at or below the committed block.
-- `candle-nn/src/kv_cache/chunked/types.rs:216`: `ChunkWindow` (`gids`, `meta`),
+- `candle-nn/src/kv_cache/chunked/types/live_chunk.rs:216`: `ChunkWindow` (`gids`, `meta`),
   the source of a row's pointers.
-- `batched_inference.rs:2172`, `assert_sealed_layers_aligned`: the every-layer
+- `batched_inference/seal_guard.rs:2172`, `assert_sealed_layers_aligned`: the every-layer
   rule the builder applies per block.
-- `batched_inference.rs:645`, `layer_seal_cap`: the per-layer level that puts a
+- `batched_inference/mod.rs:645`, `layer_seal_cap`: the per-layer level that puts a
   row in its policy group.
-- `candle-nn/src/kv_cache/chunked/compress.rs:69`, `SELECTION_BUDGET_BYTES`: the
+- `candle-nn/src/kv_cache/chunked/selection_batches.rs:69`, `SELECTION_BUDGET_BYTES`: the
   cut.
 
 **3. The lease (§3.2).**
 - New `candle-nn/src/kv_cache/chunked/gap/lease.rs`: the one-gap lease, its
   demand (retried blocks exactly, new blocks by peak share), its device stack,
   the take at the catch-up and the return of the rest.
-- `candle-nn/src/kv_cache/chunked/gid_pool.rs:1428`, `ChunkGidPool`: the lease
+- `candle-nn/src/kv_cache/chunked/gid_pool/pool.rs:1428`, `ChunkGidPool`: the lease
   allocates through `allocate_n_for`, which already takes the lowest-placed
   arena with a free slot (a find-first-set over the capacity bitmap); each
   slot's address is computed as it is allocated, so building the stack is a
@@ -800,7 +800,7 @@ Line numbers are as of commit `dc04b62ac`.
 - `candle-nn/src/kv_cache/chunked/alloc.rs`, `owe_reserves`, and
   `reserve_target.rs`, `reserve_targets`: replaced by the lease's demand, with
   `reserves_short` restoring the one-arena guard.
-- `alloc.rs:664`, `create_deferred_arenas`, and the compaction: run with the
+- `alloc/arena_window.rs:664`, `create_deferred_arenas`, and the compaction: run with the
   gap's demand per class set aside as ground, and make the arenas a lease is
   short of, in the gap.
 
@@ -817,7 +817,7 @@ Line numbers are as of commit `dc04b62ac`.
   `candle-kernels/src/simple/kv_gap_claim.rs`. Its harness,
   `candle-core/tests/kv_gap_claim_bench.rs`, checks every output byte against a
   sequential reference and holds the benchmark and the `ncu` target.
-- `candle-core/src/quantized/cuda.rs`, `quantize_palette4_convert_buffered`:
+- `candle-core/src/quantized/cuda/kv_palette.rs`, `quantize_palette4_convert_buffered`:
   split into building the buffer and launching on it, so the gap launches the
   same convert on a buffer whose destination half the device wrote.
 - New `candle-nn/src/kv_cache/chunked/gap/codes.rs`: the per-code class and
@@ -828,7 +828,7 @@ Line numbers are as of commit `dc04b62ac`.
   completion word. It keeps, across gaps, the summary, the claim's status words
   and epoch, the sink and held scratch for the selection blocks and the convert
   buffer, and refuses a gap while one is outstanding. The candidates and
-  thresholds come from `compress.rs`'s `policy_selection`, each head's source
+  thresholds come from `compress/layer_quantize.rs`'s `policy_selection`, each head's source
   bands from its `head_source`, and the selection's gid order from
   `HeadGids::extend_selection_gids` — all three shared with today's seal, and
   the token-window check with today's convert (`check_token_window`). `gap/launch_tests.rs` holds it to today's seal: the same native
@@ -838,13 +838,13 @@ Line numbers are as of commit `dc04b62ac`.
   exactly the jobs past it. It also refuses a bad window and a gap over no
   layers before launching, drops the device state mid-gap cleanly, and does
   not see the gap after a sequence wrap complete early.
-- `candle-nn/src/kv_cache/chunked/sampled_selection/gpu.rs:741`, `run_palette4`,
+- `candle-nn/src/kv_cache/chunked/sampled_selection/gpu/paged_inputs.rs:741`, `run_palette4`,
   and the readback at `:1497–1538`: removed.
 
 **5. The summary and the catch-up (§3.4, §3.5).**
 - New `candle-nn/src/kv_cache/chunked/gap/summary.rs`: the mapped buffer, its
   row layout and the completion word. Pattern:
-  `candle-transformers/src/models/expert_lre/dispatch.rs:156`, `SummaryRing`.
+  `candle-transformers/src/models/expert_lre/dispatch/ring.rs:156`, `SummaryRing`.
 - New `candle-nn/src/kv_cache/chunked/gap/install.rs`: the catch-up over live
   sequences — the summary read only once `GapDevice::finished` hands it out,
   each block found by identity, its slots taken block by block, every record
@@ -857,16 +857,16 @@ Line numbers are as of commit `dc04b62ac`.
   to today's seal band for band, and covers a truncate under the gap, the
   natives' return, the lease's surplus and a deferred block installed by the
   next gap. `gap/ownership_tests.rs` is the randomised model test of §7.
-- `candle-nn/src/kv_cache/chunked/backing.rs:1307`, `fill_records_on_device`,
+- `candle-nn/src/kv_cache/chunked/backing/record_pool.rs:1307`, `fill_records_on_device`,
   and `meta_pool.rs:146`, `serialize_kv_heads`: the record, unchanged.
-- `candle-nn/src/kv_cache/chunked/gpu_chunks.rs:692`, `update_chunk`, and
-  `types.rs:1458` / `:1507`: the header re-serialisation and its upload.
+- `candle-nn/src/kv_cache/chunked/gpu_chunks/guard.rs:692`, `update_chunk`, and
+  `types/gpu_sync.rs:1458` / `:1507`: the header re-serialisation and its upload.
 
 **6. The gap call (§3, §3.7).**
-- `candle-conversation/src/scheduler/run.rs:1363`: the gap. Catch-up before
+- `candle-conversation/src/scheduler/run/scheduler_loop.rs:1363`: the gap. Catch-up before
   `create_deferred_arenas`; the quantize after `compact_kv_if_fragmented`
-  (`scheduler/prefill.rs:1249`).
-- `candle-conversation/src/scheduler/decode.rs` (the rollback, around `:860`
+  (`scheduler/prefill/pack_pools.rs:1249`).
+- `candle-conversation/src/scheduler/decode/decode_step.rs` (the rollback, around `:860`
   and `:1051`): the table is built after it.
 - `candle-nn/src/kv_cache/chunked/gap/cycle.rs`, `GapCycle`: the gap's state
   from one gap to the next and its two calls, `catch_up` and `quantize`
@@ -882,13 +882,13 @@ Line numbers are as of commit `dc04b62ac`.
   (64 MiB, `gap_jobs_within`): 3,838 at 4 KV heads of 128, 4,739 at 2 of 256.
 - The `kv_gap` line, `candle-conversation/src/scheduler/kv_gap.rs`: summed per
   second and written while gaps run.
-- `batch_test/utils.rs`, `batch_test/fidelity.rs` and `quantized_qwen38_moe.rs`:
+- `batch_test/gap_tally.rs`, `batch_test/fidelity.rs` and `quantized_qwen38_moe/tests_speculation.rs`:
   every caller of `quantize_and_seal_sequences` moves to the gap — the batched
   gate's loop to `gap_catch_up` and `gap_quantize`, the other two to
   `gap_settle` — and the function is deleted.
 
 **7. Persistence (§5).**
-- `candle-conversation/src/persistence/thread.rs`: `run_pass` keeps the copy
+- `candle-conversation/src/persistence/thread/pass.rs`: `run_pass` keeps the copy
   (`copy_group_hot_to_warm`, which replaced `migrate_group_hot_to_warm`) and
   the append; a turn the gap still owes is left (`holds_native`). Deleted: the
   quantize and convert, the fence after the convert and the per-group sync,
@@ -896,7 +896,7 @@ Line numbers are as of commit `dc04b62ac`.
   scheduler's (`scheduler/gap_residence.rs`). The copy keeps its retry at the
   next gap (`await_owed_arenas`, `MAX_GAP_RETRIES`) and the pass its opening
   and closing syncs (§5). `BacklogGauge` stays, stamped with the copy backlog.
-- `candle-nn/src/kv_cache/chunked/chunk_ops.rs:1297`,
+- `candle-nn/src/kv_cache/chunked/chunk_ops/tier_migration.rs:1297`,
   `migrate_sealed_to_cpu_batch_async`: the copy, on the thread's own stream,
   through its pinned staging into the warm arenas.
 - `candle-conversation/src/persistence/`: `PersistenceTrigger::warm_turns`, a
@@ -928,7 +928,7 @@ Line numbers are as of commit `dc04b62ac`.
 - A record names its bands by raw address, so it must hold their gids
   (`meta_pool.rs`). A record filled at the catch-up holds the claimed gids, not
   the native ones.
-- A `ChunkPin` holds both the bands and the record (`gpu_chunks.rs`). Holding
+- A `ChunkPin` holds both the bands and the record (`gpu_chunks/chunk_pin.rs`). Holding
   only the first has already cost a night.
 
 **The sequence's layout.**
@@ -952,7 +952,7 @@ Line numbers are as of commit `dc04b62ac`.
   `kv_gap` line counts it.
 - The header upload at the catch-up goes through the slot-buffer staging path,
   which never reads the live host copy and is aware of recorded waves
-  (`gpu_chunks.rs`). No other path writes a slot buffer.
+  (`gpu_chunks/mod.rs`). No other path writes a slot buffer.
 - A copy stream's wait on `E_gap` needs an event that carries no timing.
   cudarc's `new_event(None)` already makes one. Events come from a small pool,
   one per outstanding gap and one per copy in flight.
@@ -966,7 +966,7 @@ Line numbers are as of commit `dc04b62ac`.
   session, and the table's cut is sized from that scratch, so no take of the
   gap's is declined or grown later.
 - The persistence copy gathers into device staging before the DtoH
-  (`chunk_ops.rs`). That staging is transient VRAM and stays small.
+  (`chunk_ops/tier_migration.rs`). That staging is transient VRAM and stays small.
 - The lease never buys ground from the experts. Deferral is the release valve,
   and a run of deferrals is a finding to log, not a reason to raise the lease.
 - Pinned staging is charged to system commit under WDDM. WhiteWorld already

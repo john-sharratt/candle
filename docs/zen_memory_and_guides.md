@@ -325,7 +325,7 @@ quoted in Phase 8's report.
   the brief, the design documents and the repository's rules, and record each
   decision in the answer; commit and push the result; run the brief's verify
   step; state anything only the user may approve as pending, and stop there.
-- **Outcomes.** The settle notes `workers.rs:1573-1628` writes gain `kind:
+- **Outcomes.** The settle notes `workers/settle.rs:1573-1628` writes gain `kind:
   outcome` on `Note` for an alone task, with where it landed and what waits on
   approval; `mcp::tending` writes the same note for an alone task it finds lost.
   Each outcome is indexed at `mcp/outcome/<owner>/<at>-<task digest>` — so two

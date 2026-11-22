@@ -587,7 +587,7 @@ tail whole, and the turn samples on from its pending token. What the
 projection placed reaches the recurrent layers through the tokens forwarded
 after it. The re-feed — the turn's last 8 tokens forwarded again over every
 rebuilt slot, the recurrent state folded on top — was built and withdrawn
-(`docs/reprojection_refeed.md`): it wrote each boundary's last tokens into
+(`docs/archived/reprojection_refeed.md`): it wrote each boundary's last tokens into
 the recurrent state twice, and the reasoning it ran under looped.
 
 **A request is read twice; every other opening once.** The question a new

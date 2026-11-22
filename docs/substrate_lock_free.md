@@ -4,7 +4,7 @@ Every reader and writer of a substrate, of its redo log, and of zend's engine
 waited on one of a handful of critical sections. This document is the audit of
 all of them — what each guarded, who took it, and the races that shape allowed
 — and the design that removed them. It replaces
-`docs/substrate_mutation_queue.md`, whose queue moved some writes off the
+`docs/archived/substrate_mutation_queue.md`, whose queue moved some writes off the
 scheduler but left every reader blocking and every queued write invisible
 until applied.
 
@@ -62,18 +62,18 @@ replaced; §3 onward describes what replaced it.
 | `SubstrateLock` (`RwLock<Substrate>` + mutation queue) | `substrate/lock.rs`, `Conversation::inner` | all 49 fields of `Substrate` (§2.2) | every thread: scheduler, persistence, writer, applier, replication, zend handlers and ingest, summariser, maintenance | maintenance reads 0.5–1.0 s every ~15 s; replication batches 0.25–1.16 s; projection reads |
 | `PersistenceLock` (`Mutex<SubstratePersistence>` + waiter count) | `persistence/priority_lock.rs` | the log (segments, staging, handles), manifest, accounting, header index, location maps, relocation watch, replica/rebase, minter handle | writer thread (one hold per job), maintenance batches, cold reads, elevate, replication, custom objects, model binding | relocation batches ~150 ms; compaction 16–31 s; I/O and fsync under it |
 | `Mutex<ConversationEngine>` | zend `state.engine`, ~155 sites | **nothing of its own** — every engine method takes `&self`, and npcd shared the same type without a mutex | every zend path | held across scheduler round-trips, prefills, git lookups, VFS restores, full metadata scans (15.6 s measured before a fork, 2026-10-29) |
-| `conversations` map (`Mutex<HashMap<String, Arc<ConvLock>>>`) | `zend/src/session.rs` | which conversations are resident | turn path, sweep, deletes, file changes | held across `fork_resuming` — a scheduler round-trip |
-| `base_conv: Mutex<Sequence>`, ingest bases | `session.rs` | the dialogue base, each ingest layer's base | forks, history reads | across `fork_resuming` |
+| `conversations` map (`Mutex<HashMap<String, Arc<ConvLock>>>`) | `zend/src/session/mod.rs` | which conversations are resident | turn path, sweep, deletes, file changes | held across `fork_resuming` — a scheduler round-trip |
+| `base_conv: Mutex<Sequence>`, ingest bases | `session/mod.rs` | the dialogue base, each ingest layer's base | forks, history reads | across `fork_resuming` |
 | `ConvLock<ConvState>` (tokio mutex) | per conversation | one turn in flight per conversation | turn path | the whole turn — **by design** (§8.4) |
 | `events_cache: Mutex` (inside the substrate) | `substrate.rs` | decoded events memo | belief scans under the substrate read | decode under the inner lock |
-| `Conversation` side locks | `resolver.rs` | `normalization`, `maintenance` (status), `branch_checkpoint`, `gallery_cache`, `held_index_pages`, `conv_state_writes` | scheduler, persistence, API | `gallery_cache` taken inside a substrate read |
+| `Conversation` side locks | `projection/resolver/mod.rs` | `normalization`, `maintenance` (status), `branch_checkpoint`, `gallery_cache`, `held_index_pages`, `conv_state_writes` | scheduler, persistence, API | `gallery_cache` taken inside a substrate read |
 | GalleryArena `residency`, `index_cache`, `zero_page`, dedup `book`/`masks` | `provenance/gallery_arena/` | resident pages, indices, codebook, masks | scheduler | `residency` across device uploads |
 | Writer `Backpressure` / `Progress` / handle | `persistence/writer.rs` | queue depth, write tickets | producers, the writer | flow control |
 | Minter | `persistence/identity/minter.rs` | origin sequence, section generations | every minting path | leaf |
 | `CHUNK_LOCATIONS` | `migrate_flight.rs` | chunk addresses during GPU moves | migrates, off-thread frees, compaction (all `try_`) | held across GPU work |
 | Inherited-log cache and file | `persistence/inherit.rs` | loaded inherited substrates; the seek cursor of each | cold loads | a load under the cache lock's check |
-| Engine internals | `engine.rs` | `plain_frames`, `attachments`, `scheduler_handle` | engine methods | short |
-| Sampler, telemetry, statics | `batched_sampler.rs`, `phase_ring.rs`, `memory_report.rs`, `relief_trace.rs` | scheduler-owned buffers, rings | scheduler (+ status reads) | `LEARNED_STORE` across `fs::write` once a minute on the scheduler |
+| Engine internals | `engine/mod.rs` | `plain_frames`, `attachments`, `scheduler_handle` | engine methods | short |
+| Sampler, telemetry, statics | `batched_sampler/`, `phase_ring.rs`, `memory_report/`, `relief_trace.rs` | scheduler-owned buffers, rings | scheduler (+ status reads) | `LEARNED_STORE` across `fs::write` once a minute on the scheduler |
 
 ### 2.2 What the substrate lock protected
 
@@ -385,7 +385,7 @@ been retired, so the entry's value is a slot (`ArcSwapOption`) emptied as the
 entry leaves the map — by `remove` and by the sweep. The released conversation,
 with its scheduler slot and resident KV, goes when its last holder lets it go;
 the map's retired copy holds nothing. npcd's live characters
-(`engine/mind.rs`) are held the same way.
+(`engine/mind/mod.rs`) are held the same way.
 
 ### 8.3 Read-modify-writes
 

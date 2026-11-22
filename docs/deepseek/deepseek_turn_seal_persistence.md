@@ -13,7 +13,7 @@ The sliding-window ring bounds the *live* window to `O(window_size)`. What it do
 **not** yet do is persist a turn so a resumed conversation reconstructs (a) the raw
 ring buffer and (b) the turn's compressed KV, and so provenance can *select* the turn.
 DeepSeek currently has **no substrate seal wiring at all** — `BatchedEngine` is only a
-`ManagedBatchedModel` (`wave.rs:132`), driven by tests; nothing calls `record_turn` /
+`ManagedBatchedModel` (`latent_moe/wave/mod.rs:132`), driven by tests; nothing calls `record_turn` /
 emits `WideQSig` / persists the gallery. This document specifies that seal, and the
 matching resume.
 
@@ -81,8 +81,8 @@ in-RAM state, so the superseded copy is absent from the resident set and reads a
 There is **no per-record `Tombstone`**: `RecordType::Tombstone` (record 14) is
 timeline/turn-scoped death, not a metadata-supersession marker; the supersede-and-keep-
 latest is the positional LWW mechanism `ConvState` uses (`persistence/mod.rs`
-`is_tracked_metadata` / `metadata_locs`; `maintenance.rs` `gather_resident_set`;
-`compaction.rs` `collect_live_records`). Distillation drops the ring like the KV chunks
+`is_tracked_metadata` / `metadata_locs`; `persistence/maintenance/resident.rs` `gather_resident_set`;
+`persistence/compaction/collect.rs` `collect_live_records`). Distillation drops the ring like the KV chunks
 (it is transient window state, not the durable belief signature `WideQSig`).
 
 **Resume.** Load the timeline's latest `WindowRing` → rebuild the ring arena directly
@@ -107,7 +107,7 @@ is what the user means by "a partially sealed turn gets softmax and merged in th
 attention kernel anyway."
 
 **Supersedes the monoid-persistence idea.** We do **not** persist an open `(m,l,acc)`
-tail across the seam. `GroupPartial` (`compressor.rs`) stays **reference-only algebra**
+tail across the seam. `GroupPartial` (`latent_moe/compressor/pool.rs`) stays **reference-only algebra**
 (its seam-fold proof remains a correctness test, not a runtime path). The next turn
 starts a fresh group; `group_idx` continues so corpus positions stay monotone.
 
@@ -213,23 +213,23 @@ On conversation open:
 ## 5. Integration points
 
 **candle-transformers / deepseek4**
-- `compressor.rs`: `IncrementalCompressor::close()` (+ byte-exact test).
-- `kernel_attention.rs` / `gallery.rs`: seal snapshot of the gallery's corpus entries
+- `latent_moe/compressor/incremental.rs`: `IncrementalCompressor::close()` (+ byte-exact test).
+- `kernel_attention.rs` / `latent_moe/gallery/snapshot.rs`: seal snapshot of the gallery's corpus entries
   (serialize) + inject (deserialize into `append_batch`/`gather_corpus` shape).
 - `indexer.rs`: `sign(Q)` extraction → `Vec<WideQSig>`.
-- `wave.rs` (`BatchedEngine`): seal hook exposing (window bytes, corpus entries,
+- `latent_moe/wave/mod.rs` (`BatchedEngine`): seal hook exposing (window bytes, corpus entries,
   indexer wide-Q) to the scheduler.
 - Ring snapshot/restore reads/writes the `ChunkedKvBacking` window arena (the
   `base_pos`/resident chunks from the committed ring work).
 
 **candle-conversation**
-- `persistence/record.rs`: `RecordType::WindowRing = 20` + payload codec.
-- Seal path (`scheduler/mod.rs::perform_seal_and_write` / `projection/resolver.rs::
+- `persistence/record/mod.rs`: `RecordType::WindowRing = 20` + payload codec.
+- Seal path (`scheduler/mod.rs::perform_seal_and_write` / `projection/resolver/mod.rs::
   record_turn`): accept + persist DeepSeek's window/corpus/wide-Q; DeepSeek override of
   `gather_wide_sigs` (Indexer source).
-- `persistence/maintenance.rs` / `compaction.rs`: `WindowRing` = supersede-and-tombstone
+- `persistence/maintenance/mod.rs` / `persistence/compaction/mod.rs`: `WindowRing` = supersede-and-tombstone
   per-timeline (mirror `ConvState`); keep only the latest live.
-- Resume (`persistence/resume.rs`): load latest `WindowRing` → ring rebuild; corpus
+- Resume (`persistence/resume/mod.rs`): load latest `WindowRing` → ring rebuild; corpus
   inject on turn selection.
 
 **Reused unchanged**: `WideQSig` + `encode_wide_sigs`/`decode_wide_sigs` +
@@ -284,7 +284,7 @@ All four artifacts' model-side primitives are landed and green. Each is self-con
 (no dependency on `candle-conversation`, honoring the crate direction), so the scheduler
 integration composes them.
 
-**Artifact B — close partials** (`latent_moe/compressor.rs`, `kernel_attention.rs`)
+**Artifact B — close partials** (`latent_moe/compressor/incremental.rs`, `kernel_attention.rs`)
 - `IncrementalCompressor::close(&mut self) -> Result<Option<(Tensor, u32)>>` — pools the
   trailing `< ratio` buffered rows (overlap: previous group's first-half included) into a
   pre-RoPE corpus entry + group-start position. Terminal (clears the buffer, advances
@@ -293,7 +293,7 @@ integration composes them.
 - `KernelLayerSeqState::seal_close(&mut self)` — closes `comp`+`icomp` in lockstep and
   appends the closed entry+key to the gallery.
 
-**Artifact C — corpus persist/restore** (`latent_moe/gallery.rs`, `wave.rs`)
+**Artifact C — corpus persist/restore** (`latent_moe/gallery/snapshot.rs`, `latent_moe/wave/mod.rs`)
 - `CorpusSnapshot { index_head_dim, len, nope_i8, nope_scale, rope_bf, keys }` with
   `encode()`/`decode()` — self-describing little-endian codec (magic `DSC2` + 5×u32
   geometry). **No positions stored** (reconstructed at inject — see below). Test
@@ -310,8 +310,8 @@ integration composes them.
   (B), snapshot (`Vec<Option<CorpusSnapshot>>`, `None` on SWA), and fresh-state restore
   that reconstructs each layer's positions as `corpus_base + i · compress_ratio(layer)`.
 
-**Artifact A — window ring snapshot/restore** (`kv_cache/chunked/sequence_ops.rs`,
-`chunk_ops.rs`; `latent_moe/wave.rs`)
+**Artifact A — window ring snapshot/restore** (`kv_cache/chunked/sequence_ops/mod.rs`,
+`kv_cache/chunked/chunk_ops/mod.rs`; `latent_moe/wave/mod.rs`)
 - `ChunkedKvBacking::{window_base_pos, resident_len, set_window_base_pos}` +
   `SequenceState::{base_pos, set_base_pos}` — the resident-window + absolute-frame
   accessors. Snapshot reads via `read_contiguous(seq, 0, resident_len)` (FP8/BF16 ⇄ F32 is
@@ -325,7 +325,7 @@ integration composes them.
   ending at `decode_pos`, so `base_pos = decode_pos − resident_len` is RECONSTRUCTED from
   the resume frame.
 
-**The resume path** (`latent_moe/wave.rs`)
+**The resume path** (`latent_moe/wave/mod.rs`)
 - `BatchedEngine::resume_sequence(session, seq, corpus_snaps, window, base, total_tokens)`
   — composes the artifacts at a (possibly new) absolute frame: corpus at `base + i·ratio`,
   the raw window as the tail ending at `decode_pos = base + total_tokens`
@@ -351,7 +351,7 @@ seal hook. So the conversation-side wiring below must land together with (a) a
 it earlier would be a record nothing writes / an always-on hot-path capture with no
 consumer. The seams are exact (mapped against the current tree):
 
-1. **`ManagedBatchedModel` seal hook** (`candle-transformers/.../batched_inference.rs`):
+1. **`ManagedBatchedModel` seal hook** (`candle-transformers/.../batched_inference/managed_model.rs`):
    add `fn seal_artifacts(&self, session, seq) -> Result<SealArtifacts>` (default: empty),
    overridden by `BatchedEngine` to call `seal_sequence` → `corpus_snapshot` →
    `window_ring_snapshot` + drain the per-token `query_band` capture. `SealArtifacts`
@@ -362,7 +362,7 @@ consumer. The seams are exact (mapped against the current tree):
    CSA layers), drained at seal. Always-on (no env flag), so it lands only with the
    scheduler consumer that pays for it.
 
-3. **`RecordType::WindowRing = 20`** (`persistence/record.rs`): next free tag. Add the
+3. **`RecordType::WindowRing = 20`** (`persistence/record/mod.rs`): next free tag. Add the
    enum variant, the `from_tag` arm, a binary `WindowRingRecordPayload {timeline_id,
    turn_index, ring: Vec<u8>}` (per-layer dense window-KV blob; the model's
    `WindowRingSnapshot` bytes). **No absolute position in the record** — the resume path
@@ -371,14 +371,14 @@ consumer. The seams are exact (mapped against the current tree):
    metadata (the `ConvState` family): `apply_walker_entry` arm stores it on the timeline
    (latest wins);
    `is_tracked_metadata` / `accounting.rs` / `manifest.rs` skip-list classify it;
-   `compaction.rs` `collect_live_records` + `maintenance.rs` `gather_resident_set`
+   `persistence/compaction/collect.rs` `collect_live_records` + `persistence/maintenance/resident.rs` `gather_resident_set`
    re-emit only the live copy; **dropped on distill** (transient, unlike `WideQSig`).
    `write_window_ring` helper + a `WriteJob::WindowRing` on the off-thread writer.
    Resume reads the timeline's latest ring → `window_ring_restore`. Verifiable on CPU by
    mirroring `wide_q_sigs_persist_and_recover` (emit → reopen → readback) and
    `wide_q_sigs_record_survives_compaction`.
 
-4. **Corpus persist as `Chunk`** (`persistence/resume.rs` `persist_turn_chunks*`): the
+4. **Corpus persist as `Chunk`** (`persistence/resume/persist.rs` `persist_turn_chunks*`): the
    turn's `CorpusSnapshot::encode()` blobs ride the existing per-turn `Chunk` records
    (one per compression layer, `chunk_index = flat_chunk_index(layer, 0, ...)`), injected
    on resume via `corpus_restore`.

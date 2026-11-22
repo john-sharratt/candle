@@ -44,7 +44,7 @@ always a **whole ingest conversation** — one file or one folder.
 of a file the corpus held whole with an `in_context` pointer and locked that
 reading in; the content was placed, but in the short term the model did not
 tie the pointer to it, and a re-fetch got the same pointer
-(`docs/zen_coding_session_fixes.md`, Cause 2). The page now arrives as a tool
+(`docs/archived/zen_coding_session_fixes.md`, Cause 2). The page now arrives as a tool
 result in the dialogue, and a file the turn's loop has read is kept out of the
 working set until the next question, so it is never carried twice.
 
@@ -127,7 +127,7 @@ Verified in the code. Items 1–6 are live bugs; the design removes each, and
 The working set is **not** part of the dialogue group. Each member is a member
 of its **own layer's group** — a file of `code_reading/scopes`, a folder of
 `repo_map/structure`. For a target that declares a working set the projection
-emits (`project.rs` Step 12):
+emits (`projection/project/pipeline/sink.rs` Step 12):
 
 ```
 system prompt
@@ -153,7 +153,7 @@ set) and §3.8 (the working set is always ahead of the dialogue).
 **Order within a group: the working set's own — insertion order.**
 `working_set_pick::pick` emits the group's members exactly as the `WorkingSet`
 sequence holds them (§4.3): provenance in the order it entered, each at its
-momentum. Each conversation's turns come in order, and `project.rs` does not
+momentum. Each conversation's turns come in order, and `projection/project/pipeline/sink.rs` does not
 re-sort a working-set group.
 
 The order is built so that **changes happen on the right.** RoPE attention
@@ -184,7 +184,7 @@ ahead of it moves further back. That remains open.
 **Budget.** The two groups are sized by the working set, not by the flexbox.
 On a selecting engine the shares below are caps on the slot fill
 (`projection/fill.rs`), which places the working set and the dialogue in one
-pass; on any other engine `project.rs` takes the working set's selections off
+pass; on any other engine `projection/project/pipeline/sink.rs` takes the working set's selections off
 the top and distributes the dialogue's `window` over the rest. Their
 `budget:` shares in `projection.yaml` are deleted.
 
@@ -367,9 +367,9 @@ scoped group, and leaves the set at the next observation.
 
 **Off the flexbox, by an existing precedent.** A `score_density` group already
 has its picks decided upstream and emitted verbatim, skipping the bounded pass
-(`project.rs:1851-1864`). A `working_set` group takes the same path, and one more
+(`projection/project/pipeline/sink.rs:1851-1864`). A `working_set` group takes the same path, and one more
 step: its natural consumption is left out of `layer_items`/`group_items`
-(`project.rs:1768-1848`), so the flexbox distributes the dialogue's `window`
+(`projection/project/pipeline/sink.rs:1768-1848`), so the flexbox distributes the dialogue's `window`
 over the other groups as if the working set were not there. Its selection is
 sized by its own budget and never trimmed.
 
@@ -513,7 +513,7 @@ own opening, the calls it made, prefilled. The unit names its face under
 entries, like `forked_from`.
 
 **A dialogue holds the opening by the face.** Every selected turn becomes a
-`ResolvedTurn` at one place (`projection/project.rs`). There, a projection
+`ResolvedTurn` at one place (`projection/project/resolved.rs`). There, a projection
 whose target is not an append-only ingest layer emits `Substrate::face_of(turn)`
 in place of a unit's opening turn, when the unit has a live, sealed face. The
 face is a turn like any other, with its own K/V, layout and index pages, so
@@ -618,7 +618,7 @@ and cap.
   position, so a dialogue inside the trained window runs the trained RoPE at
   every position. Progressive YaRN (`qwen4exp/rope.rs`) still carries a
   sequence a caller drives deeper ×2 to 524,288. The only length checks are
-  against the RoPE reach (`prefill.rs:2052`); `max_seq_len` is ignored for this
+  against the RoPE reach (`scheduler/prefill/first_samples.rs:2052`); `max_seq_len` is ignored for this
   architecture.
 - **Sparse attention.** Flash-Next has 12 attention layers (every 4th of 48) and
   36 recurrent. Spliced content reaches the attention layers only, through QSA's
@@ -650,20 +650,20 @@ measurement watches these numbers.
 | `WorkingSet`: seed / observe / remove / withhold, per-file momentum | `candle-conversation/src/working_set/state.rs` |
 | `WorkingSetConfig` (the `working_set:` block) | `candle-conversation/src/working_set/config.rs` |
 | `is_mark`, `is_dialogue` / `gather_tags` | `candle-conversation/src/working_set/marks.rs` |
-| Per-dialogue sets on the substrate; `tombstone_timeline` drops from every set | `candle-conversation/src/substrate.rs` (`working_set_*`) |
+| Per-dialogue sets on the substrate; `tombstone_timeline` drops from every set | `candle-conversation/src/substrate/registry.rs` (`working_set_*`) |
 | `observe` after the scan | `scheduler/mod.rs` (`reproject_view_prepare`), `Conversation::observe_working_set`, `projection/working_set_observe.rs` |
-| `working_set` selection rule, `WorkingSetShare` | `projection/schema.rs`, `projection/yaml.rs` |
-| Filling the groups; off the flexbox, emitted verbatim | `projection/project.rs` (Step 4b), `projection/working_set_pick.rs` |
-| The dialogue group holds lineage + its own turns; members per group | `projection/resolver.rs` (`TargetedRead::group_turns`, `working_set_members`) |
-| Withheld files: the set of files a turn's loop read for real, kept out of provenance's newcomers | `candle-conversation/src/working_set/state.rs` (`withhold`, `clear_withheld`), `substrate.rs` / `engine.rs` (`working_set_withhold`, `working_set_clear_withheld`) |
+| `working_set` selection rule, `WorkingSetShare` | `projection/schema/mod.rs`, `projection/yaml/mod.rs` |
+| Filling the groups; off the flexbox, emitted verbatim | `projection/project/pipeline/sink.rs` (Step 4b), `projection/working_set_pick.rs` |
+| The dialogue group holds lineage + its own turns; members per group | `projection/resolver/targeted_read.rs` (`TargetedRead::group_turns`, `working_set_members`) |
+| Withheld files: the set of files a turn's loop read for real, kept out of provenance's newcomers | `candle-conversation/src/working_set/state.rs` (`withhold`, `clear_withheld`), `substrate/registry.rs` / `engine/retrieval.rs` (`working_set_withhold`, `working_set_clear_withheld`) |
 | Which ingested readings stand for a file, and whether a reading covers it whole | `zend/src/working_set/corpus.rs`, `zend/src/working_set/coverage.rs` |
 | The dialogue layer's `working_set:` block | `zend/src/working_set.rs` (`dialogue_config`) |
 | Seed resolution | `zend/src/working_set/seeds.rs` |
-| Open, the read files withheld after each round, cleared at a new question | `zend/src/session.rs` (`run_inference_stream`, `withhold_read_files`) |
+| Open, the read files withheld after each round, cleared at a new question | `zend/src/session/inference_stream/stream_turn.rs` (`run_inference_stream`), `zend/src/session/working_reads.rs` (`withhold_read_files`) |
 | Layer config | `zend/src/prompts/projection.yaml` |
 | Faces: `face_of` / `unit_of`, the `face` / `face_of` keys | `candle-conversation/src/substrate/faces.rs` |
-| A dialogue holds an opening by its face; the event records the unit | `projection/project.rs`, `projection/event.rs` (`build_selection`) |
-| A unit's tombstone takes its face | `projection/resolver.rs` (`Conversation::tombstone_timeline`) |
+| A dialogue holds an opening by its face; the event records the unit | `projection/project/pipeline/sink.rs`, `projection/event/classify.rs` (`build_selection`) |
+| A unit's tombstone takes its face | `projection/resolver/lifecycle.rs` (`Conversation::tombstone_timeline`) |
 | Sealing faces after each pass, the `face/` lease | `zend/src/faces.rs`, `zend/src/branch_ingest/mod.rs` (`readings`), `zend/src/ingest_lease.rs` |
 
 ## 7. Tests (CPU unless marked)

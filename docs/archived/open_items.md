@@ -26,7 +26,7 @@ prefill** zend runs at load, before either test turn is submitted:
 - `Conversation::submit_prefilled_turn_group` pinned `grid.tokens[region.token_range()]`, the
   real tokens only, under a comment claiming that aligned 1:1 with the K/V. It did not: a
   15-token question is a 25-token case, padded 7, sealed as one 32-token block.
-- The substrate's own contract (`substrate.rs`, `TurnPart::token_count`) is
+- The substrate's own contract (`substrate/entries.rs`, `TurnPart::token_count`) is
   `token_count == token_ids.len()`, which cross-process replay rebuilds the grid from. The
   assert was right; the carved content was wrong. It was introduced by `d94c20f5` against an
   assert from `e10ad58f`.
@@ -80,7 +80,7 @@ href="/blog/feed.xml">` to every page's `<head>` (`page.rs:240`) and per-page ti
 (`git log -m -G assistant_lead`: no ordinary commit ever removed it), leaving
 `format!("{assistant_head}{assistant_prefill}")` — so a thinking-off turn on Qwen3.5/3.8
 prefilled no closed block, while `assistant_content_start` (non-empty-prefill arm) still
-measured past one. Restored through `conversation.rs::assistant_lead`, with
+measured past one. Restored through `conversation/probe_assembly.rs::assistant_lead`, with
 `assistant_lead_tests` pinning both dialect families.
 
 ### 4. Smaller
@@ -91,7 +91,7 @@ measured past one. Restored through `conversation.rs::assistant_lead`, with
 - **Stale test comments** in `belief.rs` citing the removed `ToolBelief::CAP` and a deleted
   saturation test.
 - **Mojibake** (`Â§` for `§`, a CP1252 round-trip): `scheduler/mod.rs` ×2 and
-  `projection/tests.rs` ×2, all from `80b5541b` (2026-05-31).
+  `projection/tests/mod.rs` ×2, all from `80b5541b` (2026-05-31).
 
 ### 5. Default-run test times
 
@@ -200,9 +200,9 @@ Measured over the two newest segments (`substrate_inspect projections --jsonl`, 
 
 **Corrections to the earlier analysis:**
 - **The floored path is not in play for tools.** The tools collection normalizes through
-  `cache.normalize` with no floors (`resolver.rs:945`), i.e. the unfloored denominator
+  `cache.normalize` with no floors (`projection/resolver/belief_collections.rs:945`), i.e. the unfloored denominator
   `max(level or hit_prior, floor)`. The `peak()`/`child_floor` path applies only to the
-  per-file groups (`resolver.rs:1855`). The ~1e6 arithmetic (1,170 × 42.7 × 1000 / d) needs
+  per-file groups (`projection/resolver/belief_groups.rs:1855`). The ~1e6 arithmetic (1,170 × 42.7 × 1000 / d) needs
   `d = 50` — which is `floor_min`, i.e. a collapsed level.
 - **Why levels collapse (code-derived, not yet measured).** `HitLevel::observe` folds zeros
   into the level (`hit_level.rs:73-84`, `alpha_dn = 0.02`), and every observe passes the
@@ -216,7 +216,7 @@ Measured over the two newest segments (`substrate_inspect projections --jsonl`, 
 - **Lever 3 is not wired.** `normalize_with_fallback` has no production caller — it and
   `ScopeKey::CollectionPhase` survive the phase-lens removal only in tests.
 - **The warm-up races the first query.** It runs on a thread spawned just before
-  `mark_ready` (`session.rs:4672`), so an early query scores against cold levels (prior 400).
+  `mark_ready` (`session/lifecycle.rs:4672`), so an early query scores against cold levels (prior 400).
 - **The design doc is stale.** `docs/provenance_score_normalization.md` still says "module not
   yet built", "collections (tools) … not yet wired" (§5) and "hard-floored at the prior"
   (§3.1) against `floor_min = 50`.
@@ -232,7 +232,7 @@ selected nothing and `proj #1` selected `datetime` at 5000.000.
 
 **Corrections to the earlier analysis:**
 - **The opening projection scores nothing at all.** Submit reads through the unscored
-  `read_for` (`mod.rs:3643`; `resolver.rs:532-563`: "every score lookup returns zero"). There
+  `read_for` (`mod.rs:3643`; `projection/resolver/handle.rs:532-563`: "every score lookup returns zero"). There
   is no prefill-Q scoring path — refutation #3's premise, and the comments at
   `mod.rs:3644-3648` / `3662-3663`, describe code that no longer exists.
 - **`5000.000` is the `fedd96e2` accumulator clamp**, removed by `3d9ed922` for exactly this
@@ -242,7 +242,7 @@ selected nothing and `proj #1` selected `datetime` at 5000.000.
   first sampled token (from prefill logits, against an empty `<tools>`) is exposed; if large,
   the early reprojection was lost.
 - **`ProbeCtx::probe` scores the same tool-tagged gallery as reprojection**
-  (`conversation.rs:4579`), not a different one; it works because it has a prefilled query.
+  (`conversation/probe_assembly.rs:4579`), not a different one; it works because it has a prefilled query.
 - **`projection.yaml:387-402` is false**: `question_pin` is read only in `score_beliefs`,
   never at submit, so it does not rescue the opening projection; the same comment still lists
   `tools_overview` under `depends_on: tools`. The header (`:58-61`) still says min112/evict60.
@@ -257,7 +257,7 @@ rather than from prefill logits — the smallest change, reusing the one scoring
 `paged-glue/` (357.49): every high hit is an ingest turn shaped *question + `<tool_call>`*,
 and `score_belief_groups` scores the whole stored signature, user half included. Levers:
 exclude the prompt half of the ingest turn from the gallery; or fix item 5. **Do not retry
-`content_gated` fusion** — introduced `660a1b66`, reverted `cbf2574c`; `session.rs` asserts
+`content_gated` fusion** — introduced `660a1b66`, reverted `cbf2574c`; `session/tests_projection.rs` asserts
 `FusionMode::Additive`.
 
 ---

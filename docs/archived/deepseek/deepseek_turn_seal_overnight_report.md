@@ -1,7 +1,7 @@
 # DeepSeek-V4 turn-seal persistence — overnight execution report
 
 **Date:** 2026-08-09 (overnight, autonomous). **Branch:** `deepseek-flash`.
-**Design doc:** [deepseek_turn_seal_persistence.md](deepseek_turn_seal_persistence.md)
+**Design doc:** [deepseek_turn_seal_persistence.md](../../deepseek/deepseek_turn_seal_persistence.md)
 (updated — §8 decisions resolved, §9 implementation status added).
 **Nothing committed** — per standing instruction, all changes are staged in the working
 tree for your review and commit.
@@ -45,7 +45,7 @@ signatures — and the matching resume path, with the doc's staged green checkpo
 ## What is implemented and tested (green)
 
 ### Stage 1 — Artifact B: close the partial compressor groups
-`candle-transformers/src/models/latent_moe/compressor.rs`, `kernel_attention.rs`
+`candle-transformers/src/models/latent_moe/compressor/incremental.rs`, `kernel_attention.rs`
 
 - `IncrementalCompressor::close() -> Result<Option<(Tensor, u32)>>` — finalizes the
   trailing `< ratio` buffered rows into a pre-RoPE corpus entry + group-start position.
@@ -59,7 +59,7 @@ signatures — and the matching resume path, with the doc's staged green checkpo
   including the empty-buffer → `None` boundary. Existing 6 compressor tests still pass.
 
 ### Stage 2 — Artifact C: corpus persist/restore
-`candle-transformers/src/models/latent_moe/gallery.rs`, `wave.rs`
+`candle-transformers/src/models/latent_moe/gallery/snapshot.rs`, `candle-transformers/src/models/latent_moe/wave/mod.rs`
 
 - `CorpusSnapshot` + `encode()`/`decode()` — self-describing little-endian codec
   (magic `DSC1` + 5×u32 geometry + the native durable set: `nope_i8`/`nope_scale`/
@@ -75,8 +75,8 @@ signatures — and the matching resume path, with the doc's staged green checkpo
   growth boundary).
 
 ### Stage 3b — Artifact A: window-ring snapshot/restore (model side)
-`candle-nn/src/kv_cache/chunked/{sequence_ops.rs,types.rs,chunk_ops.rs}`,
-`candle-transformers/src/models/latent_moe/wave.rs`
+`candle-nn/src/kv_cache/chunked/{sequence_ops/mod.rs,types/mod.rs,chunk_ops/mod.rs}`,
+`candle-transformers/src/models/latent_moe/wave/mod.rs`
 
 - `SequenceState::{base_pos, set_base_pos}` + `ChunkedKvBacking::{window_base_pos,
   resident_len, set_window_base_pos}` — resident-window + absolute-frame accessors.
@@ -125,9 +125,9 @@ Reconnaissance of `candle-conversation` (two deep passes, mapped in the doc) est
    `BatchedEngine`, invisible to the scheduler.
 2. **DeepSeek is not scheduler-driven yet.** Its tests call `forward_wave` directly; no
    `Scheduler` runs it. So "the scheduler seals a DeepSeek turn" is not an existing path.
-3. **The conversation-side record has ~11 GC touch points** across `record.rs`,
-   `substrate.rs`, `mod.rs`, `accounting.rs`, `manifest.rs`, `compaction.rs`,
-   `maintenance.rs`, `resume.rs`. This is the exact surface the memory bank repeatedly
+3. **The conversation-side record has ~11 GC touch points** across `record/mod.rs`,
+   `substrate/mod.rs`, `mod.rs`, `accounting.rs`, `manifest.rs`, `compaction/mod.rs`,
+   `maintenance/mod.rs`, `resume/mod.rs`. This is the exact surface the memory bank repeatedly
    flags for **silent data loss**.
 
 Given the project's own rules — *no stubs, don't land what isn't correct yet, no
@@ -150,18 +150,18 @@ placement), and each piece names the existing test it mirrors for CPU verificati
 ## Files changed (all uncommitted)
 
 **candle-transformers/src/models/latent_moe/**
-- `compressor.rs` — `IncrementalCompressor::close()` + 2 tests
+- `compressor/incremental.rs` — `IncrementalCompressor::close()` + 2 tests
 - `kernel_attention.rs` — `KernelLayerSeqState::{seal_close, snapshot_gallery, restore_gallery}`
-- `gallery.rs` — `CorpusSnapshot` + codec + `FloatGallery::{snapshot, from_snapshot}` + 2 tests
+- `gallery/snapshot.rs` — `CorpusSnapshot` + codec + `FloatGallery::{snapshot, from_snapshot}` + 2 tests
 - `indexer.rs` — `Indexer::{query_band, head_dim, n_heads}` + 1 test
-- `wave.rs` — `BatchedEngine::{seal_sequence, corpus_snapshot, corpus_restore,
+- `wave/mod.rs` — `BatchedEngine::{seal_sequence, corpus_snapshot, corpus_restore,
   window_ring_snapshot, window_ring_restore}` + `WindowRing{Snapshot,Layer}`
 - `mod.rs` — exports (`CorpusSnapshot`, `WindowRingSnapshot`, `WindowRingLayer`)
 
 **candle-nn/src/kv_cache/chunked/**
-- `types.rs` — `SequenceState::{base_pos, set_base_pos}`
-- `sequence_ops.rs` — `ChunkedKvBacking::{window_base_pos, resident_len, set_window_base_pos}`
-- `chunk_ops.rs` — `window_ring_snapshot_restore_round_trip` test
+- `types/mod.rs` — `SequenceState::{base_pos, set_base_pos}`
+- `sequence_ops/mod.rs` — `ChunkedKvBacking::{window_base_pos, resident_len, set_window_base_pos}`
+- `chunk_ops/mod.rs` — `window_ring_snapshot_restore_round_trip` test
 
 **docs/**
 - `deepseek_turn_seal_persistence.md` — §8 decisions resolved, §9 status + integration spec, §A supersede wording corrected

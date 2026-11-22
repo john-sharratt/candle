@@ -108,7 +108,7 @@ the turn needs and little else.
 |---|---|---|
 | a | crate roots and their `src/` folders; ARCHITECTURE, README | test files, benches, examples, game assets |
 | b | the paper, every page | anything unrelated to the paper |
-| c | the paper; `docs/performance.md` and the code its claims rest on (`compression_policy.rs`, `params.rs`, `wide_sig.rs`, `project.rs`) | test files, unrelated subsystems |
+| c | the paper; `docs/performance.md` and the code its claims rest on (`compression_policy.rs`, `sampled_selection/params/mod.rs`, `wide_sig.rs`, `projection/project/mod.rs`) | test files, unrelated subsystems |
 | d | the paper; files that restate its claims (README, ARCHITECTURE) | — |
 
 The analysis layers (`dependencies`, `architecture`, `critique`, `bugs`,
@@ -227,7 +227,7 @@ better informed, not just tidier.
 5. The paper's probe window is 64 tokens in six places; the code's is 256
    (`config/sequence_config.rs`, `SequenceConfig`'s probe window).
 6. §5's "template K/V never persisted" describes a removed mechanism —
-   `project/emit.rs`: "Template sections seal like any other".
+   `projection/project/emit.rs`: "Template sections seal like any other".
 7. §9.9's "no per-model calibration" contradicts the per-model `*_KV_FACTORS`
    rows.
 8. C10 is calibrated against the same story-rewrite test that validates it.

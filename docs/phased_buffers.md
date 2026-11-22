@@ -16,7 +16,7 @@ program that would read a buffer after its ground was reused.
 ## 1. Where the tier stood
 
 Three bump arenas, one per `LayerPhase`, laid side by side
-(`candle-nn/src/kv_cache/chunked/bump_arena.rs`, `begin_wave`):
+(`candle-nn/src/kv_cache/chunked/bump_arena/wave.rs`, `begin_wave`):
 
 ```
 | Attention span | FFN span | Forward span |      tier = the sum of the three
@@ -40,7 +40,7 @@ rows the attention phase (the DeltaNet chain) prices ~1.2 GB and the FFN ~1.0 GB
 — ~2.2 GB of the ~2.4 GB tier, for spans never live together.
 
 **Inside a phase, dead buffers keep their bytes.** The census of a DeltaNet
-layer at 2,100 rows (`wave_plan.rs`,
+layer at 2,100 rows (`wave_plan/tests_chains.rs`,
 `the_pre_mix_and_live_delta_net_match_the_census`):
 
 ```

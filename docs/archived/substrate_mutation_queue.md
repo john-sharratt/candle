@@ -15,13 +15,13 @@ site. Ten minutes of BlackWorld under ingest (build 4029, 2026-10-29):
 
 | Who | Site | n | max | total |
 |---|---|---|---|---|
-| maintenance's liveness scan (read) | `resolver/maintenance_op.rs:92` | 51 | 715 ms | 29.8 s |
-| maintenance's plan gather (read) | `resolver/maintenance_op.rs:110` | 12 | 1,010 ms | 9.9 s |
-| seal / metadata / tiering writers (wait) | `resolver.rs` `record_turn`, `couple_turn`, `rewrite_for_compaction`, `mark_timeline_transient`, `mint_timeline`, … | ~25 | 808 ms | ~11 s |
+| maintenance's liveness scan (read) | `projection/resolver/maintenance_op.rs:92` | 51 | 715 ms | 29.8 s |
+| maintenance's plan gather (read) | `projection/resolver/maintenance_op.rs:110` | 12 | 1,010 ms | 9.9 s |
+| seal / metadata / tiering writers (wait) | `projection/resolver/` `record_turn`, `couple_turn`, `rewrite_for_compaction`, `mark_timeline_transient`, `mint_timeline`, … | ~25 | 808 ms | ~11 s |
 | the scheduler's placement ranges (wait) | `scheduler/pending_ranges.rs:27` | 5 | 458 ms | 1.9 s |
 
 Build 4027, before the demote change below: the scheduler's ingest demote
-(`scheduler/prefill.rs`, `demote_ingest_once`) waited 56 times, up to 715 ms,
+(`scheduler/prefill/`, `demote_ingest_once`) waited 56 times, up to 715 ms,
 24.9 s in ten minutes — the scheduler thread stalled, every forward behind it.
 
 Two facts shape the design:

@@ -220,7 +220,7 @@ Experts are Q3_KO under 64 GiB of VRAM and Q4_KO at or above it
 - Per token, the expert input is one q8a128 row: 20 blocks × 144 B = **2,880 B**.
 - The pool returns one F32 row per *token*: **10,240 B**. That row is the
   routing-weighted sum of the token's CPU experts (§5.5). `down_out` is F32,
-  and the scatter reads F32 only (`cuda.rs:7449-7455`).
+  and the scatter reads F32 only (`quantized/cuda/moe_routing.rs:7449-7455`).
 
 ### 3.2 Bandwidth per machine
 
@@ -236,7 +236,7 @@ Experts are Q3_KO under 64 GiB of VRAM and Q4_KO at or above it
   reaches far less: 28% for PyTorch in Huang et al.
 - **The laptop's link is Gen4 ×8.** `nvidia-smi` read on 2026-10-16:
   `pcie.link.width.current = 8` against a maximum of 16. The generation reads
-  1 at idle and trains up to 4 under load. `dispatch.rs:112` and the
+  1 at idle and trains up to 4 under load. `dispatch/mod.rs:112` and the
   CPU-throttle memory note were right; `AGENTS.md` and
   `docs/performance.md:229` (×16, ~25 GB/s) are corrected in this change.
 - **The laptop's memory is LPDDR5X-7467** on Meteor Lake's 128-bit bus (SMBIOS
@@ -374,13 +374,13 @@ The amendments below land in `AGENTS.md` and
 8. **Pinned and mapped budgets.**
    - Pinned memory counts against WDDM's non-local budget (17.22 GiB on the
      laptop).
-   - The 64 MiB / 256 MiB observation (`cuda.rs:2446-2450`) is a *time* limit:
+   - The 64 MiB / 256 MiB observation (`quantized/cuda/dequantize.rs:2446-2450`) is a *time* limit:
      one launch writing host memory past the 2 s TDR. It is not a size cap. The
      rings are sized against the non-local budget, and no single launch writes
      more than the TDR allows.
    - Pageable warm slots need no pinning at all (§5.7).
 9. **The existing refusals** (`expert_cache_design.md:898-902`,
-   `expert_lre/handle.rs:11-12, 612`) refuse a CPU *device* build, which stays
+   `expert_lre/handle/construction.rs:11-12, 612`) refuse a CPU *device* build, which stays
    true. They are amended to point here, not replaced.
 
 ---
@@ -390,14 +390,14 @@ The amendments below land in `AGENTS.md` and
 ### 5.1 One more class in `moe_bucketize`
 
 `moe_bucketize` sorts every routed expert into VRAM, pinned or cold
-(`dispatch.rs:905-937`). It gains a fourth class, **CPU**, decided on the
+(`quantized/cuda/bucketize.rs:905-937`). It gains a fourth class, **CPU**, decided on the
 device per layer from:
 - the expert's count;
 - its live-table entry;
 - `SplitParams` (§5.3.1).
 
 The summary word is `count | pinned<<29 | cold<<30 | decode<<31`
-(`dispatch.rs:249-250`). Bit 28 becomes the CPU class, which leaves the count
+(`dispatch/ring.rs:249-250`). Bit 28 becomes the CPU class, which leaves the count
 28 bits. A CPU-class cold expert keeps bit 30, so the stager still stages it
 (§5.4).
 
@@ -437,7 +437,7 @@ scatter input, and the bytes it saves are small next to the experts' (a 10 KB
 row against a 2 MB expert).
 
 - **The stacked launch stays.** The shared SwiGLU and down run after the
-  stack (`quantized_moe.rs:173-175`, before the routed path at `:202-204`).
+  stack (`qwen35/quantized_moe.rs:173-175`, before the routed path at `:202-204`).
 - **These launches are serial.** Everything is on one stream
   (`live_table.rs:103-110`), so the overlap is between the CPU pool and the GPU
   stream, not among GPU branches. The GPU work behind bucketize is what hides
@@ -969,11 +969,11 @@ Each target is an estimate until measurement 0 replaces it.
 
 **Rows before routing (decode).**
 - `hc_mix_with_operand`'s epilogue already writes the q8a128 operand
-  (`wave.rs:4162`). At decode widths it also stores the rows into the row-ring
+  (`qwen4exp/wave/layers.rs:4162`). At decode widths it also stores the rows into the row-ring
   slot the forward thread reserved for this invocation.
 - **Where it applies.** It applies wherever the operand is emitted, including
-  the MTP head's FFN (`draft.rs:527`).
-- **Where the operand comes from `to_dynamic`** (`wave.rs:4195-4204`,
+  the MTP head's FFN (`qwen4exp/draft.rs:527`).
+- **Where the operand comes from `to_dynamic`** (`qwen4exp/wave/layers.rs:4195-4204`,
   `h2_q8 = None`), there is no epilogue to extend. A small row-export kernel
   runs there instead.
 - **Cost.** These writes happen on every decode layer, whether or not the split
@@ -1048,7 +1048,7 @@ measured campaign. A change stays only if a measurement says so.
 
 **Nothing to inherit from candle's CPU side** (inventory, 2026-10-16):
 - `k_quants::matmul` quantises and walks one token at a time, re-reading the
-  whole weight matrix per token (`k_quants.rs:6082-6129`), on the global rayon
+  whole weight matrix per token (`k_quants/mod.rs:6082-6129`), on the global rayon
   pool.
 - SIMD is chosen at compile time (`cpu/mod.rs:1-9`, `utils.rs:31-33`) under
   `target-cpu=native`.
@@ -1058,12 +1058,12 @@ measured campaign. A change stays only if a measurement says so.
 - Q3_KO has no CPU form (`quantized/mod.rs:1333-1341`).
 
 **What carries over is specification:**
-- the KO plane layout (`ko_quant.rs:306-389`, `dequant_ko` at `:641-699`);
+- the KO plane layout (`ko_quant/affine_ko.rs:306-389`, `dequant_ko` at `:641-699`);
 - the affine fold's arithmetic (`ko_affine_fold`, `kernel.cuh:2173-2183`): the
   scale and min terms and the sum convention, though not its rounding order
   (§6);
-- the q8a128 byte layout (`cuda_tests.rs:2875-2960`) and the Σx conventions
-  (`SumScale::Raw` for the SwiGLU operand, `dispatch.rs:1063-1069`);
+- the q8a128 byte layout (`quantized/cuda_tests/tests_q8a128_format.rs:2875-2960`) and the Σx conventions
+  (`SumScale::Raw` for the SwiGLU operand, `dispatch/launch.rs:1063-1069`);
 - the u8×s8 `maddubs` idioms in `quantized/avx.rs:21-44`;
 - crossbeam's `CachePadded` for ring words;
 - `raw-cpuid` (already in the lockfile) for WAITPKG, MONITORX and topology.
@@ -1280,7 +1280,7 @@ and residency must price it.**
 **Eviction.** The ranking already orders its passes by eviction class (whether
 the row routed the victim on its last visit, and whether a warm copy backs it),
 each class costed at its measured regret rate × what restoring one costs
-(`regret::eviction_costs`, set per pass by `pipeline.rs`'s
+(`regret::eviction_costs`, set per pass by `pipeline/ring.rs`'s
 `set_eviction_order`). The CPU class changes the restore costs, which
 `SplitParams::refill_secs` now supplies:
 
@@ -1301,7 +1301,7 @@ pack refill = cold_bias · pack_read + copy
 
 **Promotion.** A decode miss's GPU copy also installs the expert into a
 promotion slot: the workers store each slice into `remote_dst` as they copy it
-(`kernel.cuh:1650-1653`, `dispatch.rs:16-23`). A CPU-served miss has no GPU
+(`kernel.cuh:1650-1653`, `dispatch/mod.rs:16-23`). A CPU-served miss has no GPU
 copy to ride on, so its own launch claims nothing for it.
 
 **Promotion behind the pool** (`promote`: `none`, `cold`, `all`). The launch
@@ -1365,7 +1365,7 @@ the split on versus off.
   can't hold is a better use of the RAM.
 - It ships with the better static choice. Whether it should adapt at run time
   is measured with the eviction counters' "routed again at next visit" share
-  (`cache.rs:301-309`).
+  (`regret.rs:301-309`).
 
 **Sweeps.** Run `cold_bias` on the laptop at ×1, ×8 and C5×8, alternating, as
 the `FADE_FLOOR` sweep was. Record the pack-read share, the hit rate and t/s.

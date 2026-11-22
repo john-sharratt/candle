@@ -38,7 +38,7 @@ WDDM-launch-floor + MoE bound, so the sub-percent kernel win is invisible end-to
 streaming MXFP4 experts, 43 layers. RTX PRO 5000 Blackwell 72 GB (sm_120), WDDM.
 
 This document is the backlog for the round *after* the landed prefill batching (`pprep:select` 124×,
-`pprep:push` batched, writeback dead-work) — see `docs/deepseek/deepseek_perf_optimization_report.md`. It is a
+`pprep:push` batched, writeback dead-work) — see `docs/archived/deepseek/deepseek_perf_optimization_report.md`. It is a
 read-only static sweep of the forward hot path across five lenses: (1) VRAM↔RAM copies, (2) GPU syncs,
 (3) dtype conversions, (4) inefficient Rust/kernel code, (5) formula/op-sequence rewrites.
 
@@ -73,16 +73,16 @@ real levers; pure parallel-compute cuts are hidden under the launch floor at dec
 - **Category:** 1 (redundant activation quant) + 3 (dtype)
 - **Where:** `candle-transformers/src/models/latent_moe/linear.rs:78-85` (`QLinear::Int8::forward`),
   invoked per projection at `attention.rs:389` (`wq_a`), `attention.rs:398` (`wkv`),
-  `compressor.rs:90-91` (`wkv`/`wgate`), `indexer.rs:85`/`:108` (`weights_proj`); prefill mirror at
+  `latent_moe/compressor/mod.rs:90-91` (`wkv`/`wgate`), `indexer.rs:85`/`:108` (`weights_proj`); prefill mirror at
   `attention.rs:100/113/118`. Root cost: `to_dynamic` → `quantize_acts_q8a128`
-  (`candle-core/src/quantized/cuda.rs:4457`, alloc `:4467` + kernel launch `:4472`).
+  (`candle-core/src/quantized/cuda/activations_q8a128.rs:4457`, alloc `:4467` + kernel launch `:4472`).
 - **Issue:** the same `x [*, dim]` is quantized to q8a128 **independently for every projection** — ≥2
   full redundant quantizes/layer/token (`wq_a` + `wkv`), more on CSA/group-boundary tokens, ×43 layers ×
   every token. Each is a fresh VRAM alloc + kernel launch; at M=1 decode this launch overhead dominates.
 - **Fix (no int8-KO weight surgery — the API already exists and the MoE path already uses it):**
   quantize `x` once, share the operand.
   - Fused/best: `QMatMul::qkv_segmented(&op, &[wq_a_q, wkv_q, ...], DType::F32)`
-    (`candle-core/src/quantized/mod.rs:2337` → `cuda.rs:5117 qkv_segmented_matmul`) runs one shared
+    (`candle-core/src/quantized/mod.rs:2337` → `candle-core/src/quantized/cuda/dense_matmul.rs:5117 qkv_segmented_matmul`) runs one shared
     operand against multiple KO weights **of differing formats in a SINGLE launch**, returning the
     concatenated output. Build `op = cuda::to_dynamic(&x, Int8Mode::Performance, &dev)?` once — or fold
     the pre-attention RMSNorm+quant via `cuda::rms_norm_q8a128(pre_x, attn_norm, eps, dev)` exactly as
@@ -91,7 +91,7 @@ real levers; pure parallel-compute cuts are hidden under the launch floor at dec
     (`mod.rs:2313`) — no new kernels, just stop routing each weight through `forward_via_int8`.
   - Plumbing: `QLinear::Int8` already holds a `QMatMul` (`linear.rs:18`); add a
     `QLinear::forward_dynamic(&self, &DynamicTensor)` and a caller that builds the shared op once per
-    attention block. `Q8a128Operand` is explicitly reusable (`cuda.rs:4344 with_device_ptr`).
+    attention block. `Q8a128Operand` is explicitly reusable (`candle-core/src/quantized/cuda/q8a128_operand.rs:4344 with_device_ptr`).
 - **Confidence:** HIGH — removes N-1 of N quantize allocs+launches; proven pattern; not a drain
   relocation. **This is the reframed "x-proj concat" — the earlier int8-KO-weight-surgery worry was
   unfounded; `qkv_segmented` does the multi-weight-single-launch already.**
@@ -163,8 +163,8 @@ bit-exact with a tested prefill precedent.
 ## Tier 2 — solid, real
 
 ### T2.1 — Kill the `signs_cat` depth-scaling D2D copy
-- **Category:** 1 (VRAM↔VRAM copy). **Where:** `gallery.rs:1289-1295` (`q_signs_cat`) and
-  `gallery.rs:1309-1313` (`signs_cat`) in `two_stage_select_batched`.
+- **Category:** 1 (VRAM↔VRAM copy). **Where:** `latent_moe/gallery/select.rs:1289-1295` (`q_signs_cat`) and
+  `latent_moe/gallery/select.rs:1309-1313` (`signs_cat`) in `two_stage_select_batched`.
 - **Issue:** concatenates each deep session's **entire** `[len, sign_words]` resident sign index into one
   contiguous buffer per CSA layer per token, purely to hand `bdp_recall_batched` one base pointer. The
   sign index is **never spilled — GPU-resident at any depth** (`gallery.rs:47`), so this is an
@@ -172,15 +172,15 @@ bit-exact with a tested prefill precedent.
   ~350 MB/token). The one selection cost that scales with unbounded context.
 - **Fix:** give `bdp_recall_batched` a per-gallery **device pointer table** reading each gallery's
   `packed_signs()` in place — the same pointer-table shape `gather_corpus_batched` /
-  `run_corpus_gather_rows_batched` already use (`gallery.rs:~1530-1564`, though that one builds the table
+  `run_corpus_gather_rows_batched` already use (`latent_moe/gallery/gather.rs:~1530-1564`, though that one builds the table
   from `hot_region_ptrs()`, not `packed_signs()`). Needs a kernel-signature change.
-- **Note:** gallery.rs line numbers in this doc are ~15 low vs the current file (the file drifted); the
+- **Note:** latent_moe/gallery/mod.rs line numbers in this doc are ~15 low vs the current file (the file drifted); the
   cited regions are otherwise accurate. wave/paged/hyper/engine/attention/compressor refs are exact.
 - **Confidence:** HIGH for the unbounded-context product regime; pure copy, not a drain relocation.
 - **Hotness:** very high (per CSA layer × token × wave).
 
 ### T2.2 — Stop zero-initializing fully-overwritten kernel outputs
-- **Category:** 4 (needless work / driver memsets). **Where:** `paged.rs:375` + `:562` (attention `out`);
+- **Category:** 4 (needless work / driver memsets). **Where:** `latent_moe/paged/decode.rs:375` + `latent_moe/paged/prefill.rs:562` (attention `out`);
   `hyper.rs:376-378` (`pre`/`post`/`comb_raw`), `:418` (`y`), `:456` (mHC `out`); also `wave.rs:916-919`
   (the four gather output buffers).
 - **Issue:** these are `Tensor::zeros(...)` then **fully written** by their kernels (split-KV combine,
@@ -207,8 +207,8 @@ bit-exact with a tested prefill precedent.
 - **Confidence:** HIGH (q_pos_dec) → LOW; all genuine upload/alloc removals, none drain relocations.
 
 ### T2.4 — Build selection masks on-device instead of host-uploading them
-- **Category:** 1 + 4. **Where (remaining):** `two_stage_select_batched` validity mask (~`gallery.rs:1438-1444`,
-  host double loop `validv` then `affine`). The `batched_causal_select` mask (`gallery.rs:629-643`) is
+- **Category:** 1 + 4. **Where (remaining):** `two_stage_select_batched` validity mask (~`latent_moe/gallery/select.rs:1438-1444`,
+  host double loop `validv` then `affine`). The `batched_causal_select` mask (`latent_moe/gallery/mod.rs:629-643`) is
   **already on-device** (`arange`/`broadcast_lt`/`affine`, landed in commit 5d3928aa) — do NOT redo it.
 - **Issue:** the validity mask builds an `O(big·mm)` mask on the host in a double loop and H2D-uploads it
   every call. It is a pure function of a small per-row count: `col_index < a.m_s`.
@@ -233,12 +233,12 @@ bit-exact with a tested prefill precedent.
 - **Decode output narrow-then-cat round-trip** — `wave.rs:1004-1006` splits the contiguous
   `[n_dec,1,dim]` into `n_dec` narrows, `wave.rs:1194` re-`cat`s them. Push one `reshape((1,n_dec,dim))`
   view instead (free); on decode-only waves the `cat` collapses to a no-op. MEDIUM/small, bit-identical.
-- **Ascending re-sort in `two_stage_select_causal`** — `gallery.rs:568-576` does a u32→f32 cast + argsort
+- **Ascending re-sort in `two_stage_select_causal`** — `latent_moe/gallery/mod.rs:568-576` does a u32→f32 cast + argsort
   + `index_select` (~6 launches) to reorder `k` ids ascending, but the **batched** sibling proved order
   is immaterial (the decode reader attends the SET; softmax is order-independent; each entry carries its
   own RoPE position — `gallery.rs:1338-1342`). Drop the re-sort **iff** the single-session
   `two_stage_select` path is still live. MEDIUM conditional.
-- **Phase-B `pad+cat+stack` churn** — `gallery.rs:1390-1401` (`keys_pad`) + `:1437-1448` (`sl_pad`) pad
+- **Phase-B `pad+cat+stack` churn** — `latent_moe/gallery/select.rs:1390-1401` (`keys_pad`) + `:1437-1448` (`sl_pad`) pad
   each ragged session then `stack` (which allocs the result anyway). Alloc `keys_all`/`sl_all` zeros once
   and `slice_set` each row. LOW-MED (tensors small: mm ≤ 1024, ihd = 128).
 - **Single-session engine decode-step micro-uploads** — `kernel_attention.rs:343/344/352` rebuild
@@ -271,7 +271,7 @@ bit-exact with a tested prefill precedent.
   worker blocks fetch pinned misses themselves, the stager thread publishes cold experts, and the routing
   summary reaches the host through a mapped ring read asynchronously. Removing the readback alone would
   have relocated the drain; removing the host's place on the critical path is what removed it.
-- **append_batch f32-archive D2H** — `gallery.rs:275-278` (`attn.to_device(Cpu)`). Proven
+- **append_batch f32-archive D2H** — `latent_moe/gallery/mod.rs:275-278` (`attn.to_device(Cpu)`). Proven
   sync-attribution artifact (removing it just moved the drain to `prefill:writeback`). The `attn` field is
   bench-only (`gather_selected` has no production caller) — but the D2H is not the real cost.
 - **Greedy-decode readback** — `engine.rs:481/595` `argmax(...).to_scalar::<u32>()`. Required per

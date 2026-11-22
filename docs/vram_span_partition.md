@@ -348,8 +348,8 @@ low, and `weight_floor` can sit as far left as possible — **making the weight 
 and so expert residency, as large as it can be.**
 
 The code is `candle-nn/src/kv_cache/chunked/compact_plan.rs` (what to move),
-`compact_map.rs` (who holds the old identities), `compact.rs` (the pass), and
-`scheduler/prefill.rs::compact_kv_if_fragmented` (when). The harness that specified
+`compact_map.rs` (who holds the old identities), `compact/pass.rs` (the pass), and
+`scheduler/prefill/pack_pools.rs::compact_kv_if_fragmented` (when). The harness that specified
 it, and still gates it, is `candle-conversation/examples/kv_fragmentation.rs`.
 
 ### What the shape is, and why each part is that shape
@@ -472,7 +472,7 @@ it, and still gates it, is `candle-conversation/examples/kv_fragmentation.rs`.
 - **Every holder of a relocated identity is rewritten, structurally.** A chunk's gid
   *is* its location, so moving bytes changes identity. The holders span three crates
   — the backings' block tables, the substrate's residences, the projection caches —
-  and `compact.rs` enumerates them and refuses the pass if any sweep fails. It does
+  and `compact/pass.rs` enumerates them and refuses the pass if any sweep fails. It does
   not try to *discover* holders from a gid: there is no reverse index, and the
   refcount cannot stand in for one, because `HeadGids` is `Arc<Vec<ChunkGid>>` with a
   derived `Clone` and every sharing path shares the allocation. A prior branch tried

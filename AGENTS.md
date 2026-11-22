@@ -27,14 +27,14 @@ Under provenance-selected attention (not full-sequence attention), total numeric
 Every 32-token block is independently evaluated. The `CompressionPolicy` selects K/V formats per block based on cosine distance thresholds:
 - **C0** — near-lossless (K: R16/F16 fallback, V: Q8_0). Reference quality.
 - **C4–C5** — moderate compression (K: Q4_0 … Q8_0, V: Q3_0 … Q8_0; Q5_0/Q5_1 fill the Q4_1 → Q8_0 gap on C4–C6, and on K at C7)
-- **C9–C10** — maximum compression (sub-4-bit formats down to Q0_V/Q1_S); C10 is calibrated just inside each model's validation edge by its `*_KV_FACTORS` row in `sampled_selection/params.rs`, and reaches 4.1×–7.6× across the fleet
+- **C9–C10** — maximum compression (sub-4-bit formats down to Q0_V/Q1_S); C10 is calibrated just inside each model's validation edge by its `*_KV_FACTORS` row in `sampled_selection/params/` (`dense_factors.rs`, `moe_factors.rs`), and reaches 4.1×–7.6× across the fleet
 
 **Asymmetric K/V**: Keys are sensitive by channel, Values by token. Separate threshold tables exist for each (`PRODUCTION_K_QREL_*`, `PRODUCTION_V_QREL_*`).
 
 **Attention sink protection**: The first 4 tokens (positions 0–3) use a dedicated fine scale (Q4_KS/Q8_KS) to prevent global scale inflation from attention sink magnitudes.
 
 ### Attentional Provenance Retrieval
-Q vectors are captured live during decode (not pre-computed from embeddings). A paged GPU BDP scan over the resident gallery arena (Binary Directional Provenance: sign(Q_PCA^T @ K) agreement via IMMA/BMMA kernels; `candle-conversation/src/provenance/gallery_arena/scan.rs`) completes in milliseconds across the full unbounded corpus. Results prefetch from warm/cold tiers while GPU decodes the next token.
+Q vectors are captured live during decode (not pre-computed from embeddings). A paged GPU BDP scan over the resident gallery arena (Binary Directional Provenance: sign(Q_PCA^T @ K) agreement via IMMA/BMMA kernels; `candle-conversation/src/provenance/gallery_arena/scan/`) completes in milliseconds across the full unbounded corpus. Results prefetch from warm/cold tiers while GPU decodes the next token.
 
 ### Markov Expert Prediction (MoE models)
 Routing patterns from the prior layer predict the current layer's expert needs. Measured 69% hit rate on Qwen3-30B-A3B. Wave-batched grouped GEMM steps 64 concurrent sessions coherently through layers, amortising expert weight loads across sessions.
@@ -481,7 +481,7 @@ candle-kernels        (AOT CUDA kernels: paged-decode/, paged-prefill/, quantize
 
 **candle-nn** — The most actively developed crate. `kv_cache/` is where all the compression/paging/arena work lives.
 
-**candle-transformers** — `batched_inference.rs` + `batched_model.rs` are the high-level batched inference API. `batch_test/` has story/system prompt fixtures for integration tests.
+**candle-transformers** — `batched_inference/` + `batched_model.rs` are the high-level batched inference API. `batch_test/` has story/system prompt fixtures for integration tests.
 
 ---
 
@@ -499,7 +499,7 @@ beside it supplying only what is genuinely its own.
 | `latent_moe/geometry.rs` | `LatentGeometry` — `(head_dim, rope_dim, n_bands)` plus the divisibility rules the kernel tiling depends on. `SUPPORTED` lists the geometries the kernels are built for. |
 | `latent_moe/config.rs` | `Config` (carries its `&'static dyn Arch`), `LayerKind`. |
 | `latent_moe/loader.rs` | GGUF → weights. Names every tensor through the arch. |
-| `latent_moe/{paged,gallery,wave,engine}.rs` | Kernel wrappers, provenance corpus, wave batching, resident model. Model-agnostic. |
+| `latent_moe/{paged,gallery,wave}/`, `latent_moe/engine.rs` | Kernel wrappers, provenance corpus, wave batching, resident model. Model-agnostic. |
 
 **Adding a model in this family** is a sibling of `deepseek4.rs`: a unit struct
 implementing `Arch`. If it changes the *latent geometry*, `geometry::SUPPORTED`
@@ -517,20 +517,20 @@ The most complex part of the codebase. Key files:
 | File | Role |
 |------|------|
 | `mod.rs` | Public API, `KvFormat`, `QuantFormat`, `PagedKvArenas` trait |
-| `cache.rs` | `Cache`, `KvCache` (contiguous, simple baseline) |
+| `cache/` | `Cache`, `KvCache` (contiguous, simple baseline) |
 | `rotating.rs` | `RotatingKvCache`, `ScatteredKvCache` |
 | `arena_table.rs` | `ArenaTable`, `PerHeadTable`, `ArenaLocation`, palette indexing |
 | `chunked/mod.rs` | Exports, constants |
-| `chunked/backing.rs` | `ChunkedKvBacking` — core cache state |
+| `chunked/backing/` | `ChunkedKvBacking` — core cache state |
 | `chunked/arena.rs` | `Arena` enum (Float/Quantized), `ArenaKey`, `StoragePolicy` |
-| `chunked/gid_pool.rs` | `GidPool`, `ChunkGid` — free-list chunk allocator |
+| `chunked/gid_pool/` | `GidPool`, `ChunkGid` — free-list chunk allocator |
 | `chunked/head_gids.rs` | `HeadGids` — per-head/palette chunk GID collection |
-| `chunked/compress.rs` | Per-block format selection, quantization kernel calls |
+| `chunked/compress/` | Per-block format selection, quantization kernel calls |
 | `chunked/compression_policy.rs` | `CompressionPolicy`, level→candidate tables, production thresholds |
-| `chunked/sequence_ops.rs` | Sequence injection / sealing operations |
+| `chunked/sequence_ops/` | Sequence injection / sealing operations |
 | `chunked/io.rs` | Contiguous read/write, raw sealed-chunk extraction |
-| `chunked/gpu_chunks.rs` | GPU-side arena storage, kernel table builders |
-| `chunked/types.rs` | `SealedSequence`, `SealedChunk`, `ChunkMeta` |
+| `chunked/gpu_chunks/` | GPU-side arena storage, kernel table builders |
+| `chunked/types/` | `SealedSequence`, `SealedChunk`, `ChunkMeta` |
 
 > **Tiering status:** the three-tier KV cache is **built and wired** — GPU (hot)
 > → RAM (warm, CPU arenas) → NVMe (cold, append-only redo log). hot→warm runs on
@@ -543,7 +543,7 @@ The most complex part of the codebase. Key files:
 
 **`KvFormat`**: `Float(DType)` or `Quantized(QuantFormat)`. All quant blocks = 32 elements.
 
-**`CompressionPolicy`**: Given a level (C0–C9), returns ordered candidate lists for K and V. Evaluation in `compress.rs` picks smallest format passing cosine distance threshold.
+**`CompressionPolicy`**: Given a level (C0–C9), returns ordered candidate lists for K and V. Evaluation in `chunked/sampled_selection/sampler.rs` picks smallest format passing cosine distance threshold.
 
 ---
 

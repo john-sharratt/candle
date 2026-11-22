@@ -26,8 +26,8 @@ and a standing task restates an idle drone's summons every 90 s
 | Piece | Where | Bearing |
 |---|---|---|
 | Zen is `takes_orders: false` — an **unordered** body; drones take orders | `tenant.rs:980`, `Missions::is_unordered` | The one switch every Zen/drone branch reads. No code names Zen. |
-| Zen is `moves: attention` — no `move_to`, no lift, a `focus` teleport | `sim/mod.rs:139`, `enact.rs:676` | Half-way to no body already. |
-| A conversation can be unloaded and rejoined from the log | `Minds::let_go` (`mind.rs:2097`) | Used by suspension; an idle drone uses the same path. |
+| Zen is `moves: attention` — no `move_to`, no lift, a `focus` teleport | `sim/mod.rs:139`, `engine/enact/movement.rs:676` | Half-way to no body already. |
+| A conversation can be unloaded and rejoined from the log | `Minds::let_go` (`engine/mind/conversation.rs:2097`) | Used by suspension; an idle drone uses the same path. |
 | A held character: parked, `begin_tick` refuses, inbox fills and is cut on resume, reflect/dream/journal refuse | `Scheduler::suspend`, `follow_suspended`, `held::PER_SOURCE` | Exactly what idle is. |
 | The table hands a free drone its work | `Runtime::assign_work` → `work::take_up` | Built (§8 step 1): no act of a drone's takes work. |
 | An unordered body takes nothing from the table | `Missions::collect` | Its missions come from the people who message it. |

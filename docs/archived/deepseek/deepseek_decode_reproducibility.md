@@ -125,7 +125,7 @@ Both call sites built their expert list with
 slot is empty at compute time. Its contribution simply vanishes and the layer
 returns an answer computed from fewer than k experts, indistinguishable
 downstream from a correct one. Now a hard error at both sites
-(`pipeline.rs`, `handle.rs`).
+(`pipeline.rs`, `expert_lre/handle/mod.rs`).
 
 Measured: it never fires on these workloads, so it was **not** a cause of the
 non-determinism. It is a latent correctness hazard, closed.
@@ -134,12 +134,12 @@ non-determinism. It is a latent correctness hazard, closed.
 
 | Test | Where | Asks |
 |---|---|---|
-| `prefill_kernel_is_bitwise_repeatable` | `latent_moe/paged.rs` | the prefill kernel returns the same bits twice — **0.16 s, no model** |
-| `prefill_replay_probe` | `batch_test/utils.rs` | re-prefilling a prompt is bitwise stable |
-| `decode_replay_probe` | `batch_test/utils.rs` | a decode step replayed from identical KV state is bitwise stable |
-| `wave_decode_step_bitwise_probe` | `latent_moe/wave.rs` | both of the above, on the real model |
-| `wave_decode_is_reproducible` | `latent_moe/wave.rs` | end-to-end token streams |
-| `qwen3_moe_decode_replay_is_bitwise_repeatable` | `quantized_qwen3_moe.rs` | **the harness control** (see below) |
+| `prefill_kernel_is_bitwise_repeatable` | `latent_moe/paged/tests_prefill.rs` | the prefill kernel returns the same bits twice — **0.16 s, no model** |
+| `prefill_replay_probe` | `batch_test/utils/reproducibility.rs` | re-prefilling a prompt is bitwise stable |
+| `decode_replay_probe` | `batch_test/utils/reproducibility.rs` | a decode step replayed from identical KV state is bitwise stable |
+| `wave_decode_step_bitwise_probe` | `latent_moe/wave/tests_reproducibility.rs` | both of the above, on the real model |
+| `wave_decode_is_reproducible` | `latent_moe/wave/tests_reproducibility.rs` | end-to-end token streams |
+| `qwen3_moe_decode_replay_is_bitwise_repeatable` | `quantized_qwen3_moe/tests_gates.rs` | **the harness control** (see below) |
 
 Prefill and decode are gated **separately and on purpose**: end-to-end token
 streams cannot attribute a divergence to one or the other, so a fix to either

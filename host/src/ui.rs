@@ -111,7 +111,7 @@ mod tests {
     }
 
     /// **The shared library polls only while it is seen**
-    /// (`docs/performance_patch.md` W12): the helper is the one file that
+    /// (`docs/archived/performance_patch.md` W12): the helper is the one file that
     /// starts a poll's interval; the performance page's age clock is the
     /// other interval, and it polls nothing.
     #[test]

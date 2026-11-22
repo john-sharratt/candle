@@ -12,7 +12,7 @@ being `life` → `moon`. This document is the design; the code answers to it.
 | What | Where | On a rename |
 |---|---|---|
 | The world's records — sim, bodies, missions, the Discord mirror's guild, threads, webhooks and channel bindings, servers, DMs, NPC leases | substrate custom objects under `world/<id>/` (`world_state::keys`) | **taken in** (§3) |
-| Each character's world | the NPC record's `world_id` (`npcs.rs`, `Casting`) | **rewritten** (§3) |
+| Each character's world | the NPC record's `world_id` (`npcd/src/npcs/methods.rs`, `Casting`) | **rewritten** (§3) |
 | The world's mind files | `worlds/<id>.yaml`, `map/<id>/`, `missions/<id>.yaml` and `missions/<id>/`, `rounds/<id>.yaml`, `standing/<id>/` | **moved** in the mind, in one commit (§4) |
 | An operation's store | a timeline named by a hash over the world id (`opstore::owner`) | **drained first** (§4): none may be open |
 | An owner's unpublished drafts of the world's mind files | the owner's draft store, by path | **published or dropped first** (§4) |

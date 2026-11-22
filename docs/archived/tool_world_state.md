@@ -223,7 +223,7 @@ cluster that touches the product's actual users.
 
 `character_write_beliefs`
 
-`tools.rs` holds `tests::no_tool_writes_beliefs` as a build failure, and its
+`tools/tests_grammar.rs` holds `tests::no_tool_writes_beliefs` as a build failure, and its
 module documentation is explicit: beliefs move only through the evidence-threshold
 process on the sleep clock; an operator authoring a character can write them
 *"through the authoring API; that plane is separate and is not reachable from

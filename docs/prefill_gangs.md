@@ -4,8 +4,8 @@ How a prefill group divides its budget between the prompts waiting on it, and
 why background ingest is divided differently from dialogue.
 
 Code: `candle-conversation/src/scheduler/gang.rs` (the arithmetic),
-`scheduler/prefill.rs` (`form_wave_group`, `fit_cohort_to_ground`,
-`weights_at_width_beside`, `prefill_gang_for`).
+`scheduler/prefill/wave_group.rs` (`form_wave_group`, `fit_cohort_to_ground`),
+`scheduler/prefill/rate_model.rs` (`weights_at_width_beside`, `prefill_gang_for`).
 
 ## 1. What the queue looked like
 

@@ -311,7 +311,7 @@ site, rather than serving an empty page that looks like a bug in the GUI.
 web/
   web.yaml                  the site table — the whole deployment
   src/
-    config.rs               sites, routes, backoff, auth config
+    config/                 sites, routes, backoff, auth config
     server.rs               host → site → (local | proxy | files); the Builder
     proxy.rs                streaming forward, ws tunnel, identity headers
     health.rs               per-upstream backoff and single-probe recovery

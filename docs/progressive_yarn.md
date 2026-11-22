@@ -161,7 +161,7 @@ refused rather than double-scaled.
 
 - `latent_moe::rope::yarn_freqs` (`latent_moe/rope.rs:32`) feeds the kernel
   table through `build_rope_table` (`kernel_attention.rs:117-129`,
-  `paged.rs:190`).
+  `latent_moe/paged/paged_geometry.rs:190`).
 - Per layer, compressing layers use YaRN with θ 160,000 and SWA layers use plain
   θ 10,000 (`latent_moe/config.rs:118-124`).
 - The constants live in `deepseek4.rs:129-136`. The GGUF does not carry them.
@@ -172,7 +172,7 @@ refused rather than double-scaled.
   tensor, never as metadata keys (`conversion/llama.py`,
   `generate_extra_tensors`).
 - Our loader looks only for four `llama.rope.scaling.*` keys
-  (`quantized_llama.rs:1091-1128`). It never reads that tensor, so it builds
+  (`quantized_llama/model.rs:1091-1128`). It never reads that tensor, so it builds
   plain RoPE at θ 5e5.
 - Llama3 scaling divides the low-frequency pairs **at every position**. So
   Hermes is slightly wrong even at short contexts, not only past 8K.
@@ -183,7 +183,7 @@ refused rather than double-scaled.
 
 - `infer_rope_scaling_factor` (`quantized_qwen3.rs:51-62`) turns any
   `qwen3.context_length` above 32,768 into a linear factor `ctx / 32768`.
-- Our Qwen3-8B GGUF declares 40,960 (`quantized_qwen3.rs:1608-1610`).
+- Our Qwen3-8B GGUF declares 40,960 (`quantized_qwen3/tests_gate.rs:1608-1610`).
 - So every Qwen3 dense position is compressed 1.25× today, at every length.
 
 **The two neighbours are not affected.** Qwen3Moe scales only on a declared
@@ -193,8 +193,8 @@ exactly 32,768.
 ### 3.2 `mscale`: not applied anywhere, so there is nothing to double
 
 - **No path applies an attention temperature today.** Every GQA softmax scale
-  is exactly `1/√head_dim`: `prefill_utils.rs:667, 1686`,
-  `batched_layer.rs:1290, 1511`, `decode_utils.rs:447`, and the reference paths
+  is exactly `1/√head_dim`: `prefill_utils/` (667, 1686),
+  `batched_layer/` (1290, 1511), `decode_utils.rs:447`, and the reference paths
   in the `quantized_*` loaders.
 - **The one `mscale` in the tree** is `deepseek2.rs:375-494`, which is not on any
   path we serve.
@@ -222,8 +222,8 @@ more than one sequence. None does.
 | `latent_decode_kernel` / `latent_prefill_kernel` (DeepSeek) | one slot per CTA; one query per CTA | `latent_decode_kernel.cuh:211-220`, `latent_prefill_kernel.cuh:468-520` | `:380-389`, `stage_key` `:407-418` | no |
 | QSA `append_kernel` (`qsa_index_append.cu:125-187`) | **one launch spans every sequence in the wave**; one CUDA block = one key of one sequence | — | `job.pos` | the table pointer is launch-wide |
 | QSA `flush_kernel`, `place_kernel` | one sequence per launch in practice | — | `tail_base + n·ratio`; one `delta` per page | the table pointer is launch-wide |
-| QSA query rope, host (`indexer.rs:1187-1201`) | one call over **all rows of the wave** | each row's own position | — | one table for every row |
-| float fallback, host (`batched_layer.rs:1119-1258`) | per-sequence loop | per-sequence slice | per-sequence slice | one table split once per wave |
+| QSA query rope, host (`indexer/project.rs:1187-1201`) | one call over **all rows of the wave** | each row's own position | — | one table for every row |
+| float fallback, host (`batched_layer/fallbacks.rs:1119-1258`) | per-sequence loop | per-sequence slice | per-sequence slice | one table split once per wave |
 
 So bleed is possible only through **launch-wide parameters**. §6.2 lists every
 one of them with its fix.
@@ -237,9 +237,9 @@ with that reader's own table, and I1 already holds for K/V.
 
 - **The live tail is rotated at absolute positions.** The append and flush
   kernels rotate each pooled key at `tail_base + n·ratio` into
-  `IndexCache.keys` (`indexer.rs:62-64, 313-341, 1365`).
+  `IndexCache.keys` (`indexer/mod.rs:62-64, 313-341, 1365`).
 - **The live tail is scored by cuBLAS reading those rows directly**
-  (`indexer.rs:875-905`), not by the paged scorer.
+  (`indexer/score.rs:875-905`), not by the paged scorer.
 - **Pages are rotated relative to their own start.**
   - A seal turns rows back by `−frame` (`seal_page`, `wave.rs:81-89`).
   - `IndexPage` carries `roped_base` (`paged_index.rs:47-66`).
@@ -347,7 +347,7 @@ The Q sites:
 | Tile decode | `i8_apply_rope(x, q_pos, …)` for the Q rows (`int8_decode_tile_kernel.cuh:2168`), before the Q window scale is taken |
 | Int8 prefill | `i8_apply_rope` for Q (`paged_prefill_int8_kernel.cuh:365-366`), before int8 quantization |
 | Glue | `paged_glue_kernel.cuh:255-259` |
-| Float fallback | the per-sequence host planes, built per rung from `RopeRungs::cos_sin`: K's at scale 1, Q's at the rung's `q_scale` (`batched_layer.rs`) |
+| Float fallback | the per-sequence host planes, built per rung from `RopeRungs::cos_sin`: K's at scale 1, Q's at the rung's `q_scale` (`batched_layer/fallbacks.rs`) |
 | QSA indexer query | `qsa_rope_rows`, one launch over the wave, each row at its sequence's rung with that rung's `m²` (`RotSide::Query`, §7.4). The reference rotates the indexer with the attention's own YaRN cache, `m` included (§12) |
 
 Every paged kernel reads it through one helper: `RopeView::for_q()`
@@ -414,7 +414,7 @@ and tested, so it becomes the engine's one RoPE table:
   loads, then `_rn` multiply and add. There is **no contraction**, so the CPU
   mirror can be bit-exact.
 - **Tests:** a CPU mirror of builder and lookup (`paged.rs:2444-2492`), with
-  `rope_table_device_matches_mirror` (`paged.rs:4195-4246`) checking every entry
+  `rope_table_device_matches_mirror` (`latent_moe/paged/tests_kernel_gates.rs:4195-4246`) checking every entry
   and a spot-checked lookup.
 
 The format's lookup is shared as `candle-kernels/src/rope/rope_table.cuh`
@@ -442,7 +442,7 @@ multiply is one integer operation beside two `float2` loads.
 | Hybrid attention at 1,010,000 | ≈ 986 MiB | 768 KiB |
 | Qwen3 attention (`[max_pos, 128]`) at 131,072 | 64 MiB | **1.5 MiB** (P = 64) |
 | Qwen4Exp indexer (`RopeTables`, cos + sin `[max_pos, 32]`) at 262,144 | 64 MiB | shares the attention rung table |
-| DeepSeek-V4 | 43 layers × 768 KiB = 32 MiB (one table per layer, `wave.rs:370-381`) | **2 × 768 KiB**, one per frequency set |
+| DeepSeek-V4 | 43 layers × 768 KiB = 32 MiB (one table per layer, `latent_moe/wave/mod.rs:370-381`) | **2 × 768 KiB**, one per frequency set |
 
 **All rungs of a model fit in one allocation of at most 4.5 MiB.** That is three
 rungs of 1.5 MiB, well inside even the 3090's 6 MiB L2.
@@ -450,12 +450,12 @@ rungs of 1.5 MiB, well inside even the 3090's 6 MiB L2.
 So every table exists from load:
 
 - no lazy build and no `max_blocks` rebuild (today's caches compare with `==`,
-  `batched_model.rs:899-915`, `qwen4exp/wave.rs:1436`);
+  `batched_model/` (899-915), `qwen4exp/wave/` (1436));
 - no host loop over hundreds of millions of entries;
 - no upload of hundreds of MB.
 
 **The indexer and attention share one rung table.** The QSA indexer rotates with
-the model's own `θ` and 64-dim rotary width (`config.rs:229-236`), so its
+the model's own `θ` and 64-dim rotary width (`qwen4exp/config.rs:229-236`), so its
 frequencies are the attention's.
 
 ### 5.4 Cost and accuracy
@@ -675,7 +675,7 @@ placement staging.
   its register edge. It uses 64 registers, and at 51 it spilled (`:99-104`).
 - **The live tail moves off cuBLAS, including at prefill width.** Today the
   tail is scored by a cuBLAS matmul over **every** query row of the span
-  (`indexer.rs:875-905`, tiled by `SCORE_TILE_BYTES`). A prefill chunk is
+  (`indexer/score.rs:875-905`, tiled by `SCORE_TILE_BYTES`). A prefill chunk is
   thousands of rows.
   - The paged scorer puts rows on the grid's y axis and re-reads every key once
     per row tile (`:301-306`).
@@ -902,7 +902,7 @@ Each round:
   within run-to-run variance. At this width (b)'s tail is cuBLAS, so this is the
   gate the wide-row arm answers to.
 - **Every correctness test green,** and `device_selection_matches_the_cpu_oracle`
-  (`indexer.rs:2779`) unchanged.
+  (`indexer/tests_device.rs:2779`) unchanged.
 
 **If the rounds do not reach the gates,** the fallback runs in this order. Each
 step is taken only on the evidence that the previous one fell short:
@@ -973,10 +973,10 @@ hold row-major rows rotated by `j·ratio` relative to each page's start.
 - `qsa_page_place.cu:46-52` says one placement covers every page of every
   layer. Every caller places one cache or one window. The file's header is
   rewritten with its reduction to a transpose.
-- `latent_moe/paged.rs:233-238` says the CorpusCache is roped once. It holds
+- `latent_moe/paged/corpus_cache.rs:233-238` says the CorpusCache is roped once. It holds
   pre-rotation `rope_bf` plus `comp_pos`.
-- `latent_moe/gallery.rs:531` says indexer keys are pre-RoPE. They are stored
-  rotated (`wave.rs:2139, 2595` via `Compressor::pool_and_norm`).
+- `latent_moe/gallery/mod.rs:531` says indexer keys are pre-RoPE. They are stored
+  rotated (`latent_moe/wave/` at 2139, 2595, via `Compressor::pool_and_norm`).
   - DeepSeek's schedule is static, so this cannot bleed.
   - It is outside §7, which covers the Qwen4Exp QSA index; DeepSeek's indexer
     keys remain rotated.
@@ -1002,7 +1002,7 @@ rung = rung_of(ceilings, offset + input_len)
   for a decode row, `offset + q_len` for a prefill span, the slot's `kv_len` for
   glue.
 - Positions are absolute everywhere a rung is read. The one sliding-window ring
-  (`sequence_ops.rs:199-214`) is DeepSeek's latent window, whose schedule is one
+  (`latent_moe/engine.rs:199-214`) is DeepSeek's latent window, whose schedule is one
   rung per layer kind, so its evicted front never reaches a rung choice.
 
 **Consequences:**
@@ -1053,7 +1053,7 @@ paths refuse any row past rung 0 (§6.3), and the oracles are tests.
   `llama_rope.rs` (moved into `rope_schedule/llama3.rs`);
 - `infer_rope_scaling_factor`, its Qwen2 twin and `QWEN3_NATIVE_CONTEXT_LEN`;
 - the host indexer query rope (`RopeTables` remains only as the CPU oracle);
-- the θ loops in `qwen35/batched.rs` and `qwen4exp/wave.rs` (the lineages'
+- the θ loops in `qwen35/batched/` and `qwen4exp/wave/` (the lineages'
   schedules live in `qwen35/rope.rs` and `qwen4exp/rope.rs`);
 - the per-layer DeepSeek tables (`latent_moe/rope_tables.rs` shares one per set);
 - the placement kernel's rotation (it remains as a pure transpose into the
@@ -1092,18 +1092,18 @@ the code.
 | DeepSeek unchanged | `latent_moe` | The moved `yarn_freqs` returns identical vectors for `(160000, 65536, 16, 32, 1)`; the shared table is byte-equal to today's per-layer table; the DeepSeek forward gate passes |
 | Llama3 | `rope_schedule/llama3.rs` | Records whether both Hermes presets' files (and the Nidum file) carry `rope_freqs.weight`; where one does, it equals the published-parameter formula; a Llama3 preset without the tensor builds exactly the published-parameter frequencies |
 | `SlotHeader` layout | `slot_types.cuh` + `models/slot_header.rs` | `sizeof == 32` and every field offset agree between CUDA (`static_assert`) and Rust (`the_layout_is_the_kernels`); decode, prefill, glue and latent kernels all read a 32-byte stride |
-| Qwen3 linear gone | `quantized_qwen3.rs` | Our 40,960-declaring Qwen3-8B GGUF builds rung-1 `ω` exactly `1/θ^(2i/d)` |
+| Qwen3 linear gone | `quantized_qwen3/tests_gate.rs` | Our 40,960-declaring Qwen3-8B GGUF builds rung-1 `ω` exactly `1/θ^(2i/d)` |
 | Factored table exactness | `rope_schedule/table.rs` + GPU | The table is host-built, so there is no device builder to compare; the device lookup equals the CPU mirror bit for bit at positions {0, 1, 1023, 1024, 1025, 2¹⁰·k ± 1 sampled across k < 2048, 2²¹ − 1} for P = 32 and 64 (`indexer::tests::device_lookup_is_the_host_mirror_bit_for_bit`, which rotates unit pairs so the output is the lookup itself) |
 | **Factored table accuracy** | `rope_schedule/table.rs` | Max \|lookup − f64 (sin, cos)\| over a sweep of every `hi` row × sampled `lo` rows, for each model's rung-1 and rung-4 `ω`. The bound is measured, then pinned as a raw constant |
 | Pass-through pairs | `table.rs` | Pair ≥ P returns exactly `(0, 1)` |
 | Lane tables | `table.rs` | Each (rung, ratio) lane table equals the factored lookup at `L·ratio` for every lane and pair |
 | Tile kernel unit step | `int8_decode_tile_kernel` test | A group walked from `rope0` by the slot's `LO[1]` equals per-token lookups at the slot's rung. Also run with the slot on rung 2 **and the rung-1 table deliberately placed first**, which catches a step taken from the wrong rung |
 | **No bleed, per kernel** | `tests/rope_rung_tests.rs` | One launch with sequences on rungs 1, 2 and 4 **interleaved in the wave's order** ([2, 0, 1]) matches each sequence run alone at its own rung, bit for bit, and the rungs' outputs differ. Decode through each kernel the launcher can pick (warp-per-head, stripe, bmma, tile), int8 prefill with sequences of unequal `q_len` whose rungs come from the production `build_slot_headers`, and glue |
-| No bleed, QSA | `tests/qsa_score_rot_harness.rs`, `qwen4exp/indexer.rs` | The scorer at each rung matches that rung's oracle and a wrong rung breaks the bound (`rungs_1_2_4`); a wave's queries on three rungs in one rotation launch are each their solo launch bit for bit (`rows_on_different_rungs_share_a_launch_without_bleed`) |
+| No bleed, QSA | `tests/qsa_score_rot_harness.rs`, `qwen4exp/indexer/` | The scorer at each rung matches that rung's oracle and a wrong rung breaks the bound (`rungs_1_2_4`); a wave's queries on three rungs in one rotation launch are each their solo launch bit for bit (`rows_on_different_rungs_share_a_launch_without_bleed`) |
 | One `m²`, on Q's rotary dims | `tests/rope_rung_tests.rs` | `q_scale_applies_to_q_rotary_pairs_only`: the decode output against a host reference that scales Q's rotary pairs by `m²`, within a derived band that rejects no scale, `m`, `m⁴` and `m²` on every pair; temperature on and off agree exactly on a pass-through-only query and at rung 1 |
 | Rung bounds | kernels | A header rung ≥ `n_rungs` traps |
 | Selection | `rope_schedule/select.rs` | reach → rung at each ceiling and one past it; refusal past `supported_max` for every schedule |
-| QSA stored rows | `qwen4exp/indexer.rs` | Rows after append equal the reference's pooled normed un-rotated key; a seal is a byte copy of stored rows; `device_selection_matches_the_cpu_oracle` (`indexer.rs:2779`) passes unchanged, since the oracle already ropes at read time |
+| QSA stored rows | `qwen4exp/indexer/` | Rows after append equal the reference's pooled normed un-rotated key; a seal is a byte copy of stored rows; `device_selection_matches_the_cpu_oracle` (`indexer/tests_device.rs:2779`) passes unchanged, since the oracle already ropes at read time |
 | QSA rotate-on-load scorer | `tests/qsa_score_rot_harness.rs` | The full §7.5 correctness set |
 
 **GPU gates.** These run one `cargo` process per model, with the daemon

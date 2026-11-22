@@ -161,7 +161,7 @@ on the 16 GB card, and 2026-10-07 read 99% (30B) and 97% (Flash-Next)
 worst sustained. A failure is a fragmentation regression to attribute, not a standing cost.
 
 **The uptake gate is a different question.** `reclaim_spare_ground` runs between forwards
-from every wave loop (`qwen4exp/wave.rs`, `latent_moe`, and `quantized_qwen3_moe` through
+from every wave loop (`qwen4exp/wave/`, `latent_moe`, and `quantized_qwen3_moe` through
 `BatchedModelCore`), and the growth policy's own refusal (`Refusal::Pressure`, when KV demand
 is rising or the KV side asked since the last negotiation) is a KV-pressure gate. Flash-Next
 reads well under 100% with its zone at its limit (59% on 2026-10-07) — read that as the zone
@@ -237,7 +237,7 @@ again by the same procedure.
 - **C10 fails** — C10 is the top rung and is calibrated to sit just under the breaking edge,
   so it can drift red. It *may* need its thresholds tuned down, carefully:
   the model's `*_KV_FACTORS` row in
-  `candle-nn/src/kv_cache/chunked/sampled_selection/params.rs` (lower factor = tighter
+  `candle-nn/src/kv_cache/chunked/sampled_selection/params/` (lower factor = tighter
   threshold = less compression). The doc comments on those rows record every
   re-derivation — read them first: V is usually the lever at the top rung, prefer a value a
   previous sweep measured passing over a fresh guess, record the new re-derivation (date,

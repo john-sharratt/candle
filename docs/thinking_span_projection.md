@@ -100,7 +100,7 @@ pub struct SealedChunk {
     ...
 }
 ```
-— `candle-nn/src/kv_cache/chunked/types.rs`
+— `candle-nn/src/kv_cache/chunked/types/sealed.rs`
 
 `offset`/`token_count` make a sealed chunk an arbitrary sub-range of a physical
 chunk. Two `SealedChunk`s may therefore reference the **same** physical chunk
@@ -113,7 +113,7 @@ may be projected partially, and the same block may be projected twice.
 
 ### 4.2 `window_sealed_tokens` already does the windowing
 
-`candle-conversation/src/conversation.rs:96` takes a per-layer sealing and a
+`candle-conversation/src/conversation/window_slices.rs:96` takes a per-layer sealing and a
 token range `[start, end)` and returns a zero-copy view: whole chunks cloned
 as-is, boundary chunks cloned with `offset += overlap_start - chunk_start` and
 `token_count = overlap_len`, chunks outside the range dropped.
@@ -136,7 +136,7 @@ The reason a hole is safe, and the fact that decides the whole design:
 > *Consequence: a `SealedChunk` (and its underlying K/V bytes) can be injected
 > at **any absolute position** in any sequence and the kernel will apply the
 > correct RoPE for that new position. No re-rotation, no byte copy, no CoW
-> required."* — `candle-nn/src/kv_cache/chunked/types.rs:135`
+> required."* — `candle-nn/src/kv_cache/chunked/types/live_chunk.rs:135`
 
 Because position is derived from cumulative usage of the layout as injected,
 omitting a span does not leave a positional gap — it **compacts**. The answer
@@ -146,7 +146,7 @@ result, reached without a forward.
 
 ### 4.4 Injection accepts any chunk list
 
-`inject_arc_sealed` (`scheduler/projection_assembler.rs:1463`) copies the
+`inject_arc_sealed` (`scheduler/projection_assembler/inject.rs:1463`) copies the
 per-layer chunk vectors and calls `inject_sealed_at_tail`. It asserts the layer
 count and nothing about contiguity. A holed sequence needs no change here.
 
@@ -158,7 +158,7 @@ Thinking {
     kv: Option<KvSpan>,   // Some ⇒ REAL (K/V stored); None ⇒ ETHEREAL
 },
 ```
-— `candle-conversation/src/turn_layout.rs`
+— `candle-conversation/src/turn_layout/segment.rs`
 
 and the module doc states the intent outright:
 
@@ -189,13 +189,13 @@ end:
 > deliberate trade: **the scorer carries each page's width and derives the
 > candidate prefix from it, so a short block is expressible**; a block pooled
 > from another turn's tokens is not correctable at all."*
-> — `qwen4exp/indexer.rs:236` (`flush_open_block`)
+> — `qwen4exp/indexer/cache.rs:236` (`flush_open_block`)
 
 **And the scorer walks those widths rather than dividing by `ratio`:**
 
 > *"Per row, the candidate blocks are those wholly below its tail. With injected
 > pages ahead of the live tail this is a walk over their widths rather than a
-> division — see `candidates_at`."* — `indexer.rs:577`
+> division — see `candidates_at`."* — `qwen4exp/indexer/score.rs:577`
 
 **Consequence:** dropping a whole page renumbers everything downstream by
 construction, with no rounding in either direction. Provided the reasoning is a
@@ -242,8 +242,8 @@ wrong block, and makes `indexed_tokens` over-report by `ratio − cells` — for
 rest of the sequence, internally consistent and wrong against the K/V. The
 coverage gate (§8.7) would fire on every thinking turn, forever.
 
-This is why every existing caller flushes on a **fork** (`wave.rs:415`,
-`wave.rs:519`) or on a throwaway ingest slot, and in the same breath lifts the
+This is why every existing caller flushes on a **fork** (`qwen4exp/wave/positional.rs:415`,
+`qwen4exp/wave/positional.rs:519`) or on a throwaway ingest slot, and in the same breath lifts the
 rows into a page whose `last_cells` records the short width. **A page is the
 only place a ragged width can live**; closing the tail is what puts it there.
 
@@ -306,7 +306,7 @@ tokeniser involvement and no forward.
 
 **But `think_strip::strip_think_blocks_keep_layout` STAYS** — only the scheduler
 wrapper above goes. The underlying function has a second caller,
-`zend/src/tools.rs:274`, which uses it so that a `<tool_call>` emitted *inside* a
+`zend/src/tools/call.rs:274`, which uses it so that a `<tool_call>` emitted *inside* a
 reasoning block is not dispatched. That is a parsing rule about text, unrelated
 to K/V, and deleting it would start executing tool calls the model only thought
 about. It belongs on §5.5's list.
@@ -364,7 +364,7 @@ Each of these looks like part of the machinery above and is not:
   Unrelated to K/V; stays. So does its caller `strip_think_from_tokens`
   (`mod.rs:4754`), which the compression path uses at `mod.rs:4813–4814`.
 - **`think_strip::strip_think_blocks_keep_layout`** — §5.2. The scheduler's
-  wrapper goes; the function itself is load-bearing in `zend/src/tools.rs`.
+  wrapper goes; the function itself is load-bearing in `zend/src/tools/call.rs`.
 - **`think_strip::strip_empty_think_blocks`** (`scheduler/mod.rs:4994`) — drops
   an empty `<think></think>` from display text so a `/no_think` turn does not
   surface one. Stays.
@@ -439,7 +439,7 @@ cache — it is the entire memory:
 
 > *"The GDN state is an accumulated sum with no per-token decomposition, and the
 > PLE conv history is likewise irrecoverable from the KV."*
-> — `qwen4exp/wave.rs:1181` (`carries_recurrent_state`)
+> — `qwen4exp/wave/delegates.rs:1181` (`carries_recurrent_state`)
 
 Windowing is a metadata edit on an addressable store. The GDN and PLE states are
 folds. No projection rule can reach them, and they are carried across turns
@@ -614,7 +614,7 @@ separately, which is fewer than the numbering suggests.
 ### 8.1 One index, recorded as the token goes past — **LANDED**
 
 `</think>` is a single token id, resolved by name at scheduler construction
-(matching `Engine::compile_think_steering`, `engine.rs:902`, which gates the same
+(matching `Engine::compile_think_steering`, `engine/compile.rs:902`, which gates the same
 way). `DecodeState::think_close_at` records the index into the generated run of
 the first one decoded, and everything derives from that: the layout's `Thinking`
 span (8.4), the index cuts (8.2), and the projection's window (8.5).
@@ -640,10 +640,10 @@ which is what decides whether a cut is possible (§8.2b):
 
 | Route | Where | Enters by |
 |---|---|---|
-| the sampler's own commit | `decode.rs`, `commit_decoded_tokens` | `commit_generated` |
+| the sampler's own commit | `scheduler/decode/commit.rs`, `commit_decoded_tokens` | `commit_generated` |
 | the turn's first token | the three `DecodeState` constructions | `commit_generated` |
-| a stencil's static run | `decode.rs`, `play_stencil_runs` | `push_forwarded` |
-| an assistant prefill prefix | `decode.rs`, the heal path | `push_forwarded` |
+| a stencil's static run | `scheduler/decode/stencil.rs`, `play_stencil_runs` | `push_forwarded` |
+| an assistant prefill prefix | `scheduler/decode/commit.rs`, the heal path | `push_forwarded` |
 
 The second row is the one that would have been missed. A think-steer tree
 **always suppresses the model's own `</think>` and injects the closing tag as a
@@ -664,7 +664,7 @@ is available wherever there is one to record.
 > `Dialect::no_think_block` (`"<think>\n\n</think>\n\n"`, documented as
 > "prefilled after `assistant_start`") is a real capability of this family and
 > is **not** on the live path: its only reader is `thinking_suppression`, whose
-> only caller is `batch_test/utils.rs`. The dialect describes what the family
+> only caller is `batch_test/utils/params.rs`. The dialect describes what the family
 > supports, not what the daemon sends.
 
 Two turn shapes then fall out with no clause of their own:
@@ -836,7 +836,7 @@ six-turn conversation, while every answer was still correct.
 
 The rollback cannot move: it runs after the commit loop because a stash span is
 good for exactly one step, and truncating twice leaves the second call with no
-rewind point (`decode.rs`, "One call, not two"). So the **cut** moves.
+rewind point (`scheduler/decode/decode_step.rs`, "One call, not two"). So the **cut** moves.
 `commit_generated` records `DecodeState::pending_page_cut`; `flush_page_cut`
 takes it once the K/V is final — after the rollback on the decode path,
 immediately on the prefill and summarise paths, where nothing speculates. That
@@ -867,7 +867,7 @@ conversation never re-reads its own pages. It is `#[ignore]`d and needs
 
 ### 8.3 Seal the pages the turn actually has, from the immediate path
 
-**Store the list.** `seal_positional_tail_span(seq, tokens)` (`wave.rs:452`)
+**Store the list.** `seal_positional_tail_span(seq, tokens)` (`qwen4exp/wave/positional.rs:452`)
 already walks back over whole pages until the turn's width is covered and returns
 **one blob per page**. Store that list on the turn record in place of the single
 blob `seal_positional_range` returns, and hand it back a blob at a time —
@@ -890,9 +890,9 @@ boundaries, and the caller then injects the turn whole — see §8.5.
 
 **The persistence side does not change.** `RecordType::TurnIndexPage` is
 last-writer-wins per turn stream id with `chunk_index` pinned at 0, and five
-sites depend on that shape — replay (`substrate.rs:3678`), compaction
-(`compaction.rs:465`), relocation (`maintenance.rs:358`), accounting
-(`accounting.rs:59`), and `is_metadata_record` (`persistence/mod.rs:205`). Keep
+sites depend on that shape — replay (`substrate/loading.rs:3678`), compaction
+(`persistence/compaction/collect.rs:465`), relocation (`persistence/maintenance/relocate.rs:358`), accounting
+(`persistence/accounting.rs:59`), and `is_metadata_record` (`persistence/mod.rs:205`). Keep
 **one record** and make its payload a length-prefixed sequence of the existing
 per-page blobs. All five sites are untouched and `entry.index_page:
 Option<Vec<u8>>` stays; only the encode and decode move. Emitting one record per
@@ -944,7 +944,7 @@ own target timeline and among `Substrate::reasoning_turns` of it (§6.3), read
 once per walk; it is windowed otherwise (`projection_assembler::keeps_reasoning`).
 
 **By turn index, not by position in the piece list.** Groups emit in score order
-with the highest last (`project.rs:1682`), so a tool-scope or repo_map group can
+with the highest last (`scheduler/projection_assembler/inject.rs:1682`), so a tool-scope or repo_map group can
 emit turns after the conversation group's — the last `Turn` piece in the walk is
 not reliably the most recent turn.
 
@@ -1062,7 +1062,7 @@ Two pieces are genuinely independent, and both are bug fixes on their own merits
    `DecodeState::think_close_at`, `DecodeState::push_generated`, and
    `build_turn_layout` taking the recorded index; the tokeniser round trip is
    gone. Pinned by `thinking_span_covers_the_body_through_the_close_marker` and
-   `no_recorded_boundary_leaves_the_body_whole` in `turn_layout.rs`, which assert
+   `no_recorded_boundary_leaves_the_body_whole` in `turn_layout/tests_thinking.rs`, which assert
    against a hand-built grid rather than against re-tokenised prose — a test that
    re-derived the length from the text would have agreed with the bug.
 2. **The seal relocation (8.3).** Verifiable against current behaviour: every

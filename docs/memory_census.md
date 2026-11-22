@@ -38,7 +38,7 @@ record at 0.2–1 KB:
 |---|---|---|
 | Replica location index (`persistence/replica/location_index.rs`) | 48 B | No: never shrinks; `forget_segments` empties slots and keeps the length |
 | Record accounting `live_sizes` (`persistence/accounting.rs`) | ~100 B per chunk key | Reset at compaction |
-| `StreamRuntime.chunks` (`substrate.rs`) | ~56 B + node | Bounded by live chunks |
+| `StreamRuntime.chunks` (`substrate/entries.rs`) | ~56 B + node | Bounded by live chunks |
 | `ResidenceSlab.slots` (`substrate/residence.rs`) | 72–80 B per turn | No: discard flags a slot dead and keeps it |
 | Custom objects | 0.5–2 KB + text | Ceased keys expire (`forget_expired_tombstones`) |
 | `PendingChildren` (`substrate/pending.rs`) | the record's payload | **No**: held until the timeline registers, so forever if it never does |
@@ -230,7 +230,7 @@ registry the gauges are published to:
 
 Every gauge is a count over in-memory maps, O(entries), so it is not run on any
 request path. The **persistence thread computes them once a minute**, in a
-phase 2.7 right after the warm-tier purge (`persistence/thread.rs`), where it
+phase 2.7 right after the warm-tier purge (`persistence/thread/pass.rs`), where it
 already holds the store off every request path. It publishes the result, with
 how long the gauge took, to `store_gauges`, which `/v1/memory` and the census
 log read. A request never walks a map.

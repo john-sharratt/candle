@@ -161,7 +161,7 @@ Four problems follow, all from that one root.
 
 Today the stream sends the reply's text as OpenAI `delta.content` chunks, markup
 included, beside named events: `tool` (`phase`, `tools`, and `results` /
-`tokens` matched by position; `ToolStatusOut`, `zend/src/session.rs:213`),
+`tokens` matched by position; `ToolStatusOut`, `zend/src/session/turn_types.rs:213`),
 `think` (`tokens`, `done`), `prefill`, `status`, `projection`, `turn_error`.
 
 After the change, `delta.content` carries **prose only**: the reply's visible
@@ -261,7 +261,7 @@ path, so the model looped:
 | --- | --- | --- |
 | Serving a read: `screen`, `hit`, `read_hit`, `served_response`, `Served` | `zend/src/fast_path.rs`; call at `zend/src/session.rs:5176` | Removed |
 | Locks and their release: `departed`, `round_release`, `holding`, promise marks | `zend/src/working_set/promises.rs`; `session.rs:5054`, `session.rs:5412` | Removed |
-| `file_conversation`, `Coverage` | `fast_path.rs`, `fast_path/coverage` | Kept (used by seeds and audit); moved into the working set |
+| `file_conversation`, `Coverage` | `zend/src/working_set/corpus.rs`, `zend/src/working_set/coverage.rs` | Kept (used by seeds and audit); moved into the working set |
 | The `in_context` prompt rule | `zend/src/prompts/projection.yaml:482–492` | Anchor and fade guidance kept for provenance content; the sentence about a tool answering in_context removed; section renamed |
 | Design doc | `docs/zend_working_set.md` §1 (locks), §4.6 (release) | Rewritten to provenance and seeds, in the same change |
 
@@ -346,13 +346,13 @@ model does not lose track. It is not a fault to fix.
 39 projection points the tools shown changed about every 64 tokens. `file_read`
 and `file_grep` are mandatory and stayed shown throughout; `file_edit` came and
 went. It now projects on every turn (`zend/src/prompts/tools/file_edit.yaml`,
-the pinned set in `zend/src/tool_def.rs`).
+the pinned set in `zend/src/tool_def/mod.rs`).
 
 ## Cause 4 — The forced note hid failed rounds
 
 In a conversation with a journal, `journal_note` is mandatory and the stencil
 forces it as the first call of any round that opens a tool call
-(`docs/zend_journal.md` §5.2; `zend/src/session.rs:627–670`). The note keeps the
+(`docs/zend_journal.md` §5.2; `zend/src/session/triggers.rs:627–670`). The note keeps the
 thinking's conclusions as visible text, so they outlive the `<think>` window.
 The design stands; three things change.
 

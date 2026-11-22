@@ -1,5 +1,5 @@
 //! A task a conversation of Zen's starts begins on that conversation's work
-//! (`docs/zen_coding_challenge_fixes.md` Cause 5): on its branches, with its
+//! (`docs/archived/zen_coding_challenge_fixes.md` Cause 5): on its branches, with its
 //! uncommitted changes. A reviewer or a test-writer reads the change as it
 //! stands, without a commit first.
 //!

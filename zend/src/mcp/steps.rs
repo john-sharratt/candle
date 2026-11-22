@@ -1,5 +1,5 @@
 //! What a task was asked to do, step by step, and whether its answer says of
-//! each what became of it (`docs/zen_coding_challenge_fixes.md` Cause 3).
+//! each what became of it (`docs/archived/zen_coding_challenge_fixes.md` Cause 3).
 //!
 //! A brief's steps are its own numbered or bulleted lines. Two tasks ended
 //! with an answer that read as complete while steps they were given went

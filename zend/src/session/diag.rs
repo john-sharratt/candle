@@ -23,7 +23,7 @@
 //! A run may change the target before it decodes: text spliced into its user
 //! half ([`splice`]), and the recurrent rows of one of its blocks captured for
 //! a later run of the call, or merged in from an earlier run's capture
-//! (`docs/recurrent_reply_calibration.md` §3: rows run through any state).
+//! (`docs/archived/recurrent_reply_calibration.md` §3: rows run through any state).
 
 mod splice;
 

@@ -158,7 +158,7 @@ pub struct Qwen4ExpBatched {
     /// Per-sequence GDN state (S + conv tails), wave-atomic.
     pub(super) recurrent: RwLock<HashMap<usize, RecurrentStateStore>>,
     /// Spans armed for capture or replay, committed and rolled back with the
-    /// stores (`docs/recurrent_reply_calibration.md`).
+    /// stores (`docs/archived/recurrent_reply_calibration.md`).
     arms: RwLock<SpanArms>,
     /// Per-sequence PLE state (conv history + hash window) — the third
     /// carried class. Advanced in place by the sweep; the failure bracket

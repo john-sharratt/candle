@@ -99,7 +99,7 @@ they are its lineage already.
 **Each layer below is drawn at its own window.** A unit's own group, its
 lineage, is kept whole and asks the budget for nothing. Its turn budget is the
 sum of the windows of the layers it draws on, each capped at its own
-(`project.rs`, Steps 9–11). Priced from the unit's own 8k window instead, the
+(`projection/project/pipeline/sink.rs`, Steps 9–11). Priced from the unit's own 8k window instead, the
 lineage took nearly all of it, and the layers below shared what was left: a
 fourth layer up drew nothing at all. Which units each layer draws is then the
 ordinary belief selection (`default_policy: high_recall_scope`), so a clear

@@ -40,7 +40,7 @@ order, §16 what is still open, §17 the documents this changes.
   (`docs/web_gateway_design.md` §1). It is axum 0.7 over hyper 1, with an HTTPS
   entrance on TCP and QUIC from one router (`web/src/tls/mod.rs:107-123`).
 - A route names exactly one upstream: `Upstream::Local | Url(String)`
-  (`web/src/config.rs:362-380`). There is no list of upstreams, no balancing, no
+  (`web/src/config/server_block.rs:362-380`). There is no list of upstreams, no balancing, no
   stickiness (`web/src/proxy.rs`, all of it). The deployed table sends
   `bot.tokera.com` to `http://192.168.0.6:8081` and `code.tokera.com` to
   `https://192.168.0.5:8444` with `self_signed` (`web/web.yaml:237-261`).
@@ -59,7 +59,7 @@ order, §16 what is still open, §17 the documents this changes.
 - The gateway has **no telemetry and no status page**: no request or byte counters, no
   access log; `Health::report()` exists and nothing calls it
   (`web/src/health.rs:176-193`). `Config.roles` is parsed and never read
-  (`web/src/config.rs:53-61`).
+  (`web/src/config/mod.rs:53-61`).
 
 ### 1.2 Daemons only listen, and trust the gateway by source IP
 
@@ -67,7 +67,7 @@ order, §16 what is still open, §17 the documents this changes.
   (`host/src/server.rs:87-142`). The merged API router is one `axum::Router`
   (`merge_routes`, `host/src/run.rs:280-289`), a `tower::Service` that tests already
   drive with `oneshot` (`host/src/endpoints/mod.rs:214-243`); npcd even calls its own
-  router in-process (`npcd/src/engine/runtime.rs:2541-2587`).
+  router in-process (`npcd/src/engine/runtime/device.rs:2541-2587`).
 - Identity reaches a daemon as **unsigned** `x-tokera-*` headers
   (`web/src/auth/forwarded.rs:21-26,39-87`), believed only when the TCP peer is in the
   `Gateways` allowlist — loopback, the bind address, each `--gateway` IP
@@ -80,7 +80,7 @@ order, §16 what is still open, §17 the documents this changes.
   (`host/src/guard.rs:165-183`), recorded as `Guarded { path, min, nested }`
   (`guard.rs:48-54`); `declared(roles)` returns the table with no state
   (`host/src/endpoints/mod.rs:73-77`, zend `zend/src/api/mod.rs`, npcd
-  `npcd/src/tenant.rs`).
+  `npcd/src/tenant/mod.rs`).
 - Streaming responses: zend chat SSE (`zend/src/api/chat.rs:330-397`), its reattach
   `GET /v1/conversations/:id/live` (`chat.rs:314-328`), upload progress SSE
   (`zend/src/api/files.rs:55-306`), npcd interaction SSE
@@ -95,54 +95,54 @@ order, §16 what is still open, §17 the documents this changes.
 
 - A record is a one-line JSON header (`type, payload_len, crc, format, stream_id,
   chunk_index, token_count`) and a payload, padded to 4 KiB
-  (`candle-conversation/src/persistence/record.rs:351-372,392-396`). Twenty-five types
-  (`record.rs:88-300`). `encode_record` / `decode_record` are the one codec pair
-  (`record.rs:451,516`).
+  (`candle-conversation/src/persistence/record/header.rs:351-372,392-396`). Twenty-five types
+  (`persistence/record/mod.rs:88-300`). `encode_record` / `decode_record` are the one codec pair
+  (`persistence/record/framing.rs`, `persistence/record/decode.rs`).
 - A record's only identity is its header key plus its local `(SegmentId, offset)`
   (`persistence/segment.rs:8-35`), and every maintenance pass moves the offset.
 - **Ids that two machines could mint identically:** `TimelineId` is
   `max(now_micros, last+1)` from a process-wide counter
   (`projection/ids.rs:373-407`), including for zend's passthrough conversations, which
   are found by a content key, not by an id (`zend/src/passthrough.rs:174-183,357-358`); `TurnIndex` is the timeline's `turns.len()`
-  (`substrate.rs:1568-1572`); the VFS `seq` is per timeline, continuing from the highest
+  (`substrate/mod.rs:1568-1572`); the VFS `seq` is per timeline, continuing from the highest
   seen (`persistence/vfs/writes.rs:64,95`); npcd interaction ids are
   `now_ms` + a counter (`npcd/src/engine/interaction.rs:163-167`).
 - **A turn's stream id is recomputed, not stored.** `turn_stream_id(timeline,
   turn_index)` (`persistence/content_hash.rs:217`) is derived from the decl at 34
   production call sites in 9 files: cold load, restore, scheduler and projection. No
-  record holds it (`persistence/streams.rs:149-153`, `persistence/resume.rs:409,467,512`,
-  `substrate.rs:5471`).
+  record holds it (`persistence/streams.rs:149-153`, `persistence/resume/mod.rs:409,467,512`,
+  `substrate/mod.rs:5471`).
 - **Checksums are weak and partial.** A `Chunk` record's `crc` is a Fletcher-32 over
   `kv_bytes` only, and the metadata (formats, palettes, scales) is covered by nothing
-  (`record.rs:420-431,566-572`). Every other record carries a CRC-32. No stronger
+  (`persistence/record/crc.rs:420-431,566-572`). Every other record carries a CRC-32. No stronger
   per-record digest exists.
 - **K/V is not bit-identical across machines.** The int8 path, the expert format and the
   KV threshold row are chosen per card (`candle-core/src/quantized/mod.rs:679-715`;
-  `candle-nn/src/kv_cache/chunked/sampled_selection/params.rs:702-707,1214-1224`). Batch
+  `candle-nn/src/kv_cache/chunked/sampled_selection/params/mod.rs:702-707,1214-1224`). Batch
   composition changes summation order. So two members prefilling the same section write
   different bytes, each valid.
 - **`adopt_turn` needs the source turn hot, and duplicates its K/V on disk.** It reads
-  the source's resident K/V or refuses (`projection/resolver.rs:2560-2569`). The new
+  the source's resident K/V or refuses (`projection/resolver/mod.rs:2560-2569`). The new
   turn's residence is cold-written later under the new stream as fresh `Chunk` records
-  (`substrate.rs:5402,5436`; `persistence/thread.rs:1500`). Only in VRAM are the chunks
+  (`substrate/mod.rs:5402,5436`; `persistence/thread/mod.rs:1500`). Only in VRAM are the chunks
   shared.
 - **Ids that already travel:** a zend dialogue timeline is
-  `hash_bytes(conv_id)` — the same on every machine (`zend/src/session.rs:6659-6662`),
+  `hash_bytes(conv_id)` — the same on every machine (`zend/src/session/timeline_ids.rs:6659-6662`),
   and `conv_id` is a browser-minted UUID (`zend/web/index.html:1340`); section stream
   ids are content-addressed (`persistence/content_hash.rs:162-213`); `CustomObject`
-  ids hash their key (`record.rs:1027-1040`); `npc_id` is SHA-256 over
-  `(sub, name, now_ms, salt)` (`npcd/src/npcs.rs:983-999`).
+  ids hash their key (`persistence/record/metadata.rs:1027-1040`); `npc_id` is SHA-256 over
+  `(sub, name, now_ms, salt)` (`npcd/src/npcs/cast.rs:983-999`).
 - **Turns are not created by records.** `apply_walker_entry` replays a record into the
-  substrate's *indexes* (`substrate.rs:5070-5226`) and already runs against a live
+  substrate's *indexes* (`substrate/loading.rs:5070-5226`) and already runs against a live
   substrate after `compact()` (`persistence/mod.rs:2305-2341`), but a turn entry and its
   residence are created only by `restore_turn` during whole-log reconstruction
-  (`projection/resolver.rs:2729-3081`) or by the local seal path (`append_migrated`).
+  (`projection/resolver/mod.rs:2729-3081`) or by the local seal path (`append_migrated`).
 - **Runtime appends have two choke points** under the persistence mutex:
   `append_record` and `append_recurrent_parts` (`persistence/mod.rs:948-1046`), both
   reaching `account_appended` (`:1051-1088`). Maintenance relocates verbatim through
   `append_raw_record` (`:1099-1131`) and re-emits resident metadata through
-  `append_record` (`persistence/maintenance.rs:1018-1057`); full `compact()` writes a
-  scratch file of its own (`persistence/compaction.rs:777-884`).
+  `append_record` (`persistence/appends.rs:1018-1057`); full `compact()` writes a
+  scratch file of its own (`persistence/compacting.rs:777-884`).
 - One writer per substrate directory, enforced by an OS lock on `substrate/LOCK`
   (`persistence/writer_lock.rs:1-52`).
 - Sizes: a `Chunk` record is ~165 KB (one layer × one 32-token block,
@@ -157,7 +157,7 @@ order, §16 what is still open, §17 the documents this changes.
     `StreamDecl`, `Chunk` and `Tokens` locations, `Snapshot` and its empty-payload
     retraction, `BranchCheckpoint`, `ConvState`, `TreeMetadata`, `DebugId`,
     `CustomObject`, `Distilled`, `ProjectionEvents`, `WideQSig`, `TurnIndexPage`
-    (`substrate.rs:4115-4320,5084-5206`). `Commit` overwrites rather than taking the
+    (`substrate/apply_records.rs:4115-4320,5084-5206`). `Commit` overwrites rather than taking the
     max (`:4218-4220`). `Label` merges per field, last wins per field (`:4229-4258`).
   - `TreeMetadata`, `DebugId` and `TurnCoupling` are **dropped silently** when their
     timeline is not registered yet, and nothing re-applies them later (`:3505-3517`,
@@ -167,18 +167,18 @@ order, §16 what is still open, §17 the documents this changes.
     so a record logged before its parent is lost for good.
   - **Section tombstones carry no generation.** A `PromptSection` decl lifts the
     tombstone, and old-generation records applied after it come back
-    (`:4116-4118,4588-4622`; `persistence/record.rs:1417-1425`;
+    (`substrate/marking_dead.rs:4116-4118,4588-4622`; `persistence/record/mod.rs:1417-1425`;
     `persistence/relocation_watch.rs:22-32`).
   - **A timeline tombstone is never undone, but it is not enforced at apply.** Later
     records still register and index the timeline, and a later `Snapshot` is re-inserted
     (`:3026-3035,4175`). Compaction does not re-emit timeline tombstones
-    (`persistence/compaction.rs:541-546`), so after a compaction nothing would stop a
+    (`persistence/compacting.rs:541-546`), so after a compaction nothing would stop a
     late record bringing the timeline back.
   - **VFS events are keyed `(timeline, seq)`** with a locally allocated `seq`, so two
     writers collide (`persistence/vfs/index.rs:16-26,58-69,110-117`).
   - **A turn is rebuilt only when every chunk is present.** With some chunks it is
-    `Corrupt` (`persistence/resume.rs:521-531`), and the corrupt-turn policy can
-    tombstone the timeline (`projection/resolver.rs:2828-2909`). `Commit` is never
+    `Corrupt` (`persistence/resume/mod.rs:521-531`), and the corrupt-turn policy can
+    tombstone the timeline (`projection/resolver/mod.rs:2828-2909`). `Commit` is never
     checked against the chunks.
 
   §6.5 replaces these with rules under which the order does not matter.
@@ -187,11 +187,11 @@ order, §16 what is still open, §17 the documents this changes.
 
 | State | Where | Written by |
 |---|---|---|
-| zend chat uploads | `<workspace>/substrate/conv-files/` (`zend/src/conv_file_store.rs:61-71`) | `POST /v1/conversations/:id/files` |
-| npcd worlds, personalities | `<mind>/worlds/`, `<mind>/personalities/` (`npcd/src/tenant.rs:288-289`) | admin `PUT`, `Registry::put` (`npcd/src/registry/mod.rs:268-305`) |
+| zend chat uploads | `<workspace>/substrate/conv-files/` (`zend/src/legacy_uploads.rs:61-71`) | `POST /v1/conversations/:id/files` |
+| npcd worlds, personalities | `<mind>/worlds/`, `<mind>/personalities/` (`npcd/src/tenant/tenant_start.rs:288-289`) | admin `PUT`, `Registry::put` (`npcd/src/registry/mod.rs:268-305`) |
 | npcd mind corpus | `<mind>/layers/…` (`npcd/src/mind/address.rs:172-223`) | admin `PUT /v1/mind/entry`; bench commits (`npcd/src/sim/bench.rs:654-704`) |
-| npcd maps | `<mind>/map/<world>/` (`npcd/src/engine/runtime.rs:545-556`) | `/v1/local/reshape/:world` (`npcd/src/world/mapstore.rs:41`) |
-| npcd accounts, images, device tokens | `<data>/accounts/`, `<data>/images/`, `<data>/tokens/` (`tenant.rs:300,383`, `npcd/src/images.rs:113`) | account upsert, portrait upload |
+| npcd maps | `<mind>/map/<world>/` (`npcd/src/engine/runtime/load.rs:545-556`) | `/v1/local/reshape/:world` (`npcd/src/world/mapstore.rs:41`) |
+| npcd accounts, images, device tokens | `<data>/accounts/`, `<data>/images/`, `<data>/tokens/` (`npcd/src/tenant/tenant_start.rs:300,383`, `npcd/src/images.rs:113`) | account upsert, portrait upload |
 
 zend's *repository* edits already live in the substrate: a conversation's file store is
 a chain of deltas per path over a pinned base commit, mirrored as `VfsEvent` /
@@ -1168,7 +1168,7 @@ u8 kind | u8 flags | u32 stream (LE) | body…        (WebSocket supplies the le
 | `PEER_HELLO`, `ACME_CHALLENGE`, `ACME_ACK`, `ACME_CLEAR`, `ACME_CERT`, `ACME_LEDGER`, `ACME_INVENTORY`, `ACME_ORDERING`, `ACME_DONE`, `ACME_ACCOUNT` | between peer gateways only, never on a member's socket (§13.4) | control |
 
 Bodies are little-endian binary with `u32`-length blobs, in the style of the persistence
-codec (`record.rs:777-914`); a record inside `EVENT` is carried as the record's own
+codec (`persistence/record/mod.rs:777-914`); a record inside `EVENT` is carried as the record's own
 encoded header line and payload, unpadded. The codec lives in the new `cluster` crate (no
 CUDA): the gateway never decodes a record — `web` cannot link `candle-conversation`
 without becoming a CUDA build — so the record bytes stay opaque to it.
@@ -1390,7 +1390,7 @@ ends hand to the HTTP machinery they already run:
   is served, so Host-based site dispatch, UI files, `/auth/*` and compression behave as
   on the TCP entrance.
 - **Gateway side.** A `Route` keeps its configured `upstream` URL and gains an optional
-  `cluster: <app>` (`web/src/config.rs:336-380`). It is in clustered mode while that app
+  `cluster: <app>` (`web/src/config/mod.rs:336-380`). It is in clustered mode while that app
   has a ready member (§5.7). Then `proxy::forward` (`web/src/proxy.rs`) keeps its header
   rewriting, streaming and upgrade splice and swaps only its transport. Instead of the
   pooled TCP client (`web/src/upstream_tls.rs`), it:
@@ -2077,7 +2077,7 @@ round.
    `ACCEPTED`.
 3. **Decided.** With `ACCEPTED` from a quorum, the value is decided. The proposer writes it
    as a replicated record, so every member reads the decision from its substrate. The
-   record is a `CustomObject` keyed `cluster/<key>` (`record.rs:1027-1040`), so it needs
+   record is a `CustomObject` keyed `cluster/<key>` (`persistence/record/metadata.rs:1027-1040`), so it needs
    no new record type. Paxos guarantees one value per key, so two members that both
    write the decision write the same value; the key holds the greater stamp, which every
    member agrees on (§6.5).
@@ -2213,7 +2213,7 @@ with no identity at all (every identity field zero).
 
 ### 6.2 Identity
 
-- **The header gains six fields** (`record.rs:351-372`). Housekeeping preserves all
+- **The header gains six fields** (`persistence/record/header.rs:351-372`). Housekeeping preserves all
   six: a relocation copies the header verbatim, and a re-emission or compaction
   re-encodes the record with the values it carried. That needs the resident in-RAM
   state to keep each value's stamp beside it.
@@ -2393,7 +2393,7 @@ normally within one relay hop.
 This covers the records a turn writes while it runs: `StreamDecl`, `Tokens`, `Label`,
 `ConvState`, `VfsEvent`, `TurnIndexPage`, `WideQSig`, `ProjectionEvents`. A turn's K/V
 `Chunk` records and its `Commit` are written later, when the persistence thread moves
-the turn warm → cold (`persistence/thread.rs:1244-1302`, `writer.rs:527-554`). They
+the turn warm → cold (`persistence/thread/mod.rs:1244-1302`, `writer.rs:527-554`). They
 follow on the ordered lane one persistence pass after the response, and the affinity
 catch-up barrier (§5.4) is what keeps a moved conversation from outrunning them.
 
@@ -2401,7 +2401,7 @@ catch-up barrier (§5.4) is what keeps a moved conversation from outrunning them
 
 The member's cluster client applies `EVENT`s itself, in batches, under the substrate
 write lock. That is how the persistence thread installs tiers today
-(`persistence/thread.rs`), so the scheduler is not involved. A projection that reads
+(`persistence/thread/mod.rs`), so the scheduler is not involved. A projection that reads
 the substrate sees each batch whole or not at all.
 
 **As they arrive, with no reorder buffer.** The applied set is a version vector *with
@@ -2427,7 +2427,7 @@ replaying it at the next start meets records in an order no writer chose.
 | Keyed values: `StreamDecl`, `Chunk` and `Tokens` locations, `Snapshot` (an empty payload is a value meaning *retracted*), `BranchCheckpoint`, `ConvState`, `TreeMetadata`, `DebugId`, `CustomObject`, `Npc`, `Distilled`, `ProjectionEvents`, `WideQSig`, `TurnIndexPage` | **Greatest version stamp wins** (§6.2). The substrate keeps each value's stamp beside it, and a record replaces the value only if its stamp is greater. The result is a max, so it is the same in any order. |
 | `Label` | Per field: each of `conv_id`, `label` and every `custom` key keeps the value with the greatest stamp. |
 | `Commit` | `committed_through = max(…)`, never overwrite. |
-| conversation order (`conv_order`, `substrate.rs:6015-6031`) | Taken from the `hlc` of the record that first named the `conv_id`, not from a counter that counts arrivals. |
+| conversation order (`conv_order`, `substrate/apply_records.rs:6015-6031`) | Taken from the `hlc` of the record that first named the `conv_id`, not from a counter that counts arrivals. |
 | `TurnCoupling`, VFS kills, applied-set gaps | Set inserts, which commute already. |
 | **Turn streams** (`Chunk`, `Tokens`, `WideQSig`, `TurnIndexPage` under a turn's stream id) | **Indexed per writer.** The index keys a turn stream `(stream_id, origin)`, so two writers' turn *N*, which share `turn_stream_id(timeline, N)`, never overwrite each other's entries. A lookup by stream id, which is all any caller does, resolves to the turn that holds that index in the timeline's stamp order (§6.6). That is decided by the stamps, not by which arrived last. |
 | **Records that need a parent**: `TreeMetadata`, `DebugId`, `TurnCoupling`, `Label`, `ConvState`, and every timeline-scoped value | **Wait for the parent.** A record whose timeline is not registered yet is held, with its identity, in a pending map keyed by timeline (`substrate/pending.rs`), and applied by the decl that registers it. Nothing is dropped for arriving early. A stream's own records (`Chunk`, `Tokens`, `WideQSig`, `TurnIndexPage`, `ProjectionEvents`, `Commit`) need no holding: they are indexed under their stream as they arrive, and a stream another origin wrote is not an orphan for want of a decl (§6.8). |
@@ -2470,7 +2470,7 @@ replaying it at the next start meets records in an order no writer chose.
    against the other, so members that kept different stamps for one value would
    diverge on it. A `Label` merges field by field and a `Commit` takes the greatest
    mark, so neither is ever superseded whole; a set insert never is.
-4. **Otherwise** verify the `digest`, and the golden or CRC (`record.rs:550`), then
+4. **Otherwise** verify the `digest`, and the golden or CRC (`persistence/record/crc.rs:550`), then
    append it locally as `Remote`, with padding added back and every header field kept.
    That gives it a local location. A record that fails verification is refused and
    fetched again.
@@ -2495,16 +2495,16 @@ on both members (2026-11-11).
 
 **Taking the substrate lock.** Apply takes the substrate write lock once per batch and
 never nests a read inside a held guard. Windows SRW locks deadlock on that
-(`docs/shared_model_host.md`, `projection/resolver.rs` `recover_turn_chunks`).
+(`docs/shared_model_host.md`, `projection/resolver/log_reconstruct.rs` `recover_turn_chunks`).
 
 **Applying it.**
 
-- **Index state.** The record goes through `apply_walker_entry` (`substrate.rs:5070-5226`),
+- **Index state.** The record goes through `apply_walker_entry` (`substrate/loading.rs:5070-5226`),
   rewritten to the rules above. It already works on a live substrate.
 - **Turns.** The batch adopts each turn it completed (`persistence/remote/adopt.rs`)
   once the turn is **complete**: its `StreamDecl`, its `Tokens`, and every `Chunk` the
   decl's block range calls for (`n_layers × (block_end − block_start)`, the count
-  `persistence/resume.rs:524-531` checks), in any order of arrival. A `Commit` is not
+  `persistence/resume/mod.rs:524-531` checks), in any order of arrival. A `Commit` is not
   enough on its own. A turn whose declaration claims no K/V — a summary node — holds
   nothing more than its declaration, and a distilled timeline's turns were shed on
   purpose, so either is complete as declared (`persistence/remote/completeness.rs`).
@@ -2528,7 +2528,7 @@ never nests a read inside a held guard. Windows SRW locks deadlock on that
     epoch and the summariser queue are touched as `restore_turn` touches them.
 - **An incomplete remote turn is pending, never corrupt.** Today a turn with some of its
   chunks is `Corrupt`, and the layer's corrupt-turn policy can tombstone the timeline
-  (`persistence/resume.rs:521-531`, `projection/resolver.rs:2828-2909`). For a remote
+  (`persistence/resume/mod.rs:521-531`, `projection/resolver/mod.rs:2828-2909`). For a remote
   turn whose pieces are still arriving that would be fatal, and the tombstone would
   replicate.
   - So a remote turn short of pieces, at runtime or at open, is *pending*: it is left
@@ -2547,7 +2547,7 @@ never nests a read inside a held guard. Windows SRW locks deadlock on that
 **Portability.** K/V bytes from another machine are valid here, though not identical to
 what this machine would have written (§1.3). The model lock makes the weights the same
 (§3.6), and each block's format is self-describing in its `ChunkPayload`
-(`record.rs:586-737`). Per-machine calibration chooses which format a block gets, not
+(`persistence/record/chunk.rs:586-737`). Per-machine calibration chooses which format a block gets, not
 how it is read.
 
 ### 6.6 Two writers on one timeline
@@ -2582,7 +2582,7 @@ corruption, not a conflict.
   leaves a gap, and the turns above it stay where they were written. So each turn's
   position is `max(previous + 1, its own index)` down the stamp order: for one writer
   exactly the indices it wrote, for two the interleaving the stamps give. Reload fills a
-  gap with an empty placeholder (`projection/resolver.rs` `fill_turn_gap`). A writer's
+  gap with an empty placeholder (`projection/resolver/turn_log.rs` `fill_turn_gap`). A writer's
   next turn therefore always takes an index no stream of its own holds.
 - A declared turn is reached only through its position. An id whose position holds no
   turn names nothing, even when another writer's turn further up was written under it.
@@ -2626,7 +2626,7 @@ not move under it.
 1. The member stops taking work, as `drain` does (§12.4). It hands back its claims and
    the gateways route nothing to it. A rejoining member is not serving yet anyway.
 2. It runs the reload a compaction already uses (`engine.reload_substrate()`,
-   `engine.rs:769-779`; the `ReconstructSubstrate` request on the scheduler thread). No
+   `engine/services.rs:769-779`; the `ReconstructSubstrate` request on the scheduler thread). No
    new hot-path code is involved.
 3. It becomes ready again.
 
@@ -2749,7 +2749,7 @@ wrote them.
 
 ### 6.8 Compaction
 
-Each member compacts its own log (`persistence/maintenance.rs`). Once appended, a
+Each member compacts its own log (`persistence/maintenance/mod.rs`). Once appended, a
 replicated record is an ordinary record.
 
 - **It is dropped by §6.5's rules.** Those rules are deterministic, so what one member
@@ -3216,7 +3216,7 @@ empty stream.
   catch-up, and it is routed nothing until it has;
 - **trying to free space.** Once a second it runs a maintenance `Drop`, which unlinks a
   segment holding only dead records and needs no scratch space
-  (`persistence/maintenance.rs`). It does not start a `Compact` or `Combine`, which would
+  (`persistence/maintenance/mod.rs`). It does not start a `Compact` or `Combine`, which would
   need room it does not have — nor expire tombstones, since a tombstone shrinks only
   inside a full compaction (§6.8).
 
@@ -3439,8 +3439,8 @@ writing at once, and runs the world locally if characters of it run there (§9.4
 ### 9.3 NPC leases: lent by the world's authority, held where they are lent
 
 **Each character runs on one machine, the holder of its NPC lease.** The holder runs the
-character's autonomy loop (`npcd/src/engine/tick.rs`, `character_loop` in
-`runtime.rs`) and writes its turns, beliefs and journal. One writer per character's
+character's autonomy loop (`npcd/src/engine/tick/mod.rs`, `character_loop` in
+`runtime/turn.rs`) and writes its turns, beliefs and journal. One writer per character's
 memory means its records are never contested.
 
 **Every member embodies every character.** Each member hosts every world, and its copy
@@ -3671,7 +3671,7 @@ A member whose manifest lacks one of the conversation's repositories cannot serv
 
 ### 10.2 zend uploads
 
-Uploads stop being files in `substrate/conv-files/` (`zend/src/conv_file_store.rs`).
+Uploads stop being files in `substrate/conv-files/` (`zend/src/legacy_uploads.rs`).
 Each one becomes a `ReplaceBinary` delta (`zend-vfs/src/file_delta.rs:32-46`) in the
 conversation's `uploads` store, the folder repository that already exists
 (`docs/zend_workspace_execution.md` §3.2), and so it replicates as a `VfsEvent`. The
@@ -3683,7 +3683,7 @@ refused with the cap named.
 The mind folder is a git repository (`docs/the_effector.md`). npcd gains the `zend-vfs`
 store over it.
 
-**With `--cluster`, the mind is a repository the agents hold** (`npcd/src/mind_repo.rs`),
+**With `--cluster`, the mind is a repository the agents hold** (`npcd/src/mind/mod.rs`),
 named the way zend names a repository in its workspace: `--mind-repo <name>`
 (`mind_repo:` in `motherd.yaml`), its record the branch `--mind-branch` (default
 `main`). So the machine that runs inference needs neither the repository nor a way to
@@ -3736,7 +3736,7 @@ operation's, and every mission that carries one of its steps works in it.
 
 - A character carrying a mission reads and writes the mind **through the store of the
   operation that mission is a step of** (`Mission::operation`,
-  `npcd/src/engine/mission.rs:241-247`). The bench's file acts
+  `npcd/src/engine/mission/mod.rs:241-247`). The bench's file acts
   (`npcd/src/engine/bench.rs:104-387`) and every mind read under `Within` are routed
   through it.
 - The table's own steps read the same store. The `reading` decode, and the `committed`
@@ -3838,11 +3838,11 @@ passed:
 
   There is no abandon act. A failed or cancelled operation's store is discarded by the
   engine, as `on-failed` says.
-- Their handlers are in `npcd/src/engine/work.rs`. Adding them takes the same pieces
+- Their handlers are in `npcd/src/engine/work/mod.rs`. Adding them takes the same pieces
   `vault-time` and its `time-machine` took: a level YAML and a part YAML under the
   world's map directory, `Tool` consts with `at: &["merge-table"]` chained into `CATALOG`
-  (`npcd/src/engine/tools.rs:956-965`), and a match arm in `work::perform`
-  (`work.rs:708`).
+  (`npcd/src/engine/tools/mod.rs:956-965`), and a match arm in `work::perform`
+  (`npcd/src/engine/work/dispatch.rs:708`).
 - `merge_publish` lands the operation's store on the record as **one commit on the
   store's base**, pushed under a lease on what the record held when the commit began
   (`npcd/src/opstore/merge/publish.rs`). A record that moved since the base is merged into
@@ -4171,7 +4171,7 @@ through a stream the member opens to `group:agent` (§5.1). An Admin's operation
 starts a run job the same way, without waiting for it (`Agents::submit`), and a run job
 naming a `stage` has the agent copy what it built to the agent's `stage_dir` once it
 exits 0, for that machine's keep (`docs/claude_zend_gateway.md` §8.3–§8.4). The in-process `Sandboxes`
-(`zend/src/tools.rs:771`) remain the executor of a daemon without `--cluster`. That is a
+(`zend/src/tools/dispatch.rs:771`) remain the executor of a daemon without `--cluster`. That is a
 deployment configuration, not a fallback: with `--cluster`, an unreachable agent is the
 tool error `no_agent`, never a quiet local run.
 
@@ -4438,7 +4438,7 @@ the reason.
 | `restart` | `drain`, wait for in-flight requests and the outbox to empty (bounded at 60 s), flush and commit the log, close its sockets with `1001`, then relaunch the same binary with the same arguments. | `LaunchSpec::capture` / `relaunch` (`cluster/src/launch.rs`), which `self_heal` and the upgrade's swap use too, one-shot flags dropped |
 | `shutdown` | `drain`, flush, close with `1001`, exit. Nothing restarts it. | |
 | `compact` | A full `compact()` of its substrate (`persistence/mod.rs:2169-2344`), run drained: a member not already drained drains for it and undrains after. Refused in fault mode, and refused when free space is below the substrate's live size, because the scratch copy needs it. | zend's `--compact-substrate` (`zend/src/loading.rs:30`) as a command |
-| `maintain` | One incremental maintenance pass: Drop, Compact or Combine, as the planner picks (`persistence/maintenance.rs`). Allowed in fault mode only as Drop. | zend's `POST /v1/substrate/zend/maintenance`, which it replaces, in the host so npcd has it too |
+| `maintain` | One incremental maintenance pass: Drop, Compact or Combine, as the planner picks (`persistence/maintenance/mod.rs`). Allowed in fault mode only as Drop. | zend's `POST /v1/substrate/zend/maintenance`, which it replaces, in the host so npcd has it too |
 | `expire-tombstones` | The tombstone expiry check (§6.8), which runs inside a full compaction: when any tombstone has had a complete compaction run past it, a `compact` as above, reporting how many expired; otherwise it says none can yet. | |
 | `audit` | The read-only liveness walk: what maintenance counts as live against what it carries (`persistence/liveness_audit.rs`). Reports, changes nothing. | |
 | `self-check` | zend only: ask every stored conversation whether it is intact, reporting and tombstoning nothing. | zend's `--self-check` (`zend/src/self_check/`) |
@@ -4580,7 +4580,7 @@ The group key is 32 random bytes, hex-encoded in a file.
 
 - **Gateway:** `web/secrets/group.key`, named by `cluster.group_key_file` in a new
   `cluster:` block of `web.yaml`, resolved like the other secret paths
-  (`web/src/config.rs:552-561`).
+  (`web/src/config/mod.rs:552-561`).
 - **Members:** `--group-key`.
 - On Unix, a file readable by group or other is refused, as zend refuses its secrets
   file (`docs/zend_workspace_execution.md` §3.5).
@@ -4776,7 +4776,7 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | generations | a cut-off member's events carry ⊤ and sort after everything it holds; on rejoin it catches up before sending anything detached; it takes `gen/<k>` by Paxos for *k* one above the greatest decided it knows, and moves to *k + 1* when *k* is already decided; decided generations have no gaps; a joined member's event written before the decision, including one the rejoining member never caught up on, sorts before its detached events on every member; the generation is persisted as a local `Rebase` that is never replicated, and applied on reading its own records back; without a quorum the member stays cut off, serving locally and sending nothing detached, and takes its generation once a quorum is reachable; two members cut off together sort in the order their generations were decided; offline keyed writes win over the group's from the same period; a tombstone still kills offline writes to its timeline; a turn arriving ranked below one held makes the member drain, reload and come back |
 | consensus (`cluster` crate, Paxos among members) | a proposer `NACK`ed waits a random time within the key's `ttl` before trying a higher ballot, and two duelling proposers end with one decision; an acceptor promises only above its highest promised ballot and `NACK`s the rest with that ballot; a promise and an acceptance are durable in the substrate before they are sent, and survive a restart; a proposer proposes the highest-ballot accepted value it was shown; under every interleaving of two and three proposers against three and five member-acceptors, with dropped and duplicated frames and frames arriving through two clusters, a decision never changes and two lease holders never overlap; a decided value is written as a replicated record |
 | leases | `PROMISE` carries an accepted lease only while its `ttl` runs; another member's unexpired lease stops a proposer, its own does not (renewal); under `start_paused`, the holder's term, counted from `PREPARE`, ends before every acceptor's; a lease accepted before an acceptor restarts counts for what is left of the wall-clock end its vote recorded — the rest of its term after a restart inside it, nothing after a restart past it, a full `ttl` when the wall clock went back — and repeated restarts never extend it; `RELEASE` drops it and the next proposer waits for `through`; a partitioned authority stops persisting before its lease runs out; a member alone in a group of three can never hold one |
-| gateway peering (`cluster/src/peer/`, `cluster/src/frame/tests.rs`, `web/src/acme/{ledger,certs}.rs`, `web/src/acme/peers/inventory.rs`, `web/src/cluster/peers.rs`, `web/src/config.rs`, `web/tests/peering.rs`) | every peer frame encodes to exact bytes; two gateways link and carry frames; three in a mesh name the same orderer for every site, and a gateway alone orders everything; crossed dials keep the lower node's link on both ends, and it stays; a differing session key or OAuth client refuses the peering on both ends, each recording why, and a node other than the handshake's or the gateway's own is refused; a closed link is redialled; ledgers merge to the union in either order, and a save keeps what a peer merged meanwhile; a peer is sent the certificates it lacks or holds older, and the later `not_after` wins; the node id is minted once and kept; peers need the TLS entrance. Against a local stand-in for the CA, at the `Ca` trait — it publishes through the gateways' own path and asks every gateway it could reach for each answer: three linked gateways name one orderer and only it may order, its challenges are answered on all three before the CA validates, and its certificate is installed on all three with every challenge withdrawn; a peer's `ACME_ORDERING` holds the site until `ACME_DONE`; two gateways partitioned each order, and once linked both serve the later certificate; over a link that is not verified TLS the challenges cross but no certificate key and no account do; the account is given to a peer that has none, and the ledgers merge on connect and on change |
+| gateway peering (`cluster/src/peer/`, `cluster/src/frame/tests.rs`, `web/src/acme/{ledger,certs}.rs`, `web/src/acme/peers/inventory.rs`, `web/src/cluster/peers.rs`, `web/src/config/mod.rs`, `web/tests/peering.rs`) | every peer frame encodes to exact bytes; two gateways link and carry frames; three in a mesh name the same orderer for every site, and a gateway alone orders everything; crossed dials keep the lower node's link on both ends, and it stays; a differing session key or OAuth client refuses the peering on both ends, each recording why, and a node other than the handshake's or the gateway's own is refused; a closed link is redialled; ledgers merge to the union in either order, and a save keeps what a peer merged meanwhile; a peer is sent the certificates it lacks or holds older, and the later `not_after` wins; the node id is minted once and kept; peers need the TLS entrance. Against a local stand-in for the CA, at the `Ca` trait — it publishes through the gateways' own path and asks every gateway it could reach for each answer: three linked gateways name one orderer and only it may order, its challenges are answered on all three before the CA validates, and its certificate is installed on all three with every challenge withdrawn; a peer's `ACME_ORDERING` holds the site until `ACME_DONE`; two gateways partitioned each order, and once linked both serve the later certificate; over a link that is not verified TLS the challenges cross but no certificate key and no account do; the account is given to a peer that has none, and the ledgers merge on connect and on change |
 | commands | each command of §12.4 runs on an in-process member and its effect is asserted; `drain` hands back every claim and lease and the gateway routes nothing new; `restart` waits for in-flight work and the outbox, then builds a relaunch with the original arguments, one-shot flags dropped (the process spawn is asserted on, not run); `compact` is refused in fault mode and when free space is below the live size; a destructive command without the matching `confirm` is refused; a second command while one runs is refused; every command lands in the coordination log; `drain-gateway` closes members with `1001` and they carry on through their other cluster; a delivered Ctrl-C on a joined member drains, waits for the outbox, flushes, closes `1001` and then runs the tenant shutdown, with another member taking its world at once rather than after a term; a second Ctrl-C mid-drain exits at once; without `--cluster`, Ctrl-C is unchanged |
 | fault mode | a simulated `ENOSPC` on append, and free space under the floor, each enter fault mode; the member stays connected and keeps sending `COORD`; it releases every claim and world lease, stops its characters, and proposes nothing; **with the volume completely full it still promises and accepts, durably, through the vote journal, and counts toward the quorum**; it keeps sending its unsent events and answering `FETCH`es; the gateway routes no request to it and relays no live events to it, but relays Paxos frames to it; only `Drop` maintenance runs; leaving needs twice the floor and a test append, then catches up before taking work; free space hovering at the floor does not flap the mode; the status page and the log show both transitions |
 | quorum | `cluster/max_members` rises when more members are seen together, never falls by itself; a *set* lowers it, and raises after the set raise it again, in any arrival order; `--cluster-quorum-max` and the admin call write a set; the quorum is `⌊max_members / 2⌋ + 1`; a freshly restarted member alone reads its quorum from its substrate; in a group of two, one member plus the voting gateway's tie-break promise and acceptance decides, and the same vote does not complete a larger quorum |
@@ -4790,7 +4790,7 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | identity | the `TimelineId` layout and monotonicity; `hlc` is monotonic and passes every `hlc` seen; `(origin, oseq)`, stamp and `digest` preserved through relocation, re-emission and `compact()`; the applied set and the location index rebuild from the last `Replica` plus the walk; a substrate copied to another directory or machine re-mints its node; passthrough timelines are `hash(conversation_key, n)`, `n` the first opening whose timeline is free; VFS events are named `(origin, seq)`, two writers' of one number are two events, and a tombstone of another member's event outlives compaction |
 | VFS scoping | the writer's, reviewer's and checker's missions of one operation see one store, and a draft written in one step is read in the next, on another in-process member too; two operations over one base see different files; a character with no mission reads the tip; the table's reading and checks read the store; nothing an operation writes reaches the mind folder before its publish step; a failed run's store is discarded under `discard` and kept under `keep`, and `reopen` resumes a kept one; a workflow with a route to `done` from anything but a publish step is a load error; a clean publish lands the store and settles the run `done`; a conflict refuses the publish with the paths named, `merge_sync` marks the overlapping hunks in the store, and once the Maker has resolved and committed them at the bench the publish lands and the run settles `done` without going back through verification; the `published` check holds the step open until then; a Maker that reports `stuck` hands the step to another; publishing the same text twice merges as a no-op; in disconnected mode a step's edits write no `VfsEvent`; with `origin` or every agent unreachable, a publish settles nothing, counts toward neither send-backs nor stuck, and under paused time is offered again exactly 30 minutes later with the store intact |
 | agent selection | stickiness, the spill off a busy holder, and the idle-core ranking with repository and toolchain filters |
-| fetch through an agent (`zend-vfs/src/remote/fetch_bundle.rs`, `agent/src/wire.rs`, `agent/tests/agents.rs`, `npcd/src/mind_repo.rs`, `npcd/src/tenant.rs`) | a member that cannot reach origin gets a branch through an agent's checkout — the commit and its objects under its own tracking ref, reported as a fetch from origin reports it — then only what it lacks, and nothing when it lacks nothing; every branch is carried and a deleted one pruned; a branch asked for alone that origin lacks is an unknown revision; a `have` the agent does not hold is passed over; a fetch job and its answer are their exact JSON; through an in-process gateway a mirror whose `origin` is `agent:r` pulls origin's branch through the agent, and cut off a member's fetch reaches only its own agent, else `no_agent`; npcd's mirror is made under `--data` named `agent:<name>`, brought up to the record and checked out — ready — and follows later commits; a branch origin lacks leaves it not ready; `--mind-repo` needs `--data`, is refused beside `--mind`, and reads the same from `motherd.yaml`; an unready mirror starts on no mind |
+| fetch through an agent (`zend-vfs/src/remote/fetch_bundle.rs`, `agent/src/wire.rs`, `agent/tests/agents.rs`, `npcd/src/mind/mod.rs`, `npcd/src/tenant/mod.rs`) | a member that cannot reach origin gets a branch through an agent's checkout — the commit and its objects under its own tracking ref, reported as a fetch from origin reports it — then only what it lacks, and nothing when it lacks nothing; every branch is carried and a deleted one pruned; a branch asked for alone that origin lacks is an unknown revision; a `have` the agent does not hold is passed over; a fetch job and its answer are their exact JSON; through an in-process gateway a mirror whose `origin` is `agent:r` pulls origin's branch through the agent, and cut off a member's fetch reaches only its own agent, else `no_agent`; npcd's mirror is made under `--data` named `agent:<name>`, brought up to the record and checked out — ready — and follows later commits; a branch origin lacks leaves it not ready; `--mind-repo` needs `--data`, is refused beside `--mind`, and reads the same from `motherd.yaml`; an unready mirror starts on no mind |
 | status page | `COORD` encodes to exact bytes; every coordination decision of §12.3 — admission, refusal, mode switch, floor, lock, claim, grant, majority, NPC lease, cut-off, rejoin step, generation fixed, disconnected mode, catch-up, resync, tombstone expiry — driven through an in-process gateway lands in the log with its gateway and subject; `status.json` carries every block of §12.2, and a member reporting a gateway this one cannot see shows in both the `clusters` column and the grant counts |
 
 ### 14.2 Burst micro harnesses
@@ -5144,7 +5144,7 @@ from each member's own disk.
 
 **Tests.** The gateway-peering table (§14.1), against a local test double of the ACME
 CA (`web/tests/peering.rs`); the mirror brought up and followed through an agent
-(`npcd/src/mind_repo.rs`, `agent/tests/agents.rs`).
+(`npcd/src/mind/mod.rs`, `agent/tests/agents.rs`).
 
 **Exit.** Two gateways can serve the same names with one certificate store between
 them, and today's zend runs as a member of the gateway's cluster with its history
@@ -5331,7 +5331,7 @@ same configured upstreams as before.
    lift and find itself back in the command room. Whether the character should be told,
    say with a perception on rejoin, is open.
 12. **The apply rewrite is the largest piece of this design.**
-   - Every apply path in `substrate.rs:4115-4320,5070-5226` becomes a stamped max, a
+   - Every apply path in `substrate/apply_records.rs:4115-4320` and `substrate/loading.rs:5070-5226` becomes a stamped max, a
      union or a dominating fact.
    - Records that need a parent gain a pending map.
    - Section tombstones gain generations.

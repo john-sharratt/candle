@@ -48,13 +48,13 @@ Three frames, and they disagree.
 `select_layer` builds one position per query row from the sequence's own offset:
 
 ```rust
-// indexer.rs — the row positions handed to project_queries
+// indexer/project.rs — the row positions handed to project_queries
 for (span, &off) in spans.iter().zip(offsets) {
     positions.extend(off..off + span.len);
 }
 ```
 
-and `offsets[i]` is `session.sequence_offset(s)` (`wave.rs`) — the absolute
+and `offsets[i]` is `session.sequence_offset(s)` (`wave/`) — the absolute
 position of the sequence in its slot, injected prefix included. So the query side
 is absolute. This is the frame everything else must agree with.
 
@@ -64,7 +64,7 @@ is absolute. This is the frame everything else must agree with.
 in the **live tail**:
 
 ```rust
-jobs.push(((n_blocks + i) * ratio) as i64);   // indexer.rs, the append job
+jobs.push(((n_blocks + i) * ratio) as i64);   // indexer/append.rs, the append job
 ```
 
 and `flush_open_block` passes `self.n_blocks` the same way. `n_blocks` counts
@@ -81,7 +81,7 @@ A page is closed out of a live cache, so its rows were roped at that
 conversation's ordinals. The seal then writes `first_pos` as a literal zero:
 
 ```rust
-// wave.rs — seal_positional_tail_span
+// wave/positional.rs — seal_positional_tail_span
 page: IndexPage::new(p.keys.clone(), 0, p.last_cells),
 ```
 
@@ -133,7 +133,7 @@ and the base is **recomputed on every rebuild** from where the chunk sits in
 *this* projection, never from where it was written:
 
 ```rust
-// gpu_chunks.rs — rebuild_decode
+// gpu_chunks/guard.rs — rebuild_decode
 let mut rope_base = base_pos;
 for (i, chunk) in chunks.iter().enumerate() {
     write_slice_header(..., rope_base, kvheads_ptr);
@@ -275,7 +275,7 @@ no rows, which the host-side `candidates_at` walk gets right for free.
 ### 5.7 RoPE table depth
 
 Three sites size the indexer's rotation table from the tail alone —
-`live_blocks() + 1` at `wave.rs` (the flush, the close, and the seal) and
+`live_blocks() + 1` at `wave/` (the flush, the close, and the seal) and
 `capacity_blocks()` at `spec.rs`. Under absolute roping they must span the
 absolute block extent. The wave's own append path already does: it takes
 `index_rope_for(chunked_max_blocks())`, whose table spans `max_blocks ·
@@ -288,10 +288,10 @@ accidentally-sufficient.
 
 | Where | Change |
 |---|---|
-| `indexer.rs` `IndexCache` | `tail_base`; `pages: Vec<PlacedPage>`; `block_start` and `candidates_at` read `base`; `push_gap` → `skip_to`; `place_pending` |
-| `indexer.rs` `append_wave` | rope position `tail_base + (n_blocks + i) · ratio` |
-| `indexer.rs` `flush_open_block` | rope position `tail_base + n_blocks · ratio` |
-| `indexer.rs` `push_page` | takes a placement `base`; refuses an overlap |
+| `indexer/cache.rs` `IndexCache` | `tail_base`; `pages: Vec<PlacedPage>`; `block_start` and `candidates_at` read `base`; `push_gap` → `skip_to`; `place_pending` |
+| `indexer/append.rs` `append_wave` | rope position `tail_base + (n_blocks + i) · ratio` |
+| `indexer/cache.rs` `flush_open_block` | rope position `tail_base + n_blocks · ratio` |
+| `indexer/cache.rs` `push_page` | takes a placement `base`; refuses an overlap |
 | `indexer.rs` `score_pages` | reads the `Placement`'s staging; refuses an unplaced cache |
 | `place.rs` (new) | `PlacePage` / `Placement` (plan + run) / `place_pages` / `rotate_rows` |
 | `paged_index.rs` `IndexPage` | drop `blocked` + its `OnceLock`; `first_pos` → `roped_base` |
@@ -299,8 +299,8 @@ accidentally-sufficient.
 | `qsa_page_place.cu` (new) | signed constant rotation + channel-block, one pass, batched |
 | `wave.rs` `seal_page` | the four seal sites normalise to the zero frame |
 | `wave.rs` `index_rope_depth` | rope-table depth from the absolute extent, not the tail |
-| `wave.rs` `push_positional_state` | places at `next_base` and runs the placement |
-| `wave.rs` `push_positional_gap` | `skip_to` |
+| `wave/positional.rs` `push_positional_state` | places at `next_base` and runs the placement |
+| `wave/positional.rs` `push_positional_gap` | `skip_to` |
 
 No change to `qsa_score_paged.cu`, `qsa_index_append.cu`, `qsa_topk.cu`, or the
 aux blob format.
@@ -343,7 +343,7 @@ Gates 1–5 are built and green. `qsa_page_place` is at the memory floor —
 enough to sit in L2, and `tests/qsa_page_place_bench.rs` carries the sweep.
 
 **The decisive gate is `a_sealed_page_selects_the_same_wherever_it_is_placed`**
-(`indexer.rs`): forward the same tokens at two offsets, seal one into a
+(`indexer/tests_placement.rs`): forward the same tokens at two offsets, seal one into a
 position-free page, inject it at the other, and the selections must match. It was
 checked for teeth by stubbing the placement delta to zero — it is the only test
 in the file that then fails.

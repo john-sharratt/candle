@@ -20,7 +20,7 @@ impl WaveStats {
     /// `backlog` is the point-in-time prefill backlog in tokens
     /// ([`Scheduler::pending_prefill_tokens`]) — the signal the unified-wave
     /// engine's large-batch trigger keys on (see
-    /// `docs/unified_wave_inference_engine.md` §4.5); the line reports
+    /// `docs/archived/unified_wave_inference_engine.md` §4.5); the line reports
     /// *executed* forwards, so this is the only view of pending *work*.
     /// Call only when [`Self::due`] — windows with NO forwards still flush so
     /// stalls surface their phase split. `bands` is the whole card, cut by what

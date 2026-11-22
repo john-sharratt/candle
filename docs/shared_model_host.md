@@ -24,7 +24,7 @@ Two binaries, two machines, two models, two engines:
 |---|---|---|
 | Machine | `.5` (RTX PRO 5000, 72 GB) | `.6` |
 | Model | `model_choice::resolve` — VRAM ladder: Qwen3.8-Flash-Next Q4_KO above 60 GiB, else Qwen3.6-35B-A3B Q4 (`zend/src/model_choice.rs:54-105`) | hard-coded `Qwen36_35B_A3B_AntiLoop_StyleTune` (`npcd/src/model.rs:54-56`); no flag, no ladder |
-| Engine | one `ConversationEngine` in `InferenceState.engine: Mutex<_>` (`zend/src/session.rs:475`, built `:1292`) | one `ConversationEngine` as an `Arc<Mutex<_>>` (built `npcd/src/engine/runtime.rs:3866`), held by `Minds` (`engine/mind.rs:203-204`) |
+| Engine | one `ConversationEngine` in `InferenceState.engine: Mutex<_>` (`zend/src/session/mod.rs:475`, built `:1292`) | one `ConversationEngine` as an `Arc<Mutex<_>>` (built `npcd/src/engine/runtime.rs:3866`), held by `Minds` (`engine/mind.rs:203-204`) |
 | Substrate | engine opens `<workspace>/substrate` itself (`engine.rs:387-412`) | npcd opens `<data>/substrate` (`npcs.rs:218-252`) and hands it over with `.substrate(shared)` (`runtime.rs:3791-3795`) |
 | HTTP | its own `axum::serve` + `web::tls` entrance (`zend/src/main.rs:680-721`) | `web::Builder … .behind_gateway().local_api("npcd", …)` (`npcd/src/main.rs:861-870`) |
 | UI | compiled in (`include_dir!`, `zend/src/api/mod.rs:43`) | compiled in, or from disk with `--content` — which production passes (`docs/deployment.md:88`) |
@@ -48,9 +48,9 @@ one scheduler (`slots_sharing_a_substrate_are_walked_once`, `:15487`).
   `:2194-2201`, `:2310-2317`); there is no public way to create a sequence on another
   substrate.
 - One `PersistenceThread` per engine, bound to that one `Conversation`
-  (`engine.rs:491`, `persistence/thread.rs:207-317`). A second substrate would get no
+  (`engine.rs:491`, `persistence/thread/handle.rs:207-317`). A second substrate would get no
   hot→warm drain, and `evict_hot_to_free` only evicts what has a warm copy
-  (`substrate.rs:2802`), so its hot KV could never be relieved.
+  (`substrate/eviction.rs:2802`), so its hot KV could never be relieved.
 - The startup reload (`reconstruct_substrate`) runs only on the engine's own
   conversation (`engine.rs:532`, `:569`, and the `ReconstructSubstrate` request at
   `:662`).
@@ -58,7 +58,7 @@ one scheduler (`slots_sharing_a_substrate_are_walked_once`, `:15487`).
 **Keys that carry no substrate.** `TurnKey`, `TimelineId`, `SectionId` and `StreamId`
 key scheduler-wide maps (`ingest_timelines` `:3456`, `timeline_projections` `:3530`)
 and the gallery arena's residency map
-(`gallery_arena/mod.rs:113`). Each `Conversation` has its own `TimelineAllocator`,
+(`provenance/gallery_arena/mod.rs:113`). Each `Conversation` has its own `TimelineAllocator`,
 minting `max(now_µs, last+1)` (`projection/ids.rs:372-421`), so two substrates can
 mint the same id, and two substrates opened on different machines may already hold
 colliding ids. A `SectionId` is its schema's own — allocated in order as the schema is
@@ -72,8 +72,8 @@ section's **stream id** that is the hash of its content.
 | `Tokenizer` | SHA-256 of `tokenizer.json` | **yes** — a different tokenizer is refused (`engine.rs:454-467`, `persistence/mod.rs:1992-2015`); skipped, with a warning, when `tokenizer.json` cannot be read (`builder.rs:1382-1388`) |
 | `ModelSpec` | text: arch, chat format, repo, filename, tokenizer repo, max_seq_len (`builder.rs:913-934`) — no revision, tensor overrides, adapters or gate donor | **no** — written last-writer-wins, read only by tests and `substrate_inspect` |
 | KV chunks | `KvFormat` tag, stream, index, token count; per-head formats (`persistence/record.rs:345-365`, `:580-598`) | no model field; layer count not recorded — the reload assumes the running model's (`scheduler/mod.rs:9409`); only `substrate_inspect` infers it, by majority vote (`resume.rs:727-751`) |
-| Recurrent snapshot | `schedule_hash` = layer schedule + DeltaNet dims (`candle-transformers/src/models/delta_net/state_store.rs:135-160`) | geometry only; a mismatch is logged and the timeline runs with no recurrent memory (`scheduler/mod.rs:7068-7103`) |
-| WideQSig | fold stamp (`wide_sig.rs:335-344`) | only the group size; a mismatch skips scoring the record, not the open (`:537-552`) |
+| Recurrent snapshot | `schedule_hash` = layer schedule + DeltaNet dims (`candle-transformers/src/models/delta_net/state_store/snapshots.rs:135-160`) | geometry only; a mismatch is logged and the timeline runs with no recurrent memory (`scheduler/mod.rs:7068-7103`) |
+| WideQSig | fold stamp (`provenance/wide_sig.rs:335-344`) | only the group size; a mismatch skips scoring the record, not the open (`:537-552`) |
 
 So a model change today does one of three things, none of them right:
 
@@ -84,7 +84,7 @@ So a model change today does one of three things, none of them right:
   model check: their address hashes tokens only, and the restore refuses only a chunk
   count the running layer count does not divide (`resume.rs:584-601`).
 - **Different layer count:** every turn fails `recover_turn_cold_refs`
-  (`resume.rs:524-531`) and its layer's corrupt-turn policy fires. Under
+  (`persistence/resume/recover.rs:524-531`) and its layer's corrupt-turn policy fires. Under
   `DropConversation` — the default (`projection/schema.rs:951-961`), and every zend
   layer's but dialogue's — every timeline is durably tombstoned; zend's dialogue is
   `drop_turn`, so every turn of every chat is dropped instead.
@@ -104,7 +104,7 @@ the tokenizer's rule to the whole model.
 Shared by design, and fine with one model and one scheduler: the device span
 reservation, region pool, ground broker, wave domains and VRAM governor (all keyed by
 device ordinal, `region_pool.rs:547-602`, `bump_arena.rs:1078-1087`); `ACTIVE_FOLD`
-(`wide_sig.rs:160`, "one process loads one model"); the scheduler's telemetry and
+(`provenance/wide_sig.rs:160`, "one process loads one model"); the scheduler's telemetry and
 admission atomics (`PREFILL_OK_TOKENS`, phase rings, `memory_report::LATEST`).
 
 Wrong once two daemons share a process:
@@ -112,9 +112,9 @@ Wrong once two daemons share a process:
 | Global | Why it breaks |
 |---|---|
 | `cancel.rs:28-35` `INGEST_CANCEL` | one latch for the process; zend's shutdown cancel would stop npcd's ingest too |
-| `layer_toggle.rs:24-27` `DISABLED` | keyed by layer *name* across every conversation; a toggle in one daemon reaches the other's layer of the same name |
+| `projection/layer_toggle.rs:24-27` `DISABLED` | keyed by layer *name* across every conversation; a toggle in one daemon reaches the other's layer of the same name |
 | the global tracing subscriber | both `main`s call `.init()`; the second panics |
-| zend's panic hook (`main.rs:343`), its Ctrl-C flag reset (`ctrl_c.rs`), `std::process::exit` | process-wide; zend exits the process on load failure, at shutdown and to self-heal (`session.rs:6171`, `:6183`, `:6360`; `main.rs:740`, `:776`; `self_heal.rs:217`, `:240`) |
+| zend's panic hook (`main.rs:343`), its Ctrl-C flag reset (`host/src/ctrl_c.rs`), `std::process::exit` | process-wide; zend exits the process on load failure, at shutdown and to self-heal (`session.rs:6171`, `:6183`, `:6360`; `main.rs:740`, `:776`; `host/src/self_heal.rs:217`, `:240`) |
 | `#[tokio::main]` | each owns a runtime |
 
 Daemon-private statics stay daemon-private and are fine with one copy of each daemon:
@@ -262,7 +262,7 @@ run of that binary shares.
 ### 3.2 Engine core and attachments
 
 ```
-EngineCore (Arc, one per process)              candle-conversation/src/engine.rs
+EngineCore (Arc, one per process)              candle-conversation/src/engine/mod.rs
 ├─ scheduler thread + Sender<SchedulerRequest>
 ├─ model (moved to the scheduler), tokenizer, device, guests
 ├─ model identity: ModelKey (§4.1)
@@ -578,7 +578,7 @@ High (either daemon's live conversation) > Normal > Low (either daemon's ingest)
   it at the conversation's ratio (`docs/continuous_fair_waves.md` §3.1). A pause that held
   ingest out for 15 s after every conversation's activity stopped zend's ingest outright
   beside npcd's cast, which never falls idle for that long.
-- **The prefill throttle** (`prefill.rs` `throttle_ratio`) uses the same order: work
+- **The prefill throttle** (`scheduler/prefill/decode_priority.rs` `throttle_ratio`) uses the same order: work
   yields to the decodes in a higher band, at that band's ratio, whichever daemon
   either belongs to. Two daemons' work in one band shares the wave as one daemon's
   always has.

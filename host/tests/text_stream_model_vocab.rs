@@ -1,5 +1,5 @@
 //! The streamed text is the full decode for the prescribed model's own
-//! tokenizer (`docs/performance_patch.md` Z1, §7) — a landing requirement, so
+//! tokenizer (`docs/archived/performance_patch.md` Z1, §7) — a landing requirement, so
 //! it fails, never skips, when the tokenizer cannot be had. Ignored by default:
 //! run it with `cargo test --release -p host --test text_stream_model_vocab --
 //! --ignored --nocapture`.

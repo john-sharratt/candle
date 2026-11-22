@@ -326,7 +326,7 @@ window. While nothing has sealed, `journal_none` shows.
   entry reseals itself and the closing section; a fold reseals what follows the
   place it took; a turn pins only the chain's sealed beginning.
   `Minds::prepare` reconciles them before each turn through the same `Carried`
-  reconcile the mission uses (`mind/carried.rs`): what the prompt wants and is not
+  reconcile the mission uses (`candle-conversation/src/conversation/carried.rs`): what the prompt wants and is not
   yet held is submitted and sealed; a section the prompt no longer wants is
   removed (`remove_section_named`). The entries a fold took are therefore removed
   from the conversation, and the prompt names them so a reconcile that did not

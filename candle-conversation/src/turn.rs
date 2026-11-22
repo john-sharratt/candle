@@ -130,7 +130,7 @@ pub struct TurnOptions {
     /// Spans of the user half whose recurrent state is captured — the rows
     /// arrive as [`TurnEvent::RecurrentCapture`](crate::TurnEvent::RecurrentCapture)
     /// before `Done` — or replayed from a record
-    /// (`docs/recurrent_reply_calibration.md`).
+    /// (`docs/archived/recurrent_reply_calibration.md`).
     pub recurrent_spans: Vec<TextSpan>,
 }
 

@@ -377,13 +377,13 @@ With the table of §2.
 
 | Piece | Where |
 |---|---|
-| The table and its reader | `host/machines.yaml`, `cluster/src/machines.rs`, `host/src/machines.rs`, `web/src/config.rs` (`machines_file`) |
+| The table and its reader | `host/machines.yaml`, `cluster/src/machines.rs`, `host/src/machines.rs`, `web/src/config/cluster_block.rs` (`machines_file`) |
 | The fill, the round robin, an app that runs no model | `cluster/src/gateway/placement/{conversation,least}.rs` |
 | Room: drawing, reserved, `max` | `cluster/src/gateway/placement/room.rs` |
 | Pictures and the reservation | `cluster/src/gateway/placement/draw.rs`, `Registry::draw_target`, `Hub::pick_in` |
 | Lagging passed over, among those with room | `cluster/src/gateway/placement.rs` (`prefer_current`) |
 | The forward queue | `cluster/src/gateway/queue.rs`, `Hub::place`, `Hub::release_waiting` |
-| The plan: shares, busy, `RETURN_AFTER`, `SETTLE`, the plan on the busy event | `cluster/src/gateway/planner/`, `Hub::pick_in` |
+| The plan: shares, busy, `RETURN_AFTER`, `SETTLE`, the plan on the busy event | `cluster/src/gateway/planner.rs`, `Hub::pick_in` |
 | A move that completes; a held, unwoken character handed back | `npcd/src/authority/{npc_lease,cast}.rs` |
 | Worlds that keep their lease | `npcd/src/authority/{world_lease,driver}.rs` |
 | The expert pin | `candle-core/src/vram/host_probe.rs`, `host/src/run.rs` |

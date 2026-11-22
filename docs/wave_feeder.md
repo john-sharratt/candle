@@ -368,8 +368,8 @@ tenants, all legitimate, none of them ever leaked:
 
 | tenant | where | scales with |
 |---|---|---|
-| `Gallery` | `provenance/gallery_arena/storage.rs` | the **ingested corpus** |
-| `RecurrentState` | `delta_net/state_store.rs` | concurrent sequences |
+| `Gallery` | `provenance/gallery_arena/mod.rs` | the **ingested corpus** |
+| `RecurrentState` | `delta_net/state_store/mod.rs` | concurrent sequences |
 | `VerifyStash` | `qwen35/spec.rs` (since replaced by each state slot's fixed timeline, `docs/deltanet_timeline.md`) | concurrent sequences × draft budget |
 
 All three exist only on DeltaNet-lineage models, which is why this never
@@ -483,7 +483,7 @@ The check is one line of trace and would have cost ten minutes before any of
 the three controller designs in §4.7.
 
 **What this means.** Recurrent state stores are created per *sequence in the
-wave engine*, and per fork (`state_store.rs`, the fork path, ~3 per turn) — not
+wave engine*, and per fork (`state_store/mod.rs`, the fork path, ~3 per turn) — not
 per conversation the producer holds open. Closing conversations neither prevents
 them nor returns them. So the lever for phase 9 is the wave engine's concurrent
 sequence count, or the store's own lifetime, and **not** anything the producer
@@ -1375,8 +1375,8 @@ exist, which is what makes the tenant bearable rather than what makes it right.
 > `budget_notches`, `cut_admit_budget`, `raise_admit_budget`,
 > `evidence_admit_grow`, `regulate_ingest_admission`,
 > `demote_cold_ingest_if_pressured` and `per_block_kv_bytes` all exist in
-> `scheduler/admission.rs` and `scheduler/prefill.rs`. The rate model that now
-> decides admission lives in `scheduler/admit/rate.rs`, and the span layout it
+> `scheduler/admission.rs` and `scheduler/prefill/mod.rs`. The rate model that now
+> decides admission lives in `scheduler/admit/rate/mod.rs`, and the span layout it
 > admits against is described in
 > [`vram_span_partition.md`](vram_span_partition.md). Read what follows as
 > history, not as the current call graph.

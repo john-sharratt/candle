@@ -76,11 +76,11 @@ much room it really has (including what eviction can reversibly reclaim).
 
 ### 3.1 Single allocation chokepoint
 Every device allocation funnels through `CudaDevice::alloc`/`alloc_zeros`
-([`device.rs:46-58`](../candle-core/src/cuda_backend/device.rs)) → cudarc
+([`device/memory.rs:46-58`](../candle-core/src/cuda_backend/device/memory.rs)) → cudarc
 `cuMemAllocAsync` on the default stream-ordered pool. Free is RAII (drop →
 `cuMemFreeAsync`, returns to the **pool**, not the OS). Present measurement
-primitives: `mem_get_info` (`device.rs:318`), `pool_used_bytes`/`pool_reserved_bytes`
-(`device.rs:333/345`), `trim_pool` (`device.rs:384`), `synchronize` (`device.rs:726`).
+primitives: `mem_get_info` (`device/device_info.rs:318`), `pool_used_bytes`/`pool_reserved_bytes`
+(`device/device_info.rs:333/345`), `trim_pool` (`device/device_info.rs:384`), `synchronize` (`device.rs:726`).
 
 ### 3.2 Allocation categories (→ the `AllocClass` tags)
 | `AllocClass` | Category (Qwen3-30B-A3B) | Evictable? |
@@ -93,11 +93,11 @@ primitives: `mem_get_info` (`device.rs:318`), `pool_used_bytes`/`pool_reserved_b
 ### 3.3 The nine KV relief mechanisms (wired into the ladder in §8)
 Cheap→expensive / reversible→lossy: `release_empty_arenas` (`backing.rs:873`),
 `compact` (`backing.rs:856`), `compact_forced` (`backing.rs:863`),
-`evict_hot_to_free` (`substrate.rs:1716`, oldest hot→warm, reversible),
-`evict_hot_except` (`substrate.rs:1646`), `demote_turns_to_warm` (`substrate.rs:1788`),
-`quantize_sealed_in_place` (`compress.rs:157`, **lossy**), warm→cold
+`evict_hot_to_free` (`substrate/eviction.rs:1716`, oldest hot→warm, reversible),
+`evict_hot_except` (`substrate/eviction.rs:1646`), `demote_turns_to_warm` (`substrate/eviction.rs:1788`),
+`quantize_sealed_in_place` (`compress/mod.rs:157`, **lossy**), warm→cold
 (`thread.rs:570`), `purge_warm_to_target` (`substrate.rs:1553`). The existing
-cascade `relieve_vram_pressure` (`prefill.rs:74-128`) returns "still pressured?" as
+cascade `relieve_vram_pressure` (`scheduler/prefill/relief.rs:74-128`) returns "still pressured?" as
 a bool; `request_global_compact` (`backing.rs:49-84`) broadcasts to all backings;
 `EvictionScope` (`alloc.rs:93-124`) grants a compress-to-free op a privileged
 slice. These are the closures the ladder registers — subsumed, not rewritten.
@@ -318,7 +318,7 @@ tunables re-derived per card class.
 
 **Phase-aware trigger band (scheduler).** The scheduler's `vram_under_pressure`
 gate — which decides *when* to invoke this ladder — sizes its reserve band by the
-phase the caller is in (`VramPhase`, `scheduler/prefill.rs`). The availability
+phase the caller is in (`VramPhase`, `scheduler/prefill/vram_phase.rs`). The availability
 number is phase-independent (`headroom + reuse`, so the WDDM false-pressure fix
 always holds); only the band it is compared against changes:
 - **Load** (prefill upload, section/scope ingest, warm→hot elevation — bringing KV
@@ -511,10 +511,10 @@ impl VramGovernor {
   allocate directly — the live measurement catches them; there is no counter to
   keep exact.
 - **Retry on failure (requirement 11):** `allocate` catches `KV_DEVICE_OOM_MARKER`
-  or raw driver OOM (`is_device_oom`, `backing.rs:39`), invokes relief, retries,
+  or raw driver OOM (`is_device_oom`, `backing/refusals.rs:39`), invokes relief, retries,
   escalates a tier per round, gives up after `Critical`. Subsumes today's
   `ensure_vram_budget` force-compact retry (`alloc.rs:244`) and `handle_prefill_oom`
-  requeue (`prefill.rs:652`).
+  requeue (`scheduler/prefill/wave_run.rs:652`).
 - **Scratch is never predicted:** scratch allocations just call `reserve(Scratch,…)`
   and are allowed to proceed; if they need room, the ladder (KV is the flex) makes
   it. "It just has to be allocated or everything breaks" — so scratch always wins
@@ -611,14 +611,14 @@ all_resident = num_slots >= total_experts
   moment of the decision, so it's accurate to what the card actually has after
   weights — no `cuMemGetInfo`-free guessing, no double-counting. This replaces
   today's `min(max(free−5GB, free/2), total_expert_bytes)`
-  (`quantized_qwen3_moe.rs:1467-1536`).
+  (`quantized_qwen3_moe/loader.rs:1467-1536`).
 - **Experts can never starve KV below its floor** — the budget subtracts
   `kv_floor` (+ `SCRATCH_MARGIN`) before experts get a byte, by construction.
 - **All-resident preferred when it fits** — if `total_expert_bytes ≤ budget`,
   every expert stays resident → the static-index fast path (`handle.rs:287`), zero
   DMA stalls; KV gets the rest.
 - **Partial residency degrades gracefully** — the score-based cache churns the
-  remainder (`cache.rs:180-270`), the 69% Markov hit-rate hides the DMA, and
+  remainder (`expert_lre/cache/bookkeeping.rs:180-270`), the 69% Markov hit-rate hides the DMA, and
   experts register `Moderate`/`Critical` relief so KV can borrow expert VRAM only
   under genuine overload.
 - **`SCRATCH_MARGIN`** is a small fixed cushion (not a scratch prediction — §9.1)
@@ -653,15 +653,15 @@ Deps: `cudarc` (existing); `windows` crate (`#[cfg(windows)]`, minimal features)
 `windows-sys` hand-roll. **No NVML.**
 
 ### 12.1 Integration points (what changes, where)
-- **Replace** `vram_has_room`/`vram_budget_available` (`alloc.rs:140/210`) with
+- **Replace** `vram_has_room`/`vram_budget_available` (`alloc/budget.rs:140/210`) with
   governor queries; `ensure_vram_budget` (`alloc.rs:234`) → `governor.allocate(Kv,…)`.
-- **KV registers relief** wrapping §3.3; `relieve_vram_pressure` (`prefill.rs:74`)
-  and `evict_to_fit_incoming` (`mod.rs:6470`) call the governor.
+- **KV registers relief** wrapping §3.3; `relieve_vram_pressure` (`scheduler/prefill/relief.rs:74`)
+  and `evict_to_fit_incoming` (`projection_turns.rs:6470`) call the governor.
 - **Scheduler admit width** ← `governor.forecast_units(...)` (`mod.rs:4205-4225`,
   `prefill.rs:139`).
-- **Expert fill** (`quantized_qwen3_moe.rs:1467-1536`) → measured fill (§11);
+- **Expert fill** (`quantized_qwen3_moe/loader.rs:1467-1536`) → measured fill (§11);
   expert cache registers slot relief.
-- **Weight load** (`quantized_qwen3_moe.rs:1543-1694`) → `governor.reserve(Weights,…)`.
+- **Weight load** (`quantized_qwen3_moe/loader.rs:1543-1694`) → `governor.reserve(Weights,…)`.
 - **Balloon** at session construction (`batched_inference.rs:560`), before load.
 - **`device_init_free`** kept only as the balloon circuit-breaker fallback.
 

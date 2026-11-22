@@ -204,8 +204,8 @@ TCC and Linux a launch is submitted as it is issued, so `query_submits` returns
 without the call.
 
 The limits sized under WDDM's 2 s display watchdog stay as they are. The
-expert workers' spin limit (`moe_live.cuh`, `dispatch.rs`) is a deadlock
-backstop under any driver, and the banded launches in `quantized/cuda.rs` cost
+expert workers' spin limit (`moe_live.cuh`, `dispatch/mod.rs`) is a deadlock
+backstop under any driver, and the banded launches in `quantized/cuda/dequantize.rs` cost
 nothing under TCC.
 
 ## 7. Switching a machine

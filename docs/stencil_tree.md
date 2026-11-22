@@ -4,8 +4,8 @@
 deltas* below for what shipped beyond it).
 **Module:** `candle-conversation/src/stencil/` (self-contained, 100% unit-tested
 without a GPU; only the final end-to-end check needs hardware).
-**Touch-points:** a sample-stage mask hook in `batched_sampler.rs` and a
-per-sequence step hook in `scheduler/decode.rs`. Nothing in the KV cache,
+**Touch-points:** a sample-stage mask hook in `batched_sampler/allow_list.rs` and a
+per-sequence step hook in `scheduler/decode/`. Nothing in the KV cache,
 projection, or persistence paths changes.
 **Primary use case:** forcing a tool call to a tool catalog's exact names and
 JSON schema.
@@ -16,12 +16,12 @@ JSON schema.
   `compile_think_tree`): per-effort-dial trees that steer the `<think>` block with
   an opener + continuation phrases, closed via token-closed `suppress_close` spans.
   §8's "three front-ends" is now four.
-- **`StencilDriver`** (`driver.rs`): the online walker the scheduler drives one
-  decoded token at a time (the `Healed` signal contract with `scheduler/decode.rs`).
+- **`StencilDriver`** (`driver/mod.rs`): the online walker the scheduler drives one
+  decoded token at a time (the `Healed` signal contract with `scheduler/decode/`).
 - **`TriggerRegistry`** (`trigger.rs`): token → tree dispatch with atomic,
   idempotent `with_trigger` / `without_trigger`, used to swap the per-turn think
   tree onto the tool-call base.
-- The `§15` module layout and the `§13` public-API sketch predate `driver.rs`,
+- The `§15` module layout and the `§13` public-API sketch predate `driver/mod.rs`,
   `think.rs`, and `trigger.rs` and are illustrative, not exhaustive.
 - **Value sub-trees as shipped** (§8.3). Scalars (`integer`/`number`) and any
   container the grammar does not guide are one `FreeText{JsonValue}` span —
@@ -104,7 +104,7 @@ JSON schema.
     address costs its url, not its body, and the test holds that cost under 400
     nodes.
   - **The budget counts paths, not nodes.** `estimated_paths` (npcd
-    `tools.rs`) sums a shaped parameter over its shapes and multiplies over
+    `engine/tools/compile.rs`) sums a shaped parameter over its shapes and multiplies over
     properties, then raises to `ACTS_PER_TURN`. It is the larger number and is
     quadratic in the address count: it bounds what a change to the catalogue can
     multiply, while the node count above is what the compile costs.
@@ -435,7 +435,7 @@ three kinds, with no regex engine.
 
 `FreeTextLimits` scopes the sampler's whole-turn EOS mechanism
 (`SamplingConfig::{eos_boost, eos_ramp_start, eos_ramp_len, graceful_eos_after,
-forced_eos_after}`, see `batched_sampler.rs`) to a single span, closing with the
+forced_eos_after}`, see `batched_sampler/`) to a single span, closing with the
 span's terminator (or EOS when `eos_ends`) instead of the turn's EOS:
 
 ```rust
@@ -927,7 +927,7 @@ carries its own: `TurnGrammar { tree, held }`. A file's reading
 reads: `repo` to its repository, `path` to its path, `lines` to its ranges. The
 reading's prompt names all three, and the model — not the grammar — used to
 write them, which is how a reading came to read `src/turn_layout.rs` for
-`candle-conversation/src/turn_layout.rs` nine times over.
+`candle-conversation/src/turn_layout/` nine times over.
 
 ### 9.3 A tail: what an answer's end hands over to
 
@@ -947,7 +947,7 @@ A task's `Steps:` section is the tail (`stencil/answer_steps.rs`). It writes
 the heading and, for each step, `N. <its words> — `. Each line is held to
 `done`, `not done` or `could not`, then `: ` and the model's own line, which
 ends at its newline. A section the model was only asked to write was left out
-of 3 answers in 8 (`docs/zen_coding_challenge_fixes.md` Cause 3).
+of 3 answers in 8 (`docs/archived/zen_coding_challenge_fixes.md` Cause 3).
 
 ---
 
@@ -957,16 +957,16 @@ Per sequence: an `Option<StencilSession>` beside its `DecodeState` (small; the
 tree is shared `Arc`). The trees compile once at model/catalog load and live on
 the scheduler in the `TriggerRegistry`. Only two scheduler changes:
 
-1. **Sample-stage mask + EOS bias hook** in `batched_sampler.rs`: a per-row
+1. **Sample-stage mask + EOS bias hook** in `batched_sampler/`: a per-row
    `Option<AllowedSet>` mask and a per-row close-token boost (§6.3), applied
    after penalties.
-2. **Pre-wave prefill drain** in `scheduler/decode.rs`: a sequence owing a
+2. **Pre-wave prefill drain** in `scheduler/decode/`: a sequence owing a
    `Prefill` runs it on its slot (`run_prefill`) before rejoining the
    next decode wave; the §3 inner loop drains chained actions.
 
 KV cache, projection, and persistence are untouched. The rare healing rewind
 (§7.3) uses the existing `truncate_sequence_to_tokens`. **Decode-health guards**
-(`decode_health.rs` entropy/repetition floors) are suspended while a session is
+(`decode_health/` entropy/repetition floors) are suspended while a session is
 active — stenciled regions are deliberately low-entropy/repetitive — via a
 `stencil_active` flag the checks short-circuit on, symmetric with how they handle
 `inside_think_block`.
@@ -1163,14 +1163,14 @@ candle-conversation/src/stencil/
   spec.rs         TreeSpec, NodeSpec, BuildError (the string-space intermediate)
   compile.rs      compile(): tokenize-in-context, fold, fuse, verify invariants
   builder.rs      StencilTreeBuilder (front-end A)
-  tool_call.rs    compile_tool_call_tree + ToolSpec → TreeSpec (front-end B)
+  tool_call/      compile_tool_call_tree + ToolSpec → TreeSpec (front-end B)
   yaml.rs         TreeSpec::from_yaml (front-end C)
   sim.rs          StencilSimulator + Oracle (test/diagnostic harness)
   tests/          extensive scenario + edge-case suites (or #[cfg(test)] per file)
 ```
 
 One concern per file. The scheduler/sampler touch-points are additive hooks in
-`scheduler/decode.rs` and `batched_sampler.rs`; no existing KV, projection, or
+`scheduler/decode/` and `batched_sampler/`; no existing KV, projection, or
 persistence code changes.
 
 ---

@@ -32,7 +32,7 @@ The pieces the feature needs are all in place, and none of them is MCP-specific:
   `master`, else what is checked out (`zend/src/conv_branches.rs:27`, `:84`).
 - **The conversation's overlay, already assembled.** `InferenceState::saved_files` returns
   exactly what a conversation's reads see: a fresh set, its branches taken up, its saved events
-  replayed into it, and nothing saved back (`zend/src/session.rs:3574-3580`).
+  replayed into it, and nothing saved back (`zend/src/session/uploads.rs:3574-3580`).
 - **Invalidation on commit.** `Committing::land` carries the store onto the commit it published
   (`zend-vfs/src/work/commit.rs:173`), and the mirror tombstones the paths the store let go of
   (`docs/zend_vfs_events.md` §4, `zend/src/conv_overlay/mod.rs:51`).
@@ -89,13 +89,13 @@ overlay is saved as events and restored when the conversation is built again
 (`zend/src/conv_overlay/mod.rs:51`, `:64`).
 
 **The plumbing.** `InferenceState::saved_files` is `pub(crate)`
-(`zend/src/session.rs:3574`). *Planned:* a `ZendSession::conversation_files(conv_id) ->
+(`zend/src/session/uploads.rs:3574`). *Planned:* a `ZendSession::conversation_files(conv_id) ->
 Option<Arc<RepoFiles>>` returning `None` when the model is not loaded — the shape
-`ZendSession::conversation_branches` already uses (`zend/src/session.rs:7874`) — and the tool
+`ZendSession::conversation_branches` already uses (`zend/src/session/conversations.rs:7874`) — and the tool
 answers `LOADING` (`zend/src/mcp/tools/mod.rs:84`) when it is `None`.
 
 It reads the conversation's **saved** overlay, not its live one. A live conversation's stores
-are saved after every tool round (`zend/src/session.rs:3595`), so the difference is the round
+are saved after every tool round (`zend/src/session/inference_stream/stream_turn.rs:3595`), so the difference is the round
 in flight; reading a live store from an MCP call would reach into a conversation mid-round and
 see a half-applied edit. The answer says so when the conversation is live:
 `"a round is running; this is what it has saved"`. That is a fact about the store, not a caveat
@@ -114,7 +114,7 @@ conversation moves it (`zend-vfs/src/vfs/mod.rs:504`). So:
   registered timeline (`conv_branches::seed` returns 0 for an unknown timeline,
   `zend/src/conv_branches.rs:84`). *Planned:* it does not get one. It reads
   `InferenceState.base_branches` — the workspace's base per repository, `main` else `master`
-  else what is checked out, computed once at load (`zend/src/session.rs:3078`,
+  else what is checked out, computed once at load (`zend/src/session/load/startup.rs:3078`,
   `zend/src/conv_branches.rs:32`) — and passes it to `RepoFiles::set_branches`
   (`zend-vfs/src/files.rs:154`) on the fresh set. A reader conversation is a pair of eyes on
   the base branch, not a line of work; the moment it needs its own branch it is a task.
@@ -136,7 +136,7 @@ Three cases, and the design is that none of them needs a hook.
    base (`docs/zend_vfs_events.md` §4, `zend/src/conv_overlay/mod.rs:51`). The next read sees
    the commit. This is the existing path, unchanged.
 2. **Someone else commits to the branch.** A reader conversation holds no `RepoFiles` between
-   calls — each call builds one (`zend/src/session.rs:3574`), and a store takes its base only
+   calls — each call builds one (`zend/src/session/uploads.rs:3574`), and a store takes its base only
    when it reads (`zend-vfs/src/vfs/mod.rs:618`) — so the next call reads the branch as it
    stands now. There is nothing to invalidate because there is nothing cached.
 3. **A conversation with a base sees the branch move under it and does not follow.** That is
@@ -156,10 +156,10 @@ per-call build is the invalidation.
 Four definitions, one file each under `zend/src/mcp/tools/`, each calling the
 `zend-tools` implementation through a `ToolContext` built around the conversation's stores
 (`ToolContext::with_files`, `zend-tools/src/context.rs:199`; `ToolHost::context_for`,
-`zend/src/tools.rs:979`). Mode: Restricted, which is what a user's tasks run and what offers the
+`zend/src/tools/tool_host.rs:979`). Mode: Restricted, which is what a user's tasks run and what offers the
 file tools and no network (`docs/tool-system.md:36`), and the context is built branches-only
-(`ToolHost::bound`, `zend/src/tools.rs:958`) so a conversation owned through `/mcp` can never
-push to a default branch (`zend/src/tools.rs:938`, `zend-tools/src/context.rs:131`). The
+(`ToolHost::bound`, `zend/src/tools/tool_host.rs:958`) so a conversation owned through `/mcp` can never
+push to a default branch (`zend/src/tools/mod.rs:938`, `zend-tools/src/context.rs:131`). The
 `branches_only` guard is a write guard, so it changes nothing about a read — it is there so the
 same context is honest if a write tool is ever added.
 
@@ -233,7 +233,7 @@ read of the same conversation returns the committed content and no longer report
    footprint is the conversation record itself. If it later gains writes, the write tools are
    the ones that need a turn, a journal entry and a seal — which is a task, not a call.
 2. **A reader conversation's timeline.** `timeline_for` hashes the conversation id
-   (`zend/src/session.rs:8991`), so `mcp:<key>:<thread>/files` is a stable timeline without
+   (`zend/src/session/timeline_ids.rs:8991`), so `mcp:<key>:<thread>/files` is a stable timeline without
    registering anything. Whether it should appear in the sidebar and the thread's list is a
    product question for the daemon's own listing, not a blocker: the tools work either way.
 3. **`file_grep` over `*` on a large workspace** is the one call whose cost is not bounded by a

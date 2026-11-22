@@ -7,7 +7,7 @@ capped at ~558 t/s. This document is the study that produces the invariants the 
 must satisfy to get there — every violation below is a place the current code leaves the
 GPU idle, round-trips through the host, or does work the architecture says is unnecessary.
 
-The hot path is `forward_wave` (`wave.rs`) and everything it calls per layer, per wave:
+The hot path is `forward_wave` (`latent_moe/wave/managed.rs`) and everything it calls per layer, per wave:
 projections → compressor assemble/pool → gallery append → select → gather → attention
 kernel → out-proj → MoE. Two phases share it: **prefill** (bulk, ragged multi-token
 prompt slots) and **decode** (one token per session, batched across sessions).
@@ -62,7 +62,7 @@ Three sites were converted:
    *pool*, because page-locking every spilled arena wholesale would make an unbounded
    amount of host memory unswappable.
 
-`keys.t()?.contiguous()?` (four `gallery.rs` sites) was **measured out**, not fixed:
+`keys.t()?.contiguous()?` (four `latent_moe/gallery/mod.rs` sites) was **measured out**, not fixed:
 candle's matmul accepts the strided transpose and all gates pass without the copy, but the
 model A/B lands inside run-to-run variance (~2 % same-code spread), which points at cuBLAS
 selecting a slower kernel for the strided operand and roughly cancelling the saved traffic.
@@ -254,7 +254,7 @@ bit-exact (1 seq ⇒ global == per-seq).
   can't be naively batched; a parity-safe batched on-device recall is a large,
   unvalidatable-by-current-gate effort for an uncommon path.
 
-**Doc corrections found while verifying:** `paged.rs:208-210` (`CorpusCache::build`)
+**Doc corrections found while verifying:** `latent_moe/paged/corpus_cache.rs:208-210` (`CorpusCache::build`)
 and `gallery.rs:1704/1766` are test/bench-only, not hot sites (Inv 6 had 5 real
 sites, not 7).
 
@@ -314,7 +314,7 @@ violated today, across both phases, with the fix direction.
 
 ## Invariant 1 — no `to_dtype`; kernels emit the final type
 
-The attention kernels emit **BF16** (`paged.rs:375` decode, `paged.rs:562` prefill), but
+The attention kernels emit **BF16** (`latent_moe/paged/decode.rs:375` decode, `latent_moe/paged/prefill.rs:562` prefill), but
 out-proj quantises to **int8** and needs **F32** input, so every attention result is cast
 BF16→F32 before out-proj. Symmetrically, the projection norms emit **F32** but the kernels
 want **BF16**, so q/kv are cast F32→BF16 on the way in. Both casts are full passes the
@@ -344,10 +344,10 @@ of them.
 
 | Phase | Site | What | Fix |
 |---|---|---|---|
-| **prefill (dominant drain)** | `compressor.rs:512,515,581,587,591,594` | **6× `force_contiguous` per seq** in `assemble_groups` (carried rows + prev group) | this is the bulk of the ~3205 ms `pprep:assemble` — ~4000 tiny alloc+copies. Replace the cat/copy assemble with **one fused pooling-input kernel** |
+| **prefill (dominant drain)** | `latent_moe/compressor/incremental.rs:512,515,581,587,591,594` | **6× `force_contiguous` per seq** in `assemble_groups` (carried rows + prev group) | this is the bulk of the ~3205 ms `pprep:assemble` — ~4000 tiny alloc+copies. Replace the cat/copy assemble with **one fused pooling-input kernel** |
 | prefill | `wave.rs:71` (`pool_prefill_across_seqs`) | `pooled.narrow().contiguous()` split-copy per seq | `append_batch` takes a `(tensor, row_offset, len)` view, no compacted copy |
-| both | `gallery.rs` `gather_corpus` (`pos` + `sel` `.contiguous()`) | `index_select` results forced contiguous | gather kernel writes the corpus cache directly |
-| decode | `paged.rs:242` (`CorpusCache::from_gathered`) | `comp_pos.contiguous()` | same gather-kernel fix |
+| both | `latent_moe/gallery/mod.rs` `gather_corpus` (`pos` + `sel` `.contiguous()`) | `index_select` results forced contiguous | gather kernel writes the corpus cache directly |
+| decode | `latent_moe/paged/corpus_cache.rs:242` (`CorpusCache::from_gathered`) | `comp_pos.contiguous()` | same gather-kernel fix |
 
 ---
 
@@ -358,8 +358,8 @@ of them.
 | MoE | `engine.rs` `indices.to_vec2` | routing readback | **REMOVED** by the live MoE dispatch — the routing summary goes to the host through a mapped ring that no device work waits on; the wave readback budget (`latent_moe::readback`) is zero |
 | both | `wave.rs` `token_ids` | input token ids | **SANCTIONED** — host-origin ids that feed the embed gather (also sanctioned, see below); the MoE hash routing reads the ids uploaded with the wave, not host ids |
 | prefill | `kernel_attention.rs:621` `g.to_vec1::<u32>()` | per-token GID readback (out-of-regime recall) | violation (deep-prompt fallback) — keep on GPU |
-| decode | `wave.rs:995-1046` `idx_flat` host build + `from_vec` | comp-idx assembly | build comp-idx on-device from the batched select's offsets |
-| both | `gallery.rs` `gather_corpus` spilled arm `to_device(Cpu)` | warm-tier re-heat | **NEEDED** (tiering) — keep |
+| decode | `latent_moe/wave/sweep_wave.rs:995-1046` `idx_flat` host build + `from_vec` | comp-idx assembly | build comp-idx on-device from the batched select's offsets |
+| both | `latent_moe/gallery/mod.rs` `gather_corpus` spilled arm `to_device(Cpu)` | warm-tier re-heat | **NEEDED** (tiering) — keep |
 | MoE | `moe_cpu_export` + the down launch's CPU items | CPU-class rows out, result rows back, through mapped memory | **SANCTIONED** — the CPU expert class (`docs/cpu_expert_compute.md` §4); no host call waits on either |
 
 ---
@@ -369,8 +369,8 @@ of them.
 | Phase | Site | Host compute | Fix |
 |---|---|---|---|
 | MoE | `engine.rs` | counting-sort + `assignments` built on host then re-uploaded | **FIXED** — GPU `moe_bucketize` over the live expert table (`ExpertCache::forward_routed`); the host sort and the readback it rode on are both gone |
-| prefill | `wave.rs:1227-1267` (Host-select) | `union.sort/dedup` + `remap` HashMap + `idx_flat` host build + `from_vec` | extend `batched_causal_select_device` to the out-of-regime/HCA/SWA arms |
-| both | `wave.rs:377` `embed_rows` | `from_vec(Cpu)` + `index_select(Cpu)` | **SANCTIONED** — this is an index + host→device transfer, not compute; the embed table stays CPU-resident to save VRAM |
+| prefill | `latent_moe/wave/sweep_wave.rs:1227-1267` (Host-select) | `union.sort/dedup` + `remap` HashMap + `idx_flat` host build + `from_vec` | extend `batched_causal_select_device` to the out-of-regime/HCA/SWA arms |
+| both | `latent_moe/wave/mod.rs:377` `embed_rows` | `from_vec(Cpu)` + `index_select(Cpu)` | **SANCTIONED** — this is an index + host→device transfer, not compute; the embed table stays CPU-resident to save VRAM |
 | MoE | `expert_lre/cpu_pool` | the pool computes the experts bucketize assigned it | **SANCTIONED** — the split is decided on the device; the host computes only what it was handed (`docs/cpu_expert_compute.md` §4) |
 
 ---
@@ -381,15 +381,15 @@ of them.
 (`two_stage_select_batched`), gather (`gather_corpus_batched`), attention (one
 `paged_latent_decode`), out-proj — all batched across sessions. Residual:
 
-- `wave.rs:899-935` — per-session `kernel_attn_decode_capture` (stateful corpus push +
+- `latent_moe/wave/sweep_wave.rs:899-935` — per-session `kernel_attn_decode_capture` (stateful corpus push +
   query capture).
-- `wave.rs:995-1046` — host comp-idx build (also Invariant 4).
+- `latent_moe/wave/sweep_wave.rs:995-1046` — host comp-idx build (also Invariant 4).
 - `wave.rs:1442-1447` — per-seq `lm_head`.
 
 **Prefill** is the core gap — everything after the (now-batched) projection is per-seq:
 
 - `wave.rs:1120` — pass-1 per-seq `assemble` (stateful; the `force_contiguous` storm).
-- `wave.rs:1158` — pass-2 per-seq loop: **append, select, gather, attention kernel,
+- `latent_moe/wave/sweep_wave.rs:1158` — pass-2 per-seq loop: **append, select, gather, attention kernel,
   writeback, out-proj — all single-seq.** `paged_latent_prefill_raw` is **single-slot**;
   decode's kernel is multi-slot. Batching this across all prompt slots is the single
   biggest win.
@@ -411,8 +411,8 @@ uses — the primitive exists; only a public constructor is missing.
 
 | Phase | Site | Buffer | Written by |
 |---|---|---|---|
-| decode | `paged.rs:375` | attention `out` BF16 `[num_slots, n_q_head, HEAD_DIM]` | `paged_latent_decode` |
-| prefill | `paged.rs:562` | attention `out` BF16 `[total_q, n_q_head, HEAD_DIM]` | `paged_latent_prefill` |
+| decode | `latent_moe/paged/decode.rs:375` | attention `out` BF16 `[num_slots, n_q_head, HEAD_DIM]` | `paged_latent_decode` |
+| prefill | `latent_moe/paged/prefill.rs:562` | attention `out` BF16 `[total_q, n_q_head, HEAD_DIM]` | `paged_latent_prefill` |
 | prefill | `paged.rs:208-210` | `nope_i8`/`nope_scale`/`rope_bf` | dequant/seal kernel |
 | prefill | `paged.rs:619,620,624` | `comp_i8`/`comp_scale`/`comp_v8` (baked corpus) | pre-pass rope+quant kernel |
 | decode | `wave.rs:1003-1006` | `out_nope`/`out_scale`/`out_rope`/`out_pos` | gather kernel |

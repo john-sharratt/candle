@@ -34,9 +34,9 @@ main loop happens to notice:
   - Discord posts `spoken(&m.intent)` (`npcd/src/engine/reported.rs:69`;
     callers `npcd/src/discord/dm/outbound.rs:184`, `server/outbound.rs:50`,
     `world/outbound.rs:77`). It only strips a leading "that " and capitalises.
-  - Nothing decodes the words. `narrate_act` (`npcd/src/engine/mind.rs:963-1000`)
+  - Nothing decodes the words. `narrate_act` (`npcd/src/engine/mind/mod.rs:963-1000`)
     is a synchronous render for the feed, and `reply` is not among the acts it
-    renders (`tools::narrates`, `npcd/src/engine/tools.rs:1178-1183`).
+    renders (`tools::narrates`, `npcd/src/engine/tools/mod.rs:1178-1183`).
 
   This is the `that …` leak.
 - **Answering does not mark the thread read.** `message`/`reply`
@@ -46,15 +46,15 @@ main loop happens to notice:
 - **The phone never shows the character its own replies.** `read_phone`
   (`enact.rs:341-386`) returns only unseen lines from others.
 - **The loop guard runs after the repeat is posted.** The act is performed at
-  `npcd/src/engine/runtime.rs:6673`, judged at `:6739-6799`, and the guard's
+  `npcd/src/engine/runtime/mod.rs:6673`, judged at `:6739-6799`, and the guard's
   state is in memory only (`npcd/src/engine/loopguard.rs:368-370`).
 - **Threads themselves are fragile.**
   - A world keeps 64 non-permanent threads and drops the quietest
-    (`npcd/src/sim/phone.rs:399, 524-538`).
+    (`npcd/src/sim/phone/mod.rs:399, 524-538`).
   - A thread that is reopened gets a new id, and its seq restarts at 1
-    (`phone.rs:541-566`).
+    (`phone/mod.rs:541-566`).
   - `sign_off` leaves the thread, and a direct thread with one member closes
-    (`phone.rs:834-845`).
+    (`phone/mod.rs:834-845`).
   - Members are display names (`npcd/src/engine/mod.rs:1199-1212`).
 - **The party's identity is lost.** `inbound::judge` resolves the Discord
   author's account, then writes `WorldOp::Message{from: speaking_as(..)}`, a
@@ -63,8 +63,8 @@ main loop happens to notice:
   - Any affirmative line from one signs off a critical step
     (`authorize.rs:88-97`; `enact.rs:293-315`).
 - **NPCs talk to each other aloud.** `tell` is offered whenever anybody is in
-  the room, and `shout` always (`tools.rs:287, 345`). NPC↔NPC talk is room
-  speech (`npc-map/src/world.rs:1910-1930`), which nothing preserves and
+  the room, and `shout` always (`tools/mod.rs:287, 345`). NPC↔NPC talk is room
+  speech (`npc-map/src/world/mod.rs:1910-1930`), which nothing preserves and
   nothing concludes.
 
 A conversation removes these by construction: each message is a turn of a
@@ -98,24 +98,24 @@ account. §11 rebuilds the phone, and §12 makes room speech for people only.
 
 | Need | Existing piece | Anchor |
 |---|---|---|
-| Character decode | `Minds`, `Live{sequence}`, `send_turn_with_options_async` | `npcd/src/engine/mind.rs:163-227, 1786-1789` |
-| Act grammar, parser, performer | `grammar_for`, `act::parse` (over specs), `performable`, `Runtime::perform` → `perform_here` | `mind.rs:1034`; `npcd/src/engine/act.rs:372`; `tools.rs:2343-2349`; `npcd/src/authority/perform.rs:272-369` |
-| Modes | `Mode::{Physical, InstantMessage}` | `tools.rs:1015-1023` |
+| Character decode | `Minds`, `Live{sequence}`, `send_turn_with_options_async` | `npcd/src/engine/mind/mod.rs:163-227, 1786-1789` |
+| Act grammar, parser, performer | `grammar_for`, `act::parse` (over specs), `performable`, `Runtime::perform` → `perform_here` | `mind/mod.rs:1034`; `npcd/src/engine/act.rs:372`; `tools/mod.rs:2343-2349`; `npcd/src/authority/perform.rs:272-369` |
+| Modes | `Mode::{Physical, InstantMessage}` | `tools/mod.rs:1015-1023` |
 | Side decode that writes nothing | `UnsealedAsker::ask`, taking full `TurnOptions` (grammar, prefill) | `candle-conversation/src/conversation/ephemeral_turn.rs:69-112`; npcd's use at `npcd/src/engine/mind/ask.rs:178-185` |
 | Response templates | the shared prompt's `response` collection (`top_k: 1`, filled from `<mind>/responses/`) | the mind's `projection.yaml`; `npcd/src/projection.rs:361` |
-| Runtime-offered candidates | `SelectionRule::Offered { selector, k }`, set per turn through `SelectionState` | `candle-conversation/src/projection/schema.rs:1397-1409`; precedent `tools.rs:1266-1274` |
+| Runtime-offered candidates | `SelectionRule::Offered { selector, k }`, set per turn through `SelectionState` | `candle-conversation/src/projection/schema.rs:1397-1409`; precedent `tools/mod.rs:1266-1274` |
 | Banning tokens in a turn | `TurnOptions.turn_banned_tokens` | `candle-conversation/src/turn.rs:60-62` |
 | Carried sections per turn | `Carried::reconcile` | `candle-conversation/src/conversation/carried.rs:159` |
 | Republishing the projection | `rebuild_projection` → `publish_ask_state` (private) | `candle-conversation/src/conversation/submitted_sections.rs:733-746` |
 | Resume on a new slot | `resume_conversation_with_projection`; `restore_recurrent_state` | `candle-conversation/src/engine.rs:2505`; `candle-conversation/src/scheduler/mod.rs:7654-7790` |
-| Idle KV demotion | `demote_idle_hot` | `candle-conversation/src/substrate.rs:2121, 519` |
+| Idle KV demotion | `demote_idle_hot` | `candle-conversation/src/substrate/mod.rs:2121, 519` |
 | Bands | `DecodePriority`; timeline `decode_band` | `projection/schema.rs:936-958`; `scheduler/band.rs:14-40` |
 | Leases and hand-back | rendezvous leases; `Standing::begin_turn`/`end_turn`/`hand_back_due`; `lease.ready`; `wake_character`; `put_down` | `npcd/src/authority/npc_lease.rs:1-16`; `npcd/src/authority/worlds.rs:333-397`; `npcd/src/authority/cast.rs:163, 206, 241-248` |
-| Cross-member delivery | `Told` pulses; `Runtime::tell` | `environment.rs:465-470`; `npcd/src/authority/follow.rs:74-78`; `runtime.rs:2660-2672` |
-| Mood | `NpcPayload.mood`; `note_feeling` → `MoodSink` → `Npcs::remember_mood` | `candle-conversation/src/persistence/record.rs:1353`; `runtime.rs:3678-3692`; `npcd/src/npcs.rs:477-500` |
-| Missions | `Mission`, `Todo{critical}`, `check_off`, `critical_next`, `authorize`, `critical_compass`; `lodge_mission`; `cancel_mission`; agenda acts | `npcd/src/engine/mission.rs:32-289, 603-640`; `authorize.rs:101`; `perform.rs:406-447`; `runtime.rs:2133-2148`; `npcd/src/engine/agenda/` |
+| Cross-member delivery | `Told` pulses; `Runtime::tell` | `environment.rs:465-470`; `npcd/src/authority/follow.rs:74-78`; `runtime/mod.rs:2660-2672` |
+| Mood | `NpcPayload.mood`; `note_feeling` → `MoodSink` → `Npcs::remember_mood` | `candle-conversation/src/persistence/record.rs:1353`; `runtime/mod.rs:3678-3692`; `npcd/src/npcs/mod.rs:477-500` |
+| Missions | `Mission`, `Todo{critical}`, `check_off`, `critical_next`, `authorize`, `critical_compass`; `lodge_mission`; `cancel_mission`; agenda acts | `npcd/src/engine/mission/mod.rs:32-289, 603-640`; `authorize.rs:101`; `perform.rs:406-447`; `runtime/mod.rs:2133-2148`; `npcd/src/engine/agenda/` |
 | Ownership | `NpcPayload.owner_id` (a public handle `u_…`) | `npcd/src/api.rs:1092`; `npcd/src/npcs/cast.rs:147-153` |
-| Striking an act | `Within.cooling`, read by `performable` | `tools.rs:1996-2002, 2343-2349` |
+| Striking an act | `Within.cooling`, read by `performable` | `tools/mod.rs:1996-2002, 2343-2349` |
 | Journals | `Store` (one private ref per checkout); `Section::Bots`; `Actor::Npcd`; `fold_period`; zend's `Memory` wrapper and memory writer | `journals/src/store/mod.rs:46, 117-173, 269-334`; `journals/src/scope.rs:19, 84, 130`; `journals/src/actor.rs:35`; `journals/src/ops/period_fold.rs:58-116`; `zend/src/mcp/memory/mod.rs:121-290`; `zend/src/session/memory_writer.rs:65-86` |
 | A visitor's body | `visitor:{handle}` | `npcd/src/engine/interaction.rs:105-112, 280-287`; `npcd/src/engine/order_table.rs:56` |
 
@@ -149,19 +149,19 @@ Its conversation id is `npc-{npc}-talk-{party}-g{n}`, where `n` is the
 generation. Any member holding the character's lease rejoins the newest
 generation (§9). It does not roll over with the world day or chapter.
 `retire_superseded` sweeps only `npc-{id}-day-` and `narrator-{id}-day-`
-(`mind.rs:2205-2221`).
+(`mind/mod.rs:2205-2221`).
 
 - **A conversation is resumed only under the frame it was decoded under.** npcd
   rejoins a timeline only when the rendered frame's fingerprint matches
-  (`resumable`, `mind.rs:2135-2170`), because a history the character can no
-  longer produce is worse than none (`mind.rs:2099-2105`). A conversation's
+  (`resumable`, `mind/mod.rs:2135-2170`), because a history the character can no
+  longer produce is worse than none (`mind/mod.rs:2099-2105`). A conversation's
   frame is the shared prompt rendered under the `talking` stance (§6.5).
 - **When the frame changes**, the next message opens generation `n+1`. The
   `talk.*` state is carried over, and generations below `n+1` are retired by
   prefix, as `retire_superseded` does. History before the change is recalled
   from the journal (§5). This is why every conversation's content also lands in
   the journal.
-- **Lifecycle.** `retire_npc` (`mind.rs:2075-2082`) also tombstones every
+- **Lifecycle.** `retire_npc` (`mind/mod.rs:2075-2082`) also tombstones every
   `npc-{npc}-talk-*` timeline when an NPC is deleted.
 - **NPC↔NPC** is two conversations, one in each mind, over the one direct thread
   the pair shares (§11.1).
@@ -527,13 +527,13 @@ does (`docs/zend_journal.md`), written by the same workflow
 3. **Publish before asking.** A section sealed by `reconcile` is not yet in the
    projection `UnsealedAsker::ask` uses. That projection is republished only at
    submit or on a removal (`submitted_sections.rs:743-746`;
-   `candle-conversation/src/conversation.rs:2031, 2039`).
+   `candle-conversation/src/conversation/mod.rs:2031, 2039`).
    - **The new method.** `Sequence::publish_sections()` runs
      `sync_submitted_sections` and publishes the ask state
-     (`submitted_sections.rs:733-746`; `conversation.rs:2106-2111`).
+     (`submitted_sections.rs:733-746`; `conversation/mod.rs:2106-2111`).
    - **When it runs.** The runner calls it after the reconcile, before any ask.
    - **The mind gets it too.** The mind's own asks have the same gap after
-     `prepare` reconciles (`mind.rs:1931-1954`), and the mind calls it as well.
+     `prepare` reconciles (`mind/mod.rs:1931-1954`), and the mind calls it as well.
 4. **Summarise when the gap is long.** If more than `VERBATIM_LINES` = 6 lines
    were read, an ask runs under `AskScope::Conversation` at the conversation's
    band: "What has happened since you last spoke with {party}, {gap} ago, that
@@ -556,41 +556,41 @@ The decision is the mind's act turn, run on an ephemeral fork with
 **The catalog, compiled for a thread.**
 
 - **`Mode` is a grammar input.** Today `act_specs` and `show_within` hard-code
-  `Mode::Physical` (`mind.rs:428-430, 2027`), as do `mind.rs:861`,
-  `runtime.rs:7925` and `npcd/src/engine/invoke_body.rs:368`, and the grammar
-  cache keys on `(thinking, within)` (`mind.rs:1042`).
+  `Mode::Physical` (`mind/mod.rs:428-430, 2027`), as do `mind/mod.rs:861`,
+  `runtime/mod.rs:7925` and `npcd/src/engine/invoke_body.rs:368`, and the grammar
+  cache keys on `(thinking, within)` (`mind/mod.rs:1042`).
   - `Mode` is therefore passed through `grammar_for`, `act_specs`, `show_within`
     and the cache key.
   - `act::parse` takes specs, so it follows without change.
 - **An explicit allow-list.** `Within::on_thread(party)` sets `allow`, the only
   acts offered.
   - **Why emptying the world sets is not enough.** `sleep`, `record_verdict`,
-    `read`, `invite`, `open_group` and `send_image` survive it (`tools.rs:1731`;
-    `npcd/src/engine/acts.rs:1019-1043`; `tools.rs:2235-2236, 699`). The
+    `read`, `invite`, `open_group` and `send_image` survive it (`tools/mod.rs:1731`;
+    `npcd/src/engine/acts.rs:1019-1043`; `tools/mod.rs:2235-2236, 699`). The
     empty-set rule removes only acts with a required world-bound parameter
-    (`tools.rs:2343-2349, 2651-2675`).
+    (`tools/mod.rs:2343-2349, 2651-2675`).
   - **Where it is checked.** `allow` is checked in `performable` beside
     `cooling`, which both `specs_within` and `invoke_body` share, so both
     grammars honour it.
 - **The path budget.** `estimated_paths` raises the per-act total to a
-  hard-coded `ACTS_PER_TURN` (`tools.rs:2700-2703`) under `MAX_TURN_PATHS` =
-  2,000,000 (`tools.rs:2737`). It takes the call count as a parameter, and a
+  hard-coded `ACTS_PER_TURN` (`tools/mod.rs:2700-2703`) under `MAX_TURN_PATHS` =
+  2,000,000 (`tools/mod.rs:2737`). It takes the call count as a parameter, and a
   budget test covers the full thread catalog at `TALK_ACTS`.
 
 | Act | In a conversation | Binding |
 |---|---|---|
-| `reply` | the voiced text goes to the party | `to` = the party, **whoever spoke last** (the talk `Within.awaiting` holds the party; the main loop's needs somebody else to have spoken last, `tools.rs:1833, 2064-2066`) |
+| `reply` | the voiced text goes to the party | `to` = the party, **whoever spoke last** (the talk `Within.awaiting` holds the party; the main loop's needs somebody else to have spoken last, `tools/mod.rs:1833, 2064-2066`) |
 | `sign_off` | the voiced text is the parting; ENDED | `to` = the party; it ends the conversation and keeps membership (§11.1) |
-| `reflect` | the voiced text goes to the journal; the mood is set | `feeling` ∈ `Choices::Feelings` (`tools.rs:808-819`). In a conversation the performer calls `note_feeling` only: no `arm_pause`, no reflection, no dream (`runtime.rs:2949-2955, 6696-6722`). |
+| `reflect` | the voiced text goes to the journal; the mood is set | `feeling` ∈ `Choices::Feelings` (`tools/mod.rs:808-819`). In a conversation the performer calls `note_feeling` only: no `arm_pause`, no reflection, no dream (`runtime/mod.rs:2949-2955, 6696-6722`). |
 | `promise` | a ledger promise to the party | `to` = the party; `what`, `by` |
 | `remind` | remind the party of their promise | NPC↔NPC only, because a person never `promise`s. `which` ∈ what the party owes. |
 | `mission_*` | change the mission (§7.1) | offered only when the party is the owner or an authorizer, outside the thrash cooldown |
 | `message_someone_else` / `reach_out` | hand off: a purpose to another conversation (§10) — not the answer | `to` ∈ the NPC's threads, channels and contacts **other than the party**. `message_someone_else` is the conversation's own act (`Availability::OnThread`, `talk/hand_off.rs`), performed as the world's `message`; the main loop keeps `message` and is never offered it. |
 
 - **Calls per turn.** `compile_action_loop` with `max_calls` = `TALK_ACTS` = 2
-  (`candle-conversation/src/stencil/tool_call.rs:1207`): a promise or a
+  (`candle-conversation/src/stencil/tool_call/mod.rs:1207`): a promise or a
   mission change, and the reply beside it. This is its own constant beside the
-  main loop's `ACTS_PER_TURN` = 2 (`tools.rs:1354`). It is two, not three,
+  main loop's `ACTS_PER_TURN` = 2 (`tools/mod.rs:1354`). It is two, not three,
   because of the path budget: `reflect` binds the whole mood library, so with
   the shipped mind's 116 moods and an agenda to change one act is about 300
   paths. Three acts admit 2.6 × 10⁷ decodes, twelve times `MAX_TURN_PATHS`;
@@ -603,11 +603,11 @@ The decision is the mind's act turn, run on an ephemeral fork with
   rounds end once they are spent. The acts of every round are performed, so
   the character messages somebody else and then answers the party.
 - **The destination.** The loop cannot make one call terminal
-  (`tool_call.rs:1262-1294`), so the destination is read after parsing: the
+  (`tool_call/mod.rs:1262-1294`), so the destination is read after parsing: the
   **last** of `reply`, `sign_off` or `reflect` in the list decides. A list with
   none of them goes to the journal.
 - **Deliberation.** The decision uses `Deliberation::None`, opened by a closed
-  think block and the call marker (`mind.rs:941-961, 1729-1742`).
+  think block and the call marker (`mind/mod.rs:941-961, 1729-1742`).
 
 ### 6.3 Voice (the real turn)
 
@@ -624,7 +624,7 @@ The decision is the mind's act turn, run on an ephemeral fork with
 3. **Decode.** `submit_turn_with_options` with no grammar and no triggers.
    - Thinking is off: the no-think selector is set, and both `<think>` and
      `<tool_call>` are banned (`turn_banned_tokens`). With no grammar,
-     `opening()` prefills nothing (`mind.rs:949-951`), so the bans are what
+     `opening()` prefills nothing (`mind/mod.rs:949-951`), so the bans are what
      hold.
    - `max_tokens` is 320 for a message, which fits one Discord message, and 480
      for a journal entry.
@@ -662,10 +662,10 @@ measured in the live check (§13).
 
 - **Wait for durability, then drop.** After the voice turn seals, the runner
   waits for that turn's recurrent snapshot to be durable, then drops the
-  `Sequence`, which frees the slot (`conversation.rs:5352-5361`).
+  `Sequence`, which frees the slot (`conversation/mod.rs:5352-5361`).
   - **The new query.** The wait is a new non-consuming per-timeline query,
     `Substrate::snapshot_durable(timeline, turn)`, built from the snapshot's
-    location and `sealed.is_durable` (`candle-conversation/src/projection/resolver.rs:5062-5069`).
+    location and `sealed.is_durable` (`candle-conversation/src/projection/resolver/mod.rs:5062-5069`).
   - **Why not the existing call.** `drain_durable_snapshots` is a global
     read-once queue whose only consumer is the scheduler's own idle parking
     (`candle-conversation/src/scheduler/recurrent_park.rs:24-28`). Draining it
@@ -679,13 +679,13 @@ measured in the live check (§13).
     person's critical path.
 - **KV.** The turn's KV was truncated at seal (`scheduler/mod.rs:8559-8574`).
   Its residences stay hot until `demote_idle_hot`'s grace: at most 16 epochs,
-  ticking on seal or flush passes or a 5 s idle tick (`substrate.rs:2121-2128`).
+  ticking on seal or flush passes or a 5 s idle tick (`substrate/mod.rs:2121-2128`).
   Abandoned conversations drain to warm and cold through the existing tiering.
 - **Never transient, never unresumed.** A conversation timeline is never marked
-  transient (`substrate.rs:5592-5597`) or unresumed (`recurrent_park.rs:60-63`).
+  transient (`substrate/mod.rs:5592-5597`) or unresumed (`recurrent_park.rs:60-63`).
 - **Resume.** `resume_conversation_with_projection` (`engine.rs:2505`), under
   the frame rule of §4.1. A resumed `Sequence` reconciles its carried
-  collections afresh (`mind.rs:1533-1548`): the mission section and the
+  collections afresh (`mind/mod.rs:1533-1548`): the mission section and the
   journal-core chain are restored on every turn after a park, one
   `RestoreSection` each (`submitted_sections.rs:420-447`). That is part of the
   per-turn cost.
@@ -698,11 +698,11 @@ layer id and dials, framing on the same prompt. Its differences are selections
 and a `talking` stance branch:
 
 - **Unchanged:** identity, personality and world collections
-  (`identity::selection_for`, `mind.rs:2012`). It is the same person.
+  (`identity::selection_for`, `mind/mod.rs:2012`). It is the same person.
 - **Mission.** The current mission, re-reconciled every turn
-  (`mind.rs:1927-1942`). For Zen, its agenda as well (`agenda_prompt`,
-  `npcd/src/sim/missions.rs:520-547`).
-- **Journal-core.** The character's journal-core entries (`mind.rs:1943-1954`).
+  (`mind/mod.rs:1927-1942`). For Zen, its agenda as well (`agenda_prompt`,
+  `npcd/src/sim/missions/mod.rs:520-547`).
+- **Journal-core.** The character's journal-core entries (`mind/mod.rs:1943-1954`).
 - **Catch-up.** The `catchup` collection (§6.1).
 - **Mood.** The current mood, read fresh from `Cast::mood_of`
   (`npcd/src/npcs/cast.rs:168-174`).
@@ -759,8 +759,8 @@ place of the intent, with its `requests` on the line.
 Today the op carries only `{npc, call, decided, pinned_at}`
 (`npcd/src/authority/ops.rs:38-44`), and the call is re-parsed against
 `tools::specs()` (`perform.rs:124`). Voicing runs after the mind's turn has
-cleared `turn_in_flight` (`conversation.rs:3790-3798, 3855`; perform at
-`runtime.rs:6596-6673`), so the voicing ask never waits on the mind's own
+cleared `turn_in_flight` (`conversation/mod.rs:3790-3798, 3855`; perform at
+`runtime/mod.rs:6596-6673`), so the voicing ask never waits on the mind's own
 turn.
 
 **Source.** `WorldOp::Act` and `perform`/`perform_here` gain
@@ -777,7 +777,7 @@ a third `Origin` beside `phone::Origin` and `mission::Origin`.
     it as news, which is correct.
 
 **Speaking steps and answers fire when a line lands.** `mark_spoken`
-(`runtime.rs:1903-1937`) and `ledger.answered` (`enact.rs:1077-1081`) fire when
+(`runtime/mod.rs:1903-1937`) and `ledger.answered` (`enact.rs:1077-1081`) fire when
 a conversation's line lands on the thread, not when a main-loop purpose is
 handed over (§10).
 
@@ -799,9 +799,9 @@ agenda acts included (`npcd/src/engine/talk/orders.rs`).
 - **Why the agenda acts don't fit.** They refuse an ordered body
   (`agenda/perform.rs:31-35`). Their required `priority` binds
   `Choices::Priorities`, which is empty for ordered bodies, so the empty-set
-  rule would remove the whole act (`agenda/acts.rs:46`; `tools.rs:1854,
+  rule would remove the whole act (`agenda/acts.rs:46`; `tools/mod.rs:1854,
   2241-2247, 2343-2349`). An ordered mission has no title either: titles live
-  on `agendum` (`mission.rs:284`).
+  on `agendum` (`mission/mod.rs:284`).
 - **So.** The same names (`mission_add`, `mission_edit`, `mission_cancel`,
   `mission_done`) get ordered-body specs with their own descriptions
   (`npcd/src/engine/agenda/ordered.rs`). `mission` binds the active mission's
@@ -817,8 +817,8 @@ agenda acts included (`npcd/src/engine/talk/orders.rs`).
   - `mission_add` → `lodge_mission(.., start: true)` with
     `Origin::Lodged { by: account }`, which assigns it, and calls off the
     current mission and its operation (`perform.rs:406-447`;
-    `sim/missions.rs:702-716`). Not `Origin::Own`, which closes as a routine
-    (`missions.rs:659-669`).
+    `sim/missions/mod.rs:702-716`). Not `Origin::Own`, which closes as a routine
+    (`missions/mod.rs:659-669`).
   - `mission_edit` → a new `Missions::edit_active`. It keeps every done and
     every critical step, and refuses a mission with an operation, whose steps
     are the operation's.
@@ -830,9 +830,9 @@ agenda acts included (`npcd/src/engine/talk/orders.rs`).
 
 **Critical steps are protected on the agenda path too.**
 - `agenda_edit` rebuilds `todo` and would drop an unsigned critical step, or
-  re-create it as non-critical (`sim/missions.rs:388-399`). It keeps critical
+  re-create it as non-critical (`sim/missions/mod.rs:388-399`). It keeps critical
   and done steps.
-- `agenda_done` (`missions.rs:415-447`) is refused while a critical step is
+- `agenda_done` (`missions/mod.rs:415-447`) is refused while a critical step is
   unsigned.
 
 ### 7.2 Authority
@@ -858,7 +858,7 @@ The party is known by account (D14):
 step only when both hold:
 
 1. **It asked.** When a purpose reaches a conversation whose party is an
-   authorizer while `critical_next()` is `Some(step)` (`mission.rs:619-640`),
+   authorizer while `critical_next()` is `Some(step)` (`mission/mod.rs:619-640`),
    the runner records `talk.pending_critical = step`. The posted line carries
    `requests: step` (a `Message` field, §11.1).
 2. **The authorizer answered yes.** Their next message is affirmative
@@ -879,15 +879,15 @@ after each passes the authority check.
 
 **The main loop is told.** After applying, the authority delivers an URGENT
 `Concluded{party, act, applied_as}` through `Runtime::tell`
-(`runtime.rs:2660-2672`), which reaches the character wherever it is held. The
+(`runtime/mod.rs:2660-2672`), which reaches the character wherever it is held. The
 next decision starts from the new mission and knows why.
 
 ### 7.3 Outcomes flow out, not back
 
 An act's outcome reaches the conversation's next turn the way main-loop
 outcomes reach theirs: a `<tool_response>` ahead of the user turn
-(`compose_narrated`, `mind.rs:2400-2422`). `Within.owed` is built from the
-party for a conversation, not from the room (`tools.rs:2186-2190`).
+(`compose_narrated`, `mind/mod.rs:2400-2422`). `Within.owed` is built from the
+party for a conversation, not from the room (`tools/mod.rs:2186-2190`).
 
 ---
 
@@ -897,7 +897,7 @@ Conversation guards are **per conversation** and never touch the character's.
 
 - **Today all strikes land on the character.** `Within.cooling` is the
   per-character union of `cooldowns.cooling(npc)` and `loop_guards.cooling(npc)`
-  (`runtime.rs:2284-2290`). A remote `reply` stamps the character's
+  (`runtime/mod.rs:2284-2290`). A remote `reply` stamps the character's
   `(npc, "reply")` cooldown (`perform.rs:306-308`).
 - **A talk `Within` builds `cooling` only from its own state.** Acts with
   `ActSource::Talk` never call `cooldowns.took_act` or `loop_guards.record` for
@@ -951,7 +951,7 @@ holder**, in a per-member runner for the characters held there
     refused while the character is being handed back, and `Standing::end_turn`
     around every conversation turn. These are not `Runtime::begin_turn`
     (`perform.rs:374`), which sends `WorldOp::Begin` and takes the mind's
-    arrival and compass news (`runtime.rs:1885-1899`).
+    arrival and compass news (`runtime/mod.rs:1885-1899`).
   - **When a hand-back happens.** A character is handed back only when no turn
     of its mind or any conversation is running.
   - **On the new holder.** Conversations resume only once `lease.ready(applied)`
@@ -962,11 +962,11 @@ holder**, in a per-member runner for the characters held there
   - **What this prevents.** A conversation timeline written from two members.
 - **A message is never left unanswered.** `Told` pulses are not persisted
   (`npcd/src/authority/told.rs:5-7`). The runner rescans whenever it starts a
-  character: `spawn_character` (`runtime.rs:6265`; `api.rs:1455`) and
+  character: `spawn_character` (`runtime/mod.rs:6265`; `api.rs:1455`) and
   `wake_character` (`cast.rs:206`). The rescan covers every conversation thread
   and takes a turn for lines with a seq above `talk.answered_seq`.
   - **A thread with no conversation yet** initialises the bookmark to the
-    mind's delivered cursor (`phone.rs:879-901`), so it does not answer the
+    mind's delivered cursor (`phone/mod.rs:879-901`), so it does not answer the
     whole history.
 - **Duplicates are tolerated** (D13). An old holder's reply in flight may still
   land after a hand-back began.
@@ -994,11 +994,11 @@ holder**, in a per-member runner for the characters held there
   - **Channels are unchanged.** `message{via: channel}` stays on the main loop
     (§11.4).
 - **The main loop keeps off conversation threads.**
-  - **`reply`.** It binds `Choices::Awaiting` (`tools.rs:1833`), which would
+  - **`reply`.** It binds `Choices::Awaiting` (`tools/mod.rs:1833`), which would
     include direct threads where the party spoke last. The main loop's
     `awaiting`, `leavable` and `invitable` sets (`sim/mod.rs:443-614`) exclude
     conversation threads, so its `reply` and `sign_off` never touch them.
-  - **`invite`** is refused on a direct thread (`phone.rs:819-831`). A group
+  - **`invite`** is refused on a direct thread (`phone/mod.rs:819-831`). A group
     starts only with `open_group`.
 - **A conversation's own `reply` and `sign_off`** write to its party's thread.
   They are the only acts that do.
@@ -1012,7 +1012,7 @@ holder**, in a per-member runner for the characters held there
 
 ## 11. The phone, rebuilt
 
-The current phone (`npcd/src/sim/phone.rs`) is replaced, not patched. The new
+The current phone (`npcd/src/sim/phone/mod.rs`) is replaced, not patched. The new
 phone is `npcd/src/sim/phone/`, one concern per file.
 
 ### 11.1 Direct threads
@@ -1023,12 +1023,12 @@ phone is `npcd/src/sim/phone/`, one concern per file.
 - **One thread per pair, forever.** A direct thread's id is derived from the
   sorted pair of member ids, so reaching someone again finds the same thread.
   - Its seq never restarts.
-  - It is never evicted; `KEEP_THREADS` (`phone.rs:399`) does not apply to
+  - It is never evicted; `KEEP_THREADS` (`phone/mod.rs:399`) does not apply to
     direct threads.
 - **`sign_off` does not leave.** It marks the conversation ENDED (§4.3) and
   leaves membership alone. A direct thread is never closed by its members.
 - **Read is bounded.** `read_through(who, thread, seq)` marks read up to a seq,
-  never "everything". Today `read` marks every unseen line (`phone.rs:849-863`),
+  never "everything". Today `read` marks every unseen line (`phone/mod.rs:849-863`),
   which would hide a message that arrived during the turn.
 - **A line** holds:
   - the voiced text;
@@ -1046,7 +1046,7 @@ loop.
 
 - Members are ids.
 - They are bounded by per-channel retention, not a world-wide count.
-- The world channel (`phone.rs:53-90`) is one of them.
+- The world channel (`phone/mod.rs:53-90`) is one of them.
 - The roster functions cover both kinds by id (`sim/mod.rs:443-614`): `enrol`,
   `contacts_for`, `invitees_for`, `leavable_for`, `awaiting_for`.
 
@@ -1111,7 +1111,7 @@ Everything that reads or writes `Threads` today moves to the new API:
   - `zend-tools/src/tools/ops/bots.rs`.
 - **Effector phone:** `npcd/src/effector/phone.rs` and its routes in `router.rs`.
 - **Console API:** `message_npc`, `messages_with`, `say_on_channel_from` and
-  `channel` (`runtime.rs:2777-2894`).
+  `channel` (`runtime/mod.rs:2777-2894`).
 - **Roster and unread:** the roster in `npcd/src/sim/mod.rs:443-614`, and
   `npcd/src/sim/unread.rs`.
 - **Engine:** `npcd/src/engine/{on_you, channels, survey, pulse, mod}.rs`.
@@ -1125,7 +1125,7 @@ Everything that reads or writes `Threads` today moves to the new API:
 ## 12. Speech in the room needs a person in the room
 
 **The problem.** Offering an act is what makes a character take it
-(`tools.rs:342-344`, `263-281`). Offering `tell` to an NPC whose only company
+(`tools/mod.rs:342-344`, `263-281`). Offering `tell` to an NPC whose only company
 is other NPCs is what makes it talk to them aloud instead of messaging them.
 
 **The rule.** Room speech is for people. NPCs talk to each other by `message`.
@@ -1141,7 +1141,7 @@ is other NPCs is what makes it talk to them aloud instead of messaging them.
 
 **Why the related acts are gated too.** Leave any of them open and it becomes
 the room voice NPCs reach for, which is how `whisper` became the default once
-before (`tools.rs:255-261`).
+before (`tools/mod.rs:255-261`).
 
 **Messaging needs no person.**
 - **Always offered.** `message`, `reply`, `reach_out`, `sign_off`, `invite` and
@@ -1215,7 +1215,7 @@ defined as: the body holds a field stance, or a hostile is within its reach.
 - **New `Within` fields.** `people: Vec<String>` (the company that are
   visitors), `heard_by_person: bool` and `in_field: bool`, filled in
   `Runtime::within` from the `actors_at` read, which yields ids
-  (`runtime.rs:2225-2234`). All are part of the grammar cache key.
+  (`runtime/mod.rs:2225-2234`). All are part of the grammar cache key.
 - **One hearing rule.**
   - `heard_by_person` uses perception's rule.
   - `Scope::at(world, &at).reach(&place)` is already public
@@ -1227,14 +1227,14 @@ defined as: the body holds a field stance, or a hostile is within its reach.
 - **New availabilities.** `Availability` gains `PersonNearby`,
   `PersonAmongOthers` and `PersonInEarshot`. They are matched in every
   exhaustive match:
-  - `tools.rs:1085-1133`;
-  - `tools.rs:2291-2313`;
+  - `tools/mod.rs:1085-1133`;
+  - `tools/mod.rs:2291-2313`;
   - `npcd/src/engine/pulse.rs:1162-1181`;
   - the `needs` strings (`pulse.rs:1220-1241`): "a person here", "a person here,
     and somebody else", "a person within earshot, or the field".
-- **`to`** stays bound to the whole company (`tools.rs:2589`).
+- **`to`** stays bound to the whole company (`tools/mod.rs:2589`).
 - **`tools::nearby`** takes `people` and `heard_by_person`
-  (`tools.rs:1127-1133`).
+  (`tools/mod.rs:1127-1133`).
 
 **Model-facing text that steers NPCs to room speech is rewritten.** Each piece
 below would otherwise tell the model to use an act the grammar no longer
@@ -1244,24 +1244,24 @@ offers:
 |---|---|---|
 | `prompt::frame` (`npcd/src/engine/prompt.rs:529-542`) | "If somebody is here, speak to them … two people in one room texting is worse than either of them saying nothing." | "Speak to the people here. To reach another character, here or anywhere, message them." The advice to ask rather than announce, and to go where an answer sends you, stays. |
 | `MESSAGE` description and doc comment (`acts.rs:1160-1170, 1189-1194`) | "If the person you want is standing in front of you, `tell` or `ask`." | "How you reach another character, even one standing beside you." |
-| `TELL`/`ASK`/`SHOUT` descriptions (`tools.rs:288-291, 346-353`) | "how you talk to a person", "Not for talking to somebody who is with you — that is `tell`" | "how you talk to the people here" |
-| `GESTURE` description (`tools.rs:632`) | refers to speech in company | refers to people present |
+| `TELL`/`ASK`/`SHOUT` descriptions (`tools/mod.rs:288-291, 346-353`) | "how you talk to a person", "Not for talking to somebody who is with you — that is `tell`" | "how you talk to the people here" |
+| `GESTURE` description (`tools/mod.rs:632`) | refers to speech in company | refers to people present |
 | `act` description (`acts.rs:115`) | "promise or order somebody, use `tell`, `ask`, `whisper` or `shout`" | names `message` for characters |
 | `post_notice` description (`acts.rs:346`) | "`tell` reaches whoever is standing here" | "speak to the people here; message the others" |
 | `promise` example (`acts.rs:966`) | room speech | a thread |
 | Cooldown rationale (`cooldown.rs:225-254`) | messaging priced "dearer than being in the room" | pacing a correspondence |
-| `IN_COMPANY` idle nudge (`runtime.rs:914-918`, used at `:1362`) | room speech | message the others; speak to people present |
-| `TO_THE_TABLE` (`runtime.rs:787, 798`) | "do not answer the room" | names messaging |
-| Mission compass (`npcd/src/engine/mission.rs:1037`) | "`ask` or `tell` them" | "message them" (or speak to a person present) |
+| `IN_COMPANY` idle nudge (`runtime/mod.rs:914-918`, used at `:1362`) | room speech | message the others; speak to people present |
+| `TO_THE_TABLE` (`runtime/mod.rs:787, 798`) | "do not answer the room" | names messaging |
+| Mission compass (`npcd/src/engine/mission/mod.rs:1037`) | "`ask` or `tell` them" | "message them" (or speak to a person present) |
 | Work text (`npcd/src/engine/work.rs:1058-1062`) | "`move_to` {room} and `ask` or `tell` them" | "message them" |
 | `awaiting_line` (`environment.rs:202`) | "`tell` them if they are here" | "message them" |
 | `company_line` (`environment.rs:213-237`) | lists `tools::nearby` for NPC-only company | lists what is offered |
-| Standing mission templates (`mission.rs:1737-1769, 1803-1829`, including trace-a-thread and visit-and-review) | face-to-face NPC talk | the same exchanges by message |
-| Tool examples (`tools.rs:311-322, 381-412, 461-468, 518-531, 564-570`) | NPC↔NPC room speech | rewritten with a visitor present, or as messages |
+| Standing mission templates (`mission/mod.rs:1737-1769, 1803-1829`, including trace-a-thread and visit-and-review) | face-to-face NPC talk | the same exchanges by message |
+| Tool examples (`tools/mod.rs:311-322, 381-412, 461-468, 518-531, 564-570`) | NPC↔NPC room speech | rewritten with a visitor present, or as messages |
 
 **What it does not break:**
-- Mission `met` steps sign off on presence (`runtime.rs:1551-1559`;
-  `sim/missions.rs:1545`). Speaking steps move with `mark_spoken` (§7.1).
+- Mission `met` steps sign off on presence (`runtime/mod.rs:1551-1559`;
+  `sim/missions/mod.rs:1545`). Speaking steps move with `mark_spoken` (§7.1).
 - The loop guard's speech family and the cooldowns are keyed by act name.
 - NPCs no longer overhear one another when no person is there. What they would
   have overheard reaches them as messages and journal lines.
@@ -1326,7 +1326,7 @@ Changed:
   - Conversation threads are excluded from the main loop's `awaiting`,
     `leavable` and `invitable`.
 - **Guards.** `would_repeat`; talk cooling isolated; cooldowns keyed per
-  conversation (`loopguard.rs`, `cooldown.rs`, `runtime.rs:2284-2290`).
+  conversation (`loopguard.rs`, `cooldown.rs`, `runtime/mod.rs:2284-2290`).
 - **Discord.** Per-part cursors in the dm, server and world records; a nonce on
   Create Message.
 - **Journals.**
@@ -1392,9 +1392,9 @@ These are recorded here so they are not lost.
 - **`sleep.rs:22` describes code that doesn't exist.** It says a finished day is
   "folded into the memory layer"; no code does that.
 - **Two stale comments:**
-  - `mind.rs:1756-1758` says "two decodes, the narrator then the act". The
+  - `mind/mod.rs:1756-1758` says "two decodes, the narrator then the act". The
     narrator is a synchronous render (`npcd/src/engine/narrator.rs:25-30`).
-  - The `finish_turn` doc (`candle-conversation/src/conversation.rs:3829-3845`)
+  - The `finish_turn` doc (`candle-conversation/src/conversation/mod.rs:3829-3845`)
     says it prefills the next header. `finalize_turn_post_done`, which it calls
     at `:3863`, does not (`:4310-4314`).
 - **`zen_task_act` keeps its handle on the replica.** It runs `perform_here`

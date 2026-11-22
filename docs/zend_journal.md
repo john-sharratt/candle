@@ -4,7 +4,7 @@
 Battle Cities characters) to zend dialogues, and it closes the `TODO.md` item
 "Implement the journal tool". This document is authoritative over
 `zend/src/journal/`, `journal-core/` and the journal's wiring in
-`zend/src/session.rs`.
+`zend/src/session/journaling.rs`.
 
 ## 1. Why
 

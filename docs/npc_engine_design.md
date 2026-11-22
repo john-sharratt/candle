@@ -42,7 +42,7 @@ across the corpus. It is exactly the distinction between an NPC's *private* laye
 *shared* ones, and it is already implemented and load-bearing.
 
 **Identity scoping over shared sections already works.** `IdentityBuilders`
-(`zend/src/session.rs`) resolves a per-conversation identity and retains only that
+(`zend/src/session/builders.rs`) resolves a per-conversation identity and retains only that
 identity's members of the `identity_anchor` and `identity` collections, with members
 namespaced `<name>::<stem>`. Identities load from an `identities/<name>/*.yaml` tree —
 `anchor.yaml` the always-on compressed self, every other file a detail facet.
@@ -892,16 +892,16 @@ shared. This is the concrete inventory.
 | From | To | What it is |
 |---|---|---|
 | `zend/src/response_section.rs` | `::templates` | the templating engine — sections, examples, substitution, install |
-| `zend/src/tool_def.rs` | `::tools::def` | YAML tool definitions, `json_line`, calibration markers |
-| `zend/src/tools.rs` | `::tools::catalog` | catalog install into a collection |
+| `zend/src/tool_def/mod.rs` | `::tools::def` | YAML tool definitions, `json_line`, calibration markers |
+| `zend/src/tools/catalog.rs` | `::tools::catalog` | catalog install into a collection |
 | `zend/src/chatml.rs` | `::runtime::chatml` | ChatML rendering |
 | `zend/src/loading.rs` | `::runtime::loading` | load-state machine |
 | `zend/src/turn_sink.rs` | `::runtime::turn_sink` | turn sink |
 | `zend/src/projection_event.rs` | `::runtime::events` | projection events |
 | `zend/src/refresh_ctx.rs` | `::runtime::refresh` | refresh context |
-| `zend/src/conv_file{,_store}.rs` | `::runtime::files` | attachment store |
-| `InferenceState` core (`session.rs`) | `::runtime::inference` | model + sequence + streaming |
-| `IdentityBuilders` (`session.rs`) | `::projection::scope` | **generalised to `ScopeBuilders`** |
+| `zend/src/conv_files.rs` | `::runtime::files` | attachment store |
+| `InferenceState` core (`session/mod.rs`) | `::runtime::inference` | model + sequence + streaming |
+| `IdentityBuilders` (`session/builders.rs`) | `::projection::scope` | **generalised to `ScopeBuilders`** |
 
 Model acquisition, the log bus and the process's own setup went to the `host` crate instead,
 which both daemons run in (`docs/shared_model_host.md`); the VRAM-adaptive quant choice was
@@ -922,7 +922,7 @@ language model.
 ### Stays in zend
 
 `code_read/` (7.3k), `repo_scan/` (4.0k), `raw_read/`, `watcher.rs`, `ingest*.rs`, and the
-coding-assistant halves of `session.rs` and `api/`. These are workspace-and-code specific and
+coding-assistant halves of `session/` and `api/`. These are workspace-and-code specific and
 have no NPC counterpart.
 
 ### The test that keeps it honest

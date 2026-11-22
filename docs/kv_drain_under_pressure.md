@@ -31,9 +31,9 @@ waiting on the one thing that would have freed it:
    first.
 2. **An arena made for it could be swept away before it was used.**
    `create_deferred_arenas` stamps an owed arena and finishes its creation at
-   once (`alloc.rs:473`). An empty, finished, unprotected arena is exactly
+   once (`alloc/arena_window.rs:473`). An empty, finished, unprotected arena is exactly
    what `release_empty_arenas` reclaims on the next sweep. The gap runs that
-   sweep through compaction (`run.rs:1380`), relief, `claim_region` and
+   sweep through compaction (`scheduler/run/scheduler_loop.rs:1380`), relief, `claim_region` and
    `settle_device`.
 3. **Compaction and migration exclude each other through one process-global
    word** (`migrate_flight.rs`: `CHUNK_LOCATIONS` with a `FROZEN` bit, and
@@ -309,7 +309,7 @@ holder the sweep rewrites to that copy reads unfinished bytes as its KV.
   needed.
 - *Skipping slots whose refcount shows an extra holder.* `HeadGids` is a shared
   `Arc<Vec<ChunkGid>>`, so six holders can read `strong_count() == 1`
-  (`compact.rs` header). The refcount is not a holder count.
+  (`compact/mod.rs` header). The refcount is not a holder count.
 - *Pinning planned sources.* A free slot's refcount word holds its recycle-list
   link, so a "retain if live" from a raw id can succeed on a freed slot.
 

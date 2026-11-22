@@ -112,17 +112,17 @@ disk.
 ```
 HTTP POST /v1/chat/completions              zend/src/api/chat.rs
    ↓
-ZendSession resolves/creates a Sequence     zend/src/session.rs
+ZendSession resolves/creates a Sequence     zend/src/session/mod.rs
    against the Substrate + projection Schema
    ↓
-Substrate append + projection Builder       substrate.rs; projection/
-   (turns/sections appended; content         builder.rs, resolver.rs,
-   resolved via ContentResolver)             project.rs
+Substrate append + projection Builder       substrate/mod.rs; projection/
+   (turns/sections appended; content         builder/mod.rs, resolver/mod.rs,
+   resolved via ContentResolver)             project/mod.rs
    ↓
 SchedulerRequest over channel                scheduler/mod.rs
    (single background thread owns all GPU state)
    ↓
-SCHEDULER LOOP — admission + wave forming    scheduler/run.rs
+SCHEDULER LOOP — admission + wave forming    scheduler/run/mod.rs
    drain_submissions → promote_new_prefills (VRAM-gated admission)
    form a wave: decode + prefill + glue row-groups for this quantum
    (continuous fair waves: decode sweeps every layer every wave; a
@@ -156,11 +156,11 @@ SAMPLING                                     scheduler/sample.rs
 TURN SEAL, on turn completion                scheduler/mod.rs (seal path)
    prefill refresh over the completed turn — re-quantizes from clean,
    non-decode-drifted activations; per-block format re-selected
-   (candle-nn/src/kv_cache/chunked/compress.rs)
+   (candle-nn/src/kv_cache/chunked/compress/)
    ↓
 PERSISTENCE                                  candle-conversation/src/persistence/
    sealed chunks appended to the redo log (writer.rs, log_file.rs);
-   hot→warm migration on the persistence thread (thread.rs);
+   hot→warm migration on the persistence thread (thread/mod.rs);
    substrate metadata (streams, manifest) kept consistent
    ↓
 Streaming response back to zend → HTTP client (SSE)
@@ -183,7 +183,7 @@ path.
 ## 4. The KV cache subsystem (`candle-nn/src/kv_cache/`)
 
 The most actively developed part of the codebase. Two cache families exist:
-`Cache`/`KvCache` (`cache.rs`) is the contiguous baseline used by
+`Cache`/`KvCache` (`cache/`) is the contiguous baseline used by
 non-batched/simple paths; `ChunkedKvBacking` (`chunked/`) is the paged,
 quantized, multi-tenant cache that the batched inference engine actually
 runs on.
@@ -191,13 +191,13 @@ runs on.
 ### 4.1 Chunking, arenas, GIDs
 
 Every KV block is `CHUNK_SIZE = 32` tokens — a constant shared verbatim
-between Rust (`chunked/types.rs`) and CUDA (`arena_table.cuh`), enforced by
+between Rust (`chunked/types/mod.rs`) and CUDA (`arena_table.cuh`), enforced by
 the build so a mismatch cannot silently compile.
 
 - **`Arena`** (`chunked/arena.rs`) — Float or Quantized backing, one of
   several `StoragePolicy` layouts, allocated in `TARGET_ARENA_BYTES = 16 MiB`
   slabs.
-- **`ChunkGidPool` / `ChunkGid`** (`chunked/gid_pool.rs`) — a lock-free,
+- **`ChunkGidPool` / `ChunkGid`** (`chunked/gid_pool/`) — a lock-free,
   refcounted slab allocator. `ChunkGid` is an RAII handle
   (`id = arena_idx * stride + chunk_idx`); allocation is O(1) (pop a Treiber
   free-list, else bump a high-water mark); the last `Drop` recycles the slot
@@ -209,16 +209,16 @@ the build so a mismatch cannot silently compile.
   collection for one sequence.
 - **`ArenaTable` / `PerHeadTable`** (`arena_table.rs`) — the per-head format
   and palette index the attention kernel reads once per tile.
-- **`SealedSequence` / `SealedChunk`** (`chunked/types.rs`) — the immutable,
+- **`SealedSequence` / `SealedChunk`** (`chunked/types/sealed.rs`) — the immutable,
   byte-stable representation of a completed sequence's KV; the unit
   persistence and tier migration operate on.
 
 ### 4.2 Adaptive per-block quantization (C0–C10)
 
 `CompressionPolicy` (`chunked/compression_policy.rs`, backed by
-`chunked/sampled_selection/params.rs`) carries a `compression_level: u8`
+`chunked/sampled_selection/params/`) carries a `compression_level: u8`
 (0–10) plus per-model K/V error-threshold factors. `production_adaptive_candidates(level)`
-returns ordered K and V candidate format lists; `compress.rs` evaluates each
+returns ordered K and V candidate format lists; `sampled_selection/sampler.rs` evaluates each
 candidate at seal time against a cosine-distance threshold and keeps the
 smallest format that passes. Levels 0–1 are the `"quality"` tier, 2–4 are
 `"sweet"`, 5–10 are `"compress"` (`PRODUCTION_LEVEL_TIER`). Thresholds are
@@ -284,8 +284,8 @@ sign bits of Q itself (bit set ⇔ `Q[i] >= 0`). Retrieval is therefore a
 compared against every gallery token's folded signature by sign agreement
 (XNOR + popcount), not against K and with no PCA projection. At turn seal,
 the turn's full signature window is
-gathered (`gather_wide_sigs`, `scheduler/mod.rs`) and persisted on the
-substrate as the `wide_q_sigs` blob (`substrate.rs::set_wide_q_sigs_blob`).
+gathered (`gather_wide_sigs`, `scheduler/provenance_capture.rs`) and persisted on the
+substrate as the `wide_q_sigs` blob (`substrate/`).
 
 ### 5.2 The paged VRAM gallery arena
 
@@ -322,7 +322,7 @@ so one selection threshold works uniformly across heterogeneous content.
 Design: [`docs/provenance_score_normalization.md`](docs/provenance_score_normalization.md).
 Normalized scores update an online per-tool/per-turn belief
 (`provenance/gather.rs::belief_step`, `provenance/belief.rs::ToolBelief`)
-that `projection::Builder`/`resolver.rs` reads on the *next* reprojection to
+that `projection::Builder`/`resolver/mod.rs` reads on the *next* reprojection to
 decide which turns, sections, and tools are in-window.
 
 ### 5.5 The immutable summary forest
@@ -342,7 +342,7 @@ global root. Design: [`docs/archived/immutable_summary_forest.md`](docs/archived
 
 MoE inference (Qwen3-30B-A3B: 30B total, 3B active) cannot hold every expert
 resident on a 16 GB card, so `candle-transformers/src/models/expert_lre/`
-runs a background pipeline thread (`handle.rs`, `pipeline.rs`) owning a
+runs a background pipeline thread (`handle/mod.rs`, `pipeline/mod.rs`) owning a
 fixed-size VRAM expert pool with `&mut self` (no lock on the hot path):
 callers submit routed-expert requests over a channel; the pipeline
 partitions them into cache hits (compute immediately) and misses (DMA-load
@@ -390,7 +390,7 @@ object's fatbinary, not loaded separately at process start. Archives link
 statically (`cargo:rustc-link-lib=static=<group>`) into the final binary;
 there is no runtime kernel-loading step.
 
-`CHUNK_SIZE = 32` is defined once in Rust (`kv_cache/chunked/types.rs`) and
+`CHUNK_SIZE = 32` is defined once in Rust (`kv_cache/chunked/types/mod.rs`) and
 once in CUDA (`arena_table.cuh`, mirrored as `candle-kernels::CHUNK_SIZE`) —
 the build treats a mismatch as a correctness bug, not a tuning knob.
 
@@ -419,12 +419,12 @@ chunked-cache internals.
 
 ### 8.1 Substrate model
 
-`substrate.rs`'s `Substrate` is the concrete per-session store of turns and
+`substrate/mod.rs`'s `Substrate` is the concrete per-session store of turns and
 sections; `projection/` is a **pure structural reconciler** that compresses
 that unbounded substrate into a fixed-size context window every
 reprojection — it owns no content, no tokenizer, no scoring, only the
 declared schema and the budget/selection rules. The schema (authored as
-YAML, `projection/yaml.rs`, `projection/schema.rs`) declares a hierarchy:
+YAML, `projection/yaml/mod.rs`, `projection/schema/mod.rs`) declares a hierarchy:
 
 ```
 Schema
@@ -464,13 +464,13 @@ conversation-specific) module: an append-only, content-addressed redo log at
 once large. **There is no in-memory-only mode** — `Substrate` cannot be
 constructed without a backing log; every turn append and section ingest goes
 through this layer, no `Option<Persistence>` seam. One concern per file:
-framing (`record.rs`), the append/fsync log itself (`log_file.rs`), the
+framing (`record/mod.rs`), the append/fsync log itself (`log_file.rs`), the
 skip-load header walk (`walker.rs`), the in-RAM last-writer-wins index
 (`manifest.rs`), the recovery chains (`content_hash.rs`, `header_index.rs`,
 `recovery.rs`), O(1) dead-byte accounting and whole-file rewrite
-(`accounting.rs`, `compaction.rs`), multi-log/shared-base loading
+(`accounting.rs`, `compaction/mod.rs`), multi-log/shared-base loading
 (`inherit.rs`), the tier-migration orchestrator that drives `candle-nn`'s
-`kv_pack`/`kv_unpack` (`transfer.rs`), the background thread (`thread.rs`),
+`kv_pack`/`kv_unpack` (`transfer.rs`), the background thread (`thread/mod.rs`),
 warm→hot promotion (`elevate.rs`), and the NVMe→VRAM bridge
 (`cold_load.rs`). Full design:
 [`docs/archived/kv_tier_migration.md`](docs/archived/kv_tier_migration.md) §13.
@@ -483,7 +483,7 @@ warm→hot promotion (`elevate.rs`), and the NVMe→VRAM bridge
 service: an OpenAI-compatible HTTP API (`zend/src/api/`, `axum` router in
 `api/mod.rs` — `/v1/chat/completions`, `/v1/models`, `/v1/substrate/*`
 introspection routes, `/v1/conversations/*`, a `/ws/logs` websocket, plus the
-embedded web UI) fronting a `ZendSession` (`session.rs`) that owns the
+embedded web UI) fronting a `ZendSession` (`session/mod.rs`) that owns the
 `ConversationEngine`.
 
 **Ingest** populates non-dialogue layers of the projection schema with no
@@ -494,7 +494,7 @@ convention; everything else reads ChatML records from a same-named folder).
 Two pipelines matter architecturally: **`repo_scan/`** walks the workspace and
 mints one conversation per directory onto the `repo_map` layer, each explored as
 two `code_read`-shaped tool round-trips — list the folder, then read its
-`README`/module-doc anchor (`anchor.rs`) — the last of which **decodes** a
+`README`/module-doc anchor (`zend/src/repo_scan/`) — the last of which **decodes** a
 two-sentence summary of what the folder is for. Keeping every decode's request
 one turn back is what holds it on task; folded into one longer chain the model
 keeps driving the tool loop instead of answering. Both tool responses are produced by running the real tools, so a
@@ -502,7 +502,7 @@ prefilled response cannot drift from what the model sees at runtime. The unit's
 content hash (`DirState`) covers the evidence the turns actually *show* — the
 listed page plus the anchor excerpt — so a refresh re-ingests exactly the
 directories whose shown evidence moved. **`code_read/`** mints one
-conversation per file, parsed (`carve.rs`, `parsers/`) into scope-aware
+conversation per file, parsed (`doc-units/src/carve/`) into scope-aware
 parts each contributing a prefilled `read_file` tool round-trip; files
 ingest **in parallel** (`CODE_READ_PARALLELISM` workers) while scopes within
 one file ingest **serially** (a response turn's summary must decode with its
@@ -510,7 +510,7 @@ call turn in its projected prefix), so the parallelism is across files —
 each worker's scope decodes coalesce into the scheduler's shared multi-session
 batching, amortising the MoE expert load exactly as any other wave.
 
-**Tools** (`tools.rs`, `tool_def.rs`, YAML specs under `prompts/tools/`) are
+**Tools** (`tools/mod.rs`, `tool_def/mod.rs`, YAML specs under `prompts/tools/`) are
 declared data — network sessions (SSH/TCP/TLS/HTTP/SQL), crypto primitives,
 file/credential management, code execution — surfaced as the `tools`
 section collection and selected into context by the same
@@ -533,7 +533,7 @@ they submit `SchedulerRequest`s over a channel and receive `TurnHandle`s.
 **Waves.** A wave is the unit of scheduling: a mixed forward whose rows are
 the union of in-flight decode (`q_len == 1`), prefill, and glue tokens for
 one step, built as one packed batch header spanning all three
-(`docs/unified_wave_inference_engine.md`). Attention runs per-type (three
+(`docs/archived/unified_wave_inference_engine.md`). Attention runs per-type (three
 kernel launches, each into its disjoint row range of one output buffer);
 everything after attention — `o_proj`, FFN norm, the MoE grouped GEMM — runs
 **once** over all rows, which is where the PCIe-amortisation gain comes
@@ -565,11 +565,11 @@ reclaimed before KV is ever touched. Design:
 |---|---|
 | HTTP API, daemon entry point | `zend/src/api/`, `zend/src/main.rs` |
 | Repo/code ingest | `zend/src/repo_scan/`, `zend/src/code_read/` |
-| Tool catalog | `zend/src/tools.rs`, `zend/src/prompts/tools/` |
-| Conversation engine entry point | `candle-conversation/src/engine.rs` |
-| Scheduler / wave loop | `candle-conversation/src/scheduler/run.rs`, `mod.rs` |
+| Tool catalog | `zend/src/tools/`, `zend/src/prompts/tools/` |
+| Conversation engine entry point | `candle-conversation/src/engine/mod.rs` |
+| Scheduler / wave loop | `candle-conversation/src/scheduler/run/mod.rs`, `mod.rs` |
 | Projection schema + builder | `candle-conversation/src/projection/` |
-| Substrate (turns/sections storage) | `candle-conversation/src/substrate.rs` |
+| Substrate (turns/sections storage) | `candle-conversation/src/substrate/` |
 | Summary forest | `candle-conversation/src/summary_tree/`, `tree/` |
 | Provenance capture + BDP scan (host) | `candle-conversation/src/provenance/` |
 | Provenance gallery VRAM arena | `candle-conversation/src/provenance/gallery_arena/` |
@@ -578,8 +578,8 @@ reclaimed before KV is ever touched. Design:
 | Chunked KV cache (paging, arenas, GIDs) | `candle-nn/src/kv_cache/chunked/` |
 | Adaptive quantization policy | `candle-nn/src/kv_cache/chunked/compression_policy.rs`, `sampled_selection/` |
 | Migration kernel binding | `candle-nn/src/kv_cache/chunked/migrate.rs` |
-| Batched inference API | `candle-transformers/src/models/batched_inference.rs`, `batched_model.rs`, `batched_layer.rs` |
-| MoE model + expert pipeline | `candle-transformers/src/models/quantized_qwen3_moe.rs`, `expert_lre/` |
+| Batched inference API | `candle-transformers/src/models/batched_inference/mod.rs`, `batched_model.rs`, `batched_layer/mod.rs` |
+| MoE model + expert pipeline | `candle-transformers/src/models/quantized_qwen3_moe/mod.rs`, `expert_lre/` |
 | VRAM governor | `candle-core/src/vram/` |
 | CUDA kernels (AOT) | `candle-kernels/src/` (see §7 table), `build.rs`/`build_utils.rs` |
 | Design docs (authoritative) | `docs/*.md` |

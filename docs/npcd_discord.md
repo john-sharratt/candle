@@ -23,11 +23,11 @@ channels (§3.4, `server/`), the posting both share (`post/`), and seeing what t
 did (§5.5, `trace/`, with `bot_discord_read` and `bot_thread_read` in `npcd/src/mcp/`),
 and part three: the world's own server mirrored — its open channel, groups,
 private-thread DMs and the channels its people make there — with the reconcile, the
-carry-over of its cursors, and typing (§4.4, §5.3–5.4, `world/`, `dm/typing.rs`); and
+carry-over of its cursors, and typing (§4.4, §5.3–5.4, `world/`, `discord/dm/typing.rs`); and
 how a character knows its channels and chooses where to speak (§3.5,
 `engine/channels.rs`). §8 records the order it was built in. It sits on npcd's
-messaging (`npcd/src/sim/phone.rs`, `npcd/src/engine/runtime.rs` `message_npc` /
-`say_on_channel`, `npcd/src/engine/enact.rs` the `message` family of acts) and on the
+messaging (`npcd/src/sim/phone/mod.rs`, `npcd/src/engine/runtime/messages.rs` `message_npc` /
+`say_on_channel`, `npcd/src/engine/enact/mod.rs` the `message` family of acts) and on the
 world authority (`npcd/src/authority/`, `docs/replicated_substrate.md` §9).
 
 ---
@@ -35,11 +35,11 @@ world authority (`npcd/src/authority/`, `docs/replicated_substrate.md` §9).
 ## 1. What exists, and what it lacks
 
 npcd already has three kinds of conversation, all held in one store, the world's
-`Sim.threads` (`sim/phone.rs:100-170`):
+`Sim.threads` (`sim/phone/mod.rs:100-170`):
 
 | npcd | What it is | Who writes it |
 |---|---|---|
-| **The channel** (`CHANNEL = "the channel"`, `phone.rs:83`) | one per world, permanent; every enrolled person and character is a member | a person with the Creator role (`POST /v1/world/:wid/channel`), a character's `message` act to `"the channel"` |
+| **The channel** (`CHANNEL = "the channel"`, `sim/phone/channel.rs:83`) | one per world, permanent; every enrolled person and character is a member | a person with the Creator role (`POST /v1/world/:wid/channel`), a character's `message` act to `"the channel"` |
 | **A group** (`Kind::Group`: `named`, or more than two members) | opened by a character's `open_group`, or a DM that gained a third member by `invite` | characters' `message` / `invite` / `open_group` acts |
 | **A DM** (`Kind::Direct`) | a person and a character, or two characters | `POST /v1/npc/:nid/message` (`bot_message_send`), a character's `message` act |
 
@@ -52,12 +52,12 @@ every other member as substrate records.
 What a mirror needs and the store does not have:
 
 - **No message identity.** A message is `{from, intent, seen_by}`
-  (`phone.rs:193-203`): no id, no time, no author account — `from` is a display name
+  (`sim/phone/line.rs:193-203`): no id, no time, no author account — `from` is a display name
   (`engine/mod.rs:1134-1166`), and positions shift as the window is trimmed
-  (`phone.rs:251-268`). A mirror cannot say "this one I have posted" or "this one came
+  (`sim/phone/thread.rs:251-268`). A mirror cannot say "this one I have posted" or "this one came
   from Discord".
 - **No hook when a message is created.** Every message passes through
-  `Threads::send` (`phone.rs:541`); nothing observes it, and the codebase chose
+  `Threads::send` (`sim/phone/mod.rs:541`); nothing observes it, and the codebase chose
   polling over a broadcast deliberately (`engine/mod.rs:1440-1448`).
 - **No external identity** on an account or a character.
 - **No outbound HTTP** in npcd (`host` carries `reqwest` and `tokio-tungstenite`).
@@ -207,7 +207,7 @@ console's own message pages show a person's threads with the character but point
 to the character's bot to talk.
 
 A person on Discord is a person in npcd only once **linked**: the account record
-(`accounts.rs:151-200`) gains `discord: Option<DiscordUser { id, username, linked_ms }>`,
+(`accounts/mod.rs:151-200`) gains `discord: Option<DiscordUser { id, username, linked_ms }>`,
 and a replicated index `discord/user/<discord user id>` → the account key, so an
 arriving message finds its account without a scan.
 
@@ -463,7 +463,7 @@ state (§3.3): those are custom objects outside any world, `discord/user/…`,
 ### 4.3 Bot tokens
 
 A character's bot is the replicated custom object **`discord/bot/<npc_id>`**
-(`npcd/src/discord/store.rs`, the pattern of `accounts.rs`), not a world record:
+(`npcd/src/discord/store.rs`, the pattern of `accounts/mod.rs`), not a world record:
 
 ```json
 { "application_id": "<id>", "user_id": "<id>", "username": "<name>",
@@ -549,8 +549,8 @@ reads, and the cursors the bots move are written with the world's records on its
 beat (§4.2).
 
 1. **The text is the message's own.** A message holds what was said, `intent`
-   (`phone.rs:193-203`), and the console shows exactly that: `get_messages` reads it
-   off the thread (`runtime.rs` `messages_with`) with no model call. Discord is sent the
+   (`sim/phone/line.rs:193-203`), and the console shows exactly that: `get_messages` reads it
+   off the thread (`engine/runtime/messages.rs` `messages_with`) with no model call. Discord is sent the
    same text, so the two never disagree and a post costs nothing to render.
 2. Posted by the right sender (§3.1), split at 2,000 characters on a sentence boundary.
 3. `mirrored_through` advances only on Discord's `200` with the message id it returned.
@@ -634,7 +634,7 @@ Every five minutes, and once when a member takes a world:
   is gone is forgotten. The same read runs on the first beat after the listener's shard
   hears a channel of the server made, changed or deleted — the mirror's own beat, so a
   channel it has just made for a group is already recorded when it is read
-  (`world/rooms.rs`).
+  (`discord/world/rooms.rs`).
 - **Gaps.** For each mapped channel and DM, `GET /channels/{id}/messages?after=
   <last_seen_discord>` fetches what arrived while no member held the world — a restart,
   a move — and applies it through §5.2, oldest first.

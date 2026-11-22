@@ -24,7 +24,7 @@ Two APIs share this daemon's transport and must never share a meaning:
 | Identity | gateway `X-Tokera-*` headers | the NPC's own auth token (§8.3) |
 | Purpose | run and observe the daemon | *be* a character acting in the world |
 
-The operator API is out of the fiction and already built (`npcd/src/api.rs`,
+The operator API is out of the fiction and already built (`npcd/src/api/mod.rs`,
 `ops.rs`, `engine/mod.rs`). The effector API is in the fiction and is what this
 document specifies.
 
@@ -34,14 +34,14 @@ document specifies.
 
 ## 1. The tool surface does not scale, and cannot be made to
 
-[`tool_surface_audit.md`](tool_surface_audit.md) counted it exactly. Nine body
+[`tool_surface_audit.md`](archived/tool_surface_audit.md) counted it exactly. Nine body
 tools are implemented and armed. **One hundred and fifteen** more are authored into
 the vault with no parameters, no handlers, no plane, and no presence in the
 grammar. The audit's own conclusion: *"Building the foundation is building all 79,
 plus what this audit adds."* That is the road we are not going to walk.
 
 *(Correction, from a later code audit — Appendix D: the **handlers were since
-implemented**, in `engine/work.rs` (`work::perform`); what the audit called missing is
+implemented**, in `engine/work/dispatch.rs` (`work::perform`); what the audit called missing is
 now the *routing surface*, not the handler bodies. That makes the migration mostly a
 re-wiring, and it does not weaken the argument here — the compiled per-verb cost is
 what fails to scale, whether or not a handler already exists behind each verb.)*
@@ -49,17 +49,17 @@ what fails to scale, whether or not a handler already exists behind each verb.)*
 Each of those tools, to become real, is the same five-part cost, paid once per
 verb, forever:
 
-1. A `Tool` static (`tools.rs:186`) with an `Availability` variant and `params`.
+1. A `Tool` static (`engine/tools/mod.rs:186`) with an `Availability` variant and `params`.
 2. A `Choices` variant and a `LIVE` row for every world-enumerated argument
-   (`tools.rs:1196`, `1443`).
+   (`engine/tools/choices.rs:1196`, `1443`).
 3. A field on `Within` — the per-turn world snapshot that is *also the grammar
-   cache key* (`tools.rs:1509`) — so the new fact is hashable and gate-visible.
-4. A handler in `enact.rs`.
+   cache key* (`engine/tools/within_tools.rs:1509`) — so the new fact is hashable and gate-visible.
+4. A handler in `engine/enact/`.
 5. Its share of the compiled turn grammar.
 
 The fifth cost is the wall. The turn grammar is the reachable catalogue expanded to
-`ACTS_PER_TURN = 2` (`tools.rs:1162`), budgeted against `MAX_TURN_PATHS = 2_000_000`
-(`tools.rs:1955`). Because the tree is the catalogue *squared*, and an unbounded
+`ACTS_PER_TURN = 2` (`engine/tools/compile.rs:1162`), budgeted against `MAX_TURN_PATHS = 2_000_000`
+(`engine/tools/compile.rs:1955`). Because the tree is the catalogue *squared*, and an unbounded
 value type makes it non-terminating, **every parameter is restricted to `string` or
 `boolean`** — an `integer` is "any JSON number," measured running away at 390 MB/s.
 A world that wants a machine with a numeric dial, a list argument, or a nested
@@ -73,7 +73,7 @@ door has to change.
 
 The NPC does not stop being embodied. It still thinks it is real, and everything
 that makes it act alive stays where it is: the body catalogue — `tell`, `whisper`,
-`shout`, `ask`, `gesture`, `move_to`, `follow`, `reflect` (`tools.rs:876`) — is
+`shout`, `ask`, `gesture`, `move_to`, `follow`, `reflect` (`engine/tools/mod.rs:876`) — is
 fixed, always present, and unchanged. Speech is a body act. Walking is a body act.
 Those are hands, and hands do not need a URL.
 
@@ -134,15 +134,15 @@ effector device.
 | Stays a body act | Becomes a device route |
 |---|---|
 | `tell` `whisper` `shout` `ask` `gesture` | every `STATION_ACTS` verb (~53, `station.rs:996`) |
-| `move_to` `follow` | `lift_call` `lift_use` (`acts.rs:682`, `705`) |
-| `reflect` | the world-state half of `WORLD_ACTS` (`acts.rs:1311`) |
+| `move_to` `follow` | `lift_call` `lift_use` (`engine/acts/combat_and_machines.rs:682`, `705`) |
+| `reflect` | the world-state half of `WORLD_ACTS` (`engine/acts/mod.rs:1311`) |
 | `act` `sleep` `promise` `remind` (human interactions) | the phone acts (`message` `invite` `open_group` `send_image` `reach_out`) → `http://local/phone` |
 | — | `bench_*` (11), reused `file_*` (5), all 115 audited part tools |
 
 Speech does not go behind the device, and not from sentiment: if `tell` were `POST
 http://local/say`, a character could only speak where a `/say` route was mounted —
 asserting a body can talk near a terminal and not in a corridor, the exact falsehood
-the audit found when `room.talk` was hung on furniture (`tool_surface_audit.md`
+the audit found when `room.talk` was hung on furniture (`archived/tool_surface_audit.md`
 §3.1). Speaking is `Availability::Always`. The device is for what a body does *not*
 always have — which is everything the world supplies.
 
@@ -420,7 +420,7 @@ world means answering all three from state:
 
 1. **Reachability** — is the thing within reach of where the body stands? This is
    the map: `within_reach` (`perceive.rs:280`) over the node's placed parts,
-   `at_landing` (`world.rs:545`) for the lift. Frozen topology, live standpoint.
+   `at_landing` (`npc-map/src/world/lifts.rs:545`) for the lift. Frozen topology, live standpoint.
 2. **Condition** — is the thing in a state that affords the call? A powered-down
    command table affords `OPTIONS` and `POST {powered:true}` but none of its
    working verbs; a claimed station affords reading but not a second body's write; a
@@ -435,7 +435,7 @@ actors/holds/lift, but *per placed item* it does not exist yet: a `Part` is a sh
 catalogue entry placed by reference, with no per-instance state (`part.rs:133`). So
 the world-map design this document depends on adds one thing — a **per-item state
 record**, keyed by the item id of §7, living in the world's mutable half beside
-`actors`/`riders`/`lift` (`world.rs:458`), that route handlers read and write. This
+`actors`/`riders`/`lift` (`npc-map/src/state.rs:458`), that route handlers read and write. This
 is the smallest addition that makes "turn the command table off" real, and it is
 what the simulation tests of Part F drive.
 
@@ -512,7 +512,7 @@ for rather than discovered:
   then invokes the router again in-process (a sub-resource, an `OPTIONS`, the near-you
   index) deadlocks silently. **Invariant: never invoke the router while holding the
   world lock** — handlers acquire, act, release, as the lift handlers already do
-  (`enact.rs:535`) — and it is tested.
+  (`engine/enact/movement.rs:535`) — and it is tested.
 - **The production Router handle.** Today the merged router is handed to `web` and no
   handle is kept; the `oneshot` path is `#[cfg(test)]` (`api.rs:448`, `main.rs:636`).
   **As-built (Step 1):** `Runtime` retains the router (`set_effector_router`) and
@@ -560,7 +560,7 @@ types it, cannot leak it into prose. The engine stamps it on the in-process requ
 - **The v1 check, whole.** Authorized iff the request carries the header, the header
   names a token, and the token is in the table (one lookup). No roles, no ownership
   on this surface — the token *is* the identity, resolving to a body whose standpoint
-  the handlers read from world state (`body_of`; `at_landing`, `world.rs:545`;
+  the handlers read from world state (`body_of`; `at_landing`, `npc-map/src/world/lifts.rs:545`;
   `within_reach`, `perceive.rs:280`).
 - **Scope decides proximity.** A token carries a scope. An **as-NPC** token — the
   character's own — is proximity-gated: it reaches only what is within the body's
@@ -603,7 +603,7 @@ the wager of §3 depend on them:
 - **Prescriptive.** A malformed or invalid body returns a structured error with a
   `field` naming the offending key — `400 missing_field {field:"powered"}`, `400
   bad_range {field:"count", detail:"1..10"}`. Two honest costs the review named: the
-  estate's `err()` helper emits `{error, detail}` only today (`api.rs:1637`), so
+  estate's `err()` helper emits `{error, detail}` only today (`npcd/src/api/errors.rs:1637`), so
   `field` is *added* — either by widening that shared helper (which touches the
   operator surface) or a device-only helper; and mapping a deserialize failure to a
   precise `field` is real work (serde's error path is clean for a missing scalar but
@@ -680,9 +680,9 @@ moment its act names it, with no change here.
 Handlers reach the world through the one lock: `Hosted`, a single mutex over
 `{ world, attention, sim, rooms }` (`world/mod.rs:41`), with `with` the sole write
 path, `read` for queries, `with_both` for world+sim (`world/mod.rs:117`). A device
-handler is an `enact.rs` handler with an HTTP envelope; the lift handlers
-(`enact.rs:519`, `535`) are the template, and their typed refusals (`Refused`,
-`world.rs:351`) become the route's error bodies (§12).
+handler is an `engine/enact/` handler with an HTTP envelope; the lift handlers
+(`engine/enact/movement.rs:519`, `535`) are the template, and their typed refusals (`Refused`,
+`npc-map/src/world/events.rs:351`) become the route's error bodies (§12).
 
 ### 9.1 Two worlds: the simulated world and the attachable world API
 
@@ -819,10 +819,10 @@ the projected store, not the world store — flagged there.
 *As-built correction (Appendix E "The bridge"): this is now **met**. The bridge is
 built — the cast is shared as `Arc<Npcs>`, which takes no lock
 (`docs/npcd_cast_lock_free.md`), and installed on
-`Runtime` (`runtime.rs::set_npcs`/`npcs`), reusing the one `Npcs`/substrate handle,
+`Runtime` (`npcd/src/engine/runtime/mind_hold.rs::set_npcs`/`npcs`), reusing the one `Npcs`/substrate handle,
 never a second. `plan_*`/`orders_*` route through `effector/plan.rs` (mounted at
 `/plan` and `/orders`, and excluded from the generic station nest so they never reach
-`Sim.ledger`) to `Npcs::put_strategy_self` (`npcs.rs`), an owner-blind write of the
+`Sim.ledger`) to `Npcs::put_strategy_self` (`npcd/src/npcs/methods.rs`), an owner-blind write of the
 character's own `agency` layer that projects on the next turn via the `agency`
 collection and `persona::intent`. The write target is `Npcs::put_strategy`, not
 `engine/authoring.rs` (which is only a life-document parser).* (The one hard invariant
@@ -840,7 +840,7 @@ against:
 1. **The npc-map `World` (RAM)** — who is where, what each body holds, the lift,
    witnessed events. Not persisted; bodies re-enter deterministically on restart
    (`runtime.rs:776`). Written by the world acts (lift, claim/release/operate/…,
-   `enact.rs`). Claim = proximity + `Actor.hold`.
+   `engine/enact/`). Claim = proximity + `Actor.hold`.
 2. **`Sim` (RAM)** — everything about the world that is not its map: the `record`
    authored-content state machine (`sim/record.rs`), the `bench` per-body working
    copy (`sim/bench.rs`), the `ledger` (orders/verdicts), missions, phone. **This is
@@ -857,7 +857,7 @@ against:
    (D.5).
 4. **The substrate (projected, persisted)** — agency, belief, memory; redo-logged;
    the belief-write invariant (§9.2). This is §9.2's "projected store." **No station
-   handler writes it yet** — the bridge from `work.rs` to the authoring plane
+   handler writes it yet** — the bridge from `engine/work/` to the authoring plane
    (`engine/authoring.rs`) is to-build (D.6 #2).
 
 The rule stands: a handler reads and writes the store that already owns that fact,
@@ -875,7 +875,7 @@ turn. The car then travels on the world clock — `step_lift` inside `tick`
 the right landing — and the character learns it arrived the way it learns anything
 that happened while it was not looking: through `witness`/`stir` →
 `perceived::digest` → the narrated perception at the head of its next input
-(`witness.rs:151`, `perceived.rs:84`, `mind.rs:1473`), and through the near-you
+(`witness.rs:151`, `perceived.rs:84`, `npcd/src/engine/mind/perception.rs:1473`), and through the near-you
 index, which at the landing now shows the car boardable.
 
 The loop: **`invoke` → acknowledgement now → world ticks → effects perceived +
@@ -924,7 +924,7 @@ tree.
 `invoke.url` is a closed enum over those addresses, and each value brings the body
 it takes. The stencil expresses that as `Param::shapes`: a list of
 `(enum value, sibling fields)`, where a value's fields are the *required* siblings
-that follow it and replace any same-named sibling (`stencil/tool_call.rs`,
+that follow it and replace any same-named sibling (`candle-conversation/src/stencil/tool_call/builder.rs`,
 `build_discriminated`). `engine/invoke_body.rs` builds the shapes: an address's body
 is its act's own parameters, typed exactly as the compiled act types them, so a
 station verb's body is the body the same act would carry as a native call, an
@@ -971,8 +971,8 @@ stencil.
 
 A wrong `invoke` comes back as a real API error (§8.4): a status and `{ error,
 detail, field }`. The character reads it next turn as a `<tool_response>` — the
-channel act outcomes already ride back on (`record_act`, `runtime.rs:1481`;
-`compose_narrated`, `mind.rs:1473`) — and corrects, because correcting a JSON API
+channel act outcomes already ride back on (`record_act`, `npcd/src/engine/runtime/acting.rs:1481`;
+`compose_narrated`, `npcd/src/engine/mind/perception.rs:1473`) — and corrects, because correcting a JSON API
 against its error body is a thing the model has done a million times. The rule: **a
 device error is what a well-behaved REST API would return, and nothing more
 clever** — an invented format would forfeit the whole prior the wager rests on.
@@ -994,9 +994,9 @@ percepts (`perceive.rs:9`). Any caching is the *engine's*, keyed on
 
 ## 14. What stays, what is new, what migrates
 
-**Stays.** The body catalogue (`tools.rs:876`). The stencil machinery
+**Stays.** The body catalogue (`engine/tools/mod.rs:876`). The stencil machinery
 (`candle-conversation/src/stencil/`). The two clocks and turn loop (`driver.rs`,
-`character_loop`, `runtime.rs:3443`). Witness, stir, narration. The one-lock world
+`character_loop`, `npcd/src/engine/runtime/turn.rs:3443`). Witness, stir, narration. The one-lock world
 model. The per-character `ConversationLock`, projection/window/prompt structure.
 
 **New.** `invoke` (§5). The `local` router + its external mount (§8).
@@ -1007,12 +1007,12 @@ ids on placed instances and the per-item state record (§7, §7.1; Q2). Routing 
 `plan_*`/`orders_*` to the projected store so the plan stays in the system prompt
 (§9.2).
 
-**Migrates.** The world-touching half of `WORLD_ACTS` (handlers in `enact.rs`), all
-`STATION_ACTS`/`bench`/`mission` (handlers in `engine/work.rs`, `work::perform` —
+**Migrates.** The world-touching half of `WORLD_ACTS` (handlers in `engine/enact/`), all
+`STATION_ACTS`/`bench`/`mission` (handlers in `engine/work/dispatch.rs`, `work::perform` —
 *shipped*, not the audit's "0-of-79"; Appendix D), and the reused `file_*` stop being
 compiled `Tool` statics reached through the grammar and become routes reached through
 `invoke`. For most verbs this is **wrapping an existing handler in a route
-envelope**, not writing it — the audit's "build 115 tools" (`tool_surface_audit.md`
+envelope**, not writing it — the audit's "build 115 tools" (`archived/tool_surface_audit.md`
 §6) becomes "declare 152 routes" over handlers that largely exist, at no grammar and
 no `Within` cost. The genuinely-absent handlers (`plan_*`, `roster_*`, `room_sit`,
 `character_write_beliefs`) and the durability/projection gaps are D.6. **Appendix A**
@@ -1027,9 +1027,9 @@ is the inventory, **Appendix C** the route map, **Appendix D** the store map.
   (`tools.rs:1762`) becomes "the route is absent or its enum is empty." Same
   decision, expressed as HTTP.
 - **Choices becomes handler-computed schema.** `Company`, `Floors`, `Reachable`,
-  `Claimable` (`tools.rs:1196`) are enums a handler fills from world state at
+  `Claimable` (`engine/tools/choices.rs:1196`) are enums a handler fills from world state at
   `OPTIONS` time — `http://local/lift/<id>/call`'s `level` enum *is*
-  `world.floor_names()` (`world.rs:613`) at that moment. The world enumerates; the
+  `world.floor_names()` (`npc-map/src/world/lifts.rs:613`) at that moment. The world enumerates; the
   schema carries; the stencil enforces.
 
 `Within` does not vanish — the body acts still gate through it and it is still the
@@ -1039,11 +1039,11 @@ capability, the unbounded cost §1 named.
 **And it shrinks — the migration's free win, and the review's top recommendation.**
 Post-migration the body acts need only a few `Within` fields (`company`, `places`,
 `feelings`, `cooling`, `me` — tell/whisper/ask/gesture→`Company`, move_to→
-`Reachable`, reflect→`Feelings`, `tools.rs:1444`); every sim-derived field
+`Reachable`, reflect→`Feelings`, `engine/tools/choices.rs:1444`); every sim-derived field
 (`operable`, `readable`, `claimable`, `device_modes`, `hostiles`, `makeable`,
-`queues`, `threads`, …, `tools.rs:1529`) leaves `Within` because those acts are now
+`queues`, `threads`, …, `engine/tools/within_tools.rs:1529`) leaves `Within` because those acts are now
 routes. The cache key shrinks, the hit rate rises, and the exponential path budget
-(`tools.rs:1946`) stops being a live concern — which is exactly what makes the
+(`engine/tools/compile.rs:1946`) stops being a live concern — which is exactly what makes the
 fixed-frame grammar cheap enough to compose a per-schema `invoke` sub-stencil onto
 (§11). The empty-set rule still applies to `move_to` (nowhere to walk) and the
 `Nearby` speech acts (alone), so routing-becomes-availability does not remove
@@ -1120,7 +1120,7 @@ abstraction is what makes the world broadly unit-testable: a room, a machine, a
 mode change is now a request and an assertion.
 
 **Implement the missing world — but most of it exists.** Contrary to the audit's
-"0 of 79" (`tool_surface_audit.md` §1), the handlers are shipped in `engine/work.rs`
+"0 of 79" (`archived/tool_surface_audit.md` §1), the handlers are shipped in `engine/work/`
 (Appendix D); the migration wraps them in route envelopes. What is *genuinely* missing
 is scoped in Appendix D.6: durable persistence for the RAM-only `Sim.record`/`ledger`
 writes (character, place, record, orders — they do not survive a restart today), the
@@ -1206,8 +1206,8 @@ The tools that **become routes** (removed as `Tool` statics; each row is a route
 
 | Namespace | n | Becomes | From |
 |---|---|---|---|
-| `lift` | 2 | `.../lift/<id>/{status,call,use}` | `LIFT_CALL`, `LIFT_USE` (`acts.rs:682`) |
-| world-state acts | ~18 | `.../<thing>/<id>/<verb>` | `GIVE READ POST_NOTICE CLAIM RELEASE EQUIP USE GATHER ENGAGE OPERATE RECALL SCAN COMMAND_TOWER PRODUCE RECORD_VERDICT SIGN_OFF` (`acts.rs:1311`) |
+| `lift` | 2 | `.../lift/<id>/{status,call,use}` | `LIFT_CALL`, `LIFT_USE` (`engine/acts/combat_and_machines.rs:682`) |
+| world-state acts | ~18 | `.../<thing>/<id>/<verb>` | `GIVE READ POST_NOTICE CLAIM RELEASE EQUIP USE GATHER ENGAGE OPERATE RECALL SCAN COMMAND_TOWER PRODUCE RECORD_VERDICT SIGN_OFF` (`engine/acts/mod.rs:1311`) |
 | `chronicle` | 8 | `.../chronicle/<id>/{read_era,rewrite_page,add_entry,…}` | audit §2.2 |
 | `record` | 16 | `.../record/<id>/{appraise,let_go,accession,…,cross_reference,leave_note,tidy_index,hand_on}` | audit §2.2, §6.2 |
 | `story` | 9 | `.../story/<id>/{read_ledger,draft,file,read_aloud,…}` | audit §2.2 |
@@ -1263,11 +1263,11 @@ changes. Ordered by how load-bearing the contradiction is.
 
 | Doc | What is now stale | What survives |
 |---|---|---|
-| [`tool_surface_audit.md`](tool_surface_audit.md) | the whole "build all 115 as compiled tools" plan (§1, §6, §6.4); the `namespace_verb` naming/tokenisation analysis (§5A) is moot for URL path segments; the counts (§6.3); and its "Implemented: 0" claim is itself stale — the handlers ship in `engine/work.rs` (Appendix D) | §2 (what exists), §3 (removals), §4 (the 8 missing clusters), the craft-word naming rule for verbs |
+| [`tool_surface_audit.md`](archived/tool_surface_audit.md) | the whole "build all 115 as compiled tools" plan (§1, §6, §6.4); the `namespace_verb` naming/tokenisation analysis (§5A) is moot for URL path segments; the counts (§6.3); and its "Implemented: 0" claim is itself stale — the handlers ship in `engine/work/` (Appendix D) | §2 (what exists), §3 (removals), §4 (the 8 missing clusters), the craft-word naming rule for verbs |
 | [`tool_world_acts.md`](tool_world_acts.md) | world-acting verbs as compiled body tools; the string/boolean workaround (§0) — lifted by per-resource schema (§11); the "seven new live sets" (§4) become handler-computed `OPTIONS` schema | the intent-vs-typed field rule; §6 "to simulate this in the vault" |
 | [`tool_decisions.md`](tool_decisions.md) | "vocabulary moved onto the argument axis" — it moves onto the **route axis**; `read`/`claim`/`release` as body tools (§2, §3) reopen (read → `scan` and the internal `GET`) | §1 belief-write prohibition (reinforced, §9.2); tool-shape/argument-binding sections |
 | [`tool_interaction_reconciliation.md`](tool_interaction_reconciliation.md) | "25 `*_read_*` tools vs one `observe`" (§4.2) — reads are now `scan` and the internal `GET`; the 25-reads open question dissolves | interaction modes (§1, §3), interlocutor resolution; note phone acts' placement is Q5 |
-| [`tool_world_state.md`](tool_world_state.md) | the "129 tools" framing; `bench_`/`file_` as tools | most of it — the four stores and the namespace→store table become the **route-handler** spec (§9) |
+| [`tool_world_state.md`](archived/tool_world_state.md) | the "129 tools" framing; `bench_`/`file_` as tools | most of it — the four stores and the namespace→store table become the **route-handler** spec (§9) |
 
 **Tier 2 — engine & wire contract (section rewrites + additions).**
 
@@ -1309,7 +1309,7 @@ changes. Ordered by how load-bearing the contradiction is.
 
 **Agrees, no change (a reader might expect otherwise):**
 [`stencil_tree.md`](stencil_tree.md) is the reused machinery §11 depends on (the
-string/boolean limit lives in `tools.rs`, not here); `reflect`
+string/boolean limit lives in `engine/tools/`, not here); `reflect`
 ([`reflection_and_dreams.md`](reflection_and_dreams.md)) is preserved as a body act;
 [`narrative_engine.md`](narrative_engine.md) is unchanged (device acts return JSON
 receipts, body acts still carry intent); [`npc_mind_design.md`](npc_mind_design.md)'s
@@ -1329,9 +1329,9 @@ vault"). It turns Appendix A's checklist into an executable specification: every
 becomes routes, the routes each affords, what gates them, the body schema each `invoke`
 takes, and the store the handler reads or writes. It is grounded in the shipped vault
 (`npc-map/maps/*.yaml`), the shipped act tables (`npcd/src/engine/{acts,station}.rs`), the
-availability/choices machinery (`npcd/src/engine/tools.rs`), and the current handlers
-(`npcd/src/engine/enact.rs`). Where a namespace is authored in the audit but has no handler
-yet (the audit's 0-of-79 finding, `tool_surface_audit.md` §1), the row cites the audit and
+availability/choices machinery (`npcd/src/engine/tools/`), and the current handlers
+(`npcd/src/engine/enact/`). Where a namespace is authored in the audit but has no handler
+yet (the audit's 0-of-79 finding, `archived/tool_surface_audit.md` §1), the row cites the audit and
 is flagged **[no handler yet]** — that route is the work Step 6 lands, per Part F.*
 
 Conventions used in every table below:
@@ -1344,7 +1344,7 @@ Conventions used in every table below:
   `paired` (a settling table: needs the other holder present, the `Nearby`-class two-body
   gate), `affordable` (the `OPTIONS` enum is non-empty — the economy is enforced in the schema).
 - **Body schema** field tags: `enum(src)` = grammar-enforced closed set filled from the named
-  live-set at `OPTIONS` time (§15, `tools.rs:1443` LIVE / `1421` FIXED); `typed(kind)` =
+  live-set at `OPTIONS` time (§15, `engine/tools/choices.rs:1443` LIVE / `1421` FIXED); `typed(kind)` =
   integer/number/array/object — **shaped, not enforced**, so the handler validates (§11);
   `free` = open string. `req`/`opt` = required/optional.
 - **Store** — the column below records the *intended* target and is **superseded by
@@ -1353,7 +1353,7 @@ Conventions used in every table below:
   `ledger`), and a subset also reaches the **mind folder** (the authored lore) through
   the `bench` working copy (§D.4). `projected` = the substrate authoring plane (§9.2),
   which no station handler writes yet (D.6). The dispatcher for these handlers is
-  `engine/work.rs` (`work::perform`), not `station.rs` (declaration only) — so the
+  `engine/work/dispatch.rs` (`work::perform`), not `station.rs` (declaration only) — so the
   `[no handler yet]` flags mark *reads and genuinely-absent verbs*, not the shipped
   writing handlers (see D.5).
 - **id pattern** — `<part-id>~<ordinal>` (§7). The ordinal is 0-based and world-wide (across
@@ -1446,42 +1446,42 @@ level.
 
 | Route | Method | Condition | Body schema | Store | From |
 |---|---|---|---|---|---|
-| `GET .../lift/<id>` | GET | at a landing (`at_landing`, `world.rs:545`) | — (returns `{here, level, moving}`) | World | new (status), design §5.1/§14 |
-| `POST .../lift/<id>/call` | POST | at landing **and car elsewhere** (`AtLift`, `tools.rs:1750`) | — | World | `LIFT_CALL` acts.rs:682; enact `lift_call` enact.rs:85 |
-| `POST .../lift/<id>/use` | POST | at landing **and car here** (`InLift`, `tools.rs:1751`) | `floor` enum(`world.floor_names()`, `world.rs:613`) req | World | `LIFT_USE` acts.rs:705; enact `lift_use` enact.rs:86 |
+| `GET .../lift/<id>` | GET | at a landing (`at_landing`, `npc-map/src/world/lifts.rs:545`) | — (returns `{here, level, moving}`) | World | new (status), design §5.1/§14 |
+| `POST .../lift/<id>/call` | POST | at landing **and car elsewhere** (`AtLift`, `engine/tools/types.rs:1750`) | — | World | `LIFT_CALL` engine/acts/combat_and_machines.rs:682; enact `lift_call` engine/enact/movement.rs:85 |
+| `POST .../lift/<id>/use` | POST | at landing **and car here** (`InLift`, `tools.rs:1751`) | `floor` enum(`world.floor_names()`, `npc-map/src/world/lifts.rs:613`) req | World | `LIFT_USE` engine/acts/combat_and_machines.rs:705; enact `lift_use` engine/enact/movement.rs:86 |
 
 ---
 
-## C.2 The world-state half of `WORLD_ACTS` — `acts.rs:1311`
+## C.2 The world-state half of `WORLD_ACTS` — `engine/acts/mod.rs:1311`
 
-These are the sixteen Appendix A names ("world-state acts | ~18", `acts.rs:1311`). `read` and
+These are the sixteen Appendix A names ("world-state acts | ~18", `engine/acts/mod.rs:1311`). `read` and
 `scan` are **reads → GET** (dissolved into the router's internal `GET`, per Tier-1 `tool_world_acts.md`); the rest
 are `POST` effects. Several are not part-bound (`Availability` other than `AtPart`): their verb
 is mounted on the target thing named by their live-set (`claim`/`release`/`post_notice`/
 `record_verdict` on the room's claimable/postable/judgeable things; `give`/`equip`/`use` on the
-body's own inventory as personal-ish world routes). Handler dispatch table: `enact.rs:71–98`.
+body's own inventory as personal-ish world routes). Handler dispatch table: `engine/enact/mod.rs:71–98`.
 
 | Route | Method | Condition | Body schema | Store | From |
 |---|---|---|---|---|---|
-| `GET .../<thing>/<id>` (read) | GET | always (`Readable` non-empty) | — (returns contents) | Sim (`postings`/`ledger`) | `READ` acts.rs:289; enact.rs:236 |
-| `GET .../scan/<place>` | GET | always (`Reachable` non-empty) | `at` enum(`Reachable`) req | Sim (`field`) | `SCAN` acts.rs:730; enact.rs:87 |
-| `POST .../<part>/<id>/claim` | POST | always (`Claimable`) | — (target is the id) | World / Sim `ledger` | `CLAIM` acts.rs:386; enact.rs:311 |
-| `POST .../<part>/<id>/release` | POST | holding it | — | World | `RELEASE` acts.rs:418; enact.rs:336 |
-| `POST .../<board>/<id>/post_notice` | POST | always (`Postable`) | `what` free req | Sim `postings` | `POST_NOTICE` acts.rs:336; enact.rs:289 |
-| `POST .../<thing>/<id>/record_verdict` | POST | always | `judgement` free req; `what_would_change_it` free opt | World | `RECORD_VERDICT` acts.rs:983; enact.rs:92 |
-| `POST .../give` | POST | `Nearby` (someone here) | `what` enum(`Carried`) req; `to` enum(`Company`) req; `count` typed(int) opt | Sim (inventory) | `GIVE` acts.rs:226; enact.rs:205 |
-| `POST .../equip` | POST | `Embodied` | `what` enum(`Equippable`) req | Sim | `EQUIP` acts.rs:436; enact.rs:79 |
-| `POST .../use` | POST | `Embodied` | `what` enum(`Usable`) req; `on` enum(`Company`) opt | Sim | `USE` acts.rs:459; enact.rs:362 |
-| `POST .../gather` (field) | POST | `Embodied` (`Extractable`) | `what` enum(`Extractable`) req | Sim `field` | `GATHER` (field) acts.rs:499; enact.rs:394 — **distinct from `gather_*` (C.24)** |
-| `POST .../operate/<id>` | POST | always (`Operable`) | `mode` enum(`DeviceModes` — dependent on the chosen thing) req | World / Sim | `OPERATE` acts.rs:604; enact.rs:83 |
-| `POST .../recall` | POST | `AwayFromHome` (`tools.rs:1743`) | — | World | `RECALL` acts.rs:644; enact.rs:84 |
-| `POST .../engage` **(war world)** | POST | `Embodied` + `Postures` non-empty | `posture` enum(`Postures`) req; `target` enum(`Hostiles`) opt; `priority` enum(FIXED `sim::field::PRIORITIES`) opt | Sim `field` | `ENGAGE` acts.rs:529; enact.rs:82 |
-| `POST .../tower/<id>/command` **(war world)** | POST | `affordable` (`TowerActions`) | `action` enum(`TowerActions`) req; `target` free opt; `x`,`y`,`depth` typed(number) opt | Sim (tower) | `COMMAND_TOWER` acts.rs:791; enact.rs:88 |
-| `POST .../stores/fab-<n>/produce` **(war world)** | POST | `affordable` (`Makeable`) + fabricator `idle` | `what` enum(`Makeable`) req; `count` typed(int) opt; `queue` enum(`Queues`) opt | Sim | `PRODUCE` acts.rs:855; enact.rs:89 |
-| `POST .../phone/<thread>/sign_off` | POST | on a leavable thread (`Leavable`) | `intent` free req | Sim phone / **projected** | `SIGN_OFF` acts.rs:1027; enact.rs:96 — **see C.28.2** |
+| `GET .../<thing>/<id>` (read) | GET | always (`Readable` non-empty) | — (returns contents) | Sim (`postings`/`ledger`) | `READ` engine/acts/carrying.rs:289; engine/enact/reading.rs:236 |
+| `GET .../scan/<place>` | GET | always (`Reachable` non-empty) | `at` enum(`Reachable`) req | Sim (`field`) | `SCAN` engine/acts/combat_and_machines.rs:730; engine/enact/scan.rs:87 |
+| `POST .../<part>/<id>/claim` | POST | always (`Claimable`) | — (target is the id) | World / Sim `ledger` | `CLAIM` engine/acts/carrying.rs:386; engine/enact/notices.rs:311 |
+| `POST .../<part>/<id>/release` | POST | holding it | — | World | `RELEASE` engine/acts/carrying.rs:418; engine/enact/carry.rs:336 |
+| `POST .../<board>/<id>/post_notice` | POST | always (`Postable`) | `what` free req | Sim `postings` | `POST_NOTICE` engine/acts/carrying.rs:336; engine/enact/notices.rs:289 |
+| `POST .../<thing>/<id>/record_verdict` | POST | always | `judgement` free req; `what_would_change_it` free opt | World | `RECORD_VERDICT` engine/acts/tower_and_work.rs:983; engine/enact/command.rs:92 |
+| `POST .../give` | POST | `Nearby` (someone here) | `what` enum(`Carried`) req; `to` enum(`Company`) req; `count` typed(int) opt | Sim (inventory) | `GIVE` engine/acts/carrying.rs:226; engine/enact/carry.rs:205 |
+| `POST .../equip` | POST | `Embodied` | `what` enum(`Equippable`) req | Sim | `EQUIP` engine/acts/carrying.rs:436; engine/enact/carry.rs:79 |
+| `POST .../use` | POST | `Embodied` | `what` enum(`Usable`) req; `on` enum(`Company`) opt | Sim | `USE` engine/acts/carrying.rs:459; engine/enact/carry.rs:362 |
+| `POST .../gather` (field) | POST | `Embodied` (`Extractable`) | `what` enum(`Extractable`) req | Sim `field` | `GATHER` (field) engine/acts/carrying.rs:499; engine/enact/carry.rs:394 — **distinct from `gather_*` (C.24)** |
+| `POST .../operate/<id>` | POST | always (`Operable`) | `mode` enum(`DeviceModes` — dependent on the chosen thing) req | World / Sim | `OPERATE` engine/acts/combat_and_machines.rs:604; engine/enact/engage.rs:83 |
+| `POST .../recall` | POST | `AwayFromHome` (`engine/tools/types.rs:1743`) | — | World | `RECALL` engine/acts/combat_and_machines.rs:644; engine/enact/reading.rs:84 |
+| `POST .../engage` **(war world)** | POST | `Embodied` + `Postures` non-empty | `posture` enum(`Postures`) req; `target` enum(`Hostiles`) opt; `priority` enum(FIXED `sim::field::PRIORITIES`) opt | Sim `field` | `ENGAGE` engine/acts/combat_and_machines.rs:529; engine/enact/engage.rs:82 |
+| `POST .../tower/<id>/command` **(war world)** | POST | `affordable` (`TowerActions`) | `action` enum(`TowerActions`) req; `target` free opt; `x`,`y`,`depth` typed(number) opt | Sim (tower) | `COMMAND_TOWER` engine/acts/tower_and_work.rs:791; engine/enact/command.rs:88 |
+| `POST .../stores/fab-<n>/produce` **(war world)** | POST | `affordable` (`Makeable`) + fabricator `idle` | `what` enum(`Makeable`) req; `count` typed(int) opt; `queue` enum(`Queues`) opt | Sim | `PRODUCE` engine/acts/tower_and_work.rs:855; engine/enact/command.rs:89 |
+| `POST .../phone/<thread>/sign_off` | POST | on a leavable thread (`Leavable`) | `intent` free req | Sim phone / **projected** | `SIGN_OFF` engine/acts/tower_and_work.rs:1027; engine/enact/messaging.rs:96 — **see C.28.2** |
 
 `act`, `sleep`, `promise`, `remind` stay **body acts** and gain no route (§4, App A;
-`ACT` acts.rs:95, `SLEEP` acts.rs:186, `PROMISE` acts.rs:901, `REMIND` acts.rs:940).
+`ACT` engine/acts/mod.rs:95, `SLEEP` engine/acts/carrying.rs:186, `PROMISE` engine/acts/tower_and_work.rs:901, `REMIND` engine/acts/tower_and_work.rs:940).
 
 ---
 
@@ -1636,7 +1636,7 @@ Part: muster-board (fixture, tower-redoubt — the `set`/`hand_to` end). Per §9
 
 **order-table routes under `command`, not `orders`.** The plan below to keep both parts on
 one `orders` prefix was superseded during Step 6: `report_done` at the command desk closes a
-mission against `Sim.ledger` (`ORDERS_REPORT_DONE`, `work.rs`'s `mission` dispatch), which is
+mission against `Sim.ledger` (`ORDERS_REPORT_DONE`, `engine/work/mission_acts.rs`'s `mission` dispatch), which is
 a different store and a different concern from muster-board's projected-agency `set`/`hand_to`
 — so `namespace_of` mounts order-table's acts at `command/<id>` instead
 (`npcd/src/effector/namespace.rs`). `command` is otherwise a plain generic station namespace
@@ -1645,7 +1645,7 @@ like any other (§9), not a second projected-store surface.
 | Route | Method | Condition | Body schema | Store | From |
 |---|---|---|---|---|---|
 | `GET .../command/command-room-1` (read) | GET | always | — | World (generic station read) | `station.rs::state` |
-| `POST .../command/command-room-1/report_done` | POST | holding an order | `what` free req | Sim `ledger` | `ORDERS_REPORT_DONE` station.rs:830, `work.rs::perform` |
+| `POST .../command/command-room-1/report_done` | POST | holding an order | `what` free req | Sim `ledger` | `ORDERS_REPORT_DONE` station.rs:830, `engine/work/dispatch.rs::perform` |
 | `POST .../orders/muster-1/set` | POST | always | `what` free req; `for` free opt | projected (agency) | `ORDERS_SET` station.rs:804 (audit §3.2/§6.2) |
 | `POST .../orders/muster-1/hand_to` | POST | always | `what` free req; `to` free req | projected (agency) | `ORDERS_HAND_TO` station.rs:818 (audit §6.2) |
 
@@ -1817,24 +1817,24 @@ implementation serves every editing station (§5.1). In the vault that is the te
 parts: chronicle-terminal, character-terminal, story-desk, easel, survey-desk, map-table,
 accession-desk, catalogue, appraisal-bench, mending-bench (§5.4). Mounted at
 `http://local/bench/<id>` where `<id>` is the station instance being worked. The mode is
-**per body** (§5.1), held as engine state. **These are shipped** (`work.rs:795–1026`) —
+**per body** (§5.1), held as engine state. **These are shipped** (`engine/work/bench_acts.rs:795–1026`) —
 the `[no handler yet]` flags in the table below are stale (Appendix D.5); `bench_commit`'s
 collision check already names the other party (`bench.rs:559`), so the Settling trigger
 is real today.
 
 | Route | Method | Condition (mode transition) | Body schema | Store | From |
 |---|---|---|---|---|---|
-| `POST .../bench/<id>/branch` | POST | reading → working (takes the claim) | — | World + engine mode state | `bench_branch` audit §5.2 — shipped (`work.rs:795–1026`) |
-| `POST .../bench/<id>/stash` | POST | working → reading | — | World + mode | `bench_stash` audit §5.2 — shipped (`work.rs:795–1026`) |
-| `POST .../bench/<id>/stash_pop` | POST | reading → working | — | World + mode | `bench_stash_pop` audit §5.2 — shipped (`work.rs:795–1026`) |
-| `GET .../bench/<id>/diff` | GET | working, offered | — | World | `bench_diff` audit §5.2 — shipped (`work.rs:795–1026`) |
-| `POST .../bench/<id>/restore` | POST | working → reading (discards) | — | World + mode | `bench_restore` audit §5.2 — shipped (`work.rs:795–1026`) |
-| `POST .../bench/<id>/stage` | POST | working → offered | — | World + mode | `bench_stage` audit §5.2 — shipped (`work.rs:795–1026`) |
-| `POST .../bench/<id>/unstage` | POST | offered → working | — | World + mode | `bench_unstage` audit §5.2 — shipped (`work.rs:795–1026`) |
-| `POST .../bench/<id>/commit` | POST | offered → reading (**may fail with a conflict naming the other party**) | — | World + mode | `bench_commit` audit §5.2 (manufactures the Settling trigger) — shipped (`work.rs:935`) |
-| `GET .../bench/<id>/status` | GET | any | — | World | `bench_status` audit §5.2 — shipped (`work.rs:795–1026`) |
+| `POST .../bench/<id>/branch` | POST | reading → working (takes the claim) | — | World + engine mode state | `bench_branch` audit §5.2 — shipped (`engine/work/bench_acts.rs:795–1026`) |
+| `POST .../bench/<id>/stash` | POST | working → reading | — | World + mode | `bench_stash` audit §5.2 — shipped (`engine/work/bench_acts.rs:795–1026`) |
+| `POST .../bench/<id>/stash_pop` | POST | reading → working | — | World + mode | `bench_stash_pop` audit §5.2 — shipped (`engine/work/bench_acts.rs:795–1026`) |
+| `GET .../bench/<id>/diff` | GET | working, offered | — | World | `bench_diff` audit §5.2 — shipped (`engine/work/bench_acts.rs:795–1026`) |
+| `POST .../bench/<id>/restore` | POST | working → reading (discards) | — | World + mode | `bench_restore` audit §5.2 — shipped (`engine/work/bench_acts.rs:795–1026`) |
+| `POST .../bench/<id>/stage` | POST | working → offered | — | World + mode | `bench_stage` audit §5.2 — shipped (`engine/work/bench_acts.rs:795–1026`) |
+| `POST .../bench/<id>/unstage` | POST | offered → working | — | World + mode | `bench_unstage` audit §5.2 — shipped (`engine/work/bench_acts.rs:795–1026`) |
+| `POST .../bench/<id>/commit` | POST | offered → reading (**may fail with a conflict naming the other party**) | — | World + mode | `bench_commit` audit §5.2 (manufactures the Settling trigger) — shipped (`engine/work/bench_acts.rs:935`) |
+| `GET .../bench/<id>/status` | GET | any | — | World | `bench_status` audit §5.2 — shipped (`engine/work/bench_acts.rs:795–1026`) |
 | `GET .../bench/<id>/blame` | GET | any | — | World | `bench_blame` audit §5.2 (the custody chain) **[no handler yet]** |
-| `GET .../bench/<id>/log` | GET | any | — | World | `bench_log` audit §5.2 — shipped (`work.rs:795–1026`) |
+| `GET .../bench/<id>/log` | GET | any | — | World | `bench_log` audit §5.2 — shipped (`engine/work/bench_acts.rs:795–1026`) |
 
 ---
 
@@ -1865,12 +1865,12 @@ Reachable wherever the body stands (§7); npcd owns them even when an embedder r
 | Route | Method | Condition | Body schema | Store | From |
 |---|---|---|---|---|---|
 | `GET .../phone` | GET | always (has a handset) | — | Sim phone / projected | new (thread listing), §7.2 |
-| `POST .../phone/message` | POST | on a thread (`Threads`) | `to` enum(`Threads`) req; `intent` free req | Sim phone / projected | `MESSAGE` acts.rs:1140; enact.rs:93 |
-| `POST .../phone/reach_out` | POST | `Contacts` non-empty | `to` enum(`Contacts`) req; `intent` free req | Sim phone / projected | `REACH_OUT` acts.rs:1061; enact.rs:97 |
-| `POST .../phone/invite` | POST | `Invitable` non-empty | `to` enum(`Invitable`) req; `who` enum(`Invitees`) req; `intent` free opt | Sim phone / projected | `INVITE` acts.rs:1230; enact.rs:94 |
-| `POST .../phone/open_group` | POST | `Contacts` non-empty | `called` free req; `with` enum(`Contacts`) req; `intent` free opt | Sim phone / projected | `OPEN_GROUP` acts.rs:1270; enact.rs:95 |
+| `POST .../phone/message` | POST | on a thread (`Threads`) | `to` enum(`Threads`) req; `intent` free req | Sim phone / projected | `MESSAGE` engine/acts/conversation_acts.rs:1140; engine/enact/messaging.rs:93 |
+| `POST .../phone/reach_out` | POST | `Contacts` non-empty | `to` enum(`Contacts`) req; `intent` free req | Sim phone / projected | `REACH_OUT` engine/acts/conversation_acts.rs:1061; engine/enact/messaging.rs:97 |
+| `POST .../phone/invite` | POST | `Invitable` non-empty | `to` enum(`Invitable`) req; `who` enum(`Invitees`) req; `intent` free opt | Sim phone / projected | `INVITE` engine/acts/conversation_acts.rs:1230; engine/enact/messaging.rs:94 |
+| `POST .../phone/open_group` | POST | `Contacts` non-empty | `called` free req; `with` enum(`Contacts`) req; `intent` free opt | Sim phone / projected | `OPEN_GROUP` engine/acts/conversation_acts.rs:1270; engine/enact/messaging.rs:95 |
 | `POST .../phone/send_image` | POST | *(deferred — see below)* | `to` enum(`Threads`) req | Sim phone / projected | `send_image` (body, `tools.rs`); audit §2.1 |
-| `POST .../phone/<thread>/sign_off` | POST | `Leavable` | `intent` free req | Sim phone / projected | `SIGN_OFF` acts.rs:1027; enact.rs:96 |
+| `POST .../phone/<thread>/sign_off` | POST | `Leavable` | `intent` free req | Sim phone / projected | `SIGN_OFF` engine/acts/tower_and_work.rs:1027; engine/enact/messaging.rs:96 |
 
 *As-built: `/phone/send_image` is **deferred** and is **not** mounted or advertised. `send_image` is
 not a body act — it is absent from `body::is_of_the_body` and `enact::is_mine`, so `enact::perform`
@@ -1913,9 +1913,9 @@ is `/history`. Each read degrades to an empty layer if the cast is not installed
    Tier-1 `tool_world_acts.md` reads dissolve into the internal `GET`, so `read` is the `GET` on the target
    resource and `scan` is `GET .../scan/<place>`.
 2. **`sign_off` — store and namespace.** Appendix A groups it with *world-state* acts
-   (`acts.rs:1311`), but it acts on a conversation thread. **Call:** routed under
+   (`engine/acts/mod.rs:1311`), but it acts on a conversation thread. **Call:** routed under
    `/phone/<thread>/sign_off` (C.27), store = Sim phone / projected; cross-referenced in C.2.
-3. **Two `gather`s.** Field extraction (`Extractable`, acts.rs:499) vs the reading-table
+3. **Two `gather`s.** Field extraction (`Extractable`, engine/acts/carrying.rs:499) vs the reading-table
    `gather_*` (station.rs:978). **Call:** disambiguated by URL shape — `POST .../gather` (no id)
    vs `POST .../gather/long-table-1/…`.
 4. **Not-part-bound world acts.** `claim`/`release`/`post_notice`/`record_verdict` mount on the
@@ -1955,12 +1955,12 @@ is `/history`. Each read degrades to an empty layer if the cast is not installed
 
 **v1 total ≈ 152 routes** across 27 namespaces (map's 6 Step-8 routes excluded).
 **Correction (Appendix D):** the "Store" column above and any "0-of-79 / [no handler
-yet]" framing are stale. The writing handlers are *shipped* — in `engine/work.rs`
+yet]" framing are stale. The writing handlers are *shipped* — in `engine/work/`
 (`work::perform`), not `station.rs` (declaration only) — and the store for the
 authoring namespaces is `Sim` (its `record`/`ledger`), not the npc-map `World`; a
 subset reaches the mind folder on disk through the `bench` working copy. Appendix D.5
 is the authoritative per-namespace store map, and D.6 the genuinely-missing work. So
-the migration mostly *wraps existing `work.rs` handlers in route envelopes*; the
+the migration mostly *wraps existing `engine/work/` handlers in route envelopes*; the
 handlers truly absent are the short list (`plan_*`, `roster_*`, `room_sit`,
 `character_write_beliefs`).
 
@@ -1978,7 +1978,7 @@ names every store a handler can touch, the mechanism by which a write reaches th
 folder, and — grounded in the shipped code — what each Appendix-C writing namespace
 actually does today versus what it must do. It corrects two now-stale claims: the audit's
 "0-of-79 handlers" and Appendix C's uniform `Store = World` (both wrong — the handlers are
-shipped, in `engine/work.rs`), and `tool_world_state.md §2`'s "the mind folder is not a git
+shipped, in `engine/work/`), and `archived/tool_world_state.md §2`'s "the mind folder is not a git
 repository" (it is one now). Grounded in `--mind D:/prog/mind` and `npcd/src/{mind,sim,engine}`.*
 
 ## D.1 The mind folder on disk
@@ -2005,7 +2005,7 @@ repository" (it is one now). Grounded in `--mind D:/prog/mind` and `npcd/src/{mi
 Two facts the rest turns on:
 
 - **The mind folder is now a git repository** (`layers/` tracked; `.substrate/`
-  git-ignored). This resolves the *precondition* of `tool_world_state.md` dispute A. **But
+  git-ignored). This resolves the *precondition* of `archived/tool_world_state.md` dispute A. **But
   the daemon never invokes git** — no `Command::new("git")`, `git2`, or `gix` in
   `npcd/src`. The repo is a human's safety net, not a runtime store.
 - **The canon under `layers/world/` (1,268 files) is not writable by any station act.** The
@@ -2022,7 +2022,7 @@ first and last and folds the middle two away.
 placement/standpoint, `Actor.hold` claims, the lift, witnessed events. No persistence;
 deterministic re-entry (`runtime.rs:776`); reached under the one lock (`Hosted::with`/`read`,
 `world/mod.rs:41`). Claim = proximity (`perceive.rs:280`) + `Actor.hold`. Handlers: the
-world-state half of `WORLD_ACTS` (`enact.rs:71–98`; C.1–C.2).
+world-state half of `WORLD_ACTS` (`engine/enact/mod.rs:71–98`; C.1–C.2).
 
 **2. The in-RAM `Sim`** (`sim/mod.rs:61`) — *everything about the world that is not its map.*
 Behind the same lock (`with_sim`/`with_both`); **the store Appendix C mislabels "World" for
@@ -2085,8 +2085,8 @@ directly (D.4).
 
 ## D.4 How an effector handler writes the mind folder
 
-The shipped mechanism is `engine/work.rs` (the dispatcher for `STATION_ACTS` + `BENCH_ACTS`
-+ `MISSION_ACTS`, `work.rs:37`, entry `work::perform` `work.rs:173`) — **not** `enact.rs`
+The shipped mechanism is `engine/work/dispatch.rs` (the dispatcher for `STATION_ACTS` + `BENCH_ACTS`
++ `MISSION_ACTS`, `engine/work/dispatch.rs:37`, entry `work::perform` `engine/work/dispatch.rs:173`) — **not** `engine/enact/`
 (world acts) and **not** `station.rs` (which only declares the `Tool` statics).
 
 **The two-store bench act.** A body at a station holds both a `Record` item (the thing it has
@@ -2106,25 +2106,25 @@ taken on) and a `Benches` working set (documents it has changed, uncommitted). `
   anything else in the working set stays open.
 
 **The write path.** For the prose verbs (`chronicle_add_entry`/`rewrite_page`, `story_draft`,
-`character_write_*`, `place_write_*`) dispatch funnels into `write_into` (`work.rs:700`):
+`character_write_*`, `place_write_*`) dispatch funnels into `write_into` (`engine/work/bench_acts.rs:700`):
 1. Ask `Record::settle_path(name)` (`record.rs:338`) — returns a path **only for `Era`/
    `Story`/`Gap` kinds** (`layers/eras/…`, `layers/stories/…`), minting on first write; all
    other kinds get `None`.
 2. **No path →** `Record::write` appends to the in-RAM `Item.body` (`record.rs:512`). *Never
    reaches disk.*
 3. **Path →** `Record::claim_for_write` (custody) then `Benches::append(body, name, path,
-   text)` — the text goes to the working set, invisible until commit (`work.rs:718–726`).
+   text)` — the text goes to the working set, invisible until commit (`engine/work/bench_acts.rs:718–726`).
 
 The join: `Record::index_canon(root)` (`record.rs:379`) reads `layers/eras` and
 `layers/stories` at host time, adopting each doc with its `path` and `State::Filed`, so an
 era *is* the file it is. Portrait and craft writes take a **field** path instead:
 `portrait_draw`/`prompt_edit` → `bench.write_field(personalities/<who>.yaml,
-["portrait","prompt"], …)` (`work.rs:239`); `library_write` → `bench.write_field(moods|
-responses/<id>.yaml, [field], …)` (`work.rs:634`); `file_write`/`edit`/`delete` →
-`bench.write`/`edit`/`remove` over any editable-area doc (`work.rs:1051–1094`).
+["portrait","prompt"], …)` (`engine/work/dispatch.rs:239`); `library_write` → `bench.write_field(moods|
+responses/<id>.yaml, [field], …)` (`engine/work/craft.rs:634`); `file_write`/`edit`/`delete` →
+`bench.write`/`edit`/`remove` over any editable-area doc (`engine/work/bench_acts.rs:1051–1094`).
 
 **The commit is the only disk write, and it reconciles "admin writes disk."** `bench_commit`
-(`work.rs:935`) requires a one-line `why`, runs `Benches::commit` (collision check + atomic
+(`engine/work/bench_acts.rs:935`) requires a one-line `why`, runs `Benches::commit` (collision check + atomic
 writes), then settles the record item. The disk write is plain `std::fs` under the world
 lock, on behalf of the body's token — not through the admin-gated `/v1/mind` API. So the two
 rules do not conflict — they are **two doors** to store #3: the **console door** (a person's
@@ -2145,37 +2145,37 @@ body, the body's standing is the authorization, commit lands it).
 
 ## D.5 Per-namespace store table (reconciling Appendix C)
 
-Store the App-C column claims vs the store the shipped handler touches (`work.rs`), whether it
+Store the App-C column claims vs the store the shipped handler touches (`engine/work/`), whether it
 reaches the mind folder, and the mechanism. Schemas/verbs are in Appendix C.
 
-| Namespace (App C) | App C "Store" | **Actual store today** (`work.rs`) | Mind folder? | Mechanism |
+| Namespace (App C) | App C "Store" | **Actual store today** (`engine/work/`) | Mind folder? | Mechanism |
 |---|---|---|---|---|
-| `chronicle_add_entry`/`rewrite_page` (C.3) | World | `Sim.record` + **mind folder** via `Sim.bench` | **Yes** (`layers/eras/*.md`) | `write_into`→`settle_path`→`bench.append` (`work.rs:198,700`) |
-| `chronicle_retire_entry` (C.3) | World | `Sim.record` (→Retired) | No | `set_state` (`work.rs:261`) |
-| `chronicle_settle_boundary` (C.3) | World | `Sim.record` xref + `Sim.ledger` | No | `settle` (`work.rs:264`) |
+| `chronicle_add_entry`/`rewrite_page` (C.3) | World | `Sim.record` + **mind folder** via `Sim.bench` | **Yes** (`layers/eras/*.md`) | `write_into`→`settle_path`→`bench.append` (`engine/work/bench_acts.rs:198,700`) |
+| `chronicle_retire_entry` (C.3) | World | `Sim.record` (→Retired) | No | `set_state` (`engine/work/bench_acts.rs:261`) |
+| `chronicle_settle_boundary` (C.3) | World | `Sim.record` xref + `Sim.ledger` | No | `settle` (`engine/work/bench_acts.rs:264`) |
 | `story_draft` (C.5) | World | `Sim.record` + **mind folder** via `Sim.bench` | **Yes** (`layers/stories/*.md`) | `write_into`→`bench.append` |
-| `story_file` (C.5) | World | `Sim.record` (→Filed) | No | `set_state` (`work.rs:260`) |
+| `story_file` (C.5) | World | `Sim.record` (→Filed) | No | `set_state` (`engine/work/bench_acts.rs:260`) |
 | `character_write_identity`/`wants`/`memories` (C.8) | World | **mind folder** via `Sim.bench` *(as-built: D.6 #1 done)* | **Yes** (`personalities/<who>.yaml` `anchor`/`wants`; `layers/memory/<who>/memories.md`) | `bench.write_field`/`bench.append` (the `portrait_draw` pattern) — RAM `Record.write` only when there is no mind folder |
-| `character_settle_relation` (C.8) | World | `Sim.record` xref + `Sim.ledger` | No | `settle` (`work.rs:264`) |
+| `character_settle_relation` (C.8) | World | `Sim.record` xref + `Sim.ledger` | No | `settle` (`engine/work/bench_acts.rs:264`) |
 | `place_write_entry`/`write_local_history` (C.9) | World | `Sim.record` + **mind folder** via `Sim.bench` *(as-built: D.6 #1 done)* | **Yes** (`layers/world/locations/<slug>.md`; `layers/world/geography/<slug>.md`) | entry: `write_into`→`settle_path`(Place→locations)→`bench.append`; local history: `history_path`(geography)→`bench.append` |
 | `place_settle_route` (C.9) | World | `Sim.record` xref + `Sim.ledger` | No | `settle` |
-| `portrait_draw`/`prompt_edit` (C.6) | World | **mind folder** via `Sim.bench` | **Yes** (`personalities/<who>.yaml` `portrait.prompt`) | `bench.write_field` (`work.rs:239`) |
+| `portrait_draw`/`prompt_edit` (C.6) | World | **mind folder** via `Sim.bench` | **Yes** (`personalities/<who>.yaml` `portrait.prompt`) | `bench.write_field` (`engine/work/dispatch.rs:239`) |
 | `portrait_file_plate` (C.6) | World | `Sim.record` (→Filed) | No (no image store) | `set_state` |
 | `portrait_settle_likeness` (C.6) | World | `Sim.record` xref + `Sim.ledger` | No | `settle` |
-| `library_read`/`write` (C.7) | World | **mind folder** via `Sim.bench` | **Yes** (`moods`/`responses/*.yaml`) | `bench.read_field`/`write_field` (`work.rs:612`) |
-| `record_*` (accession/provenance/hand_on/describe/arrange/cross_reference/leave_note/tidy_index/mend/mark_repair/let_go) (C.4) | World | `Sim.record` fields (RAM) | No | field setters (`work.rs:310–440`) |
-| `record_appraise`/`write_reason` (C.4) | World | `Sim.ledger` verdicts (RAM) | No | `ledger.record_verdict` (`work.rs:357,366`) |
-| `map_add_place`/`remove_place` (C.10) | World (topology) | `Sim.record` (RAM); **no topology mutation** | No | `Record.put`/`let_go` (`work.rs:271,299`) |
+| `library_read`/`write` (C.7) | World | **mind folder** via `Sim.bench` | **Yes** (`moods`/`responses/*.yaml`) | `bench.read_field`/`write_field` (`engine/work/craft.rs:612`) |
+| `record_*` (accession/provenance/hand_on/describe/arrange/cross_reference/leave_note/tidy_index/mend/mark_repair/let_go) (C.4) | World | `Sim.record` fields (RAM) | No | field setters (`engine/work/dispatch.rs:310–440`) |
+| `record_appraise`/`write_reason` (C.4) | World | `Sim.ledger` verdicts (RAM) | No | `ledger.record_verdict` (`engine/work/dispatch.rs:357,366`) |
+| `map_add_place`/`remove_place` (C.10) | World (topology) | `Sim.record` (RAM); **no topology mutation** | No | `Record.put`/`let_go` (`engine/work/dispatch.rs:271,299`) |
 | `map_settle_border` (C.10) | World (topology) | `Sim.record` xref + `Sim.ledger` | No | `settle` |
-| `orders_set`/`hand_to`/`report_done` (C.11) | **projected (agency)** | **`Sim.ledger` (RAM)** — *not the substrate* | No | `ledger.set_order`/`hand_to`/`finish` (`work.rs:468–490`) |
-| `plan_*` (C.21) | **projected (agency)** | **unimplemented** — no `work.rs` arm | No | — (must reach substrate `AuthoredStrategy`) |
-| `enquiry_*` (C.12) | World | `Sim.record` + `Sim.ledger` | No | `work.rs:443–465` |
-| `dispatch_post_wake`/`cast_report_disagreement`/`plant_*`/`gather_call` (C.13/18/14/24) | World | `Sim.ledger` (RAM) | No | `ledger.set_order` (`work.rs:491–599`) |
+| `orders_set`/`hand_to`/`report_done` (C.11) | **projected (agency)** | **`Sim.ledger` (RAM)** — *not the substrate* | No | `ledger.set_order`/`hand_to`/`finish` (`engine/work/dispatch.rs:468–490`) |
+| `plan_*` (C.21) | **projected (agency)** | **unimplemented** — no `engine/work/dispatch.rs` arm | No | — (must reach substrate `AuthoredStrategy`) |
+| `enquiry_*` (C.12) | World | `Sim.record` + `Sim.ledger` | No | `engine/work/dispatch.rs:443–465` |
+| `dispatch_post_wake`/`cast_report_disagreement`/`plant_*`/`gather_call` (C.13/18/14/24) | World | `Sim.ledger` (RAM) | No | `ledger.set_order` (`engine/work/dispatch.rs:491–599`) |
 | `structure_*` (C.16) | World | `Sim.ledger` verdicts (RAM) | No | `ledger.record_verdict` |
-| `stores_put_back`/`take_out` (C.15) | Sim | `Sim.record` give_back/take | No | `work.rs:528,532` |
-| `creator_present` (C.20) | World | `Sim.record` (read) | No | `work.rs:499` |
-| `bench_*` (C.25) | World + mode | `Sim.bench` + `Sim.record` (commit → **mind folder**) | **commit: Yes** | `work.rs:795–1026` (**shipped**, contra App C flags) |
-| `file_*` (C.26) | World overlay | `Sim.bench` (commit → **mind folder**) | **commit: Yes** | `work.rs:1037–1094` |
+| `stores_put_back`/`take_out` (C.15) | Sim | `Sim.record` give_back/take | No | `engine/work/dispatch.rs:528,532` |
+| `creator_present` (C.20) | World | `Sim.record` (read) | No | `engine/work/dispatch.rs:499` |
+| `bench_*` (C.25) | World + mode | `Sim.bench` + `Sim.record` (commit → **mind folder**) | **commit: Yes** | `engine/work/bench_acts.rs:795–1026` (**shipped**, contra App C flags) |
+| `file_*` (C.26) | World overlay | `Sim.bench` (commit → **mind folder**) | **commit: Yes** | `engine/work/bench_acts.rs:1037–1094` |
 
 **Verbs Appendix C lists that do not exist as station acts** (`station.rs:996`):
 `character_write_beliefs` (deliberately absent — beliefs are earned on the sleep clock, not
@@ -2201,7 +2201,7 @@ craft-library, and the raw `bench_`/`file_` surface** reach the mind folder — 
 
 1. **Durable persistence of `Sim.record`/`Sim.ledger`, or a disk write for the non-era/story
    authoring verbs.** `character_write_*`, `place_write_*`, and every `record_`/`orders_`/
-   `structure_` verdict live only in RAM (`work.rs:710`, `record.rs:512`); `Sim` is not in the
+   `structure_` verdict live only in RAM (`engine/work/bench_acts.rs:710`, `record.rs:512`); `Sim` is not in the
    substrate redo log, so they do not survive a restart — the failure `record.rs:363` fixed for
    eras/stories but which still holds elsewhere. Fix: give Character/Place kinds a `settle_path`
    (`personalities/…`, `layers/world/locations|geography/…`) + `index_canon` adoption so they
@@ -2219,7 +2219,7 @@ craft-library, and the raw `bench_`/`file_` surface** reach the mind folder — 
 2. **The projected store is never written by a station handler.** §9.2/C.11/C.21 require
    `orders_`/`plan_` to write the substrate **agency** layer (`AuthoredStrategy`) and re-project
    into the system prompt. Today `orders_*` write `Sim.ledger` and `plan_*` has no handler. **The
-   write API is `Npcs::put_strategy` (`npcs.rs:745`), not `engine/authoring.rs`** (which is only a
+   write API is `Npcs::put_strategy` (`npcd/src/npcs/methods.rs:745`), not `engine/authoring.rs`** (which is only a
    life-document parser with no substrate side effect). A bridge from the turn loop to the shared
    `Npcs` handle must be built (Appendix E). Once it writes, the change projects automatically via
    the `agency` collection (`projection.yaml:437`) and `persona::intent` (`persona.rs:98`).
@@ -2257,7 +2257,7 @@ build follows Part F's order; this is the decision record it is built against.*
 
 - **Character authoring.** `character_write_identity` → the `anchor` field of
   `personalities/<who>.yaml` via `bench.write_field(["anchor"], …)` (the `portrait_draw`
-  pattern, `work.rs:239`); `character_write_wants` → a **new top-level `wants` field** on the
+  pattern, `engine/work/dispatch.rs:239`); `character_write_wants` → a **new top-level `wants` field** on the
   sheet; `character_write_memories` → **append to `layers/memory/<who>/*.md`**.
   `character_write_beliefs` is **not exposed** — beliefs form on the sleep clock and
   belief-writes stay operator-only (the §9.2 invariant). So C.8 adds no belief route.
@@ -2277,7 +2277,7 @@ build follows Part F's order; this is the decision record it is built against.*
 
 ## Engineering (settled by investigation)
 
-- **Agency writer = `Npcs::put_strategy`** (`npcs.rs:745`), not `engine/authoring.rs`.
+- **Agency writer = `Npcs::put_strategy`** (`npcd/src/npcs/methods.rs:745`), not `engine/authoring.rs`.
   `plan_break_down`/`order`/`reorder`/`scope` and `orders_*` write `AuthoredStrategy` (a tree via
   `parent_id`) into the `agency` layer, which projects automatically (`projection.yaml:437`,
   `persona::intent` `persona.rs:98`) — no extra projection wiring.
@@ -2346,7 +2346,7 @@ impl World {
 }
 ```
 
-Each returns the same typed `Done`/`Refused` (`world.rs:351`) the movement and claim
+Each returns the same typed `Done`/`Refused` (`npc-map/src/world/events.rs:351`) the movement and claim
 surface uses — a mutation that would break the map is refused, in second person, not
 half-applied.
 
@@ -2373,7 +2373,7 @@ The map has derived state that is never authored — `Node::exits` and `Node::vi
   `visible` are always re-woven, never hand-set — so a one-way door remains impossible
   to write (`schema.rs:24`).
 - **No stranded hold.** Removing a node or a part must first release any hold on it, as
-  `leave` does for a departing actor (`world.rs:837`) — a station that vanishes with a
+  `leave` does for a departing actor (`npc-map/src/world/bodies.rs:837`) — a station that vanishes with a
   claim on it would strand that claim forever.
 - **No body left nowhere.** Removing an occupied node relocates its bodies to the
   area's `arrival`/a `Core` (and logs it), or the removal is refused while occupied —
@@ -2396,12 +2396,12 @@ those verbs are a *different map*, and this records the correction (design docs 
 authoritative; a draft the code disproves is fixed, §AGENTS.md):
 
 - The `map_*` verbs author **cartography lore** — `sim.record` items of `Kind::Place`,
-  the fictional world-map the Makers draw as content (`work.rs:342`, `map_add_place`
+  the fictional world-map the Makers draw as content (`engine/work/dispatch.rs:342`, `map_add_place`
   puts a `Place` item; `map_remove_place` lets one go). They do not touch the walkable
   `npc-map` topology at all, and they should not: a Maker drawing a coastline is
   authoring the game's world, not adding a room to the vault it is standing in.
 - Runtime topology mutation is the **engine primitive** `MapSet::apply` /
-  `World::reshape` (`npc-map/src/mutate.rs`, `world.rs`), which reshapes the *walkable*
+  `World::reshape` (`npc-map/src/mutate.rs`, `npc-map/src/world/bodies.rs`), which reshapes the *walkable*
   map — the rooms and ways bodies actually move through. Its trigger is not a Maker's
   in-fiction act; it is the **operator / embedder surface** (direct scope, §8.3): an
   embedder growing the world it attached (through the public `World::reshape`), or an
@@ -2440,7 +2440,7 @@ direct-scope `/reshape/:world` route, and the `mapstore` YAML writeback.*
 # Appendix G — World-state acts as routes
 
 The generic station mechanism (§C, Step 6) mounts only the acts an authored `Part`
-names in its `at`. The world-state half of `WORLD_ACTS` (`acts.rs:1311`) is not
+names in its `at`. The world-state half of `WORLD_ACTS` (`engine/acts/mod.rs:1311`) is not
 `at`-bound — its availability is `Always`/`Nearby`/`Embodied`/`AwayFromHome`/`Holding`,
 not "at this part" — so those verbs need their own mounting. `Holding` is the
 availability of `release`: it is offered only while the body holds an order it took

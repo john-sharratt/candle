@@ -73,7 +73,7 @@ is not — the model writes its arguments in different orders, with or without
 
 Per DeltaNet layer, per token of the span, the record holds exactly what the
 fused prefill scan reads for that row (`delta_net_prefill_scan`,
-`candle-transformers/src/models/delta_net/cuda.rs`):
+`candle-transformers/src/models/delta_net/cuda/prefill.rs`):
 
 | Field | Width (Flash-Next) | What it is |
 |---|---|---|
@@ -344,7 +344,7 @@ nothing, and the reply prefills as it does today.
 A replay arm uploads each layer's rows once, when the span is armed — BF16
 widened to the F32 the scan reads, the narrowing being the storage format's.
 In the span's wave each DeltaNet layer runs one extra launch per replayed span
-(`replay_spans` in `delta_net/mix.rs`): the same `delta_net_prefill_scan`, over
+(`replay_spans` in `delta_net/mix/fused.rs`): the same `delta_net_prefill_scan`, over
 a one-span table built by the same `build_span_tables`, pointed at the record's
 rows. A replay is one per served read, and a wave carries one about as often as
 a turn serves a read, so the launches are not batched across spans.
@@ -404,7 +404,7 @@ Kernel parity, on the card:
 - **Self-replay is exact.** Replaying a record onto the fork's own entering state
   reproduces the fork's state-out, bit for bit, at F32 rows; at BF16 rows, it
   matches the scan run on the same BF16-rounded rows bit for bit.
-- **Replay onto another state** matches `delta_recurrence` (`delta_net/mix.rs`)
+- **Replay onto another state** matches `delta_recurrence` (`delta_net/mix/recurrence.rs`)
   over the same rows from that state, within the reference's parity tolerance.
 - **Live outputs are untouched.** A span with a record and one without produce
   the same span outputs and K/V bit for bit; only the state past the span
@@ -455,8 +455,8 @@ Taken 2026-11-03:
 |---|---|
 | Rows and their blob | `candle-transformers/src/models/delta_net/span_rows.rs` |
 | Arms and hooks | `candle-transformers/src/models/delta_net/span_arm.rs`; `DeltaNetSeq::hook` |
-| Capture and replay in the mixer | `capture_spans`, `replay_spans` in `delta_net/mix.rs` (fused path only; the ops path refuses a hook) |
-| Model trait | `arm_recurrent_span`, `take_recurrent_capture`; Flash-Next in `qwen4exp/wave.rs` |
+| Capture and replay in the mixer | `capture_spans`, `replay_spans` in `delta_net/mix/fused.rs` (fused path only; the ops path refuses a hook) |
+| Model trait | `arm_recurrent_span`, `take_recurrent_capture`; Flash-Next in `qwen4exp/wave/delegates.rs` |
 | Byte span → tokens | `turn_text::token_span`, `TurnText::prefix` |
 | Spans, the cut | `candle-conversation/src/recurrent_span.rs`; `Scheduler::cut_at_recurrent_spans` |
 | The record | `zend/src/reply_record.rs` |

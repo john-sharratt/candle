@@ -22,7 +22,7 @@ rebuilds — 64 ms a rebuild, 21 % of all reprojection time and the largest part
 after the scan. The link carries more than twenty times the warm rate.
 
 The rate is not the link's. `elevate_to_hot` calls
-`ChunkedKvBacking::migrate_sealed_to_gpu_batch_async` (`candle-nn/src/kv_cache/chunked/chunk_ops.rs`)
+`ChunkedKvBacking::migrate_sealed_to_gpu_batch_async` (`candle-nn/src/kv_cache/chunked/chunk_ops/tier_migration.rs`)
 once per layer — 48 calls a lift — and each call:
 
 1. resolves its sources into fresh `HashMap`s and `HashSet`s;
@@ -206,7 +206,7 @@ there and two of the three orders it needs are the stream's own FIFO:
    the old path paid ~192 waits.
 
 The metadata records stay as they are: `build_meta_records` fills them on the device
-from a descriptor table, asynchronously (`candle-nn/src/kv_cache/chunked/backing.rs`).
+from a descriptor table, asynchronously (`candle-nn/src/kv_cache/chunked/backing/record_pool.rs`).
 
 ### 3.6 Failure
 
@@ -239,7 +239,7 @@ copiers and the scatter is unchanged.
 | The copy both scatter kernels share | `candle-kernels/src/simple/scatter_copy.cuh` |
 | Where a lift's host time goes | `candle-nn/src/kv_cache/chunked/warm_lift/split.rs`, `LiftSplit`, logged on the `elevate_to_hot phases` line |
 | The micro harness | `candle-nn/src/kv_cache/chunked/tests/warm_lift_bench.rs` |
-| The ring's memory | `PinnedBuf::alloc_owned_mapped` (`candle-core/src/quantized/pinned_staging.rs`) |
+| The ring's memory | `PinnedBuf::alloc_owned_mapped` (`candle-core/src/quantized/pinned_staging/buffers.rs`) |
 | The caller | `elevate_to_hot`'s warm leg, one call in place of the layer loop; the scheduler holds the ring (`Scheduler::warm_lift_ring`), allocated at the first lift |
 | Removed | `migrate_sealed_to_gpu_batch_async`, and `elevate_to_hot`'s `copy_stream` and `pinned_scratch` |
 
@@ -253,7 +253,7 @@ In `candle-nn/src/kv_cache/chunked/tests/warm_lift_tests.rs` unless named:
 - **Byte for byte against the source** (GPU): three layers × two items lifted through
   a ring of 4 KiB slots — hundreds of batches, every slot refilled many times — and
   every lifted sequence's stored bytes equal its original's.
-- **The round trips** in `chunk_ops.rs` and `tests/compress_tests.rs` (hot → warm →
+- **The round trips** in `chunk_ops/tests_cpu_migration.rs` and `tests/compress_tests.rs` (hot → warm →
   hot → warm, BF16, F16, quantized, a band narrower than its slot) run through the
   lift and compare raw bytes.
 - **No host sync**: with the device's stream held shut by a `StreamGate`

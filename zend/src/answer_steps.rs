@@ -1,4 +1,4 @@
-//! The steps a task's answer accounts for (`docs/zen_coding_challenge_fixes.md`
+//! The steps a task's answer accounts for (`docs/archived/zen_coding_challenge_fixes.md`
 //! Cause 3). Recorded on the task's conversation as it starts ([`mark`]), and
 //! read by each of its rounds ([`of`]), whose answer the grammar ends with a
 //! `Steps:` section of them (`ConversationEngine::ending_with_steps`).

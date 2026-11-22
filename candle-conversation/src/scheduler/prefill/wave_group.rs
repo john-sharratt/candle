@@ -480,7 +480,7 @@ impl Scheduler {
     /// Cut each prefill's chunk so that every recurrent span of its turn runs as
     /// a chunk of its own, and arm the model for a chunk that is one — the model
     /// honours an arm only on exactly that span
-    /// (`docs/recurrent_reply_calibration.md` §7.2). The last step of forming a
+    /// (`docs/archived/recurrent_reply_calibration.md` §7.2). The last step of forming a
     /// group: the members are fixed for its life, so the cut holds across every
     /// window of its sweep.
     pub(super) fn cut_at_recurrent_spans(&mut self, members: &mut [WaveMember]) {

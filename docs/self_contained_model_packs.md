@@ -58,14 +58,14 @@ Two further costs follow from the pack living beside the GGUF:
 
 | Need | Where | Who |
 |---|---|---|
-| Identity check (length + 4 MiB fletcher32) | `expert_lre/handle.rs:648`, `qwen35/quantized_loader.rs:316` | every packed model |
+| Identity check (length + 4 MiB fletcher32) | `expert_lre/handle/mod.rs:648`, `qwen35/quantized_loader.rs:316` | every packed model |
 | Pinned MoE layers — **repacked from the GGUF on every boot**; the pack holds no records for them | `expert_lre/startup.rs:264-320`, `pack/header.rs:25-29` | every MoE model |
 | Pinned layer head (`PINNED_LAYERS = 2`), per-layer residues | `qwen35/layer_loader.rs:209-213`, `quantized_weights.rs:1738` | layer-streamed dense models |
-| Metadata: architecture, shapes, rope, expert counts, chat template, `general.*` | e.g. `quantized_qwen3_moe.rs:1002-1039`, `candle-conversation/src/models/builder.rs:1587-1620` | every model |
-| Attention, norms, router, shared expert, dense FFN, embedding, output head | e.g. `quantized_qwen3_moe.rs:1346-1447`, `qwen4exp/engine.rs:225-419` | every model |
+| Metadata: architecture, shapes, rope, expert counts, chat template, `general.*` | e.g. `quantized_qwen3_moe/loader.rs:1002-1039`, `candle-conversation/src/models/builder.rs:1587-1620` | every model |
+| Attention, norms, router, shared expert, dense FFN, embedding, output head | e.g. `quantized_qwen3_moe/loader.rs:1346-1447`, `qwen4exp/engine.rs:225-419` | every model |
 | Tokenizer vocabulary check (`tokenizer.ggml.tokens` vs `tokenizer.json`) | `builder.rs:1493-1576` | every model |
 | Flash-Next n-gram / PLE table, **read at run time** through a 2 GiB row cache | `qwen4exp/loader.rs:151-208` | Flash-Next |
-| `config.json` beside the GGUF | `quantized_qwen3_moe.rs:744-776` | Qwen3-30B |
+| `config.json` beside the GGUF | `quantized_qwen3_moe/loader.rs:744-776` | Qwen3-30B |
 
 `tokenizer.json` itself comes from a separate repo for every model
 (`builder.rs:1493`), so even a model whose weights were self-contained would
@@ -187,7 +187,7 @@ names the same — the revision only where the request pins one. The recorded
 hash is provenance, not a check: by the time a pack is opened its sources are
 gone. Content is pinned by revision instead — a hub commit, a local file's
 length and mtime, a prepared artifact's recipe digest. Where a source table
-carries SHA-256 pins — Flash-Next's Q8_0 split (`quantized_qwen38_moe.rs`) — the
+carries SHA-256 pins — Flash-Next's Q8_0 split (`quantized_qwen38_moe/checkpoint_pins.rs`) — the
 prepare step checks every file against them before the merge
 (`qwen4exp/prepare/store.rs`), and the artifact it produces is what the pack
 names.
@@ -278,7 +278,7 @@ from, and how a fetched source is released.
   cache first, through `model_pack::HubFetch` and `models::hub_download` — one
   resumable, timeout-protected download, never hf-hub's own, which has no read
   timeout) or
-  `resolve_model_with` (`models/pack_source.rs`). A caller's local checkpoint is
+  `resolve_model_with` (`models/builder/pack.rs`). A caller's local checkpoint is
   packed under a `local/…` label through `LocalFetch`, which never releases it;
   a path that is already a pack is used as it is. A gate donor is added to the
   request only when the checkpoint stores its DeltaNet gates below F32, judged
@@ -328,7 +328,7 @@ with the temp-file pack it chose between.
 
 | Family | Loader | Load path |
 |---|---|---|
-| Qwen3-30B-A3B | `ModelWeights::from_pack` (`quantized_qwen3_moe.rs`) | tensors and metadata from the pack's GGUF part, experts from its expert section; the mapping stays for the host-resident embedding table. No `config.json` beside a pack: the GGUF states context and RoPE base, and `norm_topk_prob` is the lineage's own `true` |
+| Qwen3-30B-A3B | `ModelWeights::from_pack` (`quantized_qwen3_moe/loader.rs`) | tensors and metadata from the pack's GGUF part, experts from its expert section; the mapping stays for the host-resident embedding table. No `config.json` beside a pack: the GGUF states context and RoPE base, and `norm_topk_prob` is the lineage's own `true` |
 | Qwen3.5/3.6-35B, hybrids | `load_hybrid_pack` (`qwen35/quantized_loader.rs`), wrapped by each model file's `from_pack` | sidecar, donor and overrides folded in at build (`qwen35/pack_build.rs`); one mapping |
 | Qwen3.5-0.8B/9B, Qwen3.8-27B | same, layer-stream path (`qwen35/layer_loader.rs`) | pinned head filled from the layer section (`LayerCache::fill_pinned`), residues from the GGUF part |
 | Flash-Next | `Qwen4ExpGpu::load` (`qwen4exp/engine.rs`) | the PLE table is a dense tensor of the pack, read through the same row cache (`loader::open_cached_ple`) |

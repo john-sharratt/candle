@@ -289,7 +289,7 @@ each loader opens the expert section at the offset the pack records:
 ```text
 ModelBuilder::resolve_model              pack_source.rs → model_pack::model_pack
   → ModelBuilder::load_model             the pack's own int8 mode
-    → ModelWeights::from_pack            quantized_qwen3_moe.rs (and each routed model's own)
+    → ModelWeights::from_pack            quantized_qwen3_moe/loader.rs (and each routed model's own)
       → expert_lre::section::open_section
         → ExpertCache::new               the only consumer
 ```
@@ -506,7 +506,7 @@ observed top-*X*%. Still one fill, still immutable. Worth it only if the tail
 turns out to be skewed enough to beat *X*% — which §10 should measure before it
 is built.
 
-**Grade the strata by layer depth.** `cache.rs` already records the reason this
+**Grade the strata by layer depth.** `expert_lre/cache/policy.rs` already records the reason this
 might pay, for the VRAM tier: the first layers "run first every pass and have
 **zero compute to overlap with DMA**". A RAM slot given to layer 0 removes more
 stall than one given to layer 40, which has the whole preceding sweep to prefetch

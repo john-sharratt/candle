@@ -123,7 +123,7 @@ replacement commits, and the next pass tombstones it (§7.2); a unit past the de
 bound, which nothing re-reads, is tombstoned at once. Version 2 counted pages
 from 1; version 3 read a file's parts under inline anchors; version 4 shows each
 part as a fenced block, its lines numbered from `+1`, and reads a file by
-`lines` ranges of whole parts (`docs/zen_coding_challenge_fixes.md` Cause 4);
+`lines` ranges of whole parts (`docs/archived/zen_coding_challenge_fixes.md` Cause 4);
 version 5 seals every unit that is not a priming-chain link behind the system
 prompt alone, never parented on the chain (`docs/zend_workspace_execution.md` §6);
 version 6 names a part's `scope` only for a part with a label of its own, so no
@@ -265,8 +265,8 @@ zend/src/
     tree_scope.rs     one tree's ingested units
     kept.rs           the bounded caches
 candle-conversation/src/
-  substrate.rs        scoped groups and per-target scopes; archiving drops a scope
-  projection/resolver.rs   both readers honour them
+  substrate/mod.rs    scoped groups and per-target scopes; archiving drops a scope
+  projection/resolver/mod.rs   both readers honour them
 ```
 
 ---

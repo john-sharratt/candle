@@ -151,8 +151,8 @@ mirror/pal tests pass with 4-bit; the seal/regroup gates remain red (regroup off
 ## Phase 2 — geometry 8 → 16 (SUB=32, identity, map still dead)
 
 ### Constants (lockstep — all three, one commit)
-- `paged.rs:32` `N_BANDS: 8→16`; `candle-nn/.../arena_table.rs:367`
-  `LATENT_N_BANDS: 8→16`; `candle-kernels/.../latent_common.cuh:56` `NPAL: 8→16`.
+- `paged.rs:32` `N_BANDS: 8→16`; `candle-nn/src/kv_cache/arena_table.rs:367`
+  `LATENT_N_BANDS: 8→16`; `candle-kernels/src/paged-latent/latent_common.cuh:56` `NPAL: 8→16`.
 - Rewrite the doc comments at each (8×64 → 16×32; rope = last two bands).
 
 ### Decode kernel — `latent_decode_kernel.cuh` (WARPS=8, 16 bands)
@@ -202,7 +202,7 @@ mirror/pal tests pass with 4-bit; the seal/regroup gates remain red (regroup off
 - Hardening: assert `n_kv_head == 1` where the single-latent path uses the const
   `GIDS_PER_HEAD`/`HeadGids::n_kv_head()` (`head_gids.rs:79-148`) — it only works
   today because n_kv_head==1; make the invariant explicit (candle-nn audit).
-- `backing.rs identity_scale` (:876): size by `n_palette()` not `N_PALETTE`
+- `chunked/backing/mod.rs identity_scale` (:876): size by `n_palette()` not `N_PALETTE`
   (currently relies on `unwrap_or(1.0)` for bands 4..15).
 - Stale golden tests `meta_pool.rs:638, 716-717, 731, 809` (`104=4*26`,
   old signatures) — update to the current 3-arg/11-arg API and 16-band goldens.
@@ -236,7 +236,7 @@ region; rope dims map identically.
   via `kernel_attention.rs:206,306`, `wave.rs:529,629,688`). This makes
   `pal_rank_of` / `load_mapped_key_dims` load-bearing for the first time —
   exercise them hard (they were cold).
-- CPU mirror `mapped_chunk_roundtrip` (`paged.rs:1499`): **restore** the
+- CPU mirror `mapped_chunk_roundtrip` (`latent_moe/paged/band_codec.rs:1499`): **restore** the
   map-honoring gather/scatter (the identity-only collapse from the NPAL=8 stabilize
   pass is removed) — now correct because `pal_of` is 4-bit and names 16.
 
@@ -254,7 +254,7 @@ compression ratio vs identity-16 and vs the 8-band 2.12×/2.7× baselines.
 - `candle-conversation/src/persistence/transfer.rs` `reassemble_block`
   (:667-690): 4-bit unpack (`(byte >> ((d&1)*4)) & 0xF`), `pal_bytes=head_dim/2`,
   loop `0..n_palette` (16), `expect_bands = n_kv_head*n_palette()` (:655).
-- On-disk format is length-prefixed (`record.rs:404-559`) so it is structurally
+- On-disk format is length-prefixed (`candle-conversation/src/persistence/record/mod.rs:404-559`) so it is structurally
   agnostic; **old 8-band/2-bit images are incompatible** — bump the persistence
   version and reject/skip stale latent chunks (this is a research codebase; no
   back-compat shim — fresh `substrate`). Document in the redo-log version note.

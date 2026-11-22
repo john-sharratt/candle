@@ -19,7 +19,7 @@ Measured on the zend substrate, 2026-10-25.
 
 ### 1.1 How projection cuts its probe
 
-A boundary fires during decode (`scheduler/decode.rs`):
+A boundary fires during decode (`scheduler/decode/`):
 
 - on a line-feed token (`reproject_trigger_texts: ["\n"]`), once more than 16
   non-trigger tokens have been decoded since the last boundary;
@@ -82,7 +82,7 @@ build at the same point.
 
 ### 2.1 One boundary formula
 
-The trigger rule leaves `decode.rs` as a pure function over a token stream:
+The trigger rule leaves `scheduler/decode/` as a pure function over a token stream:
 
 ```rust
 /// Where a projection's boundaries fall in `tokens`.
@@ -476,7 +476,7 @@ replay of the conversation remains the end-to-end check after the gate passes.
 
 | Piece | Where |
 |---|---|
-| The boundary rule | `candle-conversation/src/provenance/boundaries.rs` (new), called by `scheduler/decode.rs` |
+| The boundary rule | `candle-conversation/src/provenance/boundaries.rs` (new), called by `scheduler/decode/` |
 | Windows from a stored turn | `candle-conversation/src/projection/belief_files.rs`, replacing `subwindow_bounds` over seams |
 | Per-file aggregation | `candle-conversation/src/projection/belief_files.rs` / the scan wrappers |
 | Probe construction | `scheduler/mod.rs` (the reproject probe) — the shape the windows mirror |

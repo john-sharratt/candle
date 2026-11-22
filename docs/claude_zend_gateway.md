@@ -177,7 +177,7 @@ through zend's REST routes:
   (`zend/src/mcp/nudges.rs`), so it reaches the worker whichever member took
   the call; the loop takes the queue where a tool round's results become the
   next turn's input — after the check that ends a round with no results, so a
-  nudge never makes a turn of nothing (`session.rs`, `nudges::follow`).
+  nudge never makes a turn of nothing (`session/inference_stream/stream_turn.rs`, `nudges::follow`).
 - **MCP sessions are records** under `mcp/session/` (`zend/src/mcp/state.rs`).
   A handshake session is kept under its `Mcp-Session-Id`. A 2026-07-28
   client's is kept under its person and client, and the aggregator's own
@@ -307,7 +307,7 @@ it sits 24 hours untouched (`docs/mcp_guides.md` §3).
   for a task someone is waiting on interactively — before the task's first
   turn. Priority is a decode-to-prefill
   airtime ratio, not strict ordering
-  (`candle-conversation/src/projection/schema.rs`).
+  (`candle-conversation/src/projection/schema/mod.rs`).
 - **The caller as owner**, so the conversation is theirs and replicates as
   theirs.
 
@@ -372,7 +372,7 @@ Inheriting turns was considered and refused: inherited turns are pinned whole
 and unscored (`candle-conversation/src/projection/selection.rs:231-249`), up to
 `INHERITED_CHAIN_TOKEN_CAP` (100K tokens) across the chain, and an ancestor
 that does not fit is dropped together with everything above it — the priming
-chain included (`candle-conversation/src/substrate.rs:3470, 3775-3791`). A long
+chain included (`candle-conversation/src/substrate/mod.rs:3470, 3775-3791`). A long
 thread would have cost every worker its priming.
 
 The worker runs the task's rounds — its reads, its builds, its tool output —
@@ -389,7 +389,7 @@ are workers too, started by it on the same thread (§6.1).
 
 **An archived worker keeps the turns behind its entries.** Today archiving a
 conversation keeps its entries and ceases the text filed under them
-(`archive_conversation` → `cease_journal_text`, `zend/src/session.rs:6992-7001,
+(`archive_conversation` → `cease_journal_text`, `zend/src/session/conversations.rs:6992-7001,
 5252-5260`), because nothing reads an archived conversation's turns. A worker's
 are exactly what is read later — the evidence behind a task's outcome — so a
 conversation owned through `/mcp` keeps its filed turns when it is archived,
@@ -431,11 +431,11 @@ result is every entry whose span overlaps the task's turns, the last of them
 first. Two things about the draft route shape this:
 
 - It only starts the draft: `202 {from_turn, to_turn, parts}`, the entry kept
-  later (`zend/src/session.rs:5171, 5270-5299, 7051-7063`). `GET …/journal`
+  later (`zend/src/session/journaling.rs:5171, 5270-5299, 7051-7063`). `GET …/journal`
   already reports `drafting` and `covered_to` (`journal-core/src/record.rs:140-158`),
   so the task waits for `drafting` to clear, then takes the entries whose ids
   are past the newest the worker's journal held before the task began
-  (`zend/src/mcp/workers.rs`).
+  (`zend/src/mcp/workers/mod.rs`).
 - It answers `409 draft_running` while a draft runs — checked under the same
   lock that begins one, so a draft that starts in between is never read as
   nothing new — `409 nothing_to_draft` when nothing is new, and `409 not_open`
@@ -494,7 +494,7 @@ guides (`docs/mcp_guides.md`) are the caller's and do not reach a worker.
 
 **A conversation carries its ancestors' journals.** The lineage runs project →
 thread → worker: `P:candle`, `T:review-layers`, `T:review-layers/verify-expiry`.
-At each round head (`carry_journal`, `zend/src/session.rs`) the journal
+At each round head (`carry_journal`, `zend/src/session/journaling.rs`) the journal
 collection of a conversation owned through `/mcp` holds every ancestor's
 journal, outermost first, then its own, then the reader's line:
 
@@ -716,7 +716,7 @@ decision, the same failure keeps coming back, it is about to give up — does no
 guess and does not stop. It asks, and Claude's answer moves it on.
 
 **A worker asks by ending its final response with a question block**, which
-every task's prompt describes (`ASKING`, `zend/src/mcp/workers.rs`):
+every task's prompt describes (`ASKING`, `zend/src/mcp/workers/constants.rs`):
 
 ```
 QUESTION: what it needs decided or explained, in a sentence or two
@@ -760,7 +760,7 @@ every turn.
 while it still runs, then refuses it alone, and closes a loop after three rounds
 of nothing but refusals, each saying so; the round cap closes at
 `MAX_TOOL_ROUNDS = 128`
-(`zend/src/repeat_guard.rs`, `zend/src/session.rs`); both end in
+(`zend/src/repeat_guard.rs`, `zend/src/session/inference_stream/stream_turn.rs`); both end in
 a closing turn that may not call tools. The loop sends `StreamItem::Closing`
 when it closes (`CLOSED_BY_REPEATS`, `CLOSED_BY_CAP`), which the chat stream
 shows nothing for and the worker reads as **stuck**: it settles `stuck` with
@@ -1101,7 +1101,7 @@ lines are its steps (`mcp/steps.rs`). An answer to a brief of two or more
 steps ends with a `Steps:` section, a line per step saying `done` and what
 shows it, `not done` or `could not` and why; one that leaves a step out is
 sent back once to account for it, in the same send-back as a citation check
-(`docs/zen_coding_challenge_fixes.md` Cause 3).
+(`docs/archived/zen_coding_challenge_fixes.md` Cause 3).
 
 **A nudge says who sent it.** A message queued for a worker's next tool round
 is delivered under a line naming its sender — Claude, the agent that started

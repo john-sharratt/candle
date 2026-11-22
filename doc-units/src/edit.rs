@@ -3,7 +3,7 @@
 //! An edit names a unit by its anchor (`at`), optionally the last unit of a
 //! span (`to`), and says what to do there — to the unit whole, or to lines of
 //! it, numbered from 1 in the unit as a read shows them
-//! (`docs/zen_coding_challenge_fixes.md` Cause 4). A line range counts from
+//! (`docs/archived/zen_coding_challenge_fixes.md` Cause 4). A line range counts from
 //! the unit's own first line, so an edit elsewhere never moves it, and several
 //! edits from one read stay valid. **An anchor that names no unit of
 //! the document as it stands is refused** ([`EditError::Stale`]): an anchor is

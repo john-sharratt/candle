@@ -40,7 +40,7 @@ departure is recorded here:
   restart loses the cache, and the next run asks again.
 
 **Source:** six worker tasks run on 2026-11-06 after
-`docs/zen_coding_session_fixes.md` was built:
+`docs/archived/zen_coding_session_fixes.md` was built:
 
 - `single-segment-handles`
 - `npcd-reads-with-catalog`
@@ -121,7 +121,7 @@ exist.
   - if prefill dominates, the reprojection's tail;
   - if reasoning dominates, the prompt and Cause 2.
 
-**Where.** The round boundary in `zend/src/session.rs`, which already sees the
+**Where.** The round boundary in `zend/src/session/inference_stream/stream_turn.rs`, which already sees the
 turn's `prefill_ms` and token counts, and the `calls` view in the timeline
 tools.
 
@@ -132,8 +132,8 @@ tools.
 - `journal_note` was 63 of the npcd task's 210 calls (30%), and 14 of
   single-segment-handles' 71 (20%).
 - Each note is a decoded call, and a forced call after it
-  (`docs/zen_coding_session_fixes.md` Cause 4).
-- `NOTE_AFTER_REASONING` (`zend/src/session.rs:623`, 200 tokens) is measured
+  (`docs/archived/zen_coding_session_fixes.md` Cause 4).
+- `NOTE_AFTER_REASONING` (`zend/src/session/triggers.rs:623`, 200 tokens) is measured
   per round. So a worker that reasons 200 tokens before each edit writes a note
   before each edit.
 
@@ -170,7 +170,7 @@ asked for.
 
 **Where.**
 
-- `zend/src/mcp/workers.rs`: the brief's steps, kept with the worker.
+- `zend/src/mcp/workers/start.rs`: the brief's steps, kept with the worker.
 - The closing note's held fields: `journal/style.rs`, and the stencil for
   `journal_note`.
 - `docs/claude_zend_gateway.md` §6.
@@ -341,7 +341,7 @@ After `repo` and `path`, a read names exactly one of:
 
 - **`from` and `to` are forced to `+N` by the grammar.** They are strings with
   the pattern `\+[1-9][0-9]?`; the stencil compiles a string `pattern` into
-  the value's rule (`candle-conversation/src/stencil/tool_call.rs:540`). An
+  the value's rule (`candle-conversation/src/stencil/tool_call/param.rs:540`). An
   absolute number cannot be decoded into an edit.
 - A range past the part's last line is refused, naming the part's length. The
   grammar does not bind it per part, for the reason `at` is free text: the turn's
@@ -364,7 +364,7 @@ After `repo` and `path`, a read names exactly one of:
 
 ### The stencil: exactly one of a group of keys
 
-`merge_variants` (`tool_call.rs:283`) merges a `oneOf` into the union of its
+`merge_variants` (`tool_call/param.rs:283`) merges a `oneOf` into the union of its
 arms' fields. That would admit `part` with `lines`, or neither, and only the tool
 would refuse it. The grammar gains a group of alternative keys: after `repo` and
 `path`, it offers one of `part`, `lines`, `list`, then that key's value shape,
@@ -415,14 +415,14 @@ satisfied by any one member, whose other members are then closed.
 - `zend/src/working_set/coverage.rs`: a chain is complete when its pages cover
   `1..=pages`. It becomes the reads covering every part.
 - `zend/src/working_set/corpus.rs`: what the working set places from a reading.
-- Inline read placement (`docs/inline_read_injection.md`,
+- Inline read placement (`docs/archived/inline_read_injection.md`,
   `candle-conversation/src/placed_span.rs`): a served read's tokens are found in
   the reading by occurrence. A `part` read's block is a run inside the ingested
   window, so it should place. The build checks that it does.
 - `zend/src/repeat_guard.rs`: which `file_read` / `file_edit` calls count as
   repeats, by their arguments.
-- `zend/src/tool_summary.rs`, `zend/src/tool_round.rs`, `zend/src/tools.rs`,
-  `zend/src/tool_def.rs`, `zend/src/tool_availability.rs`,
+- `zend/src/tool_summary.rs`, `zend/src/tool_round.rs`, `zend/src/tools/mod.rs`,
+  `zend/src/tool_def/mod.rs`, `zend/src/tool_availability.rs`,
   `zend/src/tool_guidance.rs`: what they say about a read or an edit.
 - `zend/src/self_check/` and `zend/src/calibrate/run.rs`: fixtures holding
   `page=` fences.
@@ -433,11 +433,11 @@ satisfied by any one member, whose other members are then closed.
 
 **npcd, which shares `doc-units`.**
 
-- `npcd/src/engine/work.rs`, `npcd/src/sim/bench.rs` (and `bench/tests.rs`):
+- `npcd/src/engine/work/bench_acts.rs`, `npcd/src/sim/bench.rs` (and `bench/tests.rs`):
   the bench's read and edit acts.
-- `npcd/src/engine/tools.rs`: the `file_edit` act's catalog entry, its
+- `npcd/src/engine/tools/offers.rs`: the `file_edit` act's catalog entry, its
   `BRINGS`, and the stencil params.
-- `npcd/src/engine/compose.rs`, `npcd/src/engine/runtime.rs`: the mending
+- `npcd/src/engine/compose.rs`, `npcd/src/engine/runtime/composing.rs`: the mending
   sitting. Its `mend` edits bind `at` to the piece's anchors, which become
   `part`, with `from`/`to`.
 - npcd's own read header (`… (14 paragraphs):`) becomes the block shape.
@@ -446,7 +446,7 @@ satisfied by any one member, whose other members are then closed.
 
 - `doc-units`: `render.rs` (the block), `edit.rs` (ranges), `carve/` (the
   attachment).
-- `candle-conversation/src/stencil/`: the alternative-key group (`tool_call.rs`,
+- `candle-conversation/src/stencil/`: the alternative-key group (`tool_call/`,
   `field_order.rs`), and the `pattern` on `from`/`to`.
 - `candle-conversation/tests/tool_cases/` (`MANIFEST.json`, `prompts.json`,
   `test_config.json`): calls written with `page`.
@@ -466,8 +466,8 @@ satisfied by any one member, whose other members are then closed.
   - `docs/tool-system.md`
   - `docs/zend_working_set.md`
   - `docs/zend_branch_ingest.md`
-  - `docs/inline_read_injection.md`
-  - `docs/mcp_vfs_branch_file_reads.md`
+  - `docs/archived/inline_read_injection.md`
+  - `docs/archived/mcp_vfs_branch_file_reads.md`
   - `zend-tools/src/tools/file/README.md`
   - `ARCHITECTURE.md`
 
@@ -635,7 +635,7 @@ prompt gives it in that form. So does the answer check's send-back
 user"): in the second challenge round a researcher sent back for its `Steps:`
 section journaled it as "the Steps: accounting the user asked for".
 
-**Where.** `workers::nudge` and the reply path in `zend/src/mcp/workers.rs`,
+**Where.** `workers::nudge` and the reply path in `zend/src/mcp/workers/answer.rs`,
 where the queued text is delivered, and the send-back in `workers::run`.
 
 ## Cause 8 — refusals without a way on

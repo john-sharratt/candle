@@ -117,13 +117,13 @@ There are three decode implementations; only the batched wave is production and 
 matters here (the reference `IncrementalTransformer::step` and single-seq engine paths stay
 as correctness oracles):
 
-- **Production:** `BatchedEngine::forward_wave` (`wave.rs:470`) — one call = one wave =
+- **Production:** `BatchedEngine::forward_wave` (`latent_moe/wave/managed.rs:470`) — one call = one wave =
   one forward step for every session in the batch.
 - Per-wave the head block already gathers scored rows and runs **one batched `lm_head` GEMM**
   over `[1, R, dim]` (`wave.rs:1494-1516`), returning per-row logits. Sampling (argmax) is
   the caller's host responsibility (`wave.rs:1695,1726,1830`) — there is no sampler in the
   module.
-- **The verify shape already exists.** `paged_latent_prefill_raw` (`paged.rs:548`,
+- **The verify shape already exists.** `paged_latent_prefill_raw` (`latent_moe/paged/prefill.rs:548`,
   driven at `wave.rs:1344-1363`) feeds K new tokens for one sequence through **one** kernel
   launch: packed `kv_new`, a `seq_of` query→slot map, per-token `q_pos`, and per-seq diagonal
   metadata `new_meta[n_seq,4] = {rows, base, start, -}`. Each query attends its arena slot +
@@ -242,7 +242,7 @@ existing multi-slot prefill machinery rather than adding a kernel:
 `verify_seqs` is guarded like prefill (skip when empty) so pure-decode waves are unchanged.
 
 **Kernel choice — reuse prefill now, extend decode later.** The prefill kernel is *correct*
-for verify (gate test `prefill_rows_equal_decode_steps`, `paged.rs:2861`, proves prefill row i
+for verify (gate test `prefill_rows_equal_decode_steps`, `latent_moe/paged/tests_prefill.rs:2861`, proves prefill row i
 == decode step i) but it is **not** flash-style query-tiled: it launches **one thread block per
 query token** (`latent_prefill_kernel.cuh:986`, `grid(total_q,1,num_splits)`; the MMA M
 dimension is *heads*, not tokens), so the `d+1` verify tokens **each re-stream the whole
@@ -302,8 +302,8 @@ Four pieces of state, three already truncatable:
    before each layer's launch, commits their length on the host (`set_len`), and marks the
    cached decode slot buffer with `mark_decode_writer_stale`, so the header build's sync
    re-serialises it — a commit made outside the decode kernel must, see
-   `deepseek_perf_optimization_report.md` ("the live buffer's one invariant"). On accept length `m ≤ d+1`, roll back with
-   `truncate_sequence_to_tokens(seq, p+m)` (`sequence_ops.rs:2071`) + `set_sequence_offset`
+   `../archived/deepseek/deepseek_perf_optimization_report.md` ("the live buffer's one invariant"). On accept length `m ≤ d+1`, roll back with
+   `truncate_sequence_to_tokens(seq, p+m)` (`candle-nn/src/kv_cache/chunked/sequence_ops/tail.rs:2071`) + `set_sequence_offset`
    (`batched_inference.rs:2455`). **Present.** Needs a session-level token-granular wrapper
    (only a block-granular `truncate_sequence_to_blocks` wrapper exists at
    `batched_inference.rs:1216`).
@@ -315,7 +315,7 @@ Four pieces of state, three already truncatable:
    includes groups completed inside the current block — `kernel_attn_prefill_assemble`'s
    `n_visible[t] = base + (l0+t+1)/ratio` — mirroring decode's push-then-select, so deferral
    would diverge verify from decode at every group-boundary token). The implemented design:
-   - `verify_block` takes a per-layer pre-verify snapshot (`VerifySnapshot` in `wave.rs`):
+   - `verify_block` takes a per-layer pre-verify snapshot (`VerifySnapshot` in `latent_moe/wave/speculative.rs`):
      each `IncrementalCompressor`'s streaming state (`CompressorState` — partial-group
      buffers, overlap prev-group, `group_idx`; `Arc`-clone cheap) + the gallery length.
      During the verify forward, prefill pass 1 stashes the block's projected compressor
@@ -327,7 +327,7 @@ Four pieces of state, three already truncatable:
      (`FloatGallery::truncate` — every reader narrows to `len`, appends overwrite `len..`,
      so a length rollback suffices), and replays exactly the `m` accepted rows via
      `emit_groups_projected` — bit-identical to having absorbed only those tokens
-     (`snapshot_restore_replay_matches_clean_absorb`, compressor.rs).
+     (`snapshot_restore_replay_matches_clean_absorb`, `latent_moe/compressor/tests_incremental.rs`).
    - Without this, a partial accept leaves rejected draft rows in the partial-group buffer,
      a group pooled over draft content in the gallery, and `group_idx` advanced — the
      re-decoded positions get absorbed AGAIN as duplicate, shifted groups, and the model
@@ -336,7 +336,7 @@ Four pieces of state, three already truncatable:
    from the arena/corpus, which we already truncated. The only cross-wave carried state is
    per-`(layer,seq)` compressor buffers, handled by (3).
 
-**No `window_ring_snapshot`/`corpus_snapshot` full checkpoints** (`wave.rs:168-299`) on the
+**No `window_ring_snapshot`/`corpus_snapshot` full checkpoints** (`latent_moe/wave/mod.rs:168-299`) on the
 hot path — they copy full corpus/window state and are far heavier than truncate. They remain
 for cold resume only.
 

@@ -27,7 +27,7 @@ pub(super) mod tests {
         }
     }
 
-    /// **The console polls only while it is seen** (`docs/performance_patch.md`
+    /// **The console polls only while it is seen** (`docs/archived/performance_patch.md`
     /// N9): every timed poll goes through `/common/lib/visible.js`, so the only
     /// files that start an interval of their own are the landing page's
     /// animation and the mock backend.

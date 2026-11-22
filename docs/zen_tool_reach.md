@@ -293,7 +293,7 @@ tools out, and `repo_task_start` from it is refused
 starter's branches, with the starter's uncommitted changes as its last finished
 tool round saved them, copied into the task's own file events when its
 conversation is first built (`zend/src/conv_inherit.rs`,
-`docs/zen_coding_challenge_fixes.md` Cause 5). A reviewer reads the change
+`docs/archived/zen_coding_challenge_fixes.md` Cause 5). A reviewer reads the change
 without a commit first; what the task changes stays its own until it commits.
 
 So work nests at most one level below where a person or Claude started it.
@@ -320,7 +320,7 @@ handle can carry. A task's tasks go on its own thread.
 
 **The tools are hidden from a task a level down.** Each round of a task a
 task started withholds the task tools (`zen_tasks::level_of` and
-`withhold_by_level`, `zend/src/session.rs`). The worker record says whether a
+`withhold_by_level`, `zend/src/mcp/zen_tasks.rs`). The worker record says whether a
 conversation is a task or a chat, and whether a task started it
 (`Worker::by_task`); a dialogue has none. A withheld tool is out of the
 round's grammar and out of its prompt alike (`SelectionState::withhold_members`),

@@ -89,13 +89,13 @@ it needs neither the key nor the combination.
 | `SegmentTimer` | `cuda_backend/graph/timing.rs` | Device time of the segments on trial: an event pair on the device's stream per segment, read once its end has fired — never a wait. |
 | `WaveCapture` | `cuda_backend/graph/hub.rs` | RAII for one forward. `CudaDevice::begin_wave_capture` opens it **held**; `finish` launches the last segment; dropping it unfinished discards what is recording (the forward has already failed). Not `Send`, like the `Paused` guard: the driver ends a thread-local capture only on the thread that began it. |
 | `Device::record_launches` | `eager.rs` | The model's mark: recording starts here. |
-| `CudaDevice::cuda_stream` | `device.rs`, `stream_lease.rs` | The device's **one stream**, created (the legacy null stream cannot be captured), as a `StreamLease` the caller holds while it issues: every launch, copy, allocation and graph launch on the device goes on it, from every thread. Not `Send`; a lease from the recording thread is not counted, since its launches are the segment's. |
-| `Device::eager` / `CudaDevice::pause_capture` | `eager.rs`, `device.rs` | Suspend recording until the guard drops; see §2.2. |
-| `CudaDevice::flush_launches` | `device.rs` | End the segment, launch it, free what it retired, `cuStreamQuery` the stream, resume. A thread with no wave open queries under a lease. |
-| `CudaDevice::recording_segment` | `device.rs` | The `(wave, segment ordinal)` this thread is recording into, or `None` when its launches run eagerly — what the MoE dispatch's flush schedule keys on. |
-| `CudaDevice::retire` | `device.rs`, `hub.rs` | Free device memory after the segment that may still read it has been launched — whichever thread releases it — and at once, under a lease, when nothing records. `Held` and `Uploaded` release through it when their stream is a device's (`stream_owner`). |
-| `CudaDevice::read_raw` | `device.rs` | Read device memory held by address back to the host, behind everything on the stream. |
-| `CudaDevice::upload_raw` | `device.rs`, `staging.rs` | A host upload that, while recording, is staged and recorded instead of ending the segment. |
+| `CudaDevice::cuda_stream` | `device/stream.rs`, `stream_lease.rs` | The device's **one stream**, created (the legacy null stream cannot be captured), as a `StreamLease` the caller holds while it issues: every launch, copy, allocation and graph launch on the device goes on it, from every thread. Not `Send`; a lease from the recording thread is not counted, since its launches are the segment's. |
+| `Device::eager` / `CudaDevice::pause_capture` | `eager.rs`, `device/stream.rs` | Suspend recording until the guard drops; see §2.2. |
+| `CudaDevice::flush_launches` | `device/stream.rs` | End the segment, launch it, free what it retired, `cuStreamQuery` the stream, resume. A thread with no wave open queries under a lease. |
+| `CudaDevice::recording_segment` | `device/stream.rs` | The `(wave, segment ordinal)` this thread is recording into, or `None` when its launches run eagerly — what the MoE dispatch's flush schedule keys on. |
+| `CudaDevice::retire` | `device/stream.rs`, `hub.rs` | Free device memory after the segment that may still read it has been launched — whichever thread releases it — and at once, under a lease, when nothing records. `Held` and `Uploaded` release through it when their stream is a device's (`stream_owner`). |
+| `CudaDevice::read_raw` | `device/memory.rs` | Read device memory held by address back to the host, behind everything on the stream. |
+| `CudaDevice::upload_raw` | `device/memory.rs`, `staging.rs` | A host upload that, while recording, is staged and recorded instead of ending the segment. |
 | `GraphExec::{instantiate_audited, try_fold}` | `exec.rs` | Instantiate and upload an audited recapture; or fold one in place with `cuGraphExecUpdate_v2`, reporting when the driver refuses it as a different topology. |
 | audit | `exec.rs` | Every node must be a kernel, a memset, a device-to-device copy or a profiling span's external event record; anything else is refused with the graph dumped as DOT (`cuGraphDebugDotPrint`) and named in the error. |
 | `grow_scratch` | `candle-kernels/src/grow_scratch.cuh` | Grow-only launcher scratch that is safe to grow while recording. |
@@ -481,7 +481,7 @@ engine (12,700 copy-engine promotions, 16 GiB). In order of discovery:
    Flash-Next's wide decode most of its gain.
 5. **Executables per wave shape** (§2.2), which took the re-instantiations after each prefill
    to near zero.
-6. **Decode misses credited, with a long memory beside the short one** (`cache.rs`). A miss
+6. **Decode misses credited, with a long memory beside the short one** (`cache/policy.rs`). A miss
    was scored as a fresh elevation (−0.1), so the expert the next decode step would route
    again was the zone's first victim: Flash-Next's wide rows thrashed (×16 225 t/s). Crediting
    the miss as a hit (+1) fixed them (×16 368) but cost the short rows: with only the ×0.85

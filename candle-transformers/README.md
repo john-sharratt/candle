@@ -100,7 +100,7 @@ Eviction is score-based (frequency-decayed, layer-aware, with early-layer
 pinning); see the module header in `expert_lre/mod.rs` for the full four-part
 policy. `docs/moe_live_dispatch_design.md` covers the live MoE dispatch — the
 expert forward with no per-layer routing readback and no host round trip — and
-`docs/unified_wave_inference_engine.md` / `docs/continuous_fair_waves.md`
+`docs/archived/unified_wave_inference_engine.md` / `docs/continuous_fair_waves.md`
 cover how decode, prefill, and glue forwards are interleaved so decode's hot
 expert working set survives large prefills.
 
@@ -138,6 +138,6 @@ long-context generator's `tokenizers` dependency).
 ## Related docs
 
 - `docs/archived/markov_expert_prediction_eval.md` — the Markov Wave paper: promotion/eviction study and final design.
-- `docs/unified_wave_inference_engine.md` — the original decode/prefill/glue wave design.
+- `docs/archived/unified_wave_inference_engine.md` — the original decode/prefill/glue wave design.
 - `docs/continuous_fair_waves.md` — supersedes the above: decode and prefill share the layer traversal instead of time-slicing it.
 - `docs/moe_live_dispatch_design.md` — the live MoE dispatch: live pointer table, worker-block miss service, stager and pipeline threads, no per-layer routing readback.

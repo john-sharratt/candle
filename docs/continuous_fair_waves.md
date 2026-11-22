@@ -10,7 +10,7 @@ prefill" penalty disappears, and decode/prefill overlap becomes continuous rathe
 than an either/or flip.
 
 This supersedes the small⇄large **flip + recovery cooldown** of
-[`unified_wave_inference_engine.md`](unified_wave_inference_engine.md). That design
+[`unified_wave_inference_engine.md`](archived/unified_wave_inference_engine.md). That design
 still ran one homogeneous mode at a time and then spent a cooldown re-warming
 decode after each large prefill smashed the LRU. Continuous fair waves removes the
 smash at its source, so there is nothing to cool down from.
@@ -251,7 +251,7 @@ a reprojected context prefilled, so it belongs on the prefill cursor.
   untouched; each still fills its own disjoint rows.
 - **The layer traversal is still single-threaded, start → end**, and still uses
   the **Markov expert prediction + per-layer expert streaming** exactly as today
-  (`quantized_qwen3_moe.rs`, `expert_lre/`).
+  (`quantized_qwen3_moe/mod.rs`, `expert_lre/`).
 - **Decode state** — the sampler, DRY window, sampling-state-per-sequence — is
   unchanged; it is simply applied to the decode cursor's rows within the unified
   waves.

@@ -508,7 +508,7 @@ A patch is held to `ChangeSet`'s rules (§8.1), judged by what it actually chang
 
 ## 9. First consumer: the VFS purge (not built)
 
-A repository's overlay store (`zend-vfs/src/vfs.rs`) holds one conversation's changes as deltas (`zend-vfs/src/file_delta.rs`): per path, a chain of `Replace` (a whole-file write), `Edit` (only the changed lines, as splices against the text before it) and `Delete`. A purge publishes them and empties the overlay:
+A repository's overlay store (`zend-vfs/src/vfs/store.rs`) holds one conversation's changes as deltas (`zend-vfs/src/file_delta.rs`): per path, a chain of `Replace` (a whole-file write), `Edit` (only the changed lines, as splices against the text before it) and `Delete`. A purge publishes them and empties the overlay:
 
 1. **Snapshot.** Take the overlay's changed paths as a `ChangeSet` — each path's chain replayed to its resulting text as `Change::Write` (its UTF-8 bytes), a chain ending deleted as `Change::Delete`.
 2. **Filter.** Drop paths `ignored()` reports; they are listed back to the caller, not committed.
@@ -518,7 +518,7 @@ A repository's overlay store (`zend-vfs/src/vfs.rs`) holds one conversation's ch
 6. **Branch.** `create_branch(zen/<name>, commit)` locally, then `push` with `Lease::Absent` — or `Lease::Expect` of the last pushed head when the branch already exists, rebuilding through §8.5 when origin moved — and `set_upstream` so the user can check the branch out, pull and push it like one they pushed themselves.
 7. **Empty.** Only after the push succeeds are the purged paths removed from the overlay, and only those whose content is unchanged since the snapshot. A failure at any step leaves the overlay as it was.
 
-Each conversation has its own overlay per repository (`zend/src/tools.rs`, `ToolHost::conversation_files`), and its own branch per repository recorded in its state (`zend/src/conv_branches.rs`), so a purge is per conversation and lands on that conversation's branch.
+Each conversation has its own overlay per repository (`zend/src/tools/tool_host.rs`, `ToolHost::conversation_files`), and its own branch per repository recorded in its state (`zend/src/conv_branches.rs`), so a purge is per conversation and lands on that conversation's branch.
 
 ---
 

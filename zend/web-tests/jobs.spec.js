@@ -1,5 +1,5 @@
 // Job blocks and streaming replies redraw only what moved
-// (docs/performance_patch.md G1, G2, G3, G6, G7). Against the mock (?mock=1).
+// (docs/archived/performance_patch.md G1, G2, G3, G6, G7). Against the mock (?mock=1).
 const { test, expect } = require('@playwright/test');
 
 const URL = '/index.html?mock=1';

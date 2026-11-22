@@ -2,7 +2,7 @@
 
 *The second and third conversations a character runs: what reflection is for, how a dream corpus becomes a character's private inner world, and why the coupling between them is the whole safety argument.*
 
-**Where this stands.** The reflection conversation is built and produces dream briefs: `npcd/src/engine/reflect.rs`, `POST /v1/npc/:nid/reflect`, with both its questions authored in the mind's `projection.yaml` under `reflection:`. The character's own `reflect` act runs it (§3), asynchronously, and is answered with the reflection's first line. The brief is dreamt in a conversation of its own and the dream is written to a per-character `dreams` layer a passage to a turn, each passage signed (§7, `npcd/src/engine/dreams.rs`). Dreams are gathered back by provenance: one passage deep into a turn in the room, three into a reflection (§4). What is not built is the rest of the gather — `relationships`, `beliefs`, the mood — eviction and `LayerHit` (§8), and the authored seed dreams (§9). Each section says so where it applies.
+**Where this stands.** The reflection conversation is built and produces dream briefs: `npcd/src/engine/reflect/mod.rs`, `POST /v1/npc/:nid/reflect`, with both its questions authored in the mind's `projection.yaml` under `reflection:`. The character's own `reflect` act runs it (§3), asynchronously, and is answered with the reflection's first line. The brief is dreamt in a conversation of its own and the dream is written to a per-character `dreams` layer a passage to a turn, each passage signed (§7, `npcd/src/engine/dreams.rs`). Dreams are gathered back by provenance: one passage deep into a turn in the room, three into a reflection (§4). What is not built is the rest of the gather — `relationships`, `beliefs`, the mood — eviction and `LayerHit` (§8), and the authored seed dreams (§9). Each section says so where it applies.
 
 ---
 
@@ -166,7 +166,7 @@ The reflection runs with a **much larger top-K on the dream layer** than an acti
 
 ## 5. The exchange
 
-**Built**: `npcd/src/engine/reflect.rs`, behind `POST /v1/npc/:nid/reflect`.
+**Built**: `npcd/src/engine/reflect/mod.rs`, behind `POST /v1/npc/:nid/reflect`.
 
 The reflection is not a pair of questions answered in prose. It is an **exchange of calls**, in the one direction the checkpoint is trained for:
 
@@ -201,7 +201,7 @@ Then the character is let go: one unstencilled turn where it thinks in its own v
 
 ### The questions are still content
 
-The prose asks are authored in the mind's `projection.yaml` under `reflection:` — `question_one`, `question_two`, `question_two_retry`, and the `repair` list — read once at load by `npcd::engine::schema::reflection` and sent verbatim. `reflect.rs` owns the machinery and no wording. `mind/layers/dreams/_dream-prompt-system.md` carries the reasoning behind each clause.
+The prose asks are authored in the mind's `projection.yaml` under `reflection:` — `question_one`, `question_two`, `question_two_retry`, and the `repair` list — read once at load by `npcd::engine::schema::reflection` and sent verbatim. `reflect/mod.rs` owns the machinery and no wording. `mind/layers/dreams/_dream-prompt-system.md` carries the reasoning behind each clause.
 
 What has *left* those turns is the format. They no longer describe labels, because the grammar emits them.
 
@@ -223,7 +223,7 @@ A sample and never the whole corpus. Shown every axis it had used, the generator
 
 ### The behaviour space is rotated by the engine, not chosen by the model
 
-`DOMAINS` in `reflect.rs` is eight cells — work, body, the building, time, the people you know, the things that are not you, being addressed at all, language — and the route advances through them. Asked to pick freely, the generator returned to what it already knew: every axis it produced unprompted was about the character's relationship to its own work. Rotating the domain is what a quality-diversity search does with a behaviour space — define the dimensions, then fill them.
+`DOMAINS` in `reflect/steer.rs` is eight cells — work, body, the building, time, the people you know, the things that are not you, being addressed at all, language — and the route advances through them. Asked to pick freely, the generator returned to what it already knew: every axis it produced unprompted was about the character's relationship to its own work. Rotating the domain is what a quality-diversity search does with a behaviour space — define the dimensions, then fill them.
 
 ### Structural checks and one retry
 

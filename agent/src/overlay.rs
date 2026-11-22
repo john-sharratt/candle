@@ -1,6 +1,6 @@
 //! A run's overlay as the wire carries it: the base its changes are made on,
 //! and each changed path's chain named by its digest. The chains themselves
-//! travel only when the agent lacks them (`docs/zen_coding_challenge_fixes.md`
+//! travel only when the agent lacks them (`docs/archived/zen_coding_challenge_fixes.md`
 //! Cause 5).
 //!
 //! A member sends the names first. An agent holding every chain named runs

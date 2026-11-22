@@ -156,7 +156,7 @@ pub fn next_steps(job: &JobHandle) -> String {
 /// **A job a task starts runs the task's work, not origin's alone.** A worker
 /// started tests on a branch before committing to it, read "1399 passed" off
 /// a run of origin's tree without its edits, and recorded a pass of a change
-/// the run never held (`docs/zen_coding_challenge_fixes.md` Cause 5).
+/// the run never held (`docs/archived/zen_coding_challenge_fixes.md` Cause 5).
 async fn overlay_of(call: &OpsCall, repo: &str) -> Overlay {
     if !call.worker {
         return Overlay::default();

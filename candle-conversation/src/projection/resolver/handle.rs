@@ -333,7 +333,7 @@ impl Conversation {
 
     /// Bounded rolling-window view ranges for an append-only ingest — the
     /// system-prompt blocks plus the most recent `window_turns` sealed turns of
-    /// `timeline` (design `docs/unified_wave_inference_engine.md` §4.7). Returned
+    /// `timeline` (design `docs/archived/unified_wave_inference_engine.md` §4.7). Returned
     /// as raw `(start_block, end_block)` pairs for the scheduler's view borrow.
     ///
     /// `window_turns == 0` (unbounded) or fewer sealed turns than the window

@@ -40,10 +40,10 @@ already built and already proven:
 
 | Piece | Where | What it does today |
 |---|---|---|
-| `ToolSpec` list for a turn | `npcd/src/engine/tools.rs` — `specs_within` | Produces the tool set a body can actually use from where it is standing |
-| Argument binding to live sets | `npcd/src/engine/tools.rs` — `Choices`, `Within` | Binds an argument to the people actually present, the rooms actually reachable |
-| Grammar the turn begins inside | `candle-conversation/src/conversation.rs` — `TurnOptions::turn_grammar` | Forces the turn to open inside a supplied tree rather than merely detecting a call |
-| Prefill-then-constrain | `candle-conversation/src/stencil/driver.rs` — `Driver::opening` | Emits the scaffold as token ids and hands back the first sampled decision point |
+| `ToolSpec` list for a turn | `npcd/src/engine/tools/compile.rs` — `specs_within` | Produces the tool set a body can actually use from where it is standing |
+| Argument binding to live sets | `npcd/src/engine/tools/choices.rs`, `npcd/src/engine/tools/within_tools.rs` — `Choices`, `Within` | Binds an argument to the people actually present, the rooms actually reachable |
+| Grammar the turn begins inside | `candle-conversation/src/turn.rs` — `TurnOptions::turn_grammar` | Forces the turn to open inside a supplied tree rather than merely detecting a call |
+| Prefill-then-constrain | `candle-conversation/src/stencil/driver/mod.rs` — `Driver::opening` | Emits the scaffold as token ids and hands back the first sampled decision point |
 
 Today `specs_within` reads an authored constant. In this design it reads a list produced
 by the level above. The compiler is the same; only the front end changes. The constrained
@@ -258,7 +258,7 @@ into the substrate on start, so **wiping the substrate is a cache flush, not amn
 
 The archive is useful because of *how* it is recalled. Q vectors captured live during decode
 are scanned against the resident gallery arena
-(`candle-conversation/src/provenance/gallery_arena/scan.rs`), so what surfaces is the
+(`candle-conversation/src/provenance/gallery_arena/scan/mod.rs`), so what surfaces is the
 archived mission whose signature resembles the situation the NPC is in *now* — not the most
 recent, and not the one sharing the most nouns. That is case-based reasoning with a
 similarity metric the model itself produced, which is the correct shape for this: no
@@ -312,7 +312,7 @@ authored repertoire and different histories are genuinely different characters.
 
 ## 8. What this replaces
 
-The current loop nudges an idle character after `IDLE_AFTER_MS` (`npcd/src/engine/runtime.rs`)
+The current loop nudges an idle character after `IDLE_AFTER_MS` (`npcd/src/engine/runtime/turn.rs`)
 with a standing instruction. This does not drive behaviour: it produces an act, not a
 pursuit, and the act it produces is uncorrelated with anything the character wants. Every
 symptom traced during its development — a cast that scatters, conversation that has to be
@@ -324,7 +324,7 @@ knobs a mission sets for its current task (§3.1), rather than the only thing st
 between a character and doing nothing.
 
 The existing goal tree is the seed of the persistent side. `AuthoredStrategy`
-(`candle-conversation/src/persistence/record.rs`) already carries `strategy_id`,
+(`candle-conversation/src/persistence/record/npc.rs`) already carries `strategy_id`,
 `statement`, `parent_id` and `state`, and `parent_id` already models mission-to-task
 decomposition. Nothing currently writes that tree; in this design the mission level is what
 writes it.

@@ -73,7 +73,7 @@ Keep the band generalization; set `LATENT_N_BANDS = 8`.
 
 ### DONE — Phase 2 COMPLETE (palette maps removed, tree builds green)
 Host cleanup landed on top of the device removal below:
-- `paged.rs`: `mapped_chunk_roundtrip` is identity-only (dropped `pal_map` param);
+- `latent_moe/paged/band_codec.rs`: `mapped_chunk_roundtrip` is identity-only (dropped `pal_map` param);
   both callers updated; deleted `pack_map`, `palmap_output_invariant_across_maps`,
   `mirror_bit_exact_mapped_mixed_formats`, and the assign-palettes gate tail of
   `latent_band_select_convert_matches_codec`.
@@ -113,8 +113,8 @@ inconsistency). This was never correct for the latent at any band count ≠ 4; i
 hidden because the tests that exercise these paths (C3/seal) were red. Two ways to a
 fully-green tree:
 
-- **(A) Full `n_palette()` sweep** (~30–40 sites: backing.rs, chunk_ops.rs, sequence_ops.rs,
-  cpu_selection.rs — everywhere `head_dim/N_PALETTE` or `0..N_PALETTE`+`gid_pal`). GQA-safe
+- **(A) Full `n_palette()` sweep** (~30–40 sites: chunked/backing/mod.rs, chunked/chunk_ops/mod.rs, chunked/sequence_ops/mod.rs,
+  chunked/cpu_selection/mod.rs — everywhere `head_dim/N_PALETTE` or `0..N_PALETTE`+`gid_pal`). GQA-safe
   (`n_palette()`=4 for GQA). This is the honest fix and is required for the FP8 reference
   format anyway (its band-split write must work at ≠4 bands).
 - **(B) De-band the latent BF16 window** — store the 512-d latent as ONE contiguous BF16
@@ -151,7 +151,7 @@ bands to account for) and matches the reference format directly.
 - **Record** (`slot_types.cuh` / `meta_pool.rs`): replace the per-band block with two entries:
   `{nope_ptr(FP8), nope_scale-or-per64-scales, rope_ptr(BF16)}`. The dead `[0,HD/2)` pal_map
   region can be reclaimed here. Keep it byte-exact host↔device.
-- **Arena/alloc** (`alloc.rs`): allocate a 448-wide FP8 arena + a 64-wide BF16 arena per head,
+- **Arena/alloc** (`chunked/alloc/mod.rs`): allocate a 448-wide FP8 arena + a 64-wide BF16 arena per head,
   instead of `n_palette` equal `sub_head_dim` arenas.
 - **Kernels** (`latent_decode_kernel.cuh`/`latent_prefill_kernel.cuh`/`latent_common.cuh`):
   the window read splits at `NOPE_DIM`: dims `< 448` → FP8 region (`load_band_elem` FP8 path
@@ -199,14 +199,14 @@ band as a flat 32×32 region via `band_ptr + within*SUB + d`), so `wave_paris` p
 
 **What landed, per file (single-latent only; GQA byte-identical):**
 - `arena_table.rs`: `LATENT_NOPE_BANDS = 14` (the `448/32` band split; rope = the last 2 bands).
-- `chunked/alloc.rs` (`alloc_block_chunks`): single-latent now mints **two chunk runs per head**
+- `chunked/alloc/mod.rs` (`alloc_block_chunks`): single-latent now mints **two chunk runs per head**
   — 14 nope bands from the writer-format arena (`active_k_arena_key`) + 2 rope bands from a
   **pinned BF16** arena — instead of one 16-band run. K≡V (V aliases K). The KvHead record still
   carries all 16 bands; each band resolves its own `{ptr, fmt, scale}` from its gid's arena, so
   the FP8/BF16 format tag follows the region automatically (no `serialize_kv_heads` change
   needed). When the writer format is already BF16 (the wave window) the two runs are both BF16 →
   the store is uniform BF16, i.e. the pre-existing behaviour, only the arena width narrows 128→32.
-- `chunked/backing.rs`:
+- `chunked/backing/mod.rs`:
   - `resolve_arena_info_filtered`: per-band `sub_head_dim` now `head_dim / n_palette()` (32 for
     the single latent, 128 for GQA) so the stride matches the width the arenas are physically
     created at. GQA identical (`n_palette() == N_PALETTE`).
@@ -218,13 +218,13 @@ band as a flat 32×32 region via `band_ptr + within*SUB + d`), so `wave_paris` p
   GQA) and promotes each band to **F32 before `cat`** on read (mixed dtypes can't concatenate;
   no-op for GQA). Removed the up-front whole-latent cast for the single latent (it would have
   stripped the rope tail's BF16 precision to FP8 before the rope arena ever saw it).
-- `latent_moe/paged.rs` (`arena_write_read_round_trip`): oracle updated — dims `< 448` round
+- `latent_moe/paged/tests_kernel_gates.rs` (`arena_write_read_round_trip`): oracle updated — dims `< 448` round
   through FP8 E4M3, dims `≥ 448` through BF16. (`build_mapped` needed no change: it hand-authors
   per-band regions/records already; the two-region store only changes the real backing.)
 
 **Build:** `cargo build -p candle-transformers --features cuda --release` green after every step;
 candle-nn lib green. (The `-p candle-nn --lib` **test** harness has 7 PRE-EXISTING compile errors
-in `meta_pool.rs`/`gpu_chunks_tests.rs` calling `chunk_record_bytes`/`serialize_kv_heads`/
+in `meta_pool.rs`/`chunked/tests/gpu_chunks_tests.rs` calling `chunk_record_bytes`/`serialize_kv_heads`/
 `token_slice_serialized_size` with the old arg counts — from the earlier uncommitted latent work,
 untouched here.)
 
@@ -244,7 +244,7 @@ NPAL collapse. `NPAL` is retained; the record stays `HD/2 + NPAL*26`.
 ### DONE — cleanup + reference-FP8 pass (tasks a/c/d, review-ready)
 
 **Task (a) — candle-nn lib-test compile errors FIXED.** `meta_pool.rs` +
-`gpu_chunks_tests.rs` call sites updated to the current `n_palette`-carrying
+`chunked/tests/gpu_chunks_tests.rs` call sites updated to the current `n_palette`-carrying
 signatures (`chunk_record_bytes`/`serialize_kv_heads`/`kv_head_serialized_size`/
 `token_slice_serialized_size`); GQA goldens stay 4-palette (`104 = 4*26` unchanged).
 `cargo build -p candle-nn --features cuda --release --tests` compiles clean.
@@ -348,7 +348,7 @@ BF16 window is *above* the reference — correct but heavier. Under (B) the form
   fixed reference per-band format (no adaptive selection).
 - Remove `latent_band_select`/`latent_band_convert` kernels + FFI if only the ladder
   used them (verify no other caller).
-- `batched_inference.rs`: remove `InferenceMode::C3`; `wave.rs`: `story_rewrite_c3_compressed`.
+- `batched_inference/inference_mode.rs`: remove `InferenceMode::C3`; `wave.rs`: `story_rewrite_c3_compressed`.
 - `paged.rs`: delete `latent_c9_seal_decode_robustness`, `latent_compressed_arena_roundtrip_decode`
   (compression); KEEP `arena_backed_matches_synthetic` (uncompressed) but note it was
   failing pre-session — the io.rs `n_palette()` fix + reference format should resolve it.

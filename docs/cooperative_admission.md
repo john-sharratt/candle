@@ -133,7 +133,7 @@ How it is built:
 - **Current enough is a conversation dimension.** Every member hears every
   release (`AppMember::on_unclaim`) and awaits the key: once it has applied
   every record of that conversation through the release's point and holds
-  every turn of it whole — no gap turn (`remote/completeness.rs`) — it reports
+  every turn of it whole — no gap turn (`persistence/remote/completeness.rs`) — it reports
   the key in `COMPLETE` (`AppMember::report_complete`). A key stays reported,
   re-sent whole on every admission, until anyone claims it again. A member
   behind on everything else the releaser wrote may take the conversation all

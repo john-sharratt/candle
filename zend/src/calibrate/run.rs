@@ -256,7 +256,7 @@ pub fn calibrate_layer(
         "calibrating the layer's units",
     );
     // **The sweep is backlog the bar shows.** A pass reads every file before
-    // it calibrates any (`docs/recurrent_reply_calibration.md` §6), so this
+    // it calibrates any (`docs/archived/recurrent_reply_calibration.md` §6), so this
     // sweep is where a re-read tree spends most of its decode; each unit is
     // counted until it is sealed, failed or found to be another member's, and
     // shown as `<path> (calibrated)`.

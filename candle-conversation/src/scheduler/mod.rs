@@ -311,7 +311,7 @@ const EVIDENCE_MIN_PREFILL_TOKENS: u64 = 256;
 /// `disable_reprojection` path — `code_reading` / `repo_map`): each such turn
 /// attends only the system prompt + the last `CODE_READ_WINDOW_TURNS` sealed
 /// turns, bounding otherwise-unbounded ingest context that would exhaust the
-/// window and blow up KV VRAM (design `docs/unified_wave_inference_engine.md`
+/// window and blow up KV VRAM (design `docs/archived/unified_wave_inference_engine.md`
 /// §4.7 and [`crate::projection::resolver::Conversation::windowed_ingest_ranges`]).
 /// `0` = unbounded (whole-parent borrow).
 const CODE_READ_WINDOW_TURNS: usize = 8;

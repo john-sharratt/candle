@@ -95,9 +95,9 @@ one route table, a capacity, `INFO serving` printed once admitted.
 It joins as **its own app, `zenj`**, never as `agent`, so the gateway never routes it a build job.
 Apps are a fixed list in the `cluster` crate, and that is where the change is:
 
-- `zenj` is added to `APPS` (`cluster/src/gateway/hub.rs:109`); `web` takes the list from there
+- `zenj` is added to `APPS` (`cluster/src/gateway/hub/constants.rs:109`); `web` takes the list from there
   (`web/src/cluster/endpoint.rs:60-66`) and needs no change of its own for the socket.
-- `zenj` is added to `SERVICES` (`hub.rs:122`). An app outside `SERVICES` and not `agent` is
+- `zenj` is added to `SERVICES` (`hub/constants.rs:122`). An app outside `SERVICES` and not `agent` is
   *locked* and must name a model, so a `zenj` with `model: None` would be closed at the handshake
   (`cluster/src/gateway/admission.rs:26-28`, `:148-152`). As a service it has no floor, no model
   lock and no rollout: each machine's is released on its own — which is exactly right for a process

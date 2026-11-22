@@ -22,7 +22,7 @@ against is the safety net it already is.
 
 ## 1. What this is built on
 
-- **`Mission`** (`npcd/src/engine/mission.rs`) — the unit of work: a `prompt`
+- **`Mission`** (`npcd/src/engine/mission/mod.rs`) — the unit of work: a `prompt`
   (the brief the carrier reads as part of who it is), ordered `todo` steps,
   optional `work` (documents to read/write with `checks` gates), `grants` (the
   world-building acts the carrier is lent while it carries the mission), and the
@@ -33,18 +33,18 @@ against is the safety net it already is.
   §8) — a character that takes no orders (Zen) `order_post`s work for a drone, as
   an ad-hoc `{brief, steps}` or a named standing `{job}`; reports come back
   through `order_results`.
-- **Routines** (`npcd/src/engine/mission_gen/world.rs`, `sim/missions.rs`) —
+- **Routines** (`npcd/src/engine/mission_gen/world.rs`, `sim/missions/draw.rs`) —
   authored missions a world hands out, `Routine { id, brief, steps }`, read from
   the world's repo and offered through `Choices::Jobs`. **These are templates
   already** — they just can't take arguments yet.
 - **The grammar gate** (`performable` and `stencil_param` in
-  `npcd/src/engine/tools.rs`) — a drone can only emit an act that is *performable
+  `npcd/src/engine/tools/compile.rs`) — a drone can only emit an act that is *performable
   here*, and only with argument values that are *live here*. A device act is
   dropped where no device stands; where one does, the emitted device is
   constrained to the real names. This is what ended the invented-device looping,
   and it holds **whatever a mission's prose says** — which is why template
   parameters need no validation machinery of their own (§4).
-- **The handset threads** (`npcd/src/sim/phone.rs`) — the Discord messaging the
+- **The handset threads** (`npcd/src/sim/phone/mod.rs`) — the Discord messaging the
   drones already do, over which a coding mission drives zend (§7).
 
 ---
@@ -110,7 +110,7 @@ a real device. The template's prose guides; the grammar binds.
 
 This means v1 ships with **no change to the grammar** and **no shared live-set
 module**. (An earlier draft proposed lifting `Choices`/`Within` out of
-`engine/tools.rs` so templates could validate arguments early and Zen could be
+`engine/tools/` so templates could validate arguments early and Zen could be
 offered only the fillable templates. That is a genuine nicety — a wrong argument
 is caught at issue rather than quietly redirected by the grammar — but it is not
 needed for correctness, and it touches the just-stabilised grammar. It is

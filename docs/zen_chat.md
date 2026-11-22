@@ -188,7 +188,7 @@ person's worker conversations to them and to Admins
   failed tombstone ceases nothing.
 - `chats/sweep.rs`: a chat is due when closing or idle twelve hours — and not
   otherwise.
-- `workers.rs`: a chat turn settles done with its reply, never as a question; a
+- `workers/tests_workers.rs`: a chat turn settles done with its reply, never as a question; a
   chat worker's notes are not entered.
 - `mcp/src/context.rs`: no chat tool is ever an episode.
 - `chats/dialogue/target.rs`: a chat's id names the chat, a web UI conversation's

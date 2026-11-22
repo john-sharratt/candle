@@ -20,7 +20,7 @@ is independent of token count** (339 tok → 1068 ms; 1907 tok → 1714 ms; marg
 ~0.4 ms/tok ≈ 2400 t/s). The fixed cost is **streaming experts from pinned RAM**:
 the 18.56 GB model does not fit in 16 GB, so the expert-cache LRU holds only a
 fraction of the 128 experts/layer resident (`num_slots < total_experts`,
-`quantized_qwen3_moe.rs:1468-1496`), and each forward evicts + DMAs the experts it
+`quantized_qwen3_moe/loader.rs:1468-1496`), and each forward evicts + DMAs the experts it
 misses.
 
 ### 1.2 Why ≤512-token forwards are near the worst case
@@ -38,7 +38,7 @@ MoE routing is top-8 over 128 experts. By the coupon-collector bound, a chunk of
 So **any forward ≥ ~64–128 tokens already touches essentially all 128 experts**
 — it pays the full all-expert weight-load. Processing only ≤512 tokens per such
 forward is the worst amortisation: maximum PCIe traffic for minimum tokens. The
-cost model (confirmed in `compute.rs` / `pipeline.rs`) is:
+cost model (confirmed in `compute.rs` / `expert_lre/pipeline/mod.rs`) is:
 
 ```
 forward_time(C) ≈ expert_residency_churn(fixed, ~all experts) + C · compute_per_token
@@ -56,9 +56,9 @@ once to its whole token-group regardless of group size (`compute.rs:108`,
 The scheduler runs **three separate, homogeneous forward passes** — it never
 mixes token types into one forward, and each type's forward is small:
 
-- **Scheduling quantum** = one iteration of `Scheduler::run` (`run.rs:94`):
+- **Scheduling quantum** = one iteration of `Scheduler::run` (`run/scheduler_loop.rs:94`):
   `drain → promote → {decode quantum ≤32 steps, prefill 1 pass, section 1 chunk}`,
-  widest-phase-first (`run.rs:136-151`). ("Wave" in the logs is only a **2 s
+  widest-phase-first (`run/scheduler_loop.rs:136-151`). ("Wave" in the logs is only a **2 s
   logging window**, `mod.rs:1091` — not a scheduling unit.)
 - **Decode**, **prefill**, and **glue** are dispatched to **different attention
   kernels and different forward shapes**, forked purely on query length at
@@ -66,13 +66,13 @@ mixes token types into one forward, and each type's forward is small:
   glue rides the prefill route). A forward is all-decode `[b,1,h]` or
   all-prefill `[1,Σq,h]` — never both.
 - Per-forward prefill is capped at **512 tokens/seq** (`max_prefill_pass_tokens`
-  ← `config.scheduler.large_prefill_max_tokens`, `engine.rs:386`; the model also
-  re-slices any batch over `MAX_PREFILL_TOKENS = 4096`, `batched_inference.rs:2590`).
+  ← `config.scheduler.large_prefill_max_tokens`, `engine/mod.rs:386`; the model also
+  re-slices any batch over `MAX_PREFILL_TOKENS = 4096`, `batched_inference/prefill_slabs.rs:2590`).
 - There is **no time budget, no cooldown, no adaptive sizing, and no
   queue-depth signal** — sizing is fixed constants (`DECODE_BUDGET=32`,
   `PREFILL_BUDGET=1`, `MAX_ACTIVE_PREFILLS=16`); the only backpressure is a
-  VRAM-band eviction throttle (`prefill.rs:46,151`). `SchedulerConfig`'s
-  `small_prefill_threshold` is dead (`config.rs:1275`, "reserved for Phase 2").
+  VRAM-band eviction throttle (`scheduler/prefill/vram_phase.rs:46,151`). `SchedulerConfig`'s
+  `small_prefill_threshold` is dead (`config/engine_config.rs:1275`, "reserved for Phase 2").
 
 So during a single-session ingest each quantum spends most of its wall-clock on
 32 memory-bound decode steps (the whole-file summary) **plus** one ≤512-token
@@ -89,15 +89,15 @@ in flight *at the same time*.
 From the four subsystem studies:
 
 1. **Post-attention is fully type-agnostic and token-flat.** There is exactly
-   one FFN call site per layer (`batched_layer.rs`): `ffn_norm →
+   one FFN call site per layer (`batched_layer/mixed_layer.rs`): `ffn_norm →
    ffn_residual → SparseMoeBlock::forward_dynamic`, which immediately flattens to
-   `num_tokens = b_size·seq_len` (`quantized_qwen3_moe.rs:253`) and routes/gathers
+   `num_tokens = b_size·seq_len` (`quantized_qwen3_moe/moe.rs:253`) and routes/gathers
    per flat row. The router and experts never see sequence structure or token
    type. All projections (q/k/v/o) and the FFN qmatmul are shared `QMatMul`
    weights invoked through one `forward_dynamic` dispatch.
 
 2. **One `process_request` per layer serves the whole co-batched set**
-   (`quantized_qwen3_moe.rs:529` → `handle.rs:459`). All sessions' tokens for a
+   (`quantized_qwen3_moe/moe.rs:529` → `expert_lre/handle/forward.rs:459`). All sessions' tokens for a
    layer are counting-sorted into one `assignments` array and one grouped GEMM
    (`compute.rs:108`); an expert loaded to VRAM serves **every** token from
    **every** session routed to it. This *is* the "wave-batched grouped GEMM
@@ -115,7 +115,7 @@ From the four subsystem studies:
 
 4. **The only fork points are (a) the `max_input_len==1` header build
    (`batched_inference.rs:2702`) that produces a different metadata struct for
-   decode, and (b) the attention-kernel dispatch (`batched_layer.rs:413`).**
+   decode, and (b) the attention-kernel dispatch (`batched_layer/mod.rs:413`).**
    Everything downstream of attention already unifies.
 
 **Therefore the unified wave is a batch-assembler + attention-dispatch reshape.
@@ -180,7 +180,7 @@ Key properties:
    These are additive per-subset descriptors, not a merged kernel contract.
 
 2. **Attention dispatch runs all three sub-kernels into one buffer
-   (`batched_layer.rs:413`).** Instead of `if seq_len==1 { decode } else {
+   (`batched_layer/mod.rs:413`).** Instead of `if seq_len==1 { decode } else {
    prefill/glue }`, the layer runs whichever sub-kernels have rows this wave,
    each writing its slice of the `[total_tokens, hidden]` attention-out buffer.
    Row offsets come from the unified `cu_seqlens`. Reconcile the decode int8
@@ -295,7 +295,7 @@ after an arbitrary interval.
 **Mitigation — pin the decode working set (optional, VRAM-permitting).** To blunt
 the smash at its source, the large-wave admission can **pin the resident experts
 of the active decode conversations** so the LRU eviction band skips them
-(`evict_cold_tail`, `prefill.rs:178`, would exclude pinned keys). The large wave
+(`evict_cold_tail`, `scheduler/prefill/relief.rs:461`, would exclude pinned keys). The large wave
 then loads its experts into the *un*-pinned slots only, so decode stays warm
 across the wave — at the cost of a smaller expert budget for the large wave
 (fewer resident slots → more of its own streaming). This is a direct
@@ -326,9 +326,9 @@ The current VRAM reality (corrected from the batching study):
 
 - `used` on the wave line (`~11.7 GB`) is the **whole resident pool** — non-expert
   weights + resident expert-LRU slots + KV arenas + activation workspaces
-  (`vram_pool_stats`, `batched_inference.rs:1282`) — **not** KV alone.
+  (`vram_pool_stats`, `batched_inference/kv_arenas.rs:1282`) — **not** KV alone.
 - `budget` (`~3 GB`) is **growth headroom** = `init_free − pool_used − reserve`
-  (`alloc.rs:141-154`, reserve default 384 MiB). KV competes for this headroom
+  (`alloc/budget.rs:141-154`, reserve default 384 MiB). KV competes for this headroom
   with the large-wave activation buffer.
 
 So the large-wave ceiling is `available_headroom / bytes_per_token_activation`,
@@ -336,7 +336,7 @@ recomputed each trigger from `vram_budget_available()`. A 4096–8192-token wave
 needs a correspondingly larger `[total_tokens, hidden]` activation + grouped-GEMM
 scratch; the admission controller must size the wave to fit the *current*
 headroom (which shrinks as KV grows), and fall back toward small waves under
-pressure (reuse the existing `vram_under_pressure` machinery, `prefill.rs:151`).
+pressure (reuse the existing `vram_under_pressure` machinery, `scheduler/prefill/vram_phase.rs:151`).
 
 ### 4.5 New signal required: pending-token backlog
 
@@ -517,7 +517,7 @@ scope prefills against `system_prompt ⊕ last-N-scopes` — bounded, constant-c
   top_k=8 selection trims the context to the k most-relevant prior scopes — reuses
   existing machinery but pays the per-scope selection cost; the rolling window is
   simpler and deterministic.
-- The dormant `context_window_turns` field (`config.rs:1345`, default 0, inert —
+- The dormant `context_window_turns` field (`config/sequence_config.rs:1345`, default 0, inert —
   superseded by projection) describes exactly this "system prompt + last N turns"
   rebuild but is not wired into `insert_turn`/prefill; the rolling window can
   revive it for this path or be a fresh ingest-local mechanism.
@@ -534,8 +534,8 @@ Replace the three-phase quantum with a **single wave builder + dispatcher**:
 
 ```
 loop {                                        // one wave per iteration
-  drain_submissions();                        // unchanged (run.rs:102)
-  promote_new_prefills();                     // unchanged admission (prefill.rs:36)
+  drain_submissions();                        // unchanged (scheduler/requests.rs:102)
+  promote_new_prefills();                     // unchanged admission (scheduler/prefill/admitting.rs:36)
   update_backlog_counter();                   // NEW (§4.5)
 
   // choose_mode: Large iff backlog > THRESH AND cooldown allows. Cooldown is
@@ -704,22 +704,22 @@ throughput/latency probes for steps 5–6.
 
 | Concern | Location |
 |---|---|
-| Scheduler loop / quanta | `candle-conversation/src/scheduler/run.rs:94`, budgets `:5-7`, phase order `:136-151` |
-| Wave stats / log line | `scheduler/mod.rs:1101` (`flush`), fields `:1115-1138`, vram tuple `run.rs:163-167` |
+| Scheduler loop / quanta | `candle-conversation/src/scheduler/run/scheduler_loop.rs:94`, budgets `:5-7`, phase order `:136-151` |
+| Wave stats / log line | `scheduler/mod.rs:1101` (`flush`), fields `:1115-1138`, vram tuple `run/scheduler_loop.rs:163-167` |
 | Forward dispatch fork | `candle-transformers/src/models/batched_inference.rs:2702` (`max_input_len==1`) |
-| Attention dispatch | `batched_layer.rs:413` (`forward_attn_batched`), decode `:474/:899`, prefill/glue `:609/:711/:736` |
-| Attn↔FFN boundary (type-agnostic) | `batched_layer.rs:390-393` |
-| MoE token-flat | `quantized_qwen3_moe.rs:243` (`forward_dynamic`), flatten `:253`, submit `:529` |
-| One process_request/layer | `expert_lre/handle.rs:459`, `pipeline.rs:887` (`process_request`) |
+| Attention dispatch | `batched_layer/mod.rs:413` (`forward_attn_batched`), decode `:474/:899`, prefill/glue `:609/:711/:736` |
+| Attn↔FFN boundary (type-agnostic) | `batched_layer/mod.rs:390-393` |
+| MoE token-flat | `quantized_qwen3_moe/moe.rs:243` (`forward_dynamic`), flatten `:253`, submit `:529` |
+| One process_request/layer | `expert_lre/handle/forward.rs:459`, `expert_lre/pipeline/mod.rs:887` (`process_request`) |
 | Grouped GEMM (3 launches) | `expert_lre/compute.rs:108` |
-| Expert VRAM budget | `quantized_qwen3_moe.rs:1468-1496`; pinned pool `handle.rs:287-294` |
-| VRAM budget/used semantics | `candle-nn/src/kv_cache/chunked/alloc.rs:141-154`; `batched_inference.rs:1282` |
-| Per-forward token cap (512) | `engine.rs:386`, `prefill.rs:368/379`; model cap 4096 `batched_inference.rs:2590` |
-| Prefill queue (no depth signal) | `scheduler/mod.rs:1220`; backpressure `prefill.rs:46/151` |
-| Glue assembly / bridge window | `scheduler/projection_assembler.rs` (`GapFillPlan`, `fire_gap_fill_batch`), `paged-glue/api.rs:44-54` |
+| Expert VRAM budget | `quantized_qwen3_moe/loader.rs:1468-1496`; pinned pool `expert_lre/handle/mod.rs:287-294` |
+| VRAM budget/used semantics | `candle-nn/src/kv_cache/chunked/alloc/budget.rs:141-154`; `candle-transformers/src/models/batched_inference/kv_arenas.rs:1282` |
+| Per-forward token cap (512) | `engine/mod.rs:386`, `prefill.rs:368/379`; model cap 4096 `batched_inference/prefill_slabs.rs:2590` |
+| Prefill queue (no depth signal) | `scheduler/mod.rs:1220`; backpressure `scheduler/prefill/vram_phase.rs:46/151` |
+| Glue assembly / bridge window | `scheduler/projection_assembler/` (`GapFillPlan`, `fire_gap_fill_batch`), `paged-glue/api.rs:44-54` |
 | Cross-session concat | `batched_model.rs:288` (`forward_batch`) |
-| Dormant Phase-2 config | `config.rs:1273-1292` |
+| Dormant Phase-2 config | `config/engine_config.rs:1273-1292` |
 | Ingest skips projection (unbounded ctx) | `repo_scan/mod.rs:48` (`disable_reprojection`), `scheduler/mod.rs:1699` (`skip_projection`), whole-parent borrow `:1975-2013`/`:2009` |
 | `scopes` top_k / window (inactive in ingest) | `prompts/projection.yaml:244` (`top_k k:8`), layer window `:176` |
-| Dormant rolling-window field | `config.rs:1345` (`context_window_turns`, default 0), `conversation.rs:2232` (`window_state`) |
+| Dormant rolling-window field | `config/sequence_config.rs:1345` (`context_window_turns`, default 0), `conversation/sequence_state.rs:2232` (`window_state`) |
 | Expert affinity / prefetch (for §4.6) | `expert_lre/transition.rs` (`predict_hop`, `observe`) |

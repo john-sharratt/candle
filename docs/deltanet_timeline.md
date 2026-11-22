@@ -8,8 +8,8 @@ is amended.
 
 **Scope:** the Gated DeltaNet recurrent state of every hybrid model —
 `qwen35`/`qwen36`/`qwen38` (`models/qwen35/`) and Qwen3.8-Flash-Next
-(`models/qwen4exp/`). The loaders `quantized_qwen35.rs`, `quantized_qwen36_moe.rs`,
-`quantized_qwen38.rs` and `quantized_qwen38_moe.rs` build these two stacks and hold
+(`models/qwen4exp/`). The loaders `quantized_qwen35_moe.rs`, `quantized_qwen36_moe.rs`,
+`quantized_qwen38.rs` and `quantized_qwen38_moe/mod.rs` build these two stacks and hold
 no state of their own. The attention half is unchanged; the PLE window, the QSA
 index cache and the draft seed keep their rewinds but lose the row layout they
 borrow from the stash (§6.6).
@@ -18,7 +18,7 @@ borrow from the stash (§6.6).
 
 Every DeltaNet layer of every sequence holds its recurrent state twice today: the
 live `S` and conv tail, and a second copy the next wave writes into
-(`delta_net/state_store.rs`). The second copy exists for two reasons — a failed
+(`delta_net/state_store/mod.rs`). The second copy exists for two reasons — a failed
 wave must leave no trace, and a speculative block accepted at `m` of its `k + 1`
 rows must rewind — and the rewind adds a third structure, a per-row operand stash
 (`VerifyStash`, `SlotTenant::RewindStash`) that a replay (`replay_accepted_prefixes`,
@@ -93,7 +93,7 @@ The row quantities of row `t` — `G[t]`, `k[t]`, `v_new[t]` — depend only on 
 - **`G`:** the Hillis–Steele scan adds slot `t − off` into slot `t` at each
   doubling; lanes at or past `len` start at zero and only feed higher lanes; at
   `off = 32` every lane adds `+0` (`short_span:230-247`; the three-kernel scan,
-  `prefill_kernel.cuh:476-482`, does the same).
+  `delta_net_prefill_kernel.cuh:476-482`, does the same).
 - **Conv and norm:** each row's window is a fixed `j`-ascending chain over its own
   inputs, and the l2-norm tree is per row (`short_span:152-159, 206-273`).
 - **`A` and `kq`:** entry `(i, j ≤ i)` is one d-ascending FMA chain over rows `i`
@@ -152,7 +152,7 @@ short-span kernel runs. Every span that kernel takes keeps a timeline and every
 longer span is a long span (§7), so the short-span kernel loses its state-out and
 tail-out entirely. Production verify blocks are at most 5 rows (a draft ceiling of
 4 in every shipped ladder, `draft_ladder.rs:222, 268, 331, 420`; a ceiling of 5
-measured slower, `docs/possible-performance-boost.md`). The other rows serve short
+measured slower, `docs/archived/possible-performance-boost.md`). The other rows serve short
 prompts and leave room for a ceiling up to 7. Draft depth is bounded at `R − 1 = 7`
 everywhere a block can be formed, and a deeper block is refused (§6.2, §12 D1).
 
@@ -163,7 +163,7 @@ One timeline row, at row `t`:
 | `G[t]` | `[h_v]` | short-span: block of V head `h`, tile 0 (every block holds `sg`, `short_span:243-246`); decode: the decode-step kernel | the decays |
 | `k[t]` | `[h_k, d_k]`, normed, unscaled | short-span: block of V head `h = kh < h_k`, tile 0 (every block holds its K head's 128 channels, `:282-284`); decode: the decode-step kernel | the rank-1 terms |
 | `v_new[t]` | `[h_v, d_v]` | short-span: each (V head, d_v tile) block, its own 32 `d_v` rows (`vnew`, `:372`); decode: `err` from the decode-step kernel | the rank-1 terms |
-| `x[t]` | `[conv_dim]`, raw conv input | short-span: spread over the span's blocks, one writer per element (the tail writer's pattern, `:190-201`); decode: the conv-decode kernel, which is the only decode kernel that reads raw `x` (`decode_kernel.cuh:203`) | the conv tail |
+| `x[t]` | `[conv_dim]`, raw conv input | short-span: spread over the span's blocks, one writer per element (the tail writer's pattern, `:190-201`); decode: the conv-decode kernel, which is the only decode kernel that reads raw `x` (`delta_net_decode_kernel.cuh:203`) | the conv tail |
 
 `k` is stored once per K head and `x` once per row — the two dedupes the structure
 allows. `x` is the widest field (10,240 of 18,480 floats per row on Flash-Next); it
@@ -173,7 +173,7 @@ by then (§11.1, item 17).
 
 The slot is one `SlotTenant::RecurrentState` claim per layer, as today; only its
 stride grows. Compaction, fork, export, eviction and reset move or read the slot
-whole. `relocate` (`state_store.rs:977`) copies only `S` and the tail: nothing is
+whole. `relocate` (`state_store/store_steps.rs:977`) copies only `S` and the tail: nothing is
 pending between steps (§6.4), so the timeline region holds nothing to keep.
 
 ## 5. Size
@@ -242,12 +242,12 @@ output rows and its timeline rows.
 - **The short-span kernel** writes `G`, `k`, `v_new` and `x` per row (§4), computes
   the state phase's reads (`inter`, `v_new` → `o`), and stores no state and no tail.
 - **The decode path is two kernels, and both change.** The conv-decode kernel
-  writes `x[0]` into the timeline in place of its tail shift (`decode_kernel.cuh:213-219`).
+  writes `x[0]` into the timeline in place of its tail shift (`delta_net_decode_kernel.cuh:213-219`).
   The decode-step kernel writes `G[0] = g`, `k`, `v_new[0] = err`, and computes its
   in-register update in the fold's exact operations at `m = 1` — `kg = k · __expf(g − g)`,
   `acc = __fmaf_rn(err, kg, 0)`, `S' = __fmaf_rn(S, decay, acc)` — so the state `o` is
   read from is the state the fold stores (§11.1, items 6 and 10). `g` already
-  matches `dn_decay_gate` bit for bit (`decode_kernel.cuh:95`, `common.cuh:45-47`).
+  matches `dn_decay_gate` bit for bit (`delta_net_decode_kernel.cuh:95`, `delta_net_common.cuh:45-47`).
   Every `len == 1` span takes this path, a one-token prefill included
   (`mix.rs:1705-1709`).
 - **Tables.** A decode row's and a short span's rows are `[tail, state, timeline]`;
@@ -408,8 +408,8 @@ and writes a final state, and for that alone the sequence holds a **scratch slot
   end a sequence's prefill without another commit. The store records whether a
   layer's last commit carried a long span; nothing records it today.
 - **Priced** separately: admission charges one figure per sequence today
-  (`reserved_bytes_for`, `state_store.rs:1084`; `recurrent_store_bytes`,
-  `qwen35/batched.rs:588`). A prefilling sequence and a decoding one are priced
+  (`reserved_bytes_for`, `state_store/store_steps.rs:1084`; `recurrent_store_bytes`,
+  `qwen35/batched/recurrent_state.rs:588`). A prefilling sequence and a decoding one are priced
   apart.
 
 Length decides: a span of at most `R` rows takes the timeline, whatever its kind;
@@ -461,10 +461,10 @@ Deleted:
 - `RecurrentStateStore::layer_state_rewind`.
 - `qwen35/spec.rs`: `VerifyStash`, `StashSpan`, `stash_in_slots`,
   `compact_verify_stash`, `replay_accepted_prefixes`, `replay_stacked`.
-- `qwen35/batched.rs`: `begin_verify_stash`, `verify_stash_width`,
+- `qwen35/batched/mod.rs`: `begin_verify_stash`, `verify_stash_width`,
   `take/put/drop_verify_stashes` (`:278-380`); `replay_recurrent`'s replay body
   becomes the fold.
-- `qwen35/forward.rs`: the sweep's stash take, `StashSlot`, `filled`, the put-back
+- `qwen35/forward/layer_sweep.rs`: the sweep's stash take, `StashSlot`, `filled`, the put-back
   (`:1344-1361, 1502-1573, 1645-1656`) and the replay pricing (`:1107-1158`).
 - `qwen4exp`: `verify_stash_for`, `park_verify_stash` (`spec.rs:169-210`), the stash
   capture in the sweep (`wave.rs:3963-3993, 4033`), its pricing (`wave.rs:3151-3191`),
@@ -542,7 +542,7 @@ latent-MoE architecture and has no DeltaNet.)
    fold at `m = 1`: the folded `S` equals the decode kernel's in-register update,
    written out through a test-only state-out in the test build. A decode row and the
    same token at `len = 1` through the short-span kernel are not compared: their
-   conv chains differ (`decode_kernel.cuh:206-209`), by design.
+   conv chains differ (`delta_net_decode_kernel.cuh:206-209`), by design.
 3. **A failed armed step leaves no trace.** A verify forward over several segments
    that fails in the last leaves the armed sequence's `S` and tail bytes as they
    entered; a discard does the same after a successful forward. Run on the fused
@@ -630,7 +630,7 @@ changed, with the section that now carries it:
   (`delta_net_mix`, `absorb_solo`, `quantized_delta_net_layer_forward`) and the
   reference models — already lacks wave atomicity. The design fixes it for every
   store user (§7.1, §12 D3); the oracles that own a plain state keep it.
-- **The store's `seeded` flag** is read only by qwen35 (`qwen35/batched.rs:513`);
+- **The store's `seeded` flag** is read only by qwen35 (`qwen35/batched/recurrent_state.rs:513`);
   qwen4exp keeps its own (`qwen4exp/wave.rs:1667, 1791`). Untouched by this design.
 
 ## 12. Decisions
@@ -663,7 +663,7 @@ rewind is: eager issue measured ~3.6 ms of wall for ~0.8 ms of kernels
 
 Where each part landed, and what building it settled.
 
-**The store** (`delta_net/state_store.rs`). A layer is `{live: Half, scratch:
+**The store** (`delta_net/state_store/mod.rs`). A layer is `{live: Half, scratch:
 Option<Half>, pending: Option<Pending>, advanced}`; a `Half` is a state, its conv
 tail and its timeline, views into one `SlotTenant::RecurrentState` slot laid out
 `S | tail | timeline`, each on a 256-byte boundary. `layer_span_mut(li, len)` hands

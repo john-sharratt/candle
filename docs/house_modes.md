@@ -160,7 +160,7 @@ machine with no guard:
 | no `house/<world>.yaml` | the world has no house: `house_mode` is in nobody's grammar |
 | a device not linked, or not answering | its line says so; the switch goes on |
 
-The cluster sees `zenj` as a service app (`cluster/src/gateway/hub.rs` `SERVICES`): never certified,
+The cluster sees `zenj` as a service app (`cluster/src/gateway/hub/constants.rs` `SERVICES`): never certified,
 rolled out or floored, so a missing `zenj` member blocks no rollout.
 
 ## 6. Limits, as built

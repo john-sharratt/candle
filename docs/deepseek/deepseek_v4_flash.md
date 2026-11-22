@@ -463,8 +463,8 @@ tests at first green.
 
 ## 5. Current engine survey (what we build on)
 
-The batched engine (`quantized_qwen3_moe.rs` as the reference model, `batched_model.rs` /
-`batched_layer.rs` / `batched_inference.rs` / `expert_lre/` as the engine) is what DeepSeek
+The batched engine (`quantized_qwen3_moe/model.rs` as the reference model, `batched_model/mod.rs` /
+`batched_layer/mod.rs` / `batched_inference/mod.rs` / `expert_lre/` as the engine) is what DeepSeek
 plugs into. The load + run seam is three lines (`quantized_qwen3_moe.rs:2340`):
 
 ```rust
@@ -510,9 +510,9 @@ GEMM → silu_mul → scatter`, all on the GPU, with zero routing readback.
 
 ### 5.2 The seam map — what plugs in vs. what is model-owned
 
-Two traits define the model↔engine contract: `BatchedModelCore` (`batched_model.rs:98` — leaf
+Two traits define the model↔engine contract: `BatchedModelCore` (`batched_model/model_core.rs:98` — leaf
 accessors: layers, embed, `final_norm`, `output_proj`) and `BatchedAttentionLayer`
-(`batched_layer.rs:232`). Verified pluggability:
+(`batched_layer/mod.rs:232`). Verified pluggability:
 
 | Concern | Hook today | DeepSeek needs |
 |---|---|---|
@@ -529,7 +529,7 @@ strategy (extract each into a defaulted trait method; existing models keep the d
 DeepSeek overrides). The expert-streaming / scheduler / wave machinery is reused untouched.
 
 **Quant infra status** (post first-pass): MXFP4 codec (CPU+GPU dequant) is **done** (§0). The
-grouped expert GEMM float path `grouped_matmul_gemx` (`cuda.rs:4151`) dequants on the fly via
+grouped expert GEMM float path `grouped_matmul_gemx` (`candle-core/src/quantized/cuda/grouped_matmul.rs:4151`) dequants on the fly via
 `gemx_dequant.cuh` per-format `block_type_traits`; MXFP4 needs (a) a `block_c_mxfp4` traits +
 dequant there for the correctness baseline, then (b) the native FP4 tensor-core path (§6.1).
 `moe_bucketize` is compiled `MAX_EXPERTS 128` (`moe_bucketize.cu:44`) → raise to 256. Paged

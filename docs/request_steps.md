@@ -6,7 +6,7 @@
   headings;
 - `zend/src/journal/steps.rs`: `RequestSteps`;
 - `zend/src/journal/notes.rs`: `own_notes`;
-- the round's seal and `carry_journal` in `zend/src/session.rs`.
+- the round's seal and `carry_journal` in `zend/src/session/journaling.rs`.
 
 This document is authoritative over the steps section of a dialogue's journal
 and over the projection's rule that a request's own turn is never windowed out.
@@ -169,7 +169,7 @@ step has no record of its own. Its words are the note call in its turn:
 ### 2.6 Cost
 
 The steps are part of the system prompt, so they are charged before the fill's
-room (`segment_tokens(&system_prompt_segments, …)` in `project.rs`). At the cap
+room (`segment_tokens(&system_prompt_segments, …)` in `projection/project/pipeline/sink.rs`). At the cap
 that is ~3–6K tokens, which the dialogue's other shares give up while a long
 request runs and get back when it finishes. Per round, a step costs its own
 line's prefill plus the closing section's.
@@ -204,7 +204,7 @@ the model loses what it is doing, whatever the steps say.
   newest tool turn and the newest turn, and emits every step of §2.
 - **The summary tree's path does not hold it.** When a summary tree exists,
   the §8 score-density pick replaces the rule-based selection and is only closed
-  under exchange (`project.rs`, `summary_tree_select`). Nothing in it keeps the
+  under exchange (`projection/project/pipeline/sink.rs`, `summary_tree_select`). Nothing in it keeps the
   newest exchange. The tree is switched off and goes once the journal is proven
   (`docs/zend_journal.md` §12). Until then, the end-to-end test above runs on
   the path production runs, and the tree is not re-enabled without passing it.

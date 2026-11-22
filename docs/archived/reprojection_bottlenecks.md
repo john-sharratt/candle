@@ -72,7 +72,7 @@ pieces, a different set nearly every time.
 
 ### B1. The belief scan, 175 ms per reprojection (52%)
 
-`Substrate::score_beliefs` (`projection/resolver.rs`) scores the target layer's
+`Substrate::score_beliefs` (`projection/resolver/belief_scoring.rs`) scores the target layer's
 collections, plus every belief-driven turn group in every layer, against the
 probe. The pool is now the working set: up to 2M tokens on BlackWorld
 (`PoolSize::for_card`), 167–197 pieces here. A scan that covers the working-set

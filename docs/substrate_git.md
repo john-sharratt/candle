@@ -67,7 +67,7 @@ it removes and what it adds, §11 the build order, §12 the tests, §13 what is 
 
 - **Content-addressed records.** `Blob` (tag 29) is bytes named by their SHA-256, keyed in
   the header by the hash's first 128 bits, checked on every read, a duplicate dead on
-  arrival, never superseded and never resident (`persistence/record.rs`,
+  arrival, never superseded and never resident (`persistence/record/mod.rs`,
   `persistence/blob/`). It is how images replicate.
 - **Leases.** Paxos leases among an app's members, used by `ingest/<content key>` so one
   member reads a unit, and by `calibrate/<marker>` so one member calibrates it
@@ -388,7 +388,7 @@ Built in `npcd/src/mind/files.rs` and `npcd/src/mind_store.rs`.
   (`mind_store::from_log`), and reads the schema and the registries from the branch's
   commit. A log that holds no such branch yet starts the daemon on the bundled schema,
   with the mind pending.
-- After the cluster join, `load_mind` (`engine/runtime.rs`) loads the repository whole
+- After the cluster join, `load_mind` (`engine/runtime/load.rs`) loads the repository whole
   through `substrate_git::member::Repos`, over the mind's database: pulled through an
   agent by the lease holder when no member has. A mind that was pending is taken in, in
   process: the load rebuilds the projection, its policies and the minds over it, and the

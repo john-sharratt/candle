@@ -161,7 +161,7 @@ pub(crate) fn window_sealed_tokens(
 }
 
 /// Pure block-range windowing for a bounded rolling-window ingest (design
-/// `docs/unified_wave_inference_engine.md` §4.7): given the system-prompt end
+/// `docs/archived/unified_wave_inference_engine.md` §4.7): given the system-prompt end
 /// block `sys_end`, the ascending per-turn start blocks `turn_starts` (one per
 /// sealed turn), the current `total` block count, and `window_turns`, return the
 /// parent block ranges the next prefill should attend — the system prompt plus

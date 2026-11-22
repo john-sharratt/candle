@@ -793,7 +793,7 @@ impl SchedulerRequest {
 /// consumed_offset)` per work unit (queued work has `consumed == 0`; an
 /// in-flight prefill/section has `consumed == offset`). This is the signal the
 /// unified-wave engine's large-batch trigger keys on (design
-/// `docs/unified_wave_inference_engine.md` §4.5). Pure over its input so it is
+/// `docs/archived/unified_wave_inference_engine.md` §4.5). Pure over its input so it is
 /// unit-testable without a live scheduler.
 pub(in super::super) fn sum_pending_prefill_tokens(
     items: impl IntoIterator<Item = (usize, usize)>,

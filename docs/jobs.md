@@ -278,7 +278,7 @@ A conversation of Zen's — a task, a chat, a person's dialogue — gets the fiv
 laid onto it — the overlay its last tool round saved, each file's chain sent by
 name and carried only when the agent lacks it, as `run_command`'s is — on a
 machine it names; the answer says how many files it carries,
-`docs/zen_coding_challenge_fixes.md` Cause 5, `docs/replicated_substrate.md`
+`docs/archived/zen_coding_challenge_fixes.md` Cause 5, `docs/replicated_substrate.md`
 §11.4), `service_deploy`, `service_status`, `cluster_status`, `cluster_logs`,
 `cluster_audit`, `member_status`, `timeline_read` (another run's turns, calls,
 projections and prompt, for diagnosing it), `layer_read`, the acting tools of

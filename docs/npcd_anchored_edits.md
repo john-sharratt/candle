@@ -155,20 +155,20 @@ Every unit is a fenced block of its own. The fence names the file, the unit's
 anchor, the lines of the file it holds and its scope — a code unit's path, or
 else its own first line — and each of its lines follows behind its number in
 the unit, from `+1`, exactly as it is, indentation and all
-(`docs/zen_coding_challenge_fixes.md` Cause 4):
+(`docs/archived/zen_coding_challenge_fixes.md` Cause 4):
 
 ````
-```rust file=candle/candle-nn/src/kv_cache/chunked/backing.rs part=Zp0_ lines=3-4 scope="use std::sync::Arc;"
+```rust file=candle/candle-nn/src/kv_cache/chunked/backing/mod.rs part=Zp0_ lines=3-4 scope="use std::sync::Arc;"
  +1 use std::sync::Arc;
  +2 use std::collections::BTreeMap;
 ```
-```rust file=candle/candle-nn/src/kv_cache/chunked/backing.rs part=r7Lm lines=6-9 scope="impl KvCache > fn seal_chunk"
+```rust file=candle/candle-nn/src/kv_cache/chunked/backing/mod.rs part=r7Lm lines=6-9 scope="impl KvCache > fn seal_chunk"
  +1     /// Seal a chunk.
  +2     pub fn seal_chunk(&mut self, gid: ChunkGid) -> Result<()> {
  +3         …
  +4     }
 ```
-end of candle/candle-nn/src/kv_cache/chunked/backing.rs lines 1-198 of 620 — next: lines=199-391
+end of candle/candle-nn/src/kv_cache/chunked/backing/mod.rs lines 1-198 of 620 — next: lines=199-391
 ````
 
 - **No anchor stands on a line of content.** Shown inline on a unit's first
@@ -200,7 +200,7 @@ too**: `from` and `to`, `+N` as the read numbers them beside each line and
 forced to that shape by the grammar, make `replace`, the inserts and `delete`
 cover those lines of the unit; without `from` the edit is to the unit whole as
 below, with `through` in the place of `to`
-(`docs/zen_coding_challenge_fixes.md` Cause 4):
+(`docs/archived/zen_coding_challenge_fixes.md` Cause 4):
 
 ```json
 {"repo": "app", "path": "src/parser.rs", "part": "KehT", "do": "replace", "from": "+30", "text": "        if len >= max {"}

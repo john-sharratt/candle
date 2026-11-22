@@ -133,8 +133,8 @@ and that callback registered on the same Google client. No code: `/auth/*` is se
 
 **Written here, not compiled or run** (the laptop builds nothing of this repository; the BlackWorld session builds, tests and merges):
 
-- The app's name among the services and its build kind (`cluster/src/gateway/hub.rs`, `admission.rs`, `version/info.rs`).
-- The deploy engine's service, repository and package (`zend/src/mcp/tools/service/mod.rs`, `deploy.rs`, `service_control.rs`), with their tests.
+- The app's name among the services and its build kind (`cluster/src/gateway/hub/constants.rs`, `admission.rs`, `version/info.rs`).
+- The deploy engine's service, repository and package (`zend/src/mcp/tools/service/mod.rs`, `deploy.rs`, `zend/src/mcp/tools/service_control.rs`), with their tests.
 - One deploy of a commit (§4.3): `pending.rs` and its tests, its use in `service_deploy`, and the commit an agent records on a run (`agent/src/jobs.rs`, `wire.rs`).
 - The webhook's signature and body (§4.1): `web/src/hooks/github.rs` and its tests. The signature test is GitHub's own published example.
 - The supervisor's entry and the site's route (`keep/keep.yaml`, `web/web.yaml`), and the two headers added to the list the gateway removes (`web/src/proxy.rs`).

@@ -53,7 +53,7 @@ probing the filter (decided 2026-10-28).
   `"{purpose}\n{prompt_sha256_hex}\n{exp_ms}"`, verified in constant time —
   as image links are (`npcd/src/image_links.rs:115-146`), but a type of its
   own with its own key. With no cluster the key is minted per process, as
-  image links' is (`api.rs:189`); an unclustered daemon checks locally anyway.
+  image links' is (`api/mod.rs:189`); an unclustered daemon checks locally anyway.
 - `prompt_sha256` is over the exact `ImageRequest.prompt` handed to the guest.
   The route does no normalisation: a caller trims before it authorizes, as the
   MCP tools already trim (`npcd/src/mcp/args.rs`).
@@ -107,7 +107,7 @@ On the member the call landed on (D):
    same questions of the same prescribed model under a fixed seed and
    stencil, so they reach the same verdict. Whichever answers first stands,
    and the other is dropped. A dropped check frees its turns' sequences
-   (`Sequence`'s drop, `candle-conversation/src/conversation.rs`). On the
+   (`Sequence`'s drop, `candle-conversation/src/conversation/mod.rs`). On the
    peer, that depends on the drop reaching its handler through the gateway.
    WhiteWorld's log shows it does: the two checks BlackWorld gave up on never
    decoded once WhiteWorld's waves cleared, while a later check did.
@@ -156,11 +156,11 @@ footprint, which can push a batch-mate to `no_room` — the same as any draw.
 
 **Cancelling a queued job.** `GuestQueue::cancel(seq) -> bool`
 (`candle-conversation/src/guest/queue.rs`) and `ConversationEngine::cancel_guest`
-beside `submit_guest_watched` (`engine.rs:839`): removes the job while it is
+beside `submit_guest_watched` (`engine/services.rs:839`): removes the job while it is
 still queued — including one requeued to wait for room — answers its receipt
 `GuestError::Cancelled`, and **clears `waiting` and `retry_at_ms` when no job
 with `waiting_since` remains**: `waiting` closes prefill admission
-(`scheduler/prefill.rs:2144`), and a cancel that removed the last waiting job
+(`scheduler/prefill/admitting.rs:2144`), and a cancel that removed the last waiting job
 without clearing it would close admission for good. `GuestError::Cancelled` is
 added to the exhaustive matches (`guest_routes.rs:312-319, 491-498`).
 
@@ -248,15 +248,15 @@ every reader that asks "is this member up" uses it:
 | Reader | Where |
 |---|---|
 | clustered / table / standing-by | `gateway/registry.rs:410-435` |
-| joining beside a serving member (sync) | `gateway/hub.rs:449` |
+| joining beside a serving member (sync) | `gateway/hub/sockets.rs:449` |
 | in-sync judgement | `gateway/relay.rs:162` |
 | catch-up answerer | `gateway/registry.rs:466` |
 | aggregates | `gateway/registry.rs:609` |
 | handover forgetting, `everyone_holds` | `gateway/registry.rs:256, 519-522` |
-| any ready, app view | `gateway/hub.rs:1258-1265, 1361` |
+| any ready, app view | `gateway/hub/members.rs:1258-1265, 1361` |
 | world and character rendezvous | `npcd/src/authority/cast.rs:34` |
 | replication's ready count, governor, absent leases | `replicate/consensus.rs:421, 345-355`; `quorum_governor.rs` |
-| forced-rollout quorum | `gateway/upgrades/plan.rs:108-113`; `hub.rs:985` |
+| forced-rollout quorum | `gateway/upgrades/plan.rs:108-113`; `hub/certification.rs:985` |
 | certification start | `gateway/upgrades/mod.rs:281` |
 | status page, worlds view | `gateway/status.rs:249`, `worlds_view.rs:67`, `cluster/gateway.html:348, 361, 859` |
 

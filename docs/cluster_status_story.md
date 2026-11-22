@@ -67,7 +67,7 @@ later:
   | Line | What it said | What was true |
   |---|---|---|
   | machine (`absent_line`) | loading or stuck | its members were connected. Below the floor they are routed nothing, so `/v1/status` cannot reach them through the gateway |
-  | member state | `upgrading` | nothing was upgrading. The gateway stands a member admitted below the floor as `Upgrading` for its whole session (`cluster/src/gateway/hub.rs`) |
+  | member state | `upgrading` | nothing was upgrading. The gateway stands a member admitted below the floor as `Upgrading` for its whole session (`cluster/src/gateway/hub/sockets.rs`) |
   | member note (`upgrade_line`) | no upgrade under way, left behind | true, with no time and no reason |
   | rollout (`render_gateway`) | members below it upgrading | none was |
 
@@ -80,7 +80,7 @@ The path as built:
 2. The restored process finds that its install failed. The install plan the
    old process wrote names another build (`upgrade/runtime/failed_install.rs`).
    It adds that build to `<data>/upgrade/refused.json` **for good**
-   (`upgrade/runtime/refused.rs`).
+   (`upgrade/runtime/attempts.rs`).
 3. It reconnects. Its HELLO is below the floor, so the gateway admits it
    **upgrading**: no traffic, no events applied or sent, no claim, no lease,
    no vote (`docs/replicated_substrate.md` §3.5, `cluster/src/member/app.rs`).
@@ -200,7 +200,7 @@ gateway, and its machine's other parts follow it:
   member is admitted as a serving member, cleared when it is admitted upgrading,
   closed or drained. That covers resume sweeps, worker revive, journal sync,
   ingest, calibration and scheduled tasks. The 10 s handed-turn sweep
-  (`zend/src/session.rs` `resume_handed_turns`) is gated today only on
+  (`zend/src/session/unfinished_turns.rs` `resume_handed_turns`) is gated today only on
   `leaving`. It relies on the claim to refuse, and the claim is the second
   guard, not the first.
 - **The local listener does not stand in for the cluster.** §5.8 there serves

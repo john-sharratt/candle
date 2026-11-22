@@ -30,8 +30,8 @@ Decode and prefill are **launch-count bound**, not compute- or PCIe-bound:
 - **Correction:** my first instrumentation used device-synced spans, which *serialized* the pipeline and
   made MoE look like the bottleneck (~117 ms). With syncs off, the **real** decode split is
   **`decode_attn` 95.6 ms (59%)**, MoE only 42.6 ms, wave_metadata 15.5 ms. The decode lever is the
-  **attention path**, not MoE. (Instrumentation now supports both: sync helpers in `profile.rs`,
-  per-phase pipeline tables in `batch_test/utils.rs`, and the expert-worker profile drained via
+  **attention path**, not MoE. (Instrumentation now supports both: sync helpers in `profile/mod.rs`,
+  per-phase pipeline tables in `batch_test/utils/mod.rs`, and the expert-worker profile drained via
   `BatchedEngine::snapshot_profiles`.)
 
 **The fusion rule (learned by measuring):** a fusion helps only when the ops it removes are
@@ -49,8 +49,8 @@ The per-token prep loop was **86% of prefill** — and only the attention *kerne
 the *projections*. Every stateless projection (attention `wq_a`/`wq_b`/`wkv` + both streaming compressors'
 `wkv`/`wgate`) is now hoisted out of the token loop into a few batched GEMMs, keeping the exact
 incremental pooling + per-token causal selection. Bit-exact (each matmul output row is independent of
-batching). Files: `compressor.rs` (`project_rows`, `push_projected`, `push_projected_roped`),
-`kernel_attention.rs` (`kernel_attn_prefill_prepare_batched`), `wave.rs`.
+batching). Files: `latent_moe/compressor/incremental.rs` (`project_rows`, `push_projected`, `push_projected_roped`),
+`kernel_attention.rs` (`kernel_attn_prefill_prepare_batched`), `latent_moe/wave/mod.rs`.
 
 ### 2. mHC hyper-connection fusion
 The manifold-constrained hyper-connection (`hc_pre`/`hc_post`, around **every** attention and FFN
@@ -341,10 +341,10 @@ de-risked and how the reverted `indexer_select` should have been caught earlier.
 - **candle-kernels:** `src/simple/hyper_mhc.cu`, `src/simple/hyper_mhc.rs` (new); `src/simple/mod.rs`,
   `build_utils.rs` (register the mHC kernel).
 - **candle-transformers/src/models/latent_moe:** `hyper.rs` (mHC fusion + parity test), `attention.rs`
-  (rms_norm fusion), `compressor.rs` + `kernel_attention.rs` + `wave.rs` (prefill projection batching +
+  (rms_norm fusion), `compressor/incremental.rs` + `kernel_attention.rs` + `wave/mod.rs` (prefill projection batching +
   fine-grained instrumentation + `snapshot_profiles`/`expert_stats` overrides), `engine.rs` (MoE
   instrumentation + `experts()` accessor).
-- **candle-transformers/src/models:** `profile.rs` (sync-bracketed span helpers, currently un-synced for
-  real-throughput measurement), `batch_test/utils.rs` (per-phase prefill/decode profile tables).
-- (Also present in the tree: the earlier turn-seal persistence work in `gallery.rs`/`indexer.rs`/
-  `kernel_attention.rs`/`mod.rs`/`wave.rs`.)
+- **candle-transformers/src/models:** `profile/mod.rs` (sync-bracketed span helpers, currently un-synced for
+  real-throughput measurement), `batch_test/utils/mod.rs` (per-phase prefill/decode profile tables).
+- (Also present in the tree: the earlier turn-seal persistence work in `gallery/snapshot.rs`/`indexer.rs`/
+  `kernel_attention.rs`/`mod.rs`/`wave/mod.rs`.)

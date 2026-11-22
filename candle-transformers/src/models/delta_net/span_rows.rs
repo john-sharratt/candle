@@ -1,6 +1,6 @@
 //! A span's rows as the fused prefill scan reads them, per DeltaNet layer: the
 //! convolved `[Q|K|V]` row and the raw gate projections
-//! (`docs/recurrent_reply_calibration.md` §3).
+//! (`docs/archived/recurrent_reply_calibration.md` §3).
 //!
 //! The scan derives every per-token quantity of the delta rule from these and
 //! the layer's own weights, and none of them depends on the state it runs

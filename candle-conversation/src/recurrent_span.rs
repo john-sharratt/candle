@@ -1,5 +1,5 @@
 //! Spans of a turn's user half whose recurrent state is captured or replayed
-//! (`docs/recurrent_reply_calibration.md` §6.3, §7.2).
+//! (`docs/archived/recurrent_reply_calibration.md` §6.3, §7.2).
 //!
 //! A caller names a span by its bytes in the half's text ([`TextSpan`]); the
 //! conversation turns that into token positions of the turn's prefill

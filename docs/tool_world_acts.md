@@ -305,7 +305,7 @@ value**, which is the dependent binding of §4 in its strongest form:
 `target`, `x`, `y` or `depth` is needed by every action, so none can be listed
 required outright; left optional, the grammar offers the close straight after
 `relocate`, and a body took it — the tower answered "A fold needs somewhere to
-fold to." The `REQUIRES` table in `engine/tools.rs` names, per choosing
+fold to." The `REQUIRES` table in `engine/tools/choices.rs` names, per choosing
 parameter, the fields each value requires, and `stencil_params` hands them to the
 stencil as `Param.requires`: after `relocate` the call must write `x` and `y`
 before it may close, after `drill down` a `depth`. A value with no entry may
@@ -317,7 +317,7 @@ is free text, and its opening quote is the model's to write — a live tower wro
 `"depth": ""`, which closes the field with nothing in it. An integer is written
 digit by digit under the mask, so it cannot be empty or anything but a number;
 `x` and `y` may take a leading `-`, and `depth` may not (the `MINIMUM` table in
-`engine/tools.rs` bounds it at zero, so `-` is never offered). The act reads them
+`engine/tools/choices.rs` bounds it at zero, so `-` is never offered). The act reads them
 as JSON numbers; a string, a zero depth or a number past the map is refused
 (`A drill needs a depth to drill to, a whole number of metres.`, `That is off the
 map.`), for the caller that does not go through the grammar.

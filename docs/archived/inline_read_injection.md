@@ -81,7 +81,7 @@ values, and judged the page truncated.
 
 ## 4. Why it does not pay
 
-This is the split `docs/recurrent_reply_calibration.md` §1 measured and the
+This is the split `docs/archived/recurrent_reply_calibration.md` §1 measured and the
 literature names: attention K/V carries literal recall, the recurrent state
 carries how the model responds — its judgment of what it has
 ([What Attention Recalls and Recurrence Controls in Hybrid Language Models](https://arxiv.org/html/2609.04434)).
@@ -107,7 +107,7 @@ Exact composition stores state instead (`S = T·S_prefix + S_seg`,
 [HYPIC](https://arxiv.org/html/2607.01299),
 [LinearKV](https://arxiv.org/html/2608.11231)) — about two state-sized tensors
 per DeltaNet layer per segment, ~115 MB per page here, the cost
-`docs/recurrent_reply_calibration.md` was withdrawn for.
+`docs/archived/recurrent_reply_calibration.md` was withdrawn for.
 
 ## 5. What replaced it
 

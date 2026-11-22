@@ -81,12 +81,12 @@ cells in Candidate mode and 14.4K cells in Forced mode, against a dense read of
 |---|---|
 | `Strata` (and `Strata::from_tokens`), the oracle `selection_entries`, bounds `max_entries_for` / `max_gathered_for` | `candle-transformers/src/models/qwen4exp/qsa_select.rs` |
 | The kernel (single pass, plus the split segment/merge pair) | `candle-kernels/src/simple/qsa_topk.cu` |
-| `SelectionTable`, `selection_stride`, `IndexCache::{set_prompt_end, prompt_blocks}` | `candle-transformers/src/models/qwen4exp/indexer.rs` |
-| `Qwen4ExpBatched::{set_selection_strata, set_selection_prompt}` | `candle-transformers/src/models/qwen4exp/wave.rs` |
-| `ManagedBatchedModel::{set_selection_prompt, set_selection_strata}` (no-ops for every other model) | `candle-transformers/src/models/batched_inference.rs` |
-| `ModelBuilder::qsa_strata` | `candle-conversation/src/models/builder.rs` |
-| The prompt span is declared after each projection walk, from the leading run of sections and glue (`prompt_end_of`) | `candle-conversation/src/scheduler/projection_assembler.rs` |
-| `--qsa-window`, `--qsa-recent`, `--qsa-recent-mode` (default `StrataTokens::DEFAULT`) | `zend/src/main.rs` |
+| `SelectionTable`, `selection_stride`, `IndexCache::{set_prompt_end, prompt_blocks}` | `candle-transformers/src/models/qwen4exp/indexer/select.rs`, `candle-transformers/src/models/qwen4exp/indexer/cache.rs` |
+| `Qwen4ExpBatched::{set_selection_strata, set_selection_prompt}` | `candle-transformers/src/models/qwen4exp/wave/qsa_wave.rs` |
+| `ManagedBatchedModel::{set_selection_prompt, set_selection_strata}` (no-ops for every other model) | `candle-transformers/src/models/batched_inference/managed_model.rs` |
+| `ModelBuilder::qsa_strata` | `candle-conversation/src/models/builder/mod.rs` |
+| The prompt span is declared after each projection walk, from the leading run of sections and glue (`prompt_end_of`) | `candle-conversation/src/scheduler/projection_assembler/slot_state.rs` |
+| `--qsa-window`, `--qsa-recent`, `--qsa-recent-mode` (default `StrataTokens::DEFAULT`) | `zend/src/cli.rs` |
 | `StrataTokens`, `Recent`, `StrataTokens::{DEFAULT, WHOLE}` | `candle-transformers/src/models/selection_strata.rs` |
 
 The strata is stated in positions (`StrataTokens`) and turned into blocks at
@@ -141,7 +141,7 @@ tail sit above every pool, so they are appended in order unsorted.
 ## Measured
 
 RTX PRO 5000 Blackwell, ratio 4, budget 2048, a 2,000-block prompt. Each figure
-is ms per launch (`tests/qsa_topk_bench.rs`), followed by its HEAD value where
+is ms per launch (`candle-transformers/tests/qsa_topk_bench.rs`), followed by its HEAD value where
 one exists.
 
 | rows | blocks (tokens) | HEAD whole | whole | 128K windows, candidate | 128K windows, forced |

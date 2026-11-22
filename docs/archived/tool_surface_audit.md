@@ -4,7 +4,7 @@
 implements it, against the vault that offers it, and against the 480 tasks that
 are supposed to spend it.*
 
-The premise of [`asynchronous_mind_hierarchy.md`](asynchronous_mind_hierarchy.md)
+The premise of [`asynchronous_mind_hierarchy.md`](../asynchronous_mind_hierarchy.md)
 is that **tools are fixed at the boundary with reality** and everything above
 invents against them. That only holds if the boundary is real. This document is
 the check on the boundary: every tool that exists, every tool the world
@@ -18,7 +18,7 @@ There are two catalogues, and only one of them is a catalogue.
 
 | | Where | Count | Implemented | Reaches the model |
 |---|---|---|---|---|
-| The body catalogue | `npcd/src/engine/tools.rs` — `CATALOG` | 9 | 9 | as a compiled grammar |
+| The body catalogue | `npcd/src/engine/tools/mod.rs` — `CATALOG` | 9 | 9 | as a compiled grammar |
 | The world's part tools | 34 part files, `tools:` | 79 | **0** | **not at all** |
 
 The second row is the finding. `reach::in_world` computes what a body can do
@@ -486,6 +486,6 @@ tests name the old form.
   Nothing in the grammar offers them and nothing refuses them. The sentence
   should say that they are authored and unreachable, which is a stronger form of
   invariant 8 rather than a weaker one.
-- [`vault_world.md`](vault_world.md) — every station description asserting that
+- [`vault_world.md`](../vault_world.md) — every station description asserting that
   sitting claims a thing and locks it describes the design, not the engine. The
   claim is real once §5 is built; until then the descriptions run ahead of it.

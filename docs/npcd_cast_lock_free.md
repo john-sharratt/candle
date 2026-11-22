@@ -1,6 +1,6 @@
 # The cast without a lock
 
-npcd's cast — every character it knows (`npcd/src/npcs.rs`) — is read by the
+npcd's cast — every character it knows (`npcd/src/npcs/mod.rs`) — is read by the
 console, the turn loop, the pulse, the effector and the load walk, and written
 by the console's edits, the effector's agency acts, a character naming its
 mood, and the replication refresh. It was one `tokio::sync::RwLock<Npcs>`
@@ -17,9 +17,9 @@ for however long the owner was busy with the engine's own appends ahead of it.
 | Writer | Where | How often |
 |---|---|---|
 | an agency act (`plan_*`, `orders_*`) | `effector/plan.rs` | every act a character takes in a turn |
-| a mood | `tenant.rs` (`remember_mood`) | whenever a character names a new register |
-| the replication refresh | `tenant.rs`, `authority/cast.rs` | every pass that takes in another member's writes — and it walked every character's record location inside the same owner call |
-| a console edit | `api.rs`, `portrait.rs` | a person pressing save |
+| a mood | `tenant/mod.rs` (`remember_mood`) | whenever a character names a new register |
+| the replication refresh | `tenant/mod.rs`, `authority/cast.rs` | every pass that takes in another member's writes — and it walked every character's record location inside the same owner call |
+| a console edit | `api/mod.rs`, `portrait.rs` | a person pressing save |
 
 `tokio::sync::RwLock` is fair: a writer waiting holds back every reader that
 arrives after it. So each of those writes stalled every read behind it — the
@@ -84,7 +84,7 @@ cast it publishes.
 
 A write's computation runs on the persistence owner's thread. It must be pure
 over the `Cast` it is handed: no call back into the owner (that would wait on
-itself), no await, no I/O. Every write in `npcs.rs` is validation and a record
+itself), no await, no I/O. Every write in `npcs/mod.rs` is validation and a record
 built from the snapshot.
 
 ## 3. What remains

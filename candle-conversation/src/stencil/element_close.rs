@@ -14,7 +14,7 @@
 //!
 //! A value has no escaping, so the text `</parameter>` alone cannot end it: a
 //! file about the call format holds that text, and so do its tests. Cut there,
-//! every write of such a file failed (`docs/zen_coding_session_fixes.md`,
+//! every write of such a file failed (`docs/archived/zen_coding_session_fixes.md`,
 //! Cause 1a). **A value ends at a `</parameter>` that structure follows** — a
 //! separator from [`SEPARATORS`], then the next element's tag, `<parameter=` or
 //! `</function>`. Any other `</parameter>` is content.

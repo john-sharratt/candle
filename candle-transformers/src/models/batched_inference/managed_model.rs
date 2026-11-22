@@ -790,7 +790,7 @@ pub trait ManagedBatchedModel {
     /// Arm `seq`'s span of `len` tokens at absolute position `at` for a capture
     /// of its recurrent scan inputs, or for a replay that takes the span's
     /// advanced recurrent state from a record's rows
-    /// (`docs/recurrent_reply_calibration.md`). The wave that runs exactly that
+    /// (`docs/archived/recurrent_reply_calibration.md`). The wave that runs exactly that
     /// span honours it.
     ///
     /// `false` for a model with no recurrent layers, where a span has no such

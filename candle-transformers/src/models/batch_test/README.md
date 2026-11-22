@@ -57,5 +57,5 @@ The captured `perf-investigation/baseline_run*.txt` and
 ## Related docs
 
 `docs/archived/markov_expert_prediction_eval.md` (the routing-trace fixture's
-consumer), `docs/perplexity_results.md` (a different, standalone quality
+consumer), `docs/archived/perplexity_results.md` (a different, standalone quality
 harness — not this module).

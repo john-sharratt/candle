@@ -57,7 +57,7 @@ The mirror records a write by the same two rules replay reads events with — ab
 
 The mirror starts **unread**, and an unread mirror writes nothing: until the conversation's events have been read back, anything written would sit beside events the mirror never knew of, and a later replay would read both. A write that fails part way leaves in the log whatever landed, so the mirror is read back from the log rather than guessed; if that fails too, it is left unread and nothing more is saved for the conversation until it is built again.
 
-Event bodies (`conv_overlay/event.rs`):
+Event bodies (`store-events/src/event.rs`):
 
 | `kind` | Key | Carries |
 |---|---|---|

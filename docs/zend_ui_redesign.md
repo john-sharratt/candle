@@ -86,7 +86,7 @@ stream** — they are a rendering concern, not separate events.
 `max_tokens`, `conv_id`, `messages` — **no** `think`/`effort`/`verbosity`.
 
 The daemon already runs `candle_conversation::projection` internally
-(`zend/src/session.rs` uses `projection::{Builder, …}`, schema in
+(`zend/src/session/mod.rs` uses `projection::{Builder, …}`, schema in
 `zend/src/prompts/projection.yaml`). Projections are real; they are simply not
 surfaced over the wire yet.
 
@@ -197,7 +197,7 @@ subscribeLogs(onLine) -> unsubscribe()              // live stream
 `handlers (chat) = { onStatus(text), onToken(delta), onProjection(span), onPart?(event), onPrefill?({done, total}), onLog?(), onError?(message), onDone() }`.
 
 **The GUI reads a reply as its parts, never as markup**
-(`zend/src/parts.rs`, `docs/zen_coding_session_fixes.md` Cause 1b). The daemon
+(`zend/src/parts.rs`, `docs/archived/zen_coding_session_fixes.md` Cause 1b). The daemon
 splits each reply on the server with the rule the grammar closes values on
 (`candle_conversation::stencil::element_close`): `onToken` carries only the
 reply's prose, and `onPart` (the SSE `part` event, on a request that names its
@@ -910,7 +910,7 @@ These were settled during planning and are now binding for the sections above:
 ## 11. Integration gaps & risks (design-vs-backend review)
 
 Found by reading the design bundle against the live backend (`zend/src/api/`,
-`session.rs`, `types.rs`) and today's shipped `zend/web/index.html`. Root cause
+`session/mod.rs`, `types.rs`) and today's shipped `zend/web/index.html`. Root cause
 of the big cluster (2–6): **the design prototype treats conversation state as
 fully-loaded local data, but the daemon serves it lazily and by reference.**
 

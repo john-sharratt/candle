@@ -119,7 +119,7 @@ impl EngineConfig {
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
     /// Small-prefill threshold. Reserved for the unified-wave small/large batch
-    /// flip (design `docs/unified_wave_inference_engine.md`); not yet read.
+    /// flip (design `docs/archived/unified_wave_inference_engine.md`); not yet read.
     pub small_prefill_threshold: usize,
 
     /// **Per-forward prefill token target** (`max_prefill_pass_tokens`): the

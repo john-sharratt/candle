@@ -31,7 +31,7 @@
 ### 0.1 What revision 1 met on hardware
 
 Measured on the RTX 3090 box (WDDM, driver 560.94), with unit tests in
-`candle-core/src/quantized/cuda_tests.rs` (`cuda_waiting_gate_*`) and traced
+`candle-core/src/quantized/cuda_tests/mod.rs` (`cuda_waiting_gate_*`) and traced
 runs of the qwen36-35B gate:
 
 1. **Any implicitly synchronizing driver call made while a gate block spins
@@ -106,7 +106,7 @@ next layer …
   no bytes itself: the GEMM workers fill the slots it offers, for misses and
   for read-ahead alike, and no GPU wait depends on anything it does.
 - **Bit-identical results.** A warm slot and a pad slot hold the pack record,
-  which is the VRAM slot image (`slot_offsets`, `pipeline.rs:666`): the kernel
+  which is the VRAM slot image (`slot_offsets`, `slot_image.rs:666`): the kernel
   reads the same bytes whichever address the entry names, and the scatter's
   canonical order (§4.3) is unchanged.
 
@@ -115,7 +115,7 @@ next layer …
 | Store | What | Allocation | Size | Mutable |
 |---|---|---|---|---|
 | Weight zone | VRAM cache slots | the span's right side (unchanged) | elastic (§9) | yes — pipeline thread |
-| Warm tier | slot images, pinned + pageable parts | `cuMemAllocHost` once at startup (`pinned.rs:464`), pageable `PagedSlots` beyond it | sized by `warm_sizing_from` (`handle.rs:224`) | **no** — filled once (`pinned.rs:1-15`) |
+| Warm tier | slot images, pinned + pageable parts | `cuMemAllocHost` once at startup (`pinned.rs:464`), pageable `PagedSlots` beyond it | sized by `warm_sizing_from` (`handle/sizing.rs:224`) | **no** — filled once (`pinned.rs:1-15`) |
 | **Pad** (new) | slot images staged from the pack | one `cuMemAllocHost` block at startup | §0.8 | yes — stager |
 | Live table | `[rows × E]` × 3 u64 | `cuMemHostAlloc(DEVICEMAP)` | 240 KiB (35B) | host stores |
 | Summary ring | `[RING × (E + 1)]` u32 | `cuMemHostAlloc(DEVICEMAP)` | 66 KiB | `bucketize` |
@@ -140,7 +140,7 @@ per 13.5 MiB slot, `warm_tier.rs:21-23`) instead of a pack read.
 
 **Initial state**, written at load before the first forward: VRAM-resident →
 VRAM address; pinned warm slot → its address; everything else → 0. Pinned
-layers (`PINNED_LAYERS`, `cache.rs:73`) are always VRAM.
+layers (`PINNED_LAYERS`, `cache/policy.rs:73`) are always VRAM.
 
 **Every write is a host store** to the mapped table (`[3][rows][E]`: gate, up,
 down planes). A publish writes up, down, full fence, gate; a clear writes gate,
@@ -240,7 +240,7 @@ Neither thread ever waits for a reclaim on a path a GPU wait depends on.
 
 One dedicated thread owns the pad and is the **only reader of the pack**. It
 replaces `ColdStaging` and every pack read on the pipeline thread
-(`load_expert`, `load_experts_batched`, `pipeline.rs:1627, 1734`) and the
+(`load_expert`, `load_experts_batched`, `pipeline/mod.rs:1627, 1734`) and the
 streamer's own pack reads (`streamer.rs:195-256`).
 
 **It never calls CUDA on the demand path.** Its work is: poll mapped summary
@@ -308,9 +308,9 @@ Changed:
   stager as a staging request (pack → pad, ahead of the router).
 - **Eviction** from VRAM retargets the entry to the expert's pinned or pad copy
   (or 0) and frees the slot by Rule R. Demand eviction (`demand_eviction`,
-  `cache.rs:839`, Rule D) is deleted: demand never takes a slot.
+  `cache/mod.rs:839`, Rule D) is deleted: demand never takes a slot.
 - **No host wait on the GPU anywhere**: `ColdStaging::acquire`'s
-  `event.synchronize()` (`pipeline.rs:1118`) goes with `ColdStaging`; the
+  `event.synchronize()` (`pipeline/mod.rs:1118`) goes with `ColdStaging`; the
   summary wait is the mapped-word poll.
 - **Whole-layer streaming** (`streamer.rs`) is deleted, thread and staging ring.
   What replaced it — the pipeline thread promoting the next row's scored experts
@@ -642,7 +642,7 @@ ranking (`ExpertCacheInner::rank_victims`) supersedes revision 1's Rule S
   neither judges claims nor marks a visit: it would count nearly every victim
   routed again and mark nearly every resident just hit.
 
-Tests: `cache.rs` (fade values, the walk backwards from L−1, the front
+Tests: `cache/mod.rs` (fade values, the walk backwards from L−1, the front
 wrapping with the wave, frequency within the fade, recency passes, cost-ordered
 passes), `regret.rs` (judging by ticket, class rates, pricing, tags).
 Measured (`regret`'s counters in the gate's decode table): regret at ×8 55 →
@@ -681,7 +681,7 @@ is then always stageable without reusing a slot of the same row, so the demand
 path never needs a "consumed" handshake from the GPU. Above that, the pad is
 cache: every additional slot keeps a cold expert pinned-readable for its next
 use. It comes out of the same pinned budget as the warm tier
-(`warm_sizing_from`, `handle.rs:224`) — the warm tier is sized after the pad.
+(`warm_sizing_from`, `handle/sizing.rs:224`) — the warm tier is sized after the pad.
 
 | Machine / model | One layer | Notes |
 |---|---|---|
@@ -691,7 +691,7 @@ use. It comes out of the same pinned budget as the warm tier
 
 **Eviction (LRE).** The stager keeps the pad's own score table: it reads every
 row's summary anyway, so it credits each pad-resident expert the summary routes
-to (decode rows +1.0, prefill rows +0.1 — `cache.rs`'s weights) and decays the
+to (decode rows +1.0, prefill rows +0.1 — `cache/mod.rs`'s weights) and decays the
 table by 0.85 at each pass boundary (`decay_scores`). The pipeline's VRAM score
 table stays private to the pipeline thread, unlocked. Victims: on the demand path, any slot outside the current row's routed set
 (Rule R′); for speculative staging, only a slot whose expert is also in VRAM —
@@ -802,7 +802,7 @@ Everything below is in `bucketize` and in the grouped entry
 The live launch's grid is `(row_tiles, worker_rows + launch_tiles)` — `row_tiles =
 ⌈N / 32·RN⌉`, the launch mode's row tiles — with
 `worker_rows = ⌈W / row_tiles⌉` — `row_fast = 1`, the order the live gate already
-uses (`cuda.rs` `grouped_qmatmul_dev_q8a128`); grid rows `y < worker_rows` are the
+uses (`cuda/grouped_matmul.rs` `grouped_qmatmul_dev_q8a128`); grid rows `y < worker_rows` are the
 **workers**, numbered row by row, and the rest are today's tile blocks with
 `tile = y − worker_rows`. Blocks dispatch in linear order, so the workers lead the
 grid — the order §0.10.1 showed overlaps and the reverse serialises.
@@ -883,7 +883,7 @@ is tuned on.
 
 #### 0.10.1 Measured (RTX 3090, PCIe 3.0 ×16, 2026-10-04)
 
-`bench_grouped_gemm_weights_from_pinned_host` (`candle-core/src/quantized/cuda_tests.rs`):
+`bench_grouped_gemm_weights_from_pinned_host` (`candle-core/src/quantized/cuda_tests/tests_bench_moe_sim.rs`):
 the **unmodified** grouped GEMM, qwen36-35B gate shape (512 × 2048, Q6_KO,
 819,200 B per expert), with table entries holding the host addresses of
 `cuMemAllocHost` copies.
@@ -1139,7 +1139,7 @@ abort word raised by a copy; `moe_wait_for_weights`; gate slicing
 (`allocate_slot`, `demand_eviction`, `evict_for_prefetch_batch`), replaced by
 the non-evicting `rank_victims` the reclaim rule filters; and
 `ExpertPack::read_many_unverified`. The pipeline is split by concern into
-`slot_image.rs`, `startup.rs`, `boundary.rs` and `pipeline.rs`, beside the new
+`slot_image.rs`, `startup.rs`, `boundary.rs` and `pipeline/mod.rs`, beside the new
 `reclaim.rs`, `residency.rs`, `pad.rs` and `stager.rs`.
 
 Read-ahead (§0.7.3) deleted the copy-engine prefetch that preceded it: the
@@ -1155,7 +1155,7 @@ As §18's audit, plus: `docs/expert_cache_design.md` (warm tier no longer the
 only pinned tier; demand misses no longer load), AGENTS.md hot-path invariant 3
 (the MoE routing readback is gone — propose the edit, do not commit it),
 `docs/performance.md` (new rows from acceptance), and the module docs of
-`expert_lre` (`pipeline.rs`, `dispatch.rs`, `streamer.rs` — deleted —
+`expert_lre` (`pipeline/mod.rs`, `dispatch/mod.rs`, `streamer.rs` — deleted —
 `live_table.rs`).
 
 ### 0.19 Decided in this revision (formerly open)
@@ -1203,10 +1203,10 @@ only pinned tier; demand misses no longer load), AGENTS.md hot-path invariant 3
 
 On every machine whose expert cache streams — the 16 GB and 24 GB cards for
 every MoE model, and DeepSeek-V4 everywhere — each MoE layer of each forward
-does this today (`quantized_qwen3_moe.rs:629-856`, `expert_lre/handle.rs:1266-1316`):
+does this today (`quantized_qwen3_moe/mod.rs:629-856`, `expert_lre/handle/mod.rs:1266-1316`):
 
 1. the forward thread enqueues attention, the shared expert, the router and
-   `moe_route`, then **`e2.synchronize()`** (`quantized_qwen3_moe.rs:751`) —
+   `moe_route`, then **`e2.synchronize()`** (`quantized_qwen3_moe/mod.rs:751`) —
    which, because the routing stream waits on the compute stream, drains the
    whole null stream;
 2. it sorts assignments on the host, sends a `Work` request to the pipeline
@@ -1222,9 +1222,9 @@ a synchronous `indices.to_vec2()` (`latent_moe/engine.rs:556`). Where every
 expert is resident the device path already exists and removing this round trip
 took decode from 26–28 ms to 18–19 ms per step
 (`docs/archived/gpu_native_moe_dispatch.md:3-11`); that path is refused the
-moment one expert is not resident (`handle.rs:713`, `:1036-1044`) and, for the
+moment one expert is not resident (`handle/mod.rs:713`, `:1036-1044`) and, for the
 rest of the process, the first time the weight zone concedes ground
-(`handle.rs:1665-1683`).
+(`handle/mod.rs:1665-1683`).
 
 ## 2. The shape
 
@@ -1248,10 +1248,10 @@ next layer …                                      next message …
 
 - **The forward thread never blocks on the MoE.** Every launch has a
   data-independent bound (as the device path already does,
-  `quantized_qwen3_moe.rs:359-363`), so it enqueues the whole layer and moves on.
+  `quantized_qwen3_moe/mod.rs:359-363`), so it enqueues the whole layer and moves on.
 - **The GPU waits only on a real miss**, and only the tiles of that miss: hit
   tiles compute while the copy is in flight — the overlap the determinism fix
-  gave up (`pipeline.rs:2556-2572`) comes back without touching determinism,
+  gave up (`pipeline/mod.rs:2556-2572`) comes back without touching determinism,
   because each tile writes its own rows and the scatter sums them in canonical
   expert order regardless of which tile ran first (§4.3).
 - **The host is told, not asked.** The routing summary goes to the pipeline
@@ -1289,18 +1289,18 @@ dtypes. What changes:
   stream (`docs/decode_graphs.md` §2.2), not by a condition on which stream it is.
 - **The `hidden % 1024` condition is removed** (`gpu_dispatch.rs:241`). It cites
   "the q8a1024 byte-row gather", which is now tile-granular and serves any
-  multiple of 128 (`candle-core/src/quantized/cuda.rs:7278-7281`); it is what
+  multiple of 128 (`candle-core/src/quantized/cuda/mod.rs:7278-7281`); it is what
   refuses Flash-Next (hidden 2560) today.
 - **Deleted with it:** `built_capacity`, `built_floor`, `built_concede_epoch`,
   `zone_moved` and the permanent refusal (`gpu_dispatch.rs:60-85, 567-586`;
-  `handle.rs:1632-1697`). Their job — never dispatch through an address the zone
+  `handle/mod.rs:1632-1697`). Their job — never dispatch through an address the zone
   no longer owns — is now done by clearing entries (§6), which is exact where the
   epoch was conservative.
 
 ### 3.2 Pointer constants — fills need no staging
 
 A fill writes three u64 that are a pure function of `(slot, row geometry)`:
-`slot_base(slot) + slot_offsets(geom)` (`pipeline.rs:749-762, 850-888`). They
+`slot_base(slot) + slot_offsets(geom)` (`pipeline/mod.rs:749-762, 850-888`). They
 are precomputed once into a **pinned, immutable** array
 `PointerConstants[geom_class][slot] = {gate, up, down}` for every slot up to
 `zone.limit()`, plus one pinned zero word. Every table write is then a
@@ -1379,9 +1379,9 @@ __syncthreads(); weights = s_w;
 - **New arguments**: `const MoeWait* wait` (`{abort}` in device memory; null for
   the up and down launches, which never wait) and `int tile_offset` (§4.4).
   Plumbed through `INSTANTIATE_KERNEL_GROUPED_INT8` and its m4/m8 forms
-  (`kernel_instantiate.cuh:467-521`), `run_grouped_quantized_matmul`
+  (`candle-kernels/src/quantized/impl/kernel_instantiate.cuh:467-521`), `run_grouped_quantized_matmul`
   (`dispatcher.cu:1576-1657`), the FFI (`quantized/api.rs:282`) and the wrapper
-  (`cuda.rs:6686-6781`). The FP grouped instantiation (`:352-364`) gains the same
+  (`cuda/mod.rs:6686-6781`). The FP grouped instantiation (`:352-364`) gains the same
   parameters so the ABI stays uniform; the host-table int8 path
   (`grouped_matmul_gemx_q8a128`, still used by `latent_moe/attention.rs:482`)
   passes null/0.
@@ -1406,17 +1406,17 @@ exactly one writer with a fixed K order. `silu_mul_q8a128` and
 `fused_deterministic_scatter` index rows and `perm`, never tiles
 (`moe_scatter.cu:182-246`). So reordering tiles is invisible in the output bits.
 The only things that assumed ascending tile order are a test reference
-(`cuda_tests.rs:9417-9431`, compared exactly at `:9507-9509, 9547-9561`) and a
-doc comment (`cuda.rs:6683-6684`); both change with the kernel.
+(`cuda_tests/mod.rs:9417-9431`, compared exactly at `:9507-9509, 9547-9561`) and a
+doc comment (`cuda/mod.rs:6683-6684`); both change with the kernel.
 
 ### 4.4 Gate launch shape
 
 - **`row_fast = 1` for the gate launch.** The tile index then rides
   `blockIdx.y`, so all row tiles of the resident tiles are dispatched before
   any miss tile (`dispatcher.cu:1633`, `kernel.cuh:2485`). `row_fast` does not
-  affect numerics. Up and down keep `grouped_grid_row_fast` (`cuda.rs:95-97`).
+  affect numerics. Up and down keep `grouped_grid_row_fast` (`cuda/mod.rs:95-97`).
 - **Sliced against the watchdog.** A spinning launch is a long launch, and the
-  Windows 2 s TDR resets the device under one (`cuda.rs:2571-2582` banded a
+  Windows 2 s TDR resets the device under one (`cuda/mod.rs:2571-2582` banded a
   dequant for exactly this). The gate GEMM is issued as
   `⌈launch_tiles / gate_slice_tiles⌉` launches over `tile_offset` ranges.
   `gate_slice_tiles` is fixed at load from the slot size:
@@ -1457,7 +1457,7 @@ After bucketize:
 
 **This is not the experiment that was reverted.** DeepSeek once moved its
 routing readback onto a side stream into a pinned buffer and lost 8% on the cfg8
-gate (`docs/deepseek/deepseek_decode_launch_overhead.md:161-163`,
+gate (`docs/archived/deepseek/deepseek_decode_launch_overhead.md:161-163`,
 `latent_moe/engine.rs:541-545`). That change kept the forward thread *waiting*
 for the copy, so it paid the extra event and stream calls and removed nothing:
 the wait still drained the stream. Here the forward thread never waits for the
@@ -1479,7 +1479,7 @@ neither ring slot is overwritten before it is consumed, with no other bookkeepin
 A full channel blocks the forward thread, never the GPU, and the pipeline thread
 can always drain it (it waits on nothing the forward thread holds, §7).
 
-The single `PinnedRoutingBuffer` (`handle.rs:489-534`), whose correctness relied
+The single `PinnedRoutingBuffer` (`handle/mod.rs:489-534`), whose correctness relied
 on the forward thread blocking, is replaced by this ring.
 
 ### 5.3 What the summary carries
@@ -1488,7 +1488,7 @@ Count and decode bit per expert. That is the whole of what the host consumed
 from the readback: the routed set (classify, `transition_matrix.observe`,
 speculative validation), the per-expert decode attribution
 (`record_hit` vs `record_prefill_hit` / `record_prefill_elevate`,
-`pipeline.rs:2458-2467, 1541-1549, 1683-1685`), and hit/miss counts. It does not
+`pipeline/mod.rs:2458-2467, 1541-1549, 1683-1685`), and hit/miss counts. It does not
 carry the table bit: the host decides misses from its own bookkeeping, which §6.2
 shows is always at least as current as anything bucketize read.
 
@@ -1498,13 +1498,13 @@ shows is always at least as current as anything bucketize read.
 
 1. **Pass boundary** if `pass` advanced: `reset_pass`, `drain_streams`,
    `adapt_prefetch_depth`, end-of-pass decay — as `process_request` does today
-   (`pipeline.rs:2386-2401`, `:2699-2701`), keyed on the forward thread's pass id
+   (`pipeline/mod.rs:2386-2401`, `:2699-2701`), keyed on the forward thread's pass id
    instead of "layer index went backward".
 2. Wait `C(n)` (host). Read the summary slot.
 3. Speculative validation and `transition_matrix.observe` — unchanged.
 4. `join_stream_for(row)` — unchanged, before classify, so failed streamed jobs
-   classify as honest misses (`pipeline.rs:2443-2447`).
-5. **Classify** — `classify_and_load` (`pipeline.rs:1496-1754`) with the routed
+   classify as honest misses (`pipeline/mod.rs:2443-2447`).
+5. **Classify** — `classify_and_load` (`pipeline/mod.rs:1496-1754`) with the routed
    set and decode set from the summary: hit = bookkeeping says resident (in VRAM
    *or* an in-flight speculative/streamed install whose fill is queued); miss =
    otherwise. Demand eviction and `allocate_slot` as today.
@@ -1522,7 +1522,7 @@ every compute-stream wait it issued are gone (§10).
 ### 6.2 Ordering — the async side keeps its shape
 
 The expert copies have produced corruption through races before (the fence-ring
-key collision, `pipeline.rs:3602-3612`; the retraction that let KV memset bytes a
+key collision, `pipeline/mod.rs:3602-3612`; the retraction that let KV memset bytes a
 GEMM was reading, `docs/expert_cache_design.md` §12.4). So this design does not
 re-architect the copy side. **No stream is added, no stream is removed, and no
 new kind of ordering primitive is introduced.** The copy stream, the streamer
@@ -1532,15 +1532,15 @@ they are. What changes is listed exhaustively here, edge by edge:
 
 | # | Ordering edge today | Here | Why |
 |---|---|---|---|
-| 1 | copy stream waits a **fresh** compute event before every load batch (`order_copies_after_compute`, `pipeline.rs:1804-1812`, at 1983) | **kept, re-pointed**: it waits `e_route(n)`, the event the forward thread recorded after bucketize(`n`) and carried in the message | a fresh record now lands *behind* the spinning gate GEMM, and the copy that would release the spin would wait on it. `e_route(n)` covers exactly the readers the fresh event covered for every invocation `< n`; readers `≥ n` are §6.2's Rule D |
-| 2 | streamer stream waits a **fresh** compute event `after` (`pipeline.rs:2225`, `streamer.rs:170-184`) | **kept, re-pointed**: it waits `clears_done`, recorded on the copy stream after edge 1's wait and the plan's victim clears | same deadlock; `clears_done` implies `e_route(n)` transitively, so the streamer is ordered after every reader edge 1 covers *and* after its victims' entries are zero |
-| 3 | compute waits `classified.fence` and the prefetch fence ring before computing (`pipeline.rs:2497-2554`, `types.rs:290-301`) | **removed** — the fill-after-bytes order (§3.3) plus the spin does this job | the forward thread enqueues the GEMM before the pipeline thread has recorded these fences; there is nothing to wait on yet. The ring stays, for `is_complete` late-load accounting only |
-| 4 | compute waits the streamer's done fence at the target layer (`pipeline.rs:2273-2277` → 2498) | **kept, re-pointed**: the **copy stream** waits it at `join_stream_for`, which runs before classify | same reason as 3 for compute. The copy stream must be ordered after a streamed install before it may clear or re-tenant that slot (otherwise a late streamer write lands on the new tenant, or a late streamer fill resurrects an evicted pointer). Placing it before classify also closes an existing race, §18 |
-| 5 | compute waits copy after relocations (`order_compute_after_copies`, `pipeline.rs:1834-1843`, 2943-2945) | **kept as is** | relocation runs only with no pass in flight (§9) |
-| 6 | routing stream waits `e1` on compute before the routing DtoH (`quantized_qwen3_moe.rs:697-704`) | **kept**: it waits `e_route(n)`, recorded after bucketize instead of after `moe_route` | it copies the summary rather than the indices |
-| 7 | host waits copy-stream events in `ColdStaging::acquire` (`pipeline.rs:1197-1204`) | **unchanged** | — |
-| 8 | `quiesce_before_handover` `ctx.synchronize` (`pipeline.rs:3071-3080`) | **unchanged**, reached under §9's entry rule | — |
-| 9 | the hint path's fresh-event wait (`pipeline.rs:3185-3192`) | **removed with the hint** | the forward thread has no host routing to hint from |
+| 1 | copy stream waits a **fresh** compute event before every load batch (`order_copies_after_compute`, `pipeline/mod.rs:1804-1812`, at 1983) | **kept, re-pointed**: it waits `e_route(n)`, the event the forward thread recorded after bucketize(`n`) and carried in the message | a fresh record now lands *behind* the spinning gate GEMM, and the copy that would release the spin would wait on it. `e_route(n)` covers exactly the readers the fresh event covered for every invocation `< n`; readers `≥ n` are §6.2's Rule D |
+| 2 | streamer stream waits a **fresh** compute event `after` (`pipeline/mod.rs:2225`, `streamer.rs:170-184`) | **kept, re-pointed**: it waits `clears_done`, recorded on the copy stream after edge 1's wait and the plan's victim clears | same deadlock; `clears_done` implies `e_route(n)` transitively, so the streamer is ordered after every reader edge 1 covers *and* after its victims' entries are zero |
+| 3 | compute waits `classified.fence` and the prefetch fence ring before computing (`pipeline/mod.rs:2497-2554`, `types.rs:290-301`) | **removed** — the fill-after-bytes order (§3.3) plus the spin does this job | the forward thread enqueues the GEMM before the pipeline thread has recorded these fences; there is nothing to wait on yet. The ring stays, for `is_complete` late-load accounting only |
+| 4 | compute waits the streamer's done fence at the target layer (`pipeline/mod.rs:2273-2277` → 2498) | **kept, re-pointed**: the **copy stream** waits it at `join_stream_for`, which runs before classify | same reason as 3 for compute. The copy stream must be ordered after a streamed install before it may clear or re-tenant that slot (otherwise a late streamer write lands on the new tenant, or a late streamer fill resurrects an evicted pointer). Placing it before classify also closes an existing race, §18 |
+| 5 | compute waits copy after relocations (`order_compute_after_copies`, `pipeline/mod.rs:1834-1843`, 2943-2945) | **kept as is** | relocation runs only with no pass in flight (§9) |
+| 6 | routing stream waits `e1` on compute before the routing DtoH (`quantized_qwen3_moe/mod.rs:697-704`) | **kept**: it waits `e_route(n)`, recorded after bucketize instead of after `moe_route` | it copies the summary rather than the indices |
+| 7 | host waits copy-stream events in `ColdStaging::acquire` (`pipeline/mod.rs:1197-1204`) | **unchanged** | — |
+| 8 | `quiesce_before_handover` `ctx.synchronize` (`boundary.rs:3071-3080`) | **unchanged**, reached under §9's entry rule | — |
+| 9 | the hint path's fresh-event wait (`pipeline/mod.rs:3185-3192`) | **removed with the hint** | the forward thread has no host routing to hint from |
 | new | — | compute waits `clears_done` at the start of a pass (Rule P below) | the one new edge, and of a kind that exists today (compute waiting on a copy-stream event, as edge 3 did) |
 
 New *operations* on the copy stream are only the 8-byte clears and fills of §3.3,
@@ -1564,14 +1564,14 @@ clear is queued before the load, the load before its fill, and the gate GEMM of
 
 - invocations `< n` — complete (Fact F);
 - invocation `n` itself — reads only experts routed in row `r`, which are
-  protected (the classify protect set, `pipeline.rs:1575-1589`);
+  protected (the classify protect set, `pipeline/mod.rs:1575-1589`);
 - invocations `> n`, in this pass or any later one — their bucketize and GEMMs
   run after gate(`n`) completes, hence after the clear has landed; they read
   zero and the expert is a miss for them, loaded on their own message.
 
 So demand eviction needs no lock and no knowledge of where the GPU is. This
 covers every victim choice the current policy can make, including the
-ahead-of-the-wave ones (`cache.rs:704-712, 885-916`).
+ahead-of-the-wave ones (`cache/mod.rs:704-712, 885-916`).
 
 **Rule S (speculative evictions only from rows behind, in the current pass).**
 *Superseded by §0.7.4: revision 2 has no host speculative clears — every
@@ -1586,7 +1586,7 @@ nothing will read again before the clear lands:
   complete by Fact F, and not re-invoked in this pass by definition of a pass
   (§6.4);
 - **not** rows ahead, and **not** the wrap into the previous pass's tail that
-  `PREFETCH_EVICT_WINDOW` allows today (`cache.rs:219, 628-634, 832-848`). The
+  `PREFETCH_EVICT_WINDOW` allows today (`cache/mod.rs:219, 628-634, 832-848`). The
   window keeps its depth and its ranking; it loses the wrap. When `row < 5` it
   is simply shorter.
 
@@ -1612,7 +1612,7 @@ resident.
 
 **Rule J (cross-stream clears).** A streamed install's fill is on the streamer
 stream. Until its plan is joined it is in `stream_loads` and protected from
-demand eviction exactly as today (`pipeline.rs:1575-1589`, `cache.rs:684-688`);
+demand eviction exactly as today (`pipeline/mod.rs:1575-1589`, `cache/mod.rs:684-688`);
 at the join the copy stream waits the plan's done fence (edge 4), so every later
 copy-stream clear of that entry is ordered after the streamer's fill.
 
@@ -1634,14 +1634,14 @@ so it classifies as a miss and is loaded. A load that fails is the abort path
 
 ### 6.3 The demand-slot guarantee
 
-`minimum_resident_slots(E) = 3E + 1` (`cache.rs:156-158`) prices the pinned rows
+`minimum_resident_slots(E) = 3E + 1` (`cache/policy.rs:156-158`) prices the pinned rows
 (`PINNED_LAYERS = 2`) plus one working row plus one. Rule D shows that only
 **one** row is ever being read when a miss is serviced — the GPU is held at that
 row's gate GEMM and nothing behind it is reading — so the existing floor is
 sufficient, and the concern that several in-flight layers need protecting does
 not arise. The protect set is left exactly as it is. That keeps one existing
 edge: at the floor, a wide row plus protected in-flight installs can leave no
-victim (`cache.rs:717-719`), which today fails the wave and here is the abort
+victim (`cache/mod.rs:717-719`), which today fails the wave and here is the abort
 path (§8). Closing it would mean letting demand eviction take an in-flight
 install, which changes how the copy and streamer sides interact; it is left as
 Q5 rather than folded into this change.
@@ -1650,11 +1650,11 @@ Q5 rather than folded into this change.
 
 A **pass** is a run of invocations with strictly increasing row. The forward
 thread starts a new pass when an invocation's row is `≤` the previous one: every
-trunk forward; each sub-forward of a slab-split prefill (`wave_driver.rs:398-437`);
+trunk forward; each sub-forward of a slab-split prefill (`batched_inference/prefill_slabs.rs:398-437`);
 each MTP draft step, which re-invokes the head row (`qwen4exp/draft.rs:467`,
 `qwen35/mtp.rs:327-332`). This is decided inside the `ExpertCache` call the MoE
 block already makes, so no driver changes. The current end-of-pass decay keys on
-`moe_layer_idx + 1 == num_moe_layers` (`pipeline.rs:2699-2701`), which on models
+`moe_layer_idx + 1 == num_moe_layers` (`pipeline/mod.rs:2699-2701`), which on models
 with an MTP head fires on draft steps only; this design keeps that behaviour
 unchanged (§13, Q3).
 
@@ -1711,20 +1711,20 @@ those streams can encounter:
 | copy stream | streamer done fence (edge 4) | no — the streamer stream waits only on `clears_done`, a copy-stream event recorded earlier |
 | streamer stream | `clears_done` (edge 2) | no — copy stream, see above |
 | pipeline thread | `C(n)` | no — it follows bucketize(`n`), which precedes the gate GEMM |
-| pipeline thread | `ColdStaging::acquire` (`pipeline.rs:1197-1204`) | no — copy-stream events |
+| pipeline thread | `ColdStaging::acquire` (`pipeline/mod.rs:1197-1204`) | no — copy-stream events |
 | pipeline thread | NVMe reads, `join_stream_for` `recv` | no — the streamer depends only on the above |
-| pipeline thread | `quiesce_before_handover` `ctx.synchronize` (`pipeline.rs:3071-3080`) | yes, transiently — every gate launch enqueued so far has its `Routed` message ahead in the FIFO (§5.1 step 4), so its fills are already queued; it completes |
+| pipeline thread | `quiesce_before_handover` `ctx.synchronize` (`boundary.rs:3071-3080`) | yes, transiently — every gate launch enqueued so far has its `Routed` message ahead in the FIFO (§5.1 step 4), so its fills are already queued; it completes |
 | pipeline thread | KV pool mutex (in `renegotiate_boundary`) | only if another thread holds it across a device synchronize while a pass is open — §9 refuses before taking it |
 | forward thread | channel `send` | no — the pipeline drains it unconditionally |
 | forward thread | pass lock | no — the pipeline holds it only for enqueues, or for a boundary move with no pass in flight to wait on |
 
 And nothing on the pipeline thread is ever enqueued on the device's stream: it issues
 no kernels and no allocations against the wave arena. Wave arenas reset in
-stream order (`bump_arena.rs:83-105, 721-728`), which stays correct because every
+stream order (`candle-nn/src/kv_cache/chunked/bump_arena/arena.rs:83-105, 721-728`), which stays correct because every
 expert kernel is now enqueued by the forward thread, in program order — the
 `as_foreign_lease` leases and ticketed allocations that relied on "the submitter
-blocks" (`quantized_qwen3_moe.rs:312-333`, `types.rs:409-419`,
-`wave_buffers.rs:381-430`, `cuda.rs:5684-5688`) are deleted with the host path.
+blocks" (`quantized_qwen3_moe/mod.rs:312-333`, `types.rs:409-419`,
+`wave_buffers.rs:381-430`, `cuda/mod.rs:5684-5688`) are deleted with the host path.
 
 ## 8. Failure
 
@@ -1747,17 +1747,17 @@ Errors that are recoverable today because they surface synchronously through
 
 ## 9. Boundary moves
 
-`renegotiate_boundary` (`pipeline.rs:2771-3023`) moves and relocates slots, so it
+`renegotiate_boundary` (`boundary.rs:2771-3023`) moves and relocates slots, so it
 must not run under a bucketize that has read the old layout. Today it runs the
 whole retraction and only then lets `set_weight_floor`'s `wave_is_live` latch
-refuse, keeping the evictions (`region_pool.rs:2432-2439`, `pipeline.rs:3006-3009`).
+refuse, keeping the evictions (`region_pool/mod.rs:2432-2439`, `pipeline/mod.rs:3006-3009`).
 Under this design it decides at entry, holding the pass lock:
 
 - **Refuse at once** (answer 0, edit nothing) if a wave is live, or if the
   requester is not the forward thread and a pass is open. A pass opens at its
   first invocation and closes when the forward thread reaches phase 0
-  (`reclaim_spare_ground` / `request_kv_ground`, `batched_model.rs:781, 813`,
-  `qwen4exp/wave.rs:2264`, `latent_moe/wave.rs:1373`, `qwen35/forward.rs:781`).
+  (`reclaim_spare_ground` / `request_kv_ground`, `batched_model/mod.rs:781, 813`,
+  `qwen4exp/wave/mod.rs:2264`, `latent_moe/wave/mod.rs:1373`, `qwen35/forward/mod.rs:781`).
 - **Otherwise proceed.** Either no pass is open, or the requester *is* the
   forward thread and is blocked in the round trip, so nothing new is enqueued
   until it returns. The quiesce is safe (§7). Evictions clear entries;
@@ -1775,19 +1775,19 @@ Growing never touches the table: new slots are free.
 ## 10. Porting — every ExpertCache model
 
 The device chain moves out of `SparseMoeBlock::forward_gpu_native`
-(`quantized_qwen3_moe.rs:370-625`) into one function on the cache —
+(`quantized_qwen3_moe/mod.rs:370-625`) into one function on the cache —
 `ExpertCache::forward_routed(acts, weights, indices, decode_tokens, out_dtype, wave)`,
 in its own file under `expert_lre/` — which does bucketize through scatter and
 §5.1. Each model supplies its router and calls it.
 
 | Model | Router | Acts at the MoE | Change |
 |---|---|---|---|
-| Qwen3-30B-A3B (`quantized_qwen3_moe.rs`) | `moe_route` | Int8 | `forward_dynamic` → `moe_route` → `forward_routed`; host fork, `route_indices`, `forward_with_indices` deleted |
+| Qwen3-30B-A3B (`quantized_qwen3_moe/mod.rs`) | `moe_route` | Int8 | `forward_dynamic` → `moe_route` → `forward_routed`; host fork, `route_indices`, `forward_with_indices` deleted |
 | Qwen3.5-35B-A3B, Qwen3.6-35B-A3B incl. AntiLoop/StyleTune (`qwen35/quantized_moe.rs`) | via `SparseMoeBlock` | Int8; **Float** when a LoRA forces `Int8Mode::Off` on a DeltaNet layer (`qwen35/quantized_delta_net.rs:67-71`) | Float acts are quantized with `to_dynamic(Precision, SumScale::Raw)` at entry — the same step the host path's Float-KO arm takes (`compute.rs:523-587`). Quantization is per row and per 128-tile, so quantize-then-gather equals gather-then-quantize bit for bit |
-| Qwen3.8-Flash-Next incl. MTP head (`qwen4exp/wave.rs:3370`, `draft.rs:467`) | via `SparseMoeBlock` | Int8 | none beyond the shared block; the head row is an ordinary row. Unblocked by §3.1's `hidden % 1024` removal |
-| DeepSeek-V4-Flash (`latent_moe/engine.rs:505-586`) | `Gate::route` | Int8 (Performance quantize, `:529`) | `indices.to_vec2`, the host sort and `submit_moe_work` → `forward_routed(q8, weights, indices, …)`; the readback-budget test drops the routing term (`latent_moe/wave.rs:3413-3424`) |
+| Qwen3.8-Flash-Next incl. MTP head (`qwen4exp/wave/mod.rs:3370`, `draft.rs:467`) | via `SparseMoeBlock` | Int8 | none beyond the shared block; the head row is an ordinary row. Unblocked by §3.1's `hidden % 1024` removal |
+| DeepSeek-V4-Flash (`latent_moe/engine.rs:505-586`) | `Gate::route` | Int8 (Performance quantize, `:529`) | `indices.to_vec2`, the host sort and `submit_moe_work` → `forward_routed(q8, weights, indices, …)`; the readback-budget test drops the routing term (`latent_moe/wave/mod.rs:3413-3424`) |
 
-`ExpertCache::new` already refuses `Int8Mode::Off` (`handle.rs:604-611`), so no
+`ExpertCache::new` already refuses `Int8Mode::Off` (`handle/mod.rs:604-611`), so no
 cache-backed model can reach the MoE with Float acts except the LoRA case above.
 
 Every routing constraint holds for all four: experts 128 / 256 / 512 / 256,
@@ -1795,7 +1795,7 @@ top-k 8 / 8 / 10 / 6, hidden 2048 / 2048 / 2560 / 4096, expert widths that
 satisfy N % 32 and K % 128, KO weights throughout (MXFP4_KO for DeepSeek, which
 the int8 grouped kernel serves, `dispatcher.cu:1517-1563`).
 
-**Routing capture** (`routing_capture`, `quantized_qwen3_moe.rs:819-831`) becomes
+**Routing capture** (`routing_capture`, `quantized_qwen3_moe/mod.rs:819-831`) becomes
 an observer on the one path: when enabled it reads the route's indices and
 weights back after `moe_route` and records them. The compute path is identical
 with it on or off; the device fork's refusal under capture (`:286`) goes.
@@ -1816,7 +1816,7 @@ segment or per miss batch.
 
 ## 12. What is deleted
 
-- `expert_lre/handle.rs`: `PipelineMode::Inline`, `submit_inline`,
+- `expert_lre/handle/mod.rs`: `PipelineMode::Inline`, `submit_inline`,
   `new_prepopulated`, `submit_moe_work`, `classify_and_load` / `with_inner` /
   `wait_for_copies` / `is_threaded` / `gpu_dispatch()` (no external callers),
   `send_hint`, `set_prev_layer_experts` / `get_prev_layer_experts`,
@@ -1827,14 +1827,14 @@ segment or per miss batch.
   `PipelineMessage::{Work, Hint}`; `CopyBatchFence` loses `wait` (it stays as the
   `is_complete` probe for late-load accounting, which no longer gates compute).
 - `expert_lre/assignment_sort.rs` and its tests.
-- `expert_lre/pipeline.rs`: the compute half of `process_request`,
+- `expert_lre/pipeline/mod.rs`: the compute half of `process_request`,
   `process_hint`, and the compute-side `fence.wait` calls in
   `wait_prefetch_fences_through` / `drain_prefetch_fences` / the classify fence
   (edge 3). `order_copies_after_compute` stays and takes the event to wait on
   as an argument (edge 1); `order_compute_after_copies` stays as is (edge 5).
 - `gpu_dispatch.rs`: the all-resident and complete-grid requirements,
   `zone_moved` and the concede-epoch refusal, `hidden % 1024`.
-- `quantized_qwen3_moe.rs`: `route_indices`, `forward_with_indices`, the host
+- `quantized_qwen3_moe/mod.rs`: `route_indices`, `forward_with_indices`, the host
   fork, and the reader path `from_gguf` (`:1428-1651`), which has no callers.
 - `streamer.rs`: nothing. Its `after` field carries `clears_done` instead of a
   fresh compute event (edge 2) and its jobs carry their fill copies; the thread,
@@ -1852,7 +1852,7 @@ tests), `moe_bucketize`, `fused_deterministic_scatter`.
 ## 13. What else changes
 
 - **Stats settle.** Counters the scheduler reads right after a forward
-  (`admit_ground.rs:504-531`, `scheduler/decode.rs:57-83`, `prefill.rs:1144-1157`,
+  (`candle-conversation/src/scheduler/admit/ground.rs:504-531`, `scheduler/decode.rs:57-83`, `prefill.rs:1144-1157`,
   `WeightPlan::from_stats`) were complete when the forward returned because the
   forward waited for the pipeline. `ExpertCache::expert_stats()` now first sends a
   `Settle` message and waits for its answer, which the FIFO delivers after every
@@ -1879,7 +1879,7 @@ tests), `moe_bucketize`, `fused_deterministic_scatter`.
 
 ## 14. Tests (written first)
 
-Kernel, `candle-core/src/quantized/cuda_tests.rs`:
+Kernel, `candle-core/src/quantized/cuda_tests/mod.rs`:
 
 1. **bucketize resident-first** — `bucketize_ref` gains the residency input and
    the two-pass tile order; `tile_expert` / `tile_b_start` / `tile_b_cnt` compared
@@ -1924,7 +1924,7 @@ Pipeline, `expert_lre`:
 Model gates: the sweep (`.claude/skills/sweep`) — every gate and both engine
 probes, story intact, on the 3090 (paged for every MoE model) and the 4090
 Mobile; plus the existing bitwise repeatability gates
-(`qwen3_moe_decode_replay_is_bitwise_repeatable`, `quantized_qwen3_moe.rs:2771`),
+(`qwen3_moe_decode_replay_is_bitwise_repeatable`, `quantized_qwen3_moe/mod.rs:2771`),
 which must stay bitwise.
 
 ## 15. Acceptance
@@ -1967,8 +1967,8 @@ to say which of three things moved when decode gets slower or faster:
 Today's `profile` feature cannot separate these. Its GPU spans time only the
 device's stream (`profile/gpu.rs`, `gpu_span(name, &Device)` → `dev.cuda_stream()`),
 every copy-stream event is `DISABLE_TIMING`, `dma_h2d` times the host enqueue of
-an async copy rather than the transfer (`pipeline.rs:1010, 1057`), no kernel
-records time or counters, and `moe:gate_up` (`quantized_qwen3_moe.rs:473-532`)
+an async copy rather than the transfer (`pipeline/mod.rs:1010, 1057`), no kernel
+records time or counters, and `moe:gate_up` (`quantized_qwen3_moe/mod.rs:473-532`)
 merges the one GEMM that will wait with one that never does.
 
 ### 17.1 What is measured
@@ -2013,7 +2013,7 @@ with the bytes moved counted alongside (`demand_bytes`, `prefetch_bytes`,
 `stream_bytes` in `PipelineStats`), so achieved GB/s per kind is a division,
 not an estimate. This is the first direct measurement of bus time in the tree;
 `adapt_prefetch_depth`'s `achieved_gbps` divides bytes by a host-clock *pass*
-duration (`pipeline.rs:2348-2378`) and is never reported.
+duration (`pipeline/mod.rs:2348-2378`) and is never reported.
 
 **M3 — overlap, derived.** `copy hidden % = 1 − stall_ns / (demand + prefetch +
 stream busy)`. A copy the GPU did not wait for was hidden; every stall is a copy
@@ -2051,15 +2051,15 @@ are landing late.
 - **The pipeline and streamer threads drain their own pools** — the pool is per
   thread — non-blocking after each message and each plan, blocking on `Settle`.
 - **The pipeline thread records into the process-wide store** (`pipeline_record`)
-  instead of its private `ProfileAccumulator` (`pipeline.rs:1473`), so `pipe_*`,
+  instead of its private `ProfileAccumulator` (`pipeline/mod.rs:1473`), so `pipe_*`,
   `cl_*`, `cold_*`, `copy:*` reach `pipeline_snapshot*`, `/v1/profile`
   (`host/src/endpoints/profile.rs`) and `kv_fragmentation`'s tables, which today never
   see them. `ExpertCache::forward_profile` and `record_profile`'s second write go
-  (it double-counts every forward-thread span, `handle.rs:1916-1922`).
+  (it double-counts every forward-thread span, `handle/mod.rs:1916-1922`).
 - **`snapshot_profiles`** becomes: `Settle` (the pipeline thread drains its spans
   blockingly, reads the M1 counters with an async copy on the routing stream it
   waits for, and returns their deltas as entries). **`Qwen4ExpBatched` overrides
-  it**; today it inherits the empty default (`batched_inference.rs:5464`), so
+  it**; today it inherits the empty default (`batched_inference/mod.rs:5464`), so
   Flash-Next's pipeline spans appear in no table at all.
 - **`ProfileAccumulator` / `ProfileSnapshot` gain `max` and a `device` flag.**
   Miss stalls are a tail; a total and a count hide it. The device flag is set by
@@ -2073,8 +2073,8 @@ are landing late.
   (`scheduler/run.rs:687`) keeps it down, and a blocking drain that does happen
   records `profile:drain_block` so a self-perturbed profile says so.
 - **Printers that skip `gpu_drain_blocking`** — the `decode_profile` test
-  (`quantized_qwen3_moe.rs:3483-3612`) and the DeepSeek wave printers
-  (`latent_moe/wave.rs:4011, 4204`) — call it, or they report no GPU spans.
+  (`quantized_qwen3_moe/mod.rs:3483-3612`) and the DeepSeek wave printers
+  (`latent_moe/wave/mod.rs:4011, 4204`) — call it, or they report no GPU spans.
 
 ### 17.3 What is printed
 
@@ -2108,11 +2108,11 @@ follows the table when any row stalled.
 the path: **"MoE dispatch"** (`device` / `host (readback)`) goes — there is one
 path; **"Hint loads"** goes with the hint; **"Work requests"** becomes
 **"Routed messages"**; **"Fence stalls"** goes — it counted "a load batch had an
-event" (`pipeline.rs:2547-2553`), never a stall, and M1's stalled launches are
+event" (`pipeline/mod.rs:2547-2553`), never a stall, and M1's stalled launches are
 the real figure. **"Hit rate"** becomes correct: `classify_and_load` returns
-before its telemetry on a layer with no misses (`pipeline.rs:1616-1622` vs
+before its telemetry on a layer with no misses (`pipeline/mod.rs:1616-1622` vs
 `1733-1736`), so today all-hit layers are not counted and the hit rate — which
-also trains the admission planner (`admit_ground.rs:504-529`) — is biased low.
+also trains the admission planner (`candle-conversation/src/scheduler/admit/ground.rs:504-529`) — is biased low.
 Counting from the routing summary fixes that by construction.
 
 ### 17.4 Reading it
@@ -2160,7 +2160,7 @@ code §12 deletes go with that code and are not repeated.
 - **`.claude/skills/bed/SKILL.md:83-85`** — "two sanctioned readbacks": mirror
   invariant 3.
 - **`.claude/skills/sweep/SKILL.md:161-169`** — says the `qwen4exp` wave loop
-  never calls `reclaim_spare_ground()`; it does (`qwen4exp/wave.rs:2264`), and
+  never calls `reclaim_spare_ground()`; it does (`qwen4exp/wave/mod.rs:2264`), and
   §9 relies on it. Already false today.
 - **`candle-transformers/README.md:82-93, 134`** and
   **`candle-kernels/README.md:87-88`** — "two modes — threaded … and inline";
@@ -2182,10 +2182,10 @@ code §12 deletes go with that code and are not repeated.
 - **`docs/decode_graphs.md`** — rewritten for every model with the readback and
   the pipeline round trip gone: the whole MoE layer is one capturable region, with the
   dispatch host protocol run per layer between graph launches (§4.5).
-- **`docs/deepseek/deepseek_decode_launch_overhead.md:147-163`** — "why the
+- **`docs/archived/deepseek/deepseek_decode_launch_overhead.md:147-163`** — "why the
   readback cannot simply be removed". The rest of the doc is a measurement
   record (B), including the −8% lesson §5.1 answers.
-- **`docs/deepseek/deepseek_hot_path_optimization_findings.md`** — lines 49-51,
+- **`docs/archived/deepseek/deepseek_hot_path_optimization_findings.md`** — lines 49-51,
   264-267 ("routing must be host-visible").
 - **`docs/deepseek/deepseek_v4_speculative_decode.md`** — §1 52-59, §4.1 168-172,
   §4.2 208-209, §7 433-437: the "routing readback is the WDDM wall" premise.
@@ -2195,10 +2195,10 @@ code §12 deletes go with that code and are not repeated.
 
 ### 18.3 Historical (B)
 
-`docs/wave_feeder.md:1126-1128`; `docs/unified_wave_inference_engine.md` §3.3;
-`docs/deepseek/deepseek_perf_optimization_report.md:78-83, 310-319` (its
+`docs/wave_feeder.md:1126-1128`; `docs/archived/unified_wave_inference_engine.md` §3.3;
+`docs/archived/deepseek/deepseek_perf_optimization_report.md:78-83, 310-319` (its
 "`gpu_dispatch` today requires `all_resident`" is exactly the gap this closes —
-add a pointer); `docs/deepseek/deepseek_decode_reproducibility.md:38-40,
+add a pointer); `docs/archived/deepseek/deepseek_decode_reproducibility.md:38-40,
 171-178`; the "MoE dispatch … host (readback)" rows of
 `docs/results/performance_rtx_3090_24gb_rows.tsv`; and in `docs/archived/`:
 `gpu_native_moe_dispatch.md` (**add superseded-by this document** — its Phase B
@@ -2225,29 +2225,29 @@ is this design), `expert_pipeline_dataflow.md` (still cited by
 ### 18.5 Code comments that survive the change (A)
 
 - **`expert_lre/`**: `mod.rs` module doc (1-32, 99-106 wrap, 137-175 modes and
-  tables, link at 9); `handle.rs` (1-9, 102, 430-480, 1021-1034, 1755-1799);
+  tables, link at 9); `handle/mod.rs` (1-9, 102, 430-480, 1021-1034, 1755-1799);
   `gpu_dispatch.rs` (1-17, 60-130, 155-165, 236-241, 341-362, 443-447, 662-669,
   and the "fell to the host path" test messages at 842-951); `zone_geometry.rs`
   (whole module doc — it exists for the deleted `zone_moved`; either it goes or
-  it is re-scoped); `cache.rs` (114-119, 213-222, 259-277, 485-505); `types.rs`
-  (62-63, 86-87, 117-131, 257-258, 270-289, 428-460); `pipeline.rs` (1-6, 117,
+  it is re-scoped); `cache/mod.rs` (114-119, 213-222, 259-277, 485-505); `types.rs`
+  (62-63, 86-87, 117-131, 257-258, 270-289, 428-460); `pipeline/mod.rs` (1-6, 117,
   164-170, 1402-1458, 1814-1825, 2250, 3289-3318, 3498-3511); `streamer.rs`
   (4-11, 24-34: protocol now `clears_done`, joined on the routed message);
   `compute.rs` module doc; `slot_integrity.rs:6-11`; `weight_plan.rs:9-13`.
-- **Models**: `quantized_qwen3_moe.rs` (216-276, 345-363 → `forward_routed`,
+- **Models**: `quantized_qwen3_moe/mod.rs` (216-276, 345-363 → `forward_routed`,
   592, 2197 dangling "reader path above", 3475); `qwen35/quantized_moe.rs:1-10`
   and `qwen35/expert_loader.rs:13-15`; `qwen4exp/engine.rs:20-23` (already
-  wrong: "bucketize declines >256"); `qwen4exp/wave.rs:3202-3207, 3359-3365`;
-  `latent_moe/readback.rs:1-9`, `engine.rs:498-501`, `wave.rs:929-930,
+  wrong: "bucketize declines >256"); `qwen4exp/wave/mod.rs:3202-3207, 3359-3365`;
+  `latent_moe/readback.rs:1-9`, `engine.rs:498-501`, `latent_moe/wave/mod.rs:929-930,
   1044-1047, 1089-1090, 2953-2956` and the readback-budget test 3413-3424;
   `latent_moe/dspark_experts.rs:1-43, 212-216, 335` (lower priority);
-  `batched_inference.rs:4743, 5490-5491` and
+  `batched_inference/mod.rs:4743, 5490-5491` and
   `candle-conversation/src/models/builder.rs:257-258` (fixed cost attributed
   to the routing readback).
 - **Elsewhere**: `candle-conversation/src/scheduler/decode.rs:639-658` (forward
   timing and "counters this forward just moved", §13);
-  `candle-nn/src/kv_cache/chunked/region_pool.rs:40-45` (when `W` moves, §9);
-  `candle-core/src/quantized/cuda.rs` 5567-5571, 5760-5762, 6669-6684 (device
+  `candle-nn/src/kv_cache/chunked/region_pool/mod.rs:40-45` (when `W` moves, §9);
+  `candle-core/src/quantized/cuda/mod.rs` 5567-5571, 5760-5762, 6669-6684 (device
   GEMM: "every expert VRAM-resident", "same ascending-expert tile order"),
   7490-7498 (bucketize); `candle-kernels/src/simple/moe_bucketize.cu` 4-9,
   34-45, 158-159; `batch_test/utils.rs:2856-2867` (the "MoE dispatch" row,
@@ -2257,7 +2257,7 @@ is this design), `expert_pipeline_dataflow.md` (still cited by
 
 - **Q1 — scope.** "Every MoE model" here means every `ExpertCache` model: Qwen3-30B,
   3.5, 3.6 (and variants), Flash-Next, DeepSeek-V4. Two MoE forwards in the tree
-  never used this path and are not touched: Mixtral through `quantized_llama.rs`
+  never used this path and are not touched: Mixtral through `quantized_llama/model.rs`
   (`MlpOrMoe`, its own CPU routing at `:106-175`, non-KO experts, no cache), and
   the upstream float models (`mixtral.rs`, `qwen2_moe.rs`, `qwen3_moe.rs`,
   `deepseek2.rs`, `granitemoehybrid`). Bringing Mixtral onto the cache is a KO
@@ -2275,14 +2275,14 @@ is this design), `expert_pipeline_dataflow.md` (still cited by
   copy/streamer protection, which this change deliberately leaves alone.
 
 **A probable existing copy race, closed by edge 4.** `join_stream_for` removes
-the joined layer's installs from `stream_loads` (`pipeline.rs:2291`) *before*
+the joined layer's installs from `stream_loads` (`pipeline/mod.rs:2291`) *before*
 classify computes its protect set (`:1575-1589`), and `join` waits only for the
 streamer to finish *enqueueing* (`:2250-2262`), not for its copies to land. A
 streamed expert of the current row that the route did not select is then
 unprotected, and `demand_eviction` admits the current row at factor 1.0
-(`cache.rs:895-903`, distance 0). Its re-tenant goes out on the copy stream
+(`cache/mod.rs:895-903`, distance 0). Its re-tenant goes out on the copy stream
 ordered only after a fresh compute event — and the compute stream has not yet
-waited this plan's fence (that wait is at `pipeline.rs:2498`, after classify).
+waited this plan's fence (that wait is at `pipeline/mod.rs:2498`, after classify).
 So the new tenant's bytes and the streamer's still-landing bytes can hit the same
 slot unordered. It needs a prefill-width wave whose stream plan mispredicted an
 expert and a deficit that picks exactly that slot, which fits the
@@ -2295,4 +2295,4 @@ indexes out of bounds when every score is `-inf` (`router_topk.cu:104-123`);
 DeepSeek's routed experts skip the `swiglu_limit` clamp the reference applies
 (`latent_moe/moe.rs:65-89`); the Float non-KO arm of `compute_experts_grouped`
 cannot have worked for BF16 activations (the scatter requires F32,
-`cuda.rs:7348`) — moot once deleted.
+`cuda/mod.rs:7348`) — moot once deleted.

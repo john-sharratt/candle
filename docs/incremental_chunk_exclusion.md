@@ -294,7 +294,7 @@ All `#[test]`s, asserting raw values:
   new launches nothing; a turn appended after a restart is the one stream folded.
 - **Statistics mode** — each backend's rows equal the definitions on a fixture of
   empty cases, descending case order and a dropped out-of-range case, and the
-  backends' rows are identical (`gallery_arena/scan.rs`).
+  backends' rows are identical (`gallery_arena/scan/tests_votes.rs`).
 - **Cut** — a hub token planted in one chunk and asked by every question is the
   content cut.
 
@@ -308,13 +308,13 @@ from their definitions on the host.
 | Entry statistics and merge | `provenance/chunk_exclusion/stats.rs` |
 | Sample (bottom-k by hash) | `provenance/chunk_exclusion/sample.rs` |
 | Question and group records, and their keys | `provenance/chunk_exclusion/records.rs` |
-| The cut installed on apply | `substrate.rs` (`install_chunk_exclusion`) |
+| The cut installed on apply | `substrate/marking_dead.rs` (`install_chunk_exclusion`) |
 | A group's galleries and questions | `projection/chunk_exclusion/gallery.rs` |
 | Bounded jobs and their merge | `projection/chunk_exclusion/scan_jobs.rs` |
 | Learner state and folding | `projection/chunk_exclusion/fold.rs` |
 | Cut from state | `projection/chunk_exclusion/cut.rs` |
 | The learner, its load and its writes | `projection/chunk_exclusion/learner.rs` |
-| Statistics-mode kernel | `candle-kernels/src/provenance/bdp_vote.cuh`, `bdp_scan.cu`, `bdp_bmma.cu`, `bdp_imma.cu`, `gallery_arena/scan.rs` |
+| Statistics-mode kernel | `candle-kernels/src/provenance/bdp_vote.cuh`, `bdp_scan.cu`, `bdp_bmma.cu`, `bdp_imma.cu`, `gallery_arena/scan/scan_api.rs` |
 | A job sent to the wave thread, one a pass | `gallery_arena/held_scan.rs`, `scheduler/remote_arena.rs` (`connect_background`), `scheduler/norm_warm.rs`, `group_scanner.rs` |
 | The `warm` band | `scheduler/phase_ring.rs`, `scheduler/mod.rs`, `web/content/common/lib/perf.js` |
-| Learner and lease | `zend/src/session.rs`, `zend/src/ingest_lease.rs` |
+| Learner and lease | `zend/src/session/ingesting.rs`, `zend/src/ingest_lease.rs` |

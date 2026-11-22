@@ -1,5 +1,5 @@
 //! A reply as its parts — prose, reasoning and calls — for the daemon's GUI
-//! (`docs/zen_coding_session_fixes.md`, Cause 1b).
+//! (`docs/archived/zen_coding_session_fixes.md`, Cause 1b).
 //!
 //! The GUI once found calls by searching the streamed text for tags, and so
 //! had the decoder's blind spot: a value holding `</tool_call>` or `<think>`

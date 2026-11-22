@@ -119,7 +119,7 @@ pub fn format_tool_responses(results: &[ToolResult]) -> TurnText {
 /// [`format_tool_responses`], with each result's block as a byte range of the
 /// text — `<tool_response>` through `</tool_response>`, the span a served
 /// read's recurrent record is applied over
-/// (`docs/recurrent_reply_calibration.md` §7).
+/// (`docs/archived/recurrent_reply_calibration.md` §7).
 pub fn format_tool_blocks(results: &[ToolResult]) -> (TurnText, Vec<Range<usize>>) {
     let mut out = TurnText::default();
     let mut at = 0usize;

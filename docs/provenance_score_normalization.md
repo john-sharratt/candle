@@ -166,7 +166,7 @@ of every win.
 - **~500** — beyond 9 in 10; **~150** — the background's median. The tool gate's
   `min_score 800` / `evict_score 600` are a 1-in-40 and a 1-in-16 score.
 
-### 3.3 Per-scope = per score-competition node (verified against `project.rs`)
+### 3.3 Per-scope = per score-competition node (verified against `projection/project/`)
 
 Normalization is computed **per scope where scores are actually compared**, not
 over the whole substrate. Reading the selection path, every score comparison is
@@ -423,7 +423,7 @@ the scan (`score_belief_groups` / `score_belief_collections`):
 
    Runs **once per turn, at seal** — hooked into
    `Conversation::last_turn_belief_scores`
-   ([conversation.rs](../candle-conversation/src/conversation.rs)), which already
+   ([conversation/sequence_lifecycle.rs](../candle-conversation/src/conversation/sequence_lifecycle.rs)), which already
    re-scores the just-sealed turn's **whole-turn sig** against every gallery. This
    is exactly the probe §85 calibrated against.
 
@@ -505,11 +505,11 @@ The cache lives on the `Conversation` substrate handle (`Arc<Mutex<…>>`, share
 across clones, not persisted). `score_beliefs` carries an `observe: bool` that
 splits read from write:
 
-- **Read** (`observe = false`, every reprojection): `resolver.rs::score_belief_groups`
+- **Read** (`observe = false`, every reprojection): `projection/resolver/belief_groups.rs::score_belief_groups`
   computes the raw fresh scores, calls `cache.normalize(scope, raw)`, and feeds the
   **normalized** scores to `set_turn` / the challenger candidates. Runs from the
   scheduler reproject loop (`mod.rs`, passes `false`).
-- **Write** (`observe = true`, once per turn): `conversation.rs::last_turn_belief_scores`
+- **Write** (`observe = true`, once per turn): `conversation/sequence_lifecycle.rs::last_turn_belief_scores`
   is the seal-time whole-turn scan; it passes `observe = true`, so after computing
   the same raw scores the group scan folds them into the backgrounds. The only
   live writer — reprojections never learn.

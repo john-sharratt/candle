@@ -35,7 +35,7 @@ Build the picture from every source there is — not from recollection alone:
 - **Memory** — `MEMORY.md` and the memory files it points to that bear on current work
   (project and feedback entries especially). Verify a remembered file/function/flag still
   exists before acting on it.
-- **Open-items / plan documents** — `docs/open_items.md` and any `docs/**/*plan*.md`,
+- **Open-items / plan documents** — `docs/archived/open_items.md` and any `docs/**/*plan*.md`,
   `*progress*.md`, `*design*.md` touched recently (`git log --since` on `docs/`).
 - **The repository's state** — `git status`, `git diff --stat`, `git log` since the last
   commit the user made; uncommitted work is unfinished work until it is verified.

@@ -6,7 +6,7 @@ event at a time. The command table is where that work is handed out. This docume
 table finds the work and writes it up as missions a Maker can carry out.
 
 Code: `npcd/src/engine/mission_gen/`. Configuration: `<mind>/missions.yaml`. It sits on the
-mission system in `npcd/src/engine/mission.rs` and `npcd/src/sim/missions.rs`, inside the
+mission system in `npcd/src/engine/mission/mod.rs` and `npcd/src/sim/missions/mod.rs`, inside the
 building `vault_world.md` describes, and it is the "missions are generated" half of
 `asynchronous_mind_hierarchy.md` §7.4.
 

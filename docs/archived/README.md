@@ -51,6 +51,14 @@ code no longer has.
 | `paged_glue_kernel.md` | Earlier dedicated glue-attention kernel derived from paged-decode; superseded by the batched `GAP_FILL` approach in `docs/glue_prefill_kernel.md`. |
 | `prefill_optimization.md` | **Built, 5.2–18.6× measured.** INT8 prefix-attention prefill kernel with GQA-packed tiles — the design record for what became `paged_prefill_int8_kernel.cuh`. |
 
+## Moved from the docs index
+
+| Doc | Covers |
+|---|---|
+| [`unified_wave_inference_engine.md`](unified_wave_inference_engine.md) | Design draft (pre-implementation, superseded by `continuous_fair_waves.md`). Packs decode+prefill+glue into one forward with a small/large batch flip and cooldown, to amortise all-expert PCIe streaming cost on VRAM-constrained hardware. |
+| [`recurrent_reply_calibration.md`](recurrent_reply_calibration.md) | **Design, not built.** Why a page served `in_context` is read but never "seen" (the 36 DeltaNet layers never ran over it), and the fix: a calibration step that records, per page, the delta-rule inputs of the `in_context` reply as a reader's recurrence takes it, and a live conversation served that page whose state past the reply comes from those rows. Record format, recipe hash and staleness, the sweep, the replay scan, tests and gates. |
+| [`perplexity_results.md`](perplexity_results.md) | WikiText-2 perplexity measurements across model/quant combinations (Qwen3-30B-A3B, Qwen2/3, Llama-3.2-3B), methodology and per-context-size result tables. |
+
 ## Conversation substrate & NPC design (early)
 
 | Doc | Covers |

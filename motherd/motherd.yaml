@@ -48,18 +48,22 @@ host:
 # deep enough for the crates' module trees (`candle-nn/src/kv_cache/chunked/`,
 # `candle-transformers/src/models/expert_lre/`), whose files a dialogue is
 # asked about. `ignore` keeps out what that depth would otherwise bring in and
-# no question needs read: data and prose trees, upstream examples, and the
-# dependency battery's own results, questions and the gates' expected files
-# (`docs/provenance_expectations/`) — a reading of those would
-# answer the battery from its last run's answers or from its answer key, as
-# four answers did on 2026-11-16 (docs/unbounded_agents.md §9.12). A
-# `…/*/*` pattern covers only below the folder's own files, which the walk
-# read at depth 3 before.
+# no question needs read: data and prose trees, upstream examples, the
+# dependency battery's questions and the gates' expected files
+# (`docs/provenance_expectations/`) — a reading of those would answer the
+# battery from its answer key, as four answers did on 2026-11-16
+# (docs/unbounded_agents.md §9.12) — and the records of past states: every
+# measured result (`docs/results/`) and every archived document
+# (`docs/archived/`). A record names the code as it stood when it was written,
+# and read as current it answers with paths and names that no longer exist, as
+# battery (i)'s answers did on 2026-11-22. A `…/*/*` pattern covers only below
+# the folder's own files, which the walk read at depth 3 before.
 zend:
   working_dir: ..
   max_depth: 5
   ignore:
-    - candle/docs/results/dependency_battery_*
+    - candle/docs/results/*
+    - candle/docs/archived/*
     - candle/zend/examples/dependency_battery/*
     - candle/docs/provenance_expectations/*
     - candle/candle-examples/examples/*/*

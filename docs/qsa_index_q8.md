@@ -563,7 +563,7 @@ On-disk moved into step 2 from a later step of its own: a seal reads the
 card's bytes, so a build with Q8_0 on the card and `F32` on disk would need a
 conversion in each direction that the finished design does not have.
 
-`qwen4exp/wave.rs` is touched in step 2 (the seal functions,
+`qwen4exp/wave/` is touched in step 2 (the seal functions,
 `positional_lift_bytes_at`, `restore_aux_state`), not `claim_carried_state`.
 
 ### What the review changed

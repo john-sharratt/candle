@@ -25,7 +25,8 @@ zend:
   working_dir: ..
   max_depth: 5
   ignore:
-    - candle/docs/results/dependency_battery_*
+    - candle/docs/results/*
+    - candle/docs/archived/*
     - candle/zend/examples/dependency_battery/*
     - candle/docs/provenance_expectations/*
     - candle/candle-examples/examples/*/*

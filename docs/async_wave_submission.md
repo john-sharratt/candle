@@ -3,7 +3,7 @@
 *How work reaches the wave engine without a thread blocked on every in-flight turn,
 and how npcd is rebuilt on top of that so one slow mind never stalls the cast.*
 
-Companion to [`unified_wave_inference_engine.md`](unified_wave_inference_engine.md),
+Companion to [`unified_wave_inference_engine.md`](archived/unified_wave_inference_engine.md),
 which specifies the scheduler this document feeds, and to
 [`wave_blocking_optimizations.md`](wave_blocking_optimizations.md), which covers
 blocking *inside* the scheduler thread. This document is about blocking *in front of*
@@ -22,10 +22,10 @@ submit one at a time.
 
 | Piece | Where | Shape today |
 |---|---|---|
-| Request queue into the scheduler | `candle-conversation/src/scheduler/mod.rs` (`SchedulerRequest`) | `crossbeam::channel` — `Sender<SchedulerRequest>` held by every caller, drained by the scheduler thread, mid-wave included (`scheduler/run.rs`, `mid_wave_admission`) |
+| Request queue into the scheduler | `candle-conversation/src/scheduler/mod.rs` (`SchedulerRequest`) | `crossbeam::channel` — `Sender<SchedulerRequest>` held by every caller, drained by the scheduler thread, mid-wave included (`scheduler/run/prefill_cohort.rs`, `mid_wave_admission`) |
 | Per-turn event stream | `candle-conversation/src/handle.rs` (`TurnHandle`) | wraps a `crossbeam::channel::Receiver<TurnEvent>`; `wait`, `wait_cancellable`, `stream` and `try_recv` are all blocking or polling |
-| Submit vs. send | `candle-conversation/src/conversation.rs` | `submit_turn_with_options` returns a `TurnHandle` without blocking; `send_turn_with_options` is submit-then-`wait` |
-| One-shot replies | `conversation.rs`, `engine.rs`, `tree/conversation_tree.rs` | dozens of `crossbeam::channel::bounded(1)` round trips, one `crossbeam::channel::Select` (`conversation.rs`) |
+| Submit vs. send | `candle-conversation/src/conversation/turn_submitter.rs` | `submit_turn_with_options` returns a `TurnHandle` without blocking; `send_turn_with_options` is submit-then-`wait` |
+| One-shot replies | `conversation/mod.rs`, `engine/mod.rs`, `tree/conversation_tree.rs` | dozens of `crossbeam::channel::bounded(1)` round trips, one `crossbeam::channel::Select` (`conversation.rs`) |
 | Guest job replies | `candle-conversation/src/guest/queue.rs` (`GuestReceipt`) | `bounded(1)` crossbeam reply; `wait()` blocks the caller for the whole drain |
 | Engine handle in npcd | `npcd/src/engine/*` | `Arc<Mutex<ConversationEngine>>`, locked per call |
 
@@ -40,14 +40,14 @@ behalf.
 | Piece | Where | Shape today |
 |---|---|---|
 | Tick driver | `npcd/src/engine/runtime.rs` — `drive` | **one OS thread**, walking due characters in turn on a 100 ms sleep loop |
-| Character scheduling | `npcd/src/engine/tick.rs` | a due-heap plus per-character `due_at`, pace-floored heartbeats, `hold`/`release`, preempt flags — a hand-rolled scheduler quantised by the driver's sleep |
-| A character's thought | `npcd/src/engine/mind.rs` — `Minds::think` | `send_turn_with_options` under the character's conversation lock: the driver thread is parked until that decode finishes |
-| Reflection | `npcd/src/engine/runtime.rs` — `begin_reflection` | one OS thread per event (`reflect-<id>`), the character held until the first answer; four `send_turn_with_options` calls in sequence inside `reflect.rs` |
+| Character scheduling | `npcd/src/engine/tick/mod.rs` | a due-heap plus per-character `due_at`, pace-floored heartbeats, `hold`/`release`, preempt flags — a hand-rolled scheduler quantised by the driver's sleep |
+| A character's thought | `npcd/src/engine/mind/think.rs` — `Minds::think` | `send_turn_with_options` under the character's conversation lock: the driver thread is parked until that decode finishes |
+| Reflection | `npcd/src/engine/runtime/reflecting.rs` — `begin_reflection` | one OS thread per event (`reflect-<id>`), the character held until the first answer; four `send_turn_with_options` calls in sequence inside `reflect/mod.rs` |
 | Dreams | `npcd/src/engine/dreams.rs` | one OS thread per dream (`dream-<id>`), `send_turn_with_options` |
 | World moments | `npcd/src/engine/driver.rs` — `Metronome` | **one OS thread per hosted world**, sweeping journeys/visitors every 500 ms |
 | Life generation | `npcd/src/lifegen/{job,generate}.rs` | one OS thread per run, fanning out via `std::thread::scope` in `MAX_IN_FLIGHT` waves — a pool of blocking `send_turn` calls, by its own module doc *because* `send_turn` blocks |
 | Prose (names, descriptions) | `npcd/src/engine/prose.rs` | `submit_turn_with_options`, then a blocking drain |
-| HTTP handlers | `npcd/src/{api,ops,prose,guest_routes}.rs`, `engine/{mod,simulate,watcher}.rs`, `telemetry/mod.rs` | engine work bridged through `tokio::task::spawn_blocking` (ten call sites) |
+| HTTP handlers | `npcd/src/{api/mod,ops,guest_routes}.rs`, `engine/{mod,simulate,watcher,prose}.rs`, `telemetry/mod.rs` | engine work bridged through `tokio::task::spawn_blocking` (ten call sites) |
 
 ### 1.3 What that costs
 
@@ -266,7 +266,7 @@ thread per world. Pause/resume becomes the task's own state. Same 500 ms cadence
 sweep, one scheduler family instead of two.
 
 **What the tick scheduler's API becomes**, so the rewrite has a checklist rather than a
-discovery process. `tick.rs` is two things wearing one type: a scheduler and a data
+discovery process. `tick/mod.rs` is two things wearing one type: a scheduler and a data
 model. The data model survives untouched — `deliver`, `broadcast`, `push`/`drain`, the
 window, `window_of`, `amend_act`, `recent`, `census`, `population`, `inbox_depth`,
 `quiet_for`, `nudge_due` — these are reads and writes of per-character state the routes
@@ -319,7 +319,7 @@ cancellation stops the decode it started. Routes that read a character's live st
 through the same locks the task uses, held for the read and never across an await.
 
 Of npcd's ten `spawn_blocking` call sites, seven wrap engine work and convert
-(`api.rs` reflect, `prose.rs`, `guest_routes.rs`, `engine/mod.rs` ×2, `simulate.rs`,
+(`api/mod.rs` reflect, `engine/prose.rs`, `guest_routes.rs`, `engine/mod.rs` ×2, `simulate.rs`,
 and the engine half of `watcher.rs`'s reload). Three wrap genuinely blocking non-engine
 work and stay: the telemetry sampler's NVML/sysinfo tick, the ops memory dump, and the
 watcher's file-hash reconcile — `spawn_blocking` is the idiom for those, not a bridge
@@ -338,14 +338,14 @@ cancel. What that lands on, concretely — zend's blocking machinery as audited:
 
 | Piece | Where | Shape today → after |
 |---|---|---|
-| The submit path | `session.rs` — `run_inference_stream` | one `spawn_blocking` per request, streaming through a `tokio::sync::mpsc` bridge → an async task streaming `stream_async` directly |
-| Titler | `session.rs` — dedicated worker thread fed by a `std::sync::mpsc::sync_channel(256)` | an async task fed by a bounded channel; same drop-on-backlog, same drain-on-shutdown |
+| The submit path | `session/inference_stream/stream_turn.rs` — `run_inference_stream` | one `spawn_blocking` per request, streaming through a `tokio::sync::mpsc` bridge → an async task streaming `stream_async` directly |
+| Titler | `session/titler.rs` — dedicated worker thread fed by a `std::sync::mpsc::sync_channel(256)` | an async task fed by a bounded channel; same drop-on-backlog, same drain-on-shutdown |
 | Scope ingest fan-out | `turn_sink.rs` — `std::thread::scope`, one thread per fork per chunk | concurrent awaits over the same forks; the co-batching the scheduler does is unchanged |
 | code_read / repo_scan fan-outs | `code_read/mod.rs`, `repo_scan/mod.rs` — `thread::scope` pools | same conversion where the work is engine turns; repo scanning itself is file I/O and keeps its blocking pool |
 | Calibration retire loop | `session.rs` — 2 ms sleep-poll over in-flight handles | await whichever handle completes next (completion order, as the section-ingest `Selector` already does) |
 | Upload ingest progress | `api/files.rs` — worker thread + 150 ms progress poll | the ingest on the blocking pool, awaited by a task that streams progress on a 150 ms async tick — the tick doubles as the SSE cadence throttle, so no thread is parked on it |
-| Tool execution | `tools.rs` — `run_tool_calls`, synchronous file I/O between turns | stays blocking work, run off the async pool; the turns around it are awaited |
-| Startup loader + reload polls | `session.rs` — loader thread, 50 ms polls of `SubstrateReloadStatus` | stays a thread (§3.4's exception); the polls are fine where they are |
+| Tool execution | `tools/dispatch.rs` — `run_tool_calls`, synchronous file I/O between turns | stays blocking work, run off the async pool; the turns around it are awaited |
+| Startup loader + reload polls | `session/load/startup.rs` — loader thread, 50 ms polls of `SubstrateReloadStatus` | stays a thread (§3.4's exception); the polls are fine where they are |
 | GPU-poison watchdog | `main.rs` | stays a std thread, deliberately — it must fire when the runtime is wedged |
 
 zend's own long jobs (ingest loops, code reading) become tasks the way npcd's

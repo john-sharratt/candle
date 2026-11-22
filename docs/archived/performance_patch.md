@@ -158,8 +158,8 @@ snapshot.
   `resume.rs:78`. npcd: `engine/dreams.rs:581`; `mind_record.rs:193`;
   `mind.rs:1330`, `:2139`.
 - Readers of several keys move to `conversation_metadata_with`:
-  `session.rs:4365` (the dials compare), `:8027` (`turn_errors` takes the
-  `POrdMap`), `:8035` (dials), `layers/run.rs:770`.
+  `session/dials.rs:4365` (the dials compare), `session/history.rs:8027` (`turn_errors` takes the
+  `POrdMap`), `session/dials.rs:8035` (dials), `layers/run.rs:770`.
 - Readers that copy the whole map out keep `conversation_metadata`:
   `restore.rs:99`, `self_check/mod.rs:78`, `layers/run.rs:85`, `:784`, npcd
   `layers.rs:182`.
@@ -216,7 +216,7 @@ history read inside the closure as now; the list returns
 
 **Locks.** None new.
 
-The list also does a `read_dir` per call (`session.rs:7609`), now off the
+The list also does a `read_dir` per call (`session/conversations.rs:7609`), now off the
 runtime too. It gains `Cache-Control: no-store` and `Vary: accept-encoding`
 from `compressed::json`, which gzips at 860 bytes or more.
 
@@ -248,7 +248,7 @@ Admin opens both; Nobody neither.
 
 ### Z7. A journal draft reads only what it has not covered
 
-**Costs.** `session.rs:5864` rebuilds the whole `recovered_history` to use
+**Costs.** `session/history.rs:5864` rebuilds the whole `recovered_history` to use
 the parts after `covered`; `origin.rs:101-106` finds each message's written
 part by a linear search.
 
@@ -675,7 +675,7 @@ calls it.
 
 **Costs.** `environment.rs:413-421`: up to five thread scans per actor per
 beat, `waiting_for` among them, recomputing a sum `unread_due` already has;
-`phone.rs:276,283` lowercase every member on every call.
+`sim/phone/mod.rs:276,283` lowercase every member on every call.
 
 **Change.** `unread_due -> (Option<Due>, usize)`, the count the sum of its
 per-thread counts on every return path (`unread_threads` keeps n > 0 only and
@@ -961,7 +961,7 @@ taken inside it.
 
 **Costs.** `cluster/src/gateway/hub.rs:1849` deep-clones a member's route
 table (about 100 routes and a matchit tree) per request, under the hub's
-global mutex; `registry.rs:463` and `pick.rs:212` allocate match params to
+global mutex; `registry.rs:463` and `registry/pick.rs:212` allocate match params to
 test a match; `hub.member()` clones whole member views at `aggregate.rs:232`,
 `route.rs:202`, `merge_ws.rs:146`, `page.rs:227`, `jobs.rs:85`.
 
@@ -1086,7 +1086,7 @@ within one body, an item without an id.
 
 ### W7. Merged log lines are tagged by splicing
 
-**Costs.** `cluster/merge_ws.rs:43-55` parses and re-serialises each line.
+**Costs.** `web/src/cluster/merge_ws.rs:43-55` parses and re-serialises each line.
 
 **Change.** A per-member suffix (`,"node":…,"host":…,"member":…}`, built once
 in `read_member` with serde) spliced before the last `}` of a line that

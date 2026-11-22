@@ -25,7 +25,7 @@ substrate set + a `RecordType::Distilled` redo-log record, reached by compaction
    queries it. Idempotent — duplicate markers replay identically.
 
 2. **Marking calibration material.** The calibration loop
-   (`zend/src/session.rs`) marks a conversation for distillation in **both**
+   (`host/src/calibration/phase.rs`) marks a conversation for distillation in **both**
    paths, each gated on `is_timeline_distilled` so an already-distilled timeline
    is never re-marked:
    - **Seal path** — right after archiving a freshly-completed case.
@@ -36,7 +36,7 @@ substrate set + a `RecordType::Distilled` redo-log record, reached by compaction
    material already in the substrate from a prior run would never be distilled.
 
 3. **A compaction branch.** `collect_live_records`
-   (`persistence/compaction.rs`) already emits each record type of a turn
+   (`persistence/compaction/collect.rs`) already emits each record type of a turn
    independently. For a turn whose `timeline_id` is in the distilled set, it emits
    the `StreamDecl` + `WideQSig` (and `ProjectionEvents`) but **skips the KV
    chunks and the `Tokens` record**. Tombstoned timelines still drop entirely.

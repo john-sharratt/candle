@@ -143,7 +143,7 @@ paths, and only for a turn that placed or read guidance.
 
 **Why "read anyway" is not a hit.** A placed unit is attended and recalled, yet
 the model's own sense of what it has read comes from what its recurrence ran
-over (`docs/inline_read_injection.md`): it can judge a placed page unread and
+over (`docs/archived/inline_read_injection.md`): it can judge a placed page unread and
 fetch it again. So a read of a placed unit is evidence the placement did not
 count as reading, and a high "read anyway" count says placement is spending
 room on units the worker will read regardless. "Relevant" is the signal of

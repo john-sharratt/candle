@@ -152,7 +152,7 @@ sessions) and are folded to one per tool by **max over copies**. Chance for 1-of
 ### What is actually on disk (this gates every method)
 
 - **The R16 block stores BOTH K and Q.** Each `BlockR16` is `{ f16 d[32] = K,
-  f16 q[32] = Q }` ([`backing.rs:1696`](../candle-nn/src/kv_cache/chunked/backing.rs#L1696)).
+  f16 q[32] = Q }` ([`candle_blocks.rs:28`](../candle-core/src/quantized/k_quants/candle_blocks.rs#L28)).
   So the probe's lossless R16 chunks carry the full-resolution **query *and* key** per
   token — "real Q·K" is fully available on the probe side (see §9, **run**). The earlier
   belief that "only sign(Q) is persisted" was wrong: sign(Q) is the *signature*, but the
@@ -1423,7 +1423,7 @@ makes it work.
 > A separate dead end recorded so it is not re-tried: the **RoPE un-rotation** sweep
 > (harness `S72`) came up flat (target stuck at rank ~90 for every offset). Reason: the
 > KV cache stores K/Q **pre-RoPE** (content) and ropes in-kernel via per-chunk
-> `rope_pos` metadata (`types.rs:107`, `get_chunk_refs_with_rope`). There is no RoPE in
+> `rope_pos` metadata (`types/chunk_meta.rs`, `get_chunk_refs_with_rope`). There is no RoPE in
 > the persisted Q/K to remove — so the §73/§74 cosines are already clean content matches.
 
 ### 22.1 §73 — pooled Q·Q holdout retrieval
@@ -1965,7 +1965,7 @@ definition's best exchange at **351**; a tour probe ranks a promiscuous fixture 
 all 310 recorded projection points showed only **~7 %** of the daemon's recorded winners re-rank
 near the top under instantaneous raw scoring — recorded selection is dominated by belief/hysteresis
 **retention**, not fresh signal. These are pinned as red TDD tests + a golden digest
-(`tests/selection_replay.rs`, `baseline_golden.json`).
+(`tests/selection_replay.rs`, `tests/selection_replay_data/baseline_golden.json`).
 
 ### 25.2 Anatomy — the junk is single-group spikes; the gallery is healthy
 

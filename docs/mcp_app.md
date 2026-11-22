@@ -295,7 +295,7 @@ read the same way by the member a later call reaches.
 
 **Missions as npcd keeps them.** A character holds one open mission, a queue,
 and its last finished one. Missions have no ids, and only the open one can be
-cancelled (`npcd/src/sim/missions.rs`). So a tool names a mission by its
+cancelled (`npcd/src/sim/missions/close.rs`). So a tool names a mission by its
 character. Giving one with `start` replaces whatever the character was
 carrying.
 

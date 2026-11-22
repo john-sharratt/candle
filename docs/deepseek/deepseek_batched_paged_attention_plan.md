@@ -71,13 +71,13 @@ the current **single-session prototype** (`latent_moe/engine.rs`, host `Vec<Tens
 
 - `latent_moe/engine.rs` (`latent_moe::Engine`) is a **single-session reference** — one conversation, KV as
   host `Vec<Tensor>`, dense attention in Rust tensor ops. Correct + green ("Paris"), fully int8.
-- The production batched path already exists for Qwen3-MoE: `latent_moe/batched.rs` implements
+- The production batched path already exists for Qwen3-MoE: `quantized_qwen3_moe/model.rs` implements
   `BatchedModelCore` + `BatchedAttentionLayer`, drives the **paged INT8 attention kernels**
   (`paged-decode/`, `paged-prefill/`) over an **arena KV cache** (`candle-nn/kv_cache/chunked/`),
   batching ~64 sessions spatially across the grid. **DeepSeek must join this path.** The int8 weight
   work done already carries over unchanged.
 
-_Reuse audit (built components): int8-KO forward reused verbatim (`forward_via_int8` mod.rs:2361, `dense_qmatmul` cuda.rs:5255). `QLinear` (latent_moe/linear.rs:10) Quant/Int8 arms overlap the transformers `QMatMul` wrapper (quantized_matmul.rs:18) — only its `Dense` reference arm is additive (a fold-able cleanup). MXFP4_KO (ko_quant.rs:25), Sinkhorn (sinkhorn.cu:27), `prepare_ko_gguf` (reuses `repack_to_host` cuda.rs:3886), and the Compressor/Indexer/mHC math are NOVEL — no prior art._
+_Reuse audit (built components): int8-KO forward reused verbatim (`forward_via_int8` mod.rs:2361, `dense_qmatmul` candle-core/src/quantized/cuda/dense_matmul.rs:5255). `QLinear` (latent_moe/linear.rs:10) Quant/Int8 arms overlap the transformers `QMatMul` wrapper (quantized_matmul.rs:18) — only its `Dense` reference arm is additive (a fold-able cleanup). MXFP4_KO (ko_quant.rs:25), Sinkhorn (sinkhorn.cu:27), `prepare_ko_gguf` (reuses `repack_to_host` candle-core/src/quantized/cuda/repack_host.rs:3886), and the Compressor/Indexer/mHC math are NOVEL — no prior art._
 
 ---
 
@@ -204,7 +204,7 @@ now wrapping the model's native selector instead of a dense attention.
 
 **Cadence (what keeps the one-readback rule intact):** the two stages run on different clocks.
 **BDP recall is asynchronous shortlist maintenance** — per-turn / periodic, off the decode hot path
-(the paged GPU BDP scan, `gallery_arena/scan.rs::run_batched_bdp_scan`), refreshing which corpus
+(the paged GPU BDP scan, `candle-kernels/src/provenance/api.rs::run_batched_bdp_scan`), refreshing which corpus
 entries sit in the `FloatGalleryArena` hot tier. **Indexer precision is per-token and fully
 on-device** — the float re-score runs over that resident shortlist and yields a device index tensor
 the decode kernel walks directly (§G.4). Neither stage reads back to the host; the current per-token
@@ -255,7 +255,7 @@ only the reorder-dependent glue is recomputed. The codebase already calls the de
 window (a glue token peeking into the first `TURN_BRIDGE_FWD_AHEAD (16)` tokens of the turn it
 introduces) is an asymmetric, semantically fuzzy special case whose quality effect is unmeasured. For
 DeepSeek we set **`fwd_ahead ≡ 0`** — glue attends **backward-unbounded, strictly causal**. This is a
-single-parameter change (`glue_bridge_window` → `0`, `projection_assembler.rs:690`); the kernel
+single-parameter change (`glue_bridge_window` → `0`, `scheduler/projection_assembler/walk.rs:690`); the kernel
 already treats `fwd_ahead==0` as pure causal, so nothing else moves. Benefits: (a) removes the
 forward "unknown"; (b) removes the dependency on the *following* turn being resident-in-place for the
 bridge — glue needs only its backward (sealed-before + earlier-glue) context; (c) **cleaner
@@ -326,7 +326,7 @@ Both write into in-place gaps at true logical positions, so the compressed-corpu
 with the dense seam — the "excellent seam between the two."
 
 **Insertion — all at the existing glue hooks (no new pipeline):**
-- **Assembly-time** (`projection_assembler.rs::apply_segments_build` / `SegmentWalker`,
+- **Assembly-time** (`scheduler/projection_assembler/apply_build.rs::apply_segments_build` / `SegmentWalker`,
   `reserve_glue_island` / `glue_bridge_window`) — the one point that sees the reassembled adjacency:
   attach a **compression-merge descriptor** to the `GapFillPlan` alongside `glue_write_slice`/
   `fwd_ahead` (which boundary group, its persisted partial `(m,l,acc)`, and the boundary tokens that
@@ -396,15 +396,15 @@ variance can't leak into the sealed nodes below.
 
 **Touch-points + caveat.** Add a build-time static-interior/seam flag on `TreeGlue`; seal
 static-interior glue per branch (the build-time cross-product sealing AND the runtime
-`add_section_to_collection` per-branch allocation, `builder.rs:753-791`, must stay in lockstep); emit
-`Sealed` for it in the tree arm of `emit_system_prompt_items` (`project.rs:1803-1879`); keep seam
+`add_section_to_collection` per-branch allocation, `candle-conversation/src/projection/builder/sections.rs:753-791`, must stay in lockstep); emit
+`Sealed` for it in the tree arm of `emit_system_prompt_items` (`candle-conversation/src/projection/project/emit.rs:1803-1879`); keep seam
 glue on the `Generated` path (`push_member_glue`). **Caveat:** the new sealed glue ids must be
 counted by the `pack`/`ancestors` accounting and the `all_section_ids`/`is_collection_member` walks,
 and nodes-below prefixes shift — so the two sealing sites move together. This is a **shared-engine**
 improvement (it helps Qwen too), gated behind the same dialect/config; it is not DeepSeek-specific,
 but DeepSeek benefits from it directly.
 
-_Prior art: EXTEND — reuse the per-branch seal + `TreeVariant` (schema.rs:423, builder.rs:762, `TreeOption.variants` :409); give `TreeGlue` (:331) a `variants` vec routed through it. A sealed glue drops prefix-transparency (the intended static-interior semantic) — a new node mode over existing seal/inject primitives, not a rewrite._
+_Prior art: EXTEND — reuse the per-branch seal + `TreeVariant` (projection/schema/system_prompt.rs:423, projection/builder/sections.rs:762, `TreeOption.variants` :409); give `TreeGlue` (:331) a `variants` vec routed through it. A sealed glue drops prefix-transparency (the intended static-interior semantic) — a new node mode over existing seal/inject primitives, not a rewrite._
 
 ---
 
@@ -412,8 +412,8 @@ _Prior art: EXTEND — reuse the per-branch seal + `TreeVariant` (schema.rs:423,
 
 ## 1. `qtensor_from_ggml`: build the real GPU-repack path (not the byte-copy)
 
-**Finding.** The GPU repack primitive already exists: `QCudaStorage::repack_ko` (`cuda.rs:3713`)
-does dequantize-on-device → `run_quantize_ko`, and is used by `repack_to_host` (`cuda.rs:3916`, the
+**Finding.** The GPU repack primitive already exists: `QCudaStorage::repack_ko` (`candle-core/src/quantized/cuda/matmul_methods.rs:3713`)
+does dequantize-on-device → `run_quantize_ko`, and is used by `repack_to_host` (`candle-core/src/quantized/cuda/repack_host.rs:3916`, the
 expert-staging path) and by `QMatMul::repack_for_optimization` (the loader's int8 path). The
 `qtensor_from_ggml` KO arm I added only handles the case where the on-disk bytes are **already** KO
 (offline-prepared, via `load_repacked` — a byte copy borrowed from the swap-file helpers). It cannot
@@ -530,7 +530,7 @@ a clean fork is correct.
 
 The attention kernels are inherently batched (grid.x = active slots; each block reads its own
 `SlotHeader` from GPU memory, so ragged-depth sessions co-batch with no host raggedness). To use
-them, `deepseek4` must implement **`BatchedModelCore` + `BatchedAttentionLayer`** (as `batched.rs`
+them, `deepseek4` must implement **`BatchedModelCore` + `BatchedAttentionLayer`** (as `quantized_qwen3_moe/model.rs`
 does for Qwen3) rather than the single-session `latent_moe::Engine`. The MoE side already has the batched,
 GPU-native dispatch (`ExpertCache` + `moe_bucketize` + `GpuDispatchTables`).
 
@@ -563,7 +563,7 @@ GPU-native dispatch (`ExpertCache` + `moe_bucketize` + `GpuDispatchTables`).
 1. **`paged-deepseek/` decode kernel** (the long pole): fork `int8_decode_kernel.cuh`, single-latent
    K≡V `KvHead` variant, hybrid loop (sequential window + index-driven compressed top-k), per-head
    sink, windowed RoPE, reusing arena_table/convert/mma/slot_types + split-KV combine. Rust op
-   wrapper mirrors `prefill_utils.rs`. Develop against a **standalone test** with synthetic arena
+   wrapper mirrors `prefill_utils/mod.rs`. Develop against a **standalone test** with synthetic arena
    KV + selection, checked vs the CPU reference.
 2. **Arena-KV window integration** — `ChunkedKvBacking` per layer, single-latent 512-d/4-palette
    layout, slot per conversation.
@@ -577,13 +577,13 @@ GPU-native dispatch (`ExpertCache` + `moe_bucketize` + `GpuDispatchTables`).
 5. **`paged-deepseek/` GLUE kernel + compression-seam merge (§E)** — fork `paged_glue_kernel.cuh`
    for single-latent K≡V, **causal-only** (`fwd_ahead ≡ 0` via `glue_bridge_window → 0`, so the fork
    drops the forward-window path entirely), and add the boundary compressed-group fold: attach a
-   compression-merge descriptor on the `GapFillPlan` (`projection_assembler.rs`), reserve the
+   compression-merge descriptor on the `GapFillPlan` (`scheduler/projection_assembler/apply.rs`), reserve the
    finalized entry's gap, thread it via `PendingGlue`/`GlueMeta`, and in the forked glue kernel run
    the compressor on the boundary tokens + LSE-fold with the persisted `(m,l,acc)` + scatter the
    entry. Co-batched in the `[decode|prefill|glue]` wave. (Also: drop the stale `col_actual_pos`
    doc-comment in `paged-glue/api.rs:22`.)
 6. **`BatchedModelCore` for DeepSeek** — assemble the batched engine.
-   _Prior art: REUSE — `BatchedModelCore` (batched_model.rs:98) + `BatchedAttentionLayer` (batched_layer.rs:232); `latent_moe/batched.rs:761` (Qwen3) is the template._
+   _Prior art: REUSE — `BatchedModelCore` (batched_model/model_core.rs:98) + `BatchedAttentionLayer` (batched_layer/mod.rs:232); `quantized_qwen3_moe/model.rs:761` (Qwen3) is the template._
 
 ---
 
@@ -723,7 +723,7 @@ HD=512 the `q_reg`+`o_reg` per glue token is large, so **`GLUE_G_TILE=1–2`**, 
 threads (32 F32/thread), glue runs fanned across `gridDim.z`.
 
 **+ compression fold (§C/§E) — the LSE monoid operator is IMPLEMENTED host-side**
-(`compressor.rs::GroupPartial`: `identity` / `fold(scores,kvs)` / `merge` / `finalize`, proven by
+(`latent_moe/compressor/pool.rs::GroupPartial`: `identity` / `fold(scores,kvs)` / `merge` / `finalize`, proven by
 `group_partial_seam_fold_matches_whole` — a group's pooling rows cut at every interior seam and
 re-merged equal the single-shot softmax pool, and the identity law holds). The glue kernel transcribes
 this same per-channel recurrence in-register. The glue forward already recomputes the boundary
@@ -765,8 +765,8 @@ longer matches this model), and gives each build-order step its concrete test + 
 
 ## H. The compression harness no longer matches this model (the C0–C10 mismatch)
 
-The Qwen harness measures KV compression with `InferenceMode` C0–C10 (batched_inference.rs:57) and
-`compression_ratio_by_sequences` → `16.0 / bpe` (batched_inference.rs:2611). Both assume Qwen's KV
+The Qwen harness measures KV compression with `InferenceMode` C0–C10 (batched_inference/inference_mode.rs:57) and
+`compression_ratio_by_sequences` → `16.0 / bpe` (batched_inference/stats.rs:2611). Both assume Qwen's KV
 shape: **per-head 128-d K and V, format-selected per 32-token block** against cosine thresholds. None
 of that is true for DeepSeek:
 
@@ -838,7 +838,7 @@ bounded window + a pooled corpus.
    mirrored by `table_sincos`); and the kernel quantizes int8 from roped f32 registers while PV reads the bf16-staged
    latent — the mirror keeps both (zero-rope tests cannot catch this: fp8 ⊂ bf16). Device-vs-mirror
    bit probes for `ds_exp`/`ds_sincos` + a nullable kernel stage-dump are permanent regression
-   infrastructure (`latent_moe/paged.rs`)._
+   infrastructure (`latent_moe/paged/mod.rs`)._
 3. **Engine vs CPU reference** — `engine_generate_paris_fast` (engine.rs:532) still answers Paris
    after each kernel is swapped into `latent_moe::Engine`. The engine is kept solely as this rung's harness
    (Decisions-locked: numeric golden, not a product path).

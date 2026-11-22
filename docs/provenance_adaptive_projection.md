@@ -33,7 +33,7 @@ projection events:
 | Turn | Outcome | Projection evidence |
 |---|---|---|
 | "Give me a tour of the codebase" | Confabulated "TLS/SQL session test suite" | `structure` turns WERE selected — but they were ~27-token cluster stubs (two of ~460 tokens late in decode), drowned by the tools catalog + random scopes the model narrated as the codebase. (Earlier analysis said "zero structure turns"; the exported events corrected this — the GUI just couldn't render them, their conversation being token-less.) |
-| "tell me what the ModelBuilder struct does" | "no codebase context has been provided" | Freshly selected scopes were `candle-nn/src/ops.rs` **lines 1275–1276 (a two-line `#[cfg]` fragment)** and `zend/src/session.rs` 1285–1380 (a *call site* of `.builder()`). The definition in `candle-conversation/src/models/builder.rs` never surfaced. |
+| "tell me what the ModelBuilder struct does" | "no codebase context has been provided" | Freshly selected scopes were `candle-nn/src/ops/` **lines 1275–1276 (a two-line `#[cfg]` fragment)** and `zend/src/session/` 1285–1380 (a *call site* of `.builder()`). The definition in `candle-conversation/src/models/builder/mod.rs` never surfaced. |
 | "what questions did i ask" | Dropped the first question | 12 irrelevant scope turns interleaved with 7 dialogue turns diluted self-history. |
 | Scope turns generally | Model believes the *user pasted* the code | Scope turns render as raw calibration dialogue ("Summarize `glm4/main.rs` …" + `<tool_response>`), so the model attributes them to the user. |
 
@@ -89,10 +89,10 @@ This section is the ground truth the design builds on. File:line refs are to the
   (`provenance/scan.rs:81-183`). Group votes are **summed** (additive late
   fusion) — the vulnerability Concept G addresses.
 - **Section collections** (tools): `score_belief_collections`
-  (`projection/resolver.rs:467`) → `set_section`. **Raw votes, no normalization.**
+  (`projection/resolver/belief_collections.rs:467`) → `set_section`. **Raw votes, no normalization.**
   Thresholds (`committed_tool_scope` min 800 / evict 600) are on the raw scale.
 - **Turn groups** (repo_map clusters, code scopes): `score_belief_groups`
-  (`resolver.rs:820`) → per-exchange sub-windows → **hit-level normalization**
+  (`projection/resolver/belief_groups.rs:820`) → per-exchange sub-windows → **hit-level normalization**
   (`normalization/`, EWMA α↑ 0.30 / α↓ 0.02, 0–1000 band, scope =
   `TurnGroup{group, timeline}`, child = exchange head-turn) → `set_turn`
   (`resolver.rs:1115`). `observe` (learning) fires once per turn at seal;
@@ -101,10 +101,10 @@ This section is the ground truth the design builds on. File:line refs are to the
   min/evict + `GroupBudget{min,max}`, `provenance/gather.rs:80`), with cross-turn
   carry `PriorBelief` (decayed ×0.5 at turn boundaries,
   `scheduler/mod.rs:683,2651`), a turn-boundary challenger
-  (`project.rs:441`), and an early-decode carry floor ("lock-on",
+  (`projection/project/belief.rs:441`), and an early-decode carry floor ("lock-on",
   `policy.rs:172`, `selection.rs:119`).
 - **Layers are not scored.** Layers are token-distribution only: two-level flexbox
-  (`project.rs:1385-1454`, `reconcile.rs:131`) splits `layer.window` by static
+  (`projection/project/pipeline/sink.rs:1385-1454`, `reconcile.rs:131`) splits `layer.window` by static
   `budget {priority, min_percent, max_percent}`.
 
 ### 2.2 Linked turns (already shipped)
@@ -118,10 +118,10 @@ exchange.
 The coupling holds on **both** sides of the pipeline, and for a long time it held
 only on the first:
 
-- **Scoring** (`resolver.rs`, `belief_scores`): the scan aggregates every
+- **Scoring** (`projection/resolver/belief_scoring.rs`, `belief_scores`): the scan aggregates every
   sub-window of every member into one case and stamps each member with the
   shared score.
-- **Selection** (`project.rs`, `ContentResolver::group_exchanges`): a group's
+- **Selection** (`projection/resolver/targeted_read.rs`, `ContentResolver::group_exchanges`): a group's
   candidates ARE exchanges. `exchange_candidates` collapses the turn list to one
   representative per run, priced at the sum of its members; the rules
   (`top_k`, `single`, `always_visible`, `conversation`), the belief step, and the
@@ -222,8 +222,8 @@ everywhere, (b) Concept B can compare attention *across* layers and collections.
 - scope = `ScopeKey::collection(collection_name)`, child = `ChildKey::Named(section
   name)`;
 - `normalize` on every reprojection, `observe` only at seal (same
-  read/learn split as turn groups, `resolver.rs:1100-1107`);
-- warm replay (`ensure_normalization_warm`, `resolver.rs:648`) extends to collection
+  read/learn split as turn groups, `projection/resolver/belief_groups.rs:1100-1107`);
+- warm replay (`ensure_normalization_warm`, `projection/resolver/warm_replay.rs:648`) extends to collection
   scopes so a daemon restart does not reset tool scoring to priors.
 
 **Threshold migration.** `committed_tool_scope` min 800 / evict 600 are raw-scale;
@@ -383,13 +383,13 @@ effective_priority(ℓ) = priority(ℓ) × (1 + gain × Σ_g mass(g) / 1000)
 clamped by the layer's declared `min_percent` / `max_percent` — the YAML bounds stay
 the outer authority; adaptivity only moves allocations *between* those rails. Same
 formula one level down for groups inside a layer. `FlexItem` construction
-(`project.rs:1424-1454`) is the only integration point; `flexbox_distribute` itself
+(`projection/project/pipeline/sink.rs:1424-1454`) is the only integration point; `flexbox_distribute` itself
 is untouched.
 
 ### B.3 Member-budget modulation (belief budget / top-k)
 
 `GroupBudget.max` (and the TopK→budget mapping in `belief_config`,
-`schema.rs:918-933`) gains a mass-driven extension:
+`projection/schema/selection.rs:918-933`) gains a mass-driven extension:
 
 ```
 effective_max = clamp(base_max + floor(mass / per_extra), base_max, absolute_max)
@@ -496,7 +496,7 @@ bound the feedback.
 
 **Goal:** whenever any exchange of a code file's conversation is selected, the
 file's *first* exchange rides along — it is the `ChunkKind::FileHeader` scope
-(module doc / license / file-overview comment, `zend/src/code_read/types.rs:22-28`,
+(module doc / license / file-overview comment, `doc-units/src/carve/types.rs:22-28`,
 always the first scope, never merged forward), followed by the import scopes. The
 model reading `builder.rs:250-310` without the imports and module doc is reading
 context-free code.
@@ -757,7 +757,7 @@ default_policy:
     concentration_rho: 2.0   # per group/collection policy). Shipped values (F18).
 ```
 
-Parsing lands in `yaml.rs` beside the existing `parse_selection`/`parse_default`;
+Parsing lands in `projection/yaml/parse_groups.rs` beside the existing `parse_selection`/`parse_default`;
 validation (rails: `adaptive.max_percent ≥ max_percent ≥ min_percent`,
 `absolute_max ≥ k`, `decay ∈ (0,1]`, `gain ≥ 0`,
 `concentration_rho ≥ 0`, fusion ∈ the three modes) in `validate_policy`'s
@@ -837,7 +837,7 @@ so learned levels are reproducible.
     { "probe": "datetime",   "expect": { "collection_top1": "datetime" } },
     { "probe": "sqrt",       "expect": { "collection_top1": "calculator" } },
     { "probe": "ModelBuilder", "expect": {
-        "must_select_file": "candle-conversation/src/models/builder.rs",
+        "must_select_file": "candle-conversation/src/models/builder/mod.rs",
         "anchor_present": true,
         "mass_order": ["code_reading", "repo_map"] } },
     { "probe": "recall",     "expect": { "max_scope_turns": 4 } }
