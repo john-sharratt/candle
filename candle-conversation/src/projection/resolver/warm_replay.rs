@@ -76,15 +76,52 @@ impl Conversation {
         };
         probes.sort_by_key(|(tl, idx, _)| (*tl, *idx));
         let start = probes.len().saturating_sub(WARM_REPLAY_MAX_TURNS);
-        Some(
-            probes
-                .drain(start..)
-                .map(|(tl, idx, probe)| WarmProbe {
-                    source: turn_stream_id(tl, idx).0,
-                    probe,
-                })
-                .collect(),
-        )
+        let replay: Vec<WarmProbe> = probes
+            .drain(start..)
+            .map(|(tl, idx, probe)| WarmProbe {
+                source: turn_stream_id(tl, idx).0,
+                probe,
+            })
+            .collect();
+        self.warm_replay_progress.add(replay.len());
+        Some(replay)
+    }
+
+    /// The target a replay queued at load scores for: the timeline of the
+    /// last turn the replay would take — the last sealed dialogue turn by
+    /// `(timeline, turn index)`, as [`Self::take_warm_replay`] orders them —
+    /// with that timeline's layer and group. `None` when no dialogue turn
+    /// carries a signature, or its timeline is unregistered or on an
+    /// append-only layer (which never arms the replay).
+    pub fn warm_replay_target(&self) -> Option<ProjectionTarget> {
+        let sub = self.inner.read();
+        let (tl, _) = sub
+            .dialogue_turn_streams()
+            .filter(|turn| turn.runtime.wide_q_sigs.is_some())
+            .map(|turn| (turn.decl.timeline_id, turn.index.0))
+            .max()?;
+        let timeline = TimelineId::from_raw(tl)?;
+        let (layer, group) = sub.timeline_target(timeline)?;
+        if sub.is_append_only_layer(layer) {
+            return None;
+        }
+        Some(ProjectionTarget {
+            layer,
+            group,
+            timeline,
+        })
+    }
+
+    /// `(scored, total)` of the replay now draining — `None` once every turn
+    /// it handed out has been scored.
+    pub fn warm_replay_progress(&self) -> Option<(usize, usize)> {
+        self.warm_replay_progress.snapshot()
+    }
+
+    /// `n` handed-out replay turns that will never be scored: the scheduler
+    /// dropped them when this substrate detached.
+    pub fn warm_replay_dropped(&self, n: usize) {
+        self.warm_replay_progress.dropped(n);
     }
 
     /// Re-arm the normalization warm-up (see [`Self::take_warm_replay`]) so the
@@ -131,5 +168,6 @@ impl Conversation {
                 arena,
             );
         }
+        self.warm_replay_progress.scored_one();
     }
 }

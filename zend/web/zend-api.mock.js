@@ -264,6 +264,7 @@
     // the real daemon's counters (which reset to zero at that exact instant,
     // so a client never observes a `processed === total` frame).
     _ingestBacklogCalls: 0,
+    _normalizingCalls: 0,
     getStatus() {
       let ingest_backlog = null;
       if (window.__ZEND_MOCK_INGEST_BACKLOG__) {
@@ -290,11 +291,20 @@
           };
         }
       }
+      // `window.__ZEND_MOCK_NORMALIZING__ = true`: the score-normalization
+      // replay a load queues, draining a turn per poll from 0 of 4 and gone at
+      // 4 — beside the ingest backlog when both flags are set, as the daemon
+      // reports them independently.
+      let normalizing = null;
+      if (window.__ZEND_MOCK_NORMALIZING__) {
+        const n = this._normalizingCalls++;
+        if (n < 4) normalizing = { scored: n, total: 4 };
+      }
       // The host's shape: the process's status, with zend's own line under
       // `tenants.zend`.
       return Promise.resolve({
         state: 'ready', started_at_ms: 0, loading: null, build: 'mock',
-        tenants: { zend: { state: 'ready', loading: null, maintenance: null, ingest_backlog } },
+        tenants: { zend: { state: 'ready', loading: null, maintenance: null, ingest_backlog, normalizing } },
       });
     },
 

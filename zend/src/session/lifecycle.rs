@@ -310,6 +310,17 @@ impl ZendSession {
                             ms = t_preload.elapsed().as_millis() as u64,
                             "projection galleries preloaded"
                         );
+                        // The dialogue normalization replay, queued now rather
+                        // than at the first reprojection: the backgrounds are
+                        // runtime-only, so without it every conversation after a
+                        // restart scores against cold levels until one asks. It
+                        // drains in the background, a turn per scheduler pass,
+                        // and `/v1/status` reports it as `normalizing`.
+                        let queued = state.engine.warm_dialogue_normalization(
+                            &state.refresh_builder,
+                            state.refresh_config.reproject_max_probe_tokens,
+                        );
+                        tracing::info!(queued, "normalization replay queued at load");
                         status_tx.send(String::new()).ok();
                         // The memory's writer, when this zend serves the
                         // memory and may write: summaries, folds and closes,

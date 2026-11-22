@@ -994,4 +994,32 @@ test.describe('1.14 background ingest bar', () => {
     await expect(bar.locator('.z-ingest-item')).toBeVisible();
     await expect(bar.locator('.z-ingest-label')).toBeVisible();
   });
+
+  // The score-normalization replay a load queues takes the strip when no
+  // ingest backlog is showing, counts its turns down, and clears when done.
+  test('the normalization replay shows its own bar and clears when warm', async ({ page }) => {
+    await page.addInitScript(() => { window.__ZEND_MOCK_NORMALIZING__ = true; });
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await boot(page, { conv: '1' });
+    const bar = page.locator('#zend-ingest');
+    await expect(bar).toBeVisible();
+    await expect(bar).toHaveAttribute('data-kind', 'normalizing');
+    await expect(bar.locator('.z-ingest-label')).toHaveText('Normalizing');
+    await expect(bar.locator('.z-ingest-count')).toContainText('turns left');
+    await expect(bar).toHaveCount(0, { timeout: 10000 });
+  });
+
+  // With both reported, the ingest backlog has the strip; the replay takes
+  // it once the backlog clears.
+  test('the ingest backlog outranks the normalization bar', async ({ page }) => {
+    await page.addInitScript(() => {
+      window.__ZEND_MOCK_FACES_BACKLOG__ = true;
+      window.__ZEND_MOCK_NORMALIZING__ = true;
+    });
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await boot(page, { conv: '1' });
+    const bar = page.locator('#zend-ingest');
+    await expect(bar).toHaveAttribute('data-kind', 'ingest');
+    await expect(bar.locator('.z-ingest-label')).toHaveText('Sealing faces');
+  });
 });

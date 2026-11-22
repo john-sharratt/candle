@@ -475,8 +475,13 @@ evicted.
 
 ### 4.4 Warm-on-load
 
-The cache is **not** left cold on restart. At the first projection of a
-dialogue target after load, `Conversation::take_warm_replay` hands back the
+The cache is **not** left cold on restart. The daemon queues the replay as
+its load finishes, after the galleries are preloaded
+(`ConversationEngine::warm_dialogue_normalization` →
+`SchedulerRequest::WarmDialogueNormalization`), for the target of the last
+dialogue turn the replay takes (`Conversation::warm_replay_target`); a
+projection of a dialogue target asks for it too, which queues it when a
+reconcile has re-armed it. `Conversation::take_warm_replay` hands back the
 substrate's existing **sealed dialogue turns** (empty-tagged; gallery turns are
 tagged), and the scheduler scores each with `Conversation::score_warm_probe`
 through the same turn-group scan with `Observe::Yes`, on its gallery arena in the
@@ -492,6 +497,11 @@ answer, and scored against the gallery without it (§3.1). Details that matter:
   the replay is still scoring may read a still-warming cache; the once-per-turn
   seal-observe keeps warming it. A replay is never armed from an ingest-time
   (append-only target) scoring pass.
+- **Shown while it drains.** The turns handed out are counted in, and out as
+  each is scored or dropped with a detaching substrate
+  (`Conversation::warm_replay_progress`); `/v1/status` reports the count as
+  `normalizing: { scored, total }` and the GUI draws it in the bottom strip
+  whenever no ingest backlog or tool-output read has a bar up.
 - **Order-free.** A background is counts, so the warmed state does not depend on
   the order turns are folded in.
 - **Bounded cost.** Only the most recent `WARM_REPLAY_MAX_TURNS` (512) turns are

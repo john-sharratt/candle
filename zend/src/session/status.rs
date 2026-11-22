@@ -30,6 +30,9 @@ pub struct StatusSnapshot {
     /// uploads, which share the same per-file pool). `None` when the queue is
     /// empty — the GUI hides its bar on this.
     pub ingest_backlog: Option<crate::ingest_backlog::BacklogSnapshot>,
+    /// `(scored, total)` of the dialogue normalization replay while it drains
+    /// after a load or a re-arm; `None` once the score backgrounds are warm.
+    pub normalizing: Option<(usize, usize)>,
 }
 
 impl ZendSession {
@@ -45,6 +48,10 @@ impl ZendSession {
             detail: self.status_rx.borrow().clone(),
             started_at_ms: self.started_at_ms,
             ingest_backlog: crate::ingest_backlog::snapshot(),
+            normalizing: self
+                .inference
+                .load_full()
+                .and_then(|state| state.engine.warm_replay_progress()),
         }
     }
 

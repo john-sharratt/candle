@@ -646,6 +646,17 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<CollectionWarm>,
     },
 
+    /// Queue the dialogue normalization replay ([`Conversation::take_warm_replay`])
+    /// for `target` when it is armed, so a load re-learns the score backgrounds
+    /// without waiting for a first reprojection to ask. Scored in the gaps a
+    /// dialogue leaves, one turn per loop iteration (`norm_warm`); no reply.
+    WarmDialogueNormalization {
+        conversation: Conversation,
+        projection: Arc<Builder>,
+        target: ProjectionTarget,
+        max_probe_tokens: usize,
+    },
+
     /// Decode and place on this thread's GPU gallery arena everything a
     /// projection's belief scan reads ([`Conversation::preload_galleries`]),
     /// so the first projection after a start finds it all resident.
@@ -770,6 +781,7 @@ impl SchedulerRequest {
             Self::AttachSubstrate { .. } => "req:attach_substrate",
             Self::DetachSubstrate { .. } => "req:detach_substrate",
             Self::WarmCollectionNormalization { .. } => "req:warm_collection_normalization",
+            Self::WarmDialogueNormalization { .. } => "req:warm_dialogue_normalization",
             Self::PreloadGalleries { .. } => "req:preload_galleries",
             Self::WarmIngestSlice { .. } => "req:warm_ingest_slice",
             Self::ScanGroupVotes { .. } => "req:scan_group_votes",

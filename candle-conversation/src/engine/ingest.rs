@@ -139,6 +139,39 @@ impl ConversationEngine {
         rx.recv().unwrap_or_default()
     }
 
+    /// Queue the dialogue normalization replay now, rather than at the first
+    /// reprojection that would ask for it, so a restarted daemon re-learns its
+    /// score backgrounds before conversations need them. Returns at once; the
+    /// scheduler scores the replay a turn per loop iteration, and
+    /// [`Self::warm_replay_progress`] reports how far it has got. Scored for
+    /// the timeline of the last dialogue turn the replay takes
+    /// ([`Conversation::warm_replay_target`]); returns whether one was sent —
+    /// `false` with no dialogue turn to replay, or the scheduler gone.
+    pub fn warm_dialogue_normalization(
+        &self,
+        projection: &Builder,
+        max_probe_tokens: usize,
+    ) -> bool {
+        let Some(target) = self.conversation.warm_replay_target() else {
+            return false;
+        };
+        self.core
+            .scheduler_tx
+            .send(SchedulerRequest::WarmDialogueNormalization {
+                conversation: self.conversation.clone(),
+                projection: Arc::new(projection.clone()),
+                target,
+                max_probe_tokens: max_probe_tokens.max(1),
+            })
+            .is_ok()
+    }
+
+    /// `(scored, total)` of the dialogue normalization replay now draining;
+    /// `None` when none is.
+    pub fn warm_replay_progress(&self) -> Option<(usize, usize)> {
+        self.conversation.warm_replay_progress()
+    }
+
     /// Preload what a projection's belief scan reads — every scanned group's
     /// signatures and every collection's gallery, decoded and resident on the
     /// GPU gallery arena — so the first projection after a start does none of

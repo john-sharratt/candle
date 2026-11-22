@@ -637,6 +637,9 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // `ingest_backlog`) — `{ processed, total, last_item }`, or null when
     // there is none to show.
     ingestBacklog: null,
+    // The score-normalization replay draining after a load (GET /v1/status
+    // `normalizing`) — `{ scored, total }`, or null once it is warm.
+    normalizing: null,
     // `connecting` until the daemon first answers (a quiet splash); the startup
     // card only when it reports that it is actually loading.
     boot: { state: 'connecting' },
@@ -3258,15 +3261,47 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       itemTxt: item.length > INGEST_ITEM_MAX ? '…' + item.slice(-(INGEST_ITEM_MAX - 1)) : item,
     };
   }
+  // The score-normalization replay a load queues (GET /v1/status
+  // `normalizing`: `{ scored, total }` turns): retrieval ranks against cold
+  // backgrounds until it drains, so the strip says so. It shares the ingest
+  // strip's place and look, and shows only when nothing else is drawing a
+  // bar — no ingest backlog, and no tool output being read in the open
+  // conversation — so the bottom of the page carries one bar at a time.
+  function normalizingView(n) {
+    const total = n.total || 0;
+    const processed = Math.min(n.scored || 0, total);
+    return {
+      total, processed,
+      pct: total > 0 ? Math.round((processed / total) * 100) : 0,
+      label: 'Normalizing',
+      left: Math.max(0, total - processed).toLocaleString() + ' turns left',
+      item: '',
+      itemTxt: 'Warming retrieval scores',
+    };
+  }
+  function prefillShowing() {
+    const c = activeConv();
+    const last = c && c.history && c.history[c.history.length - 1];
+    return !!(last && last.streaming && last.prefill);
+  }
+  // Which strip the bottom of the page shows, if any: `{ kind, v }`.
+  function bottomBar() {
+    if (S.ingestBacklog) return { kind: 'ingest', v: ingestView(S.ingestBacklog) };
+    if (S.normalizing && !prefillShowing()) return { kind: 'normalizing', v: normalizingView(S.normalizing) };
+    return null;
+  }
+  function barAria(kind, v) {
+    return kind === 'ingest' ? 'Workspace ' + v.label.toLowerCase() + ' backlog' : 'Retrieval score warm-up';
+  }
   function buildIngestBar() {
-    const b = S.ingestBacklog;
-    if (!b) return null;
-    const v = ingestView(b);
+    const bar = bottomBar();
+    if (!bar) return null;
+    const v = bar.v;
     // Narrow: the count alone, against the fill. There is no room for a path
     // on a phone, and the eyebrow would cost more width than it explains.
-    return h('div', { id: 'zend-ingest', class: 'z-ingest', style: 'padding:0.3rem ' + (S.narrow ? '0.85rem' : '2rem') + ' 0.35rem;' },
+    return h('div', { id: 'zend-ingest', class: 'z-ingest', 'data-kind': bar.kind, style: 'padding:0.3rem ' + (S.narrow ? '0.85rem' : '2rem') + ' 0.35rem;' },
       S.narrow ? null : h('span', { class: 'z-ingest-label' }, v.label),
-      h('div', { class: 'z-ingest-track', role: 'progressbar', 'aria-label': 'Workspace ' + v.label.toLowerCase() + ' backlog', 'aria-valuemin': '0', 'aria-valuemax': String(v.total), 'aria-valuenow': String(v.processed) },
+      h('div', { class: 'z-ingest-track', role: 'progressbar', 'aria-label': barAria(bar.kind, v), 'aria-valuemin': '0', 'aria-valuemax': String(v.total), 'aria-valuenow': String(v.processed) },
         h('div', { class: 'z-ingest-fill', style: 'width:' + v.pct + '%;' })),
       S.narrow ? null : h('span', { class: 'z-ingest-item', title: v.item || null }, v.itemTxt),
       h('span', { class: 'z-ingest-count' }, v.left));
@@ -3278,15 +3313,18 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // (`liveUpdateStreaming`) — and nothing outside this strip reads the
   // backlog. Falls back to a full render if the strip isn't in the DOM
   // (it just appeared or disappeared), exactly as the streaming patch does.
+  // A strip of a different kind than the one on screen (the backlog ended
+  // under a draining replay, a tool read began) is a layout change: rebuilt.
   function patchIngestBar() {
-    const b = S.ingestBacklog;
+    const want = bottomBar();
     const bar = document.getElementById('zend-ingest');
-    if (!b || !bar) { render(); return; }
-    const v = ingestView(b);
+    if (!want && !bar) return;
+    if (!want || !bar || bar.getAttribute('data-kind') !== want.kind) { render(); return; }
+    const v = want.v;
     const track = bar.querySelector('.z-ingest-track');
     track.setAttribute('aria-valuemax', String(v.total));
     track.setAttribute('aria-valuenow', String(v.processed));
-    track.setAttribute('aria-label', 'Workspace ' + v.label.toLowerCase() + ' backlog');
+    track.setAttribute('aria-label', barAria(want.kind, v));
     bar.querySelector('.z-ingest-fill').style.width = v.pct + '%';
     bar.querySelector('.z-ingest-count').textContent = v.left;
     const label = bar.querySelector('.z-ingest-label');
@@ -4914,6 +4952,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
         // poll that unlocked the chat, so the bar is there on the first real
         // paint instead of up to a cadence later.
         S.ingestBacklog = zendLine(st).ingest_backlog || null;
+        S.normalizing = zendLine(st).normalizing || null;
         // The chat is already on screen and this is the same process: put it
         // back. Re-fetching every conversation here is the freeze after a
         // status blip.
@@ -5040,15 +5079,15 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       // Presence changes the layout (the chat gives up the strip's height),
       // so appearing or clearing needs the full rebuild; a counter tick does
       // not.
-      const hadBacklog = !!S.ingestBacklog;
       S.ingestBacklog = zendLine(st).ingest_backlog || null;
-      const backlogToggled = hadBacklog !== !!S.ingestBacklog;
+      S.normalizing = zendLine(st).normalizing || null;
       // The sidebar keeps its own 5s cadence even when the status poll runs
       // at 1s for the backlog bar: it is a second endpoint per tick, and
       // the conversation list has not started changing any faster.
       if (Date.now() - lastListSync >= SYNC_IDLE_MS) { lastListSync = Date.now(); refreshConversationList(); }
-      if (backlogToggled || JSON.stringify(m) !== prevM) render();
-      else if (S.ingestBacklog) patchIngestBar();
+      // `patchIngestBar` rebuilds when a strip appears, clears or changes kind.
+      if (JSON.stringify(m) !== prevM) render();
+      else patchIngestBar();
     }).catch((e) => {
       if (gen !== statusGen || document.hidden || isAbort(e)) return;
       const decision = decideStatus({
@@ -5092,7 +5131,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   function scheduleSync(delay) {
     clearTimeout(syncTimer);
     if (document.hidden) return;
-    const wait = delay != null ? delay : (S.ingestBacklog ? SYNC_BUSY_MS : SYNC_IDLE_MS);
+    const wait = delay != null ? delay : (S.ingestBacklog || S.normalizing ? SYNC_BUSY_MS : SYNC_IDLE_MS);
     syncTimer = setTimeout(() => { Promise.resolve(periodicSync()).then(scheduleSync, scheduleSync); }, wait);
   }
   function onPageHidden() {

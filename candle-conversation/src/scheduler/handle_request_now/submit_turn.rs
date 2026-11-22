@@ -1101,6 +1101,18 @@ impl Scheduler {
                 true
             }
 
+            SchedulerRequest::WarmDialogueNormalization {
+                conversation,
+                projection,
+                target,
+                max_probe_tokens,
+            } => {
+                // Background work: queued here, scored from the loop top
+                // (`step_norm_warm`) one turn at a time.
+                self.queue_norm_warm(&conversation, &projection, target, max_probe_tokens);
+                true
+            }
+
             SchedulerRequest::PreloadGalleries {
                 conversation,
                 schema,

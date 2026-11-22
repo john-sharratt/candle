@@ -25,6 +25,7 @@
 //! - `warm_collection`: warm-up of section collection backgrounds.
 //! - `warm_ingest`: warm-up of ingest file and cluster backgrounds.
 //! - `warm_replay`: replay of recent dialogue turns at load.
+//! - `warm_replay_progress`: how far that replay has been scored.
 //! - `tests_belief`: belief rules, scope segmentation and policy parsing.
 //! - `tests_persistence`: directory cleanup, reopen and read-only behaviour.
 //! - `tests_recurrent_snapshot`: snapshot reads while compaction holds the owner.
@@ -178,6 +179,9 @@ pub struct Conversation {
     /// armed — once per process, and again after each
     /// [`Self::reset_normalization_warm`]. See [`Self::take_warm_replay`].
     normalization_warm: Arc<AtomicBool>,
+    /// How far the replay [`Self::take_warm_replay`] handed out has been
+    /// scored — the `/v1/status` warm-up bar.
+    warm_replay_progress: Arc<WarmReplayProgress>,
     /// The `/v1/status` maintenance indicator: `(segment_count, last_op,
     /// running)`. `running` is `true` only while a maintenance op's relocation
     /// is in flight, so the sidebar can show a live spinner (vs. a settled ✓
@@ -318,8 +322,10 @@ mod handle;
 mod warm_collection;
 mod warm_ingest;
 mod warm_replay;
+mod warm_replay_progress;
 #[cfg(test)]
 use warm_ingest::*;
+use warm_replay_progress::WarmReplayProgress;
 mod conv_state;
 mod lifecycle;
 mod log_read;

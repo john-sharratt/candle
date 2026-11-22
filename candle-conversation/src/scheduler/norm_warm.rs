@@ -182,8 +182,10 @@ impl Scheduler {
     /// having gone.
     pub(super) fn forget_norm_warm(&mut self, conversation: &Conversation) {
         let warm = &mut self.norm_warm;
+        let queued = warm.backlog.len();
         warm.backlog
             .retain(|job| !job.substrate.same_substrate(conversation));
+        conversation.warm_replay_dropped(queued - warm.backlog.len());
         warm.scans
             .retain(|scan| !scan.conversation.same_substrate(conversation));
         warm.ingest
@@ -329,6 +331,73 @@ mod tests {
 
     /// A probe window wider than any turn here: every turn replays whole.
     const WHOLE: usize = 4096;
+
+    /// **A load queues the replay without a reprojection, and its progress
+    /// counts the turns scored.** The target is the last dialogue turn's
+    /// timeline; the request queues the two dialogue turns, progress reads
+    /// `0 / 2`, `1 / 2`, then nothing once both are scored.
+    #[test]
+    fn a_load_request_queues_the_replay_and_reports_progress() {
+        use super::super::SchedulerRequest;
+
+        let dir = tempfile::tempdir().unwrap();
+        let conv = open(dir.path());
+        let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
+        let target = record_turns(
+            &conv,
+            &builder,
+            &[
+                (&[], 0xAAAA_AAAA_AAAA_AAAA, 20),
+                (&["tool", "alpha"], 0x5555_5555_5555_5555, 20),
+                (&[], 0xABAB_ABAB_ABAB_ABAB, 12),
+            ],
+        );
+        let picked = conv.warm_replay_target().expect("a dialogue target");
+        assert_eq!(
+            (picked.layer, picked.group, picked.timeline),
+            (target.layer, target.group, target.timeline)
+        );
+        assert_eq!(conv.warm_replay_progress(), None);
+
+        let (mut sched, _tx) = make_test_scheduler();
+        assert!(
+            sched.handle_request(SchedulerRequest::WarmDialogueNormalization {
+                conversation: conv.clone(),
+                projection: Arc::clone(&builder),
+                target,
+                max_probe_tokens: WHOLE,
+            })
+        );
+        assert_eq!(sched.norm_warm.backlog.len(), 2);
+        assert_eq!(conv.warm_replay_progress(), Some((0, 2)));
+        assert!(sched.step_norm_warm());
+        assert_eq!(conv.warm_replay_progress(), Some((1, 2)));
+        assert!(sched.step_norm_warm());
+        assert_eq!(conv.warm_replay_progress(), None, "drained: no bar");
+    }
+
+    /// **A detached substrate's queued replay turns leave its progress**, so
+    /// the count still settles.
+    #[test]
+    fn forgetting_a_substrate_drops_its_replay_from_the_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let conv = open(dir.path());
+        let builder = Arc::new(Builder::from_yaml(YAML).unwrap());
+        let target = record_turns(
+            &conv,
+            &builder,
+            &[
+                (&[], 0xAAAA_AAAA_AAAA_AAAA, 20),
+                (&[], 0xABAB_ABAB_ABAB_ABAB, 12),
+            ],
+        );
+        let (mut sched, _tx) = make_test_scheduler();
+        sched.queue_norm_warm(&conv, &builder, target, WHOLE);
+        assert!(sched.step_norm_warm());
+        assert_eq!(conv.warm_replay_progress(), Some((1, 2)));
+        sched.forget_norm_warm(&conv);
+        assert_eq!(conv.warm_replay_progress(), None);
+    }
 
     /// **A replayed turn probes with the window its seal scan did**: its 64
     /// head signatures and its last `max_probe_tokens`, where a turn within

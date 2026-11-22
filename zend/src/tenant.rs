@@ -199,6 +199,10 @@ impl Reports for ZendReports {
                 "ingest_backlog".into(),
                 snap.ingest_backlog.map_or(Value::Null, backlog_view),
             );
+            s.extra.insert(
+                "normalizing".into(),
+                snap.normalizing.map_or(Value::Null, normalizing_view),
+            );
             s
         }))
     }
@@ -323,6 +327,11 @@ fn backlog_view(b: BacklogSnapshot) -> Value {
     })
 }
 
+/// The dialogue normalization replay draining: `(scored, total)` turns.
+fn normalizing_view((scored, total): (usize, usize)) -> Value {
+    json!({ "scored": scored, "total": total })
+}
+
 /// The tools modes `role` may choose, by wire id in dial order, and the one a
 /// turn runs in when the caller names none — advice to the GUI's dial; the
 /// chat route resolves the same role and enforces it.
@@ -410,6 +419,15 @@ mod tests {
                 "calibrating": 4,
                 "facing": 1,
             })
+        );
+    }
+
+    /// The normalization replay's wire shape: turns scored of the total.
+    #[test]
+    fn the_normalizing_bar_keeps_its_wire_shape() {
+        assert_eq!(
+            normalizing_view((17, 512)),
+            json!({ "scored": 17, "total": 512 })
         );
     }
 

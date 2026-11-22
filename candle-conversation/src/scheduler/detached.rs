@@ -136,6 +136,7 @@ impl SchedulerRequest {
             | Self::AttachSubstrate { .. }
             | Self::DetachSubstrate { .. }
             | Self::WarmCollectionNormalization { .. }
+            | Self::WarmDialogueNormalization { .. }
             | Self::PreloadGalleries { .. }
             | Self::WarmIngestSlice { .. }
             | Self::ScanGroupVotes { .. }
@@ -161,6 +162,7 @@ impl SchedulerRequest {
             | Self::OffloadCollectionMembers { conversation, .. }
             | Self::ReconstructSubstrate { conversation, .. }
             | Self::WarmCollectionNormalization { conversation, .. }
+            | Self::WarmDialogueNormalization { conversation, .. }
             | Self::PreloadGalleries { conversation, .. }
             | Self::WarmIngestSlice { conversation, .. }
             | Self::ScanGroupVotes { conversation, .. }
