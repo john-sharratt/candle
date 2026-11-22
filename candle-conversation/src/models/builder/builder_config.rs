@@ -82,6 +82,7 @@ impl ModelBuilder {
             // Linefeed is the most reliable paragraph/section break
             // signal across chat templates and content styles.
             reproject_trigger_texts: REPROJECT_TRIGGER_TEXTS.map(String::from).to_vec(),
+            reproject_in_thinking: true,
             disable_reprojection: false,
             // Default: turns use the engine-wide compression level. Utility
             // layers override these per-conversation (e.g. code_reading → C8,

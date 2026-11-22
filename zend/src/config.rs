@@ -13,6 +13,7 @@ use zend_tools::state::Secrets;
 use zend_vfs::Workspace;
 
 use crate::branch_ingest::ignore::Ignore;
+use crate::reprojection_settings::ReprojectionSettings;
 
 use crate::tenant::requires;
 
@@ -125,6 +126,9 @@ pub struct DaemonConfig {
     /// the user's next tool round waited behind it — 18 s on one conversation,
     /// most of a minute on another.
     pub summarize: bool,
+    /// `--reproject-probe-tokens`, `--no-reproject-in-thinking`: how every
+    /// conversation the daemon opens reprojects in the middle of a decode.
+    pub reprojection: ReprojectionSettings,
     /// `ingest:` / `--no-ingest`: whether this member reads units itself, or
     /// leaves every one to another member ([`crate::ingest_holdoff`]).
     pub ingest: bool,
@@ -165,6 +169,7 @@ impl DaemonConfig {
             qsa_selection_budget: None,
             qsa_strata: StrataTokens::DEFAULT,
             summarize: false,
+            reprojection: ReprojectionSettings::default(),
             ingest: true,
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION,
             roles: Roles::default(),

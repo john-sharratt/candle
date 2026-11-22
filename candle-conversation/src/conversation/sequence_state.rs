@@ -547,6 +547,7 @@ impl Sequence {
             substrate: self.substrate.clone(),
             boundary,
             max_probe_tokens: self.config.reproject_max_probe_tokens.max(1),
+            in_thinking: self.config.reproject_in_thinking,
         })
     }
 

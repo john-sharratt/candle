@@ -70,6 +70,7 @@ pub mod repo_ads;
 pub mod repo_events;
 pub mod repo_path;
 pub mod repo_scan;
+pub mod reprojection_settings;
 pub mod resident;
 pub mod response_section;
 pub mod resume;

@@ -128,6 +128,13 @@ impl BoundaryState {
         self.in_tool_call
     }
 
+    /// Restart the counts as a boundary does, for a boundary placed outside
+    /// the rule.
+    pub fn restart(&mut self) {
+        self.since_boundary = 0;
+        self.since_cadence = 0;
+    }
+
     /// Take the stream's next `token`.
     pub fn step(&mut self, rule: &BoundaryRule, token: u32) -> Step {
         if rule.tool_call_open == Some(token) {
@@ -271,6 +278,22 @@ mod tests {
         assert!(boundaries(&t, &rule(0)).is_empty());
         let state = BoundaryState::first(&rule(0), OPEN);
         assert!(state.in_tool_call());
+    }
+
+    /// **A restart counts as a boundary**: 40 tokens, a restart, and the
+    /// cadence's next falls 64 after it, not at 64.
+    #[test]
+    fn a_restart_restarts_the_cadence() {
+        let rule = rule(64);
+        let mut state = BoundaryState::first(&rule, 100);
+        for _ in 0..39 {
+            assert_eq!(state.step(&rule, 101), Step::Quiet);
+        }
+        state.restart();
+        let fired: Vec<usize> = (1..=64)
+            .filter(|_| state.step(&rule, 101).fires())
+            .collect();
+        assert_eq!(fired, vec![64]);
     }
 
     #[test]

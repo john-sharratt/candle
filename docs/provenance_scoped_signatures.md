@@ -28,16 +28,23 @@ A boundary fires during decode (`scheduler/decode/`):
 - inside a `<tool_call>` never, its tags included: the call's tokens count
   toward neither, and `</tool_call>` re-enables the rule.
 
+The live decode adds one gate of its own (`scheduler/think_gate.rs`): with
+`reproject_in_thinking` off (zend's `reproject_in_thinking: false`), a boundary
+inside the think block does not reproject, and the committed `</think>` does,
+restarting the rule's counts as a boundary would. The gallery's cut is the
+rule's alone.
+
 At a boundary the probe is (`scheduler/mod.rs`, the reproject probe):
 
 - the turn's first `QUERY_HEAD_CHUNKS` (2) chunks — 64 tokens, the query head —
   once the trailing window has slid past them;
-- the turn's trailing chunks, at most `reproject_max_probe_tokens` (256)
-  tokens, aligned to 32-token chunks;
+- the turn's trailing chunks, at most `reproject_max_probe_tokens` tokens
+  (256 by the engine's default; zend sets 128, `reproject_probe_tokens`),
+  aligned to 32-token chunks;
 - and a second probe, the turn's user half, at most 256 tokens (Concept F).
 
-So a projection asks one line-bounded question of at most 256 tokens plus its
-head.
+So a projection asks one line-bounded question of at most the probe's reach
+plus its head.
 
 ### 1.2 How ingest cuts its gallery
 

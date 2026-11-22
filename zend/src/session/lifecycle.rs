@@ -127,6 +127,7 @@ impl ZendSession {
         let qsa_selection_budget = self.config.qsa_selection_budget;
         let qsa_strata = self.config.qsa_strata;
         let summarize = self.config.summarize;
+        let reprojection = self.config.reprojection;
         let tombstone_retention = self.config.tombstone_retention;
         let cluster = self.config.cluster.clone();
         // A ref one member or aggregator issued, any other opens
@@ -266,6 +267,7 @@ impl ZendSession {
                     qsa_selection_budget,
                     qsa_strata,
                     summarize,
+                    reprojection,
                     tombstone_retention,
                     cluster,
                     status_tx.clone(),

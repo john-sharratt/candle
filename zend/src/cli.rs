@@ -23,6 +23,7 @@ use serde::{Deserialize, Deserializer};
 use crate::branch_ingest::ignore::Ignore;
 use crate::config::{DaemonConfig, SelfCheck};
 use crate::engine_asks;
+use crate::reprojection_settings::{ReprojectionSettings, REPROJECT_PROBE_TOKENS};
 use crate::secrets;
 use crate::session::try_projection_builder;
 use crate::substrate_git::open_workspace;
@@ -163,6 +164,18 @@ pub struct ZendArgs {
     #[arg(long)]
     pub summarize: bool,
 
+    /// How many decoded tokens, back from the decode position, a
+    /// reprojection's probe takes.
+    #[arg(long, value_name = "TOKENS", default_value_t = REPROJECT_PROBE_TOKENS)]
+    pub reproject_probe_tokens: usize,
+
+    /// Whether a boundary inside a turn's think block reprojects. `false` —
+    /// `--no-reproject-in-thinking`, or `reproject_in_thinking: false` in
+    /// `motherd.yaml` — holds the block on the projection it opened on and
+    /// reprojects once at its `</think>`.
+    #[arg(long = "no-reproject-in-thinking", action = ArgAction::SetFalse)]
+    pub reproject_in_thinking: bool,
+
     /// How many days the substrate keeps a deleted conversation's tombstone
     /// before a compaction may shrink it to a 24-byte entry in the deleted set
     /// (`docs/replicated_substrate.md` §6.8). Only when the bytes are reclaimed
@@ -205,6 +218,8 @@ impl Default for ZendArgs {
             qsa_recent: StrataTokens::DEFAULT.recent,
             qsa_recent_mode: StrataTokens::DEFAULT.mode,
             summarize: false,
+            reproject_probe_tokens: REPROJECT_PROBE_TOKENS,
+            reproject_in_thinking: true,
             tombstone_retention: DEFAULT_TOMBSTONE_RETENTION_DAYS,
             secrets: None,
             ingest: true,
@@ -366,6 +381,10 @@ impl ZendArgs {
         config.qsa_selection_budget = self.qsa_selection_budget;
         config.qsa_strata = self.qsa_strata();
         config.summarize = self.summarize;
+        config.reprojection = ReprojectionSettings {
+            probe_tokens: self.reproject_probe_tokens,
+            in_thinking: self.reproject_in_thinking,
+        };
         config.ingest = self.ingest;
         config.tombstone_retention =
             Duration::from_secs(self.tombstone_retention.saturating_mul(SECONDS_PER_DAY));
@@ -531,6 +550,26 @@ mod tests {
         );
         assert!(!parse(&["--no-ingest"]).ingest);
         assert!(serde_yaml::from_str::<ZendArgs>("model: Qwen35_0_8B_Q8").is_err());
+    }
+
+    /// The probe reaches 128 tokens and think blocks reproject unless told
+    /// otherwise, by flag or by `motherd.yaml` alike.
+    #[test]
+    fn the_reprojection_settings_read_from_flags_and_yaml() {
+        let defaults = parse(&[]);
+        assert_eq!(defaults.reproject_probe_tokens, 128);
+        assert!(defaults.reproject_in_thinking);
+        let flags = parse(&[
+            "--reproject-probe-tokens",
+            "96",
+            "--no-reproject-in-thinking",
+        ]);
+        let yaml: ZendArgs =
+            serde_yaml::from_str("reproject_probe_tokens: 96\nreproject_in_thinking: false\n")
+                .unwrap();
+        assert_eq!(flags, yaml);
+        assert_eq!(flags.reproject_probe_tokens, 96);
+        assert!(!flags.reproject_in_thinking);
     }
 
     /// Every one-shot flag is a real flag of the binary — a relaunch strips

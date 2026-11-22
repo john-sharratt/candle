@@ -46,8 +46,11 @@ pub(crate) struct ReprojectionPolicy {
     /// Maximum tokens looking back from the current decode position to
     /// include in the wide-Q probe.  Caps the "thought window" — beyond
     /// this many tokens the prior reprojection already captured the
-    /// older intent.  Must be `>= 1`.  Default: 64.
+    /// older intent.  Must be `>= 1`.
     pub(crate) max_probe_tokens: usize,
+    /// Whether a boundary inside the think block reprojects
+    /// (`SequenceConfig::reproject_in_thinking`); see [`think_gate`].
+    pub(crate) in_thinking: bool,
 }
 
 impl ReprojectionPolicy {

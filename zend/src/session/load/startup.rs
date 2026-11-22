@@ -10,6 +10,7 @@
 //! than a failure. Each step reports its progress against the loading bar.
 
 use super::*;
+use crate::reprojection_settings::ReprojectionSettings;
 use candle_conversation::index_page_cache;
 
 impl InferenceState {
@@ -38,6 +39,7 @@ impl InferenceState {
         qsa_selection_budget: Option<usize>,
         qsa_strata: StrataTokens,
         summarize: bool,
+        reprojection: ReprojectionSettings,
         tombstone_retention: Duration,
         cluster: Option<Join>,
         status_tx: watch::Sender<String>,
@@ -345,6 +347,14 @@ impl InferenceState {
         // zend decodes code, not prose: every conversation it opens — dialogue,
         // passthrough, ingest — derives from this config. See `coding_sampling`.
         coding_sampling::apply(&mut conv_config.sampling);
+        // The same: every conversation decodes under the daemon's reprojection
+        // settings.
+        reprojection.apply(&mut conv_config);
+        tracing::info!(
+            probe_tokens = conv_config.reproject_max_probe_tokens,
+            in_thinking = conv_config.reproject_in_thinking,
+            "reprojection settings",
+        );
         // Every conversation — dialogue, titler, passthrough, ingest — derives
         // from this config, so this one switch covers them all. See
         // `DaemonConfig::summarize` for why summaries are opt-in.

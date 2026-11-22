@@ -11,6 +11,7 @@
 //! healed position.
 
 use super::*;
+use crate::scheduler::think_gate::{reprojects, Thinking};
 
 /// The leading tokens of a healed token, waiting to be forwarded.
 ///
@@ -853,10 +854,25 @@ impl Scheduler {
                         state.wrote_tool_call = true;
                     }
                     // A played-back turn reprojects where its recording did; a
-                    // live one where the rule fires.
-                    let fires = match state.reprojection.as_ref().map(|p| p.projection.script()) {
-                        Some(Some(script)) => script.fires_at(count),
-                        Some(None) => step.fires(),
+                    // live one where the rule fires, as the think gate lets it.
+                    let fires = match state.reprojection.as_ref() {
+                        Some(p) => match p.projection.script() {
+                            Some(script) => script.fires_at(count),
+                            None => {
+                                let thinking = Thinking::after(
+                                    next_token,
+                                    self.sampling_states
+                                        .get(&seq_id)
+                                        .is_some_and(|ss| ss.in_segment),
+                                    state.sampling_config.segment_close_token_id,
+                                );
+                                let fires = reprojects(step.fires(), thinking, p.in_thinking);
+                                if fires && !step.fires() {
+                                    state.boundary.restart();
+                                }
+                                fires
+                            }
+                        },
                         None => false,
                     };
                     if fires {

@@ -139,6 +139,12 @@ pub struct SequenceConfig {
     /// punctuation-driven reprojection (cadence-only).
     pub reproject_trigger_texts: Vec<String>,
 
+    /// Whether a boundary inside the turn's think block reprojects. `false`
+    /// holds the projection the block opened on until it closes, and
+    /// reprojects once on the closing `</think>`, so the answer is decoded
+    /// against a selection the whole thought informed. **Default: `true`.**
+    pub reproject_in_thinking: bool,
+
     /// When `true`, turns on this conversation skip the per-turn
     /// projection rebuild once the slot is seeded: the prefill appends
     /// onto the cumulative slot instead of resetting + re-projecting, and

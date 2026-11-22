@@ -157,6 +157,7 @@ mod submit_admit;
 mod sweep_forecast;
 #[cfg(test)]
 mod test_substrate;
+mod think_gate;
 mod turn_airtime;
 mod turn_group;
 mod turn_probe;
