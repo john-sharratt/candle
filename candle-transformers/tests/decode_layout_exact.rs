@@ -33,6 +33,11 @@
 //! Prefill is already exact under every one of these layouts (the other
 //! harness reports `0.0` for all of them), so a failure here is the decode
 //! kernel's alone.
+//!
+//! The same question from the other side closes the file: a decode retried
+//! after a failed forward, which had left the device's writer length a token
+//! ahead of the host, must attend its own tokens once each and write nowhere
+//! but its own chunk — mid-chunk and at a chunk's last slot.
 #![cfg(feature = "cuda")]
 #![allow(clippy::too_many_arguments)]
 
@@ -691,6 +696,339 @@ fn decode_one(
     drop(slices_t);
     drop(pm_t);
     Ok(owned)
+}
+
+// ── a rolled-back decode, mid-chunk and at a chunk's last slot ───────────
+//
+// The decode kernel commits its token's length on the device and the host
+// counts the token only once the step has run, so a forward that fails after
+// its attention ran leaves the device a token ahead of a host that never
+// moved. These two cases run one such failure and the same step again, taken
+// back by `rollback_to_offset` (the fix) and by a plain `truncate_to_offset`
+// (the rollback before it), with a sequence claimed beside slot 0 in the same
+// arena.
+
+/// **Mid-chunk, a plain truncate leaves the retry attending its token twice and
+/// the device a token ahead after it; the rollback leaves neither.** With 8
+/// tokens held, the failed attempt writes slot 8 and commits 9 on the device.
+/// After a plain truncate the retry writes its token again at slot 9, attends
+/// both copies and commits 10 — one past the 9 the host then counts, which every
+/// later step inherits until something re-serialises the buffer. After the
+/// rollback the retry reads 8, writes slot 8, attends the host's tokens and its
+/// own once, and commits 9.
+#[test]
+fn a_rolled_back_decode_mid_chunk_attends_its_token_once() -> Result<()> {
+    const HELD: usize = 8;
+    let Some((device, stager, rope)) = edge_fixture()? else {
+        return Ok(());
+    };
+    for arena in [Arena::F16, Arena::R16] {
+        let fixed = retry_after_failure(arena, HELD, Rollback::Fixed, &rope, &stager, &device)?;
+        let plain = retry_after_failure(arena, HELD, Rollback::Truncate, &rope, &stager, &device)?;
+        for (label, r) in [("rollback", &fixed), ("truncate", &plain)] {
+            r.check_neighbour(arena, label)?;
+            r.check_failed_commit(arena, label, HELD + 1)?;
+        }
+        check_against_reference(arena, HELD, &fixed.retry, &device)?;
+        fixed.check_retry_commit(arena, "rollback", HELD + 1)?;
+        plain.check_retry_commit(arena, "truncate", HELD + 2)?;
+        if compare(&fixed.retry, &plain.retry)?.max_abs == 0.0 {
+            candle::bail!(
+                "{arena:?}: the truncate's retry, attending its token twice, decoded exactly as \
+                 the rollback's"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// **At a chunk's last free slot nothing is written past the chunk, and either
+/// take-back's retry attends its own tokens.** With 31 tokens held, the failed
+/// attempt writes slot 31 and commits the chunk full. A plain truncate leaves the
+/// device reading it full, so the kernel's `within < CHUNK_SIZE` bound skips the
+/// retry's scatter and its commit and it attends the 32 slots — the 32nd the
+/// failed attempt's copy of the same token at the same position. The edge heals
+/// itself there; what it may never do is reach the sequence beside it.
+#[test]
+fn a_rolled_back_decode_at_a_chunk_edge_writes_only_its_chunk() -> Result<()> {
+    const HELD: usize = CHUNK_SIZE - 1;
+    let Some((device, stager, rope)) = edge_fixture()? else {
+        return Ok(());
+    };
+    for arena in [Arena::F16, Arena::R16] {
+        for (label, rollback) in [
+            ("rollback", Rollback::Fixed),
+            ("truncate", Rollback::Truncate),
+        ] {
+            let r = retry_after_failure(arena, HELD, rollback, &rope, &stager, &device)?;
+            r.check_neighbour(arena, label)?;
+            r.check_failed_commit(arena, label, CHUNK_SIZE)?;
+            r.check_retry_commit(arena, label, CHUNK_SIZE)?;
+            check_against_reference(arena, HELD, &r.retry, &device)?;
+        }
+    }
+    Ok(())
+}
+
+/// The device, the stager and identity rope rungs, or `None` without CUDA.
+fn edge_fixture() -> Result<Option<(Device, PinnedStager, RopeRungs)>> {
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(None);
+        }
+    };
+    let stager = PinnedStager::new_from_device(&device);
+    let rope = RopeRungs::new(
+        &RopeSchedule::stated(vec![0f32; HEAD_DIM / 2], usize::MAX)?,
+        &device,
+    )?;
+    Ok(Some((device, stager, rope)))
+}
+
+/// The retry's output against the F32 attention over slot 0's `held` tokens and
+/// the step's own, once.
+fn check_against_reference(arena: Arena, held: usize, out: &Tensor, device: &Device) -> Result<()> {
+    let (_, k, v) = make_qkv(held, device, EDGE_SEED)?;
+    let (q_dec, k_new, v_new) = step_qkv(device)?;
+    let reference = reference_attention(&q_dec, &k, &v, &k_new, &v_new)?;
+    let (cos, mae) = against(out, &reference)?;
+    if cos < 0.995 || mae > 5e-3 {
+        candle::bail!(
+            "{arena:?} held {held}: the retry does not attend its own tokens once each: \
+             cos={cos:.5} mae={mae:.3e}"
+        );
+    }
+    Ok(())
+}
+
+/// Seed of slot 0's prefill tokens.
+const EDGE_SEED: u64 = 0xED6E;
+
+/// How a failed decode step is taken back.
+#[derive(Clone, Copy)]
+enum Rollback {
+    /// `KvCache::rollback_to_offset`: the cut, and the device brought back.
+    Fixed,
+    /// `KvCache::truncate_to_offset` alone, as the wave rollback did before.
+    Truncate,
+}
+
+/// What one failed-then-retried decode step did.
+struct EdgeRetry {
+    /// The retry's attention output.
+    retry: Tensor,
+    /// Every slice's `len` on the device after the failed attempt, and which
+    /// slice is the writer.
+    failed_lens: Vec<u16>,
+    /// The same as the retry's sync handed them to its kernel, and after it.
+    retry_in_lens: Vec<u16>,
+    retry_lens: Vec<u16>,
+    write_slice: usize,
+    /// Whether the neighbouring sequence's K/V read back bit for bit.
+    neighbour_intact: bool,
+}
+
+impl EdgeRetry {
+    fn check_neighbour(&self, arena: Arena, label: &str) -> Result<()> {
+        if !self.neighbour_intact {
+            candle::bail!("{arena:?} {label}: the decode wrote into the sequence beside it");
+        }
+        Ok(())
+    }
+
+    /// The failed attempt's commit reached the device: its writer reads `want`.
+    fn check_failed_commit(&self, arena: Arena, label: &str, want: usize) -> Result<()> {
+        self.check_writer(arena, label, "the failed attempt", &self.failed_lens, want)
+    }
+
+    /// The retry left its writer reading `want` on the device.
+    fn check_retry_commit(&self, arena: Arena, label: &str, want: usize) -> Result<()> {
+        self.check_writer(arena, label, "the retry", &self.retry_lens, want)
+    }
+
+    fn check_writer(
+        &self,
+        arena: Arena,
+        label: &str,
+        after: &str,
+        lens: &[u16],
+        want: usize,
+    ) -> Result<()> {
+        if lens.get(self.write_slice) != Some(&(want as u16)) {
+            candle::bail!(
+                "{arena:?} {label}: after {after} the writer slice {} reads {:?} on the device, \
+                 not {want} (handed to the retry as {:?})",
+                self.write_slice,
+                lens,
+                self.retry_in_lens
+            );
+        }
+        Ok(())
+    }
+}
+
+/// The decode step's query and new K/V, the same in every run.
+fn step_qkv(device: &Device) -> Result<(Tensor, Tensor, Tensor)> {
+    let (q, k, v) = make_qkv(1, device, 0x57E9)?;
+    Ok((
+        q.squeeze(2)?.contiguous()?,
+        k.squeeze(2)?.contiguous()?,
+        v.squeeze(2)?.contiguous()?,
+    ))
+}
+
+/// Slot 0 prefilled with `held` tokens, slot 1 with a full chunk beside it; one
+/// decode of slot 0 that fails after its kernel ran, taken back by `rollback`,
+/// and the same step again.
+fn retry_after_failure(
+    arena: Arena,
+    held: usize,
+    rollback: Rollback,
+    rope: &RopeRungs,
+    stager: &PinnedStager,
+    device: &Device,
+) -> Result<EdgeRetry> {
+    let backing = fresh_backing(arena, device)?;
+    let mut cache = bind(&backing, 0)?;
+    let mut neighbour = bind(&backing, 1)?;
+    let (q, k, v) = make_qkv(held, device, EDGE_SEED)?;
+    run_prefill(&mut cache, &q, &k, &v, held, rope, stager)?;
+    let (qn, kn, vn) = make_qkv(CHUNK_SIZE, device, 0xB1D)?;
+    run_prefill(&mut neighbour, &qn, &kn, &vn, CHUNK_SIZE, rope, stager)?;
+    let bits = |c: &KvCache| -> Result<Vec<u32>> {
+        let (k, v) = c.chunked_read_kv(0, CHUNK_SIZE)?;
+        let mut out = k.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+        out.extend(v.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?);
+        Ok(out.iter().map(|x| x.to_bits()).collect())
+    };
+    let neighbour_before = bits(&neighbour)?;
+
+    // The prefill committed on the host; the engine marks the buffer for the
+    // next sync, which builds it at the host's length.
+    backing.mark_decode_writer_stale(&[(0, held)])?;
+    let (q_dec, k_new, v_new) = step_qkv(device)?;
+    // The failed attempt: its kernel scatters the token and commits the
+    // length on the device, and the host never advances.
+    let (_, failed_lens, write_slice) =
+        decode_live(&backing, held, &q_dec, &k_new, &v_new, rope, stager, device)?;
+    match rollback {
+        Rollback::Fixed => cache.rollback_to_offset(held)?,
+        Rollback::Truncate => cache.truncate_to_offset(held)?,
+    }
+    let retry_in_lens = live_lens(&backing, held, stager, device)?;
+    let (retry, retry_lens, _) =
+        decode_live(&backing, held, &q_dec, &k_new, &v_new, rope, stager, device)?;
+    Ok(EdgeRetry {
+        retry,
+        failed_lens,
+        retry_in_lens,
+        retry_lens,
+        write_slice,
+        neighbour_intact: bits(&neighbour)? == neighbour_before,
+    })
+}
+
+/// Every slice's `len` of slot 0's live buffer as a sync at `offset` hands it
+/// to a decode — the sync the next [`decode_live`] repeats.
+fn live_lens(
+    backing: &ChunkedKvBacking,
+    offset: usize,
+    stager: &PinnedStager,
+    device: &Device,
+) -> Result<Vec<u16>> {
+    use candle_transformers::models::slot_state::TokenSliceHost;
+
+    let entries = [(0usize, offset)];
+    backing.ensure_for_batch_entries(&entries, 1)?;
+    let arena_info = backing.resolve_arena_info()?;
+    let generation = stager.begin_generation();
+    let (seq_ptrs, _) =
+        backing.sync_decode_gpu_chunks_snapshot(&entries, &arena_info, &generation, &[false])?;
+    let (ptr, n_slices, _) = seq_ptrs[0];
+    device.synchronize()?;
+    let mut raw = vec![0u8; n_slices as usize * TokenSliceHost::SLICE_HEADER_SIZE];
+    let candle::Device::Cuda(cuda) = device else {
+        candle::bail!("the slice table lives on a CUDA device");
+    };
+    // SAFETY: `ptr` is the slot's live slice table of `n_slices` headers, and
+    // the sync's uploads have landed (synchronised above).
+    unsafe { cuda.read_raw(ptr, &mut raw) }?;
+    Ok(raw
+        .as_chunks::<{ TokenSliceHost::SLICE_HEADER_SIZE }>()
+        .0
+        .iter()
+        .map(|h| u16::from_le_bytes([h[2], h[3]]))
+        .collect())
+}
+
+/// One decode step of slot 0 at `offset` on its LIVE slot buffer — the
+/// zero-copy pointer a plain decode row is handed, whose writer length the
+/// kernel commits on the device — with every slice's `len` read back after it.
+fn decode_live(
+    backing: &ChunkedKvBacking,
+    offset: usize,
+    q: &Tensor,
+    k_new: &Tensor,
+    v_new: &Tensor,
+    rope: &RopeRungs,
+    stager: &PinnedStager,
+    device: &Device,
+) -> Result<(Tensor, Vec<u16>, usize)> {
+    use candle_transformers::models::slot_state::TokenSliceHost;
+
+    let entries = [(0usize, offset)];
+    backing.ensure_for_batch_entries(&entries, 1)?;
+    let arena_info = backing.resolve_arena_info()?;
+    let generation = stager.begin_generation();
+    let (seq_ptrs, _) =
+        backing.sync_decode_gpu_chunks_snapshot(&entries, &arena_info, &generation, &[false])?;
+    let (ptr, n_slices, write_slice) = seq_ptrs[0];
+    let mut hdr = Vec::with_capacity(SLOT_HEADER_BYTES);
+    SlotHeaderHost {
+        n_slices,
+        write_slice,
+        slices_ptr: ptr,
+        position_map_ptr: 0,
+        rope_rung: 0,
+    }
+    .write(&mut hdr);
+    let mut pinned = generation.alloc(hdr.len())?;
+    pinned.copy_from_slice(&hdr);
+    let headers = generation.submit_resident(pinned)?;
+    let out = paged_decode_attn(
+        None,
+        q,
+        headers.dev_ptr(),
+        DType::F16,
+        N_HEAD,
+        N_KV_HEAD,
+        HEAD_DIM,
+        1.0 / (HEAD_DIM as f32).sqrt(),
+        k_new,
+        v_new,
+        rope,
+        false,
+        None,
+    )?;
+    let owned = out.to_owned_tensor()?;
+    device.synchronize()?;
+    let mut raw = vec![0u8; n_slices as usize * TokenSliceHost::SLICE_HEADER_SIZE];
+    let candle::Device::Cuda(cuda) = device else {
+        candle::bail!("the slice table lives on a CUDA device");
+    };
+    // SAFETY: `ptr` is the slot's live slice table of `n_slices` headers, and
+    // the decode and its commit have finished (synchronised above).
+    unsafe { cuda.read_raw(ptr, &mut raw) }?;
+    let lens = raw
+        .as_chunks::<{ TokenSliceHost::SLICE_HEADER_SIZE }>()
+        .0
+        .iter()
+        .map(|h| u16::from_le_bytes([h[2], h[3]]))
+        .collect();
+    drop(headers);
+    Ok((owned, lens, write_slice as usize))
 }
 
 // ── deterministic inputs ─────────────────────────────────────────────────
