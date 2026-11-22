@@ -15,10 +15,8 @@
 //! does not (and the ground between them is cleared). The chain converges by
 //! accretion, and no state has to be carried between waves to make it do so.
 //!
-//! Each checkpoint costs one fence. That is affordable because they fire once —
-//! the process stops — and because it has been measured: the gate-GEMM
-//! checkpoint reproduced the fault inside two minutes with a fence on every MoE
-//! layer of every wave, so this fault is not one a fence hides.
+//! Each checkpoint costs one fence, paid only at the site a drain has named,
+//! and it fires once — the process stops.
 //!
 //! ## Why a capture rather than more logging
 //!
@@ -51,28 +49,33 @@
 //! inputs and the output have to be taken together, between the two, which
 //! means paying for a synchronisation right here.
 //!
-//! That cost is why [`capture_gate_gemm`] is the only site that does this. One
+//! That cost is why a checkpoint fences only once a drain has named it. One
 //! fence per MoE layer per wave is the serialisation that hides
 //! ordering-dependent faults; scattering these would be the probe that suppresses
 //! what it hunts.
+//!
+//! ## Unwritten, or written by something else
+//!
+//! The expert GEMM outputs and the routed output are filled with a sentinel NaN
+//! ([`fill_sentinel`]) before the kernels that define them, so the drain's own
+//! statistics tell the two lifetime faults apart without a fence: a row nothing
+//! wrote turns its token NaN with the finite values in range, and a row
+//! something else wrote reads as floats near ±1e38.
 
-use candle::quantized::cuda::{ko_repacked_bytes, Q8a128Operand};
-use candle::quantized::GgmlDType;
 use candle::tensor_assert::{check_now, check_now_quant, Dump, Finding, QTYPE_Q8A128V};
-use candle::{cuda_backend::CudaDevice, LiveTensor, Result, Shape};
+use candle::{cuda_backend::CudaDevice, LiveTensor, Result};
 
 use super::expert_lre::slot_integrity::{check_watch, watching};
-use cudarc::driver::{CudaSlice, DevicePtr};
+use cudarc::driver::result::memset_d8_async;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Once;
 
 /// Where the dump goes.
 ///
-/// Absolute, resolved at compile time. The writer is a daemon started from the
-/// workspace root and the reader is a test whose working directory is this
-/// crate's root, so a relative path names two different places and the test
-/// silently reports "no capture" for a dump that exists.
-pub const DUMP_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/moe_gemm_dump");
+/// Absolute, resolved at compile time: the writer is a daemon whose working
+/// directory is wherever its supervisor started it, so a relative path would
+/// land the dump somewhere nobody looks.
+pub const DUMP_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../target/nan_capture");
 
 type IntegrityProbe = Box<dyn Fn() -> Vec<String> + Send + Sync + 'static>;
 
@@ -491,147 +494,26 @@ fn dump_tensor(d: &mut Dump, name: &str, t: &LiveTensor<'_>, dev: &CudaDevice) -
     unsafe { d.device_ptr(name, dev, base, t.elem_count() * esz) }
 }
 
-/// The full argument list of one `grouped_qmatmul_dev_q8a128` call.
+/// Fill `t` with the sentinel `0xFF` bytes before the kernel that defines it
+/// runs: as F32 or BF16 every element reads NaN, a NaN no arithmetic produces.
 ///
-/// Everything the kernel dereferences, so the replay can rebuild the call
-/// exactly rather than approximately — a replay over *similar* inputs answers
-/// nothing.
-pub struct GemmCall<'a> {
-    pub layer: usize,
-    pub stacked: &'a Q8a128Operand<'a>,
-    /// Device table of per-expert weight addresses; the kernel indexes it at
-    /// `expert_base + tile_expert[t]`.
-    pub weight_ptrs: &'a CudaSlice<u64>,
-    pub expert_base: usize,
-    pub num_experts: usize,
-    pub weight_dtype: GgmlDType,
-    pub weight_nrows: usize,
-    pub tile_expert: &'a CudaSlice<i32>,
-    pub tile_b_start: &'a CudaSlice<i32>,
-    pub tile_b_cnt: &'a CudaSlice<i32>,
-    pub launch_tiles: usize,
-    pub out: &'a LiveTensor<'a>,
-}
-
-/// Dump this call and panic, once a drain has named the same row's routed
-/// output (`moe.routed_out.L<row>`) as the first bad site.
-///
-/// **The gate GEMM's own output is never asserted.** It is `[total_batch,
-/// nrows]` with its padding rows unwritten (`grouped_qmatmul_dev_q8a128`), and
-/// the padding sits between the experts' tiles, so a whole-buffer assert reads
-/// whatever the arena held before: on WhiteWorld it named the gate output of
-/// rows 43 and 47 in nearly every wave — values near ±2.5e38 and scattered
-/// NaNs — while the logits stayed finite. The routed output is the dense
-/// scatter of the written rows alone, so a NaN there is a real one, and this
-/// row's next gate call is where its operands are dumped.
-pub fn capture_gate_gemm(call: &GemmCall<'_>, dev: &CudaDevice) -> Result<()> {
-    arm_from_drain();
-    if !armed_for(candle::tensor_assert::site("moe.routed_out.L", call.layer)) {
-        return Ok(());
-    }
-    let site = candle::tensor_assert::site("moe.capture.gate_out.L", call.layer);
-    let mut found: Option<Finding> = None;
-    // The callback fires the instant the kernel's verdict is read, and the
-    // operands are still live in this scope — which is what makes the dump
-    // below describe *this* call rather than some later one. The verdict
-    // covers the padding too; the replay reads the tile tables to tell them
-    // apart.
-    check_now(call.out, site, |f| found = Some(f.clone()));
-    let f = found.unwrap_or(Finding {
-        name: site.to_string(),
-        seq: None,
-        nan: 0,
-        inf: 0,
-        min: None,
-        max: None,
-        elems: 0,
-    });
-    dump(call, &f, dev)
-}
-
-fn dump(call: &GemmCall<'_>, f: &Finding, dev: &CudaDevice) -> Result<()> {
-    let mut d = Dump::create(DUMP_DIR)?;
-    d.note("layer", call.layer);
-    d.note("rows", call.stacked.rows);
-    d.note("cols", call.stacked.cols);
-    // `SumScale::as_code()`: how the stacked blocks store `Σx`, which the
-    // replay must hand the kernel to read them as production did.
-    d.note("sum_scale", call.stacked.sum_scale.as_code());
-    d.note("expert_base", call.expert_base);
-    d.note("num_experts", call.num_experts);
-    d.note("weight_dtype", format!("{:?}", call.weight_dtype));
-    d.note("weight_nrows", call.weight_nrows);
-    d.note("launch_tiles", call.launch_tiles);
-    d.note("out_dtype", format!("{:?}", call.out.dtype()));
-    d.note("out_shape", format!("{:?}", call.out.dims()));
-
-    // What the assert actually SAW, recorded beside the bytes. The replay
-    // compares against these rather than re-deriving them: if a replay of the
-    // same bytes yields a different NaN count or a different range, that is the
-    // finding, and it is only visible because production's numbers travelled
-    // with the dump instead of living in a log the test cannot read.
-    note_stats(&mut d, f);
-
-    // The activation operand, as the bytes the kernel reads.
-    let n_stacked = call.stacked.byte_len();
-    call.stacked.with_device_ptr(dev, |p| {
-        // SAFETY: `byte_len` is the operand's own accounting of its extent, and
-        // `with_device_ptr` holds the backing's guards for this closure.
-        unsafe { d.device_ptr("stacked", dev, p, n_stacked) }
-    })?;
-
-    // The tile tables, over exactly the range the kernel launches.
+/// A non-finite value downstream then says which of two faults made it. A row
+/// nothing wrote stays the sentinel and turns the consumer's output NaN with
+/// its finite values in range; a row something else wrote holds bytes that
+/// read as floats near ±1e38. Only a tensor-assert build fills: the release
+/// build allocates these outputs uninitialised (hot-path invariant 6).
+pub fn fill_sentinel(t: &LiveTensor<'_>, dev: &CudaDevice) -> Result<()> {
+    let (storage, layout) = t.storage_and_layout();
+    let candle::Storage::Cuda(cu) = &*storage else {
+        candle::bail!("sentinel: not a CUDA tensor");
+    };
     let stream = dev.cuda_stream();
-    for (name, buf) in [
-        ("tile_expert", call.tile_expert),
-        ("tile_b_start", call.tile_b_start),
-        ("tile_b_cnt", call.tile_b_cnt),
-    ] {
-        let (p, _g) = buf.device_ptr(&stream);
-        // SAFETY: the kernel reads `launch_tiles` i32 from each of these, so
-        // that range is readable by construction.
-        unsafe { d.device_ptr(name, dev, p, call.launch_tiles * 4)? };
-    }
-
-    // Every expert weight this layer can route to, resolved through the same
-    // pointer table the kernel indexes. Dumping the whole layer rather than the
-    // routed subset keeps the replay's table indexing identical to production's
-    // — a remapped table would be a different call.
-    let ptrs = dev
-        .memcpy_dtov(call.weight_ptrs)
-        .map_err(|e| candle::Error::Msg(format!("capture: reading weight table: {e}")))?;
-    let shape = Shape::from((call.weight_nrows, call.stacked.cols));
-    let w_bytes = ko_repacked_bytes(&shape, call.weight_dtype)?;
-    d.note("weight_bytes_each", w_bytes);
-    for e in 0..call.num_experts {
-        let idx = call.expert_base + e;
-        let Some(&ptr) = ptrs.get(idx) else {
-            candle::bail!("capture: weight table has no entry {idx}");
-        };
-        // SAFETY: the table's entries are the addresses the kernel itself
-        // dereferences, each naming a full KO weight of `w_bytes`.
-        unsafe { d.device_ptr(&format!("weight_{e:05}"), dev, ptr, w_bytes)? };
-    }
-
-    // The output as produced in production — what the replay must match.
-    dump_tensor(&mut d, "out", call.out, dev)?;
-
-    note_integrity(&mut d);
-    let dir = d.finish()?;
-    panic!(
-        "MoE GEMM captured at layer {} → {} (nan={} inf={} of {} finite=[{:?}, {:?}]). \
-         The process stops here on purpose: the dump names arena addresses that the next \
-         wave would overwrite, so continuing would leave a bundle that no longer describes \
-         what produced it. Replay it with \
-         `cargo test -p candle-transformers --features cuda,tensor-assert --test moe_gemm_replay`.",
-        call.layer,
-        dir.display(),
-        f.nan,
-        f.inf,
-        f.elems,
-        f.min,
-        f.max,
-    );
+    let esz = t.dtype().size_in_bytes();
+    let base = cu.slice.device_ptr(&stream) + (layout.start_offset() * esz) as u64;
+    // SAFETY: `elem_count` elements of `esz` bytes from the tensor's own
+    // offset, on the stream the defining kernel runs on next.
+    unsafe { memset_d8_async(base, 0xff, t.elem_count() * esz, stream.cu_stream()) }
+        .map_err(candle::Error::wrap)
 }
 
 #[cfg(test)]

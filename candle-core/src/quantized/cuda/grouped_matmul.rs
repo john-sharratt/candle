@@ -11,6 +11,8 @@
 //! rather than computed.
 
 use super::*;
+#[cfg(feature = "tensor-assert")]
+use cudarc::driver::result::memset_d8_async;
 
 // GROUPED EXPERT MATMUL (segmented dispatch)
 
@@ -597,6 +599,25 @@ pub fn grouped_qmatmul_dev_q8a128<'w>(
     // gate, up, SwiGLU, down — stays in the FFN generation the gather seeded.
     let (dst_ptr, owned_dst, out_backing) =
         resolve_typed_out::<f32>(op.backing(), device, nrows * total_batch)?;
+    // **A row no kernel writes reads as the sentinel, never as stale bytes.**
+    // `0xFFFFFFFF` is a NaN no arithmetic produces, so a non-finite routed output
+    // whose finite values stay in range came from a row nothing wrote, and one
+    // whose values reach ±1e38 came from bytes something else wrote there. The
+    // padding rows carry it too; nothing reads them. A tensor-assert build only:
+    // the release build allocates this output uninitialised (hot-path
+    // invariant 6).
+    #[cfg(feature = "tensor-assert")]
+    // SAFETY: `dst_ptr` names `nrows × total_batch` f32 just resolved on this
+    // device, written next by the kernel on the same stream.
+    unsafe {
+        memset_d8_async(
+            dst_ptr,
+            0xff,
+            nrows * total_batch * std::mem::size_of::<f32>(),
+            device.cuda_stream().cu_stream(),
+        )
+    }
+    .w()?;
     {
         let stream = device.cuda_stream();
         let (wp_base, _g0) = weight_ptrs_dev.device_ptr(&stream);

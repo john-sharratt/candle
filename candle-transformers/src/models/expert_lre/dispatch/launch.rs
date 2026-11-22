@@ -660,27 +660,6 @@ impl Dispatch {
             cuda_dev,
         )?;
         g.end();
-        #[cfg(feature = "tensor-assert")]
-        {
-            use crate::models::nan_capture::{capture_gate_gemm, GemmCall};
-            capture_gate_gemm(
-                &GemmCall {
-                    layer: row,
-                    stacked: &stacked,
-                    weight_ptrs: &self.snap,
-                    expert_base: 0,
-                    num_experts: n_experts,
-                    weight_dtype: gate_dtype,
-                    weight_nrows: table.gate_nrows(),
-                    tile_expert: &ws.tile_expert,
-                    tile_b_start: &ws.tile_b_start,
-                    tile_b_cnt: &ws.tile_b_cnt,
-                    launch_tiles,
-                    out: &gate_out,
-                },
-                cuda_dev,
-            )?;
-        }
         let g = gpu_span("moe:up", &device);
         let up_out = grouped_qmatmul_dev_q8a128(
             &stacked,
@@ -740,6 +719,8 @@ impl Dispatch {
         // target is defined in full by the scatter, so it is uninitialised
         // (invariant 6).
         let ys = wave_empty((num_tokens, hidden_dim), out_dtype, &device, wave)?;
+        #[cfg(feature = "tensor-assert")]
+        crate::models::nan_capture::fill_sentinel(&ys, cuda_dev)?;
         let g = gpu_span("moe:scatter", &device);
         fused_deterministic_scatter(
             &ys,
@@ -755,12 +736,14 @@ impl Dispatch {
         // **The expert GEMMs are checked through what they scatter.** Each is
         // `[total_batch, nrows]` with its padding rows unwritten, between the
         // experts' tiles, so an assert of the whole buffer reads stale arena
-        // bytes; `ys` is the dense scatter of the written rows alone. A NaN
-        // here arms this row's gate capture for its next call
-        // (`nan_capture::capture_gate_gemm`), which dumps the gate GEMM's own
-        // operands; `down_out` rides this dump whole for the replay to read
-        // through the tile tables. The gate and up outputs are not dumped
-        // here: the SwiGLU writes its operand onto the gate output's ground.
+        // bytes; `ys` is the dense scatter of the written rows alone. Every
+        // GEMM output and `ys` start as the sentinel NaN under tensor-assert
+        // (`nan_capture::fill_sentinel`), so a bad `ys` whose finite values stay
+        // in range is a row nothing wrote, and one reaching ±1e38 is a row
+        // something else wrote. A drain naming this site arms it; the next bad
+        // `ys` here dumps itself with `down_out` whole, read through the tile
+        // tables. The gate and up outputs are not dumped: the SwiGLU writes its
+        // operand onto the gate output's ground.
         #[cfg(feature = "tensor-assert")]
         crate::models::nan_capture::checkpoint(
             candle::tensor_assert::site("moe.routed_out.L", row),
