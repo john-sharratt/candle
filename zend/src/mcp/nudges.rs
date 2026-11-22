@@ -27,8 +27,7 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// **A worker is told who speaks, and who does not.** Under a bare
 /// "Claude, between your tool rounds", a worker filed Claude's nudge in its
 /// journal as "a CORRECTION from the user", and the journal then credited the
-/// user with a decision they never made (`docs/archived/zen_coding_challenge_fixes.md`
-/// Cause 7).
+/// user with a decision they never made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sender {
     /// The agent that started the task — Claude, through the connector.

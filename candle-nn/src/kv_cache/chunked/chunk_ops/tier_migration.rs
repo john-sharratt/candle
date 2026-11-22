@@ -142,7 +142,7 @@ pub(in super::super) fn cross_layer_staging_groups(
 ///
 /// Takes the band's own format tag, read from the chunk rather than from the
 /// arena its gid points into — an arena holds whatever fits its size class and
-/// cannot answer the question (`docs/archived/arena_unification.md` principle 8).
+/// cannot answer the question.
 /// Callers pair this with the arena's `location`, which *is* arena identity.
 #[cfg(feature = "cuda")]
 #[inline]
@@ -460,7 +460,7 @@ impl ChunkedKvBacking {
                     // Copy length is the BAND's payload, read from the chunk's
                     // own tag; the address step is the arena's class stride.
                     // The arena cannot supply the first — it holds whatever
-                    // fits its slots (`docs/archived/arena_unification.md` invariant 8).
+                    // fits its slots.
                     let len = payload_bytes_for_tag(tag, elems).ok_or_else(|| {
                         candle::Error::Msg(format!(
                             "migrate_sealed_to_cpu_batch_async: band tag {tag:?} names no                              storage format, so its byte length is unknown"

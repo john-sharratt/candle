@@ -25,8 +25,9 @@ use super::*;
 /// persisting an absolute per token. Persisting the original absolute `pos`
 /// would be a stale second source of truth that provenance re-layout
 /// invalidates. The packed `signs` index is likewise rebuilt from `keys`
-/// (`sign_pack`), and the archival f32 `attn` is not stored (reference
-/// `gather_selected` only, never the resumed hot path).
+/// (`sign_pack`). There is no f32 copy of the rows to store: the gallery holds
+/// only the two-region cache, and `gather_selected` reconstructs f32 rows from
+/// it for the reference callers.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CorpusSnapshot {
     pub index_head_dim: usize,
@@ -125,8 +126,8 @@ impl FloatGallery {
     /// Snapshot the live corpus into its native durable form
     /// ([`CorpusSnapshot`]) — the seal artifact. Reads the `len` live rows of
     /// the two-region cache + keys + pos back to host (tier-aware: the buffers
-    /// may be on CPU once spilled). The signs index and archival `attn` are
-    /// omitted (rebuilt / unused on restore).
+    /// may be on CPU once spilled). The signs index is omitted: restore
+    /// rebuilds it from the keys.
     #[cfg(feature = "cuda")]
     pub fn snapshot(&self) -> Result<CorpusSnapshot> {
         let len = self.len;
@@ -176,8 +177,7 @@ impl FloatGallery {
     /// Rebuild a gallery from a [`CorpusSnapshot`] — the resume injection. The
     /// two-region cache + keys are stamped directly (no re-quant); the sign
     /// index is repacked from `keys` (bit-identical to the live append, which
-    /// packs the same keys); the archival `attn` is a CPU zero placeholder (the
-    /// reference `gather_selected` is not used on the resumed hot path).
+    /// packs the same keys).
     ///
     /// `positions` (length `snap.len`) are the RECONSTRUCTED group-start
     /// positions the injected entries take in the resumed context — the caller

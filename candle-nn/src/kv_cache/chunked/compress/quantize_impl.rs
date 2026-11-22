@@ -36,8 +36,7 @@ pub(super) fn quantize_sealed_in_place_impl(
     // want of memory and the cache could never reclaim any (freeing needs
     // memory). Scarcity-only class promotion is the answer now: with no free
     // region, the small chunks take free slots in a wider class's existing
-    // region, and the float regions they release come back whole
-    // (`docs/archived/arena_unification.md` §3.4).
+    // region, and the float regions they release come back whole.
 
     let cuda_dev = match device {
         Device::Cuda(d) => d,
@@ -515,7 +514,7 @@ pub(super) fn quantize_sealed_in_place_impl(
         );
         // Byte size is summed from the tags just built, not from the arenas:
         // a size-class arena's slot is an upper bound on a band's bytes, never
-        // the bytes themselves (`docs/archived/arena_unification.md` invariant 8).
+        // the bytes themselves.
         let byte_size = new_gids.arena_byte_size(&k_fmt, &v_fmt, elems_per_head);
         // The co-resident KV-head record is built in one batched pass after the
         // loop (below), so all quantized placements are known and the device

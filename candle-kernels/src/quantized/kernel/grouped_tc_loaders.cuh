@@ -200,8 +200,7 @@ __device__ void grouped_matmul_impl(
 // (`is_mxfp4_persub`) instead folds each sub-MMA's int32 with its own E8M0
 // power-of-two scale immediately — the fold drains one reusable accumulator per
 // sub, so it holds no extra registers, and the per-32 scales apply exactly (no
-// re-quantization of an E8M0 format onto an affine grid). See
-// docs/archived/q8_matmul_pipeline.md.
+// re-quantization of an E8M0 format onto an affine grid).
 // =============================================================================
 
 // Activation tile load: global → shared via cp.async (.ca, L1-resident — the tile is re-read

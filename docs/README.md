@@ -43,10 +43,10 @@ score selection — the mechanism that picks *what* enters context at each step.
 | [`incremental_chunk_exclusion.md`](incremental_chunk_exclusion.md) | The anomalous-chunk exclusion learned incrementally from a fixed sample of calibration questions, kept as mergeable per-question records replicated in the substrate. |
 | [`provenance_scoped_signatures.md`](provenance_scoped_signatures.md) | **Partly built.** Gallery windows cut by the same boundary formula and to the same shape as projection's probes: the boundary rule (`provenance::boundaries`), the windows (`provenance::probe_windows`) and the aggregations (`provenance::window_score`) are built and measured offline; the doc carries the gates — boundary parity, capture coverage, self-retrieval — and what remains. |
 | [`provenance_score_normalization.md`](provenance_score_normalization.md) | **Built** (`candle-conversation/src/normalization/`). Normalizing raw per-candidate provenance scores against the candidate's background so they are comparable across candidates of very different scale. |
-| [`provenance_adaptive_projection.md`](provenance_adaptive_projection.md) | Design for scoring coverage, attention budgets, turn locality, anchors, probe composition and consensus fusion in the projection policy. |
+| [`provenance_adaptive_projection.md`](provenance_adaptive_projection.md) | **Built (Concepts A–D, F, G; E rejected).** Scoring coverage, attention budgets, turn locality, anchors, probe composition and consensus fusion in the projection policy. |
 | [`hit_driven_projection.md`](hit_driven_projection.md) | A dialogue's slot holds what the model's own indexer keeps asking for, with a pool up to four times the slot standing behind it in the warm tier; what the indexer would have read is loaded at the next projection. |
 | [`qsa_stratified_selection.md`](qsa_stratified_selection.md) | Stratified QSA selection on Qwen3.8-Flash-Next: the cells selected per query by indexer score, the pinned ranges, and the kernel and live recall. |
-| [`qsa_index_q8.md`](qsa_index_q8.md) | Design for QSA index keys stored in Q8_0. |
+| [`qsa_index_q8.md`](qsa_index_q8.md) | **Built.** QSA index keys stored in Q8_0, with the INT8 tensor-core scoring arm. |
 | [`tool_provenance_distillation.md`](tool_provenance_distillation.md) | How a calibration turn's tokens/KV are discarded after its Q-signature (`WideQSig`) is captured, via a `Distilled` substrate marker — shrinks the tool-calibration corpus to signature-only. |
 | [`tool_calibration.md`](tool_calibration.md) | How tools are calibrated for provenance selection. |
 | [`tool_selection_provenance_results.md`](tool_selection_provenance_results.md) | **Shipped 2026-07-06.** The production tool-selection mechanism (per-token `WideQSig` folding, late-fusion `z × margin` scorer) and the `belief-*` harness subcommands used to evaluate it. §§1–22 are research history; §23+ is the shipped design. |
@@ -63,7 +63,7 @@ the documents below are the current ones.
 | Doc | Covers |
 |---|---|
 | [`warm_lift.md`](warm_lift.md) | **Built.** The warm leg of `elevate_to_hot`: RAM → VRAM, batched and sync-free (`candle-nn/src/kv_cache/chunked/warm_lift/`, `lift_warm_to_gpu`), replacing the per-layer path. |
-| [`kv_quantize_in_the_gap.md`](kv_quantize_in_the_gap.md) | **Design, not built.** K/V is compressed on the scheduler thread in the gap where it is made, and persistence only copies. |
+| [`kv_quantize_in_the_gap.md`](kv_quantize_in_the_gap.md) | **Built, with open items.** K/V is compressed on the scheduler thread in the gap where it is made, and persistence only copies; the per-thread copy stream is not built, and the removals it calls for are listed at its end. |
 | [`kv_drain_under_pressure.md`](kv_drain_under_pressure.md) | A quant reserve, and compaction that never blocks migration; superseded in part by `kv_quantize_in_the_gap.md`. |
 | [`held_ground_elimination.md`](held_ground_elimination.md) | **Built 2026-10-18.** How held ground was eliminated from the partition, with what was measured. |
 | [`vram_governor_design.md`](vram_governor_design.md) | Cross-platform module measuring real free VRAM: the startup half (probes, balloon-and-measure, `AllocClass` tags, the capacity arithmetic the span is sized from) is built; the runtime criticality ladder was removed when KV moved onto a static reservation. |
@@ -82,7 +82,7 @@ larger than the card.
 | [`moe_live_dispatch_design.md`](moe_live_dispatch_design.md) | **Implemented (revision 2, §0).** The expert forward for every `ExpertCache` model with no host round trip: `bucketize` classifies routed experts VRAM / pinned / cold against a live pointer table, the expert kernels' worker blocks copy pinned misses into VRAM scratch and compute them, a stager thread (no CUDA calls) stages cold experts from NVMe, and the routing summary is read asynchronously from a mapped ring. Supersedes [`archived/gpu_native_moe_dispatch.md`](archived/gpu_native_moe_dispatch.md). |
 | [`self_contained_model_packs.md`](self_contained_model_packs.md) | **Built (2026-10-10).** The repacked pack is the model's only run-time file — every tensor, the metadata and the tokenizer in one GGUF container (`candle-transformers/src/models/model_pack/`). The repack fingerprint is per format, so a repack change invalidates only the packs that contain that format. Supersedes `expert_cache_design.md` §5.2. |
 | [`elastic_warm_tier.md`](elastic_warm_tier.md) | **Built (2026-11-21).** The elastic warm tier — pageable expert RAM that follows the machine. |
-| [`cpu_expert_compute.md`](cpu_expert_compute.md) | **Built (§9 steps 1–5).** CPU expert compute: the host pool, its rings, the CPU class in `moe_bucketize`, and the partition's refill price. |
+| [`cpu_expert_compute.md`](cpu_expert_compute.md) | **Built in part.** CPU expert compute: the host pool, its rings and the CPU class in `moe_bucketize` are built; the split's resident phase, the partition's refill price, half-waves and multi-GPU are not. |
 | [`archived/markov_expert_prediction_eval.md`](archived/markov_expert_prediction_eval.md) | **Archived evaluation.** "The Markov Wave" — ID-only Markov models for MoE expert promotion/eviction prediction, evaluated by 21-fold cross-validation on a captured Qwen3-30B-A3B routing trace. The live predictor is in `expert_lre/transition.rs` and `expert_lre/blend.rs`. |
 
 ## Scheduler & wave engine
@@ -127,7 +127,7 @@ The native-sparse 1M-context port of the sparse-latent MoE family
 | [`deepseek/deepseek_int8_hot_corpus.md`](deepseek/deepseek_int8_hot_corpus.md) | The int8-hot corpus and BF16 rope bands for the latent attention. |
 | [`deepseek/deepseek_prefill_tensorcore_pv.md`](deepseek/deepseek_prefill_tensorcore_pv.md) | The latent prefill kernel (HEAD_DIM=512): tensor-core PV, 2-block occupancy, pre-quantized V corpus. |
 | [`deepseek/deepseek_turn_seal_persistence.md`](deepseek/deepseek_turn_seal_persistence.md) | Turn seal and resume: window-ring snapshot, closed corpus and Indexer wide-Q. |
-| [`deepseek/deepseek_v4_speculative_decode.md`](deepseek/deepseek_v4_speculative_decode.md) | DSpark speculative decode for DeepSeek-V4-Flash (in progress). |
+| [`deepseek/deepseek_v4_speculative_decode.md`](deepseek/deepseek_v4_speculative_decode.md) | **Built.** DSpark speculative decode for DeepSeek-V4-Flash: drafter, virtual-slot verify, partial accept. |
 
 ## Conversation substrate & projection
 
@@ -149,7 +149,7 @@ are archived; the code under `candle-conversation/src/projection/` and
 | [`substrate_lock_free.md`](substrate_lock_free.md) | The substrate without locks: the audit of every critical section around a substrate, its redo log and zend's engine, and the design that removed them. |
 | [`guidance_layer.md`](guidance_layer.md) | Guides and journals placed by provenance, calibrated as they are used. |
 | [`shared_journal_sections.md`](shared_journal_sections.md) | Shared journal sections. |
-| [`turn_handover.md`](turn_handover.md) | **Design (2026-11-18).** A member that leaves hands its turns on. |
+| [`turn_handover.md`](turn_handover.md) | **Built.** A member that leaves hands its turns on. |
 
 ## The zend product & tool system
 
@@ -158,25 +158,24 @@ web UI.
 
 | Doc | Covers |
 |---|---|
-| [`coding_assistant.md`](coding_assistant.md) | Zen Code top-level design: the `zend` daemon + `zen-vscode` (Continue fork) + read-only web chat, phased-ingestion trunk sessions, and how the inference engine's primitives (provenance indexing, KV tiering, quantization) are put to work for a coding assistant. |
 | [`cognitive_coding.md`](cognitive_coding.md) | Extends the inference stack into a coding-agent architecture that continuously pulls context during decode (driven by attention) instead of one-shot RAG retrieval before generation. |
 | [`sdlc_agent.md`](sdlc_agent.md) | "The Vertically-Complete Engineering Agent" — extends Zen Code's substrate vertically across 28 layers spanning silicon-to-operations, so the agent reasons across the whole software lifecycle in one mind rather than one layer. |
 | [`paper_conversation_replay.md`](paper_conversation_replay.md) | **The acceptance test for scoring, provenance and working-set work.** Four messages replayed on a fresh conversation (tour → the paper → improve it → make the changes): how to run and grade it, what a good projection holds per turn, the 2026-10-25 baseline, and a verified answer key. |
 | [`tool-system.md`](tool-system.md) | Specifies the server-registered tools, the client-specific tool semantics (Continue client-executed vs. web-chat server-executed), and the Hermes-style `<tools>`/`<tool_call>` prompt format. |
-| [`web_search_design.md`](web_search_design.md) | The `web_*` tool family (`web_search`, `web_fetch`, `web_extract`, `web_compare`, `web_deep_research`) built on the Gemini API's combined grounded-search + Structured-Outputs capability. |
+| [`web_search_design.md`](web_search_design.md) | **Built.** `web_search` (Tavily) and `web_fetch` (a local fetch behind the public-address guard); the Gemini-hosted family it replaced is kept as a note. |
 | [`zend_working_set.md`](zend_working_set.md) | **Built.** The working set — what a dialogue already knows about the code. |
 | [`zend_layers.md`](zend_layers.md) | How layers above `code_reading` are built; zend's schema declares none now, and the engine is kept for per-file and per-day units. |
 | [`zend_branch_ingest.md`](zend_branch_ingest.md) | **Built and unit-tested.** Ingesting repository branches as origin holds them. |
-| [`zend_git.md`](zend_git.md) | The git layer of the `zend-vfs` crate and the model-facing `git_*` tools; the VFS purge is designed, not built. |
+| [`zend_git.md`](zend_git.md) | **Built.** The git layer of the `zend-vfs` crate and the model-facing `git_*` tools; work is published on each conversation's own branch, which replaced the VFS purge. |
 | [`zend_journal.md`](zend_journal.md) | **Built.** zend's journal, adapted from npcd's. |
 | [`zend_vfs_events.md`](zend_vfs_events.md) | **Built.** A conversation's files as substrate events. |
-| [`zend_workspace_execution.md`](zend_workspace_execution.md) | Workspace, tooling and execution architecture: the workspace and tools are built, the single-machine sandbox runs as `run_command`, cluster execution is designed, not built. |
-| [`zend_ui_redesign.md`](zend_ui_redesign.md) | **Built.** Phased plan for the Zend web UI: projection timeline gutter, windowed-substrate inspector, per-part upload progress, thinking-effort/answer-length composer dials, theme switcher. |
+| [`zend_workspace_execution.md`](zend_workspace_execution.md) | Workspace, tooling and execution architecture: the workspace, tools, sandbox (`run_command`) and jobs on agents are built; the agent pool, golden image and lease expiry are not. |
+| [`zend_ui_redesign.md`](zend_ui_redesign.md) | **Built, except unarchive.** The Zend web UI: projection timeline gutter, projection inspector, per-part upload progress, composer dials, theme switcher. |
 | [`zen_chat.md`](zen_chat.md) | Zen chat: a private conversation, deleted when it is done. |
-| [`zen_everywhere.md`](zen_everywhere.md) | **Design, agreed 2026-11-15.** Zen everywhere, drones at rest. |
+| [`zen_everywhere.md`](zen_everywhere.md) | **Built (§8 steps 1–7).** Zen everywhere, drones at rest. |
 | [`zen_tool_reach.md`](zen_tool_reach.md) | **Built.** Closing the gap between Zen's tools and Claude's. |
-| [`guest_access.md`](guest_access.md) | Guests: an allowlist, a role below User, and a queue. |
-| [`guest_draw_orchestration.md`](guest_draw_orchestration.md) | One call that draws now, authorizes meanwhile, and releases on both. |
+| [`guest_access.md`](guest_access.md) | Guests: an allowlist and a role below User (built), and a queue (not built). |
+| [`guest_draw_orchestration.md`](guest_draw_orchestration.md) | One call that draws now, authorizes meanwhile, and releases on both: release (a) built, release (b) not. |
 | [`build_agent.md`](build_agent.md) | Builds that a planned restart never cuts short. |
 
 ## MCP, memory, journals & jobs
@@ -185,16 +184,16 @@ The connector Claude uses, the memory behind it, and the jobs it watches.
 
 | Doc | Covers |
 |---|---|
-| [`claude_zend_gateway.md`](claude_zend_gateway.md) | Claude and zend: one orchestrator, one workhorse. Status line: designed, not built; authoritative over the remote connector. |
+| [`claude_zend_gateway.md`](claude_zend_gateway.md) | **Built.** Claude and zend: one orchestrator, one workhorse; authoritative over the remote connector. |
 | [`mcp_app.md`](mcp_app.md) | MCP as an aggregator over the apps' own servers. |
 | [`mcp_guides.md`](mcp_guides.md) | **Built (2026-10-26).** A skill library the connector serves. |
 | [`mcp_user_context.md`](mcp_user_context.md) | **Built (2026-10-29).** Memory and a per-client guide over MCP. |
-| [`mcp_file_tools.md`](mcp_file_tools.md) | **Design, not built.** File, log and site tools in the Zen MCP, and the gateway's pub/sub. |
+| [`mcp_file_tools.md`](mcp_file_tools.md) | **Built.** File, log and site tools in the Zen MCP, and the gateway's pub/sub. |
 | [`jobs.md`](jobs.md) | **Built (2026-11-19).** Everything that runs longer than a call is a job, watched, read, searched, listed and stopped with the same five tools. |
 | [`journal.md`](journal.md) | The journal: a short, dated record a character keeps beyond the tail of its conversation. |
-| [`memory_backbone.md`](memory_backbone.md) | **Redesigned, for review.** One master journal per group, in git. |
+| [`memory_backbone.md`](memory_backbone.md) | **Built** (`journals/`). One master journal per group, in git. |
 | [`zen_memory_and_guides.md`](zen_memory_and_guides.md) | Zen's memory, guides and task driving: the build plan from the 2026-11-08 audits; the branch is merged to `main`. |
-| [`private_mode.md`](private_mode.md) | **Building.** Private mode and diaries. |
+| [`private_mode.md`](private_mode.md) | **Built.** Private mode and diaries. |
 | [`cluster_status_story.md`](cluster_status_story.md) | **Partly built.** A failed install: what the member does, and what `cluster_status` says. |
 | [`memory_census.md`](memory_census.md) | The memory census: counting what motherd allocates, what the OS has committed for it, and what each substrate holds. |
 
@@ -252,6 +251,47 @@ Workstation build specs and standalone quality/throughput measurements.
 | [`performance_series.md`](performance_series.md) | How the performance readings (`/v1/telemetry`'s engine half and `/v1/phases`) are answered, and how a cluster's are added up. |
 | [`hardware_machine_consumer.md`](hardware_machine_consumer.md) | Parts list and cost for the AM5 + single RTX PRO 5000 Blackwell (72 GB) Battle Cities workstation build. |
 | [`hardware_machine_enterprise.md`](hardware_machine_enterprise.md) | Parts list and cost for the 4× RTX PRO 4500 Blackwell Threadripper PRO production workstation build, sized to saturate aggregate GPU ingress via a 16-way PCIe 5.0 NVMe array. |
+
+## Open designs — designed, not built
+
+Each stays in its document as the plan of record, marked **Not built** there.
+
+| Where | What |
+|---|---|
+| [`guest_access.md`](guest_access.md) §3–§4 | The guest queue, `Cost` and `people_busy`. |
+| [`guest_draw_orchestration.md`](guest_draw_orchestration.md) §4 | Release (b): `MemberState::Paused` and `GuestOccupancy`. |
+| [`cluster_status_story.md`](cluster_status_story.md) §2.3–§2.5 | A build stranded after its retries are spent; `restored_from`; a connector that follows its daemon out of rotation. |
+| [`zend_ui_redesign.md`](zend_ui_redesign.md) decision 11 | Unarchiving a conversation. |
+| [`zend_workspace_execution.md`](zend_workspace_execution.md) §7–§8 | The agent pool, golden image and lease expiry. |
+| [`wave_feeder.md`](wave_feeder.md) §4.11.4, §4.11.9 | The producer gate (`decode_starved` / `decode_carried`), the hit-rate width controller, `TIER_MARGIN_REGIONS`, `TIER_REFUSALS_BEFORE_FAIL`, lease renewal, batched park and resume. |
+| [`deltanet_state_persistence.md`](deltanet_state_persistence.md) §4.6, §4.7d | Sealed `TreeGlue` and baked `member_glue`. |
+| [`stencil_tree.md`](stencil_tree.md) §10, §13 | The decode-health suspension while a stencil drives, and the ablation flag. |
+| [`request_steps.md`](request_steps.md) | The end-to-end request-turn, carry and handover tests. |
+| [`kv_quantize_in_the_gap.md`](kv_quantize_in_the_gap.md) §5 | The per-thread copy stream and the gap-event wait. |
+| [`kv_drain_under_pressure.md`](kv_drain_under_pressure.md) §4 | The relief ladder run before a failed step retries. |
+| [`warm_lift.md`](warm_lift.md) §4 | The cold lift sharing the warm lift's ring and scatter. |
+| [`cpu_expert_compute.md`](cpu_expert_compute.md) | The split's resident phase, the refill price, half-waves, multi-GPU. |
+| [`deepseek/deepseek_turn_seal_persistence.md`](deepseek/deepseek_turn_seal_persistence.md) §9.2 | The conversation side of the DeepSeek turn seal. |
+| [`deepseek/deepseek_batched_paged_attention_plan.md`](deepseek/deepseek_batched_paged_attention_plan.md) §E–§G | The compression-seam fold in the glue kernel, and baked static `TreeGlue`. |
+| [`npc_engine_design.md`](npc_engine_design.md) Parts X, XIV | The move of zend's modules into candle-conversation; the shared test harness. |
+| [`the_effector.md`](the_effector.md) §9.1.1 | The `WorldRoutes` trait. |
+| [`zen_moon_mind.md`](zen_moon_mind.md) §3.2, §4, §6 | Focus attention, per-room terminal events, and the mail, calendar, tracking and camera terminals. |
+| [`reflection_and_dreams.md`](reflection_and_dreams.md) §8, §9, §12 | `LayerHit`, the 500-dream recency reaper, seed dreams. |
+
+## Open items — code a design removes, and known defects
+
+Each is listed in full in its document's **Open items** section.
+
+| Where | What |
+|---|---|
+| [`kv_quantize_in_the_gap.md`](kv_quantize_in_the_gap.md) | `MigrateFlight` still taken by the warm copy; the `run_palette4` host readback; persistence's `device.synchronize`. |
+| [`deltanet_state_persistence.md`](deltanet_state_persistence.md) §13 | The rewind and `truncate_sequence_to_tokens` survive; `WQS3`/`WQS4` records still score without the fold check; `substrate_inspect` strides by the locked head count. |
+| [`wave_feeder.md`](wave_feeder.md) | `scan_width`, `per_conversation_kv`, `SCAN_POOL_WAIT_CAP` and the AIMD fields of `AdmissionSection` survive. |
+| [`deepseek/deepseek_batched_paged_attention_plan.md`](deepseek/deepseek_batched_paged_attention_plan.md), [`deepseek/deepseek_int8_hot_corpus.md`](deepseek/deepseek_int8_hot_corpus.md) | `latent_moe/footprint.rs` accounts the corpus as f32 while the gallery stores int8 + BF16: the footprint is wrong. |
+| [`deepseek/deepseek_hot_path_invariants.md`](deepseek/deepseek_hot_path_invariants.md) | The q/kv F32→BF16 input casts, the `PrefillSel::Host` arm, per-row `kernel_attn_decode_capture`, the pageable warm tier, the `CorpusCache::build` zeroing. |
+| [`deepseek/deepseek_v4_speculative_decode.md`](deepseek/deepseek_v4_speculative_decode.md) | The scheduler-driven engine attaches no drafter; the drafter's 64 GiB gate keeps the 16 and 24 GB cards from it. |
+| [`decode_graphs.md`](decode_graphs.md) §5 | Fusing all-resident MoE layers. |
+| [`zen_moon_mind.md`](zen_moon_mind.md) §17.5 | `sim/missions/agendas.rs` tells Zen to `focus`, which the engine refuses a mind that takes no orders. |
 
 ## Other files in this directory
 

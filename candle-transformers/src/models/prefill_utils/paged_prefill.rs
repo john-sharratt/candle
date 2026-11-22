@@ -310,7 +310,7 @@ pub(super) fn paged_prefill_batched_impl<'w>(
 }
 
 /// Public wrapper: full-context prefill through the INT8 prefix-attention
-/// kernel (docs/archived/prefill_optimization.md) — GQA-packed M,
+/// kernel — GQA-packed M,
 /// slice-aligned tiles, int8 m16n8k32 QK/PV computed directly over the
 /// quantized arena.
 #[cfg(feature = "cuda")]

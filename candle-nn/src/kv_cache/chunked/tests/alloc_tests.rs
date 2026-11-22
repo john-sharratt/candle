@@ -645,8 +645,7 @@ mod tests {
         //
         // A chunk may occupy a slot of the next class up when its own class
         // has no free slot AND no region can be had for it. Strictly
-        // scarcity-gated: under any region availability a class gets its own
-        // (`docs/archived/arena_unification.md` §3.4).
+        // scarcity-gated: under any region availability a class gets its own.
 
         /// **The gate.** Under normal conditions — regions freely available —
         /// nothing promotes, however many chunks are claimed. If this ever

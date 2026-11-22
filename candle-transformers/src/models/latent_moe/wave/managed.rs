@@ -32,7 +32,8 @@ impl ManagedBatchedModel for BatchedEngine {
             // expert row, exactly like the qwen3 geometry.
             intermediate: cfg.moe_inter_dim,
             n_head: cfg.n_heads,
-            // Single-latent MLA: one 576-wide latent per token stands for K≡V.
+            // Single-latent MLA: one `HEAD_DIM`-wide latent per token (448 nope
+            // + 64 rope) stands for K≡V.
             n_kv_head: 1,
             head_dim: HEAD_DIM,
             experts_per_tok: cfg.n_activated_experts.max(1),

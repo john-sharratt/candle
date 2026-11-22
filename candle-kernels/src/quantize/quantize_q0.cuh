@@ -120,8 +120,7 @@ __device__ __forceinline__ void quantize_blocks_q0(
 
 // Q0_V is implemented in quantize_q0_v.cuh — it's a structured pattern-
 // indexed format with group-level state (sign_pattern, shape, magnitude
-// templates) rather than a fixed-split bipartition. See that file plus
-// docs/archived/q0_v.md for the design.
+// templates) rather than a fixed-split bipartition. See that file.
 
 // ---------------------------------------------------------------------------
 // Q0_X: INT8 bulk anchor + one outlier escape (no Lloyd, single pass)

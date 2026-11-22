@@ -348,8 +348,8 @@ mod tests {
         }
     }
 
-    /// **The console polls only while it is seen** (`docs/archived/performance_patch.md`
-    /// W12): every timed poll goes through `/common/lib/visible.js`. The only
+    /// **The console polls only while it is seen**, so a hidden tab does not
+    /// load the server: every timed poll goes through `/common/lib/visible.js`. The only
     /// files that start an interval of their own are the agents page, which
     /// gates on visibility itself, the console's retry tick, and the mock.
     #[test]

@@ -128,10 +128,24 @@ The turn is submitted on `POST /v1/chat/completions` with `conv_id` naming the
 worker and zend's own model (`zend/src/api/mod.rs`). With any model but
 `passthrough` that route runs zend's projection through `session.submit`, and
 answers `400 missing_conv_id` without a `conv_id` (`zend/src/api/chat.rs`,
-`missing_conv_id`). **`passthrough` is refused by the endpoint**: it runs the
-client's own messages through `submit_passthrough` and never touches the
-substrate (`zend/src/api/chat.rs`), which is exactly what delegation exists to
-avoid.
+`missing_conv_id`).
+
+**No `/mcp` path chooses `passthrough`.** The route itself does not refuse it:
+`model: "passthrough"` is the door for OpenAI-style clients that send their
+whole context on every call, open to any `User`-role caller, and runs those
+messages through `submit_passthrough` without touching the substrate
+(`zend/src/api/chat.rs`, `zend/src/passthrough.rs`) — exactly what delegation
+exists to avoid. So delegation is held by what the MCP side submits, not by a
+refusal at the route: a task's turn goes straight to `ZendSession::submit` with
+a worker's `conv_id`, and a chat's send (`zen_chat_send`) posts to the route
+with `model: "zen-code"` and the chat's `conv_id`
+(`zend/src/mcp/chats/dialogue/mod.rs`, `request`). A passthrough conversation
+names no owner, so the ownership layer serves it to an Admin alone
+(`zend/src/mcp/ownership.rs`).
+
+*Replaced design:* the first design had the endpoint refuse `passthrough`. The
+route was built open to OpenAI clients instead, and the MCP tools never submit
+one.
 
 ### 3.2 Tools
 
@@ -534,7 +548,7 @@ the lineage and the worker's own journal (`docs/memory_backbone.md` §7.3).
 - **Upward only.** A conversation carries its ancestors, never its siblings or
   its descendants. Claude reads descendants through the tools (§5.3).
 - **Bounded across the chain.** The journal's shape bounds each journal (one
-  line per entry, six open items, `journal-core/src/journal.rs:28`, and the
+  line per entry, six open items — `journal-core/src/journal.rs`, `MAX_OPEN` — and the
   calendar fold); a conversation also carries at most **8K tokens of ancestor
   journals** (`lineage::MAX_CHARS`), nearest ancestor first, so a
   long-lived lineage drops its outermost journals' oldest lines from the
@@ -1101,9 +1115,16 @@ readers.
 **A worker's answer accounts for its steps.** A brief's numbered or bulleted
 lines are its steps (`mcp/steps.rs`). An answer to a brief of two or more
 steps ends with a `Steps:` section, a line per step saying `done` and what
-shows it, `not done` or `could not` and why; one that leaves a step out is
-sent back once to account for it, in the same send-back as a citation check
-(the archived original of the rule is Cause 3 of
+shows it, `not done` or `could not` and why. The section is written by the
+grammar, not left to the model: the task records its steps on its conversation
+(`zend/src/answer_steps.rs`), each round binds them as the turn's tail, and
+when the answer's end token is sampled the tail writes `Steps:` and each step's
+number (`candle-conversation/src/stencil/answer_steps.rs`). The reason is
+measured: asked for in the role documents alone, a coder left the section out
+of 3 answers in 8, each costing a whole extra round, and two earlier tasks had
+ended with answers that read as complete while a step went undone. An answer
+that still leaves a step out is sent back once to account for it, in the same
+send-back as a citation check (history: Cause 3 of
 `docs/archived/zen_coding_challenge_fixes.md`).
 
 **A nudge says who sent it.** A message queued for a worker's next tool round
@@ -1453,8 +1474,9 @@ Claude Code only, in `~/.claude/settings.json`. `SessionStart` fires with
   still builds; the stream opened at once with progress notifications;
   `wait_s` clamped to 200 s for a claude.ai `clientInfo` and 240 s for
   Claude Code's.
-- `passthrough` refused by the endpoint; a task turn submitted with zend's
-  model and a `conv_id`.
+- A task turn submitted on the worker's `conv_id` through `ZendSession::submit`,
+  and a chat's send posted with zend's own model (`zen-code`) and a `conv_id`;
+  no MCP tool submitting `passthrough`.
 - The authorization server: the `401` and its `resource_metadata`; both
   metadata documents' exact bytes; a CIMD client accepted, a redirect outside
   the allowed set refused; PKCE `S256` required; the code exchange, refresh

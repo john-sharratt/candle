@@ -1,6 +1,6 @@
 # Zend: Workspace, Tooling and Execution Architecture
 
-**Status:** Workspace and tools built (§3–§4). Ingest (§5) reads the repositories' branches as origin holds them, as designed in `docs/zend_branch_ingest.md`; nothing ingests from a repository's folder, which is the sandbox's. The priming chain (§6) is built from the branches. The sandbox that runs tooling on one machine is built and wired into the daemon as `run_command` (`zend-vfs::sandbox`, §7.4); cluster execution is designed, not built (§7–§8).
+**Status:** Workspace and tools built (§3–§4). Ingest (§5) reads the repositories' branches as origin holds them, as designed in `docs/zend_branch_ingest.md`; nothing ingests from a repository's folder, which is the sandbox's. The priming chain (§6) is built from the branches. The sandbox that runs tooling on one machine is built and wired into the daemon as `run_command` (`zend-vfs::sandbox`, §7.4); cluster execution is built as the `agent` crate (`tokera-agent`, or the same agent run in process by `motherd --agent`, configured by `motherd/agent.yaml`), not as the leased pool this document first designed — §7 and §8 say which parts of that design stand, which were replaced, and which are not built.
 **Scope:** How zend serves several repositories as one workspace; how the model reads and changes code in them; how the base conversation is seeded with every repository; and how real tooling (cargo, node, python, tests) runs, on one machine and across a cluster.
 
 ---
@@ -31,7 +31,7 @@ A conversation reads a git repository **through its branch, never its folder**. 
 
 - **Git inside this document.** Reading repository state, committing the session overlay to a branch and pushing it to origin are the git layer's, designed in `docs/zend_git.md`. The working trees here are edited only through the conversation's overlay, never on disk.
 - **Repositories outside the workspace folder, or nested ones.** A repository is exactly `<workspace>/<name>`.
-- **Cluster execution.** Designed in §7–§8, not built.
+- **Cluster execution.** The agents' own design is `docs/replicated_substrate.md` §11; §7–§8 here record what of the first design they kept.
 
 ---
 
@@ -193,30 +193,32 @@ The chain is built at boot, before `ready` (the `Priming` load step) and before 
 
 ---
 
-## 7. Execution: leased build agents (not built)
+## 7. Execution on agents
 
-Most agent activity — reading, searching, editing, reasoning — runs in-process against the working trees and the session overlay. Real execution (builds, tests) runs on leased build agents.
+Most agent activity — reading, searching, editing, reasoning — runs in-process against the working trees and the session overlay. Real execution (builds, tests) runs in the sandbox on the zend host (§7.4) or on an agent, a CPU-only cluster member (`agent/`, `docs/replicated_substrate.md` §11). An agent runs as its own process (`tokera-agent`) or inside `motherd` (`host/src/cluster/mod.rs`, `start_agent`, when the host's config names an agent file).
+
+**Replaced design.** The first design leased a build agent per tool session: lock with an expiry, sync the repositories to the GPU node's tree, run, capture with `git add -A; git diff --cached --binary`, unlock. That was replaced by what is built: no lease and no lock. A run is a job posted to an agent over the cluster, carrying the conversation's store snapshot as an overlay over a base the agent fetches from origin itself; the agent runs it through the sandbox cycle of §7.4 on its own checkout and returns the deltas as the run's outcome, which the calling member applies to the store (`docs/replicated_substrate.md` §11.4). Sync granularity is therefore a per-job overlay over a fetched base, not a whole-tree sync (§9.4).
 
 ### 7.1 Agent layout
 
-Each build agent holds a checkout of every repository in the manifest, laid out under its own workspace folder exactly as on the GPU node, so relative references between repositories (a cargo path dependency from `battle-cities` to `candle`) resolve identically. Build output and caches persist across leases.
+Each agent holds a checkout of every repository it advertises, under its own folder, so relative references between repositories (a cargo path dependency from `battle-cities` to `candle`) resolve identically. Build output and caches persist, because ignored files are never removed (§7.4). Built: `agent/src/checkouts.rs`, `motherd/agent.yaml`.
 
-### 7.2 Lease lifecycle
+### 7.2 Job lifecycle
 
-1. **Pick** a sticky agent (§8.3) and **lock** it (lease with expiry).
-2. **Sync** each repository to the GPU node's working tree: the same commit, then the node's uncommitted changes and the session overlay's writes applied on top.
-3. **Run** one or more commands under a timeout.
-4. **Capture** the changes the run made in each repository (`git add -A; git diff --cached --binary`), excluding ignored paths, and return them to the session as overlay writes.
-5. **Unlock.**
+1. The gateway **picks** an agent: the one that last ran the conversation's jobs (the sticky lineage), unless a free agent outranks it or it is busy, when the job spills to the best idle agent (`cluster/src/gateway/agents.rs`).
+2. The agent **accepts** the job and answers with its id at once. It fetches origin, waits for its checkout to finish any setup, and takes a job slot.
+3. It **runs** the command under a timeout through the sandbox (§7.4): preserve, put the checkout on the branch with the overlay laid down, run, read back, restore.
+4. The **deltas** the run changed return as the job's outcome and become overlay writes in the conversation's store.
 
-A lease covers a tool session (edit, build, test, fix) rather than a single call, keeping incremental builds warm.
+The sticky lineage keeps incremental builds warm across a tool session, which is what the lease was for.
 
 ### 7.3 Safety
 
-- Commands run as a low-privilege user with write access only to the checkouts and caches; credentials are never readable by them.
-- Every command runs under a timeout that kills the whole process tree (a Job Object on Windows, a process group on Linux).
-- Leases expire slightly after the tool timeout, so a crashed holder's lease is reclaimed.
-- Tool output is rewritten from the agent's workspace folder to repository-relative paths before the model sees it, so the same error reads identically on every agent.
+- Every command runs under a timeout that kills the whole process tree (`zend-vfs/src/kill_tree`, used by `sandbox/process.rs`). Built.
+- The programs a job may start are the allow-list in `zend-vfs/src/sandbox/programs.rs`, with no shell (§7.4). Built.
+- An agent holds the credentials to push to its origins (`agent/src/config.rs`), and pushes are made only by agents. Built.
+- Not built, because there is no lease: lease expiry reclaiming a crashed holder's lease. A job cut short by a restart is recovered by the next job on the checkout (§7.4).
+- Not verified in the code: running commands as a separate low-privilege user whose files cannot reach the credentials, and rewriting the agent's folder out of tool output so the same error reads identically on every agent. Neither is found in `agent/` or `zend-vfs/src/sandbox/`; they stay the plan of record for those two properties.
 
 ### 7.4 One machine: the sandbox
 
@@ -249,26 +251,26 @@ A tool call drives its job on a thread and runtime of its own (`sandboxes/block.
 
 ---
 
-## 8. Cluster (not built)
+## 8. Cluster
 
 ### 8.1 Node roles
 
 | Role | Holds | Needs |
 |---|---|---|
-| GPU node | Conversations, KV state, the substrate, the working trees | GPU, large host RAM, NVMe |
+| GPU node | Conversations, KV state, the substrate | GPU, large host RAM, NVMe |
 | Build agent | Checkouts of every repository, build caches | CPU, disk, toolchains |
 
-Conversations are pinned to the GPU node holding their state. Only execution jobs fan out. GPU nodes may register as low-priority build agents with reserved engine cores and capped build memory.
+Conversations are pinned to the GPU node holding their state. Only execution jobs fan out. A host that shares a machine with a model member runs its agent at low priority, chosen only when no dedicated agent fits (`docs/replicated_substrate.md` §11.3, §11.5). Built.
 
 ### 8.2 Scheduling
 
-- **Capabilities and demands:** agents advertise OS, toolchains and memory; jobs declare demands.
-- **Sticky routing by lineage:** a conversation's jobs go to the agent that last ran them; a fork goes to its parent's agent.
-- **Spill threshold:** if the sticky agent is busy, wait briefly, then use any free agent.
+- **Capabilities and demands:** agents advertise OS, cores, load, free memory, job slots and the allow-listed toolchains found on `PATH`; a job names its repository and toolchain. Built.
+- **Sticky routing by lineage:** a conversation's jobs go to the agent that last ran them; a fork goes to its parent's agent. Built.
+- **Spill:** replaced. The design waited briefly on a busy sticky agent and then used any free one. What is built spills at once from a busy holder, or from one a free agent outranks, to the best idle agent, and queues on an agent only when every fit agent is busy (`docs/replicated_substrate.md` §11.3).
 
 ### 8.3 Pool management
 
-Agents are long-lived VMs, added or removed on queue depth and wait time, and reset to a golden image on a schedule, since ignored build output drifts.
+Not built: agents added or removed on queue depth and wait time, and reset to a golden image on a schedule. Agents are started by hand and kept by `keep`; an admin switches one on or off (`agent/src/switch.rs`) and the agent sweeps its own disk (`agent/src/sweep/`).
 
 ---
 
@@ -277,7 +279,7 @@ Agents are long-lived VMs, added or removed on queue depth and wait time, and re
 1. **Adding or removing a repository while conversations are live.** The manifest is read once at startup; a change takes a restart, which recalibrates the tools that take `repo` (§4.3). A removed repository's ingested units are on no branch the next pass walks, so they are retired (`docs/zend_branch_ingest.md` §7.2).
 2. **A mind workspace with no repositories.** The manifest requires at least one; a pure conversational mind still needs a folder to list.
 3. **Cross-repository search ranking.** `file_search` orders by path length across repositories; whether a repository the conversation is already working in should rank first is open.
-4. **Build-agent sync granularity** (§7.2): whole-tree sync per lease versus per-command deltas.
+4. **Build-agent sync granularity** (§7.2): answered. A per-job overlay over a base the agent fetches (`docs/replicated_substrate.md` §11.4).
 
 ---
 

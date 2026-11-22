@@ -497,7 +497,7 @@ pub(super) fn test_float_read_contiguous() -> Result<()> {
 /// The backing reports the geometry and the *configured* formats. Note what it
 /// no longer reports: which arenas are float and which are quantized. An arena
 /// is a run of fixed-stride byte slots and holds whatever fits, so that
-/// question has no answer (`docs/archived/arena_unification.md` principle 8) — a band's
+/// question has no answer — a band's
 /// format lives on its chunk.
 #[test]
 pub(super) fn backing_reports_its_geometry_and_configured_formats() -> Result<()> {

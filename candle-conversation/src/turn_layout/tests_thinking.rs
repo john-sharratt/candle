@@ -425,8 +425,8 @@ pub(super) mod tests {
         assert_eq!(phase_span_of(&layout.segments, Phase::Thinking), None);
     }
 
-    /// An ETHEREAL thinking segment (text kept, K/V dropped by the clean-turn
-    /// re-prefill) has no tokens in the grid, so it must report no span rather
+    /// An ETHEREAL thinking segment (text kept, no K/V) has no tokens in the
+    /// grid, so it must report no span rather
     /// than a zero-width one at the split point.
     #[test]
     fn an_ethereal_thinking_phase_has_no_span() {

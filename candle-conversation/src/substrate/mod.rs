@@ -373,7 +373,7 @@ pub struct Substrate {
     /// Reverse index: stable resume keys (`debug_id`) → `TimelineId`.
     /// Populated by [`Self::set_debug_id`] and the cold-load reader.
     /// Provides O(1) lookup for the test-harness `find_or_create`
-    /// pattern (§10.4 of `docs/archived/infinite_conversations.md`).
+    /// pattern.
     timeline_by_debug_id: PMap<String, TimelineId>,
 
     /// Records about a timeline that is not registered yet — its label, state,

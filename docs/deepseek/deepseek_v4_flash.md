@@ -94,9 +94,9 @@ Built and tested (branch `deepseek-flash`), bottom-up and TDD:
 - Treated the expert set as un-streamable. It isn't — the engine streams it (§5.1).
 - Built a standalone dense reference instead of integrating into the engine. The math is
   reused, but the container was wrong (§6.4).
-- Proposed dequant-then-BF16-matmul for experts. Superseded by a **native FP4 tensor-core
-  GEMM** (repack for MMA layout, 4-bit preserved) — faster and keeps the RAM footprint at
-  147 GB instead of ballooning (§3.3, §6.1).
+- Proposed dequant-then-BF16-matmul for experts. A native FP4 tensor-core GEMM was the first
+  replacement; it is unavailable on sm_120 (§6.1), so the experts run as the `MXFP4_KO` int8 twin on the
+  int8 grouped GEMM, which keeps the RAM footprint at 147 GB instead of ballooning (§3.3, §6.1).
 
 **What the first pass left, and where it landed:** the single merged GGUF (`merge_split_ggufs`,
 `candle-core/src/quantized/gguf_file.rs`, then the offline `prepare_ko_gguf`,
@@ -315,9 +315,9 @@ tokens per accepted token:
 
 Synergy note: a confident 5-token draft block gives the expert-streaming layer the
 complete routed-expert set for the whole block *before* the verify forward — combined
-with hash layers this converts expert prefetch from prediction into lookup. This is a
-big lever for us (§7 P-I) but is **out of scope for the base port**: community GGUFs
-strip the `mtp.*` tensors (bartowski: "MTP: no").
+with hash layers this converts expert prefetch from prediction into lookup. The drafter is
+built as a separate `dflash` GGUF (`deepseek_v4_speculative_decode.md`), because community GGUFs
+strip the `mtp.*` tensors from the main file (bartowski: "MTP: no").
 
 ### 2.9 Chat encoding
 
@@ -404,12 +404,14 @@ match QAT training. Two different roles:
    bit-exactly into BF16, so real storage ≡ reference fake-quant; that's the entire
    FP8-KV story and it is why FP8-first is the right call).
 2. **GEMM input quantization** (`act_quant` per-128 FP8 before every FP8/FP4 linear):
-   affects only matmul arithmetic precision. The production expert GEMM **dequantizes
-   MXFP4→FP16 per-tile in-register inside the existing grouped GEMM** and runs the FP16
-   tensor-core MMA (§6.1) — native FP4 MMA is unsupported on sm_120, so this is the path (not
-   an FP8/FP4 MMA). Weights stay 4-bit in memory; correctness is validated against the CPU
-   MXFP4 dequant oracle. The MoE is memory-bound on the expert stream, so this is not
-   meaningfully slower than a native FP4 path would be here.
+   affects only matmul arithmetic precision. The production expert GEMM runs the `MXFP4_KO`
+   lane-major twin on the **int8 tensor-core grouped GEMM**: activations are quantized per
+   128-K (q8a128), each 32-K sub of the weight is one int32 MMA whose result is folded with
+   that sub's own E8M0 scale in floating point (§6.1). Native FP4 MMA is unsupported on sm_120,
+   so this is the path (not an FP8/FP4 MMA). Weights stay 4-bit in memory; the MXFP4→int8-twin
+   repack is an exact byte permutation, and the codec is validated against the CPU MXFP4
+   dequant oracle (`cuda_mxfp4_dequant_matches_cpu`). The MoE is memory-bound on the expert
+   stream, so this is not meaningfully slower than a native FP4 path would be here.
 
 Hadamard rotation (`fast_hadamard_transform`, scale `d^-1/2`, d = 128) is required on
 the indexer path (q and cache symmetrically — scores are rotation-invariant only if
@@ -557,10 +559,13 @@ DeepSeek overrides). _Built differently:_ DeepSeek implements `ManagedBatchedMod
 creation (`create_batched_session`) are owned by the wave and no seam in the Qwen layer
 traits was extracted. The expert-streaming / scheduler machinery is reused.
 
-**Quant infra status:** MXFP4 codec (CPU+GPU dequant) is **done** (§0). The
-grouped expert GEMM float path `grouped_matmul_gemx` (`candle-core/src/quantized/cuda/grouped_matmul.rs`) dequants on the fly via
-`gemx_dequant.cuh` per-format `block_type_traits`, and MXFP4 is in it (`candle-kernels/src/quantized/loader/mxfp4.cuh`);
-the production expert path is the `MXFP4_KO` int8 twin on the int8 grouped GEMM (§6.1). `moe_bucketize` is
+**Quant infra status:** MXFP4 codec (CPU+GPU dequant) is **done** (§0). Native `MXFP4` has no `QType`
+slot in the matmul dispatch (`dtype_to_qtype` in `candle-core/src/quantized/cuda/mod.rs` maps
+`MXFP4_KO` but not `MXFP4`; `QTYPE_MXFP4` is declared with "no matmul kernel of its own"), so the float
+grouped path `grouped_matmul_gemx` cannot take an MXFP4 weight. The production expert path is the
+`MXFP4_KO` int8 twin on the int8 grouped GEMM (`grouped_matmul_gemx_q8a128`,
+`grouped_qmatmul_dev_q8a128`; the per-sub E8M0 fold lives in
+`candle-kernels/src/quantized/loader/mxfp4.cuh`, §6.1). `moe_bucketize` is
 compiled `MAX_EXPERTS 512` (`candle-kernels/src/simple/moe_bucketize_common.cuh`), above the 256 routed experts. Paged
 attention (`paged-decode/`, `paged-prefill/`) is GQA head_dim ∈ {64,128}, kernel-internal
 RoPE — unsuited to DSv4's 512-dim single-KV gather, hence the new attention kernel family `paged-latent/`.
@@ -572,33 +577,37 @@ RoPE — unsuited to DSv4's 512-dim single-KV gather, hence the new attention ke
 ### 6.1 MXFP4 weight format + FP4 tensor-core GEMM
 
 _Status: the production expert path is `MXFP4_KO` — the MXFP4 expert repacked offline
-(`prepare_ko_gguf`) into the exponent-collapse int8 twin, an exact 4-bit byte-reorder, read by the int8
-grouped GEMM (`grouped_matmul_gemx_q8a128`) with q8a128 activations. The MXFP4 dequant-to-FP16 path
-below is also in `gemx_dequant.cuh` and is the reference/standard-quant route; the sm_120 finding stands._
+(`prepare_ko_gguf`, an exact byte permutation: nibbles and per-sub E8M0 scales copied, no requant)
+into the lane-major per-sub twin (`QTYPE_MXFP4_KO`, `candle-kernels/src/quantized/loader/mxfp4.cuh`),
+read by the int8 grouped GEMM (`grouped_matmul_gemx_q8a128`, `grouped_qmatmul_dev_q8a128`) with q8a128
+activations._
 
 **Codec — DONE (§0).** `GgmlDType::MXFP4` + `BlockMXFP4 {e:u8, qs:[u8;16]}`, GGUF code 39,
-CPU quantize/dequantize with raw-byte tests, standalone CUDA dequant kernel bit-exact vs CPU,
-GGUF load path. `ExpertCache`/`MmapExpertRef` carry per-projection dtypes, so MXFP4 experts
-already slot in.
+CPU quantize/dequantize with raw-byte tests, standalone CUDA dequant kernel bit-exact vs CPU
+(`cuda_mxfp4_dequant_matches_cpu`), GGUF load path. The plain `QMatMul` route for a native MXFP4
+weight dequantizes the whole weight with that standalone kernel and multiplies in float
+(`cuda_mxfp4_qmatmul_dequant_path`); it is the reference route, not the expert path.
 
-**Expert GEMM — dequant-to-FP16 in the existing grouped GEMM (VERIFIED path, 2026-08-05).**
-The "layout, not density" repack idea assumed native FP4 tensor-core MMA. **That instruction
-is not available on our hardware:** ptxas on sm_120 (RTX PRO 5000 Blackwell) rejects the
-block-scaled FP4 MMA — `Instruction 'mma with block scale' not supported on .target 'sm_120'`,
-`Feature '.kind::mxf4' not supported` (llama.cpp #19662, confirmed on CUDA 13.1; we build on
-12.4, older still). So native MXFP4 MMA and its SF-layout repack are **off the table** here.
+**Expert GEMM — the int8 twin with a per-sub fold (BUILT).** The "layout, not density" idea assumed
+native FP4 tensor-core MMA. **That instruction is not available on our hardware:** ptxas on sm_120
+(RTX PRO 5000 Blackwell) rejects the block-scaled FP4 MMA — `Instruction 'mma with block scale' not
+supported on .target 'sm_120'`, `Feature '.kind::mxf4' not supported` (llama.cpp #19662, recorded
+2026-08-05 on CUDA 13.1; we build on 12.4, older still). So native MXFP4 MMA and its SF-layout repack
+are **off the table** here.
 
-The path is therefore the one the codebase already uses for every other quant: **add MXFP4 to
-`grouped_matmul_gemx` (`gemx_dequant.cuh`) as a per-format `block_c_mxfp4` + `block_type_traits`
-+ an E2M1×E8M0-half dequant in the inner loop** — the weight is dequantized *per tile in
-registers* to FP16 and fed to the standard FP16 tensor-core MMA. This:
-- keeps experts **4-bit in memory** (147 GB pinned pool preserved — the dequant is in-register,
-  not in memory), so tensor cores are engaged (FP16 MMA) at 4-bit storage density;
-- needs **no repack and no new kernel** — it mirrors the existing Q4_K / Q6_K gemx handling
-  (a small traits + dequant addition), validated against the CPU MXFP4 oracle;
-- is not the bottleneck: the MoE is memory-bound on the pinned→VRAM expert stream, so
-  FP16-MMA-with-in-register-dequant is not meaningfully slower than a hypothetical native FP4
-  path would be here.
+The built path: each 32-K sub of an MXFP4 weight is stored as its E2M1 codebook indices expanded to int8
+(`mxfp4_codebook_x4`) beside its E8M0 scale; the kernel issues one int32 MMA per sub against the q8a128
+activation and folds the result with that sub's own scale `2^(e_sub-128)` in FP32 (the
+`is_mxfp4_persub` branch of `kernel.cuh`). This:
+- keeps experts **4-bit in memory** (147 GB pool preserved) — the codebook expansion is in-register;
+- is exact in the weight (no requantization, unlike the Q8_KO twins' per-128 scale granularity);
+- is not the bottleneck: the MoE is memory-bound on the pinned→VRAM expert stream.
+
+_Replaced design: this section planned to add `block_c_mxfp4` to the float `grouped_matmul_gemx`
+(`gemx_dequant.cuh`) so the weight would be dequantized per tile in registers to FP16 and fed to the FP16
+tensor-core MMA, with no repack. That path does not exist: `MXFP4` has no `QType` slot in the matmul
+dispatch (`dtype_to_qtype` does not map it, `QTYPE_MXFP4` carries no matmul kernel), and the expert
+weights are repacked offline into `MXFP4_KO` instead, read on the int8 MMA._
 
 (DeepSeek's own reference `fp4_gemm` corroborates avoiding native FP4: it upcasts FP4→FP8 and
 runs an FP8 MMA. If a future sm_100-class board with working `kind::mxf4` is targeted, the
@@ -626,13 +635,14 @@ New candle-kernels subdir `sparse-attn/` (as planned):
   radix/partial-sort or a two-pass threshold approach), compressor gated-pooling
   (prefill batch + decode incremental).
 
-Cache state: new `Dsv4LayerKv` per session per layer — window ring (128×512),
-compressed append buffer, indexer append buffer (CSA), compressor ring states.
-Initially these are flat session-owned CUDA tensors (the session-KV override, §6.4;
-`ChunkedKvBacking` is bypassed); growth by chunked realloc. Integration with the
-three-tier arenas + substrate persistence is deferred to the zend phase (§7 P-I) —
-compressed entries are append-only and 583 B each, which maps naturally onto sealed
-chunks later.
+Cache state, as planned: new `Dsv4LayerKv` per session per layer — window ring (128×512),
+compressed append buffer, indexer append buffer (CSA), compressor ring states, as flat
+session-owned CUDA tensors with `ChunkedKvBacking` bypassed and the three-tier arenas and
+substrate persistence integrated later (compressed entries append-only at 583 B each).
+_Replaced design (built, see the status line above): there is no `Dsv4LayerKv`. The window ring is a
+`ChunkedKvBacking` in single-latent mode from the start, so it rides the arena pool and the persistence
+thread's hot→warm drain; the corpus is the per-sequence `FloatGallery` (int8+BF16 cache, f32 keys, sign
+index); the compressor ring states are `IncrementalCompressor` state held by the wave._
 
 ### 6.3 MoE deltas
 
@@ -650,39 +660,39 @@ _Status: all four are in (the router in `latent_moe/moe.rs`, `Gate::route`; `moe
   clamp, symmetric up clamp).
 - Shared expert: reuse dense-MLP machinery (Q8_0 weights).
 
-### 6.4 Engine integration — minimally invasive (defaults + overrides, no duplication)
+### 6.4 Engine integration — `BatchedEngine` implements `ManagedBatchedModel` directly
 
-_Status: not followed. DeepSeek is a `ManagedBatchedModel` implemented directly (`BatchedEngine`,
-`latent_moe/wave/`), with its own wave sweep, so the three defaulted trait methods below were not
-extracted (`deepseek_batched_paged_attention_plan.md` §K step 5 records the choice). The plan text is
-kept as the design of record._
+_Status: built as described here. DeepSeek is a `ManagedBatchedModel` implemented directly by
+`BatchedEngine` (`latent_moe/wave/managed.rs`), with its own wave sweep (`latent_moe/wave/sweep_wave.rs`);
+the scheduler binds it as `Box<dyn ManagedBatchedModel>` (`candle-conversation/src/models/builder/load_arch.rs`:
+`Engine::load` then `BatchedEngine::new`). `deepseek_batched_paged_attention_plan.md` §K step 5 records
+the choice._
 
-**Do not** fork the forward loop or implement a parallel `ManagedBatchedModel` (that
-duplicates the engine). Instead: find the spots that *wrongly hard-code*, turn each into a
-trait method whose **default implementation is today's behavior** (so Qwen3 et al. are
-byte-for-byte unchanged), and **override only those for DeepSeek**. Three seams (§5.2):
+The model-to-engine contract is the scheduler-facing trait, and `BatchedEngine` fills it in:
+- **Geometry and admission:** `num_layers`, `n_kv_head` (1), `head_dim` (`HEAD_DIM` = 512), `wave_geometry`,
+  `prefill_width_cap` (bounded by compute saturation and what the KV side can admit, because the forward
+  takes its transients from the CUDA pool rather than the wave span), `reclaimable_kv_bytes` (the weight
+  zone's cedeable span), `maybe_change_dtype` (a no-op: dtypes are fixed at load).
+- **Session KV creation:** `create_batched_session` builds the single-latent `ChunkedKvBacking` and pins
+  the writer format to the two-region latent (nope `[0,448)` FP8 E4M3 at unit scale, rope `[448,512)` BF16).
+- **The wave:** `forward_wave` calls the shared driver `wave_driver::drive_wave`, with `BatchedEngine`
+  implementing its `WaveSweep` trait (`residual_row` is the mHC stream, `hc_mult·dim` F32, so the
+  engine's carried hidden is flat as the plan wanted); `latent_moe/wave/sweep_wave.rs` owns the layer loop — the mHC
+  `hc_pre`/`hc_post`/`hc_head` blocks (one fused Sinkhorn kernel each: 24-dim linear + sigmoid/softmax +
+  20 Sinkhorn iterations on a 4×4, one warp per token, FP32 as in the reference), the paged-latent
+  attention launches (§6.2), and the MoE through `ExpertCache::forward_routed`. Cross-session wave
+  batching and the MoE seam are reused as they are for the Qwen models.
+- **Speculative decode:** `speculative_draft`, `begin_verify`, `end_verify` and `truncate_sequence`
+  (`deepseek_v4_speculative_decode.md`).
 
-1. **Attention kernel.** Extract the paged-GQA step out of `forward_attn_batched_single/_multi`
-   into a defaulted `BatchedAttentionLayer` method (e.g. `attend(qkv, cache, …)`) that defaults
-   to `paged_decode_attn`/`paged_prefill_batched`. DeepSeek overrides it with the sparse-gather
-   + sink + indexer path (§6.2). `project_qkv`/`o_proj` are already hooks, so only the middle
-   needs the seam.
-2. **Residual / layer body.** Extract the `norm→attn→add→norm→ffn→add` body of
-   `forward_layer_batched_mixed` into a defaulted `layer_forward` hook. DeepSeek overrides it for
-   mHC (`hc_pre`/`hc_post` with the fused Sinkhorn kernel). **Keep the engine buffer flat:** let
-   DeepSeek declare its engine-visible hidden as `hc_mult·4096 = 16384` and do the 4-copy
-   reshape *inside* the hook (embedding expands ×4, `hc_head` reduces ×4 before the LM head), so
-   the engine's `[tokens, hidden]` carry shape is unchanged — the refactor is "extract a
-   method", not "reshape the pipeline".
-3. **Session KV creation.** Extract the GQA `ChunkedKvBacking` construction into a defaulted
-   hook so DeepSeek supplies its session-owned window/compressed/indexer KV (§6.2) instead.
-
-`hc_pre`/`hc_post`/`hc_head` are one fused kernel each (`hc_split_sinkhorn`: 24-dim linear +
-sigmoid/softmax + 20 Sinkhorn iters on a 4×4 — one warp per token), FP32 as in the reference.
-Cross-session wave batching and the MoE `ffn_residual` seam are reused as-is (MoE input is a flat
-`[tokens, 4096]` after `hc_pre`). Int8 activation fusion (q8a128 epilogues) is a later
-optimization; BF16 dynamic acts first. **Net: one set of traits, additive defaulted methods,
-three overrides for DeepSeek, existing models untouched.**
+_Replaced design: the plan said not to implement a parallel `ManagedBatchedModel`, and instead to
+extract three hard-coded spots — the paged-GQA attention step in `forward_attn_batched_single/_multi`, the
+`norm→attn→add→norm→ffn→add` layer body of `forward_layer_batched_mixed` (with the mHC 4-copy stream hidden
+inside a flat `hc_mult·4096` buffer), and the GQA `ChunkedKvBacking` construction — into defaulted trait
+methods that only DeepSeek overrides, so the Qwen models stayed byte-for-byte unchanged. The code took the
+other branch: the DeepSeek sweep owns the attention kernel, the mHC layer body and the session KV creation,
+so no seam in the Qwen layer traits was extracted and no existing model was touched. The flat
+`hc_mult·dim` residual carry survived the change._
 
 ### 6.5 Loader & config — single merged GGUF
 
@@ -740,24 +750,27 @@ Remaining, test-first against the engine _(first-pass list; status as built: P-A
 `MXFP4_KO` int8 twin (§6.1); P-D not followed (§6.4); P-E done as `latent_moe/` + `models/deepseek4.rs`;
 P-F done — `candle-conversation/tests/deepseek_rung4.rs` and the `latent_moe/wave/tests_*.rs` gates;
 P-G partly — the live MoE dispatch and the paged-latent kernels, FP4 MMA is out of scope on sm_120;
-P-H partly — see §6.6; P-I — the scheduler binds DeepSeek and DSpark speculative decode is built, the
-turn-seal wiring is specified but not built (`deepseek_turn_seal_persistence.md`))_:
+P-H partly — see §6.6; P-I — the scheduler binds DeepSeek; DSpark speculative decode is built and gated,
+but the scheduler's load path (`load_arch.rs`) attaches no drafter (see Open items); the conversation side
+of the turn seal is specified but **Not built** (`deepseek_turn_seal_persistence.md` §9.2))_:
 
 - **P-A — Merge to a single GGUF.** No `gguf-split`/`gguf-py`/llama.cpp on the box (verified),
   so write a small Rust merger: read the 4 splits, emit one `DeepSeek-V4-Flash-0731-MXFP4.gguf`
   on D: (merge tensor_infos with recomputed offsets, concatenate aligned tensor data, drop the
   `split.*` metadata). D: has 4.8 TB free. Confirm it loads via the single-mmap path (§6.5).
-- **P-B — Copy the test, run it red.** Copy `test_parallel_batched_forwarding` →
-  `latent_moe::wave::tests::test_parallel_batched_forwarding` (new DeepSeek `Dialect`, §2.9). It fails
-  at load — that failing trail drives the rest (the step the first pass skipped).
-- **P-C — MXFP4 in the grouped expert GEMM (§6.1).** Add `block_c_mxfp4` + `block_type_traits`
-  + the E2M1×E8M0 dequant to `gemx_dequant.cuh` so `grouped_matmul_gemx` dequants FP4→FP16
-  per-tile and runs the existing FP16 MMA; `dtype_to_qtype` maps MXFP4. Validate against the CPU
-  oracle. No repack, no native FP4 (unsupported on sm_120). Decoupled from P-D/P-E.
-- **P-D — Engine seams (§6.4).** Extract the three hard-coded spots (attention kernel, layer
-  body/residual, session KV creation) into defaulted trait methods; assert Qwen3
-  `test_parallel_batched_forwarding` + `wave_equivalence` still pass byte-for-byte (the
-  regression gate for "minimally invasive").
+- **P-B — Copy the test, run it red.** Copy `test_parallel_batched_forwarding` into the DeepSeek model
+  file (new DeepSeek `Dialect`, §2.9). It fails at load — that failing trail drives the rest (the step the
+  first pass skipped). _Built as `deepseek4::tests::test_parallel_batched_forwarding`
+  (`candle-transformers/src/models/deepseek4.rs`, `#[ignore]`d: the StoryRewrite harness at widths
+  `[1,4,8,16,1]`, DeepSeek dialect, thinking blocks stripped before validation, speculative decode on)._
+- **P-C — MXFP4 in the grouped expert GEMM (§6.1).** _As planned:_ add `block_c_mxfp4` +
+  `block_type_traits` + the E2M1×E8M0 dequant to `gemx_dequant.cuh` so `grouped_matmul_gemx` dequants
+  FP4→FP16 per-tile and runs the existing FP16 MMA; `dtype_to_qtype` maps MXFP4. _Replaced design:_
+  `dtype_to_qtype` maps `MXFP4_KO` and not `MXFP4`; the experts are repacked offline to `MXFP4_KO` and run
+  on the int8 grouped GEMM with a per-sub E8M0 fold (§6.1). No native FP4 (unsupported on sm_120).
+- **P-D — Engine seams (§6.4).** _Not followed:_ the three hard-coded spots were not extracted into
+  defaulted trait methods; DeepSeek implements `ManagedBatchedModel` directly, so there is no Qwen3
+  regression gate to hold for this step.
 - **P-E — DeepSeek overrides + loader.** Single-file loader (§6.5); the three overrides:
   sparse-gather attention kernel (§6.2, window ring + compressed + indexer, sinks, de-rotation)
   ported from the oracle; mHC `layer_forward` (hidden=16384 trick); session-owned KV. MoE
@@ -776,15 +789,13 @@ turn-seal wiring is specified but not built (`deepseek_turn_seal_persistence.md`
 
 ## 8. Risks & open questions
 
-1. **Minimally-invasive refactor (P-D) is the pivotal risk.** Extracting the three hard-coded
-   seams into defaulted trait methods must leave Qwen3 **byte-for-byte identical** —
-   `test_parallel_batched_forwarding` + `wave_equivalence` are the regression gate. If a default
-   can't reproduce the current path exactly, the seam is drawn in the wrong place.
+1. **Minimally-invasive refactor (P-D) — retired.** The plan extracted three hard-coded seams into
+   defaulted trait methods that had to leave Qwen3 byte-for-byte identical. DeepSeek implements
+   `ManagedBatchedModel` directly (§6.4), so the risk did not arise; the Qwen models are untouched.
 2. **FP4 MMA on sm_120 — RESOLVED (2026-08-05):** native block-scaled FP4 MMA is *not*
    available (ptxas rejects `kind::mxf4`/`block_scale` on sm_120, llama.cpp #19662). So the
-   expert GEMM dequantizes MXFP4→FP16 in-register in the existing grouped GEMM (§6.1) — no
-   repack, no new MMA kernel, weights stay 4-bit in memory. Native FP4 is out of scope on this
-   hardware.
+   experts run as the `MXFP4_KO` int8 twin on the int8 tensor-core grouped GEMM with a per-sub E8M0
+   fold (§6.1) — weights stay 4-bit in memory. Native FP4 is out of scope on this hardware.
 3. **GGUF fidelity** — metadata is verified (§4); llama.cpp's DSv4 runtime reportedly has
    long-context corruption + KV-quant issues, so tensor-value fidelity is trusted only once the
    copied test produces coherent output on real weights (P-F), not before.
@@ -802,6 +813,24 @@ turn-seal wiring is specified but not built (`deepseek_turn_seal_persistence.md`
    oracle carries the fast TDD loop, real-weight runs are the gate, not the inner loop.
 9. **`num_speculative_tokens` 7 vs `dspark_block_size` 5** — the built drafter uses the trained
    block size from the GGUF (`dflash.block_size`, 5); see `deepseek_v4_speculative_decode.md`.
+
+---
+
+## Open items
+
+1. **The scheduler-bound engine has no speculative drafter.** `load_arch.rs` builds `Engine::load` and
+   `BatchedEngine::new` (`Engine::load` is `Engine::load_with_drafter` with no drafter path); only the
+   gates (`deepseek4::tests::test_parallel_batched_forwarding`, `latent_moe/wave/tests_speculative.rs`)
+   call `Engine::load_with_drafter` and `BatchedEngine::with_drafter`. DSpark is built and gated but not
+   reachable through the conversation engine.
+2. **The drafter needs more than 64 GiB of VRAM.** `DsparkDrafter::load` refuses a smaller device
+   (its routed experts are a permanently resident `Q2_KO` set of about 5 GiB), so speculative decode is
+   unavailable on the 16 GB and 24 GB dev machines; the target itself still runs there through the
+   expert cache.
+3. **`latent_moe/footprint.rs` accounts the wrong corpus store** (f32 pair, `(m,l,acc)` tails) — see
+   `deepseek_batched_paged_attention_plan.md` Open items.
+4. **First-pass sizing in §3.2** (the 583 B/entry FP8 corpus, the 3.5 GB/session KV figure, the FP4
+   Indexer cache) is the planned target; the built layout is recorded in the "KV row, as built" note.
 
 ---
 

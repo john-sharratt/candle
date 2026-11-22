@@ -4,8 +4,7 @@
 //! `tenant_arena`): a region of the device reservation cut into page-sized slots,
 //! dedicated to the gallery, counted and returned like every other span tenant.
 //! The slot's address is the page's address, and the scan kernel receives those
-//! addresses directly (the paged-KV `k_ptr` precedent — see
-//! `docs/archived/paged_gallery_arena.md` §3.2).
+//! addresses directly (the paged-KV `k_ptr` precedent).
 //!
 //! These pages once came from the CUDA async pool, outside the reservation, and
 //! were never returned. Memory outside the span competes with the span for the

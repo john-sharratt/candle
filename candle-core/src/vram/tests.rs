@@ -5,9 +5,8 @@
 //!
 //! The relief-ladder half of the matrix — gentle-early relief, escalation,
 //! Critical-only sync, no-spin, the concurrency forecast and the OOM retry —
-//! went with the ladder itself (`docs/archived/arena_unification.md` §5). The
-//! `kv_floor` / `expert_budget` half went with the static partition
-//! (`docs/archived/elastic_vram_partition.md` §9).
+//! went with the ladder itself. The
+//! `kv_floor` / `expert_budget` half went with the static partition.
 
 use std::sync::Arc;
 

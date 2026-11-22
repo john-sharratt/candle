@@ -66,10 +66,28 @@ A seal that finishes after its claim was released (removed or tombstoned
 mid-seal) retakes the claim under a distinct key, releases it and retires the id,
 so a newer same-name section is never clobbered.
 
-## Known limits
+## Recurrent models
 
-- A fork's tombstone does not clear the scheduler tables for sections the fork
-  itself submitted; the substrate entry is released.
-- Recurrent / hybrid models: whether a member sealed mid-sequence is gap-filled
-  correctly in recurrent state has not been verified. Test it on a hybrid model
-  before relying on submission there.
+A section's recurrence starts where the prompt before the collection, then the
+sections it continues, leave it (`SealJob::start_state`). The section it
+continues directly hands over the recurrent state its seal ended on when it was
+sealed here; one restored from the log hands over the end state its stream
+keeps when it ended a shared run (`docs/shared_journal_sections.md` §4.1);
+otherwise the start is worked out from the state after the schema's prefix,
+run on through the sections it continues (`prefix_state::state_after`,
+`continue_state`). A host copy of an end state is the largest thing a section
+holds, so it is let go once a later section and that section's successor have
+sealed (`forget_passed_end_states`).
+
+The projection's gap-fill is not what carries a submitted section's recurrence.
+A model whose `model_core_properties().can_gap_fill` is false
+(`carries_recurrent_state()`) has no glue island reserved for it: the assembler
+refuses one (`projection_assembler/walk.rs`), because a token inserted
+mid-sequence has no computable output. The seal's carried state is what keeps a
+section read after others computed as it is read.
+
+## Tombstoning a timeline
+
+`Engine::tombstone_timeline` releases every section the timeline owns, forks
+included (each section is owned by the timeline that submitted it), and clears
+the scheduler's per-section tables for them with `RetireSections`.

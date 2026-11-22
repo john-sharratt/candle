@@ -527,13 +527,17 @@ disk.
 
 A remote batch is decided against a private clone of the version (dominance,
 outranks, adoption plans) and published in one edit, so no reader sees half a
-batch. The whole of it runs as one call on the owner today — the decision is
+batch (`SubstratePersistence::apply_remote_shared`, reached through
+`SubstrateHandle::apply_remote`). Each record's integrity check (digest and CRC,
+`check_remote`) runs first on the caller's thread, touches no state, and so holds
+nothing. Everything after it runs as one call on the owner — the decision is
 interleaved with the owner's own state (the applied set, the minter, the append
 and its indexes) — so a batch holds the owner for as long as it takes, and one
-that holds it 250 ms or more names its phases (clone, decide, plan, edit) in the
-log. What those name is what leaves the owner: the decision moves to a
-snapshot of the owner's indexes, as §9.5's planning already reads them, leaving
-the owner the appends and the edit.
+that holds it 250 ms or more (`SLOW_BATCH`) names its phases (clone, decide, plan,
+drop, edit) in the log. Those phases are the measurement the next step is chosen
+from: moving the decision onto a snapshot of the owner's indexes, as §9.5's
+planning already reads them, would leave the owner only the appends and the edit.
+Not built: that snapshot decision; the owner runs the whole batch.
 
 ## 10. Every race, closed
 

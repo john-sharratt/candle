@@ -23,7 +23,8 @@ Two releases:
   rolled out by the cluster and is restarted through each machine's keep,
   before the npcd members.
 - **(b)** `MemberState::Paused`: while a draw holds a member's card, gateways
-  route new work elsewhere. A wire change (protocol 7), §4.
+  route new work elsewhere. A wire change (the next protocol after the one
+  the cluster runs), §4. **Not built.**
 
 Release (a) is built (`npcd/src/authorize/`, `PREFER_PEER` and `Registry::pick_from`
 in the cluster crate). Release (b) is not: `MemberState` in
@@ -56,9 +57,9 @@ probing the filter (decided 2026-10-28).
 - `sig` is HMAC-SHA256 under `Join::derive_key("npcd prompt authorization")`
   (`host/src/cluster/mod.rs`), over exactly the bytes
   `"{purpose}\n{prompt_sha256_hex}\n{exp_ms}"`, verified in constant time —
-  as image links are (`npcd/src/image_links.rs:115-146`), but a type of its
+  as image links are (`npcd/src/image_links.rs`), but a type of its
   own with its own key. With no cluster the key is minted per process, as
-  image links' is (`api/mod.rs:189`); an unclustered daemon checks locally anyway.
+  image links' is (`npcd/src/api/mod.rs`); an unclustered daemon checks locally anyway.
 - `prompt_sha256` is over the exact `ImageRequest.prompt` handed to the guest.
   The route does no normalisation: a caller trims before it authorizes, as the
   MCP tools already trim (`npcd/src/mcp/args.rs`).
@@ -71,11 +72,10 @@ probing the filter (decided 2026-10-28).
 
 `compliance::check` becomes the one implementation behind a `ContentCheck`
 trait, called with the state per call (no `Arc<Authored>` held in a trait
-object stored on `Authored`). Its two callers today — `post_image`
-(`guest_routes.rs:226`) and the portrait route (`portrait.rs:262`) — both go
-through it. The existing error codes are unified: a check that could not run is
-`check_unavailable` everywhere (`post_image` says `prompt_declined` with 503
-today, `guest_routes.rs:237`).
+object stored on `Authored`). Its two callers — `post_image`
+(`guest_routes.rs`) and the portrait route (`portrait.rs`) — both go
+through it. The error codes are unified: a check that could not run is
+`check_unavailable` everywhere.
 
 ## 2. The one call (a)
 
@@ -92,14 +92,14 @@ On the member the call landed on (D):
    its status, naming why. Valid: draw and answer; no check.
 2. **Restricted LoRA:** the existing rule — an Admin, no check — stands, as a
    `Clearance::AdminWaiver` constructible only from a passed
-   `require(Admin)` (`guest_routes.rs:207-227`).
+   `require(Admin)` (`guest_routes.rs`).
 3. **None given, another npcd member routable:** submit the guest job at once
-   and, at the same moment, send `POST /v1/prompt/authorize` up (`send_up`,
-   `host/src/cluster/up.rs:46`, `read_for` 30 s) **and start D's own check**.
+   and, at the same moment, send `POST /v1/prompt/authorize` up (`send_up` in
+   `host/src/cluster/up.rs`, `read_for` 30 s) **and start D's own check**.
    The gateway places the peer's by `Best`, and **a request a member sends up
    never goes back to that member while another member of its app is
    routable** (§3). D chooses no peer: the gateway has the live capacity, D
-   sees only admission weights (`MemberInfo`, `cluster/src/frame/types.rs:118`).
+   sees only admission weights (`MemberInfo`, `cluster/src/frame/types.rs`).
 
    Both checks race because neither is reliably the quicker. D's waits out
    its own drain (the drain stops D's engine) and then answers in about a
@@ -148,11 +148,11 @@ On the member the call landed on (D):
 
 Refusals move from a status code before the stream to an in-band error line
 under 200, as every other draw failure already is. The MCP tools read it
-through `outcome()` (`mcp/image.rs:375-386`); nothing else branches on the
+through `outcome()` (`npcd/src/mcp/image.rs`); nothing else branches on the
 status.
 
 **The cost of drawing first.** The check takes 10–19 s under load
-(`compliance.rs:555-558`) and a drain starts on the next scheduler pass, so a
+(`npcd/src/compliance.rs`) and a drain starts on the next scheduler pass, so a
 refused prompt is usually drawn before it is refused: one drain (~6–8 s with
 every world on that member stopped, and the card's KV evicted) instead of four
 one-token turns. Accepted (decided 2026-10-28): refusals are rare, and every
@@ -167,13 +167,13 @@ still queued — including one requeued to wait for room — answers its receipt
 with `waiting_since` remains**: `waiting` closes prefill admission
 (`scheduler/prefill/admitting.rs`), and a cancel that removed the last waiting job
 without clearing it would close admission for good. `GuestError::Cancelled` is
-added to the exhaustive matches (`guest_routes.rs:312-319, 491-498`).
+added to the exhaustive matches (`guest_error_line` and `refusal` in `npcd/src/guest_routes.rs`).
 
 **Where release happens.** `Held<T>` wraps the guest's outcome
 (`GuestImage.png`, 1–3 MB at the MCP's 1024 side) and opens only with a
 `Clearance` — `Authorized(Authorization)` matching its prompt, or
 `AdminWaiver`. It opens inside `post_image`'s streaming task before the `done`
-line is built (`guest_routes.rs:297-305`). Everything downstream — the MCP
+line is built (`guest_routes.rs`). Everything downstream — the MCP
 tools' store, seed stamp (`npcd/src/image_seed.rs`), kept notes and edit chain
 (`npcd/src/images/`) — sees only released output and is unchanged.
 
@@ -191,7 +191,7 @@ a sender the call takes back when it answers, so a refusal is the stream's
 last line and the stream ends with it, even while a drain still holds the
 withdrawn job.
 
-**Rollout order.** `ImageBody` denies unknown fields (`guest_routes.rs:52`): a
+**Rollout order.** `ImageBody` denies unknown fields (`guest_routes.rs`): a
 member that predates `authorization` answers a request carrying it 400. So the
 gateway first, then every npcd member, then callers may send `authorization`.
 The MCP tools ignore unknown arguments, so a model passing one to an old member
@@ -220,10 +220,14 @@ clients' traffic, and an unproven build is not handed the members' own. Every
 other request — a member's without the header included — is placed as a
 client's is, so zend's operations tools keep browser-identical routing.
 Addressing by `x-tokera-node` is not used: it is Admin-only
-(`web/src/cluster/route.rs:99-117`), skips routing and `in_flight`, and answers
+(`web/src/cluster/route.rs`), skips routing and `in_flight`, and answers
 404 for a node not on the gateway the stream reached.
 
 ## 4. Paused (b)
+
+**Not built** (plan of record). `MemberState` has no `Paused` and the engine
+has no `GuestOccupancy`; the line references below name where each change
+lands, by file.
 
 While a guest holds D's card, D's capacity says `Paused`; gateways route new
 work to other members, best-effort: a request already on its way when the
@@ -234,43 +238,43 @@ it: from the guest job queued until the queue is empty and no job is waiting
 for room. That covers the drain's whole stop (`drain_guests`,
 `scheduler/guest_room.rs`), the shed ladder before the claim, and a job
 requeued for room — which closes admission for up to `ROOM_PATIENCE`
-(`drain.rs:157`) — and does not flap between an image drain and a matte drain
+(`guest/drain.rs`) — and does not flap between an image drain and a matte drain
 back to back. The engine sets a process-wide `GuestOccupancy` static beside
-`reach::STATED` (`candle-conversation/src/guest/reach.rs:30`), cleared by an
+`reach::STATED` (the static in `candle-conversation/src/guest/reach.rs`), cleared by an
 RAII guard so a panicking guest cannot leave it set. A host task subscribes and
 calls `capacity_changed()` on every `AppLink`, on the cluster socket runtime,
 so `CAPACITY` goes out on the change. One engine serves both tenants, so zend
 and npcd both report it.
 
-**Precedence** in `member_state` (`host/src/cluster/capacity.rs:71`): Fault,
+**Precedence** in `member_state` (`host/src/cluster/capacity.rs`): Fault,
 then Loading (tenant not ready), then Paused, then Ready — a zend tenant still
 loading does not report Paused because npcd's draw holds the shared engine.
-`capacity_for` (`cluster/src/member/app.rs:712`) tests `state.up()`.
+`capacity_for` (`cluster/src/member/app.rs`) tests `state.up()`.
 
 **Up, not ready-for-new-work.** `MemberState::up()` is `Ready | Paused`, and
 every reader that asks "is this member up" uses it:
 
-| Reader | Where |
+| Reader | Where (under `cluster/src/` unless named) |
 |---|---|
-| clustered / table / standing-by | `gateway/registry.rs:410-435` |
-| joining beside a serving member (sync) | `gateway/hub/sockets.rs:449` |
-| in-sync judgement | `gateway/relay.rs:162` |
-| catch-up answerer | `gateway/registry.rs:466` |
-| aggregates | `gateway/registry.rs:609` |
-| handover forgetting, `everyone_holds` | `gateway/registry.rs:256, 519-522` |
-| any ready, app view | `gateway/hub/members.rs:1258-1265, 1361` |
-| world and character rendezvous | `npcd/src/authority/cast.rs:34` |
-| replication's ready count, governor, absent leases | `replicate/consensus.rs:421, 345-355`; `quorum_governor.rs` |
-| forced-rollout quorum | `gateway/upgrades/plan.rs:108-113`; `hub/certification.rs:985` |
-| certification start | `gateway/upgrades/mod.rs:281` |
-| status page, worlds view | `gateway/status.rs:249`, `worlds_view.rs:67`, `cluster/gateway.html:348, 361, 859` |
+| clustered / table / standing-by | `gateway/registry.rs` |
+| joining beside a serving member (sync) | `gateway/hub/sockets.rs` |
+| in-sync judgement | `gateway/relay.rs` |
+| catch-up answerer | `gateway/registry.rs` |
+| aggregates | `gateway/registry.rs` |
+| handover forgetting, `everyone_holds` | `gateway/registry.rs` |
+| any ready, app view | `gateway/hub/members.rs` |
+| world and character rendezvous | `npcd/src/authority/cast.rs` |
+| replication's ready count, governor, absent leases | `replicate/consensus.rs`, `quorum_governor.rs` |
+| forced-rollout quorum | `gateway/upgrades/plan.rs`, `gateway/hub/certification.rs` |
+| certification start | `gateway/upgrades/mod.rs` |
+| status page, worlds view | `gateway/status.rs`, `worlds_view.rs`, `cluster/gateway.html` |
 
-Live events reach a paused member as ever (`relay.rs:47` skips only
+Live events reach a paused member as ever (`gateway/relay.rs` skips only
 Upgrading and Fault).
 
 **Routing.** One helper, `prefer(pool, |m| !m.paused())`, returning the pool
 unchanged when no member qualifies — the shape of `ready_but` and
-`within_reach` (`registry.rs:443-462, 711-727`). Applied in `best_but` after
+`within_reach` (`gateway/registry.rs`). Applied in `best_but` after
 `within_reach` (reach first: a draw only the paused card reaches still goes
 there), in `best_for` after the holding filter (with `everyone_holds` on the
 unfiltered pool), in `round_robin_but`, and in an unpinned `Ui` pick. Not
@@ -291,13 +295,12 @@ and lease ticks run off the scheduler thread and continue; world beats and
 character turns on that member wait for the drain, as today.
 
 **The bump.** `MemberState` is a byte on the wire and an unknown value is a
-decode error (`frame/types.rs:106-110`), so (b) is protocol 7. A gateway
-refuses a different protocol with 4426, which stops the member's socket for
-good (`handshake/gateway.rs:33-44`, `close.rs:64, 76`), and gateways peer on
-the same check (`peer/dial.rs:29`, `peer/accept.rs:40`). So: every gateway at
+decode error (`frame/types.rs`), so (b) is a protocol bump. A gateway
+refuses a different protocol with 4426 (`close.rs`, `handshake/gateway.rs`), and gateways peer on
+the same check (`peer/dial.rs`, `peer/accept.rs`). So: every gateway at
 once; then every dialler on every machine staged by hand — motherd (zend, npcd,
-its in-process agent), keep, mcp, standalone agents — since a motherd at 7
-cannot join a gateway at 6 to be certified and rolled. Until a member is
+its in-process agent), keep, mcp, standalone agents — since a motherd at the new
+protocol cannot join a gateway at the old one to be certified and rolled. Until a member is
 replaced it stays off the cluster.
 
 ## 5. Modules and seams
@@ -309,9 +312,9 @@ authorization, sign and verify), `clearance` (`Clearance`, `Held`), `cache`,
 `orchestrate` (the one call), `route` (`/v1/prompt/authorize`). The three
 seams — `ContentCheck`, `PeerAuthorizer`, `GuestDraw` — are what the
 orchestration's tests fake. The inline `crate::compliance::Denial` paths
-(`guest_routes.rs:226-233`, `portrait.rs:262-266`) become imports. The
+(`guest_routes.rs`, `portrait.rs`) become imports. The
 `image_generate` description stops saying "Prompts are checked first"
-(`mcp/image.rs:94`).
+(`npcd/src/mcp/image.rs`).
 
 ## 6. Tests
 
@@ -344,11 +347,11 @@ orchestration's tests fake. The inline `crate::compliance::Denial` paths
 - Live, two members: draws and prompt edits with the timing line; a refused
   prompt, confirming nothing is stored.
 
-(b):
+(b), not built:
 - `GuestOccupancy` set from queue to empty, cleared by the guard on every
   exit including a panicking fake guest.
 - `member_state` precedence.
 - Registry: a paused member gets no new work while another is routable, gets
   it when none is, keeps held keys and pinned pages, counts as drawing, is up
   for every reader in §4's table.
-- Wire: `Paused` round-trips; protocol 6 refused.
+- Wire: `Paused` round-trips; the previous protocol is refused.

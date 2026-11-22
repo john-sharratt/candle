@@ -293,11 +293,10 @@ impl GrowthPolicy {
     /// # Why the present, and not a forecast of it
     ///
     /// This answered against a sliding-window maximum of past KV demand for as
-    /// long as the boundary existed, on the reasoning §7a of
-    /// `docs/archived/elastic_vram_partition.md` states outright: *"fast to
-    /// concede, slow to take: being short of KV **fails a forward**, being short
-    /// of experts is a slowdown, and the two are not worth trading
-    /// symmetrically."*
+    /// long as the boundary existed, on the reasoning that the weight side
+    /// should be fast to concede and slow to take: being short of KV **fails a
+    /// forward**, being short of experts is a slowdown, and the two are not
+    /// worth trading symmetrically.
     ///
     /// **Being short of KV no longer fails a forward.** A claim that runs the KV
     /// side out buys exactly the ground it needs at the moment it needs it

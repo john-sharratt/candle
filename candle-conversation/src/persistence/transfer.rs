@@ -1,5 +1,4 @@
-//! VRAM↔RAM transfer orchestration (§3, §4, §16.6 of
-//! `docs/archived/kv_tier_migration.md`).
+//! VRAM↔RAM transfer orchestration.
 //!
 //! `transfer.rs` drives `candle-nn`'s `kv_migrate` scatter/gather kernel:
 //!
@@ -205,8 +204,7 @@ mod cuda_impl {
                 // silently shifted chunk boundaries in persisted data at worst.
                 //
                 // The payload comes from the band's own tag, because the arena
-                // is a run of untyped byte slots and has no format to report
-                // (`docs/archived/arena_unification.md` invariant 8).
+                // is a run of untyped byte slots and has no format to report.
                 let payload = payload_bytes_for_tag(tag, elems_per_chunk).ok_or_else(|| {
                     candle::Error::Msg(format!(
                         "seal_to_chunk_images_cpu: band tag {tag:?} names no storage format, \

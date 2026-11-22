@@ -11,7 +11,7 @@
 //! checkpoint outweighs the card at every rung, so the trunk's layers stream
 //! through the weight zone the way a MoE model's experts do — hot VRAM slots
 //! over pinned host RAM over a repacked `.pack` beside the GGUF, on the
-//! deterministic held-prefix schedule in `docs/archived/qwen38_layer_streaming.md` §9.5.
+//! deterministic held-prefix schedule.
 //! Which rung it streams is a VRAM measurement, not a fit test: see
 //! [`QWEN38_27B_LADDER`].
 
@@ -94,7 +94,7 @@ pub const QWEN38_27B_MTP: (&str, &str, &str) = (
 /// # The thresholds are about residency, not about fitting
 ///
 /// A dense checkpoint no longer has to fit — layer streaming runs the 27B on a
-/// 16 GB card at any of these quants (`docs/archived/qwen38_layer_streaming.md`). What
+/// 16 GB card at any of these quants. What
 /// the rung buys is **how much of the model stays resident**, and therefore how
 /// many bytes cross PCIe on every forward. So the ladder is not "the largest
 /// quant that fits" but "the largest quant whose residency the card can still

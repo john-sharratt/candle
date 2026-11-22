@@ -311,6 +311,14 @@ cancelled (`npcd/src/sim/missions/close.rs`). So a tool names a mission by its
 character. Giving one with `start` replaces whatever the character was
 carrying.
 
+### zenj (`/v1/zenj/mcp` on code.tokera.com)
+
+The DJ's tools (`docs/zenj.md` §13) are served by the `zenj` process itself,
+which mounts `mcp_server` at that path (`zenj/src/http.rs`, `MCP_PATH`) and
+joins the cluster as its own app. The gateway's `/v1/zenj` route sends them to
+that member, on the machine the decks are cabled to (§6). The aggregator lists
+them as the `dj` backend.
+
 ## 5. The aggregator app
 
 `mcp/` builds a binary, `mcp`, configured by one file per machine —
@@ -361,8 +369,34 @@ instead. It holds:
 The aggregator runs on BlackWorld and WhiteWorld, each as a keep service
 (`mcp`, `--config mcp/mcp.yaml` or `mcp/mcp.whiteworld.yaml`, from the
 repository root). Each joins the gateway as a member of the app `mcp`, one of
-the gateway's services (`cluster::gateway::SERVICES`): admitted on whatever
-build it runs, with no floor, no model lock, no certification and no rollout.
+the gateway's services (`SERVICES` in `cluster/src/gateway/hub/constants.rs`):
+admitted on whatever build it runs, with no floor, no model lock, no
+certification and no rollout.
+
+The services are four apps, none of them a replication group:
+
+- **`keep`**, the failsafe on each machine (`docs/replicated_substrate.md`
+  §3.9), listed on the status page and reached by an Admin's operations tools.
+- **`mcp`**, this aggregator.
+- **`zenj`**, the DJ (`docs/zenj.md`): its own process on BlackWorld, the
+  machine the decks are cabled to, serving `/v1/zenj/*` (its tools at
+  `/v1/zenj/mcp`, which the aggregator lists as the `dj` backend). keep does not
+  run it: it is started at the user's logon in the console session, and says
+  `refuse` on its status while rekordbox is open, which keep and motherd read
+  as a guard (`guards:` in `keep/keep.yaml` and `motherd/motherd.yaml`). The
+  gateway's `/v1/zenj` route on `code.tokera.com` goes to its member, with
+  `127.0.0.1:8097` as the upstream while it is between sockets (`web/web.yaml`).
+- **`battlecities`**, the Battle Cities game server
+  (`docs/battlecities_app.md`): the members that `battlecities.net`'s requests
+  and the game's UDP datagrams go to. It serves no MCP tools. keep runs it on
+  BlackWorld from `keep/stable/battle-cities-server.exe` (`keep/keep.yaml`).
+
+Two more of keep's processes are not cluster services: `motherd`, which hosts
+the zend and npcd apps, and `yenbot` (`yenbot.com.au`), which sits behind the
+gateway on loopback and acts with a service key (`service_keys` in
+`web/web.yaml`). `service_deploy`
+names five of keep's services: `motherd`, `web`, `mcp`, `yenbot` and
+`battlecities` (`docs/claude_zend_gateway.md` §8.4).
 Each machine's is released there like `web`: build
 `cargo build --release -p mcp`, stage `keep/stage/mcp.exe`, and POST its path
 to keep. Once its listener is bound and its socket dialling it prints keep's
@@ -401,20 +435,25 @@ the leg ran at 4–11 KB/s, while the gateway itself answered over the internet
 at ~650 KB/s. An image edit that finished in npcd in 12 ms reached claude.ai
 28 s later, because its ~127 KB of base64 crossed the slow leg twice. A member
 belongs only on a machine whose link to the gateway is fast: BlackWorld's is
-loopback, and WhiteWorld's is wired, to BlackWorld's wired address (the
-addresses named below are those of the 2026-10-28 measurement; the wired
-link is now `192.168.1.2`, §5). The same
+loopback, and WhiteWorld's is wired, to BlackWorld's wired address `192.168.1.2`
+on the 10 GbE LAN (§5). *History:* the measurement below was taken on the older
+`192.168.0.x` LAN, where `192.168.0.4` was the wired side and `192.168.0.5`
+BlackWorld's Wi-Fi; BlackWorld and WhiteWorld moved to `192.168.1.x` on
+2026-11-12 (`docs/deployment.md`). The same
 109 KB file took 4–18 ms from `192.168.0.4` to WhiteWorld, and 9.7 s
 (11 KB/s) from `192.168.0.5`, BlackWorld's Wi-Fi, which answers its first
 byte at once and then sends at that rate to every machine on the LAN
 (2026-10-28). That, not AlienWorld's own Wi-Fi, was most of AlienWorld's
-leg; a member calls the gateway at `.4`.
+leg; a member calls the gateway at the wired address.
 
 Deploy in this order:
 
 1. **The gateway first.** The cluster's route table names `mcp_subject` by
    name, and a gateway older than it cannot read npcd's table.
-2. **The members.** npcd is released on WhiteWorld, and zend on BlackWorld.
+2. **The members.** `motherd` carries zend and npcd in one process, so one
+   `service_deploy {host, service: "motherd"}` per machine releases both, and
+   `service_deploy {host, service: "mcp"}` releases each aggregator
+   (`docs/claude_zend_gateway.md` §8.4).
 
 ## 7. Decisions
 

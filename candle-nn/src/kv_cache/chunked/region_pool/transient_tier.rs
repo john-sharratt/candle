@@ -34,7 +34,7 @@ pub(super) const RECENT_FORWARDS: usize = 16;
 ///
 /// # Anchored at the arena frontier `A`
 ///
-/// `docs/archived/elastic_vram_partition.md` §7 phase 2. This leaves the whole remainder
+/// The tier is placed hard against the frontier. This leaves the whole remainder
 /// in one contiguous run adjacent to the weight side, so the boundary can be
 /// moved to `A + T` in the same operation rather than through a control loop
 /// hunting for bytes stranded mid-span:

@@ -531,7 +531,7 @@ impl Substrate {
     }
 
     /// Insert a turn reconstructed from the redo log — the substrate-reload
-    /// path (§16.12 of `docs/archived/kv_tier_migration.md`).
+    /// path.
     ///
     /// The caller must [`Self::register_timeline`] first. Turns must be
     /// restored in `turn_index` order so the appended `TurnIndex` matches

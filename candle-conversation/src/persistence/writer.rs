@@ -1,5 +1,4 @@
-//! The substrate's queued redo-log writes (`docs/archived/kv_tier_migration.md`,
-//! `docs/substrate_lock_free.md` §9.1).
+//! The substrate's queued redo-log writes (`docs/substrate_lock_free.md` §9.1).
 //!
 //! A write that does not need its result back is queued to the log's owner
 //! ([`super::owner::PersistenceOwner::enqueue`]) and the caller goes on. Two

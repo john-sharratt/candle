@@ -1,5 +1,5 @@
 //! KV tier-migration primitive — the Rust side of the `kv_pack` /
-//! `kv_unpack` scatter/gather kernel (`docs/archived/kv_tier_migration.md` §9).
+//! `kv_unpack` scatter/gather kernel.
 //!
 //! A migration plan is a flat list of `(src, dst, byte_len)` records, each
 //! carrying device addresses the caller has already resolved. [`kv_migrate`]
@@ -26,8 +26,7 @@ use std::sync::Arc;
 ///
 /// The migration plan's copy lengths come from here rather than from the
 /// arena: a size-class arena holds whatever fits its slots, so its stride is an
-/// upper bound on a band's bytes, never the bytes themselves
-/// (`docs/archived/arena_unification.md` invariant 8). A tag that names no storage
+/// upper bound on a band's bytes, never the bytes themselves. A tag that names no storage
 /// format has no length, and a plan built on a guessed length would move the
 /// wrong bytes — so it is an error, not a default.
 #[cfg(feature = "cuda")]
@@ -272,7 +271,7 @@ pub fn kv_migrate_on(
     .map_err(|e| candle::Error::Msg(format!("kv_migrate: {e}")))
 }
 
-/// Host-side migration plan-builder (`docs/archived/kv_tier_migration.md` §8).
+/// Host-side migration plan-builder.
 #[cfg(feature = "cuda")]
 impl super::ChunkedKvBacking {
     /// Resolve every unique physical sub-chunk of a sealed sequence to its

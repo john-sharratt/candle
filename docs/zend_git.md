@@ -1,7 +1,7 @@
 # Zend: Git Layer
 
-**Status:** The library (§3–§8) is built and tested (§11) as the git layer of the `zend-vfs` crate, and the model-facing tools (§10) are built and tested as the `git_*` family in `zend-tools`. The VFS purge (§9) is designed, not built.
-**Scope:** A strongly typed Rust interface over the `git` command line, for the repositories a zend workspace lists (`docs/zend_workspace_execution.md` §3). It reads repository state, writes commits and branches **without touching the user's checkout**, and fetches from and pushes to origin. Its first consumer is the VFS purge (§9): turning a repository's session overlay into a commit on a branch.
+**Status:** The library (§3–§8) is built and tested (§11) as the git layer of the `zend-vfs` crate, and the model-facing tools (§10) are built and tested as the `git_*` family in `zend-tools`. The VFS purge first designed as the layer's consumer (§9) is replaced by `work::Committing` and the `git_commit` tool, which are built.
+**Scope:** A strongly typed Rust interface over the `git` command line, for the repositories a zend workspace lists (`docs/zend_workspace_execution.md` §3). It reads repository state, writes commits and branches **without touching the user's checkout**, and fetches from and pushes to origin. Its consumer is a conversation's commit (§7.9, §9): turning a conversation's file changes into a commit on its own branch.
 
 ---
 
@@ -434,7 +434,7 @@ fn commit_changes(&self, base: &Oid, changes: &ChangeSet, message: &str,
 
 Returns a new commit whose single parent is `base` and whose tree is `base`'s with `changes` applied. It moves no ref — the caller publishes it with §8.3 or §7.3.
 
-1. **Modes.** Writes with no mode take the base's (one `tree_entries` call for all of them), or `Regular` for a new path. A write with no mode over a path the base holds as a symlink is refused: inheriting the link's mode would make the written text a link target the caller never asked for — the purge, writing overlay text, would otherwise turn a repository symlink into one pointing wherever the text says.
+1. **Modes.** Writes with no mode take the base's (one `tree_entries` call for all of them), or `Regular` for a new path. A write with no mode over a path the base holds as a symlink is refused: inheriting the link's mode would make the written text a link target the caller never asked for — a commit of a conversation's text would otherwise turn a repository symlink into one pointing wherever the text says.
 2. **Blobs, through the repository's filters.** Each write is stored with `hash-object -w --stdin --path=<path>` (`write_blob`), which applies the clean filters, `core.autocrlf` and `.gitattributes` for that path. A file read from a Windows checkout holds CRLF where the committed blob holds LF, and this step makes them agree. A symlink's target is stored with `--no-filters`.
 3. **Tree and commit, in one process.** A `fast-import` stream (`write/fast_import.rs`) writes the commit onto a private scratch ref, `refs/zen/scratch/<pid>-<nanos>-<n>`: `from <base>`, then `M <mode> <blob> "<path>"` per write and `D "<path>"` per delete. Paths are always quoted, and the message is stored ending in exactly one newline. The stream names blobs only by id, because `fast-import` applies no filters to inline content.
 4. **Read back.** The commit id is read from the scratch ref, and the ref is deleted in a compare-and-swap transaction.
@@ -515,19 +515,16 @@ A patch is held to `ChangeSet`'s rules (§8.1), judged by what it actually chang
 
 ---
 
-## 9. First consumer: the VFS purge (not built)
+## 9. First consumer: a conversation's commit
 
-A repository's overlay store (`zend-vfs/src/vfs/store.rs`) holds one conversation's changes as deltas (`zend-vfs/src/file_delta.rs`): per path, a chain of `Replace` (a whole-file write), `Edit` (only the changed lines, as splices against the text before it) and `Delete`. A purge publishes them and empties the overlay:
+A repository's overlay store (`zend-vfs/src/vfs/store.rs`) holds one conversation's changes as deltas (`zend-vfs/src/file_delta.rs`): per path, a chain of `Replace` (a whole-file write), `Edit` (only the changed lines, as splices against the text before it) and `Delete`. Each conversation has its own overlay per repository (`ToolHost::conversation_files` in `zend/src/tools/tool_host.rs`) and its own branch per repository recorded in its state (`zend/src/conv_branches.rs`).
 
-1. **Snapshot.** Take the overlay's changed paths as a `ChangeSet` — each path's chain replayed to its resulting text as `Change::Write` (its UTF-8 bytes), a chain ending deleted as `Change::Delete`.
-2. **Filter.** Drop paths `ignored()` reports; they are listed back to the caller, not committed.
-3. **Base.** `head()` of the repository. `Unborn` or `Detached` is reported, not guessed around.
-4. **Warn on divergence.** `diff_worktree(base)` names any overlay path the user also changed on disk. Overlay content for such a path was read through the user's uncommitted edit, so the commit would carry that edit too; the purge reports the paths and its caller decides.
-5. **Commit.** `commit_changes(base, …)` with the signed-in user as author and committer.
-6. **Branch.** `create_branch(zen/<name>, commit)` locally, then `push` with `Lease::Absent` — or `Lease::Expect` of the last pushed head when the branch already exists, rebuilding through §8.5 when origin moved — and `set_upstream` so the user can check the branch out, pull and push it like one they pushed themselves.
-7. **Empty.** Only after the push succeeds are the purged paths removed from the overlay, and only those whose content is unchanged since the snapshot. A failure at any step leaves the overlay as it was.
+**Replaced design.** The layer was first specified to be consumed by a "VFS purge": snapshot the overlay, drop ignored paths, commit onto the repository's `HEAD`, create a `zen/<name>` branch with `Lease::Absent`, set its upstream, and empty the overlay only after the push. That purge was never built and is superseded. Publishing goes through `work::Committing` (§7.9), driven by the `git_commit` tool (§10), onto the conversation's own branch:
 
-Each conversation has its own overlay per repository (`zend/src/tools/tool_host.rs`, `ToolHost::conversation_files`), and its own branch per repository recorded in its state (`zend/src/conv_branches.rs`), so a purge is per conversation and lands on that conversation's branch.
+- the base is the commit the branch's record held when the conversation first read it, never the checkout's `HEAD`, so there is no `Unborn` or `Detached` case and no divergence from the user's working tree to warn about (the layer never reads the working tree for this);
+- `begin` refuses while paths are in conflict or the record holds commits the base lacks; `land` publishes with `publish_commit` under origin's lease (§7.8), so a concurrent change is a refusal, never an overwrite;
+- the overlay is not emptied: once the commit is published the base moves to it and the conversation's copy is carried three ways onto the committed tree, so work the commit did not take stays uncommitted and nothing is dropped;
+- the branch name is the conversation's recorded branch, not a `zen/<label>` or `zen/<id>` the purge would have chosen.
 
 ---
 
@@ -613,8 +610,6 @@ Adding these changes the tool catalog, which recalibrates only the tools whose d
 
 ## 12. Open questions
 
-1. **One overlay per conversation.** Per-conversation branches need per-conversation overlays; today one overlay per repository serves every conversation. Which conversation a purge belongs to — and so its branch name — is undecided until the overlay is split.
-2. **Dirty-path policy** (§9 step 4): refuse the purge, commit anyway, or commit only the lines the model changed.
-3. **When a purge runs**: on request, at the end of a tool round, or when a conversation closes.
-4. **Branch naming**: `zen/<conversation label>` is readable but can collide; `zen/<conversation id>` is unique but opaque.
-5. **Linear or merge history** when rebuilding onto a moved base (§8.5).
+The purge's questions (one overlay per conversation, dirty-path policy, when a purge runs, `zen/` branch naming) are closed by the replaced design of §9: an overlay per conversation, a commit on the model's request through `git_commit`, a branch recorded per conversation, and no read of the user's working tree.
+
+1. **Linear or merge history** when rebuilding onto a moved base (§8.5).

@@ -29,7 +29,7 @@ pub(super) mod tests {
     /// **Reproducibility gate.** Three independent greedy decodes of one prompt
     /// must produce identical token streams — greedy argmax from a fresh session
     /// is a pure function of the weights. DeepSeek-V4-Flash currently FAILS this
-    /// (see `docs/archived/deepseek/deepseek_decode_reproducibility.md`); the assertion is here so
+    /// (its decodes diverge run to run); the assertion is here so
     /// the day it passes is recorded rather than guessed at.
     ///
     /// Uses the shared `decode_reproducibility` helper, the same one the Qwen3-MoE

@@ -104,7 +104,7 @@ const MAX_RECORD_BANDS: usize = 16;
 /// Everything here travels **with the chunk**. In particular `k_fmt`/`v_fmt`
 /// are the band format tags: an arena under size classes holds whatever fits
 /// its stride, so it can no longer say how to decode a slot and the chunk must
-/// (`docs/archived/arena_unification.md` principle 8). The arena is consulted only for
+/// The arena is consulted only for
 /// the band's *address*.
 /// Read only on CUDA: without a device there are no records, so `build_meta_records`
 /// returns `None` for every chunk and nothing consumes these fields. The struct itself

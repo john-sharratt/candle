@@ -5,7 +5,17 @@ itself, they tell what it passes over, and they give every character a life — 
 event at a time. The command table is where that work is handed out. This document is how the
 table finds the work and writes it up as missions a Maker can carry out.
 
-Code: `npcd/src/engine/mission_gen/`. Configuration: `<mind>/missions.yaml`. It sits on the
+Code: `npcd/src/engine/mission_gen/`. Configuration: `<mind>/missions.yaml`, in the mind
+repository (not in this tree, so the generator weights, prompts and workflow wording it holds are
+not checked here). The numbers this document gives for the gates, the research and the ledger are
+the code's and were checked against it: the word bounds and repetition limits
+(`mission_gen::gates`), the research selection (`mission_gen::research`: era edge 10 years, two
+earlier documents, two around within 30 years, at most five), three attempts per answer
+(`mission_gen::run::ATTEMPTS`), three compose sittings and 900-word source cuts
+(`engine::compose`), the 30-minute publish retry (`sim::operations::RETRY_AFTER_MS`), and the
+`/v1/pulse/missions` and `/v1/pulse/operations` routes (`engine/mod.rs`). The accounts of what
+models did in live runs (the quoted failures and the **Measured** table) are observations that
+cannot be re-derived from the code. It sits on the
 mission system in `npcd/src/engine/mission/mod.rs` and `npcd/src/sim/missions/mod.rs`, inside the
 building `vault_world.md` describes, and it is the "missions are generated" half of
 `asynchronous_mind_hierarchy.md` §7.4.
@@ -509,7 +519,7 @@ announcement, which is a person speaking, not the world ordering.
 
 ## Measured
 
-Live runs of 2026-10-09 on the RTX 3090, Qwen3-30B-A3B serving both the generator and the
+Recorded results (not reproducible from this tree: the run logs are not in it). Live runs of 2026-10-09 on the RTX 3090, Qwen3-30B-A3B serving both the generator and the
 Makers, with the table open and the pool kept at 4:
 
 | run | minutes | missions done | stuck | offered | declined | targets set aside |

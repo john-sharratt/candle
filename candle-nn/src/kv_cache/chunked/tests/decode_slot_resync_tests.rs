@@ -472,8 +472,8 @@ fn a_batch_commit_across_backings_is_refused() {
     );
 }
 
-/// A writer boundary that moves between a commit and the sync — the turn-seal
-/// re-prefill's `seal_writer_boundary`, a truncate's clamp — must not shrink
+/// A writer boundary that moves between a commit and the sync — a
+/// `seal_writer_boundary`, a truncate's clamp — must not shrink
 /// the region the sync re-serialises: the commit filled chunks from the
 /// boundary as it stood then. Here a spill fills chunk 0 and starts chunk 1,
 /// and the boundary is then sealed past both.

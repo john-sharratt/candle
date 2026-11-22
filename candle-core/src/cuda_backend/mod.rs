@@ -146,7 +146,7 @@ pub enum CudaStorageSlice {
 /// A pool allocation is freed on drop, as always. A **leased** one is an offset
 /// into memory this process claimed once and never returns — letting
 /// `CudaSlice::drop` reach `cuMemFreeAsync` on it would be an error, not a
-/// leak. See `docs/archived/arena_unification.md` §3.7.
+/// leak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backing {
     /// Allocated from the stream-ordered pool; freed on drop.

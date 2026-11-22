@@ -201,8 +201,7 @@ impl QCudaStorage {
     /// [`CudaStorage::from_leased_device_ptr`], and it exists for exactly one
     /// caller: a KV arena slot. Under size classes an arena is a run of untyped
     /// byte slots, so the quantize / dequantize kernels can no longer be handed
-    /// "the arena's QTensor" — they are handed a view of one slot instead. See
-    /// `docs/archived/arena_unification.md` principle 8.
+    /// "the arena's QTensor" — they are handed a view of one slot instead.
     ///
     /// The view carries **no matrix-row padding**, unlike
     /// [`Self::zeros`]: a slot is exactly its own bytes and the next slot

@@ -1,5 +1,4 @@
-//! Deriving a summary's **user half** — its *scope* — from its children's
-//! (`docs/archived/immutable_summary_forest.md`, *Scope derivation*).
+//! Deriving a summary's **user half** — its *scope* — from its children's.
 //!
 //! A summary turn is a compressed *exchange*: a user half (the question it
 //! answers — its scope) and an assistant half (the answer — its content). The

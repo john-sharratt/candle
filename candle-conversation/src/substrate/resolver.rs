@@ -228,8 +228,7 @@ pub trait ContentResolver {
         0
     }
 
-    /// Score-density selection over a timeline's summary forest
-    /// (`docs/archived/immutable_summary_forest.md` — *Window of attention*).
+    /// Score-density selection over a timeline's summary forest.
     /// Returns the chrono-
     /// logically ordered `(turn_index, effective_score)` list for the
     /// given timeline, fitted into `budget` tokens, or `None` when no
@@ -252,8 +251,8 @@ pub trait ContentResolver {
 
     /// Number of turns currently awaiting the async summariser for
     /// `timeline`.  Used by the projection to populate the
-    /// score-density backpressure metric inside its diagnostic sink
-    /// (§9 of `docs/archived/infinite_conversations.md`).  Default returns 0.
+    /// score-density backpressure metric inside its diagnostic sink.
+    /// Default returns 0.
     fn pending_summary_len(&self, _timeline: TimelineId) -> usize {
         0
     }

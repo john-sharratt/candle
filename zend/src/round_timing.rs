@@ -1,5 +1,4 @@
-//! Where a round's time went: queued for the GPU, prefilling, decoding
-//! (`docs/archived/zen_coding_challenge_fixes.md` Cause 1).
+//! Where a round's time went: queued for the GPU, prefilling, decoding.
 //!
 //! A coding task's wall time was 89–94% the model's, and its call listing
 //! could not say which part: 128 rounds of 73 s each, against per-round

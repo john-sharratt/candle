@@ -321,7 +321,7 @@ impl<M: BatchedModelCore> BatchedInference<M> {
         // **Phase 1: admit.** Claim every KV slot this wave will write, for
         // every layer in the range, before a single byte of it computes — so the
         // arena frontier is final when the transient tier is reserved against it
-        // (`docs/archived/elastic_vram_partition.md` §7, `wave_admit`). Decode's claims
+        // (`wave_admit`). Decode's claims
         // were made by the caller when it built the position map; this covers
         // the multi-token rows.
         let t_admit = profile_now();

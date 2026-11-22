@@ -85,8 +85,7 @@ impl Conversation {
 
     /// Advance the persistence thread's **background maintenance** on the
     /// segmented redo log — drop a fully-dead segment, compact a mostly-dead
-    /// one, or combine two small adjacent ones
-    /// (`docs/archived/segmented_substrate_log.md` §6). Continues the op in
+    /// one, or combine two small adjacent ones. Continues the op in
     /// `op` when there is one; otherwise, when `start`, plans one past the age
     /// and dead-ratio gates (a cheap per-segment liveness scan on the common
     /// no-op path). Steps aside between batches when `yield_now` says a flush

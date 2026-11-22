@@ -160,8 +160,11 @@ pub(crate) fn window_sealed_tokens(
     layers
 }
 
-/// Pure block-range windowing for a bounded rolling-window ingest (design
-/// `docs/archived/unified_wave_inference_engine.md` §4.7): given the system-prompt end
+/// Pure block-range windowing for a bounded rolling-window ingest. An
+/// append-only ingest (`code_reading` / `repo_map` turns) would otherwise
+/// prefill each turn against the whole accumulated context, which grows without
+/// bound with the number of turns and exhausts KV VRAM; windowing keeps the
+/// per-turn context constant. Given the system-prompt end
 /// block `sys_end`, the ascending per-turn start blocks `turn_starts` (one per
 /// sealed turn), the current `total` block count, and `window_turns`, return the
 /// parent block ranges the next prefill should attend — the system prompt plus

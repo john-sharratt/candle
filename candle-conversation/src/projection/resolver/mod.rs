@@ -159,7 +159,7 @@ pub struct Conversation {
     /// ([`crate::tenant_rank`]).
     tenant_rank: TenantRank,
     /// The mandatory persistence layer — every turn is recorded into its
-    /// redo log (`docs/archived/kv_tier_migration.md` §13.6), by the thread
+    /// redo log, by the thread
     /// that owns it. Every redo-log append is queued here
     /// ([`PersistenceOwner::enqueue`]), so a seal on the inference thread never
     /// waits on the disk. Shared across clones; the last drop drains, commits

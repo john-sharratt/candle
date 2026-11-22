@@ -249,8 +249,7 @@ impl ChunkedKvBacking {
         // for `truncate(0)` or Arc-shared for partial truncates).
         // Clamp the existing writer_start to be ≤ the new chunk count
         // so any writes go into existing chunks past it. Callers that
-        // need the kept blocks fully immutable (the turn-seal re-prefill)
-        // follow up with [`Self::seal_writer_boundary`].
+        // need the kept blocks fully immutable follow up with [`Self::seal_writer_boundary`].
         if slot.writer_start_idx() > slot.block_count() {
             slot.set_writer_start_idx(slot.block_count());
         }
@@ -260,9 +259,9 @@ impl ChunkedKvBacking {
 
     /// Mark every block the slot currently holds as immutable prefix: later
     /// writes append AFTER them in a fresh writer chunk, never extend a kept
-    /// partial/empty tail block. The turn-seal re-prefill needs this after
-    /// its truncate — the seal range anchors at exactly the kept block count,
-    /// so a write landing below it would fall outside the sealed span and
+    /// partial/empty tail block. A caller that seals a range anchored at
+    /// exactly the kept block count needs this after its truncate — a write
+    /// landing below the anchor would fall outside the sealed span and
     /// silently drop from persistence.
     pub fn seal_writer_boundary(&self, batch_idx: usize) -> Result<()> {
         let mut state = self

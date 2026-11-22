@@ -29,7 +29,7 @@ use crate::kv_cache::chunked::size_class::{class_for_format, SizeClass};
 /// format F occupies one slot of the smallest class that fits its bytes, and
 /// the trailing pad is never read. Formats that share a class share a pool,
 /// which is what makes free slots fungible across formats — the property the
-/// whole initiative exists to obtain (`docs/archived/arena_unification.md` §3.4).
+/// size classes exist to obtain.
 ///
 /// What a slot *holds* is recorded on the chunk (`SealedChunk::k_fmt`), never
 /// here.
@@ -374,8 +374,7 @@ impl ChunkStatus {
 /// starts at `base + i * class.bytes()`, and what lives there is whatever the
 /// owning chunk says it is — the arena does not know, and does not need to.
 /// That is the point: under size classes a slot's tenant can be any format
-/// whose payload fits, so free slots are fungible across formats
-/// (`docs/archived/arena_unification.md` §3.4, principle 8).
+/// whose payload fits, so free slots are fungible across formats.
 ///
 /// The trailing pad between a chunk's payload and the slot stride is never
 /// read as data: kernels derive their read extent from the *format's* block
@@ -536,7 +535,7 @@ impl Arena {
     /// A typed tensor **view** over `chunk_idx`'s slot, shaped `shape`.
     ///
     /// The view is a lease: it aliases the arena's bytes and its drop never
-    /// frees them (`Backing::Lease`, `docs/archived/arena_unification.md` §3.7). This is
+    /// frees them (`Backing::Lease`). This is
     /// how the contiguous read/write facade still sees a slot as a typed
     /// tensor now that the arena itself is untyped.
     ///

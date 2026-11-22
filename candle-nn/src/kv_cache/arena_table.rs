@@ -14,7 +14,7 @@
 //! There is no per-arena table. An arena is a run of fixed-stride byte slots and
 //! carries no format of its own, so the only per-arena quantity a kernel could
 //! want — the base pointer — reaches it inside the per-head row that names the
-//! band. See `docs/archived/arena_unification.md` principle 8.
+//! band.
 //!
 //! The [`PerHeadTable`] maintains a GPU tensor of shape `(num_arenas * n_kv_head, 36)`.
 //! Indexed by `pal0_arena_idx * n_kv_head + head_idx`. Each row contains N_PALETTE=4
@@ -151,8 +151,7 @@ impl ArenaFormatTag {
     ///
     /// This is how a band's payload length is recovered now that arenas are
     /// size-class byte slabs and no longer carry a format: the chunk's tag is
-    /// the only record of what its bytes are (`docs/archived/arena_unification.md`
-    /// principle 8). Round-tripping every `KvFormat` through
+    /// the only record of what its bytes are. Round-tripping every `KvFormat` through
     /// `from_kv_format` and back is pinned by
     /// [`every_kv_format_round_trips_through_its_tag`](tests).
     pub fn to_kv_format(self) -> Option<KvFormat> {
@@ -593,8 +592,7 @@ impl PerHeadTable {
 /// any formats that fit, so "the arena's format" is not a question with an
 /// answer. A band's format — and therefore its payload length, its persisted
 /// image, and its checksum — comes from the owning chunk's tag
-/// (`SealedChunk::k_fmt`), never from here. See `docs/archived/arena_unification.md`
-/// principle 8 and invariant 8.
+/// (`SealedChunk::k_fmt`), never from here.
 #[derive(Clone, Debug)]
 pub struct ResolvedArenaInfo {
     /// Base device pointer for this arena's byte slab (0 for CPU arenas).

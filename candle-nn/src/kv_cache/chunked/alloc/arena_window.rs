@@ -388,7 +388,7 @@ impl BackingInner {
     /// There is no float/quantized fork any more. A slot is a fixed number of
     /// bytes and its tenant is whatever the owning chunk's tag says it is, so
     /// the allocator has exactly one thing to decide — how wide the slots are —
-    /// and the class carries that (`docs/archived/arena_unification.md` principle 8).
+    /// and the class carries that.
     ///
     /// A GPU arena **carves a region** out of the device reservation: no
     /// `cuMemAlloc`, no pool growth, no chance of the driver spilling the slab

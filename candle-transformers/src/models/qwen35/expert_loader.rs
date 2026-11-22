@@ -2,8 +2,7 @@
 //!
 //! The caller's half of [`super::quantized_weights::load_quantized_model`]:
 //! the cache is sized from a live measurement of what the dense weights left
-//! behind, so it cannot be built inside the dense loop
-//! (`docs/archived/elastic_vram_partition.md` §4). The order is fixed —
+//! behind, so it cannot be built inside the dense loop. The order is fixed —
 //!
 //! 1. dense weights resident (the loop in `quantized_weights`);
 //! 2. measure the span, carve the weight zone, place the boundary;
@@ -11,8 +10,8 @@
 //!
 //! Nothing here is Qwen3.5-specific: the expert section carries its own
 //! geometry, and the lineage's frozen `ffn_{gate,up,down}_exps` schema is shared
-//! with qwen4exp (`docs/archived/qwen38_flash_next.md` §12.2 pins it as "exactly
-//! as qwen35moe"), so each model hands over its own expert count and layer
+//! with qwen4exp (its expert tensors are laid out exactly
+//! as qwen35moe's), so each model hands over its own expert count and layer
 //! range.
 
 use candle::{Device, Result};

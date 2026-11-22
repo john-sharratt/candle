@@ -396,7 +396,7 @@ pub(super) mod tests {
     // `migrate_chunk` moves a slot between tiers; it does not convert formats.
     // Every production caller (hot->warm demote, warm->hot elevate, fork) is
     // format-preserving, and an arena has no format to convert *to* — it is a
-    // run of untyped byte slots (`docs/archived/arena_unification.md` principle 8).
+    // run of untyped byte slots.
 
     /// A relocation is byte-verbatim, including a slot whose class stride is
     /// wider than the band that occupies it.

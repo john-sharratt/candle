@@ -333,14 +333,15 @@ impl Conversation {
 
     /// Bounded rolling-window view ranges for an append-only ingest — the
     /// system-prompt blocks plus the most recent `window_turns` sealed turns of
-    /// `timeline` (design `docs/archived/unified_wave_inference_engine.md` §4.7). Returned
+    /// `timeline`: an append-only ingest of `code_reading` / `repo_map` turns
+    /// would otherwise prefill against the whole accumulated context, which grows
+    /// without bound, so the window keeps the per-turn context constant. Returned
     /// as raw `(start_block, end_block)` pairs for the scheduler's view borrow.
     ///
     /// `window_turns == 0` (unbounded) or fewer sealed turns than the window
     /// returns `[(0, total_blocks)]` — the whole parent, byte-for-byte the
     /// unwindowed behaviour. Used only on the disable-reprojection ingest path
-    /// and only when `CANDLE_CODEREAD_WINDOW_TURNS > 0`; the KV-windowing effect
-    /// itself requires golden-token validation on a live model.
+    /// and only when the scheduler's `CODE_READ_WINDOW_TURNS` is above zero.
     pub fn windowed_ingest_ranges(
         &self,
         timeline: TimelineId,

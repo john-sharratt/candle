@@ -31,7 +31,7 @@ impl<'w> LiveTensor<'w> {
     /// it releases the view and never frees the memory. This is how tensor-shaped
     /// operations reach into a KV arena slot — the arena owns the bytes for the
     /// process lifetime, so a pool free on them would be a correctness error, not
-    /// a leak. See `docs/archived/arena_unification.md` §3.7.
+    /// a leak.
     ///
     /// Views and reshapes share the underlying `Arc<Storage>`, so the lease
     /// travels with them.

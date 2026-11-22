@@ -221,14 +221,29 @@ No partial lift is installed.
 
 ## 4. The cold lift
 
-Cold items are read from the redo log (`cold_load_section_into_hot`, the turn recall
-path) and are 2.1 GB/s today, bound mostly by the read. The scatter stage is the same:
-a cold read lands in a ring slot instead of a pageable buffer — there is no pageable
-hop at all — and `warm_lift_scatter` moves it. The expert stager reads NVMe unbuffered
-into pinned memory the same way (`docs/moe_live_dispatch_design.md` §0.10.2). **To check
-before it is written:** whether a cold record's on-disk bytes are the arena payload
-verbatim, or need decoding on the way in; if they need decoding, that step runs on the
-copiers and the scatter is unchanged.
+Cold items are read from the redo log (`cold_load_section_into_hot`,
+`cold_load_turns_into_hot`, the turn recall path) and are 2.1 GB/s, bound mostly by the
+read. The expert stager reads NVMe unbuffered into pinned memory the same way
+(`docs/moe_live_dispatch_design.md` §0.10.2).
+
+**What the code does.** The cold path is its own pipeline, not the warm lift's ring:
+`load_stream_into_hot` (`candle-conversation/src/persistence/transfer.rs`) runs
+`persistence/pipeline.rs`, whose reader pool reads each record's 1 MiB units unbuffered
+into the stager's pinned scratch (`ColdLoadStager`, `PINNED_PREALLOC_BYTES` = 64 MiB,
+not write-combined), the dispatcher queues a `memcpy_htod` per unit into VRAM staging on
+the device's stream, and one `kv_migrate` scatters the staging into the arena slots.
+
+**Are a cold record's bytes the arena payload verbatim?** The K/V band bytes are: the
+allocator thread parses each record's header and metadata (`decode_record`,
+`ChunkPayload::decode_with_kv_range`), takes the `kv_bytes` range of the record, and the
+migrate copies that range byte for byte (`src_offset` is the payload offset plus
+`kv_range.start`). Only the header and metadata are decoded, on the host, to build the
+destination allocation (`BlockAllocSpec`); the band bytes are never decoded on the way in.
+
+**Not built.** The plan of record is for a cold read to land in a ring slot and move
+through `warm_lift_scatter`, so the cold leg shares the scatter stage and has no HtoD
+into device staging. The cold leg today uses `kv_migrate`, and the pipeline returns
+once `kv_migrate`'s drop syncs.
 
 ## 5. Where the code goes
 

@@ -3,8 +3,7 @@
 //! An attention output is the archetypal wave intermediate: written by one
 //! kernel, consumed by `o_proj`, dead immediately after. Inside the inference
 //! loop it comes from the wave's transient half — one cursor bump, no allocator
-//! traffic, and the whole half reclaimed when the guard drops
-//! (`docs/archived/arena_unification.md` §3.6). On the decode path that replaces an
+//! traffic, and the whole half reclaimed when the guard drops. On the decode path that replaces an
 //! alloc/free pair per layer per forward.
 //!
 //! The guard bounding these is **layer-scoped**, spanning attention ->

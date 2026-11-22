@@ -64,8 +64,7 @@ impl Scheduler {
     /// numbered `Criticality` rung with the governor re-measuring driver
     /// headroom between them to decide whether to climb. The rungs are gone:
     /// against an exact free-region count there is nothing to re-measure and
-    /// nothing to arbitrate, so the priority is expressed as call order
-    /// (`docs/archived/arena_unification.md` §5).
+    /// nothing to arbitrate, so the priority is expressed as call order.
     ///
     /// Returns `true` if pressure is **still** on afterwards — the caller's
     /// signal to narrow the admission window, which is §3.8's third and last

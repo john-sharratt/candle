@@ -28,8 +28,30 @@ floor read in one currency. What is built, and what is not:
   `Scheduler::composed_tier`) at the offer's deepest chunk. The K/V is still the
   whole turn's (`prefill_cost_bytes`), not the blocks an advance opens.
 
-Read §4.11 as the target. Where it and the code at HEAD disagree, the list above
-and the status notes inside §4.11 are the disagreement.
+* **Not built.** The designed-but-absent pieces are plan of record and each is
+  marked "Not built" where it is described: the producer gate that reads the
+  engine (`decode_starved` / `decode_carried`, `gate_decision`; §4.11.4), the
+  hit-rate width controller (ceiling / knee / floor and `WAVE_WIDTH_HARD_CAP`;
+  §4.11.4), the fixed tier margin and refusal streak (`TIER_MARGIN_REGIONS`,
+  `TIER_REFUSALS_BEFORE_FAIL`; §4.11.8), the decode-lease renewal and the batched
+  park/resume migration (§4.11.9), and the per-model, per-card width rows (§5
+  row 27).
+* **Code that a design removes is still present.** The producer at HEAD is
+  still the residency-estimate pool of §2.3(b); the **Open items** at the end of
+  this document list what stands and what retires it.
+
+Read §4.11 as the target. Where it and the code at HEAD disagree, the list above,
+the status notes inside §4.11 and the Open items are the disagreement.
+
+**Why the wave is mixed and the fill is a throughput judgement.** An MoE forward of
+more than about 64–128 tokens already touches essentially every expert (top-8 of
+128: a chunk of `C` tokens hits `128·(1 − (127/128)^(8C))` distinct experts), so
+it pays the whole expert load whatever its width. Forward time is therefore a
+fixed expert-streaming cost plus a per-token compute term, and the lever is
+tokens per forward: decode, prefill and section rows share one forward so one
+expert load serves all of them. That is why admission asks whether an offer makes
+the wave faster, not whether it fits a byte count, and why a narrow wave is slower
+per row rather than cheaper.
 
 ---
 
@@ -55,7 +77,8 @@ neither a count nor a byte budget but a claim through the real allocators
 the byte arithmetic the fill prices with.
 
 The **producer** is not designed at all. It is a worker pool whose width is a
-count-based constant, and every attempt to tune that constant has failed in both
+count derived from a residency estimate (`repo_scan::width::scan_width`, capped by
+`REPO_MAP_PARALLELISM`), and every attempt to tune that constant has failed in both
 directions — five settings in one session, each either starving the queue or
 over-filling the card. That is the signature of a proxy variable, not a control.
 
@@ -162,6 +185,13 @@ decode tok/s banded by the weight zone it ran under.
 
 ## 4. Proposed design
 
+> **Names in §4.1–§4.10 are history.** The controller, the simulator and the
+> queue-paced producer of these sections were removed; their identifiers
+> (`FeederControl`, `Machine::span_regions_per_conversation`, `residency_ceiling`,
+> `stores_are_at_their_ceiling`, `store_room`, `plan_admission`, `sim.rs`,
+> `SCAN_MAX_OPEN_CONVERSATIONS`, `queued_prefill_tokens`) no longer exist in the
+> code. What the producer is at HEAD is in the Open items at the end.
+
 ### 4.1 Fat pipe — the producer
 
 Two changes, both with precedent in the calibration path:
@@ -229,10 +259,11 @@ width and tok/s within a stated tolerance before any tuning result is believed.
 
 ## 4.4 Phase 2/3 result — the pipe is fat, and the feeder is now the constraint
 
-Built: the producer paces on `queued_prefill_tokens` (published on
-`AdmissionSection`) between a low and high water mark, bounded by a fixed count
-of open conversations. The residency-derived width survives only as a cold-start
-bound, consulted until the scheduler publishes its first backlog.
+Built for the runs below, and not at HEAD: the producer paced on a token backlog
+published on the memory report between a low and a high water mark, bounded by a
+fixed count of open conversations, with the residency-derived width only a
+cold-start bound. `AdmissionSection` publishes `queued_prefills` (a count) and no
+token backlog, and the producer is the residency-derived pool again (Open items).
 
 **Queue depth, before and after:**
 
@@ -367,7 +398,10 @@ A region is claimed either by `claim_slab`, which makes an `Arena` and appears i
 `backings.first()`, so it described one pool's share of a process-wide
 reservation with no sign that it was doing so.
 
-With both fixed (`all_pools_gpu_arenas`, `span_tenant_counts`), the run reports
+With both fixed (the census of every pool's arenas and of the span tenants, now
+`candle_nn::kv_cache::arena_census` reported as `KvSection::span_tenants`; the
+names this section was written with, `all_pools_gpu_arenas` and
+`span_tenant_counts`, are gone), the run reports
 `all 1 pools` — a single `BackingInner`, its arena count exact
 (`registered == stored`, 43/43 samples). The remainder is held by three span
 tenants, all legitimate, none of them ever leaked:
@@ -378,7 +412,9 @@ tenants, all legitimate, none of them ever leaked:
 | `RecurrentState` | `delta_net/state_store/mod.rs` | concurrent sequences |
 | `VerifyStash` | `qwen35/spec.rs` (since replaced by each state slot's fixed timeline, `docs/deltanet_timeline.md`) | concurrent sequences × draft budget |
 
-All three exist only on DeltaNet-lineage models, which is why this never
+The census today names `SlotTenant::{RecurrentState, Gallery, QsaIndex,
+CreepResidual}` (`tenant_arena.rs`); the verify stash is no longer one of them.
+The first two exist only on DeltaNet-lineage models, which is why this never
 appeared on a non-DeltaNet target — and why the throughput law may not carry
 across models unchanged (§6.1).
 
@@ -623,15 +659,19 @@ from 140 to 0.
 > map, the per-wave park sweep, the unpark-on-materialise branch and the host
 > arms of fork/move/export are gone; `restore_recurrent` now creates a device
 > store and imports into it. What bounds residency instead is the turn seal:
-> `evict_recurrent` drops the device copy once the substrate snapshot is durable,
-> and the next turn restores from that snapshot, so a conversation between turns
-> holds no recurrent state at all. The substrate is now the only place recurrent
-> state is recovered from, rather than a host cache shadowing it.
+> `ManagedBatchedModel::park_recurrent` drops the device copy once the substrate
+> snapshot is durable (`recurrent_parked` answers whether a sequence is in that
+> state, and any use of it is refused with `RECURRENT_PARKED_MARKER` until it is
+> restored), and the next turn restores from that snapshot, so a conversation
+> between turns holds no recurrent state at all. The substrate is now the only
+> place recurrent state is recovered from, rather than a host cache shadowing it.
+> `stage_recurrent` holds a restored snapshot back so the store is claimed where
+> admission prices it, not when the conversation opens.
 >
-> This also collapsed `has_recurrent` into `recurrent_resident`: the two only
-> differed for parked sequences, so with nothing parked they cannot disagree.
-> Everything below in §4.10/§4.11 describing the parked map is history, kept for
-> the measurements. The residency numbers it reports still stand; the mechanism
+> The question the fork/move/restore paths ask is `has_recurrent_state`; the
+> earlier split of "state anywhere" from "resident on the device" no longer
+> exists. Everything below in §4.10/§4.11 describing the parked map is history,
+> kept for the measurements. The residency numbers it reports still stand; the mechanism
 > that produced them does not.
 >
 > The case seal-eviction does not cover is a sequence idle *within* a turn — one
@@ -697,11 +737,19 @@ thread count with a twenty-second ramp.
 > prefills and sections only (decodes are charged to the wave, never offered).
 > Each offer is judged by `WaveRate` (`scheduler/admit/rate/`) on what it does to
 > the wave's rate and on the residency it dislodges. `WaveFill`, `wave_decode_set`,
-> `admit_recurrent` / `reserve_recurrent`, `decode_width_target`,
-> `expert_hit_rate_knee`, `resident_hit_rate` and `WAVE_WIDTH_HARD_CAP` no longer
-> exist, so the decode-first fill, the hit-rate width controller and the
-> single-bound `wave_width` below are the history of how the rate model's inputs
-> were found. What is live from this subsection: `interleave::HOLD` is 0.50 of
+> `admit_recurrent` / `reserve_recurrent`, `Ground::yield_decodes`,
+> `tier_tokens_left`, `decode_width_target`, `expert_hit_rate_knee`,
+> `resident_hit_rate` and `WAVE_WIDTH_HARD_CAP` no longer exist, so the
+> decode-first fill and the single-bound `wave_width` below are the history of how
+> the rate model's inputs were found. The **hit-rate width controller** (ceiling,
+> knee, floor, the hard cap) is **Not built** at HEAD: it is the plan of record
+> for bounding how many sequences a wave carries by the measured expert hit rate,
+> to be given per-model, per-card rows (§5 row 27), and the rate model does not
+> yet replace it. Likewise **Not built** is the producer gate described below
+> (`decode_starved`, `decode_carried`, `gate_decision`, `Hold::*`, the
+> `SCAN_OPEN_*` and `SCAN_QUEUE_SLACK` slacks, `open_slots`, `wave_width` and
+> `publish_interval_ms` on the memory report); the producer at HEAD is the
+> residency-estimate pool of the Open items. What is live from this subsection: `interleave::HOLD` is 0.50 of
 > the achievable residency (`optimal_weight_bytes`), the idle reseed
 > (`reseed_achievable_weight`) and the effective zone
 > (`effective_weight_zone_bytes`) are as described, `interleave::reserve_for`
@@ -709,7 +757,8 @@ thread count with a twenty-second ramp.
 > activation dtype alone (`prefill_width_cap_withholding` adds the ground a creep
 > sweep will lose), the wave's tier is priced by `wave_tier_bytes`,
 > `PREFILL_MIN_ADVANCE` is 128 (`admit_ground/mod.rs`), the widest-recent-tier
-> window is `RECENT_FORWARDS` = 16 (`region_pool/transient_tier.rs`), and
+> window is `RECENT_FORWARDS` = 16 (`region_pool/transient_tier.rs`; the runs below
+> call it `TIER_RECENT_WAVES`), and
 > `MAX_PREFILL_WIDTH` / `MAX_DECODE_WIDTH` are 24 / 64.
 
 Five regulators shared one pool of bytes — the learned target, the queue
@@ -772,6 +821,7 @@ tier placed since they began waiting, and the policy leaves the wider of it and
 the last tier free. When the backlog clears it is forgotten, and the weight side
 grows back as before.
 
+**Not built — the producer gate (this paragraph and the next three).**
 **The engine publishes two numbers** in the memory report's admission section:
 `decode_carried` (decodes the last fill admitted) and `decode_starved` (eligible
 decodes it could not). Starved is the real allocation's answer that the device is
@@ -1045,9 +1095,11 @@ causes and a loop:
   `has_recurrent` (state anywhere — the fork/move/restore question) is now
   distinct from `recurrent_resident` (on the device — the fill's question).
   *(Superseded: the parked map is gone, `restore_recurrent` creates the store
-  directly, and `has_recurrent` has been collapsed into `recurrent_resident` —
-  see the note at the head of §4.11. `validate_snapshot` still runs first, so a
-  foreign or torn snapshot is refused before any device memory is spent.)*
+  directly, and neither name exists — the question is `has_recurrent_state`; see
+  the note at the head of §4.11. The restore still validates the snapshot's
+  schedule hash and geometry before any device memory is spent, so a foreign or
+  torn snapshot is refused first; the check is no longer a separate
+  `validate_snapshot`.)*
 - With the zone at the floor and live regions scattered to the top of the
   span, the frontier gap was 150 MiB, and `prefill_width_cap` floored the
   budget at the 912 MiB guarantee — ground the placement cannot use while
@@ -1247,6 +1299,10 @@ waiting prefill holds); the ones past it sit the wave out and are offered
 first next fill, so each steps within a few waves. A decode that sits out
 long enough is parked by the store's idle lag and costs a copy to return — a
 bounded cost where the alternative was an unbounded width.
+
+**Not built — the hit-rate width controller (this paragraph through the
+configuration shipped at 07:00 and the card note after the ledger).** Run AU's
+lesson stands, the rest is the plan of record.
 
 **The fill, restated as one bound.** By run AU the fill carried three gates
 (the residency fraction, the hit-rate gate, the width target) and two
@@ -1516,31 +1572,32 @@ cache's hard floor, 1,415 MiB — never by the hold. Four things were buying:
 > (without a quantize rung; `relieve_vram_pressure` and `evict_cold_tail` are in
 > `scheduler/prefill/relief.rs`). The store and section rules below still hold.
 
-* **A store is materialised at admission, never at open.** Opening records a
-  `RecurrentSeed` — the checkpoint payload, the parent, or `Neutral` — and
-  `claim_recurrent` resolves it through `materialise_recurrent`: the slot's own
-  timeline snapshot first, then the seed chain (a live parent is copied; an
-  evicted parent's checkpoint is reached through it). A queued conversation
-  holds nothing on the device. The seal evicts, as before.
-* **Admission is the only buyer.** `claim_region` refuses on exhaustion,
-  `place_transient` refuses when the tier does not fit, the pre-wave purchase is
-  gone, and so is the ground-broker registry they went through.
-  `Scheduler::buy_kv_ground`, called from `WaveFill::admit` for every item the
-  gate passes (and from `resume_parked`), buys the larger of two shortfalls —
-  the price against the free list, and the tier against the frontier gap —
-  between forwards, bounded by the same accounting that admitted the item.
-* **Sections pass the fill.** `IngestSection` queues a `PendingSectionIngest`;
-  `Kind::Section` is a seventh band, Low, ahead of Low prefill (the caller is
-  blocked on the seal before it can submit the turn that attends over it) and
-  behind every interactive band. Priced like a prefill without a lease, gated
-  and counted like one; the setup and the claims run at admission. A running
-  section is an active slot and its finish is a completion.
-* **One eviction pass, run for a reason.** `demote_idle_slots` runs when the
-  head of the queue does not fit the headroom the fill prices with, or when
-  the engine is idle so the weight side grows back to what the card can hold.
-  Decodes never ask; they are continuations. The relief ladder, its setpoints,
-  `evict_cold_tail`, `compress_pending_turns` and the gentle-early ingest demote
-  are deleted, and the producer's gate no longer reads the weight zone.
+* **A store is materialised at admission, never at open.** Opening records
+  what the store will be built from — the checkpoint payload, the parent, or a
+  neutral start — and the store is claimed where admission prices it (the
+  recurrent term of `admit::Cost`, `Scheduler::recurrent_cost`, charged by
+  `admit_ground`; a restored snapshot is held back by `stage_recurrent` until
+  then). A queued conversation holds nothing on the device. The seal parks the
+  store (`park_recurrent`), as before. (The `RecurrentSeed` /
+  `claim_recurrent` / `materialise_recurrent` names this was built under no
+  longer exist.)
+* **Admission is the only buyer.** *(Replaced design: §4.11.14.)* This was
+  built as `claim_region` and `place_transient` refusing, with
+  `Scheduler::buy_kv_ground` buying between forwards from `WaveFill::admit`.
+  At HEAD claims and placement buy their own ground and admission judges
+  without buying.
+* **Sections pass the fill.** `IngestSection` queues a `QueuedSection` on
+  `Scheduler::section_queue`; `Kind::Section` is a band of `admit::order::BANDS`
+  in every priority, Low ahead of Low prefill (the caller is blocked on the seal
+  before it can submit the turn that attends over it) and behind every
+  interactive band. Priced like a prefill (`AdmitPass::peek_section` /
+  `admit_section`), gated and counted like one; the setup and the claims run at
+  admission. A running section is an active slot and its finish is a completion.
+* **One eviction pass, run for a reason.** The idle-slot demotion
+  (`demote_idle_slots`) is gone; ground comes back through the relief ladder of
+  §4.11.14 and the idle settle. Decodes never ask; they are continuations.
+  `compress_pending_turns` and the gentle-early ingest demote's old form are
+  deleted (`demote_cold_ingest_if_pressured` is the narrower survivor, §4.11.6).
 
 The rules of §4.11.4 are unchanged. What changed is that nothing else in the
 engine can now move the boundary or place a store without passing them.
@@ -1557,7 +1614,10 @@ gap_mib=213..256 least_mib=176 bought_mib=0`. The margin the fill held back had
 doubled to its 1 GiB cap and the budget read zero; the wave asked for 320 MiB
 anyway.
 
-Three things, each visible in the log:
+Three things, each visible in the log (names in this subsection are of the
+build under test; `buy_kv_ground`, `publish_tier_budget`,
+`least_wave_purchase_regions`, `note_tier_refusal` and `held_creep_rows` no longer
+exist; a refusal is recognised by `is_tier_refusal`):
 
 1. **The refused wave was never re-formed.** A creep group lives across waves —
    members, layer cursor, held residual — and `decode_forward_cobatched` forms a
@@ -1586,7 +1646,10 @@ Three things, each visible in the log:
 **The design as built (S26).**
 
 > Superseded by §4.11.14: `buy_kv_ground`, `publish_tier_budget`, the fixed tier
-> margin and the refusal streak are gone. The placement buys its own shortfall,
+> margin and the refusal streak are gone. **Not built at HEAD:**
+> `TIER_MARGIN_REGIONS` and `TIER_REFUSALS_BEFORE_FAIL` below stay the plan of
+> record for bounding a refused wave's retries; at HEAD a refusal requeues the
+> unstarted prefills (`is_tier_refusal`) and no streak or margin constant exists. The placement buys its own shortfall,
 > and a placement the weight side cannot cover fails the forward with the
 > partition named (`place_transient`).
 
@@ -1650,6 +1713,10 @@ the decode lease, the one path run 11 never reached. Two turns outran their
 
 **The design as built (S27).**
 
+> **Not built:** the lease renewal (a spent lease offered to the gate for another)
+> and the batched async park/resume migration below are the plan of record, not
+> code.
+>
 > **Status at HEAD.** There is no decode lease in the scheduler any more:
 > `park_expired_leases`, `DECODE_LEASE_TOKENS`, `lease::trim_sealed_to_tokens` and
 > `admit::gate::may_admit` do not exist (the gate's function is
@@ -1693,8 +1760,9 @@ with nothing requeued, nothing failed, no creep held and no glue pending. The
 wave was eight decode rows; 400 MiB was the tier the *previous* wave had placed
 for 375 prefill rows beside those decodes. The chain, from the log and the code:
 
-1. `enter_arena_window` — taken by arena creation and by `compact_arenas_down`'s
-   `relocate_arena` in the admission pass — releases a finished forward's tier
+1. `enter_arena_window` — taken by arena creation and by the compaction pass
+   (`compact_backings`, run from the admission pass; at the time of this run
+   `compact_arenas_down`'s `relocate_arena`, since replaced, §4.11.11) — releases a finished forward's tier
    when the partition is idle (`blocked=29 → 0` between two fills with no wave
    between them). That is by design: a standing tier belongs to a forward that
    has finished with it.
@@ -1718,7 +1786,7 @@ width of whoever is still covering the window (`WaveDomain::covering`), which is
 `None` when no one is. A guard that then opens unpriced gets the deliberately
 worst-case `fallback_plan`, never another forward's. And the opener that was
 unpriced now prices itself for its own rows before opening: the draft loop
-(`draft_cohort`, `n` rows a step) takes `cover_wave_transient` and holds the
+(`n` rows a step) takes `cover_wave_transient` and holds the
 returned `Covering` for the whole walk, so an arena it creates leaves its own
 width as the plan (`bump_arena/plan.rs`, `window.rs`).
 
@@ -1746,11 +1814,22 @@ Sealing and hot→warm migration move KV between arenas 1,000–3,000 times per 
 and have never corrupted anything, because they run the other way round:
 `quantize_sealed_in_place` and `migrate_sealed_to_cpu_batch_async` take
 `&[SealedSequence]` and **return replacements**. They never edit a holder, so
-they never need to find one. `relocate.rs` takes that shape and spends it on a
-device copy. It also builds a **fresh** `MetaGid` per relocated chunk rather than
+they never need to find one. The relocation pass takes that shape and spends it on
+a device copy. It also builds a **fresh** record per relocated chunk rather than
 rewriting one in place, which removes the remaining race rather than narrowing
 it: a reader sees the old chunk — old record, old slot, both live — or the new
 one, never a half-updated state.
+
+*(Replaced design: the pass was first written as `relocate.rs`, with
+`compact_arenas_down` driving `relocate_arena`, and a fresh `MetaGid` per chunk.
+At HEAD it is `compact_backings` (`chunked/compact/pass.rs`) over
+`compact_plan.rs`, `compact_map/` and `compact_mint.rs`: a pass plans, claims and
+copies its moves within a time budget, rewrites every holder it can reach — the
+backing's block tables, the caller's residences and the device records — publishes
+nothing until they are rewritten, and fences the device before any emptied arena
+is released. `compact_mint.rs` mints a new `KvHead` record for each relocated
+chunk, so the source slots stay pinned by the old record only for the holders
+that still hold it, and free with the last of them.)*
 
 Three attempts that did *not* work are worth recording, because each looked
 sufficient: deferred slot reclamation (a grace period before a vacated slot may
@@ -1793,8 +1872,14 @@ The transient tier was reserved from estimates. On Qwen3.5-0.8B it took
 **251.0 MiB it never touched** — ground the weight side conceded for nothing,
 and the reason the floor's guarantee failed one width later.
 
-It is now exact. `quantized_qwen35::tests::tier_is_reserved_for_exactly_what_it_uses`
-asserts zero slack in every phase and fails the run otherwise:
+It was made exact. The measurement below was taken by a quantized-Qwen3.5 test
+named `tier_is_reserved_for_exactly_what_it_uses`, which asserted zero slack in
+every phase; that test and its `wave_max_slack` instrument do not exist at HEAD.
+What pins the pricing now is the wave plan's own tests
+(`candle-nn/src/kv_cache/chunked/wave_plan/tests_*.rs`, e.g.
+`the_forward_phase_prices_its_measured_generation_and_outgrows_the_old_constant`),
+which assert each buffer's bytes against the geometry, so a re-measurement is a
+census run, not a standing gate:
 
 ```
 phase          reserved    peak used        slack
@@ -1829,9 +1914,11 @@ they combine two different ways:
 **`WaveWidth` carries the three units a wave actually has**: `prefill_rows`,
 `decode_rows`, and `scored_rows`. The third is the head's, and it is neither of
 the others — the head scores every decode row, the last token of each prefill
-sequence, and *all* rows of a verifying span. `qwen35::forward::wave_width`
-states that rule once and the head `debug_assert`s its own selection against it,
-because the two sites are a thousand lines apart.
+sequence, and *all* rows of a verifying span. The rule is stated once, in the
+`WaveWidth` type (`wave_plan/width.rs`); the Qwen3.5 forward at the time kept a
+`wave_width` function beside the head that `debug_assert`ed its own selection
+against it, because the two sites were a thousand lines apart, and that function
+no longer exists.
 
 **A latent ceiling, not just slack.** `WAVE_FORWARD_BYTES` is 16 MiB and the
 forward phase costs ~498 KB per scored row (vocab × act dtype, plus the packed
@@ -1843,21 +1930,22 @@ naming the head. Pinned in
 **Proving it needed a better instrument.** The first assertion compared
 `max(plan)` against `max(peak)` — both process-lifetime maxima, and on this run
 both from the same 2100-row prefill. A four-row decode wave priced at ten times
-what it used sits under it on both sides and never appears. `wave_max_slack`
-pairs each forward's own plan with its own peak, so the test now says *every*
-forward was exact rather than that the widest one was.
+what it used sits under it on both sides and never appears. The instrument of
+the time, `wave_max_slack`, paired each forward's own plan with its own peak, so
+the test said *every* forward was exact rather than that the widest one was.
 
-**…once the books judge every forward.** The pairing first read the previous
+**…once the books judged every forward.** The pairing first read the previous
 forward's plan out of `WaveDomain::planned` — the *layout's* record, which
 `end_wave_transient` clears at phase 0 of every forward and `enter_arena_window`
 clears when a sealing pass takes the gap. So the pricing that followed almost
 never found a plan to judge, and the run's last forward was never judged at all.
 The symptom was a contradiction: the MoE gates reported their widest FFN plan
 195–310 MiB over the run's peak while the worst forward on the books was 1.1 MiB
-over. The books are now their own field, `unjudged`, settled exactly once — by
-the next pricing, or by `wave_settle`, which the harness calls before its
-verdict. **A widest-plan slack that no per-forward pair accounts for is a hole in
-the books before it is a pricing error.**
+over. The fix gave the books their own field, `WaveDomain::unjudged`, settled
+exactly once — by the next pricing, or by `wave_settle`, which the harness called
+before its verdict. Neither the field nor `wave_settle` exists at HEAD, with the
+instrument they served. **A widest-plan slack that no per-forward pair accounts
+for is a hole in the books before it is a pricing error.**
 
 **The trap this keeps setting.** A charge whose *size* is right and whose
 *reason* is wrong survives every change that should have corrected it. The F32
@@ -1878,7 +1966,7 @@ the F32 `down_out` and never converts it, 323.7 MB of a 1.8 GB plan — and rout
 tables bounded at eight `u32` per assignment against the three separate tables
 and `rows + 1` offsets the pipeline actually uploads, once per layer. The first
 was large enough to hide an *under*-price: the Qwen3.5/3.6 shared expert's six
-span carves were never declared (see `docs/qwen35_qwen38_models.md`).
+span carves were never declared (see `docs/archived/qwen35_qwen38_models.md`).
 
 **And admission was not charging it at all.** Pricing the tier exactly is worth
 nothing if the thing that decides wave width never sees it. Two defects, one
@@ -1906,7 +1994,19 @@ audit:
   point in §4.11.4 for the fix, and for why the *standing* tier — not the
   previously published one — is what it reads.
 
-Neither is validated on a live ingest yet. Both only ever *tighten* admission,
+**A third blindness, closed in the fill.** For a background workload every
+conversation is `Low`, so the band order is Low Section, Low Prefill, Low Decode,
+and every prefill was judged at `decodes == 0`: the question "can the decode this
+turn becomes be carried at that residency" collapsed to a bare floor check. That
+is the mechanism measured as decode cost per directory going from 4.3 s to
+12.3 s — the cheap phase spending the residency the expensive one was about to
+need (figures as recorded in `scheduler/admit/mod.rs`). The fill now charges the
+engine's committed decodes to the wave before the first offer (`draft: 0`, since
+a continuation's verify block was priced when it was staged), so the second
+judge is real.
+
+The first two (the tier in the rate model, the reserve) are not validated on a
+live ingest yet. Both only ever *tighten* admission,
 which is the safe direction for a failure mode that has always been the weight
 zone collapsing, but the effect on directories/minute is unmeasured.
 
@@ -1915,7 +2015,7 @@ zone collapsing, but the effect on directories/minute is unmeasured.
 different quantity from a wave's reservation, and the one role it keeps.
 
 **Known consequence.** Changing transient pricing changes admitted wave widths,
-which changes accumulation order. `docs/qwen36_performance_plan.md` T8 carried
+which changes accumulation order. `docs/archived/qwen36_performance_plan.md` T8 carried
 an explicit constraint against landing that alone, between KV-factor
 derivations; this landed between derivations and alongside seven sibling
 changes. Marginal KV-factor calibrations are suspect until re-derived — C10 on
@@ -2121,19 +2221,19 @@ closed the gap, from 124.6 / 129.0 / 98.1 t/s:
 | 12 | park idle recurrent stores to host RAM; claim on admission | stores track in-flight width, not backlog | ✅ §4.11 — 5,120 → 640 MiB, span refusals 140 → 0 |
 | 13 | decode-first fill, decodes gated by the real allocators only | no fill stops at one decode while decodes are eligible | ✅ §4.11.1, §4.11.4 |
 | 14 | bound the co-batched wave in tokens through `prefill_width_cap` (then `(dtype, head, tier_budget)`; now `(dtype)`, with the wave priced by `wave_tier_bytes`) | no tier refusal on a wave the fill composed | ✅ §4.11.2 |
-| 15 | producer paces on `decode_starved` + backlog; controller, estimate and wait cap deleted | open conversations never exceed what the engine steps | ✅ §4.11.3, §4.11.4 |
+| 15 | producer paces on `decode_starved` + backlog; controller, estimate and wait cap deleted | open conversations never exceed what the engine steps | Not built — §4.11.4; the producer is the residency-estimate pool (Open items) |
 | 16 | demote a live idle sequence's block table to warm; re-elevate on admission | idle ingest K/V leaves the device | open — §4.11.5 |
 | 17 | chunked dialogue prefill: a wave carries `[offset, offset+advance)` of a turn, priced per chunk | no turn fails as too wide; long turns ingest beside decodes | ✅ built — §4.11.4 run AH |
 | 18 | resume lands parked: a restored snapshot costs no device store until admission | stores = in-flight width at pool open, never open conversations | ✅ §4.11.4 run AJ — 19–23 stores for 18–21 decodes |
 | 19 | producer holds on queue length; scheduler offers continuations before first turns | chains reach their next turn; open conversations ≈ carried + a wave | ✅ §4.11.4 run AK — 25–59 open, holds biting |
 | 20 | hold and purchase cap on `min(extent, effective)`; tier budget leaves the weight side what it is owed under the hold | zone never bought to its floor by the tier | ✅ §4.11.4 run AL — zone at the hold, 0 refusals, first completions |
-| 21 | producer bounds open conversations to carried + 2× queue slack | idle K/V does not pin the zone under the hold | ✅ §4.11.4 run AM — 22 dirs / 26 min, 0 failures |
+| 21 | producer bounds open conversations to carried + 2× queue slack | idle K/V does not pin the zone under the hold | measured in run AM — 22 dirs / 26 min, 0 failures; the producer bound is Not built |
 | 22 | tier margin decays; staged-log reads copy instead of flushing | no multi-second drain stalls | ✅ §4.11.4 run AN — 16 dirs / 8 min, drain avg 0 in steady state; churn remained (2/wave) |
 | 23 | weight-side growth capped at the frontier gap less slack and the recent-max tier | concessions per wave → 0 in the pool phase | ✅ §4.11.4 runs AO–AZ — 0.6/wave with the last tier, 0 relief purchases once relief stopped buying |
-| 24 | one wave width, following the measured expert hit rate; decodes ≤ width−1 by promotion; one prefill row per wave | prefill and decode on every wave; width never runs away | ✅ §4.11.4 runs AW–BH |
-| 25 | producer paces on the engine's published `wave_width` and report cadence; empty queue lifts a held worker to the full mark | queue one wave deep, open ≤ 1.5 waves beyond carried, no stale-report holds | ✅ §4.11.4 runs AX–BI |
+| 24 | one wave width, following the measured expert hit rate; decodes ≤ width−1 by promotion; one prefill row per wave | prefill and decode on every wave; width never runs away | measured in runs AW–BH; the hit-rate width controller is Not built |
+| 25 | producer paces on the engine's published `wave_width` and report cadence; empty queue lifts a held worker to the full mark | queue one wave deep, open ≤ 1.5 waves beyond carried, no stale-report holds | measured in runs AX–BI; `wave_width` / `publish_interval_ms` pacing is Not built |
 | 26 | relief does not concede; KV pressure does not close admission; `room` counts running prefills only | KV side grows by claims, never bought by the setpoint | ✅ §4.11.4 runs AZ–BC |
-| 27 | per-model, per-card rows for ceiling / knee / floor, derived from the gate on each machine | the same code runs the 3090 and the PRO 5000 without retuning | open — §4.11.4 last paragraph |
+| 27 | per-model, per-card rows for ceiling / knee / floor, derived from the gate on each machine | the same code runs the 3090 and the PRO 5000 without retuning | Not built — §4.11.4 last paragraph |
 | 28 | delete the byte-budget admission path, the AIMD budget and the wave trace built to fit them | one admission path, on every machine; nothing computed that nothing reads | ✅ §4.11.6 |
 | 29 | KV arena reclamation that cannot corrupt: relocation driven from the owner, not the arena | a full-corpus ingest with relocation active and zero corrupted generations | ✅ §4.11.11 — run 60, 352 dirs, 0 |
 | 30 | stop the arena count growing: a run that finds no tail reuses recycled slots before stamping a new arena | class 8192 occupancy stays high under ingest instead of collapsing | ✅ §4.11.11 — 6.3% → 84.7% |
@@ -2182,15 +2282,17 @@ in that limit. Concretely:
 * The controller's default posture must be **permissive**, tightening only on
   evidence — a stall, a refusal, a measured fall in tok/s. Starting conservative
   and relaxing is what produced the 0.8-of-14.4 result in §4.4.
-* The **per-sequence span cost is read from `span_tenant_counts`**, never assumed.
+* The **per-sequence span cost is read from the span-tenant census**
+  (`arena_census`), never assumed.
   §4.6.2's three tenants exist only on DeltaNet-lineage models; elsewhere the
   counts are zero, the cost term vanishes, and width is free of this constraint
   by measurement rather than by a model check. This is the constraint's best
   case: the quantity that makes the law necessary is the same quantity that
   switches it off.
 
-The test in `repo_scan` (`the_queue_watermarks_name_no_property_of_the_card`)
-pins this for the producer. The feeder needs its own equivalent.
+A `repo_scan` test (`the_queue_watermarks_name_no_property_of_the_card`) pinned
+this for the queue-paced producer; that producer and its test are not in the code
+(Open items), so nothing pins it today. The feeder needs its own equivalent.
 
 ### 6.2 Open questions
 
@@ -2213,3 +2315,36 @@ pins this for the producer. The feeder needs its own equivalent.
    of a DeltaNet running sum. §2.1's batched-test numbers are therefore **not**
    an achievable target for this model in the daemon, and the comparison in §2.2
    overstates the gap by whatever speculation was worth there.
+
+## Open items
+
+Code that a design above removes is still present. Each item names the code, where
+it is, and the section that retires it.
+
+1. **`scan_width`** (`zend/src/repo_scan/width.rs`, with
+   `max_live_conversations`, `scan_width_from_governor` and
+   `REPO_MAP_PARALLELISM`) sizes the folder pool from residency: capacity less
+   scratch less fixed footprint less the inherited corpus, divided by a
+   per-conversation figure, capped at half of what the weight zone can concede.
+   §4.11.4 deletes it in favour of the engine-reading producer gate; §2.3(b)
+   records why a residency estimate fights the expert cache.
+2. **`per_conversation_kv`** and its constants (`SCAN_CONV_KV_MIN`,
+   `SCAN_CONV_KV_MAX`, the baseline anchor `anchor_scan_kv_baseline`) in
+   `zend/src/repo_scan/kv_estimate.rs`: the K/V estimate `scan_width` divides by.
+   §4.11.4 deletes it with `scan_width`.
+3. **`SCAN_POOL_WAIT_CAP`** (`zend/src/repo_scan/scan_slot.rs`, 20 s): after it a
+   worker takes its slot whatever the gate says, which is §4.11.3's finding that a
+   hold with a cap is a delayed admission. §4.11.4 removes the cap so a hold ends
+   only when the engine says so. The process-wide `SCAN_LIVE_CONVS` gauge goes
+   with it.
+4. **`AdmissionSection`** (`candle-conversation/src/scheduler/memory_report/
+   sections_kv_host.rs`) lacks `decode_starved`, `decode_carried`, `wave_width`,
+   `open_slots` and `publish_interval_ms`, the fields the §4.11.4 producer gate
+   reads, and still carries the AIMD `setpoint_bytes` / `ceiling_bytes` /
+   `quantum_bytes` of the byte-budget path. Adding the five is part of building
+   the gate; the AIMD fields retire with `Scheduler::admit_budget`, which is still
+   computed in `scheduler/budgets.rs` and `scheduler/admission.rs` (§4.11.6's
+   status note).
+5. **The decode-lease and hit-rate vocabulary** is absent from the code, so the
+   Not built items in §4.11.4, §4.11.8 and §4.11.9 have no stubs to retire; they
+   are built or dropped as designs.

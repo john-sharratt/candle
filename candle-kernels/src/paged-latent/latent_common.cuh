@@ -350,7 +350,7 @@ __global__ void latent_glue_scatter_kernel(
 //   • ROPE bands [NOPE_DIM, HEAD_DIM) → BF16 `rope_bf` PRE-rotation (float, 8-bit
 //     mantissa, matches the window ring's BF16 rope tail — no √2 pair-magnitude
 //     margin, no clip). Readers rotate these at read time from `comp_pos`.
-// Same NPAL*32 launch contract + grid-stride as `latent_quant_corpus_range_kernel`.
+// Launch contract: NPAL*32 threads per block, grid-stride over the entries.
 template <int HEAD_DIM, int ROPE_DIM, int NPAL>
 __global__ void latent_build_corpus_cache_kernel(
     const float* __restrict__ comp,        // [G, HEAD_DIM] f32 pre-RoPE (canonical)

@@ -2,7 +2,7 @@
 //! for its maintenance jobs (`retire-faces`), which write and need the daemon
 //! stopped.
 //!
-//! The substrate persistence layer (`docs/archived/kv_tier_migration.md`) stores a
+//! The substrate persistence layer stores a
 //! conversation workspace as an append-only log of content-addressed
 //! records under `<workspace>/substrate/substrate.log`. This tool opens
 //! such a log read-only and renders it from several angles.

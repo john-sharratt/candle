@@ -6,16 +6,18 @@
   headings;
 - `zend/src/journal/steps.rs`: `RequestSteps`;
 - `zend/src/journal/notes.rs`: `own_notes`;
-- the round's seal and `carry_journal` in `zend/src/session/journaling.rs`.
+- the round's seal (`session/inference_stream/stream_turn.rs`, which grows the
+  steps from the reply's notes) and `carry_journal` in
+  `zend/src/session/journaling.rs` (which rebuilds them once and reconciles
+  the sections).
 
 This document is authoritative over the steps section of a dialogue's journal
 and over the projection's rule that a request's own turn is never windowed out.
 `docs/zend_journal.md` §4 and §5.2 defer to it.
 
-§3's request-turn rule holds by the two rules it names. The end-to-end
-projection test it calls for is not yet written: it needs a projection fixture
-with 64 tool rounds of real turn sizes, which the projection tests do not
-build today.
+§3's request-turn rule holds by the two rules it names. **Not built:** the
+end-to-end projection test §3 calls for. It needs a projection fixture with 64
+tool rounds of real turn sizes, which the projection tests do not build.
 
 ## 1. Why
 
@@ -194,12 +196,12 @@ the model loses what it is doing, whatever the steps say.
    request turn is never shed. What is left past the room carries the slot past
    its window (`over_room`), and nothing downstream trims it.
 
-**What is missing, and what is built:**
+**What the two rules leave unpinned, and what the design asks of the rest:**
 
-- **No test pins it end to end.** The fill tests check the floors on
+- **No test pins it end to end (Not built).** The fill tests check the floors on
   hand-built units, and the selection tests check the recent window. Neither
-  checks the whole projection on a long loop. The test that does is not yet
-  written: a dialogue whose request runs 64 tool rounds of ~6K-token tool
+  checks the whole projection on a long loop. The test that would, and is the
+  plan of record: a dialogue whose request runs 64 tool rounds of ~6K-token tool
   outputs, projected under a window that holds a fraction of them, must still
   emit the request turn, the newest tool turn and the newest turn, and emit
   every step of §2.
@@ -227,7 +229,7 @@ Settled with the user on 2026-11-19:
    entry replaces them (§2.3).
 5. **The request turn is never windowed out** (§3).
 
-Made in writing this, to be confirmed or reversed before it is built:
+Built as written, and the shape the code has:
 
 - **Placement** after the entries, before `journal/close` (§2.2). The steps
   read as the newest part of the record, and "Still open" stays last.
@@ -256,9 +258,10 @@ Made in writing this, to be confirmed or reversed before it is built:
 | `journal-core/src/section.rs` | the `journal/history` and `journal/current` headings and `journal/step/<n>` names; a step's rendered line (`STEP_CHARS` = 400); the closing section without `Still open:` when nothing is open; `JournalPrompt::with_steps` yields the wanted sections in order: history heading, entries, current heading, steps, `journal/close` |
 | `zend/src/journal/style.rs` | the heading, `Step` and end-line wording of each journal style |
 | `zend/src/journal/carry.rs` | scoping the `journal` collection to named members and pinning the sections that have sealed |
-| `zend/src/journal/state.rs` | `SessionJournal` holds the `Steps` |
+| `zend/src/journal/state.rs` | `SessionJournal` holds the `RequestSteps` (`steps`, `steps_mut`) |
+| `zend/src/session/journaling.rs` | `carry_journal`: rebuilds the steps once per process from `request_replies`, builds the sections with `prompt_with_steps`, reconciles them |
 | `zend/src/prompts/projection.yaml` | the intro's sentence on steps |
-| `candle-conversation/src/projection/` tests | the end-to-end request-turn test (§3) |
+| `candle-conversation/src/projection/` tests | the end-to-end request-turn test (§3): **Not built** |
 
 ## 6. Tests
 
@@ -272,12 +275,15 @@ Made in writing this, to be confirmed or reversed before it is built:
   request wants neither the current heading nor a step; a closing section with
   no open item renders the journal's end line alone, with no `Still open:`, and
   one with an open item renders the list and then that line.
-- **Carry:** a new step seals one section and the close; a finished request
-  removes every step section; a progress entry leaves the steps standing.
-- **Handover:** a conversation taken up mid-request (`resume_conversation`)
-  shows its steps on its first round.
-- **The request turn** (§3): the long-loop projection test, with the steps at
-  their cap.
+  These are built: `zend/src/journal/steps.rs` holds the grow, reset, cap and
+  rebuild tests and `journal-core/src/section.rs` the section and clipping tests.
+- **Carry (Not built):** a new step seals one section and the close; a finished
+  request removes every step section; a progress entry leaves the steps
+  standing.
+- **Handover (Not built):** a conversation taken up mid-request
+  (`resume_conversation`) shows its steps on its first round.
+- **The request turn** (§3, Not built): the long-loop projection test, with the
+  steps at their cap.
 - **Live, measured:** on long worker loops before and after, count tool calls
   repeated with the same name and arguments, re-reads of a range already read,
   notes repeating an earlier note, and rounds to the final answer

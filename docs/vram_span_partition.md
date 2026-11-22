@@ -546,7 +546,9 @@ the vacated slot into the warm tier. It does not fault — every address in the
 reservation is mapped — and it surfaces much later as a sequence answering from
 another sequence's KV.
 
-`migrate_flight` is the exclusion. Both sides use `try_`, and **neither ever blocks**:
+`migrate_flight` is the exclusion (the quantize-in-the-gap design retires it as a
+quantize lock, since the quantize now runs on the compacting thread; the persistence
+copy still takes it today — `docs/kv_quantize_in_the_gap.md`, Open items). Both sides use `try_`, and **neither ever blocks**:
 each holds substrate and block-table locks while it works, so either side waiting on
 the other would need those lock orders to agree, and nothing waits, so there is
 nothing to agree about. The migrate takes and fences the guard *per group* rather
@@ -630,21 +632,24 @@ K/V)` band it holds the band's absolute device address, plus the palette tag byt
 that say how to decode it. One record describes one chunk, and every slot referencing
 that chunk resolves to the same record.
 
-They begin outside the reservation, in `CudaSlice<u8>` slabs taken straight from the
-CUDA allocator. That contradicts §1's first claim — *there is no second allocator
-competing for the card* — and it costs three things that matter here:
+Records began outside the reservation, in `CudaSlice<u8>` slabs taken straight from
+the CUDA allocator, and are now arena slots inside it (the shape below). The slab
+design contradicted §1's first claim — *there is no second allocator competing for
+the card* — and cost three things that matter here:
 
-- **A host serialize and an upload per write.** `serialize_kv_heads` builds each
-  record into a `Vec<u8>` on the host, and `write_records_batched` coalesces those
-  into runs and issues one `memcpy_htod` **per run, under a lock**. The record's
-  entire content is derivable on the device from data the device already has, so
-  every one of those bytes crosses the bus needlessly.
-- **No walk.** A slab is reachable only through the handles pointing into it, so
-  "every live record" is not a question the pool can answer, and neither is "does
+- **A host serialize and an upload per write.** `serialize_kv_heads` built each
+  record into a `Vec<u8>` on the host, and a batched writer (`write_records_batched`,
+  since removed) coalesced those into runs and issued one `memcpy_htod` **per run,
+  under a lock**. The record's entire content is derivable on the device from data
+  the device already has, so every one of those bytes crossed the bus needlessly.
+  `fill_records_on_device` (`backing/record_pool.rs`) replaces it, and
+  `serialize_kv_heads` remains as the host reference the fill is held to.
+- **No walk.** A slab was reachable only through the handles pointing into it, so
+  "every live record" was not a question the pool could answer, and neither was "does
   this record still name ground something holds".
-- **Ground the partition cannot see.** The slabs are real VRAM that `weight_floor`
-  arithmetic knows nothing about, so the two sides of the boundary are sized against
-  a capacity that is already spoken for.
+- **Ground the partition cannot see.** The slabs were real VRAM that `weight_floor`
+  arithmetic knew nothing about, so the two sides of the boundary were sized against
+  a capacity that was already spoken for.
 
 ### Shape
 

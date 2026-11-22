@@ -28,8 +28,7 @@
 //! that built the descriptor, with the chunk and field named, is the whole
 //! point — it converts a 23-minute mystery into a stack trace.
 //!
-//! This is `docs/archived/elastic_vram_partition.md` principle 7 — refuse rather than
-//! corrupt — applied to the one surface that had no guard: `place_transient`
+//! This is the rule to refuse rather than corrupt, applied to the one surface that had no guard: `place_transient`
 //! refuses an overlapping tier, `build_slot_headers` refuses a stale
 //! position-map shape, `set_weight_floor` refuses to cut a live region. The
 //! pointers those decisions produce were never checked against the result.

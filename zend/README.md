@@ -164,9 +164,10 @@ A `projection.yaml` in the workspace (or `--working-dir`) overrides the bundled 
 
 ## Related docs
 
-- `docs/coding_assistant.md` — Zen Code product overview (daemon + `zen-vscode` + web chat); note several routes it documents (`/v1/zen/*`) are design-stage and not yet implemented — see `docs/zend_ui_redesign.md` for the ground-truth route table.
-- `docs/zend_ui_redesign.md` — the authoritative frontend/API plan, closest to what is actually shipped.
-- `docs/tool-system.md` — the full server-registered tool catalog (95 tools) and the Continue-vs-web-chat tool-execution split.
+- `docs/zend_workspace_execution.md`, `docs/zend_branch_ingest.md`, `docs/zend_working_set.md` — how zend reads repositories, ingests them and places what it read.
+- `docs/zend_ui_redesign.md` — the frontend and its API.
+- `docs/tool-system.md` — the server-registered tool catalog (`zend-tools/src/registry.rs`) and the Continue-vs-web-chat tool-execution split.
+- `docs/archived/coding_assistant.md` — the original Zen Code design (`/v1/zen/*` routes, shadow files), superseded by the docs above.
 - `docs/sdlc_agent.md` — broader engineering-agent architecture vision this daemon is one instance of.
 - `docs/web_search_design.md` — design of the `web_*` tool family (implemented in the sibling `zend-tools` crate).
 - `docs/stencil_tree.md` — the constrained-decoding mechanism (tool-call shape, `<think>` steering) `zend` compiles at load from `candle_conversation::stencil`.

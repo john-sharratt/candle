@@ -76,7 +76,7 @@ impl ChunkedKvBacking {
         // Snapshot every band as `(arena_idx, chunk_idx, tag)` while holding the
         // state lock briefly. The tag travels with the gid because it is the
         // only thing that says how to decode the slot's bytes — a size-class
-        // arena is untyped (`docs/archived/arena_unification.md` principle 8).
+        // arena is untyped.
         //
         // IMPORTANT: all N_PALETTE sub-bands are dumped, not just palette 0.
         // Dumping one palette would emit a quarter of each head and quietly

@@ -17,11 +17,16 @@ code almost untouched.
 
 ## 1. Where things stand
 
+*History:* the state before the host was built. The two machines of that time were
+BlackWorld (zend) and WhiteWorld (npcd); current addresses are in `web/web.yaml`
+(zend `https://192.168.1.2:8444`, npcd `http://192.168.1.3:8081`), the motherd configs
+and `keep/keep.yaml`. Line references in this section are to the code of that time.
+
 Two binaries, two machines, two models, two engines:
 
 | | zend | npcd |
 |---|---|---|
-| Machine | `.5` (RTX PRO 5000, 72 GB) | `.6` |
+| Machine | BlackWorld (RTX PRO 5000, 72 GB) | WhiteWorld |
 | Model | `model_choice::resolve` — VRAM ladder: Qwen3.8-Flash-Next Q4_KO above 60 GiB, else Qwen3.6-35B-A3B Q4 (`zend/src/model_choice.rs:54-105`) | hard-coded `Qwen36_35B_A3B_AntiLoop_StyleTune` (`npcd/src/model.rs:54-56`); no flag, no ladder |
 | Engine | one `ConversationEngine` in `InferenceState.engine: Mutex<_>` (`zend/src/session/mod.rs:475`, built `:1292`) | one `ConversationEngine` as an `Arc<Mutex<_>>` (built `npcd/src/engine/runtime.rs:3866`), held by `Minds` (`engine/mind.rs:203-204`) |
 | Substrate | engine opens `<workspace>/substrate` itself (`engine.rs:387-412`) | npcd opens `<data>/substrate` (`npcs.rs:218-252`) and hands it over with `.substrate(shared)` (`runtime.rs:3791-3795`) |
@@ -471,20 +476,31 @@ same files, for two different jobs.
   (`cluster::upgrade::artifacts`); the UI each serves is inside it, so a member
   fetches, keeps and swaps one file (`docs/replicated_substrate.md` §3.9).
 
-**Ports.** The host serves the one router on `192.168.0.5:8081` (plain) and
-`192.168.0.5:8444` (TLS, a certificate made at startup — `web::tls::self_signed`), the
-two ports zend has today. npcd moves from `.6` (`0.0.0.0:8081`) onto them.
+**Ports.** A process serves its one router on a plain port (`--port`, 8081) and a TLS
+port (`--tls-port`, 8444, a certificate made at startup — `web::tls::self_signed`).
+What the gateway points at is `web/web.yaml`, which is the source of truth for the
+addresses:
 
-- **A request by IP** gets zend's UI — what `http://192.168.0.5:8081/` shows on the
-  LAN today — and the whole API. npcd's console is reached by its names:
-  `bot.tokera.com` through the gateway, `npcd.localhost` on the box itself. The site
-  table names exactly the hosts in the table above (`host::server::site_table`); a LAN
-  machine that wants npcd's console directly sends one of them as its `Host` (a hosts
-  entry mapping `bot.tokera.com` to `.5`).
-- **The gateway** points both `code.tokera.com` and `bot.tokera.com` at
-  `https://192.168.0.5:8444` with `self_signed: true`. It already forwards the
-  client's `Host` unchanged (`web/src/proxy.rs:184-191`; no route sets
-  `rewrite_host`), which is what the static layer picks the UI by.
+- **zend** is reached at `https://192.168.1.2:8444` with `self_signed: true`: the
+  certificate is a new key each start, so the proxy accepts it without a CA while the
+  handshake still proves the daemon holds the key.
+- **npcd** is reached at plain `http://192.168.1.3:8081`, on its own member.
+
+*Replaced design:* this design first pointed both `code.tokera.com` and
+`bot.tokera.com` at one address, `https://<one member>:8444`, with npcd moved onto
+zend's ports. The gateway instead keeps one upstream per site (`zend` and `npcd` in
+`web/web.yaml`), each with its own address and scheme, and `trusted_backends` names
+the members it trusts for identity headers. A process still serves the whole router
+on its ports whichever tenants it holds, so either UI is reachable on either
+address by its `Host`.
+
+- **A request by IP** gets the default tenant's UI — zend's — and the whole API.
+  npcd's console is reached by its names: `bot.tokera.com` through the gateway,
+  `npcd.localhost` on the box itself. The site table names exactly the hosts in the
+  table above (`host::server::site_table`); a LAN machine that wants npcd's console
+  directly sends one of them as its `Host`.
+- **The gateway** forwards the client's `Host` unchanged (`web/src/proxy.rs`; no
+  route sets `rewrite_host`), which is what the static layer picks the UI by.
 - **Compression.** The builder gzips what it serves (`web/src/compress.rs`), zend's
   responses now included. It streams and flushes per chunk, so zend's SSE replies are
   not held back.
@@ -592,7 +608,7 @@ High (either daemon's live conversation) > Normal > Low (either daemon's ingest)
   other's ingest.
 
 This was first built tenant first (`zend High > … > npcd Low`), so that while zend had
-anything to do — its ingest included — npcd's characters waited. On `.5` that held
+anything to do — its ingest included — npcd's characters waited. On BlackWorld that held
 npcd's first mind ingest behind zend's hours-long background ingest, and the rule was
 dropped: background work of one app is no more urgent than another's, and live
 conversations already outrank ingest by band.
@@ -701,13 +717,20 @@ Two keys are the same model when `arch`, `weights`, `tokenizer` and `rope` agree
 (`ModelKey::same_model`); `repo` and `file` say where it came from, so the same file
 from a mirror is the same model.
 
-**Weights identity.** Each weight file's fingerprint (`gguf_fingerprint`) is the
-SHA-256 of its GGUF header — the metadata and the tensor-info table, which change with
-any quant, merge, fine-tune or recipe — its length, and sixteen 64 KiB windows sampled
-across its tensor data, so a file rewritten under an unchanged header is caught too.
-`WeightFiles::digest` combines every file the model loads from — the primary GGUF,
-tensor overrides, the gate donor, adapters. None of it reads the whole file: 125 GB is
-identified in seconds.
+**Weights identity.** A model loads from its model pack
+(`docs/self_contained_model_packs.md`), whose header records every source checkpoint
+it was built from — the trunk, the tensors an override takes from another checkpoint,
+a gate donor — each with its whole-file SHA-256. `WeightFiles::digest`
+(`weight_files.rs`) is the SHA-256 over the tag `weights v2\0`, each source's role and
+recorded digest in the pack's order, and then each adapter's name with the name and
+`file_digest` (SHA-256 of every byte) of each file in its directory. The sources, not
+the pack's bytes: a pack is built per card — its int8 mode and its sections' layout
+differ between machines — while the model it holds does not. Only the pack's header is
+read, so the identity costs milliseconds whatever the model's size.
+
+*Replaced design:* the first design fingerprinted each GGUF file by its header, its
+length and sixteen sampled 64 KiB windows of tensor data. The pack records the
+sources' full digests already, so the key takes those.
 
 **RoPE identity.** The schedule is part of the model: a different preset or rung
 table changes every key a later layer computed — every layer past the first attended
@@ -723,8 +746,10 @@ what makes per-record identity unnecessary.
 
 ### 4.2 The record and the check
 
-A `ModelKey` record replaces `ModelSpec`. It carries the key and today's spec text
-(for the error message and `substrate_inspect`).
+A `ModelKey` record (`RecordType::ModelKey`) replaces the `ModelSpec` record: a text
+payload under the first line `candle-conversation model-key v1`, one `name=value` line
+each for `arch`, `repo`, `file`, `weights`, `tokenizer` and `rope`, which the refusal
+message and `substrate_inspect` read as they are.
 
 **On open, before any weights load:**
 
@@ -733,6 +758,7 @@ A `ModelKey` record replaces `ModelSpec`. It carries the key and today's spec te
 | no model record (a new substrate) | any | write the key; open (`New`) |
 | the same key | — | open (`Same`) |
 | the same model under another description — a moved repo, a renamed file | — | rewrite the record; open (`Redescribed`) |
+| a spec record of the older format that matches the running model (below) | — | write the key over it; open (`Adopted`) |
 | a different model | — | **refuse** |
 
 The refusal is an error, not a panic. The persistence layer names the substrate and
@@ -749,23 +775,23 @@ model-derived in it — K/V, recurrent state, token ids — was computed by that
 and is wrong under any other. Start on a new substrate, or move this one aside.
 ```
 
-This replaces the tokenizer check, which it subsumes: a different tokenizer is a
-different key. The identity is computed from the GGUF header and `tokenizer.json`
-before the weights are read, so a refused start costs seconds, not a model load.
-Unlike today's tokenizer check, which is skipped with a warning when `tokenizer.json`
-cannot be read (`builder.rs:1382-1388`), the key is never optional: a model whose key
-cannot be computed does not start.
+The key subsumes the tokenizer check: a different tokenizer is a different key. The
+identity is computed from the model pack's header (its sources' digests and its
+embedded `tokenizer.json`) before the weights are read, so a refused start costs
+milliseconds, not a model load. The key is never optional: a pack whose sources or
+tokenizer cannot be read refuses the start (`ModelBuilder::model_identity`,
+`builder/pack.rs`).
 
-**Existing substrates** carry a `ModelSpec` text and a `Tokenizer` hash but no key.
-On first open the host compares what can be compared — arch, repo, filename and the
-tokenizer hash against the running model. If they match, it writes the full key and
-opens; if not, it refuses as above. From then on the key decides. This is the check
-running once against the older record, not a second format reader. It can only see
-what `ModelSpec` records: a change confined to what it leaves out — revision, tensor
-overrides, adapters, gate donor — passes this one adoption. The filename on both sides
-is the checkpoint's own name — its GGUF `general.name` with `.gguf`, which the builder
-puts in the spec once it reads the pack, and which builds before keys recorded too —
-not the name of the file on disk.
+**Existing substrates** carry a spec text (`LegacySpec`: arch, repo, filename) and a
+`Tokenizer` hash but no key. On first open the host compares what can be compared —
+arch, repo, filename and the tokenizer hash against the running model. If they match,
+it writes the full key and opens (`Adopted`); if not, it refuses as above. From then on
+the key decides. This is the check running once against the older record, not a second
+format reader. It can only see what the spec records: a change confined to what it
+leaves out — revision, tensor overrides, adapters, gate donor — passes this one
+adoption. The filename on both sides is the checkpoint's own name — its GGUF
+`general.name` with `.gguf`, which the builder puts in the spec once it reads the pack,
+and which builds before keys recorded too — not the name of the file on disk.
 
 **The check comes before the store is rewritten.** A substrate written before record
 identities is adopted by its first writable open (`docs/replicated_substrate.md` §6.2),
@@ -783,15 +809,14 @@ A daemon moved to a different model needs a substrate written by that model: a n
 on any new workspace), a new `--data` for npcd. The conversations, memories and NPC
 state in the old substrate stay where they are, readable by the old model.
 
-Carrying a substrate across a model change — regenerating its KV from its stored
-text — is a later design; nothing here precludes it. The key added in §4.1 is the
-identity it would need.
+**Not built:** carrying a substrate across a model change — regenerating its KV from
+its stored text. The key of §4.1 is the identity it would need.
 
 ### 4.4 Where it lives
 
 | Piece | Location |
 |---|---|
-| `ModelKey`, `ModelIdentity`, the GGUF fingerprint, `WeightFiles`, `rope_key` | `candle-conversation/src/models/identity/` (`key.rs`, `fingerprint.rs`, `weight_files.rs`, `rope_key.rs`) |
+| `ModelKey`, `ModelIdentity`, `RecordedModel`, `file_digest`, `WeightFiles`, `rope_key` | `candle-conversation/src/models/identity/` (`key.rs`, `fingerprint.rs`, `weight_files.rs`, `rope_key.rs`) |
 | The binding decision and `BoundSubstrate` | `candle-conversation/src/persistence/model_binding.rs` |
 | The check before weights | each tenant's own load: `ModelBuilder::bind_substrate`, before `engine_from_prepared` loads a weight; for an attaching tenant, `ModelBuilder::attach_to` checks the model against the engine's before it binds. A refused start costs the identity read — seconds — and no model load. (npcd replays its character store from the substrate at its start, before its load binds it: a cheap read, and a refused bind still stops the start.) |
 
@@ -810,7 +835,8 @@ pub const MODEL: Model = Model::Qwen38_FlashNext;
 
 It is Qwen3.8-Flash-Next (`candle-conversation/src/models/qwen38_flash_next.rs`), arch `Qwen4Exp`: a `Q8_0`
 trunk prepared on each machine, with the routed experts at the card's rung — `Q3_KO`
-under 64 GiB, `Q4_KO` above. It runs on every machine in the fleet — the expert cache
+under 64 GiB, `Q4_KO` from 64 to under 86 GiB, and the source's own `Q8_0` from 86 GiB
+(`candle_transformers::models::quant_ladder`). It runs on every machine in the fleet — the expert cache
 streams what VRAM cannot hold.
 
 **A rung is not another model.** Every rung is built from the same release, so the
@@ -850,31 +876,30 @@ pub struct Capabilities {
 (A minimum context was in the first draft. Neither tenant has one to declare — the
 model's context is far past what either asks — so it is not a field until one does.)
 
-- **zend:** single-token `<tool_call>`, `<think>`, `</think>`; the Qwen3.5 dialect.
-  Today only the think tokens are fatal (`session.rs:1323-1334`); a `<tool_call>`
-  that is not one token compiles an empty tool registry with a warning
-  (`engine.rs:1660-1665`), so zend would run with no tools.
-- **npcd:** the same three tokens, checked together (`engine/mind.rs:353-362`) — but
-  its callers log the failure and fall back to free decoding (`:527-565`); the
-  Qwen3.5 dialect, which its stencils and prompts assume (`engine/act.rs:338`,
-  `engine/mind.rs:855`).
+- **zend** (`zend::tenant::requires`): single-token `<tool_call>`, `<think>`,
+  `</think>`; the Qwen3.5 dialect.
+- **npcd** (`npcd::tenant::requires`): the same three tokens and the same dialect,
+  which its stencils and prompts are written for.
 
 Each tenant's are checked against the engine's model when it takes its engine from
-the slot (§3.2), and a lack refuses the start with the tenant's name and every missing
-capability. Today both pass; the check exists so a future change of `MODEL` fails at
-start, where before it degraded both daemons quietly.
+the slot (§3.2) — `Capabilities::check` encodes each token and compares the dialect —
+and a lack refuses the start with the tenant's name and every missing capability. Both
+pass under the prescribed model; the check exists so a future change of `MODEL` fails
+at start, where a `<tool_call>` that is not one token would otherwise compile an empty
+tool registry and run with no tools.
 
 ### 5.3 What changing to the fine-tune costs zend
 
-zend's live substrate (`D:\prog\substrate`) was written by Flash-Next, so under the
-binding rule it refuses to open with the fine-tune. zend starts on a new substrate:
+Going back to the fine-tune is the reverse of the move §5.1 records. zend's substrate
+is written by Flash-Next, so under the binding rule it refuses to open with the
+fine-tune, and zend starts on a new substrate:
 
 - the ingest layers (`repo_map`, `code_reading`, the analyses) rebuild from source on
   first start, as on any new workspace;
 - the chat history in the old substrate stays where it is, readable by Flash-Next.
 
-On the 72 GB card zend also trades Flash-Next's quality for the fine-tune's. Its
-throughput moves both ways (forward gates on this card, 2026-10-10,
+On the 72 GB card (BlackWorld) zend would also trade Flash-Next's quality for the
+fine-tune's. Its throughput moves both ways (forward gates on this card, 2026-10-10,
 `docs/results/sweep_rtx_pro_5000_72gb_2026-10-10_post_merge.md`):
 
 | | Flash-Next | the fine-tune (Precision) |
@@ -902,8 +927,8 @@ Each phase lands green on its own and is useful on its own.
 | 3 | **Host + tenants, one server** (§3.1, §3.3, §3.4, §3.7) | the `host` crate; the common code of §3.7 moved into it; `zend`, `npcd` and `motherd` built from the workspace, the first two running through `host::run([tenant])` on the host's `web::Builder` — tenant APIs merged, UIs by host name, `/common/` once | every existing zend and npcd test; the GUI harness; `cargo build -p zend`, `-p npcd`, `-p motherd` each green alone; unit: a path two tenants register refuses to start; `/` serves zend's UI for `code.tokera.com` and a bare IP and npcd's for `bot.tokera.com`; a file rewritten in a content directory is served changed on the next request and changes `build`, with the process untouched; a missing content directory refuses to start; an npcd turn's thinking mode is the one npcd chose, under the core's `thinking(true)`; a live restart of each |
 | 4 | **Shared endpoints** (§3.5) | the overlaps served once as their superset; one identity rule, one role table, host accounts; both UIs on the chosen field meanings | unit per endpoint with raw expected bodies — both tenants' sections present, shared parts once, `timeline` a string, signed-out `/v1/me` a 200; `/ws/logs` neither drops nor repeats a line across replay; a header from a non-gateway peer is not believed. GUI: zend's status overlay, substrate page and perf page; npcd's console sign-in, substrate, tools and system pages |
 | 5 | **The prescribed model** (§5) | `host::MODEL` for every tenant; zend's ladder and `--model` removed; the fine-tune in `PRESETS` | unit: `MODEL` passes both tenants' capabilities; a capability `MODEL` lacks is refused with the tenant's name. Live: zend on a new substrate under the prescribed model — ingest rebuilds, chat works |
-| 6 | **zend and npcd equal** (§3.6) | priority by band alone, whichever tenant | unit: two tenants' `Low` sequences do not pause each other; either tenant's `High` pauses both tenants' `Low`, and the pause lifts at `COOLDOWN`; an npcd decode throttles a zend ingest prompt by its band's ratio, and a zend section chunk yields to an npcd dialogue |
-| 7 | **`motherd` on `.5`** | `motherd` deployed: both daemons in one process on `:8081` / `:8444`; npcd's mind and data on `.5`; the gateway points `bot.tokera.com` at `:8444` beside `code.tokera.com`. npcd's substrate was written by the AntiLoop + StyleTune fine-tune, which the host no longer prescribes (§5.1), so it refuses at open, before anything in it is rewritten (§4.2), and npcd starts `motherd` on a new `--data`. The new one is written under the engine's RoPE schedule, which both tenants share (§4.1) | live: both GUIs through the gateway, both on the LAN, a refused start when a substrate's model is swapped |
+| 6 | **zend and npcd equal** (§3.6) | priority by band alone, whichever tenant | unit: two tenants' `Low` sequences do not throttle each other; one tenant's dialogue throttles the other tenant's ingest prompt by its band's ratio while both ingests keep advancing, and a section chunk yields to the other tenant's dialogue |
+| 7 | **`motherd` on BlackWorld** | `motherd` deployed: both daemons in one process on `:8081` / `:8444`; npcd's mind and data on BlackWorld. npcd's substrate was written by the AntiLoop + StyleTune fine-tune, which the host no longer prescribes (§5.1), so it refuses at open, before anything in it is rewritten (§4.2), and npcd starts `motherd` on a new `--data`. The new one is written under the engine's RoPE schedule, which both tenants share (§4.1). *Replaced design:* the gateway first pointed `bot.tokera.com` at `:8444` beside `code.tokera.com`; `web/web.yaml` now keeps one upstream per site (§3.4) | live: both GUIs through the gateway, both on the LAN, a refused start when a substrate's model is swapped |
 
 Phase 1 is worth doing first and on its own: it closes a live corruption path in both
 daemons regardless of whether the host is built.

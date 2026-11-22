@@ -785,9 +785,8 @@ fn cold_to_warm_skips_a_retired_turn() {
 ///
 /// This is the production quantize path with the format forced, and it is now
 /// the *only* way to change what a chunk's bands are: a slot move is
-/// byte-verbatim (`docs/archived/arena_unification.md` principle 8), so the old
-/// "re-point every GID into an arena of the target format" trick no longer
-/// exists. Going through the real kernel also makes these fixtures exercise
+/// byte-verbatim (an arena is a run of untyped byte slots), so there is no
+/// way to re-point a GID into an arena of the target format. Going through the real kernel also makes these fixtures exercise
 /// the path production takes.
 fn compress_sealed_to(
     backing: &ChunkedKvBacking,
@@ -831,7 +830,7 @@ fn make_backings_f16(device: &Device, head_dim: usize) -> Vec<ChunkedKvBacking> 
 /// The seeding helpers used to write F16 and then re-point every GID into an
 /// arena of the target format. That is no longer expressible, and was never
 /// quite honest: a slot move is byte-verbatim and does not convert
-/// (`docs/archived/arena_unification.md` principle 8). Configuring the backing produces
+/// (an arena is a run of untyped byte slots). Configuring the backing produces
 /// chunks genuinely tagged with the target format, which is what the cold-load
 /// round-trip is actually about.
 fn make_backings_in_format(

@@ -8,8 +8,9 @@ for. Each boot retires their conversations on every member
 (`zend/src/layers/removed.rs`). They remain the examples below; the engine is
 kept, for per-file units and for layers per day (`unit: day`). The code is
 `zend/src/layers/`, the declarations are the `ingest:` blocks in
-`zend/src/prompts/projection.yaml`, and the design they come from is
-`docs/coding_assistant.md` §"Trunk Session — Phased Parallel Analysis".
+`zend/src/prompts/projection.yaml`, and the design they come from is the
+archived original Zen Code design, `docs/archived/coding_assistant.md`
+§"Trunk Session — Phased Parallel Analysis".
 
 ## Declaring a layer
 

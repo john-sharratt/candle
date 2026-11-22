@@ -26,8 +26,7 @@ pub trait ManagedBatchedModel {
     /// Widest prefill this model will run in one forward, in tokens.
     ///
     /// The smallest of three unrelated ceilings
-    /// (`docs/archived/elastic_vram_partition.md` §7: `R = min(8192, transient-fits,
-    /// KV-fits)`):
+    /// (`R = min(8192, transient-fits, KV-fits)`):
     ///
     /// * `MAX_PREFILL_TOKENS` — where GPU compute saturates. Above it a wider
     ///   forward costs the same per token, so slicing is free.
@@ -790,7 +789,7 @@ pub trait ManagedBatchedModel {
     /// Arm `seq`'s span of `len` tokens at absolute position `at` for a capture
     /// of its recurrent scan inputs, or for a replay that takes the span's
     /// advanced recurrent state from a record's rows
-    /// (`docs/archived/recurrent_reply_calibration.md`). The wave that runs exactly that
+    /// (`docs/deltanet_timeline.md` §14). The wave that runs exactly that
     /// span honours it.
     ///
     /// `false` for a model with no recurrent layers, where a span has no such

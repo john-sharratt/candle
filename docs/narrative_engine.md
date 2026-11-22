@@ -1,6 +1,6 @@
 # Roleplay Engine (RPE) — Design Document
 **Status:** Draft v0.7  
-**Model Target:** Qwen3-30B-MoE (non-thinking mode, narrative turns)  
+**Model Target:** Qwen3-30B-MoE (the converter is recommended non-thinking; the narrator's mode is the caller's `SequenceConfig`)  
 **Crate:** Internal Candle crate — not a standalone binary (the `narrator` module of `candle-conversation`, `candle-conversation/src/narrator/`)
 
 ---
@@ -24,19 +24,19 @@ Player Input (chat app)          NPC Character LLM (prose output)
        \                              │
         ▼                             ▼
 ┌─────────────────┐         ┌───────────────────────┐
-│  parse_turn()   │         │  text_to_inputs()      │  waypoint mode,
-│  + SessionConfig│         │  author: None          │  NPC prose → Vec<NarratorInput>
+│  parse_turn()   │         │  text_to_inputs()      │  ConverterMode::Response,
+│  + SessionConfig│         │  (response mode)       │  NPC prose → 1–3 say/act entries
 └────────┬────────┘         └──────────┬────────────┘
          │ Vec<NarratorInput>                  │ Vec<NarratorInput>
-         │                            │ + NPC prose verbatim
+         │                            │
          ▼                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  Conversation (KV cache)                                         │
-│  [system]                                                        │
+│  [system]      prompts/guide_narrate.md                          │
 │  [user]      turn 1 player inputs JSON          ┐ real turns    │
 │  [assistant] narrative 1                        ┘               │
-│  [user]      NPC LLM output as Vec<NarratorInput> JSON  ┐ synthetic     │
-│  [assistant] NPC LLM prose verbatim             ┘ exchange      │
+│  [user]      NPC response as Vec<NarratorInput> JSON ┐ real turn │
+│  [assistant] narrator's own prose of it              ┘          │
 │  [user]      turn 2 player inputs JSON          ┐ real turns    │
 │  [assistant] narrative 2                        ┘               │
 │  [user]      turn N inputs JSON   ← appended here               │
@@ -44,7 +44,7 @@ Player Input (chat app)          NPC Character LLM (prose output)
                              │
                              ▼
                     ┌──────────────────┐
-                    │  Inference Stack  │  Qwen3-30B-MoE, non-thinking mode
+                    │  Inference Stack  │  Qwen3-30B-MoE
                     └────────┬─────────┘
                              │ narrative prose
                              ▼
@@ -299,94 +299,72 @@ All `character` fields are resolved to concrete names by `parse_turn`. The JSON 
 
 ## 4. NPC LLM Handoff
 
-The narrator does not directly observe or interact with the NPC character LLM. Instead, the engine serialises NPC LLM output into the narrator's conversation history as a **synthetic exchange** — a fabricated user/assistant pair that the narrator treats as a completed prior turn.
+The narrator does not directly observe or interact with the NPC character LLM. The engine reduces the NPC's response to compact inputs and the narrator narrates them itself, as an ordinary turn.
 
-### 4.1 Synthetic Exchange Pattern
+### 4.1 Response Handoff (as built)
 
-When the NPC LLM produces a prose response, the engine:
+`NarratorEngine::insert_character_response_streaming` (`candle-conversation/src/narrator/engine.rs`) takes the NPC's prose and:
 
-1. Passes the prose to `text_to_inputs(prose, None, max_attempts)` — waypoint mode, no author.
-2. Serialises the resulting `Vec<NarratorInput>` as a JSON array → the **synthetic user message**.
-3. Takes the NPC LLM's original prose verbatim → the **synthetic assistant message**.
-4. Appends both to the narrator conversation in order before the next real player turn.
+1. Converts it with `text_to_inputs_streaming(char_text, ConverterMode::Response(persona), 3, ...)`. The response prompt (`prompts/narrator_response.md`) keeps only externally observable speech and action, as `say` and `act` entries, one to three in all, with first-person references resolved to the character's name.
+2. Runs the narrator on those inputs through `NarratorEngine::next` — a real inference turn. The user message is the `Vec<NarratorInput>` JSON; the assistant message is the narrator's own prose, in second person.
+3. Returns that prose to the caller, which may show or discard it.
 
 ```
 [user]      [{ "type": "act", "character": "Voss", "action": "slaps Bob" }]
 [assistant] Voss's hand moves faster than Bob can react. The slap lands
-            hard — the sound of it fills the room.
+            hard — the sound of it fills the room.     ← narrator-generated
 ```
 
-The narrator sees a completed exchange. It knows Voss slapped Bob because it is in the conversation history as something it already narrated. When the next player turn arrives, the narrator continues naturally without re-narrating that event.
+Every assistant turn in the history is therefore narrator output in the narrator's voice, and every user turn is a structured `Vec<NarratorInput>`. The converter does the structural work (what mechanically occurred); the narrator does the prose.
+
+> **Replaced design.** The first design appended a *synthetic exchange*: the converted inputs as the user message and the NPC's own prose, verbatim, as the assistant message, with no narrator inference. It was dropped because storing raw first-person character prose as the narrator's assistant output taught the narrator that it generates first-person dialogue, and after a few turns the context was contaminated and the output corrupted (the comment on `insert_character_response_streaming` records this).
 
 ### 4.2 Serialisation Order
 
-Player inputs, NPC LLM outputs, and engine `cue` overrides are all serialised in event order — no distinction is made by input source. The engine is responsible for ordering them correctly within a turn before they reach the narrator. A typical turn sequence:
+Player inputs, NPC response inputs, and `cue` overrides are all serialised in event order — no distinction is made by input source. Ordering within a turn is the caller's job. A typical turn sequence:
 
 ```
 1. NPC LLM produces prose response to prior player action
-2. Engine converts NPC prose → synthetic exchange, appends to conversation  
-3. Engine collects player's next input from chat app
-4. Engine applies any cue overrides
-5. All player inputs serialised as Vec<NarratorInput> JSON → real user turn appended
-6. Narrator inference runs
+2. insert_character_response_streaming converts it and runs a narrator turn
+3. The caller collects the player's next input from the chat app
+4. The caller applies any cue overrides
+5. All player inputs serialised as Vec<NarratorInput> JSON → user turn; narrator inference runs
 ```
-
-### 4.3 Why This Works
-
-The narrator never double-narrates. NPC actions are injected as already-narrated history. The narrator's next generation picks up from that established context and continues forward. The conversation history is always consistent — every assistant turn is either genuine narrator output or verbatim NPC LLM prose, and the corresponding user turn is always the structured `Vec<NarratorInput>` that describes what happened.
-
-The `text_to_inputs` converter is doing real structural work here — it extracts what mechanically occurred from the NPC's prose so the narrator has a clean JSON description of events, while the NPC's own prose becomes the canonical narration of those events.
 
 ---
 
-## 5. Turn Assembler
+## 5. Turn Serialisation and Window
 
-The Turn Assembler is the only component between `parse_turn` and the conversation. It has two responsibilities:
+There is no separate Turn Assembler component. `NarratorEngine::next` (`narrator/engine.rs`) serialises the inputs with `serde_json::to_string(&inputs)` and sends the result as the next user turn. No prose construction, no merging, no templates, no character resolution: by then every field is already concrete.
 
-**Sliding window management** — before appending the new user turn, checks the conversation length against `SessionConfig.max_turns`. If the cap is exceeded, the oldest turn pair (user + assistant) is dropped. The system prompt and the world/scene initialisation message are never dropped.
+**Sliding window.** `NarratorEngine::new` fixes the window at **4 turns**: it sets `context_window_turns = 4` on the sequence config and `set_max_turns(4)` on the conversation tree. The value is hard-coded, not read from `SessionConfig.max_turns` (§7), which is a caller-side setting the engine does not consult.
 
-**Serialisation** — `serde_json::to_string(&inputs)` produces the user message content. No prose construction, no merging, no templates, no character resolution. By the time `Vec<NarratorInput>` reaches the Turn Assembler, all fields are already concrete.
+> **Replaced design.** The first design had a Turn Assembler that dropped the oldest user/assistant pair once the conversation exceeded `SessionConfig.max_turns` (default 7), never dropping the system prompt or the world/scene message. The engine instead owns a fixed 4-turn window.
 
 ---
 
 ## 6. System Prompt
 
-The system prompt is set once at session initialisation and never changes. It is generic and world-agnostic — world and scene details are given in the first user message at conversation start.
+The system prompt is the file `candle-conversation/src/prompts/guide_narrate.md`, returned by `narrate_system_prompt()` (`narrator/converter.rs`) and handed to `engine.new_conversation` by `NarratorEngine::new`. It is set once and never changes. It is generic and world-agnostic.
 
-### 6.1 Narrator Role
+### 6.1 Narrator Role (as built)
 
-```
-You are a Narrative Engine for a collaborative story. Your role is to
-narrate — not to author. You do not decide what characters do or say.
-You only narrate what you are explicitly given.
+The prompt tells the narrator it is the narrator of a collaborative story that receives a JSON array of Input objects each turn and renders them as prose **addressed to the protagonist in second person present tense**. It defines the five types (`say`, `act`, `scene`, `cue`, `beat`) as in §3.2, and its rules are:
 
-Each turn you receive a JSON array of inputs. Each input has a "type":
+- **Length:** no more than 3 sentences; stop at the third sentence-ending mark.
+- **Fidelity:** every person, object and action named across the inputs must appear; nothing is replaced, omitted or abstracted.
+- **Name clarity:** full character names on first mention; pronouns only after the name has appeared.
+- **Tone:** match the tone the inputs imply; add no tension or drama they do not contain.
+- Do not tell the protagonist what to feel, think or do.
+- **Dialogue** is quoted verbatim but always framed by a speech tag, never emitted as a bare sentence.
+- No meta-reference to the input format; no headings, timestamps or labels.
+- The prompt ends with one worked good/bad example (fidelity).
 
-  "say"   — a character speaks. Render as dialogue in your narrative.
-  "act"   — a character performs an action. Narrate it.
-  "scene" — a stage direction describing the environment. Incorporate it.
-  "cue"   — a forced character action. Narrate it as happening. The character
-            does not resist, deliberate, or refuse. It happens.
-  "beat"  — a steering hint for this turn only. Use it to guide the direction
-            of your narrative without stating it explicitly. Do not narrate
-            the beat itself.
-
-Narrate only what is described in the inputs for this turn. Do not invent
-actions, dialogue, or decisions for any character beyond what is given.
-Do not have any character speak, act, or react unless they appear in the
-inputs. Characters not present in the inputs are absent from your narration.
-
-Narrate all inputs together as a single cohesive scene continuation.
-Write in present tense, third person, 2–6 sentences unless a major
-transition warrants more.
-
-You have memory of recent turns in this conversation.
-Do not contradict anything established in prior turns.
-```
+> **Replaced design.** The first prompt was third person, 2–6 sentences, and told the narrator to narrate only what the inputs give and to leave absent characters out. The built prompt is second person, at most 3 sentences, and its fidelity rule requires every named element to appear.
 
 ### 6.2 World and Scene Initialisation
 
-The first user message in the conversation is not a turn — it is the world and scene setup. It is plain prose or structured description authored by the caller:
+A caller may open the conversation with a world and scene setup message; `NarratorEngine::new` does not send one, so any such message is the caller's. It is plain prose or structured description authored by the caller:
 
 ```
 World: [name], [tone], [era].
@@ -414,9 +392,8 @@ pub struct SessionConfig {
     /// Default target for `cue` with no --character.
     /// Update when the model switches primary characters across a scene transition.
     pub persona: String,
-    /// Maximum number of turns retained in the conversation window.
-    /// When exceeded, the oldest turn pair (user + assistant) is dropped.
-    /// The system prompt and scene init message are never dropped.
+    /// Maximum number of turns a caller retains in its window. Enforced by
+    /// the caller; `NarratorEngine` uses its own fixed window of 4 (§5).
     /// Default: 7
     pub max_turns: usize,
 }
@@ -488,7 +465,7 @@ pub fn text_to_inputs(
 
 ### 9.2 System Prompts
 
-Two system prompts are defined. The waypoint prompt is a constant. The author prompt is a template with `{author}` interpolated at call time.
+Three converter prompts are built: waypoint (a constant), author (template, `{author}`) and response (template, `{character}`; §4.1). The files under `candle-conversation/src/prompts/` are the source of truth; the texts below are the shared core. The built files add to it: an explicit list of unnamed-referent phrases that map to `"unknown"`; a fixed list of cue signal words ("reluctantly", "has no choice", "forced to", "compelled to", "can't resist", ...) that always mean `cue`, with `cue` required to carry an `action`; names preserved exactly as written; every array element must be an object (never a bare string); and double quotes inside string values must be escaped. The author prompt also forces first-person physical actions to `act` for the author, gives each third-party actor its own entry, and treats bare spoken words as a `say` by the author.
 
 #### Waypoint System Prompt (author: None)
 
@@ -670,7 +647,7 @@ We have to get out of here, I tell her.
 
 ### 9.5 Notes
 
-- Two system prompts are selected at call time based on `author`. Both are static except the author prompt which has `{author}` interpolated before the call. This keeps schema and context in the same high-attention position.
-- The converter uses non-thinking mode. This is a structured extraction task — reasoning tokens add latency with no benefit.
+- The system prompt is selected at call time from `ConverterMode`; the author and response prompts have their placeholder interpolated before the call. This keeps schema and context in the same high-attention position.
+- The converter's `SequenceConfig` is the caller's; the doc comment on `text_to_inputs` recommends non-thinking mode for production and `SamplingConfig::argmax()` in tests. This is a structured extraction task — reasoning tokens add latency with no benefit.
 - Third-person conversion ("I take" → "takes") is instructed in the system prompt. The model handles this reliably for simple first-person prose. Complex constructions ("I had been thinking about whether to...") may need the caller to pre-normalise the text if precision matters.
 - The converter never produces `character: null`. Unnamed or unidentifiable characters are represented as `"unknown"`. The `parse_turn` path resolves defaults at parse time via `SessionConfig`, so null never appears anywhere in the `Input` JSON schema.

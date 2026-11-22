@@ -480,8 +480,8 @@ impl<'w> LiveQTensor<'w> {
     ///
     /// The quantized counterpart of [`crate::Tensor::from_leased_cuda_ptr`],
     /// and the way a KV arena slot is handed to the block quantize /
-    /// dequantize paths now that an arena is a run of untyped byte slots
-    /// (`docs/archived/arena_unification.md` principle 8). Writes through the returned
+    /// dequantize paths now that an arena is a run of untyped byte slots.
+    /// Writes through the returned
     /// tensor land in the caller's memory — which is the point: cloning a
     /// `QTensor` is a device-to-device **copy**, so "clone the arena and write
     /// to it" silently writes to a throwaway.

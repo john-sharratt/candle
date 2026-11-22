@@ -39,8 +39,7 @@ pub(in super::super) fn band_ptr(
 
 /// The GGML layout a band's bytes are in, from the band's own tag.
 ///
-/// The arena cannot answer this — it holds whatever fits its slots
-/// (`docs/archived/arena_unification.md` principle 8) — so the tag is the only source,
+/// The arena cannot answer this — it holds whatever fits its slots — so the tag is the only source,
 /// and it is the same byte the substrate persisted.
 #[cfg(feature = "cuda")]
 pub(in super::super) fn band_ggml_dtype(tag: u8) -> Result<GgmlDType> {

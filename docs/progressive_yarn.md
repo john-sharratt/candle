@@ -156,7 +156,10 @@ refused rather than double-scaled.
 ## 3. What the audits found
 
 §3 records the tree as it was audited, before the build: the findings are why
-§4–§8 exist, and the `file:line` references here are to the audited tree. Each
+§4–§8 exist, and the `file:line` references here are to the audited tree, whose
+single-file kernels (`int8_decode_kernel.cuh`, `int8_decode_tile_kernel.cuh`,
+`paged_prefill_int8_kernel.cuh`) have since been split into folders of headers
+and whose line numbers have moved. Each
 fault below has since been fixed — Hermes' Llama3 scaling is read from
 `rope_freqs.weight`, the linear factor `infer_rope_scaling_factor` computed is
 gone, and the index is stored un-rotated (§7).
@@ -294,7 +297,7 @@ computes a RoPE frequency.
 | `llama3.rs` | `rope_freqs.weight` → frequencies, and the published-parameter formula (moved from `llama_rope.rs`) that the tests check the tensor against |
 | `declared.rs` | `DeclaredScaling`: what a GQA file's metadata declares, its frequencies and its schedule (§2) |
 | `preset.rs` | `RopePreset`: where a checkpoint's schedule comes from (§2) |
-| `select.rs` | `rung_for(schedule, reach)`, `rung_of(ceilings, reach)` and the ceiling refusal (§8) |
+| `select.rs` | `RungSelect` (the ceilings a session and its model share), `rung_for(schedule, reach)`, `rung_of(ceilings, reach)` and the ceiling refusal (§8) |
 | `table.rs` | The factored table (§5): CPU builder, CPU lookup mirror, and the QSA step tables (§7.4) |
 | `rungs.rs` | `RopeRungs`: every rung's table uploaded end to end, each rung's `m²`, the host mirror and the launch argument (§6.1) |
 | `factored.rs` | `FactoredRope`: the QSA indexer's view of the rungs plus each rung's step tables (§7.4) |
@@ -350,10 +353,10 @@ The Q sites:
 
 | Path | The single site |
 |---|---|
-| Decode split-KV, stripe, batched-M | `apply_rope_*_f32(q, …, q_rope_pos, …)` (`int8_decode_kernel.cuh:224-231, 1236-1250, 1611-1623`) |
-| Tile decode | `i8_apply_rope(x, q_pos, …)` for the Q rows (`int8_decode_tile_kernel.cuh:2168`), before the Q window scale is taken |
-| Int8 prefill | `i8_apply_rope` for Q (`paged_prefill_int8_kernel.cuh:365-366`), before int8 quantization |
-| Glue | `paged_glue_kernel.cuh:255-259` |
+| Decode split-KV, stripe, batched-M | `apply_rope_*_f32(q, …, q_rope_pos, rope.for_q())` (`paged-decode/int8_decode_kernel/decode_attn.cuh`, `warp_stripe.cuh`, `batched_m_bmma.cuh`) |
+| Tile decode | `i8_apply_rope(x, q_pos, …, rope.for_q())` for the Q rows (`paged-decode/int8_decode_tile_kernel/fused_kernel.cuh`), before the Q window scale is taken |
+| Int8 prefill | `i8_rope_row(x, prefix_len + tok, …, rope.for_q())` for Q (`paged-prefill/paged_prefill_int8_kernel/prefill_kernel.cuh`), before int8 quantization |
+| Glue | `apply_rope_*_f32(q_reg, …, true_pos, rope.for_q())` (`paged-glue/paged_glue_kernel.cuh`) |
 | Float fallback | the per-sequence host planes, built per rung from `RopeRungs::cos_sin`: K's at scale 1, Q's at the rung's `q_scale` (`batched_layer/fallbacks.rs`) |
 | QSA indexer query | `qsa_rope_rows`, one launch over the wave, each row at its sequence's rung with that rung's `m²` (`RotSide::Query`, §7.4). The reference rotates the indexer with the attention's own YaRN cache, `m` included (§12) |
 
@@ -404,25 +407,29 @@ So two tables, `HI[h][i] = (sin, cos)(h·B·ω_i)` and
 DeepSeek-V4's latent kernels already run this format. It is built, bit-exact
 and tested, so it becomes the engine's one RoPE table:
 
-- **Layout** (`latent_common.cuh:216-237`):
+- **Layout** (`rope_lookup` in `paged-latent/latent_common.cuh`):
   - `float2 (sin, cos)`;
   - a **hi block** `[2048][P]`, where row `h` is position `h·2¹⁰`;
   - then a **lo block** `[1024][P]`;
   - frequency innermost;
-  - `rope_table_len = (2048 + 1024)·P·2` f32s (`geometry.rs:119-121`).
+  - `rope_table_len = (2048 + 1024)·P·2` f32s (`Geometry::rope_table_len` in
+    `latent_moe/geometry.rs`, `ROPE_TAB_LEN` in `latent_moe/paged/paged_geometry.rs`).
 - **Reach:** 2²¹ = 2,097,152 positions. Every supported max in §2 is at most
   1,048,576.
-- **Builder** (`latent_rope_table_kernel`, `latent_common.cuh:257-272`):
+- **Builder** (`latent_rope_table_kernel` in `latent_common.cuh`, launched by
+  `build_rope_table` in `paged_geometry.rs`):
   - the angle is reduced in **f64** with `__dmul_rn/__dsub_rn/__dadd_rn`;
   - `pos·ω` is exact in f64, because a 21-bit integer times a 24-bit mantissa
     fits in 53 bits;
   - then a deterministic minimax `sincosf` on [−π/4, π/4], all `_rn`.
-- **Lookup** (`rope_lookup<NF>`, `latent_common.cuh:222-237`): two `float2`
+- **Lookup** (`rope_lookup<NF>`, `latent_common.cuh`): two `float2`
   loads, then `_rn` multiply and add. There is **no contraction**, so the CPU
   mirror can be bit-exact.
-- **Tests:** a CPU mirror of builder and lookup (`paged.rs:2444-2492`), with
-  `rope_table_device_matches_mirror` (`latent_moe/paged/tests_kernel_gates.rs:4195-4246`) checking every entry
-  and a spot-checked lookup.
+- **Tests:** a CPU mirror of builder and lookup (`mirror_sincos`,
+  `table_sincos` in `latent_moe/paged/tests_oracle.rs`), with the ignored GPU
+  test `rope_table_device_matches_mirror`
+  (`latent_moe/paged/tests_kernel_gates.rs`) checking every entry and a
+  spot-checked lookup.
 
 The format's lookup is shared as `candle-kernels/src/rope/rope_table.cuh`
 (`rope_f_lookup`, `rope_cs_at`, `rope_cs_step`, `rope_f_rotate`). The table is
@@ -449,21 +456,22 @@ multiply is one integer operation beside two `float2` loads.
 | Hybrid attention at 1,010,000 | ≈ 986 MiB | 768 KiB |
 | Qwen3 attention (`[max_pos, 128]`) at 131,072 | 64 MiB | **1.5 MiB** (P = 64) |
 | Qwen4Exp indexer (`RopeTables`, cos + sin `[max_pos, 32]`) at 262,144 | 64 MiB | shares the attention rung table |
-| DeepSeek-V4 | 43 layers × 768 KiB = 32 MiB (one table per layer, `latent_moe/wave/mod.rs:370-381`) | **2 × 768 KiB**, one per frequency set |
+| DeepSeek-V4 | 43 layers × 768 KiB = 32 MiB (one table per layer, before `LatentRopeTables` in `latent_moe/rope_tables.rs` shared one per set) | **2 × 768 KiB**, one per frequency set |
 
 **All rungs of a model fit in one allocation of at most 4.5 MiB.** That is three
 rungs of 1.5 MiB, well inside even the 3090's 6 MiB L2.
 
 So every table exists from load:
 
-- no lazy build and no `max_blocks` rebuild (today's caches compare with `==`,
-  `batched_model/` (899-915), `qwen4exp/wave/` (1436));
+- no lazy build and no `max_blocks` rebuild (the per-length `rope_cs` caches of
+  the batched model and the Flash-Next wave are gone);
 - no host loop over hundreds of millions of entries;
 - no upload of hundreds of MB.
 
 **The indexer and attention share one rung table.** The QSA indexer rotates with
-the model's own `θ` and 64-dim rotary width (`qwen4exp/config.rs:229-236`), so its
-frequencies are the attention's.
+the model's own `θ` and 64-dim rotary width (`qwen4exp/config.rs` refuses a
+rotary width wider than the indexer's head width), so its frequencies are the
+attention's.
 
 ### 5.4 Cost and accuracy
 
@@ -539,21 +547,21 @@ struct RopeRungs {
   `rope_offsets` the prefill kernel used to add is gone: positions come from
   the slot's own offsets alone.
 - **Bounds.** A rung ≥ `n_rungs` traps, rather than reading the next table.
-  Positions are bounded as `latent_common.cuh:222-237` already bounds them:
-  `hi` is clamped.
+  Positions are bounded as `rope_lookup` in `latent_common.cuh` already bounds
+  them: `hi` is clamped. (`rope_view` traps on the rung in `rope_table.cuh`.)
 
 ### 6.2 Every launch-wide parameter, and its fix
 
-| # | Launch-wide today | Fix |
+| # | Launch-wide before the build | Fix |
 |---|---|---|
-| 1 | The single `rope_cs` pointer passed to every paged kernel (`paged-decode/api.rs:34, 57, 90, 113`; prefill and glue likewise) | `RopeRungs`, indexed by the sequence's `SlotHeader.rope_rung` (below) |
-| 2 | The single `softmax_scale` (prefill `:731`, glue `:382`, decode `:702/725`, `:1062`, `:1829/1882`, tile `:2154`) | unchanged, and it carries nothing rung-dependent: `m²` goes on Q (§4.2) |
-| 3 | Table row 1 in the tile kernel, hard-coded as `rope_cs + HEAD_DIM` (`int8_decode_tile_kernel.cuh:1261`) | the unit step is `LO[1]` **of the slot's rung table** |
+| 1 | The single `rope_cs` pointer passed to every paged kernel (`paged-decode/api.rs`; prefill and glue likewise) | `RopeRungs`, indexed by the sequence's `SlotHeader.rope_rung` (below) |
+| 2 | The single `softmax_scale` of every paged kernel | unchanged, and it carries nothing rung-dependent: `m²` goes on Q (§4.2) |
+| 3 | Table row 1 in the tile kernel, hard-coded as `rope_cs + HEAD_DIM` | the unit step is `LO[1]` **of the slot's rung table** (`rope_cs_step`) |
 | 4 | The QSA append launch's one table, covering every sequence in the wave | append no longer rotates (§7), so it has no table |
 | 5 | The host QSA query rope's one table, covering every row in the wave | deleted: queries are rotated in the scorer, which is launched per sequence (§7.4) |
 | 6 | The float fallback's one per-wave split, and the per-group host cos/sin behind `BatchedAttentionParams::rope_cos/rope_sin` (non-paged path) | the fallback picks the sequence's rung inside its per-sequence loop; the non-paged cos/sin stay rung 0's, and those paths refuse any row past an unscaled rung 0 (`refuse_rung_past_zero`, §6.3) |
 
-`SlotHeader` (`slot_types.cuh:56-64`) grows from 24 to 32 bytes, with the rung
+`SlotHeader` (`paged-decode/slot_types.cuh`) grows from 24 to 32 bytes, with the rung
 as an explicit field:
 
 ```text
@@ -570,41 +578,47 @@ struct SlotHeader {
 Every attention kernel in §3.3 already loads its sequence's `SlotHeader`
 before it rotates anything:
 
-- decode: `int8_decode_kernel.cuh:122-125, 1166-1169, 1543-1546`;
-- tile: `int8_decode_tile_kernel.cuh:1590-1593`;
-- prefill: `paged_prefill_int8_kernel.cuh:220`;
-- glue: `paged_glue_kernel.cuh:150-152`.
+- decode: `get_slot_header` in `int8_decode_kernel/decode_attn.cuh`,
+  `warp_stripe.cuh` and `batched_m_bmma.cuh`;
+- tile: `int8_decode_tile_kernel/fused_kernel.cuh`;
+- prefill: `paged_prefill_int8_kernel/prefill_kernel.cuh`;
+- glue: `paged_glue_kernel.cuh`.
 
 So the rung comes from the same record as the sequence's positions. A 32-byte
 header is exactly one sector, where the 24-byte stride straddles sectors today.
 
 **Every reader of the header changes stride, not only the ones that rotate:**
 
-- `get_slot_header`'s `slot_idx * 24` (`slot_types.cuh:67-69`);
-- the per-layer header stride on the Rust side (`DecodeHeaders`, the slot
-  serialiser in `slot_state.rs`);
-- the commit kernel (`decode_helpers.cuh:184`);
+- `get_slot_header`'s stride, now `sizeof(SlotHeader)` (`slot_types.cuh`);
+- the per-layer header stride on the Rust side (`n_active * SLOT_HEADER_BYTES`
+  in `batched_inference/decode_metadata.rs`, the slot serialiser in
+  `models/slot_state.rs`);
+- the commit kernel (`decode_helpers.cuh`);
 - **DeepSeek's latent kernels,** which read the same `SlotHeader`:
-  - `latent_decode_kernel.cuh:125`;
-  - `latent_prefill_kernel.cuh:174`;
-  - `latent_common.cuh:318`.
+  - `latent_decode_kernel.cuh`;
+  - `latent_prefill_kernel.cuh`;
+  - `latent_common.cuh`.
 
   They never read `rope_rung`. A latent layer's frequency set is chosen by layer
-  kind (compressing or SWA, `latent_moe/config.rs:118-124`) and passed per
+  kind (compressing or SWA, `LayerKind::compresses` and `compress_rope_theta` / `rope_theta` in `latent_moe/config.rs`) and passed per
   launch, as today, from the two shared tables in §5.3. DeepSeek's serialiser
   writes `rope_rung = 0`.
 
 The stride change is one constant on each side: `sizeof(SlotHeader)` in CUDA,
-and `SLOT_HEADER_BYTES` beside `SlotHeaderHost`, the one Rust writer every
-serialiser uses (`models/slot_header.rs`). CUDA `static_assert`s the size and
+and `SLOT_HEADER_BYTES` (`candle-nn`'s `kv_cache::wave_plan::width`, re-exported
+beside `SlotHeaderHost`, the one Rust writer every serialiser uses,
+`models/slot_header.rs`). CUDA `static_assert`s the size and
 every offset; `slot_header::tests::the_layout_is_the_kernels` pins the Rust
 bytes field by field.
 
-**The rung is chosen by the session.** It holds the model's ceilings
-(`BatchedInferenceSession::set_rope_ceilings`, from
-`ManagedBatchedModel::rope_ceilings`), and every header writer computes
-`rung_of(ceilings, reach)`: `offset + 1` for decode, `offset + q_len` for
-prefill, `kv_len` for glue. A reach past the last ceiling is refused.
+**The rung is chosen by the session.** It holds the model's `RungSelect`
+(`rope_schedule/select.rs`: the ceilings; `BatchedInferenceSession::set_rope_select`
+from `ManagedBatchedModel::rope_select`, and `expect_rope_select` checks the
+model's agrees), and every header writer calls `RungSelect::rung_for(reach)`
+(`rung_of` over the ceilings): `offset + 1` for decode, `offset + q_len` for
+prefill, `kv_len` for glue. A reach past the last ceiling is refused. A model
+whose kernels read no rung holds `RungSelect::unbounded()`, one rung with no
+ceiling.
 
 **Why an explicit field rather than packed bits.** Each candidate the audit
 found means something else somewhere:
@@ -650,7 +664,7 @@ scorer's; that document carries the Q8_0 ones.
 
 This is also the reference's own structure: it caches raw keys and ropes them
 when read (`docs/qwen38_flash_next.md` §12.5). The CPU oracle already works this
-way (`qsa.rs:127-136`), so the device path becomes structurally identical to it.
+way (`qsa.rs`), so the device path becomes structurally identical to it.
 
 **Nothing rotated is ever written:** not a page view, not a tail view, not a
 placement staging.
@@ -672,8 +686,9 @@ placement staging.
 
 ### 7.2 What it costs
 
-- **The scorer is L2-bound today:** 87.8% of peak L2 against 40% compute at 128K
-  and 64 rows (`qsa_score_paged.cu:301-306`).
+- **The scorer is L2-bound:** 87.8% of peak L2 against 40% compute at 128K
+  and 64 rows, measured before the rotation was added (its `TILE_R` comment in
+  `qsa_score_paged.cu` is the L2-dial note).
 - **Rotation needs 32 `(sin, cos)` pairs per candidate.** Read naively, that is
   256 B beside a 512-B key, on the kernel's own bound. §7.4 avoids the read.
 - **Rotation adds arithmetic.** Per rotary pair, forming the rotation (warp term
@@ -683,15 +698,16 @@ placement staging.
     4 × 4 × 128 = 2,048 multiply-adds, so the overhead is about **19%**.
   - At the `(1, 1)` arm they are 4 × 128 = 512, so it is about **75%**. That arm
     is chosen because the grid cannot be filled and it is latency-bound
-    (`:194-197`), which may hide the extra arithmetic. The harness decides.
+    (`QSA_PAGED_LAUNCH`'s fill rule), which may hide the extra arithmetic. The
+    harness decides.
 - **It holds a second `float4` live,** the rotary partner, on a kernel already at
-  its register edge. It uses 64 registers, and at 51 it spilled (`:99-104`).
-- **The live tail moves off cuBLAS, including at prefill width.** Today the
-  tail is scored by a cuBLAS matmul over **every** query row of the span
-  (`indexer/score.rs:875-905`, tiled by `SCORE_TILE_BYTES`). A prefill chunk is
+  its register edge. Unrotated it used 64 registers, and at 51 it spilled.
+- **The live tail moves off cuBLAS, including at prefill width.** Before this
+  the tail was scored by a cuBLAS matmul over **every** query row of the span
+  (`indexer/score.rs`, tiled by `SCORE_TILE_BYTES`). A prefill chunk is
   thousands of rows.
   - The paged scorer puts rows on the grid's y axis and re-reads every key once
-    per row tile (`:301-306`).
+    per row tile (`TILE_R`).
   - At 8,192 rows and 128K depth, that is about 2,000 reads of each key, where a
     GEMM stages a key tile once and reuses it across a large row tile.
   - The decode-shaped arms are not built for this. §7.4 adds an arm that is.
@@ -729,7 +745,7 @@ pos(g) = δ_p + g·ratio,         δ_p = base_p − page_first[p]·ratio   (sign
 
 A thread carries `CPT` candidates, `256` apart. Thread `t` of block `b` holds,
 in slot `s`, candidate `g = b·span + t + 256·s`, plus the grid stride
-(`qsa_score_paged.cu:146, 165`). A warp's lanes are 32 consecutive threads, so
+(`qsa_score_paged.cu`). A warp's lanes are 32 consecutive threads, so
 in every slot they hold 32 consecutive candidates: `g = G + L`, where `G` is the
 slot's warp-first candidate, uniform across the warp, and `L` is the lane. So
 
@@ -770,7 +786,7 @@ at `W` composed with the rotation at `L·ratio`.
   terms are in shared memory.
 
 **The rotary pairs.** The indexer rotates NeoX half-split within its 64-dim
-rotary width (`attention.rs:57-62`). In the channel-blocked layout, pair
+rotary width (`RopeTables` in `qwen35/attention.rs`). In the channel-blocked layout, pair
 `(i, i + 32)` for `i < 32` is channel group `c = i/4` with its partner group
 `c + 8`. So the rotary width is channel groups 0–15, **half of `D = 128`**, and
 the channel loop becomes two loops:
@@ -888,7 +904,7 @@ Each round:
    pass-through half of `D` keeps today's body exactly.
 2. **Re-tune the tile arms.** A second live `float4` and eight rotation values
    move the register budget. Re-measure `(TILE_R, CPT)` and the grid-fill rule
-   (`QSA_PAGED_LAUNCH`, `:374-381`) rather than inherit them.
+   (`QSA_PAGED_LAUNCH`) rather than inherit them.
 3. **Warp-uniform fast path.** Test once per slot per warp whether all 32
    candidates share a page (`__all_sync`). If they do, take the broadcast warp
    term; if not, the per-lane path.
@@ -981,21 +997,22 @@ start. `decode_page` always gave `roped_base = 0`.
   which wedged the first boot of this build on an unwiped substrate in
   "Prefilling tool sections".
 
-### 7.8 Stale comments this work corrects
+### 7.8 Comments this work corrected, and one it did not
 
-- `qsa_index_append.cu:79` cites a gate test `qsa_index_append_matches_host`
-  that does not exist.
-- `qsa_page_place.cu:46-52` says one placement covers every page of every
-  layer. Every caller places one cache or one window. The file's header is
-  rewritten with its reduction to a transpose.
-- `latent_moe/paged/corpus_cache.rs:233-238` says the CorpusCache is roped once. It holds
-  pre-rotation `rope_bf` plus `comp_pos`.
-- `latent_moe/gallery/mod.rs:531` says indexer keys are pre-RoPE. They are stored
-  rotated (`latent_moe/wave/` at 2139, 2595, via `Compressor::pool_and_norm`).
+- `qsa_index_append.cu` names the gate that exists
+  (`stored_rows_are_the_pooled_normed_unrotated_key`).
+- `qsa_page_place.cu`'s header describes the placement as the pure transpose it
+  is, with no rotation.
+- `latent_moe/paged/corpus_cache.rs`'s header says the rope bands are kept before
+  rotation and rotated from the stored positions at read time.
+- **Open item.** `FloatGallery::keys` (`latent_moe/gallery/mod.rs`) is commented
+  "pre-RoPE", but DeepSeek's indexer keys are stored rotated: the wave sweep
+  keeps `icomp` roped (`latent_moe/wave/sweep_wave.rs`, via
+  `Compressor::pool_and_norm` with a rotary cache).
   - DeepSeek's schedule is static, so this cannot bleed.
   - It is outside §7, which covers the Qwen4Exp QSA index; DeepSeek's indexer
     keys remain rotated.
-  - The comment is corrected to say so.
+  - The comment still needs to say so.
 
 ---
 
@@ -1017,7 +1034,7 @@ rung = rung_of(ceilings, offset + input_len)
   for a decode row, `offset + q_len` for a prefill span, the slot's `kv_len` for
   glue.
 - Positions are absolute everywhere a rung is read. The one sliding-window ring
-  (`latent_moe/engine.rs:199-214`) is DeepSeek's latent window, whose schedule is one
+  (the sliding-window ring slid in `latent_moe/engine.rs`) is DeepSeek's latent window, whose schedule is one
   rung per layer kind, so its evicted front never reaches a rung choice.
 
 **Consequences:**

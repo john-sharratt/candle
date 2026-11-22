@@ -26,8 +26,9 @@ append, rotated at read):
 | NOPE bands 0–13 | `[0, 448)` | int8, per-band **component amax** scale | 448 | position-free (never rotate); 7-bit, beats the window's FP8 nope |
 | ROPE bands 14–15 | `[448, 512)` | **BF16** (pre-rotation) | 128 | float, 8-bit mantissa, matches the window tier; no √2 margin, no clip |
 
-Total **576 B/entry** (vs 2048 f32 → 3.6× smaller hot; vs 512 all-int8 → +12.5%
-to buy back the rope precision). No f32 copy of the latent
+Total **576 B/entry** of int8 and BF16 payload (vs 2048 f32 → 3.6× smaller hot; vs 512 all-int8 → +12.5%
+to buy back the rope precision), plus the 14 per-band f32 scales (56 B) = **632 B/entry** stored, and the
+f32 Indexer key (512 B) beside it. No f32 copy of the latent
 is kept: the int8+BF16 two-region cache is the canonical stored form.
 
 Gallery buffers (`FloatGallery`, `latent_moe/gallery/mod.rs`):
@@ -57,13 +58,13 @@ corpus-global PV scale remains, already documented).
    returns `(attn_i8, attn_scale, attn_rope, pos)` compacted, tier-aware.
 3. **Decode** reads the two-region cache (kernel gains `comp_rope`; `comp_i8` is
    nope-only, `comp_scale` is `[G, NOPE_BANDS]`). `CorpusCache` holds the gathered
-   buffers — no per-wave build. Validate paged gate + wave_paris.
+   buffers — no per-wave build. Validate the paged gates + `wave_prefill_then_decode_end_to_end`.
 4. **Prefill** pre-pass reads the two-region cache, dequant → rope → requant into
-   the baked `comp_i8`/`comp_v8`. Validate prefill parity + wave_paris.
+   the baked `comp_i8`/`comp_v8`. Validate prefill parity + `wave_prefill_then_decode_end_to_end`.
 5. **Tier flip.** The int8 two-region
    cache + Indexer `keys` are the HOT tier — GPU-resident below `HOT_ENTRY_CAP`,
    spilling together to CPU RAM past `HOT_ENTRY_CAP` (8192 entries; re-heated per query by `gather_corpus`,
-   ~576 B/entry — 3.5× cheaper than the old f32 pair). `signs`/`pos` stay GPU at
+   ~576 B/entry of latent payload — 3.5× cheaper than the old f32 latent). `signs`/`pos` stay GPU at
    any depth so the BDP scan never touches RAM. This keeps the resident footprint
    bounded at unbounded corpus depth. Validate memory + a large-ingest run.
 
@@ -87,3 +88,10 @@ corpus-global PV scale remains, already documented).
 **Net:** the hot retrieval artifact is the position-free int8+BF16 cache (~576 B/entry vs 2 KB f32); the compressed rope bands match the window tier's BF16 (no √2 int8 margin); decode and prefill share one representation (divergence closed); there is no separate f32 archive.
 
 **Validation:** the `latent_moe::paged` tests (`tests_oracle.rs`: `corpus_cache_two_region_bytes`, `corpus_cache_is_position_free`; `tests_prefill.rs`: prefill↔decode parity), the gallery spill/gather tests (`gallery/tests_selection.rs`, `gallery/tests_gather.rs`), and the wave gates in `latent_moe/wave/tests_prefill.rs` (`wave_prefill_then_decode_end_to_end`, `wave_prefill_state_matches_decode_steps`).
+
+## Open items
+
+- **`latent_moe/footprint.rs` accounts the corpus as an f32 pair** (`CORPUS_DTYPE = F32`, a
+  `(head_dim + index_head_dim) · 4` = 2560 B row) while the gallery stores this two-region cache (632 B)
+  plus f32 keys (512 B) and a sign/position index. `deepseek_kv_footprint` and `ratio_vs_fp16_linear`
+  therefore overstate the resident corpus (`deepseek_batched_paged_attention_plan.md` Open items).

@@ -2,7 +2,7 @@
 
 *The second and third conversations a character runs: what reflection is for, how a dream corpus becomes a character's private inner world, and why the coupling between them is the whole safety argument.*
 
-**Where this stands.** The reflection conversation is built and produces dream briefs: `npcd/src/engine/reflect/mod.rs`, `POST /v1/npc/:nid/reflect`, with both its questions authored in the mind's `projection.yaml` under `reflection:`. The character's own `reflect` act runs it (§3), asynchronously, and is answered with the reflection's first line. The brief is dreamt in a conversation of its own and the dream is written to a per-character `dreams` layer a passage to a turn, each passage signed (§7, `npcd/src/engine/dreams.rs`). Dreams are gathered back by provenance: one passage deep into a turn in the room, three into a reflection (§4). What is not built is the rest of the gather — `relationships`, `beliefs`, the mood — eviction and `LayerHit` (§8), and the authored seed dreams (§9). Each section says so where it applies.
+**Where this stands.** The reflection conversation is built and produces dream briefs: `npcd/src/engine/reflect/mod.rs`, `POST /v1/npc/:nid/reflect`, with both its questions authored in the mind's `projection.yaml` under `reflection:`. The character's own `reflect` act runs it (§3), asynchronously, and is answered with the reflection's first line. The brief is dreamt in a conversation of its own and the dream is written to a per-character `dreams` layer a passage to a turn, each passage signed (§7, `npcd/src/engine/dreams.rs`). Dreams are gathered back by provenance: one passage deep into a turn in the room, three into a reflection (§4). A character's dreams are capped by oldest-first forgetting at 64 (`dreams::KEEP_DREAMS`, §8), which replaced the 500-dream least-recently-surfaced reaper originally designed. **Not built, plan of record:** the `LayerHit` record type and recency eviction (§8), the authored seed dreams (§9), and the leakage detector (§10). **Not built either:** a reflection gathering `relationships`, `beliefs` or the mood (§3, §4): the mind-schema frame pins the anchor, who, setting, building, voice and acting members and gathers the character's dreams, and no code scopes the other layers into it. Each section says so where it applies.
 
 ---
 
@@ -26,7 +26,7 @@ Reflection cannot live in the main conversation. That is the first thing this de
 
 ### The layer that was never built
 
-`npc_mind_design.md` describes a mind as many layers on one substrate. Today exactly one of them is a live conversation: the action layer. `life`, `relationships`, `beliefs`, `agency` exist as *ingested corpora* — 1,510 authored units, read-only, never added to. Nothing in the running system writes a new thought.
+`npc_mind_design.md` describes a mind as many layers on one substrate. Today exactly one of them is a live conversation: the action layer. `life`, `relationships`, `beliefs`, `agency` existed as *ingested corpora* — authored units, read-only, never added to. Nothing in the running system wrote a new thought. (Since then a life story writes beliefs, relationships and agency, `ingest::LIFE_DERIVED`; this section describes the state the reflection design answered.)
 
 So a character has a biography and no inner life. This design adds the two conversations that give it one, and does it without adding arbitration, a scheduler, or a reconciliation step.
 
@@ -47,9 +47,9 @@ So a character has a biography and no inner life. This design adds the two conve
    ACTIVE CONVERSATION                REFLECTION (one-shot)           DREAM LAYER
    (the action layer)                 transient, no tools             (persistent, per-NPC)
 
-   reflect(situation,       ──────▶   mood-framed prompt
-           inner_thoughts,            + situation + inner thought
-           feeling)                   + DEEP gather of dreams  ◀──────  500 dreams
+   reflect(situation,       ──────▶   schema prompt (anchor, who, ...)
+           inner_thoughts,            + situation + inner thought + feeling
+           feeling)                   + DEEP gather of dreams  ◀──────  dreams (newest 64 kept)
         │                                      │                          ▲
         │                                      ▼                          │
         │                             Q1: prose — what you                │
@@ -89,9 +89,9 @@ Three rules govern every arrow:
 
 **`situation` is what makes the reflection conversation possible.** That conversation has no perception, no window, and no world state; it is framed on the character's own description of its circumstances. Asking the character to say where it is is not redundancy — it is the handoff, and it is also a cheap diagnostic, because a character that describes its situation wrongly is a character whose perception is broken in a way nothing else surfaces. The route takes it too, optionally; a caller that gives none gets the world's percept of the room the body stands in (`Runtime::situation_of`), which is the only situation there is to be had without the character's own.
 
-**The mood set here frames both conversations.** The active conversation's system prompt and the reflection's system prompt select the same mood from the mind's authored `moods/` collection. That is what makes the reflection sound like the character rather than like a narrator.
+**The mood is recorded, and does not frame either conversation.** The `feeling` of an accepted reflect is handed to the mood sink (`Runtime::note_feeling` → `set_mood_sink`), which writes it to the character's record (`mood`, `npcs/wire.rs`). `identity::Installed::selection_for` pins the anchor, who, setting, building, voice and acting members of a turn and no mood member, `Persona` carries no mood field, and nothing else selects one into the active conversation's prompt or the reflection's. The design below this line — the same mood selected from the mind's `moods/` collection into both prompts, so the reflection sounds like the character rather than like a narrator — is **Not built: plan of record.**
 
-**Unbuilt, and for the same reason as everything else in §4.** A mood is selected out of a collection by the gather, and the reflection does not gather — `Persona` carries no mood field at all, so the reflection's frame has none. The `feeling` the route accepts is recorded and never reaches the model, which is why varying it across eight test inputs changed nothing about the output. It is one line once the reflection gathers, and impossible before.
+**What does reach the reflection is the character's own words.** Question one opens with the situation, then `A moment ago, going through your head — <inner thoughts>`, then `What you feel is <feeling>.` (`reflect/mod.rs`), so the model reads the feeling the character named as text. An earlier version of this section said the route's `feeling` never reached the model; it reaches it as that sentence.
 
 ### What the frame is missing, and why it shows
 
@@ -101,9 +101,9 @@ The same root cause costs the reflection three other things, and together they e
 
 That last part is §7's invented-colleague failure arriving one layer earlier than the design expected it — not in the dream, but in the reflection that seeds it.
 
-**`relationships` and `beliefs` do not arrive either**, for the same reason, though they are listed as gathered in §4's table.
+**`relationships` and `beliefs` do not arrive in a reflection, though they are listed as gathered in §4's table.** `Persona` now carries `beliefs` and `relationships` (`engine/persona.rs` fills them from the character's record), and `prompt::build_for` renders them as sections — but `build_for` is the frame of a daemon **with no mind**. A daemon with a mind opens the reflection on the schema's own prompt (`Reflect::run`: `p.prompt`), and nothing there reads `Persona.beliefs` or `Persona.relationships`; the turn's selection (`identity::selection_for`) names no belief or relationship member, and the only layer `Reflect::run` scopes is the dream group (`dreams::scoped`). Whether turns on the `beliefs` or `relationships` layers reach a reflection's gather at all depends on layer ranks in the mind repository's `projection.yaml`, which is not in this tree; and `beliefs`, `relationships` and `agency` are written by a life story, not ingested from disk (`ingest::LIFE_DERIVED`). A reflection under a mind therefore does not deliberately read them. Gathering them (a scope per layer, as dreams have) is **Not built: plan of record.**
 
-So what a reflection still does not read is everything gathered: `relationships`, `beliefs`, the mood. The briefs are well-formed without them, which is what makes the gap easy to miss.
+So what a reflection still does not read is everything gathered but dreams: `relationships`, `beliefs`, the mood. The briefs are well-formed without them, which is what makes the gap easy to miss.
 
 **The Makers are a special case the design had not considered.** A Maker does not live in the world it is attached to — it writes it, from a vault outside that world's time, and what it files is what happens out there. `prompt.rs` renders the world under a hardcoded heading, `The world you live in:`, which is true for Kaelor and false for a Maker. The correction is authored in the personality anchor (`personalities/maker.yaml`), which is the right home for it because the relationship is a property of the personality rather than of the world — every character in `battle-cities` shares one `setting` and they do not share a relationship to it. That fix only lands once the anchor reaches the frame, which is the paragraph above. The heading itself stays wrong for a Maker until either the anchor overrides it in practice or the personality declares its relation and the prompt forks on it.
 
@@ -146,9 +146,9 @@ The reflection gathers from a **restricted set of layers**:
 
 Excluding mission and goals is the load-bearing one, and it comes from `theory_of_the_mind.md` §6: *"Self does not plan or direct. It integrates and reports."* A reflection that can see the mission list produces a plan; a reflection that cannot produces an inclination. The difference between those two is the difference between the healthy register and the leaked one — see §6 below.
 
-**Dreams are scoped per conversation; the other layers are not yet.** A turn group can now be scoped after construction to the turns carrying one of a set of tags, and given its own depth (`Builder::set_group_tags`, `Builder::set_group_selection`); projection and the belief scan both apply the tags (`ContentResolver::turn_carries`), except on a projection's own target group, which is its own timeline already.
+**Status of the table above: only the dreams row is built.** The `relationships` and `beliefs` rows (exposed) and the `memory`, mission/goals and world rows (hidden) describe the intended scope; no code scopes any layer but dreams for a reflection (§3). **Dreams are scoped per conversation; the other layers are not yet.** A turn group can now be scoped after construction to the turns carrying one of a set of tags, and given its own depth (`Builder::set_group_tags`, `Builder::set_group_selection`); projection and the belief scan both apply the tags (`ContentResolver::turn_carries`), except on a projection's own target group, which is its own timeline already.
 
-**Seen because it is ranked, not because of where it is declared.** A projection sees the layers beneath its target, and "beneath" was declaration order — so a layer appended to a live schema sat on top, invisible to every conversation, and appending is the only way to add one: declaration order also fixes every layer's and group's id, and those are persisted with every timeline. Layers now carry a `rank` (default: declaration index), and a projection sees every layer of lower rank. `dreams` is declared last and ranked `-1`, beneath `interaction`. Found live: dreams were kept and no turn was ever reminded of one. The dream group is closed when the schema is built and opened per conversation to one character's own tag — three lines deep for a turn in the room, eight for a reflection. `relationships` and `beliefs` are still not gathered into a reflection, and nothing hides mission and goals from it, because nothing gathers those either.
+**Seen because it is ranked, not because of where it is declared.** A projection sees the layers beneath its target, and "beneath" was declaration order — so a layer appended to a live schema sat on top, invisible to every conversation, and appending is the only way to add one: declaration order also fixes every layer's and group's id, and those are persisted with every timeline. Layers now carry a `rank` (default: declaration index), and a projection sees every layer of lower rank. In the mind repository's `projection.yaml` (not in this tree, so the value is not confirmed here) `dreams` is declared last and ranked `-1`, beneath `interaction`. Found live: dreams were kept and no turn was ever reminded of one. The dream group is closed when the schema is built and opened per conversation to one character's own tag — three lines deep for a turn in the room, eight for a reflection. `relationships` and `beliefs` are still not gathered into a reflection, and nothing hides mission and goals from it, because nothing gathers those either.
 
 `sampled_axes` now comes from the corpus when the act reflects: a random eight of the character's own dream assumptions, read from each dream's conversation metadata (`dreams::sample_axes`). The route still takes them from its caller.
 
@@ -302,9 +302,9 @@ This line is a plan block in Part VIII's sense — *"a standing high-salience bl
 
 **The dream does not read the identity the character works under** (`identity::Installed::dreaming_selection_for`). It pins who the character is and its world, but not its personality's anchor and not the building it stands in. In the anchor's place it pins the personality's **inner life**: an `inner_life` block in the personality file, saying who the character was before its work and what it misses, wants and fears. A personality without one gets a generic inner life. The anchor is the self the character works as. For a Keeper that self has no body, attends, never decides and keeps watch. Measured on 2026-10-08, with the anchor and the vault pinned, dreams imagined freely for about half their length and then came back to the dreamer standing still: "and I am here", "waiting for nothing". The ending rule in the stance alone did not hold them. A dream needs something to want, and the working anchor gives it only something to do. The dream is then **kept** in a second conversation, on the `dreams` layer: one prefilled turn per passage of the story, each with `Something you dreamt:` as its user half and its projection persisted as its signature, all of them in one turn group so each passage is signed against the character's memory and masked from the passages around it.
 
-**A passage is a paragraph** (`dreams::passages`): the story's own paragraph breaks, with a one-sentence paragraph joined to the next and a paragraph over five sentences broken into near-even runs, at most twelve to a dream. It used to be a sentence, and that was too small a unit to recall: "It is closed." surfacing in a room on its own is noise, a dream kept that way read as verse, and the single stock images it recalled ("the silence is not empty", "a color that has no name") were fed back into every later brief. A decode under 150 words is not kept at all (`dreams::DREAM_MIN_WORDS`) — kept dreams of one line ("I turn.") were a decode stopping almost at once, not a dream. Two conversations because the one that decodes carries the brief as its prompt, and a brief in the corpus would be recalled as though it were the dream. `relationships` is not yet in the frame, so the invented-colleague risk below is still open.
+**A passage is a paragraph** (`dreams::passages`): the story's own paragraph breaks, with a one-sentence paragraph joined to the next and a paragraph over five sentences broken into near-even runs, at most twelve to a dream. It used to be a sentence, and that was too small a unit to recall: "It is closed." surfacing in a room on its own is noise, a dream kept that way read as verse, and the single stock images it recalled ("the silence is not empty", "a color that has no name") were fed back into every later brief. A decode under 150 words is not kept at all (`dreams::DREAM_MIN_WORDS`) — kept dreams of one line ("I turn.") were a decode stopping almost at once, not a dream. Two conversations because the one that decodes carries the brief as its prompt, and a brief in the corpus would be recalled as though it were the dream. `relationships` is not in the dream's frame (`identity::dreaming_selection_for` pins the inner life, who and the setting), so the invented-colleague risk below is still open.
 
-The design as first written:
+The design as first written, of which the `relationships` frame is **Not built: plan of record**:
 
 A dream is decoded in its own **brand-new conversation on the dream layer**, seeded by Q2's answer, framed on **characters, environment, and `relationships`** — no acts, no mission, no perception.
 
@@ -371,13 +371,19 @@ Three properties fall out that nobody has to build:
 - **Recurring dreams.** An unresolved thing keeps matching, keeps surfacing, and keeps its place near the head of the order.
 - **Dreams are tellable.** They are real content in the substrate, so a character can describe one to another character and the thing described exists.
 
-### Eviction, and why recency
+### Eviction, as built
+
+A character keeps its newest **64** dreams (`dreams::KEEP_DREAMS`). After a dream is kept (`dreams::keep`) `forget_oldest` finds the character's dream conversations by metadata (`dream.of`), orders them by creation order within their group, and tombstones the oldest beyond 64 — oldest first, by when the dream was made, with no record of how often or how lately it surfaced. The reason is on the constant: every kept dream stays a conversation with its K/V on disk, and two characters had kept about seven hundred each. Recall and the axis sample draw on what remains. Authored and generated dreams are not distinguished (there are no authored dreams, §9).
+
+> **Replaced design.** The design below capped the corpus at 500 and reaped the *least recently surfaced*, with a `LayerHit` record per surfacing giving the order. The code took a simpler rule, oldest-created first at 64, and the `LayerHit` record and its five tombstone sites were never written. The rest of this section is **Not built: plan of record**, kept for the reasoning on recency versus frequency; if it is built, it replaces `forget_oldest`.
+
+### Eviction, and why recency (plan of record)
 
 The corpus is capped at **500 generated dreams per NPC**. Adding one evicts one, and the reaper takes the **least recently surfaced**.
 
 Recency and not frequency, deliberately. A most-surfaced reaper freezes the corpus on the character's history; a least-recently-surfaced reaper lets a dream that mattered last month and has gone quiet age out, so the population tracks the character's life as it is now.
 
-### `LayerHit`
+### `LayerHit` (Not built: plan of record)
 
 Surfacing is recorded by a new, very small record type:
 
@@ -403,6 +409,8 @@ Per-row supersession is what makes this affordable: a hit costs ~24 bytes rather
 
 ## 9. Authored dreams
 
+> **Status: Not built. Plan of record.** No code ingests a `layers/dreams/<personality>/` folder or marks any dream as authored or exempt from eviction: `forget_oldest` (§8) treats every kept dream alike, and `ingest::sources` reads only layers that declare an `ingest_unit:` in the schema (the mind's schema is in the mind repository, so whether its `dreams` layer declares one is not confirmed here). The ingest this section relies on, one dream per file, would use the per-document path of `engine/ingest.rs` (§12 of `docs/npcd_worlds_and_layers.md` describes it).
+
 A character with no dreams reflects and gathers nothing, so the corpus needs a floor. Dreams are seeded from the mind, following the convention the mind folder already uses for per-character layer content:
 
 ```
@@ -413,7 +421,7 @@ layers/dreams/ash-the-drifter/          # NEW — founding inner life
     *.md                                # one dream per file
 ```
 
-The identity file already states the principle: *"Biography is NOT here; it is layer content under `layers/memory/<id>/`, retrieved by provenance when the moment calls for it."* Dreams follow memory exactly. They are per-character by construction, which is what the privacy rule in §7 requires, and they ingest through the same path as the existing 1,510 corpus units — with the `content_sha256` resume cache meaning they ingest once and never again.
+The identity file already states the principle: *"Biography is NOT here; it is layer content under `layers/memory/<id>/`, retrieved by provenance when the moment calls for it."* Dreams follow memory exactly. They are per-character by construction, which is what the privacy rule in §7 requires, and they would ingest through the same path as the other layer documents (`engine/ingest.rs`) — with the content-hash ledger (`engine/watcher.rs`) meaning they ingest once and never again.
 
 **Authored dreams are exempt from eviction.** They are what the character *is*; a reaper that eats them leaves a character who has drifted into being whatever it happened to dream last month. So there are two classes:
 
@@ -437,11 +445,15 @@ The cap is on the generated pool. Authored dreams sit outside it and are permane
 | the reaper eats the character | authored dreams disappearing from the corpus | authored class is exempt |
 | ghost counters after a sweep | the map holds timelines that no longer exist | the five-site tombstone rule in §8 |
 
-The first row is the detector `theory_of_the_mind.md` §9 and `npc_mind_design.md` Part X-bis both specify and neither codebase has built. It should be built **before** this design lands, not after: there is currently a live, reproducible runaway to calibrate it against, and a threshold chosen against a real failure is worth more than one guessed at while three new streams are already writing.
+**Status of the guards.** Built: the one-line, no-connective, experiential-frame checks on the committed line (§6), the transient reflection (§4), and the dream's own structural checks (§5, §7). **Not built, plan of record:** the n-gram / mutual-information detector of the first row, which `theory_of_the_mind.md` §9 and `npc_mind_design.md` Part X-bis both specify; no code in `npcd` computes an overlap between the reflect-response stream and the main stream (the only `overlap` hits in `npcd/src` are unrelated to leakage). The zero-count `LayerHit`, the authored-class exemption and the five-site tombstone rule belong to the unbuilt §8 and §9.
+
+The first row is the detector `theory_of_the_mind.md` §9 and `npc_mind_design.md` Part X-bis both specify. It should be built **before** the remaining design lands, not after: a threshold chosen against a real failure is worth more than one guessed at while three new streams are already writing.
 
 ---
 
 ## 11. What this costs
+
+The disk and retention figures below are written against the **500-dream plan** of §8. As built, a character keeps at most 64 dreams (`dreams::KEEP_DREAMS`), so the table's rows scale by about an eighth; the per-dream figure (~6 MB, measured) is unchanged.
 
 **Decode.** A reflect becomes **seven synchronous decodes** — Q1, the loosed turn after it, Q2, and the four-pass repair review in §5 — plus a retry on the runs where the brief came out malformed and a refusal round wherever an answer came back the wrong length, and then one asynchronous dream. It is currently the cheapest act in the game: a pause and three fields. It becomes by a distance the most expensive.
 
@@ -457,7 +469,7 @@ Measured on Qwen3.5-9B with the two-decode shape, a reflection took 11–27s wal
 | the current cast of three | 1,500 | ~9 GB |
 | a cast of sixteen | 8,000 | ~50 GB |
 
-That is on top of the ~99 GB authored corpus. The cap is doing real work and 500 should be chosen against this table, not as a round number.
+The size of the authored corpus beside it is a figure from the mind repository and is not confirmed here. The cap is doing real work and should be chosen against this table, not as a round number; the built cap is 64.
 
 **Retention.** The dream layer has two reapers and they must not fight: `keep_turns: 160` retires *turns* below a horizon, while dream eviction tombstones *whole conversations*. A dream is a one-turn conversation, so it can never trip the turn horizon — eviction owns the dream layer outright. Stated here so a later change does not make them collide.
 
@@ -478,10 +490,11 @@ That is on top of the ~99 GB authored corpus. The cap is doing real work and 500
 | **a toolless system-prompt frame** | **built** — the `stance` selector's `reflecting` and `dreaming` branches, §4 |
 | **the reflect act answered asynchronously** | **built** — `Runtime::spawn_reflection`, §3 |
 | **the dream conversation and the dream layer** | **built** — `engine::dreams`, a passage to a turn, each signed, §7 |
-| **`LayerHit` record type** | **new** — §8, five integration sites |
-| **eviction at 500** | **new** — §8; nothing reaps the corpus yet |
-| **authored seed dreams** | **new** — §9; `layers/dreams/maker/seed-dreams.md` is one file of 105 briefs and the per-entry ingest it asks for does not exist, so the layer declares no `ingest_unit` and is not read from disk |
-| **the leakage detector** | **new** — §10, and should land first |
+| **`LayerHit` record type** | **Not built** — §8, plan of record, five integration sites |
+| **eviction** | **built differently** — oldest-created first at 64 (`dreams::forget_oldest`), §8; the 500-dream least-recently-surfaced reaper is Not built |
+| **authored seed dreams** | **Not built** — §9; no code ingests `layers/dreams/<personality>/`, so no dream is authored or exempt from eviction |
+| **a reflection gathering `relationships`, `beliefs`, the mood** | **Not built** — §3, §4; plan of record |
+| **the leakage detector** | **Not built** — §10, and should land first |
 
 ---
 
@@ -490,8 +503,7 @@ That is on top of the ~99 GB authored corpus. The cap is doing real work and 500
 **Taken.**
 
 - Reflections are discarded. No Self continuity; dreams are the memory.
-- Eviction is by recency of surfacing, not frequency.
-- The generated cap is 500; authored dreams sit outside it.
+- ~~Eviction is by recency of surfacing, not frequency; the generated cap is 500; authored dreams sit outside it.~~ **Superseded by the code**: eviction is oldest-created first at 64 (§8); recency eviction, the 500 cap and authored dreams are Not built, plan of record.
 - Dreams are private to one character.
 - The reflect response is one committed line in the first person. Checked, not hoped for — §6.
 

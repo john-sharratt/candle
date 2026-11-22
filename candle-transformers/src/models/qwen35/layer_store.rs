@@ -6,8 +6,8 @@
 //!
 //! # Why there are two variants and why that is not a fits/does-not-fit branch
 //!
-//! `docs/archived/qwen38_layer_streaming.md` §7 forbids deciding at load time whether a
-//! model fits and taking a different path if it does not — that is two code
+//! Deciding at load time whether a
+//! model fits and taking a different path if it does not is refused — that is two code
 //! paths for one job, and the streaming half would be exercised only by the
 //! largest checkpoint anyone happens to run. **Every dense checkpoint streams**,
 //! and "it fits" is the degenerate case of one mechanism: capacity equals the

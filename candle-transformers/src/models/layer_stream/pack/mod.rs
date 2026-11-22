@@ -22,8 +22,7 @@
 //!
 //! Everything residency does follows from it: eviction is a bookkeeping change
 //! with no copy and no destination to find, the warm tier needs no eviction
-//! policy, and "where do I load this from" is a total function. See
-//! `docs/archived/qwen38_layer_streaming.md` §4.
+//! policy, and "where do I load this from" is a total function.
 //!
 //! # Records are sector-aligned because the reads bypass the page cache
 //!

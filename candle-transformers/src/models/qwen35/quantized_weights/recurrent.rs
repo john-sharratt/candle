@@ -21,7 +21,7 @@ use super::*;
 /// # Why the cache arrives as a callback
 ///
 /// The expert cache's capacity is `(span − reserve) / slot_bytes`, and the span
-/// is *measured*, not declared (`docs/archived/elastic_vram_partition.md` §4). That
+/// is *measured*, not declared. That
 /// measurement is only meaningful once every dense tensor is resident: taken
 /// before, it reads the model's own weights as free ground and hands the expert
 /// side room the KV side is about to need. Qwen3-MoE hit exactly this and its
@@ -49,8 +49,8 @@ use super::*;
 /// One case overrides it. A **routed** checkpoint keeps its layers resident
 /// whatever the caller asked, because its weight is in the experts — which
 /// `expert_lre` already streams — and its per-layer projections are a rounding
-/// error beside them. That is not the fits/does-not-fit branch
-/// `docs/archived/qwen38_layer_streaming.md` §7 forbids: every *dense* checkpoint
+/// error beside them. That is not a fits/does-not-fit branch
+/// at load, which is refused: every *dense* checkpoint
 /// streams, and "it fits" is the degenerate case where nothing is ever evicted.
 /// The DeltaNet gate projections, which a conversion may not quantize.
 ///

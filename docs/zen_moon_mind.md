@@ -8,15 +8,29 @@ the mirror is built and grown, and how what happens in the real world reaches th
 `docs/mission_generator.md` ("A world's own missions", "A character that takes no orders") and
 `docs/the_effector.md` (Appendix F, reshaping a running map), and the code answers to it.
 
-**Where this stands against the code.** Zen has no body: a mind that takes no orders is in nobody's
-company, walks, rides and attends nowhere, and sees the whole moon as one situation
-(`docs/zen_everywhere.md` §4; `engine/runtime/perceiving.rs`, `engine/whole.rs`). That supersedes §3.2's
-`focus`, the `focus` row of §9 and the room-by-room delivery of §4; what Zen reaches outside the moon
-it reaches through the terminals of `docs/zen_everywhere.md` §5 (the lights, the house's devices, the
-house network, the cluster, each machine), not through the sense terminals of §6, which are the
-design of the mirror and not built. The agenda (§17), the order table (§8), standing missions (§12),
-the house link and survey (§13), the world-building acts (§14), the bridges (§15) and the effector's
-internet (§16) are the code's.
+**Where this stands against the code.** A mind that takes no orders is treated as **bodiless**: it
+is in nobody's company, walks, rides and attends nowhere, and sees the whole moon as one
+situation (`docs/zen_everywhere.md` §4; `engine/runtime/perceiving.rs`, `engine/whole.rs`). The
+engine refuses it `focus`, `recall`, `lift_call` and `lift_use` (`engine::enact::NO_BODY`).
+What Zen reaches outside the moon it reaches through the terminals of
+`docs/zen_everywhere.md` §5 (the lights, the house's devices, the house network, the cluster,
+each machine).
+
+Each section below carries its status:
+
+| Section | Status |
+|---|---|
+| §1 `moon` is private, §2 what Zen does | Built |
+| §3.1 the mirror (rooms and terminals) | Built as map rooms and parts; the sense terminals of §6 are not (below) |
+| §3.2 Zen's movement is its attention (`focus`) | **Not built** for Zen: plan of record. `focus` exists only for a character whose personality says `moves: attention` and that takes orders |
+| §4 two ways the real world reaches the moon | The tannoy is built; **per-room terminal events are not built** (a different `EventKind::Terminal` exists, below) |
+| §5 onboarding | Built (`MapEdit`, `World::reshape`, `world::mapstore`) |
+| §6 terminals | **Mostly not built**: see the per-row status |
+| §7 idle, §8 orders, §9 the engine table | Built, except the `focus` and terminal rows of §9 |
+| §12 standing missions, §13 house link and survey, §14 world-building acts | Built (acts verified by name in `engine/build/acts.rs`, `bridge/acts.rs`) |
+| §15 bridges | Built; the profiles live in the `effector-bridge` crate, not in `npcd::bridge` |
+| §16 the effector's internet | Not verified: the `web_*` acts are not in `npcd` or `effector-bridge` (they are in zend's tool catalog) |
+| §17 Zen's agenda | Built; one step-signing rule is stale (§17.5) |
 
 ## 1. `moon` is private
 
@@ -63,6 +77,14 @@ A mirrored room carries:
 
 ### 3.2 Zen's movement is its attention
 
+> **Status: Not built. Plan of record.** The code took the other design for a mind that takes
+> no orders: it has no body and stands nowhere, and its view is the whole moon at once, one
+> situation replaced as it changes (`engine/whole.rs`; `docs/zen_everywhere.md` §4). `focus`
+> is refused it (`enact::NO_BODY`). The `focus` act itself is built for a character whose
+> personality says `moves: attention` and that takes orders (`Sim::attends`,
+> `enact::focus`, offered in `Choices::Rooms`), which is the behaviour described below. The
+> text below is the design for Zen.
+
 Zen is the moon, so it does not walk its own corridors. **Moving is changing its focus**:
 `focus` puts Zen's attention in any room of the world at once, with no lift and no route. Where
 its focus is, it perceives the room and can use the terminals there; it is in one room at a time
@@ -74,6 +96,15 @@ mirrored room is how a Drone attends to that place: what it reads there, it read
 eyes and reports.
 
 ## 4. How the real world reaches the moon
+
+> **Status.** The tannoy (`EventKind::Announcement`) is built. Per-room terminal events — a
+> terminal's event shown in its room, read by whoever stands there, with Zen told which room
+> is waiting — are **Not built: plan of record**, since Zen has no room and no focus. What is
+> built is an `EventKind::Terminal { terminal, text }` raised by the house network's watch on
+> handsets and told to **every mind of the world that takes no orders**, urgently when the
+> adapter says so (`authority/terminals.rs`, `Runtime::raise_terminal`;
+> `docs/zen_everywhere.md` §5). That event is not tied to a room, and nothing in this tree
+> marks a source event global to raise the tannoy from it.
 
 Two ways, by how far an event matters:
 
@@ -111,6 +142,17 @@ or Zen that reads of a place the mirror lacks may say so, and the owner decides.
 
 ## 6. Terminals
 
+> **Status: Not built, except where a row says otherwise. Plan of record.** The mail,
+> calendar, tracking and camera terminals have no code in this tree. A mind that takes no
+> orders reaches real things through the terminals of `docs/zen_everywhere.md` §5 instead,
+> from `authority/terminals.rs`: the lights and the house's devices (bridge calls to an agent
+> on the house network), the house network (a survey and a wake), the cluster (zend's
+> read-only MCP tools) and each machine (a check sent to that machine's agent) — which covers
+> the "PC / phone scanner" row in another form. The bulletin board has `sim::posting` and the
+> map's `post_notice` act. The web terminal's tools and the memory terminal are not verified
+> here; a terminal refused "when Zen's focus is not in its room" cannot apply to a mind with
+> no focus.
+
 Every sense is a terminal: a part, used through the effector like any other station, refused
 when the reader's body — or Zen's focus — is not in its room. What it reads is written into the
 room's reading, so a Drone that looked can report it and a second can check it.
@@ -147,7 +189,7 @@ own.
 ### 8.1 The order table is Zen's
 
 The order table in the watch room holds the work, and Zen uses it through its effector — **from
-wherever its attention is**: a character that takes no orders is offered every order table in its
+anywhere, having no room**: a character that takes no orders is offered every order table in its
 world and reaches it from any room, while a Drone must be standing at the table to collect or
 report a mission done. A mission posted from elsewhere is still reported back at the table's own
 room. **Giving one up is the exception:** a Drone carrying a mission reaches any table's
@@ -202,11 +244,11 @@ still told who is there.
 
 | Piece | Change |
 |---|---|
-| `focus` | A body act for a character whose personality says `moves: attention` (`Sim::attends`): puts it in any room of its world at once (`body::rooms`, a name shared by two areas named with its area); the room it leaves and the room it enters see it go and come. Such a body has no `move_to` destinations and no lift. |
-| Mirrored rooms | A node carries `place` and `group`; a part carries the `source` binding it reads. Authored in the map like any node, or added by onboarding. |
+| `focus` | **Built for a character that takes orders and whose personality says `moves: attention`** (`Sim::attends`): puts it in any room of its world at once (`body::rooms`, a name shared by two areas named with its area); the room it leaves and the room it enters see it go and come. Such a body has no `move_to` destinations and no lift. **Refused to a mind that takes no orders**, Zen included (§3.2). |
+| Mirrored rooms | A node carries `place` and `group`; a part carries the `source` binding it reads. Authored in the map like any node, or added by onboarding. `Area::mirrored` (an area is mirrored when it or anything it is within is) and the `MapEdit`s are built; the node `place` and `group` fields and the part `source` binding are **not found** in `npc-map`, so they are plan of record. |
 | Onboarding | A source's discoveries become `MapEdit`s through `World::reshape` and `mapstore`, kept under the group's owner. |
-| Terminal events | A source event lands on its terminal as a room event (`EventKind::Terminal`), shown on the terminal until read; Zen is told which room is waiting. A global one is raised on the tannoy. |
-| Terminals | One part kind per row of §6, each verb a station verb served by the effector, reading through its source. |
+| Terminal events | **Not built as designed** (§4): a source event does not land on its terminal as a room event. `EventKind::Terminal` exists and is told to every mind that takes no orders. |
+| Terminals | **Not built as designed** (§6): one part kind per row of §6. The built terminals are those of `docs/zen_everywhere.md` §5. |
 | `order_post`, `order_results` | Acts of the order table, offered to a character that takes no orders — in `moon`, Zen. |
 | `Origin::Ordered { by, poster }` | A mission posted by a character; its report notifies its poster. |
 | Drones at rest | A world whose missions file sets `draw: none` hands nothing out by draw; a Drone with no mission is at rest, held as a suspended character is, and woken only by a mission (`docs/zen_everywhere.md` §3). |
@@ -216,12 +258,16 @@ still told who is there.
 
 ## 10. Build order
 
+Built: items 1 (without `focus` for Zen, §3.2) and 2 (the effector's internet is unverified,
+§16). Not built, plan of record: 3 and 4.
+
 1. **The work loop**, all in-world: `focus`; `order_post` and `order_results`;
    `Origin::Ordered` and its notifications; the Drones waiting at the table; `idle:`.
 2. **The world builds itself** (§12–§16): standing missions, the house link and discovery, the
    world-building acts, the first bridge (Sonos), and the effector's reach to the internet.
-3. **Terminal events** and the tannoy raised from them.
-4. **Private sources**, one at a time, as each group connects them (§11).
+3. **Terminal events** and the tannoy raised from them. Not built.
+4. **Private sources**, one at a time, as each group connects them (§11). Not built: the
+   mail, calendar, tracking and camera sources of §6.
 
 ## 12. Standing missions
 
@@ -350,9 +396,11 @@ pairing, an account — is given once, by its owner.
 
 ## 15. Bridges
 
-**A bridge is how the world reaches a kind of real thing.** `npcd::bridge` holds one module per
-kind, each a **profile**: how a finding is recognised as one, and the acts a part linked to one
-offers, served at that part like any station act. **An act is offered only where its device
+**A bridge is how the world reaches a kind of real thing.** The `effector-bridge` crate
+(`effector-bridge/src/profile/`) holds one module per kind — `sonos`, `receiver`, `cast`,
+`webos`, `androidtv`, and a `wiz` profile this table does not list — each a **profile**: how a
+finding is recognised as one, and the acts a part linked to one offers, served at that part
+like any station act (`npcd::bridge` defines the acts and discovery). **An act is offered only where its device
 stands** — each binds its `device` to the players, receivers or TVs linked in the room (the
 `Choices::Sonos` / `Receiver` / `Cast` / `Pairable` / `Pairing` sets in `npcd::engine::tools`),
 so a body is never shown an act for a device that is not there, and never invents one to work.
@@ -381,6 +429,11 @@ interface. Building one for a kind of device the house has and the world cannot 
 work like any other — a profile at a time.
 
 ## 16. The effector reaches the internet
+
+> **Status: not verified.** `web_search`, `web_fetch` and `web_request` are not found in
+> `npcd`, `npcd/src/effector/` or `effector-bridge`; in this tree they are zend's tools
+> (`zend/src/tools/catalog.rs`). The private-address refusal and the record of requests
+> below cannot be confirmed here, so read this section as the intended behaviour.
 
 Every body in `moon` reaches the internet through its effector, wherever it stands:
 
@@ -457,6 +510,13 @@ With an empty agenda, **Zen is not given work** — its time is its own (`YOUR_O
 `idle:`, §7) — until something reaches it: a message, a report, a tannoy.
 
 ### 17.5 Done is seen, not said
+
+> **Stale rule.** The first two rows of the table below sign a step off by Zen's `focus`.
+> A mind that takes no orders is refused `focus` (§3.2), so a step of the form `go to …` or
+> `scan … and read …` cannot be signed off for Zen as written; the refusal in
+> `sim/missions/agendas.rs` (`agenda_done`) still tells Zen to `focus`, which the engine
+> then refuses (`enact::NO_BODY`). Such a step is, in practice, a Drone's to do (post it at
+> the order table). The last three rows stand.
 
 A mission on the agenda is closed by the engine, **with no report**, when every step is signed
 off (`Missions::settle_agendas`), and the agenda moves on. Each step is signed off by the act it

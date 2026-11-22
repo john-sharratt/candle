@@ -197,11 +197,15 @@ pub(super) struct DecodeState {
     pub(super) belief: PriorBelief,
     /// Full prefill token sequence pinned into the slot at this
     /// turn's submit:
-    /// `[user_msg][user_end][assistant_start]` — the assistant header is clean,
-    /// and the `insert_turn` path additionally prepends `/no_think`.  The think
-    /// block is NEVER baked here: a suppressed turn decodes its own empty
-    /// `<think></think>` and a thinking turn opens its own `<think>`, so either
-    /// way it lands in `generated_tokens`.
+    /// `[user_msg][user_end][assistant_start][lead]` — the lead is whatever the
+    /// dialect's thinking suppression puts at the head of the assistant turn
+    /// (`Dialect::thinking_suppression`, `turn_submitter::assistant_lead`) and
+    /// the turn's assistant prefill. A thinking turn's lead holds no think block:
+    /// it opens its own `<think>`, which lands in `generated_tokens`. A suppressed
+    /// turn on a family with a `/no_think` switch carries the switch in the user
+    /// opener and decodes its own empty block; on a family without one (Qwen3.5,
+    /// Qwen3.8) the lead IS the closed block, so it is baked here, as the
+    /// template renders `enable_thinking=false`.
     /// Concatenated with `generated_tokens` and `post_decode_tokens`
     /// at seal time to form `TurnContent::token_ids` — the
     /// cross-process replay sequence persisted to the redo log.

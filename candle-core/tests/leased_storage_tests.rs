@@ -11,8 +11,6 @@
 //! The *lifetime* half of the contract needs no runtime test: `LiveQTensor<'w>`
 //! is covariant in `'w`, and the `compile_fail` doctests on that type prove a
 //! lease cannot widen to `'static` or reach [`candle_core::quantized::QMatMul`].
-//!
-//! See `docs/archived/arena_unification.md` §3.7.
 #![cfg(feature = "cuda")]
 
 use candle_core::cuda_backend::cudarc::driver::DevicePtr;

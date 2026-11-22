@@ -1,34 +1,36 @@
 # Stencil Tree — Schema-Guided Constrained Decoding
 
-**Status:** implemented (this doc captures the original design; see *As-built
-deltas* below for what shipped beyond it).
-**Module:** `candle-conversation/src/stencil/` (self-contained, 100% unit-tested
-without a GPU; only the final end-to-end check needs hardware).
-**Touch-points:** a sample-stage mask hook in `batched_sampler/allow_list.rs` and a
-per-sequence step hook in `scheduler/decode/`. Nothing in the KV cache,
-projection, or persistence paths changes.
+**Status:** built. The sections below describe the code as it is; where the
+shipped design differs from the first sketch, the section says so in a
+*Replaced design* note. Pieces designed and not built are marked **Not built**
+(§10, §13, §14.3, §14.5).
+**Module:** `candle-conversation/src/stencil/` (the walker, compiler, masks and
+simulator run without a GPU; the live-tokenizer checks in
+`zend/tests/stencil_tool_call.rs` need a cached tokenizer).
+**Touch-points:** a sample-stage mask hook in `batched_sampler/allow_list.rs`, a
+per-sequence step hook in `scheduler/decode/` (`commit.rs`, `stencil.rs`), and the
+wave rows of `scheduler/stencil_wave.rs`. Nothing in the KV cache, projection, or
+persistence paths changes.
 **Primary use case:** forcing a tool call to a tool catalog's exact names and
 JSON schema.
 
-### As-built deltas (beyond this design)
+### As-built deltas (beyond the first sketch)
 
 - **A fourth front-end, D — think steering** (`think.rs`, `ThinkMode`,
   `compile_think_tree`): per-effort-dial trees that steer the `<think>` block with
   an opener + continuation phrases, closed via token-closed `suppress_close` spans.
-  §8's "three front-ends" is now four.
+  §8 has four front-ends.
 - **`StencilDriver`** (`driver/mod.rs`): the online walker the scheduler drives one
   decoded token at a time (the `Healed` signal contract with `scheduler/decode/`).
 - **`TriggerRegistry`** (`trigger.rs`): token → tree dispatch with atomic,
   idempotent `with_trigger` / `without_trigger`, used to swap the per-turn think
   tree onto the tool-call base.
-- The `§15` module layout and the `§13` public-API sketch predate `driver/mod.rs`,
-  `think.rs`, and `trigger.rs` and are illustrative, not exhaustive. Signatures
-  as built: `compile(&TreeSpec, &dyn Vocab)` takes a `Vocab`, not a tokenizer;
-  `compile_tool_call_tree(&[ToolSpec], &ToolCallEnvelope)` returns a `TreeSpec`
-  (the dialect is the envelope); `TreeSpec::from_yaml(yaml)` is the YAML front-end;
-  the builder's `build()` returns a `TreeSpec`; the simulator is `simulate` with
-  `Oracle` and `SimRun` (`sim.rs`), not a `StencilSimulator` type; and
-  `StencilAction::FreeDecode` carries `{ close_boost, opens_value }`.
+- Signatures as built (§13, §15 list them): `compile(&TreeSpec, &dyn Vocab)` takes
+  a `Vocab`, not a tokenizer; `compile_tool_call_tree(&[ToolSpec],
+  &ToolCallEnvelope)` returns a `TreeSpec` (the dialect is the envelope);
+  `TreeSpec::from_yaml(yaml)` is the YAML front-end; the builder's `build()`
+  returns a `TreeSpec`; the simulator is `simulate` with `Oracle` and `SimRun`
+  (`sim.rs`); and `StencilAction::FreeDecode` carries `{ close_boost, opens_value }`.
   `Terminator` also has `JsonStringValue`, `JsonValue`, `Never` and `Until`.
 - **Value sub-trees as shipped** (§8.3). Scalars (`integer`/`number`) and any
   container the grammar does not guide are one `FreeText{JsonValue}` span —
@@ -170,7 +172,7 @@ cut away where paint goes through. The **solid** parts are prefilled; the
 |------|---------|
 | **Stencil tree** | An immutable compiled tree of nodes alternating *static* runs, *branches*, and *free-text* spans, ending at a *terminal*. Built once per `(tokenizer, source spec)`. |
 | **Trigger** | A token (e.g. `<tool_call>`) that, emitted during free decode, *enters* a tree at its root. |
-| **Stencil session** | The per-sequence runtime walker: a single cursor into one tree. No side buffers (§4.1). |
+| **Stencil session** | The per-sequence runtime walker: a single cursor into one tree. No buffer of structure still to emit (§4.1). |
 | **Stencil (sampling) mask** | A logit mask applied at the sample stage restricting the next token to an allowed set. |
 | **Guided phase** | Walking static runs and branches — the model is being steered. |
 | **Free-text phase** | Inside a `FreeText` span — the model decodes unconstrained until the terminator fires. |
@@ -198,7 +200,7 @@ loop {                                       // drain non-decoding actions
         Free               => break,         // not stenciling; also scan triggers
         Prefill(static_buf)=> decode_prefill(seq, static_buf),   // inject; loop
         MaskedDecode(set)  => { seq.next_mask = Some(set); break }
-        FreeDecode(boost)  => { seq.next_mask = None; seq.eos_bias = boost; break }
+        FreeDecode{close_boost, ..} => { seq.next_mask = None; seq.eos_bias = close_boost; break }
         Exit               => { seq.stencil.clear(); break }
     }
 }
@@ -270,15 +272,25 @@ pub enum StencilNode {
 
 pub struct FreeTextSpan {
     /// Escape- and nesting-aware terminator (§6).
-    term: Terminator,
-    /// When set, an EOS sample also ends the span (for free prose with no
-    /// natural delimiter). When unset, EOS is masked out for the span's
-    /// duration — the span must end via `term`.
-    eos_ends: bool,
-    /// Span-scoped limits mirroring `SamplingConfig` (§6.3). `None` soft = no
-    /// ramp; `hard` is always present (the runaway guard).
-    limits: FreeTextLimits,
-    next: NodeId,
+    pub term: Terminator,
+    /// When set, an EOS sample also ends the span (byte-terminator spans). When
+    /// unset, EOS is never committed inside the span: it is replaced by the
+    /// completion of the value as written (§12).
+    pub eos_ends: bool,
+    /// Span-scoped limits mirroring `SamplingConfig` (§6.3). `forced_after` is
+    /// always present (the runaway guard).
+    pub limits: FreeTextLimits,
+    /// A token whose sample also closes the span (the thinking block's
+    /// `</think>`), and whether that token is dropped (`suppress_close`) so the
+    /// successor prefills in its place.
+    pub close_token: Option<TokenId>,
+    pub suppress_close: bool,
+    /// What the span's value may spell (`ValueRule`, §9.2); `None` leaves it free.
+    pub rule: Option<Arc<ValueRule>>,
+    /// One successor per tail of a `Terminator::Until`, the tail that fired
+    /// choosing (§12); empty otherwise.
+    pub forks: Arc<[NodeId]>,
+    pub next: NodeId,
 }
 ```
 
@@ -290,16 +302,21 @@ The session is just a cursor:
 pub struct StencilSession {
     tree: Arc<StencilTree>,
     cursor: Cursor,
+    // plus the walk's small side state: a lookahead delimiter awaiting its
+    // successor, the bytes of a pending rewrite, the value's position against
+    // its rule, the held values and the call written so far (§9.2) — none of it
+    // a buffer of tokens still to emit
 }
 enum Cursor {
     At(NodeId),
-    InBranch { pos: TrieNodeId },
+    InBranch { node: NodeId, pos: TrieNodeId },
     InFreeText { node: NodeId, term: TerminatorState, emitted: u32 },
+    Bailing,     // the failsafe: emit the tree's bail tokens, then finish
     Done,
 }
 ```
 
-There is no `pending: Vec<TokenId>`. A `Static` node carries its own buffer; the
+There is no `pending: Vec<TokenId>` of structure still to emit. A `Static` node carries its own buffer; the
 session emits `Prefill(&node.tokens)` and advances to `next` in one step. This is
 what the §3 inner loop drains: prefill a node, loop, prefill the next… except the
 compiler's fusion (§8.1) means a `Static` is always followed by a `Branch`,
@@ -322,25 +339,28 @@ fn next_action() -> StencilAction:
                 Branch{trie}         -> cursor = InBranch{trie.root};
                                         MaskedDecode(frontier(trie.root))
                 FreeText(span)       -> cursor = InFreeText{node, term: span.term.start(), 0};
-                                        FreeDecode(span.eos_bias(0))   // §6.3
+                                        FreeDecode{span.limits.boost_at(0), ..}   // §6.3
+                                        // or MaskedDecode(rule.mask(state)) under a ValueRule (§9.2)
                 End                  -> cursor = Done; Exit
         InBranch{pos}    -> MaskedDecode(frontier(pos))
-        InFreeText{..}   -> FreeDecode(span.eos_bias(emitted))
+        InFreeText{..}   -> FreeDecode{span.limits.boost_at(emitted), ..}
+        Bailing          -> Prefill(tree.bail) ; cursor = Done
         Done             -> Exit
 
-fn observe(token):
+fn observe(token, bytes) -> Observe:
     match cursor:
         InBranch{pos}:
-            child = trie[pos].edge_to(token)        // guaranteed legal (masked)
-            if trie[child].is_leaf(): cursor = At(trie[child].next)
+            child = trie[pos].edge_to(token)        // legal by the mask; a token
+                                                    // that escaped it → Bailed
+            if trie[child].is_leaf(): cursor = At(trie[child].next)   // ArmComplete
             else:                     cursor = InBranch{child}
         InFreeText{node, term, emitted}:
             emitted += 1
-            match term.feed(token):                 // §6 byte lexer
-                Open  -> stay                        // span continues
-                Close{consumed} -> cursor = At(span.next)   // (heal if mid-token §7.3)
-                Eos   if span.eos_ends -> cursor = At(span.next)
-            apply_limits(span, emitted)              // §6.3 soft/hard
+            match term.feed(bytes):                 // §6 byte lexer
+                Continue        -> stay                      // span continues
+                Close{consumed} -> cursor = At(span.after(fired))   // leftover bytes: §7.3
+                Rewrite{bytes, closed} -> hold the bytes for take_rewrite()   // §7.3
+            close_token / eos / forced_after close it too   // §6.3
         _ -> /* tokens only arrive after MaskedDecode / FreeDecode */
 ```
 
@@ -390,53 +410,63 @@ token identity (§7.3), which is what makes it robust to tokenization.
 
 ```rust
 pub enum Terminator {
-    /// JSON string value. Ends at the first UNESCAPED `"`. A `\` escapes the
-    /// next byte (`\"`, `\\`, `\n`, …). The closing quote is consumed.
+    /// JSON string value whose opening quote is already written. Ends at the
+    /// first UNESCAPED `"`, which is consumed; validated and repaired by the
+    /// incremental JSON lexer (below).
     JsonString,
-
+    /// A JSON string value INCLUDING its opening quote, written by the model
+    /// (a plain string parameter: Qwen spells an empty string as one token,
+    /// ` ""`, so the grammar must not have chosen "non-empty" for it).
+    JsonStringValue,
     /// JSON number value. Lookahead-terminated: ends at the first byte that
-    /// can't extend a number (digit, '-', '+', '.', 'e', 'E'; `integer_only`
-    /// drops '.'/'e'). The terminator byte is NOT consumed — it belongs to the
-    /// following static run (a ',' or '}').
+    /// can't extend a number; `integer_only` drops '.'/'e'. The terminator byte
+    /// is NOT consumed — it belongs to the following node (a ',' or '}').
     JsonNumber { integer_only: bool },
-
-    /// A balanced `open`/`close` structure — a raw object/array value. Ends when
-    /// nesting **depth returns to 0**. STRING-AWARE: a `"…"` opened inside
-    /// suspends bracket counting, and within it `\` escaping applies, so a `}`
-    /// or `]` inside a string never affects depth. The closing bracket is
-    /// consumed. This is the "handle nesting" case.
+    /// A balanced `open`/`close` structure, string-aware: ends when nesting
+    /// depth returns to 0; the closing bracket is consumed.
     Balanced { open: u8, close: u8 },
+    /// Any JSON value (the shipped form of an unguided scalar or container):
+    /// lookahead-terminated at the enclosing `,`/`}`/`]`, validated byte by byte.
+    JsonValue,
+    /// No byte delimiter; the span ends by a close token, EOS or `forced_after`
+    /// (the thinking block).
+    Never,
+    /// Raw text ending at a literal `marker` followed by one of `tails` (a
+    /// function block's `</parameter>` value, §12).
+    Until { marker: &'static str, tails: &'static [&'static str] },
 }
 ```
 
 ### 6.2 The lexer state
 
 ```rust
-pub struct TerminatorState {
-    kind: Terminator,
-    depth: u32,        // bracket nesting depth (Balanced)
-    in_string: bool,   // inside a nested "…" (Balanced / string-aware)
-    escaped: bool,     // previous byte was an unconsumed backslash
-}
+pub struct TerminatorState { /* kind, depth, in_string, escaped, started,
+                                spaced, matched, recent, fired, json: Option<JsonLexer> */ }
 
-pub enum Feed { Open, Close { byte_in_token: usize }, Eos }
+pub enum Feed {
+    Continue,
+    Close { consumed: usize },                       // consumed < len ⇒ mid-token (§7.3)
+    Rewrite { bytes: Vec<u8>, closed: bool },        // commit these bytes instead (§7.3)
+}
 ```
 
-`feed(token)` decodes the token to bytes and runs the machine byte-by-byte:
+`feed(bytes)` runs the machine byte-by-byte over the decoded token:
 
-- **`JsonString`**: `if escaped { escaped=false } else if b=='\\' { escaped=true }
-  else if b=='"' { return Close }`.
-- **`Balanced{open,close}`**: maintain `in_string`/`escaped` exactly as above for
-  any `"` seen; while **not** `in_string`, `b==open → depth+=1`,
-  `b==close → { depth-=1; if depth==0 return Close }`. The first `open` is either
-  part of the preceding static run (depth starts at 1) or the span's first byte
-  (depth starts at 0 then →1); the compiler picks one convention and records the
-  starting depth on the span.
-- **`JsonNumber`**: `if !is_number_byte(b) { return Close{byte_in_token: i} }` —
-  the close byte is *not* consumed (lookahead); §7.3 push-back applies.
+- **`JsonString` / `JsonValue`**: the full incremental JSON lexer
+  (`json_lexer.rs`: container stack, escapes, number and literal states). A
+  token that cannot be committed as written comes back as `Rewrite` (§7.3).
+- **`Balanced{open,close}`**: maintain `in_string`/`escaped` for any `"` seen;
+  while **not** `in_string`, `b==open → depth+=1`,
+  `b==close → { depth-=1; if depth==0 return Close }`. A span that begins at its
+  first `open` starts at depth 0 and `started` is set on the first `open`.
+- **`JsonNumber`**: `if !is_number_byte(b) { return Close{consumed: i} }` — the
+  close byte is *not* consumed (lookahead); §7.3 applies.
+- **`Until`**: the marker is matched across token boundaries; with tails, the
+  span closes only when the marker and then one tail have been written, and
+  `fired` names the tail.
 
-Escaping and nesting are therefore handled in one ~20-line machine, shared by all
-three kinds, with no regex engine.
+No regex engine is involved; `Terminator::is_lookahead` says which kinds leave
+their delimiter to the successor.
 
 ### 6.3 Soft / hard limits (mirrors the sampler's EOS ramp)
 
@@ -453,24 +483,25 @@ pub struct FreeTextLimits {
     ramp_start: Option<u32>,
     ramp_len: u32,
     boost: f32,
-    /// Hard: at this many tokens, force-close unconditionally — emit the
-    /// terminator's canonical close tokens (healing if needed, §7.3) and advance.
-    /// The runaway backstop; always set. Mirrors `forced_eos_after`.
+    /// Hard: at this many tokens, force-close unconditionally — commit the
+    /// token with the text that completes the value as written (§7.3) and
+    /// advance. The runaway backstop; always set. Mirrors `forced_eos_after`.
     forced_after: u32,
 }
 ```
 
-- **Ramp** (`FreeDecode(boost)` in §5): the action carries a per-step boost the
-  sampler adds to the close token's logit — a *soft* nudge that lets the model
-  close naturally, exactly like `eos_boost`. Zero before `ramp_start`.
-- **Forced**: at `forced_after`, the session injects the close tokens and
+- **Ramp** (`FreeDecode{close_boost, ..}` in §5): the action carries a per-step
+  boost the sampler adds to the close token's logit — a *soft* nudge that lets
+  the model close naturally, exactly like `eos_boost`. Zero before `ramp_start`.
+- **Forced**: at `forced_after`, the session reports `Observe::SpanForcedClosed`:
+  the token is committed with the span's completion after it, and the walk
   advances regardless. Bounded; never infinite.
 - **`eos_ends`**: when set, an EOS sample is a legal close (and is what the ramp
-  boosts); when unset, EOS is masked out for the span so it cannot end early.
+  boosts); when unset, an EOS sample is never committed inside the span (§12).
 
-A pure JSON string value typically sets `forced_after` only (a high runaway
-guard) and leaves the rest `None` — the model reliably emits its own closing
-quote. A free-prose span (e.g. a tool's `reason` field) sets the full ramp +
+A pure JSON string value sets `forced_after` only (`MAX_STRING_VALUE_TOKENS`, a
+high runaway guard) and leaves the rest unset — the model reliably emits its own
+closing quote. A free-prose span (e.g. a tool's `reason` field) sets the full ramp +
 graceful so it wraps up like a normal turn.
 
 ---
@@ -479,12 +510,15 @@ graceful so it wraps up like a normal turn.
 
 ### 7.1 The mask
 
-`MaskedDecode(set)` sets every disallowed logit to `-inf` **after** penalties and
-**before** temperature/top-p, so the model's relative preference among legal
-tokens survives and a penalty can never resurrect an illegal token or override
-the stencil. Per-sequence in the wave batch (`seq -> Option<AllowedSet>`); rows
-with `None` decode normally. A one-token mask never occurs (folded to `Static`,
-§8.1); an empty mask is a compile-time invariant violation (`debug_assert`).
+`MaskedDecode(set)` restricts the sample to the allowed tokens. The sampler does
+not write `-inf` over the vocabulary: `batched_sampler/allow_list.rs` gathers only
+the allowed logits on the device and runs the row's strategy (penalties,
+temperature, top-p, or argmax) over them, so the cost is the size of the list,
+never the vocabulary, and the model's relative preference among legal tokens
+survives. Every allow-list row of a step runs in one launch; a row whose allowed
+logits hold a NaN or +inf is refused before anything is drawn. Per-sequence in
+the wave batch; rows with no mask decode normally. A one-token mask never occurs
+(folded to `Static`, §8.1); an empty mask is a compile-time invariant violation.
 
 ### 7.2 Static runs and tries are tokenized in context
 
@@ -501,14 +535,23 @@ tokenizer fingerprint; a mismatch at load fails loudly.
 The dangerous seam is the end of a free span: the model may merge the closing
 delimiter with following bytes (`rs"}` as one token). Because the terminator
 lexer works on **bytes** (§6), it detects the close *inside* the token and
-reports `byte_in_token`. If the close is mid-token, the session **heals**:
-truncate the KV by that one token (`truncate_sequence_to_tokens`), and re-tokenize
-the value tail + the stencil's close run as one canonical run, then prefill it.
-For `JsonNumber` the same machinery handles lookahead push-back — and a
-delimiter that is its own token but is not what the successor starts with is
-dropped rather than pushed back, so the successor writes the right one. Healing is rare
-(models emit the quote as its own token) but must be correct; §12 turns
-"healing impossible" into a clean abort, never corruption.
+reports `Close { consumed }` with `consumed` short of the token's length. The
+heal is a rewrite, not a rewind of the KV: the token is not yet committed when
+`StencilDriver::accept` sees it, so the driver answers `Healed::Rewrite { bytes }`
+with the valid prefix, the commit path re-tokenizes `bytes` and swaps the sampled
+token for the last token of that encoding. When the encoding is several tokens,
+all but the last are recorded as forwarded and prefilled once the step's KV is
+final (`HealPrefill`), and the last rides the next decode. The successor node
+writes the rest of the structure. (Replaced design: the first sketch truncated
+the KV by one token with `truncate_sequence_to_tokens` and re-prefilled; the
+scheduler's stencil path no longer calls it.)
+
+A lookahead span (`JsonNumber`, `JsonValue`) leaves its delimiter to the
+successor. A delimiter that is its own token but is not what the successor starts
+with is dropped (`Healed::Drop`, `Observe::DelimiterDropped`) rather than pushed
+back, so the successor writes the right one. A token that cannot be committed as
+written inside a span is `Feed::Rewrite`, handled by the same path. Every cut has
+a completion, so "healing impossible" does not arise (§12).
 
 ### 7.4 The guided→free boundary: spills
 
@@ -538,26 +581,38 @@ opening quote is already the model's (`Terminator::JsonStringValue`, §6.1).
 
 ---
 
-## 8. Construction — three front-ends, one backend
+## 8. Construction — four front-ends, one backend
 
 Every tree is a `TreeSpec` (string-space, untokenized) compiled by a single
-backend. This keeps the three required construction methods thin and guarantees
-they produce identical trees for identical logical input.
+backend. This keeps the construction methods thin and guarantees they produce
+identical trees for identical logical input. The front-ends are the builder (A),
+the tool catalog (B), YAML (C) and think steering (D, `think.rs`).
 
 ```rust
-// String-space intermediate — what every front-end produces.
-pub struct TreeSpec { nodes: Vec<NodeSpec>, root: NodeRef, label: String }
+// String-space intermediate — what every front-end produces (spec.rs).
+pub struct SpecId(pub usize);
+pub struct TreeSpec {
+    pub nodes: Vec<NodeSpec>, pub root: SpecId, pub label: String,
+    pub bail: String,                       // text emitted if a token escapes the mask
+    pub keys: HashMap<SpecId, Arc<str>>,    // value span → "tool.field" (§9.2)
+    pub name_branches: HashSet<SpecId>,     // branches whose arms are tool names
+    pub chosen: HashMap<SpecId, ChosenArms>,// branches choosing an argument's value
+    pub fixed: HashMap<Arc<str>, Vec<(Arc<str>, Arc<str>)>>, // single-valued required args
+}
 pub enum NodeSpec {
-    Static(String, NodeRef),
-    Branch(Vec<(String, NodeRef)>),                 // (arm literal, successor)
-    FreeText { term: Terminator, eos_ends: bool,
-               limits: FreeTextLimits, next: NodeRef },
+    Static { text: String, next: SpecId },
+    Branch { arms: Vec<(String, SpecId)> },         // (arm literal, successor)
+    FreeText { term: Terminator, eos_ends: bool, limits: FreeTextLimits,
+               close_token: Option<TokenId>, suppress_close: bool, next: SpecId },
+    Value { pattern: String, opened: bool, limits: FreeTextLimits, next: SpecId },
+    Element { marker: &'static str, tails: &'static [&'static str],
+              limits: FreeTextLimits, forks: Vec<SpecId>, next: SpecId },
     End,
 }
 
 /// The one backend: tokenize-in-context, build tries, FOLD single-arm branches
 /// to Static, FUSE adjacent Static runs into maximal nodes, verify invariants.
-pub fn compile(spec: TreeSpec, tok: &Tokenizer) -> Result<StencilTree, BuildError>;
+pub fn compile(spec: &TreeSpec, vocab: &dyn Vocab) -> Result<StencilTree, BuildError>;
 ```
 
 ### 8.1 The compile backend (`compile.rs`)
@@ -569,35 +624,47 @@ pub fn compile(spec: TreeSpec, tok: &Tokenizer) -> Result<StencilTree, BuildErro
 3. **Single-arm fold**: a `Branch` with one arm becomes that arm's tokens as a
    `Static` spliced to its successor.
 4. **Static fusion**: merge adjacent `Static` runs into one maximal node.
-5. **Invariant check**: every reachable `Branch` has ≥2 live arms; no two
-   `Static` nodes adjacent; `FreeText.limits.forced_after > 0`; every path
-   reaches `End`. Violations are `BuildError`, surfaced loudly.
+5. **Validation and invariant check**: references resolve, the spec has no
+   cycle, every path reaches `End` (`validate`); then every reachable `Branch`
+   has ≥2 live arms (or one and a spill), no two `Static` nodes are adjacent, and
+   `FreeText.limits.forced_after > 0` (`verify_invariants`). Violations are
+   `BuildError`, surfaced loudly.
+
+Lowering is memoised on `(spec node, left context)`, so a spec node reached along
+several paths is lowered once and the runtime tree is a DAG (the *Lowers shares
+nodes* delta above).
 
 This pass is where "atomic prefill" (§3) and "mask never one-hot" (§7.1) are
 *made true*, independent of how sloppy a front-end's spec was.
 
 ### 8.2 Front-end A — the builder
 
-A fluent, programmatic builder for tests and bespoke trees:
+A programmatic builder for tests and bespoke trees. Nodes are declared by string
+id and name their successors by id, so forward references are natural:
 
 ```rust
-let tree = StencilTreeBuilder::new("tool_call")
-    .static_str("<tool_call>\n{\"name\": \"")
-    .branch()
-        .arm("read_file").goto("read_args")
-        .arm("write_file").goto("write_args")
-    .end_branch()
-    .at("read_args")
-        .static_str("\", \"arguments\": {\"path\": \"")
-        .free_string(FreeTextLimits::json_string())   // forced_after only
-        .static_str("\"}}\n</tool_call>")
-        .finish()
+let spec = StencilTreeBuilder::new("tool_call")
+    .root("open")
+    .static_node("open", "<tool_call>\n{\"name\": \"", "name")
+    .branch("name", &[("read_file", "read_args"), ("write_file", "write_args")])
+    .static_node("read_args", "\", \"arguments\": {\"path\": \"", "path_val")
+    .free_string("path_val", "close")             // JsonString, forced_after only
+    .static_node("close", "\"}}\n</tool_call>", "done")
+    .end("done")
     // … write_args …
-    .build(&tokenizer)?;     // -> TreeSpec -> compile()
+    .build()?;                                    // -> TreeSpec
+let tree = compile(&spec, &vocab)?;
 ```
 
-It emits a `TreeSpec` and calls `compile`. Labels (`goto`/`at`) resolve forward
-references. This is the most direct way to exercise every node kind in tests.
+`build()` resolves the ids (`LabeledTree::resolve`, shared with the YAML
+front-end) to a `TreeSpec`; `compile` lowers it. Also available: `free_text`
+(any terminator, limits and EOS behaviour) and `free_text_token_closed` (a span
+that also closes on a sampled token). This is the most direct way to exercise
+every node kind in tests.
+
+*Replaced design:* the first sketch was a chained `.arm(..).goto(..)` /
+`.at(..)` builder that took the tokenizer in `build`. The shipped builder is
+id-based, returns a `TreeSpec`, and leaves tokenization to `compile`.
 
 ### 8.3 Front-end B — a JSON tool description
 
@@ -607,18 +674,22 @@ tool-call tree. The catalog is the **same** source that feeds the projection's
 grammar can never disagree.
 
 ```rust
-pub fn compile_tool_call_tree(catalog: &[ToolSpec], dialect: &Dialect,
-                              tok: &Tokenizer) -> Result<StencilTree, BuildError>;
+pub fn compile_tool_call_tree(tools: &[ToolSpec], env: &ToolCallEnvelope)
+    -> Result<TreeSpec, BuildError>;
+// and the loops a turn runs: compile_tool_call_loop(tools, env, max_calls, close_turn),
+// compile_action_loop(.., think), compile_action_loop_with_body(..)
 ```
 
-Layout (emitting a `TreeSpec`):
+The envelope (`ToolCallEnvelope::qwen3()` for the JSON block,
+`ToolCallEnvelope::qwen35()` for the function block) carries the dialect's
+markers. Layout (emitting a `TreeSpec`, JSON-block style):
 
 ```text
-Static  dialect.tool_call_open               // "<tool_call>\n{\"name\": \""
+Static  env.open                             // "<tool_call>\n{\"name\": \""
 Branch  over tool names → each tool's schema
-Static  "\", \"arguments\": {"
+Static  env.args_open                        // ", \"arguments\": {"
 <argument object per tool>
-Static  "}}\n" + dialect.tool_call_close
+Static  env.close                            // "}}\n</tool_call>"
 End
 ```
 
@@ -639,12 +710,12 @@ trailing comma. **Value sub-trees** by schema type:
 |---|---|
 | string (free) | `Static "\""` · `FreeText{JsonString}` |
 | string enum | `Static "\""` · `Branch` over enum tries · `Static "\""` |
-| integer / number | `FreeText{JsonNumber{integer_only}}` |
+| integer / number | `FreeText{JsonValue}` (the *Value sub-trees as shipped* delta) |
 | boolean | `Branch { "true" \| "false" }` |
 | nullable T | `Branch { <value(T)> \| "null" }` |
-| array&lt;T&gt; | `Static "["` · `Branch{ <value(T)> \| "]" }` · ( `Branch{ "," → value \| "]" }` )* |
+| array&lt;T&gt; | `Static "["` · `Branch{ <value(T)> \| "]" }` · ( `Branch{ "," → value \| "]" }` )*, unrolled to `MAX_ARRAY_ELEMENTS` |
 | object | recurse |
-| raw/any (object value) | `FreeText{Balanced{'{','}'}}` (string-aware, §6.1) |
+| raw/any (unguided value) | `FreeText{JsonValue}` (string-aware, §6.1) |
 
 Enum/name tries reuse §7.2; nesting recurses.
 
@@ -662,14 +733,14 @@ nodes:
     next: name
   - id: name
     branch:
-      - match: "read_file"   ; next: read_args
-      - match: "write_file"  ; next: write_args
+      - { match: "read_file", next: read_args }
+      - { match: "write_file", next: write_args }
   - id: read_args
     static: "\", \"arguments\": {\"path\": \""
     next: path_val
   - id: path_val
     free_text:
-      terminator: json_string        # | json_number | balanced: {open: '{', close: '}'}
+      terminator: json_string        # | json_number | json_integer | balanced (with open: / close: bytes)
       eos_ends: false
       limits: { forced_after: 256 }  # ramp_start/ramp_len/boost optional
     next: close
@@ -681,30 +752,36 @@ nodes:
 ```
 
 `TreeSpec::from_yaml(yaml)` parses to a `TreeSpec`, which `compile` lowers. Parser
-errors (unknown node id in `next`, unreachable node, no `End`, bad terminator
-tag) are `BuildError`s, not panics.
+errors (unknown node id in `next`, duplicate id, unknown root, a node declaring
+none or several of `static`/`branch`/`free_text`/`end`, bad terminator tag, no
+reachable `End`) are `BuildError`s, not panics. A token-closed span (the thinking
+block) is built programmatically, not in YAML, because its close token is a
+resolved id.
 
-All three front-ends share §8.1, so a builder tree, the JSON-derived tree, and
-the YAML tree for the *same logical grammar* compile to byte-identical
-`StencilTree`s — which is itself a test (§14.3).
+The builder and YAML front-ends resolve through the same `LabeledTree`, and all
+front-ends share §8.1, so a builder tree and the YAML tree for the same grammar
+compile to the same `StencilTree` — pinned by `tests::builder_and_yaml_agree`
+(§14.3).
 
 ---
 
 ## 9. Triggers
 
 ```rust
-pub struct TriggerRegistry { by_token: HashMap<TokenId, Arc<StencilTree>> }
+pub struct TriggerRegistry { by_token: HashMap<TokenId, Binding>, tail: Option<Arc<StencilTree>> }
 ```
 
-The decode loop's `observe` in the `Free` state does one hash lookup per decoded
-token (the `<tool_call>` fast path is a single special token in Qwen3). A trigger
-fires only in **free** decode, never inside an active session — the session owns
-the stream until `End`, and a `FreeText` span does **not** consult the registry
-(§12), so a `<tool_call>`-like substring inside a value cannot recursively
-trigger. Nested calls are expressed as nested *tree* structure, not re-entry.
-Multi-token triggers (a short literal that isn't a special token) are supported by
-a suffix automaton over the recent-token window, but the tool-call case needs
-only the single token.
+A `Binding` is a tree plus what a turn holds it to (§9.1, §9.2) and whether it
+fires once. The decode loop's commit path in the free state does one hash lookup
+per decoded token (`<tool_call>` is a single special token in Qwen3).
+`with_trigger` / `without_trigger` swap a binding atomically and idempotently;
+`with_once_trigger` binds a token that fires at most once a turn (the think
+block). A trigger fires only in **free** decode, never inside an active session
+— the session owns the stream until `End`, and a `FreeText` span does **not**
+consult the registry, so a `<tool_call>`-like substring inside a value cannot
+recursively trigger. Nested calls are expressed as nested *tree* structure, not
+re-entry. Triggers are single tokens; a multi-token trigger (a suffix automaton
+over the recent-token window) is **Not built**, and no catalog needs one.
 
 ### 9.1 Holding a turn's calls to the tools it was given
 
@@ -972,12 +1049,18 @@ the scheduler in the `TriggerRegistry`. Only two scheduler changes:
    rides the decode step's own wave (`scheduler/stencil_wave.rs`, §3) rather
    than a forward of its own; the §3 inner loop drains chained actions.
 
-KV cache, projection, and persistence are untouched. The rare healing rewind
-(§7.3) uses the existing `truncate_sequence_to_tokens`. **Decode-health guards**
-(`decode_health/` entropy/repetition floors) are suspended while a session is
-active — stenciled regions are deliberately low-entropy/repetitive — via a
-`stencil_active` flag the checks short-circuit on, symmetric with how they handle
-`inside_think_block`.
+KV cache, projection, and persistence are untouched. The healing path (§7.3)
+swaps the sampled token and forwards a prefix in the same step; it rewinds
+nothing.
+
+**Not built: decode-health suspension.** The design suspends the
+`decode_health/` entropy and repetition floors while a session is active, since
+stenciled regions are deliberately low-entropy and repetitive, through a
+`stencil_active` flag the checks short-circuit on. No such flag exists. The
+health checks in `scheduler/decode/commit.rs` run on a stenciled sequence like
+any other, skipping only a token the stencil dropped (`dropped[i]`), and
+`inside_think_block` is the only grammar-related state they read. The checks
+run only when `health_config.enabled`, which is off by default.
 
 ### 10.1 Speculative decode inside a free span
 
@@ -1024,7 +1107,7 @@ changes *which* tokens are produced and *how fast*, not their representation.
 | **Nested structure value** (`{…{…}…}`) | With a schema, the grammar writes every bracket (§8.3). Without one, the `JsonValue` lexer keeps a container stack, string-aware so brackets inside strings don't count: a mismatched closer ends the value and closes what was actually opened; a wrong delimiter *after* the value is dropped (§7.3). |
 | **Malformed free value** (empty, `True`, `'x'`, `{k: 1}`, `[1 2]`, `[1,]`, `01`, a raw newline in a string, `\q`) | Where another language spells the same value differently it is respelled, keeping the meaning (`True` → `true`, never `null`). Otherwise the value ends at the first byte that cannot continue it and is completed as written (`null` only for a value that is missing). Never committed as invalid JSON. |
 | **Closed or nullable field** (boolean, enum, `["T","null"]`, `anyOf` with null) | A choice under the mask, `null` among the arms where allowed — the wrong spelling is never offered. |
-| **Token healing impossible** | Session aborts to free decode, logs `WARN`; the partial call fails the caller's JSON parse loudly — never silent corruption (§7.3). |
+| **Token healing impossible** | Does not arise: every cut of a free span has a completion (§7.3), and a token the lexer cannot commit is rewritten, not rejected. |
 | **EOS sampled in a session** | Masked out at every `Branch`; inside a `FreeText` without `eos_ends` it is never committed — replaced by the completion of the value as written (a closing quote, `]}`, ` null`, a `</parameter>` marker), or dropped when there is nothing to close. A session only ends at `End`. |
 | **A raw value holding its own close tag** (a function-block value containing `</parameter>`, `</function>` or `</tool_call>` — a file about the call format) | A function block's value is an `Element` node (`NodeSpec::Element`): free text closed by `</parameter>` followed by a separator (`\n`, `\r\n`, `\n\n`, ` \n`, none) and the next element's tag, `<parameter=` or `</function>` — only the tags the tree offers next (`element_close::Follows`). Any other `</parameter>` is content. All of the close is consumed and the span forks on which tail fired (`FreeTextSpan::forks`, `TerminatorState::fired`): each fork is the continuation with that tag already written (`ToolTreeBuilder::after_written`). A value cut short is completed with `</parameter>` and goes on through the whole continuation. Every reader of the block — `function_blocks_to_json`, zend's splitter and parts, npcd's act parser — ends a value by the same rule (`element_close::value_end`, `function_end`), and the translated JSON writes a value's `<` as its JSON escape (`element_close::LT_ESCAPE`), so no tag survives inside a value. |
 | **Model "fights" the stencil** | The mask is the last word at branches, so an out-of-grammar token shouldn't occur. As a failsafe, if one ever escapes the mask the session **bails** — logs `DEBUG`, emits the tree's configurable bail tokens to terminate the call cleanly, then exits. |
@@ -1064,61 +1147,76 @@ works only when that value comes first, which is why `bytes_transcode` writes
 ## 13. Public API and configuration
 
 ```rust
-// candle-conversation/src/stencil/mod.rs
-pub use tree::{StencilTree, StencilNode, NodeId, FreeTextSpan, FreeTextLimits};
-pub use terminator::{Terminator, TerminatorState};
-pub use session::{StencilSession, StencilAction};
+// candle-conversation/src/stencil/mod.rs (the core of the re-exports)
+pub use tree::{StencilTree, StencilNode, NodeId, FreeTextSpan, FreeTextLimits, TreeMarks};
+pub use terminator::{Terminator, TerminatorState, Feed};
+pub use session::{StencilSession, StencilAction, Observe};
+pub use driver::{StencilDriver, Healed, StepMask, PathStats};
 pub use mask::AllowedSet;
 pub use trigger::TriggerRegistry;
 pub use builder::StencilTreeBuilder;
-pub use spec::{TreeSpec, NodeSpec, BuildError};
+pub use spec::{TreeSpec, NodeSpec, SpecId};
+pub use error::{BuildError, WalkError};
 pub use compile::compile;
-pub use tool_call::{compile_tool_call_tree, ToolSpec};
-pub use sim::StencilSimulator;   // test/diagnostic harness (§14)
+pub use tool_call::{compile_tool_call_tree, compile_tool_call_loop, compile_action_loop,
+                    ToolSpec, ToolCallEnvelope, Param, ParamType, Pick};
+pub use think::{compile_think_tree, ThinkMode};
+pub use sim::{simulate, Oracle, SimRun, SimError};   // test/diagnostic harness (§14)
+// plus the held-value machinery of §9 (HeldValues, ValueRule, NeverTwice, ...)
 ```
 
-Stenciling is **on by default** when a non-empty catalog and a tool-call trigger
-exist, otherwise a no-op. A `SequenceConfig` flag disables it for ablation (free
-tool-call decode) without removing the catalog from the prompt.
+Stenciling is on whenever a non-empty catalog and a tool-call trigger exist,
+otherwise a no-op (an empty catalog registers no tree, §12).
+
+**Not built: the ablation flag.** The design calls for a `SequenceConfig` flag
+that disables stenciling (free tool-call decode) without removing the catalog
+from the prompt. No such flag exists. `TriggerRegistry::without_trigger` removes
+a tree's trigger, which has the same effect on a registry a caller builds.
 
 ---
 
 ## 14. Testing — 100% coverage, simulator-driven
 
 The module is **fully unit-testable without a GPU**: everything except the
-forward pass is pure (compiler, session, terminator, mask construction). The bar
-is **100% line/branch coverage** of `stencil/`, with extensive scenario and
-edge-case suites. A **simulator** drives sessions deterministically.
+forward pass is pure (compiler, session, terminator, mask construction). The
+suites are scenario and edge-case tests beside the code (`tests.rs`,
+`edge_tests/`, `spill_tests.rs`, `held_tests.rs`, `held_values_tests.rs`,
+`shaped_params_tests.rs`, `sub_stencil_tests.rs`, `driver/tests_*.rs`,
+`tool_call/tests_*.rs`). A **simulator** drives sessions deterministically. No
+coverage gate is enforced; a 100% line/branch bar was the first sketch's target
+and is **Not built** as a measured gate.
 
 ### 14.1 The simulator (`sim.rs`)
 
 ```rust
 /// Drives a StencilSession without a model: an oracle supplies the next token at
-/// each MaskedDecode/FreeDecode; the simulator records the full action stream and
-/// the emitted token sequence for assertions.
-pub struct StencilSimulator { session: StencilSession, oracle: Oracle }
+/// each MaskedDecode/FreeDecode; the run records the action stream and the
+/// tokens that entered the KV.
 pub enum Oracle {
-    Scripted(Vec<TokenId>),        // exact tokens (deterministic edge cases)
-    PickArm(Box<dyn Fn(&AllowedSet) -> TokenId>),  // policy: choose an arm/value
-    Adversarial(AdversaryPlan),    // escapes, nesting, runaway, healing, EOS
+    Scripted(Vec<TokenId>),                              // exact tokens
+    Policy(Box<dyn FnMut(Option<&AllowedSet>) -> TokenId>),  // Some at a branch, None in free text
 }
-pub struct SimRun { actions: Vec<StencilAction>, tokens: Vec<TokenId>, healed: u32 }
+pub struct SimRun { actions, observes, tokens, dropped, healed_bytes, forced_closes }
+pub fn simulate(tree: Arc<StencilTree>, vocab: &dyn Vocab, oracle: Oracle,
+                max_steps: usize) -> Result<SimRun, SimError>;
+pub fn lowest_arm_policy(free_token: TokenId) -> Oracle;
 ```
 
-`Scripted` asserts an exact `(action, token)` trace; `PickArm` enumerates *all*
-paths through a tree (every tool, every optional combination, every enum value)
-and asserts each emits parseable JSON matching the schema; `Adversarial` injects
-the nasty inputs. The simulator also re-decodes `tokens` to a string and runs it
-through a real JSON parser + schema validator for an end-to-end assertion — all
-on CPU.
+`Scripted` asserts an exact `(action, token)` trace; a `Policy` picks the arm or
+value, so a test enumerates paths through a tree and asserts each emits parseable
+JSON matching the schema. `SimRun::text` re-decodes `tokens` to a string for an
+end-to-end assertion against a real JSON parser — all on CPU. A dedicated
+adversarial oracle type is **Not built**; the adversarial cases are scripted and
+fuzzed in `edge_tests/` (`fuzz.rs`, `intent.rs`).
 
 ### 14.2 Component suites (byte-exact)
 
 - **Terminator** (`terminator.rs`): for `JsonString`, `JsonNumber{int,float}`,
-  `Balanced`: plain close; `\"` and `\\` escapes; `\\"` (escaped backslash then
-  real quote); brackets inside strings; deeply nested `{[{}]}`; number lookahead
-  (`123,` and `1.5e-3}`); UTF-8 multi-byte values; a terminator split across two
-  tokens; empty value. Assert exact `Feed` and `byte_in_token`.
+  `Balanced`, `JsonValue`, `Until`: plain close; `\"` and `\\` escapes; `\\"`
+  (escaped backslash then real quote); brackets inside strings; deeply nested
+  `{[{}]}`; number lookahead (`123,` and `1.5e-3}`); UTF-8 multi-byte values; a
+  terminator split across two tokens; empty value. Assert exact `Feed`
+  (`consumed`, `Rewrite` bytes).
 - **Compile backend** (`compile.rs`): single-arm fold; static fusion; in-context
   tokenization (boundary merges); trie sharing of common prefixes; invariant
   failures (empty arm, adjacent statics not fused, missing `End`, `forced_after
@@ -1126,22 +1224,27 @@ on CPU.
 - **Session** (`session.rs`): the §5 state machine via `Scripted` — minimal call;
   optional included/skipped; enum; number lookahead push-back; string with
   escapes; `Balanced` value; `eos_ends` true/false; soft ramp / graceful / forced
-  limit firing; healing boundary; abort-on-heal-impossible.
+  limit firing; the healing boundary (`Observe::SpanClosed { leftover }`,
+  `Repaired`, `DelimiterDropped`); the bail failsafe.
 - **Mask** (`mask.rs`): `frontier` correctness at each trie step; EOS exclusion;
   one-arm never reaches the sampler; per-row application over a synthetic logits
   matrix; close-token boost wiring.
 
 ### 14.3 Construction equivalence
 
-For a fixed logical grammar, assert the **builder**, the **JSON tool
-description**, and the **YAML** front-ends compile to byte-identical
-`StencilTree`s (§8). YAML and builder also round-trip through `TreeSpec`.
+`tests::builder_and_yaml_agree` asserts the **builder** and the **YAML**
+front-ends compile to the same tree for one grammar. The same assertion for the
+**JSON tool description** front-end is **Not built**: the tool compiler lowers
+through its own `ToolTreeBuilder` and is covered by the tool-library tests
+(§14.4) rather than by comparison with a hand-written grammar.
 
 ### 14.4 Tool-library construction tests
 
-Take the **actual tool definitions from the tool library** (the same JSON the
-projection's `tools` collection uses), compile each to a tree, and run the
-simulator across scripted scenarios per tool: every required field; each optional
+`zend/tests/stencil_tool_call.rs` takes the **actual tool definitions from the
+tool library** (the same JSON the projection's `tools` collection uses),
+compiles them to one tree, and runs the simulator (`every_tool_minimal_call_is_valid`
+and the masking tests beside it). The scenario set the design asks of every tool
+is: every required field; each optional
 present and absent (and combinations, capped); each enum value; arrays empty,
 singleton, and multi; nested objects; nullable fields as value and as `null`.
 Assert every produced byte stream parses and validates against that tool's
@@ -1149,11 +1252,16 @@ schema, and that the **tool name and every enum are exactly from the catalog**.
 This is the regression net that guarantees the stencil never lets a real tool be
 mis-called.
 
-### 14.5 End-to-end (GPU, integration — the only non-CPU test)
+### 14.5 End-to-end (GPU, integration)
 
-With the real model + tokenizer, prompt tool calls and assert the produced bytes
-parse, name ∈ catalog, required present, enums ∈ allowed — across all catalog
-tools. Everything else (14.1–14.4) runs on CI CPU.
+**Not built** as a test: prompt a real model for tool calls and assert the
+produced bytes parse, name ∈ catalog, required present, enums ∈ allowed, across
+all catalog tools. What exists is the live *tokenizer* tier
+(`full_catalog_compiles_against_real_qwen3_tokenizer`,
+`the_rows_a_tool_call_plays_on_the_live_tokenizer`,
+`natural_calls_drive_the_live_grammar` in `zend/tests/stencil_tool_call.rs`),
+which drive the grammar with natural token streams and need a cached tokenizer,
+and the live daemon's own logs (`PathStats`, `log_stencil_finish`).
 
 ---
 
@@ -1161,48 +1269,51 @@ tools. Everything else (14.1–14.4) runs on CI CPU.
 
 ```text
 candle-conversation/src/stencil/
-  mod.rs          public API, StencilAction, re-exports
-  tree.rs         StencilTree, StencilNode, NodeId, FreeTextSpan, FreeTextLimits
-  trie.rs         TokenTrie, frontier(), in-context name/enum trie builder
-  terminator.rs   Terminator, TerminatorState (escape + nesting byte lexer)
-  session.rs      StencilSession, Cursor, next_action()/observe()
-  mask.rs         AllowedSet, logit masking + close-token boost, per-row apply
-  trigger.rs      TriggerRegistry
-  spec.rs         TreeSpec, NodeSpec, BuildError (the string-space intermediate)
-  compile.rs      compile(): tokenize-in-context, fold, fuse, verify invariants
+  mod.rs          public API, re-exports
+  tree.rs         StencilTree, StencilNode, NodeId, FreeTextSpan, FreeTextLimits, TreeMarks
+  trie.rs         TokenTrie, frontier(), spills, in-context name/enum trie builder
+  terminator.rs   Terminator, TerminatorState, Feed (byte lexer)
+  json_lexer*     the incremental JSON lexer behind JsonString / JsonValue
+  session.rs      StencilSession, Cursor, StencilAction, Observe, next_action()/observe()
+  driver/         StencilDriver: the online walker the scheduler drives (Healed, StepMask, hold)
+  mask.rs         AllowedSet, logit masking + close-token boost
+  trigger.rs      TriggerRegistry (trigger / once / tail / held bindings)
+  spec.rs         TreeSpec, NodeSpec, SpecId (the string-space intermediate)
+  error.rs        BuildError, WalkError
+  compile.rs      compile(): validate, tokenize-in-context, fold, fuse, verify invariants
   builder.rs      StencilTreeBuilder (front-end A)
-  tool_call/      compile_tool_call_tree + ToolSpec → TreeSpec (front-end B)
+  tool_call/      compile_tool_call_tree + ToolSpec/Param/ToolCallEnvelope → TreeSpec (front-end B)
   yaml.rs         TreeSpec::from_yaml (front-end C)
-  sim.rs          StencilSimulator + Oracle (test/diagnostic harness)
-  tests/          extensive scenario + edge-case suites (or #[cfg(test)] per file)
+  think.rs        compile_think_tree, ThinkMode (front-end D)
+  value_rule.rs, value_set.rs, held_values.rs, held_arms.rs, call_so_far.rs,
+  never_twice.rs, named_arm.rs, opening_call.rs, turn_grammar.rs,
+  element_close.rs, function_block.rs, answer_steps.rs   §9 and §12 machinery
+  vocab.rs        Vocab, TestVocab, HfVocab, TokenBytes
+  sim.rs          simulate, Oracle, SimRun (test/diagnostic harness)
+  *_tests.rs, edge_tests/, tests.rs   scenario and edge-case suites
 ```
 
-One concern per file. The scheduler/sampler touch-points are additive hooks in
-`scheduler/decode/` and `batched_sampler/`; no existing KV, projection, or
-persistence code changes.
+One concern per file. The scheduler/sampler touch-points are hooks in
+`scheduler/decode/` (`commit.rs`, `stencil.rs`), `scheduler/stencil_wave.rs`,
+`scheduler/block_guard.rs`, `scheduler/named_tool.rs`, `scheduler/answered.rs`
+and `batched_sampler/allow_list.rs`; no existing KV, projection, or persistence
+code changes.
 
 ---
 
-## 16. Implementation order
+## 16. Layers and dependencies
 
-Dependency-ordered, every step CPU-testable until the final hardware hook:
+The module is layered so each layer tests without the next:
 
-1. **`terminator`** — the escape/nesting byte lexer + its full edge-case suite
-   (§14.2). Pure, no dependencies.
-2. **`tree` + `trie` + `spec`** — the data model and the string-space
-   intermediate.
-3. **`compile`** — tokenize-in-context, fold, fuse, invariants, byte-exact tests.
-4. **`builder` + `yaml` + `tool_call`** — the three front-ends, with the
-   equivalence test (§14.3) and the tool-library construction tests (§14.4).
-5. **`session`** — `next_action`/`observe`, driven by `sim` (§14.1). No scheduler.
-6. **`mask`** — `AllowedSet` + per-row logit mask + close-token boost, against a
-   synthetic logits matrix.
-7. **`trigger`** + engine wiring — register trees, hand the registry to the
-   scheduler.
-8. **Scheduler hook** — pre-wave prefill drain + sample-stage mask/boost +
-   health-guard suspension.
-9. **Token healing** — the rewind/reprefill boundary path, behind the limit guards.
-10. **End-to-end GPU validation** (§14.5) across the full catalog.
+1. **Pure core** — `terminator` and `json_lexer` (byte lexers), `tree`, `trie`,
+   `spec`, `compile`: no scheduler, no model.
+2. **Front-ends** — `builder`, `yaml`, `tool_call`, `think` produce a `TreeSpec`.
+3. **Walk** — `session` and `driver`, driven by `sim` in tests; `mask` applies
+   `AllowedSet`s and close-token boosts to a logits matrix.
+4. **Triggers and holds** — `trigger`, `held_values`, `held_arms`, `never_twice`,
+   handed to the scheduler through the engine's registry.
+5. **Scheduler hooks** — the decode commit path (`Healed` signals, heals,
+   drops), the wave rows of `stencil_wave.rs` and the block guard.
 
-Steps 1–6 land and are 100% covered before any scheduler change; the
-hardware-coupled work (7–10) sits on a proven, CPU-verified core.
+Not built: decode-health suspension (§10), the ablation flag (§13), the
+model-driven end-to-end test (§14.5).

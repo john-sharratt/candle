@@ -98,6 +98,8 @@ order, §16 what is still open, §17 the documents this changes.
 
 ### 1.3 The redo log has no global record identity
 
+*History: this section is the redo log as it stood when the design was written. Chunk 1 and §6 replaced much of it; it stays as the reason for those rules.*
+
 - A record is a one-line JSON header (`type, payload_len, crc, format, stream_id,
   chunk_index, token_count`) and a payload, padded to 4 KiB
   (`candle-conversation/src/persistence/record/header.rs`). Twenty-nine types
@@ -210,8 +212,10 @@ commit writes straight to disk (`npcd/src/sim/bench.rs`); it runs no git
 `run_command` runs one allow-listed program in a borrowed checkout on the zend host
 (`zend-vfs/src/sandbox/mod.rs`; the allow-list is `PROGRAMS` in
 `zend-vfs/src/sandbox/programs.rs`). Agents (§11, the `agent` crate) are the cluster's
-execution members; `docs/zend_workspace_execution.md` §7–§8 is the earlier design of
-leased build agents and capability advertising and marks them not built.
+execution members, built as the `agent/` crate (`tokera-agent`, or the same agent run in
+process by `motherd --agent`). `docs/zend_workspace_execution.md` §7–§8 records which
+parts of its first design, a build agent leased per tool session, stand, which §11 here
+replaced (no lease: a run is a job posted to an agent), and which are not built.
 
 ### 1.6 Build identity has no order
 
@@ -1722,16 +1726,25 @@ turns it writes for that timeline (§6.6). A later claim has a later epoch, so t
 of a former holder that was partitioned and kept writing are ordered before its
 successor's.
 
-**Taking over waits for the new member to catch up.**
+**Taking over is placed among the members that hold the previous holder's records.**
 
-- A member that takes over a released key holds the request until it has applied the
-  previous holder's records through `through`.
-- When the holder vanished without releasing, the member first runs a catch-up (§7) and
-  holds the request until its `DONE` arrives. What the holder's sender-side retransmit
-  had not yet delivered arrives when the holder returns (§6.3), and takes its place by
-  stamp (§6.6).
-- The hold is bounded at 30 s. Past that, the request is answered `503` with
-  `Retry-After` rather than served from a substrate that is behind.
+- The gateway keeps each key's last release (who, through which `oseq`) and the members
+  that reported the key `COMPLETE` since, and sends the key's next request only among the
+  members holding the releaser's records through `through`
+  (`docs/cooperative_admission.md` §2.2). The member that takes over is therefore
+  already current; a request is never held on a catch-up.
+- A member serves a request behind the records the gateway relayed ahead of it: it
+  waits for those to be applied, at most `APPLY_WAIT` (10 s, `cluster/src/member/app.rs`),
+  and then serves it, logging that the records were not yet applied.
+- When the holder vanished without releasing, the gateway places the key as released
+  by it through the highest `oseq` it heard (`Registry::leave`). What the holder's
+  sender-side retransmit had not yet delivered arrives when the holder returns (§6.3),
+  and takes its place by stamp (§6.6).
+
+*Replaced design:* a member that took over held the request until a catch-up's `DONE`
+arrived, bounded at 30 s, then answered `503` with `Retry-After`. Placement among the
+members that already hold the records replaced the hold, so no request waits on a
+catch-up.
 
 **Two first claims made at the same moment through two gateways** can only happen if one
 client sends a conversation's first message to both. Both claims are then live, and the
@@ -3400,7 +3413,7 @@ table open.
   its records, and the tombstone itself expires by §6.8's rule. A world that is removed
   is stopped, and every record under its `world/<wid>/` prefix is tombstoned in one
   commit, stamped above every epoch the world was written under, so no write from
-  before it brings an entity back (`Runtime::remove_world`).
+  before it brings an entity back (`Runtime::remove_world`, `npcd/src/authority/beat.rs`).
 - **State records are ordinary keyed values** (§6.5). The greatest stamp wins in any
   arrival order. Each carries the world lease's epoch (§9.2), so a former authority can
   never overwrite its successor.
@@ -3851,9 +3864,10 @@ passed:
   the store first when it merges cleanly, and the commit lands on top of it; one that
   moved at the lines the store changes is refused with the paths. There is no operation
   branch: the record is the mind's branch on `origin`, as it is for zend's `land`. The
-  member builds the commit in its own clone of the mind; only the push needs credentials,
-  and it goes through an agent holding the mind with push rights (§11.4, `AgentPush`), or
-  through the mind's own checkout on a member run without `--cluster`. The commit message
+  member builds the commit in its in-process object database of the mind; only the push
+  needs credentials, and it goes through an agent holding the mind with push rights
+  (§11.4, `AgentPush`), or, for a mind folder given with `--mind` and no cluster, through
+  that folder's own checkout. The commit message
   names the operation, its document and every step's taker, from its run history.
 - **On success** the store's base moves to the merged commit and its published paths are
   tombstoned, which is zend's `land` behaviour (`zend-vfs/src/work/commit.rs`).
@@ -4161,7 +4175,7 @@ bundle's objects and sets its tracking refs to the commits, removing those of br
 `origin` no longer has (`Repo::take_fetch`): the same refs, and the same report, as a
 fetch from `origin` itself. The answer goes back with the submit only; the job keeps its
 status. A fetch that brings the member nothing — no objects, every branch at a commit it
-already holds — is answered and not kept: a member following origin asks every minute,
+already holds — is answered and not kept: the import lease's holder asks every 15 s,
 and kept, those polls filled the agent's job table and pushed the runs that did something
 out of it (§11.7). A repository opened `fetching_through` an agent makes every fetch this way, as
 one opened `pushing_through` one makes every push (`zend_vfs::Fetch`, `zend_vfs::Push`).
@@ -4191,20 +4205,26 @@ dial out and have no listener, so a member cut off from the gateways reaches no 
 agent. When it is cut off, a `motherd --agent` sends jobs straight to the agent in its
 own process. That is how a disconnected npcd world publishes (§9.4, §10.3). A member with
 no in-process agent fails the job with `no_agent`. A zend tool reports that to the
-model; a publish waits 30 minutes and tries again; the mind's follow tries again in a
-minute.
+model; a publish waits 30 minutes and tries again; the mind's import, which the holder of
+the `git/<repo>` lease runs, fetches again at its next `FETCH_EVERY` (15 s,
+`substrate-git/src/member.rs`), and every member goes on reading the commit its own log
+holds meanwhile.
 
 **npcd** reaches its mind repository the same way: its fetches and pushes go to an agent
 holding it (§10.3), chosen by the repository's name as any job is.
 
 ### 11.6 Safety
 
-The rules of `docs/zend_workspace_execution.md` §7.3 apply unchanged:
+The rules of `docs/zend_workspace_execution.md` §7.3 apply, with what is built marked:
 
-- Jobs run as a low-privilege user whose writes reach only the checkouts and caches.
-- Credentials are never readable by a job.
-- Every job runs under a timeout that kills its whole process tree.
-- Output is rewritten to repository-relative paths.
+- Every job runs under a timeout that kills its whole process tree. Built.
+- The programs a job may start are the allow-list, with no shell. Built.
+- Pushes are made only by agents, which hold the credentials. Built.
+- Not built: jobs running as a low-privilege user whose writes reach only the checkouts
+  and caches, so that credentials are unreadable by a job; and output rewritten to
+  repository-relative paths. They stay the plan of record for those two properties.
+- There is no lease, so there is no lease expiry to reclaim a crashed holder's work: a
+  job cut short by a restart is recovered by the next job on the checkout.
 
 The push credentials live on the agent, never on a GPU member.
 
@@ -4673,11 +4693,14 @@ So the gateways **peer**: every gateway holds one WebSocket to every other gatew
   for the site among itself and the peers it is connected to. Every connected gateway
   computes the same answer, so exactly one of them orders. No consensus is run.
 - The orderer runs the order in `acme/manager.rs`'s renewal loop: at start, then every
-  12 h, renewing 30 days before expiry. It announces the order with `ACME_ORDERING`
+  12 h (`CHECK_EVERY`). A site is due when it has no certificate, when the CA's renewal
+  window has opened for it (the order then carries `replaces`), when a third of its
+  lifetime or less is left (the floor that stands if the window cannot be read), or when
+  a name the site serves is missing from it and now reaches this gateway. It announces the order with `ACME_ORDERING`
   (`web/src/acme/order.rs`).
 - A due site whose orderer is a peer, or that a peer announced, is skipped. A peer
   leaving, or finishing an order, wakes the loop, after at least 5 minutes from its
-  last pass, since this gateway may now be a due site's orderer.
+  last pass (`MIN_SLEEP`, 300 s), since this gateway may now be a due site's orderer.
 - Gateways share one ACME account. `account.json` is created by the first gateway and
   sent to peers that hold none, over a secure link, so the ledger counts against one
   account.
@@ -4707,7 +4730,8 @@ other each name themselves orderer, so each may order a site the other also orde
   gateway fails, and is retried at the next 12-hour check.
 - At worst the site gets two certificates. Both are valid, the later `not_after` wins
   when the peers meet again, and the shared ledger counts both against the CA's limits.
-- Renewal starts 30 days early, so none of this is close to an expiry.
+- Renewal starts when the CA's window opens, at the latest with a third of the
+  lifetime left, so none of this is close to an expiry.
 - With either gateway down, the other orders alone, with no wait.
 
 **Private keys cross only an authenticated, verified link.** Certificate keys travel
@@ -4765,7 +4789,7 @@ the burst harnesses would measure an unoptimised codec (the block today covers
 | UI pinning | a page's HTML sets `tokera_ui_<app>`; every UI request with it reaches the same member; a pinned member that leaves or faults is replaced and the cookie rewritten; API requests ignore it |
 | dispatch | the route table and requests yield the expected member for each class; the `x-tokera-node` override is admin-only; the `Body` key reads ≤ 8 MiB |
 | modes | a route with `cluster:` and no ready member goes to its configured URL; the first ready member switches it; requests in flight to the URL finish there; the last member leaving reverts it; a route without `cluster:` never switches |
-| claims | a new key is claimed by the member that serves it; the claim is announced on every cluster; a gateway lacking the holder answers `409` then `503`; the idle release carries `through`; the catch-up hold releases at `through`; of two simultaneous first claims the higher epoch keeps the key |
+| claims | a new key is claimed by the member that serves it; the claim is announced on every cluster; a gateway lacking the holder answers `409` then `503`; the idle release carries `through`; a request waits for the records relayed ahead of it, at most `APPLY_WAIT`, then is served; of two simultaneous first claims the higher epoch keeps the key |
 | lagging | an ordered lane past its cap makes the member lagging: no further live events are queued for it and none of its queued stream frames are dropped; it answers no catch-up and takes no round-robin request, but a new conversation, or a released one whose last holder's records it holds, is still placed on it (`registry/tests.rs` `a_lagging_member_is_placed_by_conversation`); once its lane drains it takes live events again and syncs, routed again once in sync — an origin still writing included; its socket is never closed for being slow |
 | socket drop | an exchange with no response head yet gets a `503`; a body in progress is aborted rather than ended; a tunnelled WebSocket closes `1011`; nothing is replayed on another member |
 | emission | a request's events leave on the request's socket; other events go round robin across sockets, one whole event at a time; with every socket down events stay *unsent*, never queued in memory |
@@ -5178,8 +5202,11 @@ this framework.
   accepts rebuilding a substrate over keeping a way back.
 - **npcd started fresh under `motherd`'s model key** — the second way on in step 3
   below. Its tenant has `mind_repo: battle-mind` and `data: ../npcd-data`: the first
-  start found no mirror, ran with no mind, fetched the record through the in-process
-  agent once joined, and relaunched onto it.
+  start found no such repository in its log and pulled it once through the in-process
+  agent while loading, taking it into the substrate (§10.3). *History:* the deployment
+  as first run kept a mirror under `--data`, found none on its first start, ran with no
+  mind, and relaunched onto the mirror once it was fetched; `docs/substrate_git.md`
+  retired the mirror.
 - **`bot.tokera.com` falls back to `.6`.** While `motherd`'s npcd member is joined and
   ready the gateway routes the name to it; with no npcd member it is back in dumb mode,
   on the `.6` upstream.
@@ -5281,7 +5308,7 @@ same configured upstreams as before.
    developer's work-in-progress is routed to like any member, and its writes replicate.
    Draining it keeps gateway traffic off it. Nothing keeps its test data out of the
    shared substrate.
-3. **The affinity idle timeout** (10 min) and the **catch-up hold** (30 s) are first
+3. **The affinity idle timeout** (10 min) and the **apply wait** (10 s) are first
    values, to be measured against how long a moved conversation's K/V takes to land.
 4. **A kept store has no expiry.** An operation's store is dropped when it publishes, or
    when it fails under `on-failed: discard` (§10.3). Under `keep`, the store waits for an
@@ -5382,7 +5409,7 @@ same configured upstreams as before.
 |---|---|
 | `docs/web_gateway_design.md` | A new section for gateway peering, with ACME challenge and certificate sharing. §3: the `cluster:` route key, dumb and clustered modes, dispatch, claims and aggregates, and failing in-flight exchanges on a socket drop. §5: cluster trust next to the IP allowlist; the assertion and cookie are no longer forwarded. A new section for the status page. |
 | `docs/shared_model_host.md` | §3.4: the cluster listener in the host server, and the own listener forwarding up while joined. §3.5: dispatch on every route and the `cluster` status block. |
-| `docs/zend_workspace_execution.md` | §7 and §8 are built by §11 here. §9.4 is answered. |
+| `docs/zend_workspace_execution.md` | §7 and §8 are built by §11 here as the `agent/` crate, with a job posted to an agent in place of a leased build agent; its §7.3 and §8.3 mark what is not built (the low-privilege user, output path rewriting, pool management). §9.4 is answered. |
 | `docs/zend_git.md` | §9: publishing happens through agents. |
 | `docs/zend_vfs_events.md` | Events are keyed `(timeline, origin, seq)` and replicate. Uploads become VFS. |
 | `docs/archived/segmented_substrate_log.md`, `docs/archived/kv_tier_migration.md` §5 | The record header's new fields (`origin`, `oseq`, `hlc`, `epoch`, `digest`); `Replica`; the order-independent apply rules; timeline tombstones kept by compaction; incomplete remote turns pending, not `Corrupt`. |

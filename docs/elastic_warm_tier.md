@@ -249,10 +249,16 @@ warm tier: elastic chunks=N paged_gib=… change=grow|refused|shrink(reason) fau
 ```
 
 and `warm tier: elastic chunk filled chunk=… fill_ms=…`, `warm tier: elastic
-chunks freed chunks=… reason=… drain_ms=…`.
+chunks freed chunks=… reason=… drain_ms=…` (the controller's `report`, at target
+`candle_transformers::expert_lre`; `draining` is the chunks a shrink still owes and
+`ceiling` is −1 with none).
 
-The stats table carries the same fields, so `/v1/status` and the GUI can show
-the tier moving.
+The controller also keeps gauges in the expert pipeline's `PipelineStats`:
+`warm_paged_chunks`, `warm_paged_bytes`, `warm_paged_slots`, `warm_slots`, and the
+counts of chunks grown and shrunk (`warm_grown`, `warm_shrunk`). The batched test's
+expert table prints them. The controller's signals (faults, available RAM, ceiling,
+back-off) are on the log line only: neither `/v1/memory` nor `/v1/telemetry` carries
+the tier's elastic state.
 
 ## 7. Tests
 

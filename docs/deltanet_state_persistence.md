@@ -1,15 +1,29 @@
 # Switching to the hybrid: recurrent state, glue, and provenance
 
-Status: **partly implemented**. Scope is the hybrid Qwen3.5/3.6/3.8 lineage
-(`candle-transformers/src/models/delta_net/`, `models/qwen35/`) becoming the
-production model in place of Qwen3-30B-A3B.
+Status: **implemented, except the pieces marked "Not built" (§4.6(1), §4.7d,
+§5.2, P5c.1/P5c.2) and the items in §13 "Open items"**. Scope is the hybrid
+Qwen3.5/3.6/3.8 lineage (`candle-transformers/src/models/delta_net/`,
+`models/qwen35/`, and Qwen3.8-Flash-Next in `models/qwen4exp/`) as the production
+model in place of Qwen3-30B-A3B.
+
+Where the code deliberately chose a different design from the one this document
+first described, the code is the design and the section says so under a
+**Replaced design** note: the provenance band count (§4.8, P5d), the `<think>`
+clean re-prefill (§5.3), the rewind's removal (§5.2, §11a.1) and the branch
+checkpoint's key and shape (§11a.11).
+
+The recurrent span — a long span armed for capture or replay of its scan inputs,
+which code comments used to attribute to the archived reply-calibration design —
+is described in `docs/deltanet_timeline.md` §14.
 
 ## Implementation status
 
-Phases 0, 1, 2, 3, 4, 5a, 5b, 5c, 5d, 5e, 7 and 9 are **implemented and green**,
-and **the hybrid now runs end to end through zend on real weights.** §11a records
-what the design got wrong along the way — including three defects the first live
-run exposed (§11a.6–§11a.8).
+Phases 0, 1, 2, 3 (as §11a.1 records it), 4, 5a, 5b, 5c (template sections only),
+5d, 5e, 6, 7 and 9 are **implemented**, and **the hybrid runs end to end through
+zend on real weights.** §11a records what the design got wrong along the way —
+including three defects the first live run exposed (§11a.6–§11a.8). The test
+counts and timings quoted in this section are what the run that wrote them
+measured; they are not re-measured by this document.
 
 **Tier 3 passes — all of P9.** The daemon loads the 22 GB checkpoint, ingests,
 seals a complete 30-layer non-zero recurrent snapshot per turn, carries state
@@ -22,10 +36,10 @@ fixed rather than argued fixed. `decode_replay_probe` reports 0/7 dirty on the
 hybrid (T3.8), so the harness control is honest again. `fork_recurrent` is an
 independent copy (T1.6).
 
-**Still open:** P6 needs a new per-leaf prefill pass (§11a.3b) and is the one
-remaining item that is a feature rather than a measurement. P8 is conditional on
-a seal-latency measurement. P10 is measurements. T5b.5 is not implementable as
-written (§11a.10).
+**Still open:** P6 is implemented (§11a.11) as a per-branch prefill pass computed
+on first use. P8 is closed by measurement (§11a.12). P10 is measurements.
+T5b.5 is not implementable as written (§11a.10). The unbuilt designs and the code
+a design removes but that remains are listed in §13.
 
 **Turns now own their boundaries at both ends.** A turn's grid is
 `[user_start][/no_think?][user_msg][user_end][assistant_start][response][im_end]`,
@@ -35,8 +49,9 @@ takes the markers or the `no_think` look-up at all — the boundary decision lef
 the assembler entirely, which is visible in its signature.
 
 That removes the glue that **grows with the conversation** (one island per turn
-boundary). What remains is the fixed system-prompt glue — template sections,
-`TreeGlue` markers, `member_glue` — which is P5c.
+boundary). What remained was the fixed system-prompt glue — template sections,
+`TreeGlue` markers, `member_glue` — which is P5c. Template sections are sealed;
+`TreeGlue` and `member_glue` are not (§4.6(1), §4.7d: Not built).
 
 **The feasibility gate is now enforced rather than discovered.**
 `ModelCoreProperties::can_gap_fill` is `false` for the hybrid, and
@@ -52,8 +67,11 @@ fixed and pinned in both directions.
 **The feasibility gate is met.** The live schema's only glue producer
 (`is_template` sections) is sealed, a sealed turn owns its boundaries, and the live
 opener is tail prefill, so a projection reserves no gap chunk on this lineage
-(§11a.2, §11a.2b). `TreeGlue` and `member_glue` have no production caller; on a
-model that cannot gap-fill they refuse through `reserve_glue_island`.
+(§11a.2, §11a.2b). `TreeGlue` and `member_glue` are still live-prefilled
+`Generated` producers in the code (`projection/project/emit.rs`: the
+`SectionTree` arm and `push_member_glue`) that the live schema does not use; a
+schema that did use them would reach `reserve_glue_island` on a model that cannot
+gap-fill, and that function refuses with a message naming the island.
 
 Three were found during implementation that the design got wrong, all in
 §11a: the rewind cannot be deleted the way §5.2 said, phase 5a is **not**
@@ -139,11 +157,18 @@ about the tree as it stands, not plan.
 
 ### 0a.1 The environment (verified, not assumed)
 
-- **GPU**: RTX PRO 5000 Blackwell, 73,415 MiB, ~71 GiB free. `nvidia-smi` works.
-- **The 35B checkpoint is already on disk**, at the exact revision
-  the `Model::Qwen36_35B_A3B_Q4` preset (`candle-conversation/src/models/`) pins:
+- **GPU**: RTX PRO 5000 Blackwell, 73,415 MiB, ~71 GiB free at the time of the
+  run. `nvidia-smi` works.
+- **The 35B checkpoint is already on disk.** The tier-2 gates pin it in
+  `candle-transformers/src/models/qwen35/recurrent_gates.rs`
+  (`MODEL_REPO = "unsloth/Qwen3.6-35B-A3B-GGUF"`, `MODEL_REV =
+  "a483e9e6cbd595906af30beda3187c2663a1118c"`, `MODEL_FILE =
+  "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"`), i.e.
   `~/.cache/huggingface/hub/models--unsloth--Qwen3.6-35B-A3B-GGUF/snapshots/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`
-  (22,134,528,992 bytes).
+  (22,134,528,992 bytes when measured). The `Model::Qwen36_35B_A3B_Q4` preset
+  (`candle-conversation/src/models/qwen36_moe.rs`) names the same file but pins
+  no revision (`model_rev` is empty, so it resolves `main`) and records a
+  `model_bytes` of 22,663,387,424; it does not pin the snapshot above.
 
 **So the tier-2 and tier-3 tests are NOT blocked.** An earlier pass in this run
 recorded them as "needs the 22 GB checkpoint" without checking whether it was
@@ -155,9 +180,11 @@ already there. It is. Run them.
 correctness gate (T2.1/T2.2), the feasibility gate (T5c.1), no fold regression
 on the outgoing model (T5e.4), and zend ingest/converse/restart (P9.1–P9.3).
 
-Phases 0, 1, 2, 3, 4, 5a, 5b, 5c, 5d, 5e, 7, 9 — implemented; **997
-candle-conversation lib tests green**, `clippy -D warnings` clean on the
-workspace and on the cuda crates, `fmt --check` clean.
+Phases 0, 1, 2, 3 (as §11a.1 records it), 4, 5a, 5b, 5c (template sections), 5d,
+5e, 6, 7, 9 — implemented; at the close of the run that wrote this section **997
+candle-conversation lib tests were green**, `clippy -D warnings` clean on the
+workspace and on the cuda crates, `fmt --check` clean (a record of that run, not a
+current count).
 
 Verified on real weights, not asserted:
 
@@ -166,7 +193,7 @@ Verified on real weights, not asserted:
 | P9.1 | a complete 30-layer **non-zero** snapshot per sealed turn |
 | P9.2 | state advances across nine turns; recalled a colour stated on turn 1 |
 | P9.3 | a fresh process resumes the timeline from the redo log and continues |
-| T3.4 | a discarded thinking pass leaves the sealed state **byte-identical** |
+| T3.4 | a discarded thinking pass leaves the sealed state **byte-identical** (the discard primitive; the dialogue seal no longer discards — §5.3) |
 | T3.8 | `decode_replay_probe` 0/7 dirty — the harness control is honest |
 | T1.6 | `fork_recurrent` is an independent copy, not an alias |
 | T7.6 | a fork and its parent continue identically under argmax |
@@ -202,8 +229,7 @@ measurement, and it is measurement of the research kind.
 re-opened by mistake:
 
 - The rewind is **unreachable via a capability gate**, not deleted (§11a.1).
-  `truncate_sequence_to_tokens` still exists and has legitimate non-rewind
-  callers.
+  `truncate_sequence_to_tokens` still exists and still has callers (§13).
 - P5a/P5b landed **together** and the bake is **central** in
   `Sequence::submit_prefill_unit` (§11a.2). Do not move it per-path.
 - The fold check compares **group sizes only** (§11a.1 / P5e notes). Checking
@@ -236,17 +262,17 @@ original survey and **drift**; trust the symbol and re-locate.
 
 ### 0.1 Tier A — always, whole files
 
-| file | lines | why |
-|---|---|---|
-| `AGENTS.md` (repo root) | — | the standing rules this work is bound by: no back-compat shims, no env flags, no TODOs/stubs, one concern per file, TDD, **only Edit/Write may modify files** |
-| `candle-transformers/src/models/delta_net/state_store/mod.rs` and its siblings (`layers.rs`, `store_access.rs`, `store_waves.rs`, `folding.rs`, `store_steps.rs`, `store_io.rs`, `snapshots.rs`) | 117 (`mod.rs`) | `RecurrentStateStore` — the thing being persisted, forked and restored. `export`/`import` (`store_io.rs`), `fork_from` and the `seeded` flag (`store_steps.rs`), and the wave discipline (`store_waves.rs`): one live state per layer, a short timeline of rows not yet applied, and a scratch held only while the sequence prefills (`docs/deltanet_timeline.md`). **P1, P2, P4, P7 all edit this.** |
-| `candle-transformers/src/models/delta_net/types.rs` | 71 | `DeltaNetDims`, `LayerKind` — the geometry every size calculation uses |
-| `candle-transformers/src/models/delta_net/kv_layout.rs` | 220 | `KvLayerMap` — why `session.num_layers()` is 10 and `model.num_layers()` is 40; `snap_to_attention` |
-| `candle-transformers/src/models/qwen35/batched/recurrent_state.rs` | 482 | the recurrent map, `ensure_recurrent` (the `offset == 0` reset), `take/put_recurrent`, `release_recurrent`, `fork_recurrent`, `export_recurrent`, `restore_recurrent`, the wave begin/commit/rollback |
-| `candle-transformers/src/models/qwen35/engine.rs` | 530 | `provenance_layer_indices` (already hybrid-correct), `create_session` |
-| `candle-conversation/src/turn_layout/` (`segment.rs`, `kv_span.rs`, `layout.rs`) | 39 (`mod.rs`) | `TurnSegment` / `GlueKind` / `KvSpan` / `from_flat_grid` — **the whole of §4.7 lives here**, including the `user_content_start > 0` path |
-| `candle-conversation/src/provenance/mod.rs` | 65 | the pipeline in one page: index side at seal, query side in decode |
-| `candle-conversation/src/persistence/streams.rs` | 444 | `TurnDecl` — a turn IS a stream; `segments` is the persisted layout |
+| file | why |
+|---|---|
+| `AGENTS.md` (repo root) | the standing rules this work is bound by: no back-compat shims, no env flags, no TODOs/stubs, one concern per file, TDD, **only Edit/Write may modify files** |
+| `candle-transformers/src/models/delta_net/state_store/mod.rs` and its siblings (`layers.rs`, `store_access.rs`, `store_waves.rs`, `folding.rs`, `store_steps.rs`, `store_io.rs`, `snapshots.rs`) | `RecurrentStateStore` — the thing being persisted, forked and restored. `export`/`import` (`store_io.rs`), `fork_from` and the `seeded` flag (`store_steps.rs`), and the wave discipline (`store_waves.rs`): one live state per layer, a short timeline of rows not yet applied, and a scratch held only while the sequence prefills (`docs/deltanet_timeline.md`). **P1, P2, P4, P7 all edit this.** |
+| `candle-transformers/src/models/delta_net/types.rs` | `DeltaNetDims`, `LayerKind` — the geometry every size calculation uses |
+| `candle-transformers/src/models/delta_net/kv_layout.rs` | `KvLayerMap` — why `session.num_layers()` is 10 and `model.num_layers()` is 40; `snap_to_attention` |
+| `candle-transformers/src/models/qwen35/batched/recurrent_state.rs` | the recurrent map, `ensure_recurrent` (the `offset == 0` reset), `take/put_recurrent`, `release_recurrent`, `fork_recurrent`, `export_recurrent`, `restore_recurrent`, the wave begin/commit/rollback |
+| `candle-transformers/src/models/qwen35/engine.rs` | `provenance_layer_indices` (already hybrid-correct), `create_session` |
+| `candle-conversation/src/turn_layout/` (`segment.rs`, `kv_span.rs`, `layout.rs`) | `TurnSegment` / `GlueKind` / `KvSpan` / `from_flat_grid` — **the whole of §4.7 lives here**, including the `user_content_start > 0` path |
+| `candle-conversation/src/provenance/mod.rs` | the pipeline in one page: index side at seal, query side in decode |
+| `candle-conversation/src/persistence/streams.rs` | `TurnDecl` — a turn IS a stream; `segments` is the persisted layout |
 
 Also read, from `delta_net/mix/` (do **not** read all of it):
 
@@ -434,6 +460,10 @@ re-deriving before you start.
 
 ## 1. The problem
 
+(§1–§3 state the problem as it stood when the work began: "today" in them, and in
+the "today" columns of §4.7 and §4.8, means that tree. §11a and §13 say what the
+code does now.)
+
 Three quarters of a hybrid stack's layers mix tokens through a **recurrent
 state** rather than a KV cache. Per sequence, per DeltaNet layer, that state is
 a delta-rule matrix `S [n_v_heads, d_v, d_k]` plus a causal-conv tail
@@ -491,10 +521,15 @@ More of this is built than the gap suggests. The following all exist, are
 tested, and need no new design — only callers.
 
 **Record format.** `RecordType::Snapshot = 20`, with `SnapshotPayload`
-{`timeline_id`, `turn_index`, `schedule_hash`, `Vec<SnapshotLayer>`} and a
-versioned binary codec that validates every blob length against its declared
-dims ([record/snapshot.rs](../candle-conversation/src/persistence/record/snapshot.rs)).
-Round-trip tested. The per-layer encoding already carries a **dtype tag byte**,
+{`timeline_id`, `turn_index`, `schedule_hash`, `Vec<SnapshotLayer>`, `aux`} and a
+versioned binary codec (`SNAPSHOT_PAYLOAD_VERSION = 2`) that validates every blob
+length against its declared dims
+([record/snapshot.rs](../candle-conversation/src/persistence/record/snapshot.rs)).
+`aux` is a model-opaque blob persistence carries and never decodes (Flash-Next's
+PLE cache and QSA index, via `export_aux_state`); `SnapshotPayload::retired`
+writes the empty tail that supersedes a snapshot nothing will read again. A
+version-1 record is refused rather than tolerated, and a substrate written by an
+older build recomputes. Round-trip tested. The per-layer encoding already carries a **dtype tag byte**,
 currently pinned to `0 = F32` — the designed-in extension point for §7.
 
 **Single-tail supersede.** Snapshots are keyed in the record *header* by a
@@ -650,13 +685,17 @@ enqueue:
 
 ```
 if model exposes recurrent state:
-    payload = model.export_recurrent(slot)        # new ManagedBatchedModel hook
-    conversation.enqueue_recurrent_snapshot(timeline, payload.encode())
+    (hash, layers) = model.export_recurrent(slot)   # ManagedBatchedModel hook
+    payload = SnapshotPayload { timeline, turn_index, hash, layers, aux }
+    conversation.enqueue_recurrent_snapshot(timeline, payload)
 ```
 
-`export_recurrent(slot) -> Option<SnapshotPayload>` returns `None` for a
-non-hybrid model, so the site is model-agnostic and Qwen3-30B pays nothing.
-`turn_index` is stamped from the sealing turn; `schedule_hash` from the store.
+`export_recurrent(slot) -> Result<Option<(u64, Vec<ExportedLayerState>)>>` returns
+`None` for a non-hybrid model, so the site is model-agnostic and Qwen3-30B pays
+nothing; the scheduler assembles the `SnapshotPayload` (`candle-conversation`
+depends on `candle-transformers`, not the reverse), taking `aux` from
+`export_aux_state`. `turn_index` is stamped from the sealing turn;
+`schedule_hash` from the store.
 
 **Ordering.** The snapshot must be durable no later than the turn it describes.
 `SnapshotPayload.turn_index` already carries the rule for the torn case: reload
@@ -882,6 +921,16 @@ fixed content and add no dimension, so the cost is one more sealed section per
 branch they are active in (`TreeGlue::active_keys` already says which), plus a
 one-time re-seal of everything below them — they stop being prefix-transparent.
 
+> **Not built — plan of record.** The code still emits a `TreeGlue` node as a
+> live-prefilled, prefix-transparent `ProjectionSegment::Generated` run
+> (`projection/project/emit.rs`, the `SectionTree` arm: a node with `glue` pushes
+> `Generated` when `g.active_keys` contains the branch's pack key, and never a
+> `Sealed` segment). The live schema configures no `TreeGlue`
+> (`zend/src/prompts/` holds no `glue` key), so the lineage runs; a schema that
+> added one would reach `reserve_glue_island`, which refuses when
+> `can_gap_fill` is false (`projection_assembler/walk.rs`), naming the island.
+> Sealing the glue per branch is the design a schema with `TreeGlue` would need.
+
 **(2) Checkpoint per branch, generalised over collections.** Collections are
 the combinatorial problem: their members are top-k selected at runtime, so
 their contribution to a prefix is not a fixed thing to key on.
@@ -923,7 +972,9 @@ conversation count.
 beginning a conversation is: inject the branch's sealed K/V, inject the
 selected collection members' K/V, restore the branch's DeltaNet checkpoint,
 continue. No generated runs, no gap-fill, no recompute — and §5's glue problem
-stops applying to the system prompt entirely.
+stops applying to the system prompt entirely. (2) is built (§11a.11); (1) is
+not, and the live schema needs no `TreeGlue`, so for it the start path already
+has no generated runs.
 
 ### 4.7 Turn boundary glue: bake it, don't regenerate it
 
@@ -1161,6 +1212,16 @@ The decisive argument is that on a non-glue model the alternative to an
 approximate bake is not a more accurate answer — it is a wave that refuses to
 run.
 
+> **Status.** Templates are built: `is_template` sections seal like any other
+> section (`push_section_segment` in `projection/project/emit.rs` emits `Sealed`
+> and never `Generated`; §11a.2b). **Not built — plan of record:** the baked
+> leading `member_glue` separator. The code still emits a collection's
+> `member_glue` as a live-prefilled `Generated` run before every selected member
+> but the first (`push_member_glue`), so the glue is independent of which members
+> were selected and is a gap-fill island on any schema that configures it. The
+> live schema configures none (`member_glue_tokens` is `None`), and
+> `reserve_glue_island` refuses an island on a model that cannot gap-fill.
+
 #### The glue cache stops being a cache
 
 `SlotState.glue_islands` is in-memory, per-slot, keyed by content-context hash,
@@ -1186,16 +1247,17 @@ Five producers of `ProjectionSegment::Generated` exist:
 
 | producer | after these changes |
 |---|---|
-| `TreeGlue` dialect markers (`projection/project/emit.rs`) | sealed — §4.6(1) (designed; no production caller, refused by `reserve_glue_island` on a lineage that cannot gap-fill — §11a.2b) |
+| `TreeGlue` dialect markers (`projection/project/emit.rs`) | **Not built** — §4.6(1). Still a live `Generated` run; the live schema has none; refused by `reserve_glue_island` on a lineage that cannot gap-fill (§11a.2b) |
 | turn boundary markers (the spine) | sealed — this section |
 | `is_template` sections (`projection/project/emit.rs`) | sealed against a canonical prefix — §4.7d |
-| `SectionCollection::member_glue` (`push_member_glue`, `projection/project/emit.rs`) | sealed as a leading separator — §4.7d (designed; no production caller — §11a.2b) |
+| `SectionCollection::member_glue` (`push_member_glue`, `projection/project/emit.rs`) | **Not built** — §4.7d. Still a live `Generated` run before every member but the first; the live schema configures none; refused likewise |
 | the live turn's opener (`user_start_current`) | folded into `NewUserMessage` — §4.7c |
 
-With all five resolved, a projection of system prompt + sealed turns + a live
-user message emits **zero** gap-filled glue. That is the condition for running
-this lineage at all, and it is now met by construction rather than by a
-fallback.
+With the three built producers resolved, a projection of the live schema's system
+prompt + sealed turns + a live user message emits **zero** gap-filled glue. That
+is the condition for running this lineage at all, and it is met by construction
+for the live schema; the two unbuilt producers are refused loudly rather than
+run wrong (§13).
 
 ### 4.8 Provenance signatures: derive the fold, don't hardcode it
 
@@ -1237,14 +1299,31 @@ itself passes every KV layer.)
 
 Item 4 is a prerequisite rather than part of the fold, and it is the dangerous
 one: it is not a correctness bug, so it presents as "provenance got slow on the
-new model" rather than as a disabled fast path. The design scoped it as the
-per-backing `n_palette()` mechanism that §4.2 of
-`docs/archived/qwen35_qwen38_models.md` describes for the decode kernels. What
-the code does instead (§11a.14, item 2): the band count is a property of the R16
-arena and stays `N_PALETTE` (`prov_n_palette`); what declined at 256 was the
-sign-pack kernel's word width, and it now packs a `u64`, so `prov_sub_head_dim`
-admits a sub-band up to `MAX_SUB_HEAD_DIM = 64` and a 256-wide head takes the GPU
-path with its physical banding intact.
+new model" rather than as a disabled fast path.
+
+**Built design.** The band count is a property of the R16 arena and is the
+constant `candle_nn::kv_cache::N_PALETTE = 4` (`prov_n_palette` in
+`batched_inference/provenance.rs` returns it): an R16 chunk lays each head out in
+`N_PALETTE` bands of `head_dim / N_PALETTE` dims, so a 256-wide head is 4 bands
+of 64. What declined the GPU path at 256 was the sign-pack kernel's word width,
+which packed a band into a `u32`. The kernel packs a `u64` now, and
+`prov_sub_head_dim` admits a sub-band up to
+`candle_kernels::simple::prov_sign_pack::MAX_SUB_HEAD_DIM = 64` (128 → 32-dim
+bands, 256 → 64-dim bands); a band wider than 64 returns 0 and the caller takes
+the CPU path rather than truncating.
+
+> **Replaced design.** The first design derived `n_palette` per model as the
+> smallest `p` with `head_dim / p ≤ 32` (8 bands of 32 at 256) and threaded a
+> per-backing `n_palette()` through the arena and table path, after the decode
+> kernels' per-backing mechanism (`docs/archived/qwen35_qwen38_models.md` §4.2).
+> It was rejected because the band count does not re-band the storage: at 256 it
+> made the kernel read only the low 32 dims of each physical 64-dim band and lay
+> band `p` at `p · 32` instead of `p · 64`, dropping half of every signature and
+> permuting the rest, no longer bit-identical to the CPU fold. (`n_palette()`
+> remains a per-backing method for the 16-band latent arenas,
+> `LATENT_N_BANDS`; the R16 provenance path does not use it.) The path is held by
+> `hybrid_capture_takes_the_gpu_sign_pack_path`
+> (`zend/tests/provenance_fold_real_geometry.rs`).
 
 It also could not be fixed in `prov_sub_head_dim` alone. `pack_provenance_signs`
 stamps `n_palette` into the `ProvSignPacked` it returns beside the
@@ -1265,7 +1344,7 @@ an identity on Qwen3-30B**:
 | heads per group | the model's `n_kv_head` | 4 ✓ |
 | fold sizes | `[n − 2, 1, 1]` over capture layers | `[46,1,1]` ✓ |
 | fold shift | `head_dim / 4` | 32 ✓ |
-| `n_palette` | designed as the smallest `p` with `head_dim / p ≤ 32`; shipped as the arena's `N_PALETTE` with a 64-bit pack word (§11a.14) | 4 ✓ |
+| `n_palette` | not derived: the arena's constant `N_PALETTE`, with a 64-bit sign-pack word (see "Replaced design" above, §11a.14) | 4 ✓ |
 
 `[46,1,1]` turning out to be exactly `[n−2,1,1]` is the useful one: the existing
 constant already *is* the general rule, written out longhand.
@@ -1291,6 +1370,10 @@ Two need real code rather than parameterisation:
   scorer must use the value the signature was **folded with**, not a
   compile-time constant; each now derives it from the signature's own shape
   (`heads_per_group(n_heads)`, §11a.5).
+
+  (`candle-conversation/examples/substrate_inspect.rs` still strides its
+  inspections by the locked `PROV_HEADS_PER_LAYER`, which is right for the
+  Qwen3-30B galleries it opens and wrong for a hybrid one; §13.)
 
   There was a **fourth** copy, and it was not an alias:
   `zend/examples/provenance_layers.rs` declared its own
@@ -1389,19 +1472,21 @@ cleanly:
 | 1 | `scheduler/seal_turn.rs` | `0` | post clean-seal: drop the slot's `Arc<ChunkGid>` refs, residence owns them |
 | 2 | `scheduler/turn_group.rs` | `0` | post-`Done` seal: identical housekeeping |
 | 3 | `scheduler/sections.rs` | `0` | `prepare_section_ingest` — "defensive truncate" before injecting a prefix |
-| 4 | `scheduler/projection_assembler/apply.rs`, `scheduler/reproject_prepare.rs` | `0` | free a view, clear the parent so `apply_projection`'s populated-slot guard lets the rebuild through |
-| 5 | `scheduler/projection_assembler/apply_build.rs` (`apply_segments_build`) | `0` | snapshot tail, clear, rebuild in logical order |
-| 6 | `scheduler/prefill/` | `0` | error path: reprefill failed, drop the slot's chunks |
-| 7 | `batched_inference/` (session seal quantize) | `0` | seal quantize: drop the float chunks, `inject_sealed_at_tail` the quantized ones |
-| 8 | `scheduler/` (the `<think>` clean re-prefill) | **`seal_block_from`** | `<think>` clean-reprefill: rewind to the turn boundary |
+| 4 | `scheduler/projection_assembler/apply.rs` (`cut_slot`), `scheduler/reproject_prepare.rs` | `0` (apply, nothing kept) or **`last.blocks_after`** / **`turn_start_parent_blocks`** | free a view, cut the parent back to the pieces its last assembly placed so `apply_projection`'s populated-slot guard lets the rebuild through |
+| 5 | `scheduler/projection_assembler/apply_build.rs` (`apply_segments_build`) | via `cut_slot` (row 4) | snapshot tail, cut, rebuild in logical order; it no longer calls the truncate itself |
+| 6 | `scheduler/prefill/` | — | error path: reprefill failed, drop the slot's chunks. **No caller at HEAD** |
+| 7 | `batched_inference/injection.rs` (sealed injection) | **`pre_counts[li]`** | roll every injected layer back when a later layer's `inject_sealed_at_tail` fails |
+| 8 | `scheduler/` (the `<think>` clean re-prefill) | — | **Removed:** a dialogue turn now seals with its reasoning (§5.3) |
 | 9 | [batched_inference/block_tail.rs](../candle-transformers/src/models/batched_inference/block_tail.rs) | **`pre_counts[li]`** | `reserve_glue_gap` rollback: undo a partially-reserved gap chunk |
 
-(The first column names the file that held each site in the survey. At HEAD the
-non-test `truncate_sequence_to_blocks` callers in `candle-conversation` are
-`scheduler/seal_turn.rs`, `turn_group.rs`, `sections.rs`, `reproject_prepare.rs`
-(target `turn_start_parent_blocks`) and `projection_assembler/apply.rs`
-(targets `0` and `last.blocks_after`); `block_tail.rs` and `injection.rs` call it
-in `candle-transformers`. §11a.1 says what became of the non-zero targets.)
+(The first column names the file that held each site in the survey, and the rows
+are reconciled to HEAD. The non-test `truncate_sequence_to_blocks` callers in
+`candle-conversation` are `scheduler/seal_turn.rs`, `turn_group.rs`,
+`sections.rs`, `reproject_prepare.rs` (target `turn_start_parent_blocks`) and
+`projection_assembler/apply.rs` (targets `0` and `last.blocks_after`);
+`block_tail.rs` (its session wrapper, `reserve_glue_gap`'s rollback and
+`trim_empty_tail_chunks`) and `injection.rs` call it in `candle-transformers`.
+§11a.1 says what became of the non-zero targets.)
 
 Plus the `_to_tokens` sites, which the block-count view does not see at all:
 
@@ -1413,17 +1498,27 @@ Plus the `_to_tokens` sites, which the block-count view does not see at all:
 | 13 | [batch_test/utils/reproducibility.rs](../candle-transformers/src/models/batch_test/utils/reproducibility.rs) | **`prompt_len`** | `decode_replay_probe`: roll back between replays |
 | 14 | [batch_test/utils/run_batched.rs](../candle-transformers/src/models/batch_test/utils/run_batched.rs) | **`base`** | the gate harness's repeat loop: re-prefill "from identical state" |
 
-**Sites 1–7 are not rewinds.** Every one targets zero, and every one is either
-immediately followed by a repopulation in the same operation or is the last
-thing that happens to a dying slot. Their meaning is *release these chunk
+Three more non-test `_to_tokens` callers exist at HEAD that the survey did not
+list: `models/wave_admit.rs` (the failed-wave rollback truncates every row to its
+entry length, the same repair-toward-committed-state as site 11),
+`qwen4exp/spec.rs` (the K/V truncate of the speculative rewind, after its fold of
+the three recurrences), and `latent_moe/wave/managed.rs` (`truncate_sequence`
+beside `rollback_verify_state`). The hybrid's own `truncate_sequences`
+(`qwen35/forward/managed_model.rs`) calls it for a reset and for a folded block.
+
+**Sites 1–7 are not rewinds.** Each targets zero (rows 4 and 7 a block count of
+the pieces the slot keeps or of a failed injection's own pre-inject state), and
+each is either immediately followed by a repopulation in the same operation or is
+the last thing that happens to a dying slot. Their meaning is *release these chunk
 references* / *clear so I can rebuild*, and the slot's logical content either
 does not change or is rewritten wholesale. They are safe for a recurrent model
 exactly as they stand — and they are safe **by accident**, because the slot is
 back to `offset > 0` before the next wave calls `ensure_recurrent`, so the
 `offset == 0` reset never fires on a conversation that is merely being rebuilt.
 
-**Sites 8–14 are genuine rewinds** — "put this sequence back the way it was `n`
-tokens ago" — and that is an operation a recurrent state **cannot express**.
+**Sites 8–14 were genuine rewinds** (site 8 no longer exists) — "put this
+sequence back the way it was `n` tokens ago" — and that is an operation a
+recurrent state **cannot express**.
 `S` is an accumulated sum with no per-token decomposition. There is no inverse.
 
 Only site 10 routes through `ManagedBatchedModel::truncate_sequence`, which is
@@ -1454,6 +1549,15 @@ Three of them deserve naming individually, because they are not merely unguarded
   instrument used to rule that failure mode out. Site 14 is the same defect in
   the repeat loop of `test_parallel_batched_forwarding`, whose comment likewise
   claims "every repeat is a true re-prefill from identical state."
+
+At HEAD both are fixed without removing the truncate: `decode_replay_probe`
+allocates a **fresh sequence per replay**, and the repeat loop, when it will
+repeat, takes a shadow sequence per row (`create_sequence` + `fork_recurrent` at
+the base offset), then
+rewinds the K/V with `truncate_sequence_to_tokens` and restores the state by
+`fork_recurrent(shadow, seq)` (`batch_test/utils/run_batched.rs`). The tier-2
+gate is `decode_replay_probe_is_clean_on_the_hybrid`
+(`qwen35/recurrent_gates.rs`).
 
 That last pair is why P3 cannot be scoped to the `_to_blocks` family: these are
 the two sites that fire during the hybrid's own model gates, and no assertion
@@ -1486,6 +1590,21 @@ there is no longer an API call that means it — **which is only true if the tok
 form goes too.** A phase-3 gate stated in terms of block counts would pass green
 with `truncate_sequence_to_tokens` and all four of its non-zero callers intact.
 
+> **Replaced design; the removal is not built.** The code did not delete either
+> primitive. Neither is *inexpressible*; the rewind is made *unreachable for a
+> model that cannot express it*, by capability (§11a.1):
+> `ManagedBatchedModel::carries_recurrent_state()` and
+> `can_rewind_speculative_block()`, with `speculative_decode_step_batch` refusing
+> at its entry a model that carries state and cannot rewind a block, and the
+> hybrid rewinding a verified block by **folding its timeline**
+> (`docs/deltanet_timeline.md`) instead of by a fork. The block-count parameter
+> stays, because two callers legitimately pass a non-zero count (§11a.1), and
+> `truncate_sequence_to_tokens` stays with the callers listed in §5.1 and §13.
+> The deletion this subsection describes (`truncate_to_blocks(slot, n > 0)` and
+> `truncate_to_tokens` removed, `truncate_sequence` deleted from the trait) is not
+> done: the code the design removes is still present and is recorded as open
+> items in §13.
+
 ### 5.3 Site 8 — the `<think>` clean re-prefill
 
 Today: decode the response (which advances `S` through every DeltaNet layer,
@@ -1507,6 +1626,20 @@ restore from the turn-boundary snapshot (§4.1) — it reuses machinery we are
 building anyway, but it repairs correctness after the fact rather than making
 it structural, and it needs ~63 MiB resident per live conversation (1.3 GB at
 ×20) to avoid a D2H/H2D per rewind.
+
+> **Replaced design.** The dialogue seal no longer has a clean re-prefill at all.
+> A turn seals with everything it decoded, reasoning included, and the projection
+> decides what a later turn may attend (`docs/thinking_span_projection.md`, §6.2:
+> the recurrent state keeps the reasoning permanently, because it cannot be
+> rebuilt). `enqueue_clean_turn_reprefill` and the discard arm that released the
+> view's state are gone: `scheduler/cleanup.rs` takes one disposition for every
+> turn, `move_recurrent(view, parent)`, and `release_sequence` is reached only
+> where a view's K/V is abandoned (`reproject_abandon.rs`, a failed fork, a turn
+> group case closed without keeping its state). The compression seal
+> (`seal_compression_turn`) still strips the think block and re-prefills, on a
+> scratch slot that is released. What survives of this subsection is the
+> disposition rule below, which is what chooses between the two calls, and the
+> discard primitive it was proven with (T3.4, T2.2(b)).
 
 ### 5.3a Fork-at-turn-start already exists: it is called a *view*
 
@@ -2005,12 +2138,12 @@ Each phase ends green and useful on its own.
 | 0 | §4.5 release-on-free + the recycled-slot test | leak gone; recycled slot proven clean |
 | 1 | §4.4 `fork_from` device copy | child bit-identical, distinct allocations |
 | 2 | **§5.3a views carry the state** — carve forks it, finalize moves it | a multi-turn conversation's `S` advances across turns at all |
-| 3 | §5.3 `<think>`: discard instead of rewind; §5.2 rename `_to_blocks`, **delete `_to_tokens`** and rework its four non-zero callers | no path can rewind a slot — asserted over **both** primitives; thinking turns stop skewing; the gate harness's replay control is honest on a hybrid |
+| 3 | §5.3 `<think>`: discard instead of rewind (replaced: the dialogue seal keeps its reasoning); §5.2 rename `_to_blocks`, **delete `_to_tokens`** and rework its four non-zero callers (replaced by the capability gate and the timeline fold; the deletion is §13) | no path can rewind a slot **that cannot express it**; thinking turns stop skewing; the gate harness's replay control is honest on a hybrid |
 | 4 | §4.1 writer + §4.2 distill strip | snapshots on disk; compaction keeps one, drops distilled |
 | 5a | §4.7c fold the live opener into `NewUserMessage` | no trailing gap chunk; smallest change, independent of the rest |
 | 5b | §4.7 + §4.7a/b bake turn boundaries (both ends; `no_think` split) | stream equivalence vs today, exact |
-| 5c | §4.6(1) `TreeGlue` + §4.7d `member_glue` / templates | **zero gap chunks in a full projection** |
-| 5d | §4.8(4) derive `n_palette` for head_dim 256 | GPU sign-pack path taken, not the R16 D2H fallback |
+| 5c | §4.6(1) `TreeGlue` (Not built) + §4.7d `member_glue` (Not built) / templates (built) | **zero gap chunks in a full projection** |
+| 5d | §4.8(4) the sign-pack word widened to 64 bits so head_dim 256 packs on the GPU (replaced the per-model `n_palette` derivation) | GPU sign-pack path taken, not the R16 D2H fallback |
 | 5e | §4.8(1–3) derive the fold + stamp it on the record | Qwen3-30B bit-identical; hybrid fills all three groups |
 | 6 | §4.6(2) per-branch state checkpoints + restore on cold start | a new conversation starts with the prompt in its recurrent state |
 | 7 | §4.3 resume + the seal/drop/resume oracle | a restarted conversation continues correctly |
@@ -2084,12 +2217,12 @@ overrides it** — none of them should stop work.
 | 3 | turn-scoped tombstone | **Leave the snapshot.** `turn_index` validation on resume rejects it if the recovered turns no longer reach that index. |
 | 4 | snapshot size | **Turn snapshots F32; branch checkpoints F32 too — revised, see §11a.13.** Async staging is closed by measurement (§11a.12). bf16 stays P10.5's, behind its quality gate. |
 | 5 | join semantics | Resolved: linear = move, divergent = out of scope. |
-| 6 | non-hybrid models | `export_recurrent`/`restore_recurrent`/`release_sequence` default to no-ops on the trait. Verify no other model overrides them. |
+| 6 | non-hybrid models | `export_recurrent`/`restore_recurrent`/`release_sequence` default to no-ops on the trait. Verified at HEAD: the overrides are `HybridBatched` (`qwen35/forward/managed_model.rs`) and Flash-Next (`qwen4exp/wave/delegates.rs`), both DeltaNet stacks; `latent_moe` answers `carries_recurrent_state` false (§11a.13, item 5). |
 | 7 | boundary ownership | Resolved: both ends (§4.7a). |
 | 8 | `member_glue` / templates | Resolved: bake against a canonical prefix; `member_glue` leading (§4.7d). |
 | 9 | `turn_no_think` stability | **Assume fixed once sealed, and add the test** (T3.6 below). If the test fails, fall back to leaving `NoThink` ethereal and treat it as a live-glue exception. |
 | 10 | fold shape on a hybrid | **`[n−2,1,1]` as the shipped default.** Measurement follows the switch; it does not gate it. Record the measurement as a follow-up. |
-| 11 | unstamped gallery records | **Invalidate on the rebuild.** The substrate is being rebuilt anyway, so do not carry an implicit-fold compatibility path. |
+| 11 | unstamped gallery records | **Invalidate on the rebuild.** The substrate is being rebuilt anyway, so do not carry an implicit-fold compatibility path. *(Not what the code does: `decode_wide_sigs_checked` treats a record with no stamped group sizes — the `WQS3`/`WQS4` layouts, which still decode — as "unstated" and scores it without a fold check (`fold_admits`). The compatibility path the design removes is still present; §13.)* |
 
 ## 11. TODO — the complete, ordered work list
 
@@ -2118,7 +2251,7 @@ symbol name is authoritative.
 > | P3.4 | "Remove the block-count parameter (it only ever takes 0)" is false — two callers pass non-zero legitimately. The parameter stays (§11a.1). |
 > | P3.1 | The rewind is unreachable via a capability gate, not deleted (§11a.1). |
 > | P5a | Not independently landable; landed with P5b, and the bake is central (§11a.2). |
-> | P5c | Two thirds of it has no production caller and was left alone (§11a.2b). |
+> | P5c | Two thirds of it (`TreeGlue`, `member_glue`) is not built: the live schema configures neither and the code still emits both as live `Generated` runs (§11a.2b, §4.6(1), §4.7d). |
 > | P5e.1a | Named both gather paths; **both were missed** until this campaign (§11a.6). |
 > | P6.1 | Its premise — that the state falls out of a prefill the generator already runs — is false (§11a.3b). |
 > | T5b.5 | Not implementable as written (§11a.10). |
@@ -2250,6 +2383,13 @@ symbol name is authoritative.
 ---
 
 ### P3 — delete rewind, discard instead
+
+> **Replaced design (§5.2, §11a.1).** The rewind is made unreachable by
+> capability rather than deleted. P3.1's fork-based accept is replaced by the
+> timeline fold (`docs/deltanet_timeline.md`); P3.2, P3.3, P3.4 and P3.4a
+> (deleting `truncate_sequence`, the block-count parameter and
+> `truncate_sequence_to_tokens`) are **not done**, and the code they would remove
+> is listed in §13. P3.4b–P3.4e, P3.5 and P3.6 are covered by §5.1 and §5.3.
 
 **Changes**
 - [ ] **P3.1.** `batched_inference/managed_model.rs`: rework the spec-decode accept path
@@ -2463,17 +2603,18 @@ symbol name is authoritative.
 ### P5c — `TreeGlue`, `member_glue`, templates
 
 **Changes**
-- [ ] **P5c.1.** `candle-conversation/src/projection/schema/system_prompt.rs`: give `TreeGlue`
+- [ ] **P5c.1.** *(Not built — plan of record; §4.6(1).)* `candle-conversation/src/projection/schema/system_prompt.rs`: give `TreeGlue`
       nodes sealed variants per branch they are active in
       (`TreeGlue::active_keys` already records which). They stop being
       prefix-transparent, so everything below them re-seals.
-- [ ] **P5c.2.** `SectionCollection::member_glue`: bake as a **leading**
+- [ ] **P5c.2.** *(Not built — plan of record; §4.7d.)* `SectionCollection::member_glue`: bake as a **leading**
       separator on every member's seal. Accept the spurious copy on the first
       selected member.
-- [ ] **P5c.3.** `is_template` sections (`projection/project/emit.rs`): seal against a
+- [x] **P5c.3.** `is_template` sections (`projection/project/emit.rs`): seal against a
       canonical prefix rather than emitting `Generated`.
-- [ ] **P5c.4.** Mark `SlotState.glue_islands` dead for `can_gap_fill: false`
-      models — do not leave an apparently-live cache that never fills.
+- [~] **P5c.4.** `SlotState.glue_islands` stays: it is the cache of a glue-capable
+      model, and on this lineage `reserve_glue_island` refuses before anything
+      fills it, so it holds nothing there.
 
 **Tests** (tier 1)
 - [ ] **T5c.1.** **Zero gap chunks in a full projection** — system prompt +
@@ -2503,8 +2644,9 @@ symbol name is authoritative.
       *(Both come from `prov_n_palette` / `prov_sub_head_dim`.)*
 - [ ] **P5d.2.** Thread a per-backing `n_palette()` through the arena/table path
       (the 16-band latent precedent in `arena_table.rs` and `chunked/backing/`
-      shows the shape). 128 → 4, 256 → 8. *(Not done: the R16 arena bands every
-      head into `N_PALETTE = 4`, and 256 → 4 bands of 64 dims — §11a.14.)*
+      shows the shape). 128 → 4, 256 → 8. *(Replaced design, not built: the R16
+      arena bands every head into the constant `N_PALETTE = 4`, so 256 → 4 bands
+      of 64 dims behind a 64-bit pack word — §4.8, §11a.14.)*
 - [ ] **P5d.3.** Verify `assemble_folded_prov_sigs` (`scheduler/provenance_capture.rs`)
       reads `n_palette` from the packed struct rather than the constant.
 
@@ -2781,11 +2923,16 @@ and starts being inexpressible") reached by a different route:
   refuses any other target by name.
 
 **P3.4's premise was also wrong.** "Remove the block-count parameter (it only
-ever takes 0)" is false: the clean-turn re-prefill passes `seal_block_from` and
-the glue-gap rollback passes the pre-reservation index. Both are legitimate —
-neither leaves state describing tokens the K/V no longer holds — so the parameter
-stays, documented at `batched_inference/block_tail.rs`'s `truncate_sequence_to_blocks`
-(its doc comment points at `ManagedBatchedModel::carries_recurrent_state`).
+ever takes 0)" is false: the glue-gap rollback and the sealed-injection rollback
+pass the pre-reservation and pre-inject block indexes, the reprojection rebuild
+passes the block count of the pieces it keeps (`turn_start_parent_blocks`,
+`last.blocks_after`), and when this was written the clean-turn re-prefill passed
+`seal_block_from` (§5.3). Each is legitimate — none leaves state describing
+tokens the K/V no longer holds, because the recurrent state either moved with the
+decoded blocks or never saw the chunks being released — so the parameter stays,
+documented at `batched_inference/block_tail.rs`'s `truncate_sequence_to_blocks`
+(its doc comment still names the clean-turn re-prefill as one of its two
+callers, which is stale).
 
 ### 11a.2 Phase 5a is NOT independently landable — 5a and 5b landed together
 
@@ -2963,9 +3110,12 @@ The tests document it at `wide_sig.rs`'s `the_fold_staggers_at_head_dim_256`.
   The doc has `finalize_view` move the state; but whether the turn keeps its
   decoded blocks is not known until the clean-reprefill branch has run. The view's
   state is therefore left under the view id (`finalize_view` frees the session
-  slot but not the model's map entry) and disposed of at the branch — released on
-  the clean re-prefill, moved everywhere else. Deciding it eagerly *is* the
-  `<think>` skew.
+  slot but not the model's map entry) and disposed of at the seal
+  (`pending_view_state` in `scheduler/cleanup.rs`). When it was written the
+  disposition was a branch — released on the clean re-prefill, moved everywhere
+  else, and deciding it eagerly *was* the `<think>` skew; with the clean
+  re-prefill gone (§5.3) the seal always moves, and the deferral is kept because
+  the view's K/V is still finalized first.
 - **P4.2 resolved as predicted**: the hook returns `Vec<ExportedLayerState>` +
   hash, and the scheduler assembles `SnapshotPayload`.
 - **P7's rejections log at WARN with distinguishable reasons**, as specified —
@@ -3047,10 +3197,13 @@ the derived one, and the scorer would run over two thirds of nothing.
 
 **What landed.** The fold is a field on the `Scheduler`, set once at
 construction from the model's geometry, and it is the value used for *both* the
-fold and the stamp. One source, so they cannot drift. Both capture paths call
-`fold_provenance_checked` and store nothing when the fold cannot fill all three
-groups, warning once — an all-zero group is not a weak signature, it is a
-scorer input that agrees with everything.
+fold and the stamp. One source, so they cannot drift. Both capture paths ask
+`fold_fits` once per turn (the shape is the same for every token) and fold each
+token with `fold_provenance_fitted`, storing nothing when the fold cannot fill
+all three groups and warning once — an all-zero group is not a weak signature, it
+is a scorer input that agrees with everything. `fold_provenance_checked`, the
+single-signature form that fuses the two, remains for a caller holding one
+signature and has no production caller.
 
 A second miss came out with it: the compression/summary path persisted its
 node signature with `encode_wide_sigs` — **unstamped**. An unstamped record
@@ -3386,7 +3539,8 @@ place where two derivations of the same fact were allowed to disagree.**
    (`hybrid_capture_takes_the_gpu_sign_pack_path`). A band wider than 64 still
    declines to the CPU path.
 3. **The fold-group divisor was swept everywhere but the scorer.**
-   `resolver.rs` still divided by the locked `PROV_HEADS_PER_LAYER`, reading 1
+   the projection resolver (now `projection/resolver/belief_collections.rs` and
+   `projection/belief_files.rs`) still divided by the locked `PROV_HEADS_PER_LAYER`, reading 1
    group for the hybrid's 6-head signatures — collapsing three-group late
    fusion to a single scan and making `layer_weights` address groups never
    scanned. Now `heads_per_group`, the same derivation as the capture side.
@@ -3427,6 +3581,65 @@ the same rule.
   design), §7.8 (the three invisible defects), §7.16 (F32 accumulation), §8 risk 1.
 - `docs/tool_provenance_distillation.md` — the strip-KV-keep-sigs precedent.
 - `docs/deltanet_timeline.md` — the state store's current wave discipline
-  (timeline rows, one live state per layer) and the speculative-decode rewind.
+  (timeline rows, one live state per layer), the speculative-decode rewind, and
+  (§14) the recurrent span: a long span armed for capture or replay of its scan
+  inputs.
+- `docs/thinking_span_projection.md` — why a dialogue turn seals with its
+  reasoning and the recurrent state keeps it (§5.3).
 - `docs/archived/kv_tier_migration.md` §5.6-5.7, §16.12 — resume and the redo log
   (the archived original).
+
+The archived documents are cited as history. The reasons this document relies on
+are stated where they are used: the three invisible bring-up defects are the
+Abstract's failure mode (a state that is zero, stale or mis-folded reads
+fluently), and F32 accumulation is mandatory for a live state because it is an
+unbounded running sum (§7).
+
+## 13. Not built, and open items
+
+### 13.1 Not built — plan of record
+
+- **Sealed `TreeGlue`** (§4.6(1), P5c.1): per-branch sealed variants for the
+  dialect markers, so a tree with glue runs on a lineage that cannot gap-fill. The
+  code emits the glue as a live `Generated` run; a schema using it is refused at
+  `reserve_glue_island`.
+- **Baked `member_glue`** (§4.7d, P5c.2): a leading separator sealed with every
+  collection member. The code emits it as a live `Generated` run before every
+  member but the first (`push_member_glue`); refused likewise.
+- **The truncation removal** (§5.2, P3.1–P3.4a) is not built; the code it would
+  remove is §13.2.
+
+### 13.2 Open items — code still present that a design removes
+
+- **The rewind and its primitives.** §5.2 removes them; the code keeps
+  `ManagedBatchedModel::truncate_sequence` and `truncate_sequences`
+  (`batched_inference/managed_model.rs`; overrides in
+  `qwen35/forward/managed_model.rs` and `latent_moe/wave/managed.rs`),
+  `truncate_sequence_to_tokens` (backing: `candle-nn/.../sequence_ops/tail.rs`;
+  session wrapper: `batched_inference/block_tail.rs`) and
+  `KvCache::truncate_chunked_to_tokens` (`cache/mod.rs`). Callers:
+  `qwen35/forward/managed_model.rs` (`truncate_sequences`: reset and folded
+  block), `qwen4exp/spec.rs` (the speculative rewind's K/V truncate),
+  `latent_moe/wave/managed.rs` (`truncate_sequence`), `models/wave_admit.rs` (the
+  failed-wave rollback), `alloc/ensure_layout.rs` (`heal_tail_divergence`), and
+  the gate harness (`batch_test/utils/`). The non-zero
+  `truncate_sequence_to_blocks` callers are `scheduler/reproject_prepare.rs`
+  (`turn_start_parent_blocks`) and `scheduler/projection_assembler/apply.rs`
+  (`last.blocks_after`), beside the rollbacks in `block_tail.rs` and
+  `injection.rs`. The hybrid's own rewind is the timeline fold, not a fork.
+- **A stale doc comment**: `block_tail.rs`'s `truncate_sequence_to_blocks` still
+  names the clean-turn re-prefill as a caller (§5.3).
+- **Unstated provenance records still score.** `decode_wide_sigs_checked`
+  admits a record whose fold group sizes are `0` (`WQS3`/`WQS4`, which still
+  decode) without a fold check; §10 decision 11 invalidates them.
+- **`substrate_inspect`** (`candle-conversation/examples/`) strides by the locked
+  `PROV_HEADS_PER_LAYER` rather than the signature's own `heads_per_group`.
+- **`DiagRun::inject` and reply records** no longer exist; the span arms they
+  used remain and are documented in `docs/deltanet_timeline.md` §14.
+
+### 13.3 Open measurements
+
+P10.1 (the fold shape on the hybrid), P10.2 (attention-only capture quality),
+P10.4 (the zero-glue and baked-boundary ablation), P10.5 (bf16 snapshots) and
+P10.6 (three state forks a turn, ~188 MiB/turn) are experiments, not code
+(§11a.12).

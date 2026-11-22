@@ -561,11 +561,10 @@ impl RegionPool {
     /// # Why the present, and not a forecast of it
     ///
     /// This answered against a sliding-window maximum of past KV demand for as
-    /// long as the boundary has existed, on the reasoning §7a of
-    /// `docs/archived/elastic_vram_partition.md` states outright: *"fast to
-    /// concede, slow to take: being short of KV **fails a forward**, being short
-    /// of experts is a slowdown, and the two are not worth trading
-    /// symmetrically."* The mark was insurance, and the asymmetry was the
+    /// long as the boundary has existed, on the reasoning that the weight side
+    /// should be fast to concede and slow to take: being short of KV **fails a
+    /// forward**, being short of experts is a slowdown, and the two are not
+    /// worth trading symmetrically. The mark was insurance, and the asymmetry was the
     /// premium.
     ///
     /// **Being short of KV no longer fails a forward.** [`set_ground_broker`]
@@ -593,10 +592,9 @@ impl RegionPool {
     /// not. There is no estimate left to make.
     ///
     /// The one quantity genuinely in the future — persistence's quantize
-    /// destinations — is what `slack` is for, and it stays. `docs/archived/
-    /// elastic_vram_partition.md` §13b records that trying to replace *that* with
-    /// an exact figure was refuted, for the good reason that the thing it
-    /// estimates has not happened yet.
+    /// destinations — is what `slack` is for, and it stays. Replacing *that*
+    /// with an exact figure was tried and refuted, for the good reason that the
+    /// thing it estimates has not happened yet.
     ///
     /// The two guards below survive because they are statements about now rather
     /// than predictions: a workload that has never run, and a KV side visibly on

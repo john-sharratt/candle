@@ -98,8 +98,7 @@ impl BackingInner {
     /// Sizing follows the job list rather than storage, which is also what
     /// makes the cross-layer persist selection cheap: layers concatenate with
     /// no arena-index rebasing, and the table grows with chunks actually being
-    /// selected instead of with the arena count (`docs/archived/arena_unification.md`
-    /// E5). An empty job list yields an empty table.
+    /// selected instead of with the arena count. An empty job list yields an empty table.
     ///
     /// The whole build happens under ONE storage read — never two. A split read
     /// (bound under one lock, pointers under another) lets the scheduler

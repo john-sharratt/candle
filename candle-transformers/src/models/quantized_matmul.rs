@@ -67,7 +67,7 @@ pub fn dense_destination_for(
 /// holds its ground for the life of the process. That is right for a resident
 /// tensor and wrong for one the caller is only materialising in order to copy it
 /// somewhere else — the layer-streaming pack build
-/// (`docs/archived/qwen38_layer_streaming.md` §12.2) repacks each layer, writes its
+/// repacks each layer, writes its
 /// record and lets it go, and claiming span ground for all 64 would defeat the
 /// point: the model does not fit, which is why the pack exists.
 ///

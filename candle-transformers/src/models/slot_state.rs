@@ -138,8 +138,7 @@ impl KvHeadHost {
     /// - `k_fmt_data` / `v_fmt_data`: per-head band format tags (`N_PALETTE`
     ///   bytes each), read from the **chunk**. The arena is consulted only for
     ///   the band's address: under size classes a region holds whatever fits
-    ///   its stride and cannot say how to decode a slot
-    ///   (`docs/archived/arena_unification.md` principle 8).
+    ///   its stride and cannot say how to decode a slot.
     #[allow(clippy::too_many_arguments)]
     pub fn from_gids(
         head_idx: usize,

@@ -112,7 +112,8 @@ artifact.
 | Design feature (mock method) | Backend today | Phase-2 work |
 |---|---|---|
 | Sidebar list + hydrate (`seedConversations`) | ✅ `GET /v1/conversations`, `GET /:id` | Map `label→title`; add `updated_ms` if missing |
-| Archive/unarchive | ✅ | none |
+| Archive | ✅ `POST /:id/archive` | none |
+| Unarchive | ❌ no route (decision 11, not built) | none until built |
 | Streaming tokens + status (`streamChatCompletion` `onToken`/`onStatus`) | ✅ SSE | none |
 | `<think>` / `<tool_call>` rendering | ✅ inline in content | frontend-only |
 | Composer opts `{think, effort, verbosity}` | ❌ not in request | extend request + named-section directives + `/no_think` (§2.2) |
@@ -196,8 +197,13 @@ subscribeLogs(onLine) -> unsubscribe()              // live stream
 `handlers (chat) = { onStatus(text), onToken(delta), onProjection(span), onPart?(event), onPrefill?({done, total}), onLog?(), onError?(message), onDone() }`.
 
 **The GUI reads a reply as its parts, never as markup**
-(`zend/src/parts.rs`, `docs/archived/zen_coding_session_fixes.md` Cause 1b). The daemon
-splits each reply on the server with the rule the grammar closes values on
+(`zend/src/parts.rs`). The reason: a page that searched the streamed text for
+tags had the blind spot of the decoder it mirrored (a value holding a closing
+tag such as `</parameter>` ended its call early on the page while the grammar
+read it whole), paired results to calls by position so one unreadable call
+shifted every later result, and drew failed rounds as progress
+(history: `docs/archived/zen_coding_session_fixes.md`, Cause 1b). The daemon
+therefore splits each reply on the server with the rule the grammar closes values on
 (`candle_conversation::stencil::element_close`): `onToken` carries only the
 reply's prose, and `onPart` (the SSE `part` event, on a request that names its
 conversation in `x-tokera-conversation`) carries its reasoning and calls:
@@ -540,8 +546,8 @@ imports at top, raw-byte/shape assertions in tests, no stubs.
 
 ### 2.1 Adapter for existing endpoints + conversation-state realities
 Implement in `zend-api.live.js`: `seedConversations`/`getConversation`
-(`GET /v1/conversations`, `GET /:id`), `archiveConversation`/
-`unarchiveConversation`, `streamChatCompletion` token+status path (parse SSE:
+(`GET /v1/conversations`, `GET /:id`), `archiveConversation`
+(one-way; no `unarchiveConversation` is built, decision 11), `streamChatCompletion` token+status path (parse SSE:
 named `status` events + OpenAI chunk deltas, stop on `[DONE]`), `subscribeLogs`
 (`/ws/logs`). Projection/substrate/files methods still throw "not implemented".
 
@@ -557,7 +563,7 @@ This sub-step also fixes the prototype's fully-loaded-local-state assumptions
   conversation (guard with a `loaded` set) and folds in history. (§11 item 3)
 - **Server-split bubbles.** `GET /:id` returns clean `{role,content}[]`
   (decision 9); the adapter does no ChatML parsing. (§11 item 4)
-- **API-backed mutations.** Archive (and the new restore), delete-file, and
+- **API-backed mutations.** Archive (restore is decision 11, not built), delete-file, and
   conversation creation go through the API with optimistic update + rollback on
   failure — they are not local-only. (§11 item 6)
 - **Title reconcile.** A periodic `GET /v1/conversations` refresh updates titles
@@ -792,7 +798,7 @@ The composer placeholder, for reference, should read:
 - **No TODOs/stubs in committed code:** the only intentional "throw not
   implemented" is `zend-api.live.js` methods *during Phase 1*, and they are all
   replaced by the end of their Phase-2 sub-step — none survive Phase 2.7.
-- **Commits need explicit approval**, each one (AGENTS.md).
+- **Commit and push finished work without asking** (AGENTS.md).
 
 ### Tooling note (Playwright)
 Playwright is a dev/test-only dependency (not embedded, not shipped, not a build
@@ -880,7 +886,7 @@ These were settled during planning and are now binding for the sections above:
     the user turn — already understood by the model and already stripped on
     hydrate by the splitter (decision 9). No new inference plumbing. (This refines
     decision 3's "inference hook" to the concrete existing mechanism.)
-11. **Unarchive UI** — *Not built.* The design adds a restore affordance to
+11. **Unarchive UI** — **Not built** (plan of record). The design adds a restore affordance to
     archived rows (shown under "Show archived") calling
     `POST /v1/conversations/:id/unarchive`; the daemon serves no such route and
     the adapter's `archiveConversation` is one-way (§2.1).
@@ -898,6 +904,8 @@ These were settled during planning and are now binding for the sections above:
 ---
 
 ## 10. Milestone checklist
+
+The boxes record the plan's order; the built state is §12, which governs.
 
 - [ ] **P0** seam + Playwright harness + green smoke test; design files in repo.
 - [ ] **P1.1–1.10** GUI on mock, each with green specs; old UI replaced.
@@ -926,7 +934,7 @@ fully-loaded local data, but the daemon serves it lazily and by reference.**
 | 3 | `selectConv` never hydrates; no `getConversation` call. | Lazy hydrate on first select, guarded by a `loaded` set. | §2.1 |
 | 4 | `GET /:id` returns full stored ChatML turns; UI expects per-role bubbles. | **Server-side split** (decision 9): daemon returns clean `{role,content}[]`. | §2.1, decision 9 |
 | 5 | Numeric ids + strict `===`; new convs = `Date.now()`. Live ids are strings → silent breakage. | String ids throughout; `crypto.randomUUID()` for new `conv_id`. | §2.1 |
-| 6 | Archive, delete-file, conv-creation are local-only (no API call). No unarchive UI. | API-backed mutations w/ optimistic update + rollback; **add restore** (decision 11). | §2.1, §2.5, decision 11 |
+| 6 | Archive, delete-file, conv-creation are local-only (no API call). No unarchive UI. | API-backed mutations w/ optimistic update + rollback; **add restore** (decision 11, not built). | §2.1, §2.5, decision 11 |
 | 7 | Dot color/keying assume numeric 1-based unique span ids. | Span id = `ProjectionSel.seq` (numeric, monotonic, stable). | decision 8 |
 | 8 | Viewer/Download read `fv.content` inline; live list is metadata-only. | Fetch content on viewer open via `GET …/files/:fileId`; cache on the FileMeta. | §2.5 |
 | 9 | `thinkEnabled` state + `thinkBg/thinkColor/toggleThink` view fields are dead (no toggle; folded into effort=Off). | Drop the dead `think*` fields in the rebuild; no-think = `/no_think` (decision 10). | §2.2, decision 10 |
@@ -959,7 +967,8 @@ decisions; 12 is a perf guard.
 - **Daemon harness** `zend/tests/gui_api_harness.rs` — boots the real model-less
   router over HTTP/WS (decision 7) + the substrate 503 contract. ✅ 3/3.
 - `zend-api.live.js` adapter for every endpoint that exists today (conversations,
-  archive/unarchive, chat SSE token+status, logs WS, **windowed substrate**) +
+  archive, chat SSE token+status, logs WS; the windowed-substrate method was
+  replaced by the projection-detail routes, §2.4) +
   async-tolerant UI boot.
 
 - **Conversation files (§2.5) — complete.** `conv_files` storage core

@@ -14,13 +14,17 @@ decode floor into ~2.4+ tokens per forward with no change to the output distribu
 **The entire drafter is implemented and GPU-validated on the real 10.9 GB weights**
 (`latent_moe/dspark.rs`, `latent_moe/attention.rs`, `latent_moe/transformer.rs`): the
 `dflash` config; the complete loader (every tensor); the context encoder `encode_context`
-(Eq. 2); the bit-exact Markov bias + confidence math (Eqs. 5, 7); the **backbone**
+(Eq. 2); the Markov bias + confidence math (Eqs. 5, 7); the **backbone**
 (`Attention::forward_injected` — non-causal latent MLA with `Hctx` injected via `wkv`;
 `Block::forward_injected`; `DsparkDrafter::backbone` — mHC expand → 3 injected blocks →
 `output_hc` head-reduce → `output_norm`); the **semi-autoregressive sampler** `sample_block`
-(Eq. 4 + Alg. 1); and `DsparkDrafter::draft` tying it all together. 10 tests (6 CPU bit-exact,
-4 download) + an on-GPU real-weight test that loads the drafter and runs the 3 injected blocks
-→ finite hidden `[5,4096]`. The engine plumbing (§4.3-4.5) is in place: the wave stashes the
+(Eq. 4 + Alg. 1); and `DsparkDrafter::draft` tying it all together. `dspark.rs` carries 7 unit tests
+that need no weights (the Markov bias against a hand-computed vector — exact equality — its
+orientation robustness and shape refusal, the sequential sampler, the confidence schedule, the device
+sampler against the host reference, and the confidence head, compared to 1e-6) and 5 `#[ignore]`d tests:
+two CPU benches (`bench_cpu_expert_matmul_floor`, `bench_cpu_router`) and three that read the real GGUF
+(`inspect_real_dspark_sizes`, `compare_dspark_vs_target_experts`, and `real_dspark_loads_and_runs_on_gpu`,
+which loads the drafter and runs the 3 injected blocks → finite hidden `[5,4096]`). The engine plumbing (§4.3-4.5) is in place: the wave stashes the
 target's hidden states at `dflash.target_layers` per sequence (`target_feat`) to feed `draft()`,
 `draft()` takes the target's shared `token_embd`+`output.weight`, and `begin_verify` /
 `end_verify` / `truncate_sequence` (`latent_moe/wave/managed.rs`) run the verify/accept/rollback
@@ -28,12 +32,18 @@ loop against the target — where real acceptance (and the residency go/no-go, �
 is DSpark verified against the real GGUF — **not** the V3-MTP `eh_proj` recurrence an earlier
 draft of this doc assumed.
 
+**Reach.** The drafter is attached with `Engine::load_with_drafter` + `BatchedEngine::with_drafter`
+(the drafter loads into the dense tier before the span reservation, so it is a permanent resident the
+reservation measures around). The scheduler's load path (`load_arch.rs`) calls `Engine::load`, which
+attaches none, and `DsparkDrafter::load` refuses a device of 64 GiB or less; see Open items.
+
 ---
 
 ## 1. Why this pays off *here* specifically
 
 Our single-session decode is **not compute-bound** — it is bound by the WDDM per-launch
-overhead (`~74 ms/token` floor; see `docs`/memory `wddm-forward-floor`). Every token pays
+overhead (a `~74 ms/token` floor measured early in the port; the release-build plain wave in
+`wave/speculative.rs`'s cost-ratio comment is ~112 ms single-session on the dev box). Every token pays
 one full forward's worth of kernel-launch + submission latency regardless of how little
 compute the forward actually does.
 
@@ -51,8 +61,8 @@ k=3 is the sweet spot the vLLM recipe ships (`{"method":"mtp","num_speculative_t
 The table is the **static** yield; §4.2 makes the draft length **adaptive** on the drafter's
 confidence, which is measured to add ~1.4× on top of static speculation (vLLM DSL) by not
 wasting draft launches on tokens that will be rejected. Effective decode floor drops from
-~74 ms/token to **~74/2.39 ≈ 31 ms/token** *before* the adaptive gain — and the draft is one
-transformer block, not 43.
+~74 ms/token to **~74/2.39 ≈ 31 ms/token** *before* the adaptive gain — and the draft is three
+transformer blocks, not 43.
 
 **The catch, stated up front:** the drafter is a full decoder block with MoE routing, so
 each draft pass adds MoE launches on top of the verify forward's 43 layers. Neither side
@@ -62,8 +72,15 @@ drafter's all-resident MoE (`dspark_experts.rs`: `moe_bucketize` + a device-resi
 table into `grouped_qmatmul_dev_q8a128`) never leaves the GPU. What remains is launch
 overhead, and the confidence-gated draft length (§4.2) only spends it while the drafter is
 sure. §6 makes measuring this the first gate — if draft launch overhead still eats the win,
-we raise `τ` / lower `k_max` or drop to the n-gram drafter (§7), but the arithmetic above
-says we have comfortable margin.
+the levers are `τ` (a code constant, §4.2), `k_max` or the n-gram drafter (§7).
+
+**Measured (release build, single session, from the cost-ratio comments in `wave/speculative.rs`):** a
+drafted step costs about 238 ms against about 112 ms for a plain wave — a ratio of about 2.1 — so
+drafting wins only when the accepted tokens per step exceed it; the run counted 20.7 tok/s at 4.92
+accepts, 2.32× greedy. The break-even grows with cohort width (about 5.4 accepts at width 8), because a
+plain wave amortizes its launch floor across sessions while each drafted step pays a serial drafter
+forward per session. This is why the built driver gates drafting on a rolling acceptance EMA (§4.2)
+rather than always speculating.
 
 Output is **bit-for-bit the base model's greedy output** (verify uses the true model; drafts
 only propose). This is a pure throughput change, not a quality trade — the same property
@@ -208,10 +225,11 @@ draft fewer — at zero, do a normal decode."
     the cycle always runs; τ and the drafter's confidence decide its depth.)
   - `d = k_max` in confident, low-entropy regions (boilerplate, repeated structure) ⇒ full
     4-token draft, most of it accepted.
-- **τ selection:** vLLM DSL's default range is **0.4–0.6**; model- and workload-dependent, so we
-  calibrate it on our fixtures against effective ms/token (§6, measurement 5). The calibrated
-  value is the constant `DSPARK_TAU = 0.3` in `latent_moe/wave/speculative.rs::draft_one`. It is a
-  single scalar, **not** a per-path feature flag.
+- **τ selection:** vLLM DSL's default range is **0.4–0.6**; the value here is
+  `DSPARK_TAU = 0.3`, a function-local `const` in `latent_moe/wave/speculative.rs::draft_one` that is
+  passed to `DsparkDrafter::draft(…, tau)`. It is hard-coded: no config, environment variable or
+  per-session setting changes it, and it is a single scalar, **not** a per-path feature flag. The
+  sweep over `TAU` named in §6 measurement 5 is therefore done by editing the constant, not at runtime.
 - **Cost control around τ (built):** `draft_one` also gates on a per-sequence rolling
   acceptance EMA (`SpecStats`, `SPEC_EMA_ALPHA = 0.25`): below `SPEC_MIN_ACCEPT = 2.3`
   accepted tokens per drafted step (plus 0.45 per extra session in the cohort) the drafter is
@@ -224,11 +242,11 @@ draft fewer — at zero, do a normal decode."
   per-launch WDDM cost we're most exposed to is spent only when it pays. For Zen Code the
   local predictability is strongly bimodal, so adaptive depth is a large lever, not a marginal
   one.
-- **Variant (noted, not v1):** stop on the *cumulative* product `∏ c_j < τ_chain` (probability
-  the whole remaining chain survives) rather than per-step `c_j`. Stricter; worth an ablation
-  once per-step is measured. EAGLE-2's confidence-driven *draft tree* (multi-branch) is a
-  further step but needs a tree-causal-mask verify kernel we don't have — out of scope; the
-  linear chain here is the "keep 1–4 that converge" shape.
+- **Cumulative, not per-step:** the built schedule stops on the *cumulative* product `∏ c_j < τ`
+  (the probability the whole chain so far survives), not on the per-step `c_j`
+  (`confidence_schedule_picks_prefix_by_cumulative_product`). EAGLE-2's confidence-driven
+  *draft tree* (multi-branch) is a further step but needs a tree-causal-mask verify kernel we don't
+  have — **Not built**; the linear chain here is the "keep 1–4 that converge" shape.
 
 ### 4.3 The verify step: decode-shaped block rows + hidden readout
 
@@ -307,8 +325,12 @@ Four pieces of state, three already truncatable:
 1. **Raw SWA arena (main model)** — the verify wave writes the `d+1` latents from the host
    before each layer's launch, commits their length on the host (`set_len`), and marks the
    cached decode slot buffer with `mark_decode_writer_stale`, so the header build's sync
-   re-serialises it — a commit made outside the decode kernel must, see
-   `../archived/deepseek/deepseek_perf_optimization_report.md` ("the live buffer's one invariant"). On accept length `m ≤ d+1`, roll back with
+   re-serialises it. The reason: the decode kernel is the only writer that advances the serialised
+   buffer's write length (on the device, one token per step); a block committed by the host advances
+   only the host's count, so without the mark the next decode step writes its token over a committed slot
+   and leaves the counted slot unwritten, reading whatever it last held (another sequence's KV once slots
+   recycle). History: `../archived/deepseek/deepseek_perf_optimization_report.md` ("the live buffer's
+   one invariant"). On accept length `m ≤ d+1`, roll back with
    `truncate_sequence_to_tokens(seq, p+m)` (`candle-nn/src/kv_cache/chunked/sequence_ops/tail.rs`, with the session-level
    token-granular wrapper in `batched_inference/block_tail.rs`) + `set_sequence_offset`
    (`batched_inference/stats.rs`). **Present.**
@@ -380,13 +402,17 @@ machines, where the gated tests look): no daemon runs DeepSeek, so the hosts' mo
 - **Config + loader** (`latent_moe/dspark.rs`). `DsparkConfig::from_gguf` parses the `dflash.*`
   metadata through the existing `config_from_gguf` (arch = `dflash` ⇒ `n_layers` =
   `dflash.block_count` = 3) plus `block_size` and `target_layers`. `DsparkDrafter::load` loads
-  the 3 backbone blocks via `load_block`, the `markov_w1/w2` head, `output_norm`, and the
-  optional confidence head. The shared `token_embd` + `output.weight` are **not** in the file —
+  the 3 backbone blocks (attention + norms, `load_dspark_block`), the drafter's routed experts, the
+  `markov_w1/w2` head, `output_norm`, and the optional confidence head. The experts are a different
+  shape from the target's: all 3 × 256 are requantized at load (MXFP4 → f32 → `Q2_KO`, about 5 GiB) into a
+  permanently VRAM-resident set (`DsparkStreamingMoe`, `dspark_experts.rs`), and
+  `resident_slots_for_vram` returns a slot count only above 64 GiB of VRAM — below that `load` errors and
+  speculative decode is disabled. The shared `token_embd` + `output.weight` are **not** in the file —
   the drafter reuses the target's. No env flag, no dual path: the drafter loads iff the file is
-  present.
-- **Pure math, unit-tested bit-exact** (`dspark.rs` tests): `MarkovHead::bias` = `W₁[prev]·W₂`
-  (Eq. 5) against a hand-computed reference, orientation-robust to either GGUF storage layout;
-  `ConfidenceHead::confidence` = `σ(wᵀ[h; W₁[prev]])` (Eq. 7).
+  present and the device clears the VRAM gate.
+- **Pure math, unit-tested** (`dspark.rs` tests): `MarkovHead::bias` = `W₁[prev]·W₂`
+  (Eq. 5) against a hand-computed reference by exact equality, orientation-robust to either GGUF storage
+  layout; `ConfidenceHead::confidence` = `σ(wᵀ[h; W₁[prev]])` (Eq. 7), compared to 1e-6.
 
 The backbone `draft()` forward with target-feature extraction + KV injection (§4.1), and the
 verify/rollback/accept wiring in the wave (§4.3-4.5), are built on top of this load
@@ -399,9 +425,16 @@ verify/rollback/accept wiring in the wave (§4.3-4.5), are built on top of this 
 Following repo convention — build tests with the code, assert raw bytes for codec/kernel
 pieces, not tolerances.
 
+_Where each is gated: 1 by the `dspark.rs` unit tests and its real-weight load test (§0); 2–3 by
+`wave_speculative_step_is_lossless` (verify + accept + rollback with known tokens) and
+`snapshot_restore_replay_matches_clean_absorb` (`latent_moe/compressor/tests_incremental.rs`, the
+compressor state round trip); 4 by `wave_speculative_step_with_drafter_is_lossless`; 5 is the report of
+`wave_speculative_speedup_with_drafter` and `wave_speculative_realtext_acceptance`. All of
+`tests_speculative.rs` needs the real weights and is `#[ignore]`d._
+
 1. **Markov / confidence math** (`dspark.rs`, **done**): `MarkovHead::bias` = `W₁[prev]·W₂`
-   (Eq. 5) bit-exact against a hand-computed reference, orientation-robust; `ConfidenceHead`
-   = `σ(wᵀ[h; W₁[prev]])` (Eq. 7). **Loader** (skip-when-absent, like the existing real-GGUF
+   (Eq. 5) exactly equal to a hand-computed reference, orientation-robust; `ConfidenceHead`
+   = `σ(wᵀ[h; W₁[prev]])` (Eq. 7), compared to 1e-6. **Loader** (skip-when-absent, like the existing real-GGUF
    tests): `DsparkConfig::from_gguf` yields `block_count = 3`, `block_size = 5`, non-empty
    `target_layers`; `DsparkDrafter::load` loads 3 blocks + `markov_w1/w2` + `output_norm`.
 2. **Verify == per-token decode**: a K-token verify row-group over `[t, d_1, d_2]` must be
@@ -472,3 +505,25 @@ pieces, not tolerances.
    the measurement shows the per-virtual-slot KV re-stream is material: a decode-derived kernel
    that packs the `d+1` verify tokens (one KV-tile load for all) and adds the `(d+1)²` causal
    diagonal (§4.3, §7). Do **not** build speculatively — the measurement decides whether it pays.
+
+---
+
+## Open items
+
+1. **The conversation engine never attaches the drafter.** `load_arch.rs` calls `Engine::load` and
+   `BatchedEngine::new`; only the gates call `Engine::load_with_drafter` and `BatchedEngine::with_drafter`.
+   Speculative decode is reachable through the generic driver and the tests, not through the scheduler.
+2. **The VRAM gate excludes two of the three dev machines.** `resident_slots_for_vram` returns a slot
+   count only above 64 GiB, so the 16 GB and 24 GB cards never load the drafter; the 72 GB machine does.
+   Whether a smaller resident fraction pays on those cards is unmeasured.
+3. **Not built:** the modified-rejection sampling arm (§4.4, greedy only), batching the per-session
+   drafter forwards (§4.6), the token-packed extended-decode verify kernel (Phase 5), and the
+   confidence-driven draft tree (§4.2).
+4. **No speculative-specific results row.** The measurement gates exist
+   (`wave_speculative_speedup_with_drafter`, `wave_speculative_realtext_acceptance`); the 2.4-token and
+   ~31 ms/token figures in §1 are the paper's static yield and a projection, not measurements on this
+   engine. The engine's DeepSeek throughput on the RTX PRO 5000 (72 GB) is in `docs/performance.md`
+   (row I12, §3.7: ×1 warm 319.0 prefill / 18.9 decode t/s, ×16 1,177.1 prefill / 114.4 aggregate decode,
+   build `21c36efbd`, 2026-10-10), which does not say whether the drafter was attached. The measured
+   drafted-versus-plain ratios (238 ms vs 112 ms, break-even ≈ 2.1 at width 1 and ≈ 5.4 at width 8) live
+   only in the `speculative.rs` constant comments.

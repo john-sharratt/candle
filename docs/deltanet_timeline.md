@@ -3,8 +3,13 @@
 **Status:** implemented (2026-10-18, branch `more_tuning`), after a full audit
 against the code (2026-10-17, §11) with its open questions decided (§12). §13 records
 what the implementation settled that the design left open, and what it measured.
-Where the code and this document disagree, this document is the authority until it
-is amended.
+§14 describes the span arms that capture and replay a long span's scan inputs.
+Sections 1–12 are written as the change from the previous double-buffered design
+with a rewind stash: "today" and "removed" in them name that previous design, which
+no longer exists in the code (verified against the tree 2026-11-22: `VerifyStash`,
+`replay_stack.rs`, `SlotTenant::RewindStash`, `layer_state_rewind` and both
+`affordable_draft_budget`s are gone). Where the code and this document disagree,
+the code is the design and this document is amended.
 
 **Scope:** the Gated DeltaNet recurrent state of every hybrid model —
 `qwen35`/`qwen36`/`qwen38` (`models/qwen35/`) and Qwen3.8-Flash-Next
@@ -90,14 +95,18 @@ forward-substitution solve. Every term is anchored at `S_0`.
 The row quantities of row `t` — `G[t]`, `k[t]`, `v_new[t]` — depend only on rows
 `0..=t`, bit for bit, whatever the span's length (audited, §11.1):
 
-- **`G`:** the Hillis–Steele scan adds slot `t − off` into slot `t` at each
-  doubling; lanes at or past `len` start at zero and only feed higher lanes; at
-  `off = 32` every lane adds `+0` (`delta_net_short_span_kernel.cuh`, the `G` scan;
-  the three-kernel scan in `delta_net_prefill_kernel.cuh` does the same).
+- **`G`:** warp 0 of the block runs the Hillis–Steele scan over the chunk's 64
+  slots with `__shfl_up_sync`: lane `t` adds lane `t − off` at each doubling, lanes
+  at or past `len` start at zero and only feed higher lanes, and slots past 31 only
+  ever feed slots past 31, so the 32 lanes carry every slot a row reads; at
+  `off = 32` the shuffle distance wraps to 0 and no lane is at or past `off`, so
+  every lane adds `+0` exactly as the three-kernel intra pass does
+  (`delta_net_short_span_kernel.cuh`, the `G` scan; `delta_net_prefill_kernel.cuh`).
 - **Conv and norm:** each row's window is a fixed `j`-ascending chain over its own
   inputs, and the l2-norm tree is per row (`delta_net_short_span_kernel.cuh`).
 - **`A` and `kq`:** entry `(i, j ≤ i)` is one d-ascending FMA chain over rows `i`
-  and `j`, times `e^{G[i] − G[j]}` (`delta_net_short_span_kernel.cuh`).
+  and `j`, times `expf(min(0, G[i] − G[j]))`; the last two warps of the block take
+  the grid, one entry per thread (`delta_net_short_span_kernel.cuh`).
 - **The solve:** `x[i] = b[i] − Σ_{j<i} A[i][j] · x[j]`, reading only rows `j < i`;
   `len` only stops the loop (`delta_net_short_span_kernel.cuh`).
 - **`v_new[t]`:** `u[t] − w[t] · S_0ᵀ` — `len` is only a guard (`delta_net_short_span_kernel.cuh`).
@@ -738,3 +747,137 @@ hub's, not the timeline's: an eager segment ran on the compute stream, unordered
 launch on a capture stream held across the flush before it. Eager segments run on the
 capture stream now (`decode_graphs.md` §2.1.1), and the gate passes all ten rows with the
 library's learn/trial/lock in place.
+
+## 14. Span arms: capturing and replaying a long span's scan inputs
+
+A long span (more than `R` rows, §7) can be **armed** so that the scan inputs it
+consumed are copied out (a **capture**), or so that another conversation's saved
+inputs are run through its entering state in place of its own (a **replay**). The
+mechanism is model-level and knows nothing about the content of a span. Qwen3.8
+Flash-Next (`qwen4exp`) implements it; every other model reports the arm as
+unsupported (the `arm_recurrent_span` default in
+`batched_inference/managed_model.rs`).
+
+### 14.1 Why the rows are the scan's inputs and not the timeline
+
+The timeline (§4) stores `G`, `k` and `v_new = β·(v − S·k)`. `v_new` is the
+correction against the state it was computed on, so folding it is exact only onto
+that same state. A row set meant to be applied to another conversation's state must
+therefore be state-independent: it stores what the fused prefill scan reads for the
+row — the convolved `[Q|K|V]` row (`qkv`, `conv_dim` wide), and the raw gate
+projections `alpha` and `beta` (`n_v_heads` wide each, before the bias, softplus and
+sigmoid). The scan derives `g`, `β`, `k` and the correction from these and the
+layer's own weights, so replaying the rows against a different `S` recomputes the
+correction against that `S`. `Q` rides along so the scan runs unchanged on its
+fused `[Q|K|V]` layout, which keeps one scan rather than a variant reading `K` and
+`V` alone.
+
+The rows are kept BF16 (the narrowing is the storage format's, by design) and
+widened to the F32 the scan reads when uploaded. On Flash-Next that is 10,336
+values per token per layer, 744 KB a token over its 36 DeltaNet layers; a stored
+record of a 28-token reply measured ~20.8 MB, which is why records of this kind
+are not kept (§14.5).
+
+### 14.2 The rows and the arm
+
+`delta_net/span_rows.rs`: `SpanRows` is one layer's rows on the device (`qkv`,
+`alpha`, `beta`, F32); `ReplyRows` is a span's rows across every DeltaNet layer as
+kept (BF16), with `from_device`, `to_device` and a byte blob: `"RRC1"`,
+`n_layers u32`, `n_tokens u32`, `conv_dim u32`, `n_v_heads u32`, the layer indices
+`[n_layers] u32`, then per layer `qkv`, `alpha`, `beta`, each token-major BF16,
+little-endian. `decode` refuses a short or foreign blob.
+
+`delta_net/span_arm.rs`: `SpanArms` holds one `Arm` per sequence, naming a span by
+its absolute position `at` and length `len`, the DeltaNet trunk-layer indices, and
+per layer the rows its hook carries.
+
+- `arm` accepts only a span longer than `TIMELINE_ROWS` (a short span writes a
+  timeline, and a replay has no state to stand in for), allocates uninitialised
+  `SpanRows` for a capture (the capture writes every element), and for a replay
+  refuses rows whose layers, `conv_dim` or `n_v_heads` are not the model's. A new
+  arm replaces the sequence's earlier one.
+- `hook(seq, layer, at, len)` returns `SpanHook::Capture(rows)` or
+  `SpanHook::Replay(rows)` only for the span whose position and length equal the
+  arm's, and only for a layer that has not served it; any other span of the sequence
+  gets `SpanHook::None`. A long span of an armed sequence that is not the armed one,
+  while layers still wait, logs a warning: the cut and the arm disagree.
+- A layer counts as **served** at `commit(seq)`, so a wave that rolls back
+  (`rollback`) serves nothing and the layers run the span again, and a span swept a
+  window of layers at a time keeps its arm until every layer has run it. A replay
+  every layer has served is dropped; a capture stays until taken.
+- `take_capture(seq)` returns the rows, in layer order, once every layer has served
+  the capture, and only once. `forget` drops the arm when the sequence is gone.
+
+qwen4exp holds `SpanArms` in the model beside its recurrent stores
+(`qwen4exp/wave/mod.rs`), asks for the hook per DeltaNet layer
+(`qwen4exp/wave/layers.rs`) and commits or rolls the arms back with the sweep's
+wave (`qwen4exp/wave/wave_sweep.rs`).
+
+### 14.3 What the mixer does
+
+On the fused path only (`delta_net/mix/fused.rs`; `check_span_hooks` refuses a hook
+on a span of at most `R` rows):
+
+- **Capture** (`capture_spans`): after the conv and the scan, copy the span's rows
+  of the conv output and of `alpha_lin`/`beta_lin` into the hook's rows, on the
+  scan's stream.
+- **Replay** (`replay_spans`): after the live scan, run the record's rows through
+  the span's entering state with `delta_net_prefill_scan`, over a one-span table
+  from `build_span_tables` pointed at the rows, writing to the **same** state-out
+  the live scan wrote. The live scan still produces the span's outputs, so the
+  activations and attention K/V are the conversation's own; the state past the span
+  is `S_end = scan(record rows, S_start)`. The entering state is untouched until
+  `commit_wave` exchanges the scratch in (§7), so both scans read the state at the
+  span's start. The conv tail is the live span's: the replay does not run the conv.
+  One extra launch per replayed span; replays are not batched across spans.
+
+### 14.4 How a turn reaches it
+
+`candle-conversation/src/recurrent_span.rs` carries the span in two forms. A caller
+names it by bytes of the turn's user half (`TextSpan`, from
+`TurnOptions::recurrent_spans`); the conversation maps the bytes to token positions
+of the prefill (`turn_text::token_span`, `TurnText::prefix`, shifted past the turn's
+baked head) as a `TokenSpan`. Each carries an `ArmKind`: `Capture`, or
+`Replay(Arc<ReplyRows>)`.
+
+The span must run as one chunk of its own, because the model honours an arm only on
+exactly that span. `snap_advance(spans, offset, advance)` returns how far a prefill
+at `offset` may advance: a chunk that would reach into a span stops at the span's
+start, and a chunk that starts on a span takes exactly the span, past a smaller
+share. `span_at(spans, offset)` finds the span a chunk starts on.
+`Scheduler::cut_at_recurrent_spans` (`scheduler/prefill/wave_group.rs`) applies
+`snap_advance` as the last step of forming a wave group, so the cut holds across
+every window of a creep sweep, and calls `arm_recurrent_span` with the span's
+absolute position (`sequence_offset`) and length. An arm refused sets the
+prefill's error. When the turn's last chunk lands, a prefill whose spans include a
+capture calls `take_recurrent_capture` and sends the rows on the turn's stream as
+`TurnEvent::RecurrentCapture`, before the prefill-progress event
+(`scheduler/prefill/wave_run.rs`); a capture that never ran every layer is a turn
+error. Only a turn that armed a capture copies anything.
+
+### 14.5 Who uses it, and what was withdrawn
+
+The diagnostic decode (`zend/src/session/diag.rs`, `armed_spans`) arms a capture on
+the last tool-result block of the half it submits and replays earlier captures
+("merges") onto other blocks, in memory, to measure whether running one
+conversation's inputs through another's recurrence changes what the model reports.
+Spans of one run may not overlap, and a capture must be the half's last armed span,
+since an arm replaces the sequence's earlier one.
+
+A served-read calibration built on this mechanism was withdrawn (2026-11-04): it
+stored one record of ~20.8 MB per `file_read` page on every member (§14.1), which
+the substrates could not carry. The sweep, the record store, the live replay and
+the `DiagRun::inject` path are removed from the code; each calibration pass ends
+whatever records remain (`zend/src/calibrate/retire_replies.rs`). The design and
+the measurement that motivated it are in `docs/archived/recurrent_reply_calibration.md`:
+a served page enters a conversation as K/V only, so its recurrent layers have run
+over the conversation's own lineage and nothing the working set placed, and the
+model could not report the page it was reading even though attention read it.
+
+### 14.6 Tests
+
+`span_arm.rs`: the hook is the armed span's alone and a served layer gets it no
+more; a rolled-back wave serves nothing; a capture is handed back once every layer
+served it, and once; a short span and foreign rows are refused. `span_rows.rs`: the
+blob byte for byte, a short or foreign blob refused, the device round trip.
+`recurrent_span.rs`: `snap_advance` and `span_at` at every boundary.

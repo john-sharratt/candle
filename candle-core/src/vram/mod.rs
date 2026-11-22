@@ -14,7 +14,7 @@
 //! card was tight. That went with the KV cache's move onto a static reservation:
 //! there is nothing left to regulate at runtime, because the memory is claimed
 //! once and the scheduler reads an exact free-region count rather than asking
-//! the governor what the card can spare (`docs/archived/arena_unification.md` §3.8, §5).
+//! the governor what the card can spare.
 //!
 //! Layout (one concern per file):
 //! - [`reading`] — [`VramReading`], the [`VramProbe`] trait, the test double.

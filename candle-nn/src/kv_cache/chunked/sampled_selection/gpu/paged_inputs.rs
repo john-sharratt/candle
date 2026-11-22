@@ -448,8 +448,7 @@ impl PagedSelectionGpuInputs {
         // the table's *exponent*, not just its constant: keyed by arena it grew
         // with the arena count — i.e. with the fragmentation this initiative
         // exists to delete, so a sicker pool made every drain more expensive.
-        // Keyed by chunk it grows with the work actually being selected. See
-        // `docs/archived/arena_unification.md` E5.
+        // Keyed by chunk it grows with the work actually being selected.
         tracing::debug!(
             layers = backings.len(),
             chunks = chunk_gids_keepalive.len(),

@@ -245,7 +245,7 @@ pub(super) fn grouped_matmul_gemx_impl<'w>(
 
 /// Single-launch grouped MoE expert matmul over FP activations (F16/BF16/F32):
 /// FP16 tensor-core MMA with Q4_K weights dequantized on the fly. The INT8-MMA path
-/// is `grouped_matmul_gemx_q8a128` (q8a128 activations). See docs/archived/q8_matmul_pipeline.md.
+/// is `grouped_matmul_gemx_q8a128` (q8a128 activations).
 pub fn grouped_matmul_gemx(
     weight_ptrs: &[u64],
     weight_dtype: GgmlDType,

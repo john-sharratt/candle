@@ -233,8 +233,7 @@ pub struct TimelineEntry {
     /// member's turn still arriving (§6.5). A turn completed later takes its
     /// gap in place, so the turns above it never move.
     pub gaps: POrdSet<TurnIndex>,
-    /// Per-turn tree metadata for the immutable summary forest
-    /// (`docs/archived/immutable_summary_forest.md`).  Parallel to `turns`: every
+    /// Per-turn tree metadata for the immutable summary forest.  Parallel to `turns`: every
     /// recorded turn carries exactly one [`TreeNodeMeta`] entry (defaults to a
     /// `Normal` content sub-leaf with no children).  Promoted to a
     /// `SummaryOfTurns` / `SummaryOfSummaries` by the async summariser thread

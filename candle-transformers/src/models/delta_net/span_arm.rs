@@ -1,5 +1,5 @@
 //! Spans of a sequence armed for capture or replay
-//! (`docs/archived/recurrent_reply_calibration.md` §6.3, §7.2).
+//! (`docs/deltanet_timeline.md` §14.2).
 //!
 //! An arm names one span of a sequence by its absolute position and length.
 //! The wave that runs exactly that span asks for a [`SpanHook`] per DeltaNet

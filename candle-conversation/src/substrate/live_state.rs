@@ -204,7 +204,7 @@ impl Substrate {
 
     /// The peak set — orphan summary nodes (no parent), in chronological order
     /// (oldest/leftmost-covering first), each paired with its level.  These are
-    /// the window's coarse entry points (`docs/archived/immutable_summary_forest.md`).
+    /// the window's coarse entry points.
     pub fn peaks_of(&self, timeline: TimelineId) -> Vec<(TurnIndex, u8)> {
         let Some(tl) = self.timelines.get(&timeline) else {
             return Vec::new();
@@ -242,8 +242,7 @@ impl Substrate {
     /// canonical ternary shape for its leaves.
     ///
     /// Derived from the persisted state each call (the "dirty" bit is gone —
-    /// staleness is computed, never stored).  See
-    /// `docs/archived/immutable_summary_forest.md`.
+    /// staleness is computed, never stored).
     pub fn reconcile_next(&self, timeline: TimelineId) -> Option<Vec<TurnIndex>> {
         let tl = self.timelines.get(&timeline)?;
         let tm = &tl.tree_meta;

@@ -376,7 +376,7 @@ impl Conversation {
         }
         // Arm low-priority reconciliation per timeline. The summary forest is
         // immutable and its canonical ternary shape is a pure function of the
-        // leaves (`docs/archived/immutable_summary_forest.md`), so the reload doesn't
+        // leaves, so the reload doesn't
         // re-summarise anything — it just asks the summariser to rebuild any
         // internal node that's missing (a crash between sealing leaves and their
         // parent) or non-canonical (binary nodes from the superseded AVL, which

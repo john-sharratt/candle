@@ -335,8 +335,7 @@ mod tests {
 
         /// **Payload and stride are different numbers, and the bounds check
         /// knows it.** A read of at most the stride is fine; anything past it
-        /// would run into the next tenant and is refused
-        /// (`docs/archived/arena_unification.md` invariant 8).
+        /// would run into the next tenant and is refused.
         #[test]
         fn a_slot_read_cannot_escape_its_slot() {
             let class = small();

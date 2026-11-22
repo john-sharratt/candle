@@ -35,8 +35,8 @@ impl Scheduler {
     ///
     /// # The seal's second copy is *not* charged here, and that was tried
     ///
-    /// `docs/archived/elastic_vram_partition.md` §7 phase 1 asks admit to account for
-    /// "persistence's quantize destinations", and the obvious reading — a block
+    /// Admission is meant to account for persistence's quantize destinations,
+    /// and the obvious reading — a block
     /// occupies its active slot *and* its sealed destination while the
     /// compressor copies between them, so charge both — was built and reverted.
     ///
@@ -49,8 +49,7 @@ impl Scheduler {
     /// budget never recovered.
     ///
     /// A transient double-occupancy is a *reserve* — a fixed pool the compressor
-    /// draws on — not a per-block tariff. That is what §7 means and it is still
-    /// unbuilt.
+    /// draws on — not a per-block tariff. Such a reserve is not built here.
     pub(in super::super) fn per_block_kv_bytes(&self) -> u64 {
         let (k, v) = self.session.active_kv_formats();
         per_block_kv_bytes(

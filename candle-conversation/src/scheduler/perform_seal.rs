@@ -596,10 +596,9 @@ impl Scheduler {
                 // turn (hot→warm migrate, warm→cold redo-log write,
                 // group fsync) without waiting for its 5 s tick.
                 self.persist_triggers.fire();
-                // Wake the summariser thread
-                // (`docs/archived/infinite_conversations.md` §4 step ③) so the
+                // Wake the summariser thread so the
                 // freshly-pending Normal turn gets absorbed into the immutable
-                // summary forest (`docs/archived/immutable_summary_forest.md`) on its
+                // summary forest on its
                 // next pass instead of waiting up to 250 ms for the periodic tick.
                 self.summariser_trigger.fire();
                 // Trim the slot's live-prefill capture cache down to

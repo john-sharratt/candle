@@ -22,7 +22,7 @@ use super::*;
 ///    best option when the caller has one.
 /// 2. The **persistence domain's transient span** — one bump and an H2D. This
 ///    replaced `memcpy_stod`, which allocated and freed a device buffer per
-///    selection table, per call (`docs/archived/arena_unification.md` §3.6).
+///    selection table, per call.
 /// 3. A plain device allocation, when there is no stream to bump against
 ///    (CPU-backed tests).
 ///

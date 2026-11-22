@@ -1,11 +1,14 @@
 # DeepSeek-V4 turn seal & resume: window-ring snapshot + closed corpus + Indexer wide-Q
 
 > **Status:** the **model-side seal/resume primitives are implemented and tested**
-> (Artifacts A/B/C/D, see §9); the **conversation-side record + scheduler seal
-> wiring is specified** (§9.2, not built) and lands atomically with the seal hook the
-> scheduler path calls. Builds directly on the sliding-window KV ring (`base_pos` /
-> `evict_window_front`, committed `67309fc0`). Authoritative for the DeepSeek
-> seal/resume path; where it disagrees with code, the code is wrong.
+> (Artifacts A/B/C/D, see §9.1); the **conversation side is Not built; plan of record** (§9.2):
+> no `ManagedBatchedModel` seal hook, no `RecordType::WindowRing`, no per-token Indexer
+> capture, no corpus `Chunk` persistence, no DeepSeek `gather_wide_sigs`, and the restore of a
+> section from the log is refused on a single-latent backing (`scheduler/sections.rs`). DeepSeek is
+> scheduler-driven (`load_arch.rs` binds `BatchedEngine`; `candle-conversation/tests/deepseek_rung4.rs`
+> runs conversations over it), so the wiring has a consumer; it is simply unwritten. Builds directly on
+> the sliding-window KV ring (`base_pos` / `evict_window_front`, committed `67309fc0`). Authoritative
+> for the DeepSeek seal/resume path; where it disagrees with code, the code is wrong.
 
 ## 1. Motivation
 
@@ -17,14 +20,16 @@ DeepSeek currently has **no seal wiring into the substrate** — `BatchedEngine`
 scheduler binds for `ModelArch::DeepSeekV4` (`candle-conversation/src/models/builder/load_arch.rs`),
 but nothing in the seal path calls its seal/snapshot primitives, emits an Indexer `WideQSig` or
 persists the gallery, and a single-latent backing refuses section restore-from-log
-(`scheduler/sections.rs`: re-ingest). This document specifies that seal, and the
-matching resume.
+(`scheduler/sections.rs`: the restore's adaptive-format arena writes do not alias K≡V, so the caller
+must re-ingest, which is deterministic — the re-prefill reproduces the exact K/V the seal captured). Until
+this seal lands, a DeepSeek section that must be restored is re-ingested (O(N)), not restored from the
+log. This document specifies that seal, and the matching resume.
 
 The design rests on one structural fact established earlier: **`window_size ≥
 compress_ratio`** (128 ≥ 128 HCA, 128 ≥ 4 CSA). Every token that leaves the window has
 already been folded into the compressed corpus, so the corpus is the durable
 conversation KV and the raw window is only ever a *transient tail* needed to warm-start
-the ring.
+the ring. The fact holds for the shipped checkpoint; no code asserts it (§7).
 
 ## 2. The four seal artifacts
 
@@ -190,8 +195,8 @@ On turn seal, in order:
 
 1. **Close** the open `comp` + `icomp` groups → append the partial entries to the
    gallery (Artifact B → C).
-2. **Persist corpus**: serialize the turn's gallery entries (native two-region + keys +
-   pos) as `Chunk` records tied to the turn stream; write the `TurnDecl` (Artifact C).
+2. **Persist corpus**: serialize the turn's gallery entries (native two-region + keys; no
+   positions) as `Chunk` records tied to the turn stream; write the `TurnDecl` (Artifact C).
 3. **Extract wide-Q**: Indexer `sign(Q)` for the turn → `WideQSig` record on the turn
    stream (Artifact D).
 4. **Snapshot the ring**: write `WindowRing` for the timeline; tombstone the previous
@@ -205,12 +210,12 @@ and clears the compressor buffers so the next turn starts a fresh group).
 On conversation open:
 
 1. **Warm-start the ring**: load the timeline's latest `WindowRing` → rebuild the FP8
-   ring arena (chunks + `base_pos` + absolute positions). Decode continues the sliding
+   ring arena (chunks + `base_pos = resume_position − resident_len`). Decode continues the sliding
    window bit-exactly.
 2. **Provenance selection** runs over the persisted `WideQSig` (Artifact D) exactly as
    for other models → selects turns.
 3. **Inject corpus**: each selected turn's persisted corpus entries (Artifact C) load
-   into the gallery at their absolute `pos`. Live decode then attends window (from 1) +
+   into the gallery at their reconstructed positions (`corpus_base + i · ratio`). Live decode then attends window (from 1) +
    selected corpus (from 3), identical to a never-persisted session.
 
 ## 5. Integration points
@@ -257,14 +262,19 @@ On conversation open:
 
 - **No open `(m,l,acc)` persistence.** Closing at seal supersedes it; `GroupPartial`
   stays reference-only.
-- **`window_size ≥ compress_ratio`** (asserted at model construction) — guarantees a
-  token leaving the window is already in the corpus, so closing/eviction never drops an
-  uncompressed token.
+- **`window_size ≥ compress_ratio`** — guarantees a token leaving the window is already in the
+  corpus, so closing/eviction never drops an uncompressed token. **Not built:** no construction-time
+  assertion exists (`Engine::load` and `Config` check the geometry against the kernels, not the window
+  against the ratios); `evict_window_front` and `SequenceState` carry it only as a documented
+  precondition (`candle-nn/src/kv_cache/chunked/sequence_ops/window.rs`, `types/sequence_state.rs`). The
+  shipped checkpoint satisfies it (128 ≥ 128), so the assertion is a guard for a different checkpoint,
+  not a fix for a present fault.
 - **Native corpus form** — no re-quant on seal (entries are already QAT-precision).
 - **Wide-Q format identical** to other models — DeepSeek only changes the *source*
   (Indexer, not R16 fold), never the record or the selection.
-- **Positions stay absolute** through seal/resume (windows and corpus share the absolute
-  frame — the property the ring already relies on).
+- **One frame at resume.** Windows and corpus share a single frame at resume, derived from
+  the resume layout (`corpus_base + i · ratio`, `base_pos = decode_pos − resident_len`); no
+  position is stored, so a relocated or reordered turn takes its new frame.
 
 ## 8. Decisions (resolved)
 
@@ -344,15 +354,16 @@ integration composes them.
   pack rule. This is the model's LEARNED significance space (the Indexer), replacing the
   R16 cross-layer sign-fold other models use.
 
-### 9.2 Conversation side — integration spec (lands atomically with the scheduler seal path)
+### 9.2 Conversation side — integration spec (**Not built**; plan of record)
 
-The `Scheduler` binds DeepSeek (`BatchedEngine`, `ModelArch::DeepSeekV4`), but its seal path
-calls none of the primitives above, and the scheduler's seal path is model-agnostic — `gather_wide_sigs` reads only
-`self.session` (the KV backings), never `self.model`, and `ManagedBatchedModel` has no
-seal hook. So the conversation-side wiring below must land together with (a) a
-`ManagedBatchedModel` seal hook and (b) the scheduler actually running DeepSeek; landing
-it earlier would be a record nothing writes / an always-on hot-path capture with no
-consumer. The seams are exact (mapped against the current tree):
+The `Scheduler` binds DeepSeek (`BatchedEngine`, `ModelArch::DeepSeekV4`) and runs it — DeepSeek is
+scheduler-driven, so the wiring below has a consumer and is no longer waiting on the scheduler. It is not
+written: the scheduler's seal path calls none of the primitives above, and it is model-agnostic —
+`gather_wide_sigs` reads only `self.session` (the KV backings, whose R16 Q a single-latent backing does not
+hold), never `self.model`, and `ManagedBatchedModel` has no seal hook. The five items below land together,
+because each is a record or capture that nothing else consumes: a `WindowRing` nothing writes, or an
+always-on per-token capture with no seal to drain it. The seams are exact (mapped against the current
+tree):
 
 1. **`ManagedBatchedModel` seal hook** (`candle-transformers/.../batched_inference/managed_model.rs`):
    add `fn seal_artifacts(&self, session, seq) -> Result<SealArtifacts>` (default: empty),
@@ -390,3 +401,19 @@ consumer. The seams are exact (mapped against the current tree):
    DeepSeek, source the turn's wide-Q from the captured Indexer bands
    (`WideQSig::from_band(band, 128)` per token) instead of the R16 fold — same
    `WideQSig` record + `enqueue_wide_q_sigs` + selection scan, only the *source* changes.
+
+---
+
+## Open items
+
+1. **The conversation side (§9.2) is Not built**: the `ManagedBatchedModel` seal hook, the per-token
+   Indexer capture, `RecordType::WindowRing` (tag 32 is the next free one; tags 20–31 are taken),
+   corpus `Chunk` persistence and restore, and the DeepSeek `gather_wide_sigs` override. Until it
+   lands, `restore_section_from_persistence` refuses a single-latent backing and the caller re-ingests.
+2. **The `window_size ≥ compress_ratio` construction assertion (§7) is Not built.** The shipped
+   checkpoint satisfies it.
+3. **A closed partial group is stored as invariant, but its inputs are prefix-dependent.** The
+   compression-seam argument in `deepseek_batched_paged_attention_plan.md` §E holds that a group
+   straddling a reprojection seam must be regenerated at reassembly; Artifact C makes every group
+   turn-local and order-independent without re-deriving a closed entry after a reorder. Whether that
+   difference changes selection quality is unmeasured.

@@ -32,8 +32,6 @@
 //!   hazard unreachable; the pin already protected every arena the kernel could
 //!   address.
 //!
-//! `docs/archived/arena_unification.md` §5 (audit A4).
-//!
 //! # What a compaction is held off from, and what it merely steps around
 //!
 //! A migrate **writes** device slots for a short while: the quantize claims its

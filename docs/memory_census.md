@@ -359,7 +359,10 @@ three things that do work — the counting allocator each binary installs, the
 host's once-a-minute census task, and each store's gauge pass — and leaves the
 types and the readers built, so `/v1/memory` and `/v1/telemetry` report the
 census absent without it. `motherd`, `zend` and `npcd` take it when built with
-`--features memory-census`; the deployed build leaves it out. The feature runs down through `zend`, `npcd`,
+`--features memory-census`. The deployed build leaves it out: `motherd`'s
+`default = []` and the build commands in `docs/deployment.md` (`cargo build --release
+-p motherd`, `-p npcd`) pass no features, and `keep/keep.yaml` names no build command
+or feature, so a census run is a build made on purpose with the feature named. The feature runs down through `zend`, `npcd`,
 `host`, `candle-conversation` and `substrate-git`, each of which names its
 threads' scopes (§10) only with it.
 

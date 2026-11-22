@@ -42,10 +42,10 @@
 // SECOND prefill↔decode divergence, on the COMPRESSED path: the two corpus
 // builders no longer produce the same int8 for an entry. Prefill BAKES RoPE
 // (rotate, then per-band component amax on the rotated values —
-// `latent_rope_quant_corpus_kernel`); decode is POSITION-FREE (pair-magnitude
-// bound on the pre-rotation values, then dequant → rotate → requant with a fresh
-// amax — `latent_quant_corpus_range_kernel`). Same entry, same position → a
-// slightly different int8 and scale. This stays inside the tolerance gate above,
+// `latent_rope_quant_corpus_kernel`); decode is POSITION-FREE (nope bands int8
+// by component amax, rope bands kept BF16 pre-rotation and rotated at read time
+// — `latent_build_corpus_cache_kernel`). Same entry, same position → a
+// slightly different quantization of the rope bands. This stays inside the tolerance gate above,
 // but it is a distinct source from the int8-PV delta — a compressed-path
 // tolerance regression should be looked for HERE, not in the PV.
 #include "latent_common.cuh"
@@ -379,8 +379,8 @@ latent_prefill_kernel(
                 if (gid != 0xFFFFFFFFu && (int)comp_pos[gid] <= my_pos) {
                     valid = true;
                     // Per-assembly BAKED-RoPE corpus scratch — NOT the decode's
-                    // persistent position-free cache (`latent_quant_corpus_range_
-                    // kernel`). Here `latent_rope_quant_corpus_kernel` already
+                    // persistent position-free cache
+                    // (`latent_build_corpus_cache_kernel`). Here `latent_rope_quant_corpus_kernel` already
                     // rotated each entry at its window position, and the shared
                     // int8-PV operand `comp_v8` is derived from these roped bytes,
                     // so this path must NOT rope again: `key_pos` stays 0 (set by
@@ -865,8 +865,8 @@ __global__ void latent_prefill_combine_kernel(
 // maxima that scale the pre-quantized PV operand.
 //
 // This scratch is BAKED-RoPE and per-assembly — a DIFFERENT object from the
-// decode path's persistent POSITION-FREE cache (`latent_quant_corpus_range_
-// kernel`), even though both are named `comp_i8`. Prefill can't share the
+// decode path's persistent POSITION-FREE cache
+// (`latent_build_corpus_cache_kernel`), even though both are named `comp_i8`. Prefill can't share the
 // position-free contract because its int8-PV operand `comp_v8` is derived from
 // these bytes and gathered straight into the PV matmul with no rotation on that
 // path — making the K bytes position-free would leave V un-rotated while K is

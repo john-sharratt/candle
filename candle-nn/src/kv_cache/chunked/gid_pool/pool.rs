@@ -48,7 +48,7 @@ pub(super) fn preallocated_pool_table() -> AHashMap<ArenaKey, ArenaPool> {
     // Locations × size classes — 14 entries, down from ~58 under per-format
     // pools. That collapse is the whole point: every format sharing a class
     // now shares one pool and one free list, so a slot freed by any of them is
-    // allocatable by all of them (`docs/archived/arena_unification.md` §3.4).
+    // allocatable by all of them.
     let mut pools = AHashMap::with_capacity(
         ArenaLocation::iter().count() * SizeClass::COUNT + RECORD_STRIDES.len(),
     );

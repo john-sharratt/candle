@@ -57,12 +57,14 @@ What a mirror needs and the store did not have before §4 added it:
   "this one I have posted" or "this one came from Discord". A line now carries `seq`,
   `at_ms`, `origin` and `account` (`sim/phone/line.rs`), and `from` is a member id.
 - **No hook when a message is created.** Every message passes through
-  `Threads::send` (`sim/phone/mod.rs`); nothing observes it, and the codebase chose
-  polling over a broadcast deliberately.
-- **No external identity** on an account or a character.
-- **No outbound HTTP** in npcd (`host` carries `reqwest` and `tokio-tungstenite`).
+  `Threads::send` (`sim/phone/mod.rs`) and nothing observes it; the bridge reads the
+  threads on the bots' own beat (§5.1) rather than being told.
+- **No external identity** on an account or a character: an account now holds
+  `discord: Option<DiscordUser>` (`accounts/mod.rs`) and a bot is a record of its own (§4.3).
+- **No outbound HTTP** in npcd: `npcd/Cargo.toml` now depends on `reqwest` 0.12 and
+  `tokio-tungstenite` 0.24.
 
-§4 adds the first three; the fourth is a dependency.
+§4 adds the first three; the fourth is a dependency. All four are in the code.
 
 ### 1.1 Why Discord is not the record
 
@@ -90,7 +92,10 @@ So people's way in is Discord, and the record is the world's.
 
 ## 2. Discord's constraints
 
-From Discord's documentation (October 2026; `docs.discord.com/developers`):
+From Discord's documentation (October 2026; `docs.discord.com/developers`). These are
+statements about Discord, not about this repository, and cannot be checked from it; the
+code assumes them (the intents in `discord/gateway/protocol.rs`, the 10,000-per-ten-minutes
+window in `discord/limit.rs`):
 
 - **A bot account is made by hand.** There is no API to create an application or its
   bot user; each is created in the Developer Portal. A **team holds at most 75

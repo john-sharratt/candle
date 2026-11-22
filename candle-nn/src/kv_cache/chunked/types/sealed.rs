@@ -41,7 +41,7 @@ pub struct SealedChunk {
     /// into, which made "format ⇒ arena" a load-bearing invariant and forced
     /// one arena pool per format. Under size classes an arena holds whatever
     /// fits its stride, so the arena can no longer answer the question and the
-    /// chunk must. See `docs/archived/arena_unification.md` §2 and principle 8.
+    /// chunk must.
     pub k_fmt: Arc<Vec<u8>>,
     /// Per-`(head, palette)` V-side storage format. Same layout as `k_fmt`.
     pub v_fmt: Arc<Vec<u8>>,
@@ -133,8 +133,8 @@ impl SealedChunk {
     /// K,V order of [`HeadGids::as_slice`].
     ///
     /// The gid says *where* the band's bytes are; the tag says *how to read
-    /// them*. Under size classes only the chunk can answer the second question
-    /// (`docs/archived/arena_unification.md` principle 8), so predicates over a chunk's
+    /// them*. Under size classes only the chunk can answer the second question,
+    /// so predicates over a chunk's
     /// formats walk this rather than the arenas its gids point into.
     pub fn bands(&self) -> impl Iterator<Item = (&ChunkGid, ArenaFormatTag)> + '_ {
         band_tags(&self.gids, &self.k_fmt, &self.v_fmt)

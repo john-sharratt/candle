@@ -1,5 +1,6 @@
 //! The streamed text is the full decode for the prescribed model's own
-//! tokenizer (`docs/archived/performance_patch.md` Z1, §7) — a landing requirement, so
+//! tokenizer — the incremental stream must agree with decoding every id again
+//! from the start, which is what it replaced — a landing requirement, so
 //! it fails, never skips, when the tokenizer cannot be had. Ignored by default:
 //! run it with `cargo test --release -p host --test text_stream_model_vocab --
 //! --ignored --nocapture`.

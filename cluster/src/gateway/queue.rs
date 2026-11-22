@@ -17,8 +17,8 @@ use super::registry::LATENCY_APP;
 use crate::dispatch::Dispatch;
 
 /// How long a unit that is neither a client's conversation turn nor a client's
-/// draw waits for room before it is answered `503`: the catch-up hold of
-/// `docs/replicated_substrate.md` §5.4.
+/// draw waits for room in the forward queue before it is answered `503`: the
+/// queue's capacity wait.
 pub const HOLD: Duration = Duration::from_secs(30);
 
 /// How long a draw waiting for its card's turns to end holds that card

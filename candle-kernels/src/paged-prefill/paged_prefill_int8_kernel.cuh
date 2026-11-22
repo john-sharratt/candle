@@ -3,7 +3,7 @@
  * INT8 PREFIX-ATTENTION PREFILL KERNEL
  * ============================================================================
  *
- * The `docs/archived/prefill_optimization.md` kernel: causal prefill attention over a
+ * Causal prefill attention over a
  * palette-quantized paged KV prefix, computed with INT8 m16n8k32 tensor-core
  * MMA for both Q·Kᵀ and P·V — the compressed domain is the compute domain.
  *

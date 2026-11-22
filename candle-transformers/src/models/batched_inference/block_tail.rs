@@ -182,9 +182,9 @@ impl BatchedInferenceSession {
     /// callers legitimately pass one, and neither leaves a model's per-sequence
     /// state describing tokens the K/V no longer holds:
     ///
-    /// - the clean-turn re-prefill, which truncates to the turn boundary *and*
-    ///   discards the view's recurrent state in the same step, so both sides
-    ///   move together;
+    /// - the projection assembler's `cut_slot`, which cuts the slot after the
+    ///   pieces it keeps *and* truncates the per-position state to the same
+    ///   point in the same step, so both sides move together;
     /// - `reserve_glue_gap`'s error-path rollback, which releases chunks a
     ///   failed call had just reserved and that nothing has decoded into.
     ///

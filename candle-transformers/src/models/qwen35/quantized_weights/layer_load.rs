@@ -43,7 +43,7 @@ pub(crate) struct PendingLayer {
 ///
 /// Extracted from [`load_quantized_model`]'s loop rather than inlined in it,
 /// because a layer's tensors are also read **one at a time and then dropped**
-/// by the layer-streaming pack build (`docs/archived/qwen38_layer_streaming.md` §12.2):
+/// by the layer-streaming pack build:
 /// it repacks each layer, writes the record, and lets the layer go, so its peak
 /// is one layer rather than the whole model. Two transcriptions of a layer's
 /// tensor names would be two chances for the pack to describe a layer the

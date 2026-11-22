@@ -2,8 +2,7 @@
 //!
 //! A dense checkpoint larger than the card is held as a working set of resident
 //! layers with the rest streamed in behind the wave, the same way
-//! [`expert_lre`](crate::models::expert_lre) holds a routed one. The design is
-//! `docs/archived/qwen38_layer_streaming.md`; this module is its implementation.
+//! [`expert_lre`](crate::models::expert_lre) holds a routed one.
 //!
 //! ## Why it is not the expert cache
 //!

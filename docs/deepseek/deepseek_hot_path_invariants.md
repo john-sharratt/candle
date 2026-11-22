@@ -2,10 +2,14 @@
 
 **Goal:** compute-bound single-session **prefill ≥ 1000 t/s** and **decode ≥ 50 t/s**.
 Prefill sidesteps the expert-PCIe wall (it amortises the streaming-expert copy over a
-large token count), so it *should* approach the ~1400 t/s compute bound. It is currently
-capped at ~558 t/s. This document is the study that produces the invariants the hot path
-must satisfy to get there — every violation below is a place the current code leaves the
-GPU idle, round-trips through the host, or does work the architecture says is unnecessary.
+large token count), so it *should* approach the ~1400 t/s compute bound. It was capped at
+~558 t/s when this study began (config-8; 593 t/s after the campaign below). The engine's
+measured throughput on the RTX PRO 5000 (72 GB) is in `docs/performance.md` (row I12, §3.7, build
+`21c36efbd`, 2026-10-10): ×1 warm **319.0 t/s prefill / 18.9 t/s decode**, ×16 **1,177.1 t/s
+prefill / 114.4 t/s aggregate decode**. The single-session targets are therefore not met at ×1; the
+wide wave clears the prefill target in aggregate. This document is the study that produces the
+invariants the hot path must satisfy to get there — every violation below is a place the code
+leaves the GPU idle, round-trips through the host, or does work the architecture says is unnecessary.
 
 The hot path is `forward_wave` (`latent_moe/wave/managed.rs`, whose layer loop is
 `latent_moe/wave/sweep_wave.rs`) and everything it calls per layer, per wave:
@@ -81,8 +85,10 @@ fixes whose payoff is at production depth and width.
 One trap worth recording: the batched append first assumed one wave slot per sequence. A
 **speculative verify wave carries a whole drafted block as consecutive decode rows of the
 SAME sequence**, so one gallery legitimately receives several slots' groups in one wave.
-Only `wave_paris_speculative_dspark` caught it — the unit gates and the non-speculative
-sweep both passed. Slots are now grouped by sequence and appended back to back.
+Only a speculative end-to-end gate caught it (the test then called `wave_paris_speculative_dspark`,
+which no longer exists under that name; the speculative gates are in
+`latent_moe/wave/tests_speculative.rs`) — the unit gates and the non-speculative sweep both passed.
+Slots are now grouped by sequence and appended back to back.
 
 ### `ncu` on the two new kernels — the bottleneck is the TABLE, not the kernels
 
@@ -214,8 +220,8 @@ conversions.
 
 ## Campaign status (measured)
 
-The invariant campaign landed **every** structural fix; only three residuals remain,
-each with a measured/analysed reason. Commits on `deepseek-flash`: 4d5246d2,
+The invariant campaign landed the structural fixes below; the residuals that remain are
+**open** and are collected under "Open items" at the end of this document. Commits on `deepseek-flash`: 4d5246d2,
 c9305f8a, 30a05446, 74abb3e6. Every step held the bit gates
 (mirror/gather/compressor) and model StoryRewrite [1,4,8,1] at 100% valid; config-8
 prefill 558 → 593 t/s.
@@ -239,11 +245,11 @@ One numerics note: at multi-seq the int8-V scale `comp_vmax` is global over the 
 corpus (was per-seq) — inside the int8-PV tolerance envelope; 1-seq mirror gates stay
 bit-exact (1 seq ⇒ global == per-seq).
 
-**Residuals — analysed, not productive to fix:**
-- **Inv 1 emit-type INPUT** (q/kv F32→BF16) — necessary boundary conversion. The
-  kernel wants bf16 input (an f32-input kernel would 2× the per-tile re-read); the
-  cast is the f32-norm→bf16-kernel rounding. Eliminating it needs a candle-nn
-  `rms_norm` that stores bf16 — a fork for marginal gain.
+**Residuals:**
+- **Inv 1 emit-type INPUT** (q/kv F32→BF16) — **OPEN.** The kernel wants bf16 input (an
+  f32-input kernel would 2× the per-tile re-read); the cast is the f32-norm→bf16-kernel
+  rounding. Closing it needs a `rms_norm` (and `rms_scale`) that stores bf16, so the norm
+  emits the kernel's input type (invariant 1).
 - **Inv 4 MoE counting-sort** — **closed by the live MoE dispatch**
   (`docs/moe_live_dispatch_design.md`). The host sort, the `indices.to_vec2` routing
   readback it rode on, and `submit_moe_work` are gone: `ExpertCache::forward_routed`
@@ -252,11 +258,19 @@ bit-exact (1 seq ⇒ global == per-seq).
   by the stager thread), and the routing summary reaches the host through a mapped ring
   that nothing on the device waits for. The `latent_moe::readback` budget for the wave
   forward is zero.
-- **Inv 3/4/5 out-of-regime recall** (`kernel_attn_prefill_select` in `latent_moe/kernel_attention.rs`, its per-token `to_vec1::<u32>` readback, plus the `PrefillSel::Host` arm in `wave/sweep_wave.rs`) —
-  deep-prompt only (corpus wider than the shortlist), NOT exercised by the gate. The
-  per-token *recall* (not exact top-k) is required for prefill≡decode parity, so it
-  can't be naively batched; a parity-safe batched on-device recall is a large,
-  unvalidatable-by-current-gate effort for an uncommon path.
+- **Inv 3/4/5 out-of-regime recall and the `PrefillSel::Host` arm** (`kernel_attn_prefill_select` in
+  `latent_moe/kernel_attention.rs`, its per-token `to_vec1::<u32>` readback, plus the
+  `PrefillSel::Host` arm in `wave/sweep_wave.rs`) — **OPEN.** The out-of-regime case is a corpus wider
+  than the shortlist (deep prompts) and is not exercised by the gate. The per-token *recall* (not
+  exact top-k) is required for prefill≡decode parity, so it cannot simply be batched; a parity-safe
+  batched on-device recall is the work. The same `Host` arm also serves HCA attend-all and SWA.
+- **Inv 5 per-session `kernel_attn_decode_capture`** (pass 1c of the decode block in
+  `wave/sweep_wave.rs`) — **OPEN.** The capture of each row's selection intent runs in a host loop
+  once per decode row per layer (a verify block contributes one row per position), handing the selector
+  per-row query views. The function itself launches nothing, and `two_stage_select_batched` then
+  consumes those views as `&[Tensor]` and gathers each session's shortlist keys (`gather_keys`) in a
+  per-session loop before its rescore batches. Reading the batched query tensor through a descriptor
+  table (invariant 2b) would remove the per-row views and the per-session loop.
 
 **Doc corrections found while verifying:** `CorpusCache::build` (`latent_moe/paged/corpus_cache.rs`)
 and the corpus-gather outputs in `latent_moe/select_bench.rs` are test/bench-only, not hot
@@ -489,4 +503,26 @@ pure output is `Tensor::empty`) and open for the q/kv input casts. In order of i
 
 Invariants 1–4 remove per-step overhead; 5 removes the per-seq serialisation that caps
 prefill; 6 removes a full memset from every buffer the kernels already fill. Together they
-are what turns the current 558 t/s into the compute-bound target.
+are what turns the 558 t/s of the study into the compute-bound target.
+
+---
+
+## Open items
+
+The hot-path violations still present in `latent_moe/`, each named in the catalogue above:
+
+1. **Invariant 1 — q/kv F32→BF16 input casts.** `kernel_attn_prefill_project_batched` (`q_bf`/`kv_bf`),
+   the glue-island projection and the decode block's `q_bf_all`/`kv_bf_all` in `wave/sweep_wave.rs`, and
+   the single-session `kernel_attn_decode_step` each cast the F32 norm output to BF16 for the attention
+   kernel. Fix: a norm that stores BF16.
+2. **Invariants 3, 4 and 5 — `PrefillSel::Host` and out-of-regime recall.** The `Host` arm's host
+   `union.sort/dedup`, `remap` and `idx_flat` build, and the per-token `g.to_vec1::<u32>()` readback in
+   `kernel_attn_prefill_select`, stay on the prefill path for out-of-regime CSA, HCA and SWA layers.
+   Fix: extend `batched_causal_select_device` to those arms with a parity-safe batched recall.
+3. **Invariant 5 — per-row `kernel_attn_decode_capture`** and the per-session Stage-2 key gather in the
+   decode selection (pass 1c of `wave/sweep_wave.rs`).
+4. **Invariant 2 — the pageable warm tier.** `FloatGallery::gather_corpus_into`'s spilled arm gathers
+   rows on the host from pageable RAM because no kernel can address it; reading that tier in place needs
+   the pinned warm pool that was designed (`docs/archived/kv_tier_migration.md`) and not built.
+5. **Invariant 6 — `CorpusCache::build`** (`paged/corpus_cache.rs`) still allocates its three outputs
+   with `Tensor::zeros`; it is a reference path outside the wave.

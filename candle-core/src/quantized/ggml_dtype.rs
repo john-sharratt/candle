@@ -211,7 +211,7 @@ impl GgmlDType {
     /// inflation respectively, invisible while weights were resident and paid VRAM once. Under
     /// layer streaming a weight's width is PCIe bytes on *every forward*, and on the 27B at
     /// Q3_K_M the `Q3_K → Q4_KO` upcast alone inflated the layer pack by 12.8%
-    /// (`docs/archived/qwen38_layer_streaming.md` §2.3). Rounding *down* was never the alternative:
+    /// (the layer pack is streamed over PCIe each forward). Rounding *down* was never the alternative:
     /// `Q2_KO`'s four levels floor at `rel_l2 ≈ 0.325`, a quality loss rather than a repack.
     ///
     /// [`Int8Mode::Precision`] steps the source one notch up the ladder

@@ -5,7 +5,7 @@
 //! standing the expert cache or the layer cache up against the span the dense
 //! weights leave behind.
 //!
-//! The order is fixed and structural (`docs/archived/elastic_vram_partition.md` §4):
+//! The order is fixed and structural:
 //! dense weights resident → measure the span, carve the weight zone, place the
 //! boundary → fill the cache → graft it onto the layers that route. The
 //! measurement is only meaningful at that one point, which is why
@@ -82,8 +82,8 @@ pub fn load_hybrid_pack(path: &Path, device: &Device) -> Result<QuantModel> {
         // time rather than uploaded whole first.
         map: Some(&pack.mmap[..]),
         build_experts: |_content: &_, cfg: &_| build_expert_cache(&pack, cfg, device),
-        // **Every dense checkpoint streams its layers** —
-        // `docs/archived/qwen38_layer_streaming.md` §7. A model that fits is
+        // **Every dense checkpoint streams its layers**
+        // — no fits/does-not-fit branch at load. A model that fits is
         // the degenerate case of the same mechanism: capacity covers the trunk,
         // nothing is ever evicted, and no byte moves after load. A routed
         // checkpoint is filtered out inside `load_quantized_model`, where the

@@ -321,7 +321,7 @@ impl ChunkedKvBacking {
                 // The question is asked of the chunk's own band tags, not of
                 // the arenas its gids point into: a size-class arena holds
                 // whatever fits its stride, so "is this arena quantized" has no
-                // answer (`docs/archived/arena_unification.md` principle 8). R16 is
+                // answer. R16 is
                 // excluded because it is the raw active-K capture format, not
                 // compression — the writer chunk's own K side is R16 and must
                 // stay writable.

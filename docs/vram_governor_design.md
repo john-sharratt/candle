@@ -86,6 +86,20 @@ much room it really has (including what eviction can reversibly reclaim).
 
 ## 3. Background — what exists today (condensed from code study)
 
+**Citations in this section are the original design record.** The `file:line`
+positions are those of the code when the design was written and mostly no longer
+resolve. The functions `mem_get_info`, `pool_used_bytes`, `pool_reserved_bytes` and
+`trim_pool` stand in `candle-core/src/cuda_backend/device/device_info.rs`;
+`release_empty_arenas` is in `candle-nn/src/kv_cache/chunked/backing/`; `evict_hot_to_free`,
+`evict_hot_except` and `demote_turns_to_warm` are in
+`candle-conversation/src/substrate/eviction.rs`; `quantize_sealed_in_place` is in
+`candle-nn/src/kv_cache/chunked/compress/mod.rs`; `relieve_vram_pressure` is in
+`candle-conversation/src/scheduler/prefill/relief.rs`; `DEVICE_INIT_FREE` is in
+`candle-core/src/gpu_memory.rs`. `request_global_compact`, `compact_forced`,
+`EvictionScope` and `purge_warm_to_target` no longer exist under those names: the
+compaction pass is `compact/pass.rs` (`docs/vram_span_partition.md` §6), and the
+quantize is the gap's (`docs/kv_quantize_in_the_gap.md`).
+
 ### 3.1 Single allocation chokepoint
 Every device allocation funnels through `CudaDevice::alloc`/`alloc_zeros`
 ([`device/memory.rs:46-58`](../candle-core/src/cuda_backend/device/memory.rs)) → cudarc
@@ -343,38 +357,26 @@ tunables re-derived per card class.
   the one place we pay a sync, and it's a per-episode circuit breaker, not a
   per-op cost.
 
-**Phase-aware trigger band (scheduler).** The scheduler's `vram_under_pressure`
-gate — which decides *when* to invoke this ladder — sizes its reserve band by the
-phase the caller is in (`VramPhase`, `scheduler/prefill/vram_phase.rs`). The availability
-number is phase-independent (`headroom + reuse`, so the WDDM false-pressure fix
-always holds); only the band it is compared against changes:
+**Phase-aware trigger (scheduler), as built.** The scheduler's
+`vram_under_pressure_for` gate — which decides *when* to run the relief cascade —
+reads one exact counter, the KV side's free regions (`stats.free + stats.blocked`),
+and compares it with a setpoint that depends on the phase the caller is in
+(`VramPhase`, `scheduler/prefill/vram_phase.rs`). The earlier byte band derived from
+driver headroom (`max(C/10, 2 GiB)` for load, `max(C/20, …)` for decode) and the
+footprint qualifier built on `pool_reserved`/`used` (evict near C, defrag when a
+whole arena is reclaimable, `reclaim_footprint`) went with the reservation: KV comes
+from regions claimed at startup, so no driver reading enters the question.
 - **Load** (prefill upload, section/scope ingest, warm→hot elevation — bringing KV
-  into VRAM *before* attention): wide band `max(C/10, 2 GiB)`. Here the freed-float
-  free-list (`pool_reserved − pool_used`) is the *destination* of the incoming KV —
-  the forward will consume it — and a wide ragged forward has a large transient
-  activation peak, so the free-list is **not** spare admission capacity; relieve
-  early to make real headroom before the load competes for it.
-- **Decode** (stable working set, ~1 chunk/token/step): thin band
-  `max(C/20, CANDLE_VRAM_DECODE_BAND_MB=1.5 GiB)`. The free-list *is* genuinely spare,
-  so keep the maximum KV resident (the point of unbounded context).
+  into VRAM *before* attention): `LOAD_TARGET = FreeRegionTarget::new(8, 24, 8)` —
+  span/8, at least 24 regions, relief frees 8 past it. A wide ragged forward claims
+  regions fast, so the setpoint is wide enough that a seal never finds the free
+  list empty.
+- **Decode** (stable working set, ~1 chunk per sequence per 32 steps):
+  `DECODE_TARGET = FreeRegionTarget::new(16, 8, 8)` — span/16, at least 8 regions.
+  A thin setpoint keeps the maximum KV resident (the point of unbounded context).
 
-This is why "R16/F16 availability is irrelevant when loading KV before attention,
-and the opposite in decode" — encoded as a wider vs thinner reserve, not by
-excluding the reuse term (which would reintroduce false pressure).
-
-**Actionable-footprint qualifier.** Beyond the phase band, the gate also trips on
-the raw pool footprint — but only in a state it can *act* on, so it never churns a
-no-op reclaim:
-- **Evict** — resident `used` within `max(8%C, 1 GiB)` of C. This is the real
-  paging signal (the working set), independent of the reserved gap.
-- **Defrag** — `reserved` over `C − band` **and** a whole arena is reclaimable
-  (`can_reclaim_arena`). The reserved-but-free gap is compactable only while it is
-  fragmentation *inside live arenas*; once free has fallen to the CUDA pool's own
-  free-list with no whole arena recoverable, `trim` can't return it and compaction
-  has nothing to move. Firing there churns a `shed=0` reclaim every wave, so with
-  `used` far below C the gate treats that gap as free headroom (not a paging risk)
-  and holds. When defrag *does* run, `reclaim_footprint` ramps the bounded
-  compaction budget with the overshoot (×1 at the ceiling → ×4 near C).
+The weight side is told the load target (`set_kv_free_target`) so its growth leaves
+the relieved count free (`docs/vram_span_partition.md` §4).
 
 ### Registration (callers own their relief)
 ```rust
@@ -584,6 +586,11 @@ tier.
 
 ## 10. Diagnostics & logging (requirement)
 
+*As built* (`candle-core/src/vram/diag.rs`): `BudgetRow { class, reserved }` and
+`BudgetTable { capacity_c, total, headroom, source, rows: [BudgetRow; AllocClass::COUNT],
+pool_cushion }`. The design as first written, with the removed floor, forecast and
+ladder fields:
+
 ```rust
 pub struct BudgetRow { pub class: AllocClass, pub reserved: u64 }
 pub struct BudgetTable {
@@ -729,6 +736,20 @@ as the circuit-breaker fallback (`BALLOON_FALLBACK_MARGIN`, `vram/mod.rs`) stand
 
 ## 14. Test plan
 
+**This is the original design record; most of it is not in the tree.** The tests
+for the removed runtime half — the ladder, `kv_floor`, `forecast_units`, the expert
+budget and external-theft relief — went with that code. The startup half's tests
+are in `candle-core/src/vram/tests.rs`: `budget_evolves_with_allocations`,
+`balloon_undersized_falls_back` (the plan's `balloon_undersized_fallback`),
+`balloon_stops_at_the_real_ceiling`,
+`balloon_stops_at_the_residency_budget_when_the_driver_never_refuses`,
+`both_balloon_paths_target_total_less_the_reserve`,
+`refusal_refines_the_chunk_to_within_a_granule_of_the_ceiling`,
+`the_wddm_margin_is_capped_at_half_a_gib`, the `usable_*` capacity tests,
+`budget_table_shape`, and `startup_partitions_evolve_and_report`, plus the
+`real_cuda_*` tests behind the `cuda` feature. The plan below is kept as the
+record of what was specified.
+
 All non-GPU tests inject a `FakeProbe` (scripted `VramReading` sequence) +
 `FakeAllocator` (scripted failures). **Every test asserts via `budget_table()`** —
 the same diag view humans use.
@@ -814,4 +835,3 @@ Open / defaulted (flag if you disagree):
   theft into bounded, reversible KV eviction — resilient to squatters, immune to
   paging — while the **forecast** lets prefill safely use evictable headroom for
   parallelism without hurting the cache.
-```

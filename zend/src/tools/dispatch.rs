@@ -118,8 +118,8 @@ pub fn format_tool_responses(results: &[ToolResult]) -> TurnText {
 
 /// [`format_tool_responses`], with each result's block as a byte range of the
 /// text — `<tool_response>` through `</tool_response>`, the span a served
-/// read's recurrent record is applied over
-/// (`docs/archived/recurrent_reply_calibration.md` §7).
+/// read's recurrent rows are captured or replayed over
+/// (`docs/deltanet_timeline.md` §14.5).
 pub fn format_tool_blocks(results: &[ToolResult]) -> (TurnText, Vec<Range<usize>>) {
     let mut out = TurnText::default();
     let mut at = 0usize;

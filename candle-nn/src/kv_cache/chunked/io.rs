@@ -391,8 +391,7 @@ impl ChunkedKvBacking {
                     })?;
                 let rows = Tensor::from_vec(rows.clone(), rows.len(), device)?;
                 // Each band names its own storage format; the arena its gid
-                // points into is a run of untyped bytes and cannot
-                // (`docs/archived/arena_unification.md` principle 8).
+                // points into is a run of untyped bytes and cannot.
                 let bands: Vec<_> = cw.bands().collect();
                 let mut k_heads = Vec::with_capacity(n_kv_head);
                 let mut v_heads = Vec::with_capacity(n_kv_head);

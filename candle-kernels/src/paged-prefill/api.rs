@@ -6,7 +6,7 @@ use crate::rope::RopeRungsFfi;
 
 extern "C" {
     // ========================================================================
-    // INT8 prefix-attention prefill (docs/archived/prefill_optimization.md): GQA-packed
+    // INT8 prefix-attention prefill: GQA-packed
     // M, slice-aligned tiles, int8 m16n8k32 QK/PV directly over the quantized
     // arena. q_dtype: 1=F16, 2=BF16 (hard error otherwise).
     // ========================================================================

@@ -1,5 +1,4 @@
-//! The `Steps:` section a task's answer ends with
-//! (`docs/archived/zen_coding_challenge_fixes.md` Cause 3), written by the grammar.
+//! The `Steps:` section a task's answer ends with, written by the grammar.
 //!
 //! A task given steps says of each what became of it. Asked to in its brief,
 //! a coder left the section out of 3 answers in 8, and each was sent back for

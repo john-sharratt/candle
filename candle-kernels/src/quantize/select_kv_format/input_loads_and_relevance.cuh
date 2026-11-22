@@ -316,7 +316,7 @@ __device__ __forceinline__ float dequant_q_element(const void* block_ptr, int id
 // sub-entries describes that band alone — its own base pointer, slot stride,
 // format tag and outer scale. Keying by arena instead would force every band
 // of a head to share one arena and one format, which is exactly what size
-// classes remove (see `docs/arena_unification.md` §2).
+// classes remove.
 __device__ __forceinline__ PerHeadTableEntry load_band_entry(
     const int64_t* __restrict__ per_head_table_raw,
     int chunk_idx,

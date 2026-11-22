@@ -55,7 +55,7 @@ const HOT_ENTRY_CAP: usize = 8192;
 /// read; the live attention path reads the two-region directly and never
 /// materialises f32.
 pub struct FloatGallery {
-    keys: Tensor, // [cap, index_head_dim] f32, pre-RoPE — GPU while hot, CPU when spilled
+    keys: Tensor, // [cap, index_head_dim] f32, already rotated (the wave sweep stores the indexer's roped keys) — GPU while hot, CPU when spilled
     // The HOT retrieval artifact: the position-free two-region cache, built from
     // the incoming rows on append. The decode/prefill readers rotate the rope
     // bands at read time. GPU while hot, CPU when spilled (re-heated per query by
@@ -241,7 +241,8 @@ impl FloatGallery {
     }
 
     /// Append `n` completed groups: attended rows `[n, head_dim]` f32, scoring
-    /// keys `[n, index_head_dim]` f32 (both pre-RoPE, device), and their
+    /// keys `[n, index_head_dim]` f32 (device; the attended rows are pre-RoPE,
+    /// the scoring keys already rotated), and their
     /// group-start positions. Sign bits are packed on-device.
     ///
     /// One gallery's [`append_batch_all`] — the reference/streamed form. The
@@ -387,7 +388,7 @@ impl FloatGallery {
             // kernel can address, so the row gather itself must run on the host —
             // the one place invariant 4's "no host compute" does not reach,
             // because there is no kernel that could do it. (What would change
-            // that is the pinned warm pool of docs/archived/kv_tier_migration.md: page-
+            // that is a pinned warm pool, which is not built: page-
             // locked and device-mapped, the hot path's fused gather would read
             // this tier in place. It is a bounded POOL by design — page-locking
             // every spilled arena wholesale would make an unbounded amount of

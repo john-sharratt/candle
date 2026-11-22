@@ -117,7 +117,7 @@ pub(super) fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     // The cache is already sized and truncated for this wave: `wave_admit` did
     // both, for every layer, before the forward began. Nothing on this path may
     // claim a chunk — the transient tier is placed against the arena frontier
-    // and a claim here would move it (`docs/archived/elastic_vram_partition.md` §7).
+    // and a claim here would move it.
     // Flat attention output: [total_q, n_head, head_dim]. A reprojection-glue
     // forward (HD128, chunked) routes to the paged-glue kernel — it streams the
     // quantized slot once and reuses it across all glue rows (dequant-once),
@@ -214,7 +214,7 @@ pub(super) fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
             )?
         }
         // Ordinary prefill (fresh or over an existing prefix): the INT8
-        // prefix-attention kernel (docs/archived/prefill_optimization.md) —
+        // prefix-attention kernel —
         // GQA-packed M, slice-aligned tiles, int8 MMA directly over the
         // quantized arena, split-KV for the short-q/long-prefix regime.
         // Both RoPE pairings are applied in-kernel (half-split and

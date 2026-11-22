@@ -56,7 +56,7 @@ impl ConversationEngine {
     /// * `config` — Per-conversation configuration (role markers, sampling, etc.).
     /// Persist a substrate-side resume key (`debug_id`) for
     /// `timeline`.  Used by the debug-id-resumable grow-conversation
-    /// harness (`docs/archived/infinite_conversations.md` §10.4): a test can
+    /// harness: a test can
     /// re-open the workspace, call [`Self::lookup_by_debug_id`] to
     /// find a previously-built timeline, and continue growing.
     ///

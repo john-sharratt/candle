@@ -20,8 +20,16 @@
 
 - §2.3, serving the old build between attempts. It needs the restored member
   to say so at admission, which is a handshake change.
+- §2.4, leaving the cluster as `stranded` when the retries are spent. The
+  member sets `stranded` only when a build's requirements are incompatible with
+  this member (`check` in `install_tick`,
+  `cluster/src/upgrade/runtime/install.rs`), never from attempts spent.
 - §2.5, the connector following its daemon out of rotation, and the
   `serving` signal for the daemon's loops.
+
+The sections marked **Not built** are the plan of record. Where §3 and §4 and
+the tests of §5 name a state or line that depends on one of them, that
+dependence is marked too.
 
 The kind of a keep rollback is read as `slow`, because keep's local port
 serves no state a restored process could read. A watchdog's failure record
@@ -144,6 +152,9 @@ minutes after each failure. After that it is refused.
 
 ### 2.3 Between attempts: serve the old build if the cluster allows it
 
+**Not built.** The restored member's HELLO carries no `restored_from`; the
+gateway admits it below the floor as `Upgrading`, as before.
+
 The member was serving on its old build when it began the install. Restored, it
 asks to be admitted as it was:
 
@@ -170,6 +181,11 @@ older build with an install pending (§4).
 
 ### 2.4 When it cannot install and may not serve: out, with the reason
 
+**Not built.** Spent retries leave the member admitted upgrading and refused
+for the build; only an incompatible build (`check` in
+`cluster/src/upgrade/runtime/install.rs`) sets `stranded`, and the gateway's
+4410 close for a stranded member follows from that alone.
+
 When the retries are spent, or the build is refused, and the member may not
 serve its old build (§2.3), it **leaves the cluster** rather than sitting
 connected and idle:
@@ -185,6 +201,10 @@ connected and idle:
   process, its local GUI and its log. The cluster simply does not route to it.
 
 ### 2.5 Nothing serves from a member that is not serving
+
+**Not built.** There is no `serving` host signal, and the gateway routes
+`/mcp` to a connector without regard to its daemon's admission. The 10 s
+handed-turn sweep (`resume_handed_turns`) is gated on `leaving` and the claim.
 
 A member admitted upgrading, or closed 4410, serves nothing through the
 gateway, and its machine's other parts follow it:
@@ -215,7 +235,12 @@ gateway, and its machine's other parts follow it:
   member the gateway holds `Upgrading` that is not installing
   (`zend/src/mcp/tools/cluster_status.rs`; `MemberState` has no `Behind`). The
   member's own `Upgrading`, sent while `install_tick` runs, keeps the word.
-- **An older member serving between attempts** (§2.3) is `ready` with a note,
+
+  *Replaced design:* an earlier draft added a `Behind` variant to the
+  gateway's `MemberState`. The word is derived in the status tool instead, from
+  the state the gateway already reports and the member's upgrade report, so no
+  gateway state or wire change carries it.
+- **An older member serving between attempts** (§2.3, not built) is `ready` with a note,
   `on <build>, install of <floor> pending (attempt <n> of 3 at <time>)`.
 - **The rollout line counts:** `floor raised 6.0 h ago; 2 members below it: 0
   installing, 1 serving an older build, 1 behind`, each named in its machine's
@@ -242,6 +267,9 @@ knows something about it. It reads oldest first, then the present:
   now        attempt 2 of 3 of 5211 at 20:10 UTC; connector 5207 out of rotation
 ```
 
+The "serving on 5207, install pending" line and "connector 5207 out of
+rotation" belong to §2.3 and §2.5 and are not rendered until those are built.
+
 - **Every event carries its time**, from the record that holds it.
 - **The last line is the present**, worded from the same facts. It never
   guesses between causes ("loading or stuck"). When there is no member session
@@ -250,6 +278,11 @@ knows something about it. It reads oldest first, then the present:
   log's last line, a `stranded` reason.
 
 ## 5. Tests
+
+Tests for §2.3, §2.4 and §2.5 (the `restored_from` HELLO, the stranded report
+after spent retries, the `serving` signal, the connector routing, and the
+gateway's admission of a restored member) are written with those sections and
+do not exist yet.
 
 **Member** (`cluster/src/upgrade/runtime/`, raw expected values):
 

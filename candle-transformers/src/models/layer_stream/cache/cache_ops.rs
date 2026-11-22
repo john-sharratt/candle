@@ -602,7 +602,7 @@ impl<T, A: SlotAssembler<T>> LayerCache<T, A> {
 
     /// Adopt a new zone layout — the boundary move, in either direction.
     ///
-    /// **Between forwards only** (`docs/archived/qwen38_layer_streaming.md` §6): the
+    /// **Between forwards only**: the
     /// caller has already established that no wave is open.
     ///
     /// One entry point rather than a retract and a grow, because with a nested

@@ -82,8 +82,8 @@ pub fn forward_layer_batched_mixed<L: BatchedAttentionLayer>(
     // and having to be allocated off it.
     //
     // Scoped to one layer, not the forward: consumption stays at a single
-    // layer's working set rather than accumulating with depth
-    // (`docs/archived/arena_unification.md` §3.6). Halves alternate per layer, so
+    // layer's working set rather than accumulating with depth. Halves
+    // alternate per layer, so
     // layer N's reads are separated from layer N+2's writes by a whole layer of
     // same-stream work.
     let t_attn_host = profile_now();

@@ -85,7 +85,7 @@ pressure, a single active threat". The schema was written with this use in mind.
     second-class      │ first-class   │                    │
                       ▼               ▼                    ▼
               ┌────────────────────────────────────────────────┐
-              │  npc-engine  (the crate)                      │
+              │  npcd  (the daemon crate)                     │
               │  NpcRegistry · Tick scheduler                 │
               │  Interaction reaper · ToolReg                 │
               │  Environment simulator · MiscWork             │
@@ -183,50 +183,58 @@ from `IdentityScope`. An NPC id that fails to resolve, when NPCs *are* installed
 
 ## Part III — The substrate schema
 
-The six conversation-layers of the mind document become six layers in the projection YAML,
-plus the layers the engine itself needs. Each is an ordinary layer — window, budget,
-selection rule, summariser policy — and the differences between them are entirely
-declarative.
+The conversation-layers of the mind document become layers in the projection YAML
+(`npcd/projection.yaml`, the bundled mind's schema). Each is an ordinary layer — window,
+budget, selection rule, summariser policy — and the differences between them are
+entirely declarative. The schema declares ten:
 
-| Layer | Selection | Masking | Clock | Notes |
-|---|---|---|---|---|
-| `perception` | `Sequence{recent, historical_top_k}` | self-local | fast | **change only**; the present is a section, Part V |
-| `action` | `Sequence{…}` | self-local | tick | the act stream; ground truth |
-| `agency` | `TopK` / `Single` | self-local | slow | missions, strategies, sub-goals |
-| `relationships` | `TopK` | self-local | drift | per-entity calibration |
-| `beliefs` | `TopK` | self-local | threshold | **write-protected**, Part VI |
-| `memory` | `Sequence{…}` | self-local | unbounded | consolidation target |
-| `interaction` | `Sequence{recent:N}` | self-local | conversational | one timeline per interaction |
-| `environment` | `Sequence{recent:N}` | self-local | event | own system prompt, Part VIII |
-| `world` | `TopK` | **cross-timeline** | slow | shared authored facts; **never the event record** |
+| Layer | Selection (group) | Scope | Decode band | Window | `score_threshold` | Notes |
+|---|---|---|---|---|---|---|
+| `perception` | `conversation` — recent 12, historical top 8 | self-local | normal | 16,000 | 0.00 | **change only**; the present is a section, Part V |
+| `action` | `conversation` — recent 16, top 6 | self-local | normal | 16,000 | 0.00 | the act stream; ground truth |
+| `interaction` | `conversation` — recent 16, top 8 | self-local | normal | 16,000 | 0.00 | one timeline per interaction |
+| `talk` | `conversation` — recent 16, top 8 | self-local | **high** | 16,000 | 0.00 | one timeline per pair of parties, parked between turns (`docs/npc_conversations.md` §4) |
+| `memory` | `conversation` — recent 4, top 12 | self-local | low | 8,000 | 0.25 | consolidation target; unbounded |
+| `world` | `top_k` 6 | **shared** | low | 8,000 | 0.30 | shared authored facts; **never the event record** |
+| `environment` | `conversation` — recent 24 | self-local | low | 6,000 | 0.00 | scene continuity, Part VIII |
+| `agency` | `top_k` 4 | self-local | normal | 4,000 | 0.35 | missions, strategies, sub-goals |
+| `relationships` | `top_k` 6 | self-local | normal | 4,000 | 0.30 | per-entity calibration |
+| `beliefs` | `top_k` 5 | self-local | normal | 4,000 | 0.40 | highest threshold, Part VI |
 
-Everything an NPC privately owns is marked append-only/self-local so its belief scan is
-masked to its own timeline. The `world` layer is deliberately the exception: it is the one
-place cross-timeline enumeration is correct, because shared world facts *should* be
-retrievable across NPCs. That exception is also the one line of this schema that could undo
-a world's social design in a single change — see Part V-bis.
+Every layer but `world` is `gather_scope: conversation` — one private tree per
+character, so its belief scan is masked to its own timeline. `world` is `gather_scope:
+shared`, deliberately the exception: it is the one place cross-timeline enumeration is
+correct, because shared world facts *should* be retrievable across NPCs. That exception
+is also the one line of this schema that could undo a world's social design in a single
+change — see Part V-bis. `perception`, `action`, `interaction` and `talk` ask for `on_corrupt_turn: drop_turn`.
 
 Layer geometry — `window`, `budget.priority`, `budget.min_percent`, `score_threshold`,
 `decode_priority` — is the calibration surface the mind document's Part XII says can only
 be set by watching real runs. It is YAML precisely so it can be moved without a rebuild.
+A layer's `window` is the turn budget distributed when that layer is the projection
+target; `budget.priority` slices it.
 
 ### The system prompt is the immutable core, viewed
 
 Part II of the mind document maps directly onto the existing collection machinery, which
-already implements the three selection disciplines:
+already implements the selection disciplines. The shared system prompt in
+`npcd/projection.yaml` declares:
 
-| Discipline | Mechanism today | Collection |
+| Discipline | Mechanism | Collection |
 |---|---|---|
-| Structurally always-present | `AlwaysVisible` retained to the NPC's chain | `identity_anchor` |
-| Spiking (mood) | `Named{selector}` set per turn via `TurnOptions::selection` | `mood` |
-| Locked top-k (template) | `Named{selector}`, chosen once at interaction start, frozen | `response` |
+| Structurally always-present | `always_visible` in the schema; the engine rescopes each member to its own character with `SelectionRule::Named` (`engine/identity.rs`) | `identity_anchor`, `identity` |
+| Spiking (mood) | `top_k` 1 by provenance, low β and a min/evict gap as the hysteresis; re-evaluated at every barrier | `mood` |
+| Locked top-k (template) | `top_k` 1 by provenance match against the incoming exchange, chosen once at turn start and frozen for the decode | `response` |
 
 `SelectionRule::Named` is explicitly score-independent — it selects exactly the member the
-caller names, ignoring provenance relevance and the score threshold. That is the correct
-primitive for both a mood spike and a locked template, and it already exists. The `tools`
-collection is the exception that wants both sources: it uses `SelectionRule::Offered`, where
-the room names the acts the body can take and provenance ranks them (see
-`provenance_adaptive_projection.md` §2.3).
+caller names (set per turn through `TurnOptions::selection`), ignoring provenance relevance
+and the score threshold. The engine uses it wherever a fact about the character, not a
+score, decides what is shown: the character's own anchor and identity, its setting and
+building, and the mission, journal, channels, voice, acting and unassigned collections a
+schema may declare (`engine/identity.rs`). `SelectionRule::Offered` — the runtime names the
+candidates and provenance ranks them (`provenance_adaptive_projection.md` §2.3) — is in the
+engine; no npcd schema declares it, and the acts a body can take are offered by the room,
+Part VII.
 
 ### The situation, and the standing task
 
@@ -270,8 +278,8 @@ the world holds, so the steps that name them are ticked by the engine itself
 |---|---|
 | `go to` / `go back to` / `travel to` / `walk to` / `head to` / `make your way to` *a room* | the body stands in that room |
 | `scan` *a machine* | the body stands in the machine's room — the situation lists every machine within reach with its state — or a `scan` lists it |
-| `find` / `go to` / `visit` / `seek out` / `look in on` / `meet` *a person* | that person is in the body's room |
-| `ask` / `tell` / `talk to` / `speak to` / `give` / `draw` / `hear` *a person* | an `ask`, `tell`, `message`, `gesture` or `give` addressed to them lands |
+| `find` / `go and find` / `go to` / `travel to` / `visit` / `seek out` / `look in on` / `meet` *a person* | that person is in the body's room |
+| `ask` / `tell` / `message` / `talk to` / `talk with` / `speak to` / `speak with` / `give` / `draw` / `hear` *a person* | an `ask`, `tell`, `message`, `gesture` or `give` addressed to them lands |
 
 Anything else ("form your own view of it") is left to the guardian's step tracker, which never
 asks about a step the engine can see. A mission lodged with no steps is given them from its brief
@@ -285,7 +293,7 @@ right now — or, when only the report is left, the way back to the table. A way
 every floor there is a way to is offered, a name two floors share carrying its level ("the green
 room, on the chronicle level"), and a journey that changes floor is ridden by the world — the body
 walks to its landing, waits there for the car with whoever else is waiting, is set down on the far
-landing and walks on (`World::tick`, `board_for_the_way`). Told to make the ride itself (walk to the
+landing and walks on (`npc_map::world::World::tick`, `board_for_the_way` in `npc-map/src/world/lifts.rs`). Told to make the ride itself (walk to the
 lift, `lift_use` naming the level, walk on), a cast stood on the landing all evening and never once
 called the car. A landing is never a collision: bodies passing through one queue there. The table offers only what the
 body can do at it: `report_done` / `report_stuck` to one carrying a mission,
@@ -298,7 +306,9 @@ broken. The loop guard counts `message` as speech, and never strikes the lift (`
 `lift_call`), which is movement.
 `report_stuck` is turned away twice while the next step's room, machine or person is within
 reach — or, for a step that reads or writes a document, a desk is (`file_read` offered there) —
-with the way there, and taken the third time. On work every step of which is done, a
+with the way there, and taken the third time — a turn-away counting only after the
+world refused something the character then tried, or once three untried ones have gone by
+in a row (`UNTRIED_TURN_AWAYS`). On work every step of which is done, a
 `report_stuck` is filed done in the carrier's words (with what the engine saw beside them) — at
 once for a mission with no operation behind it; for an operation's step, after it has been turned
 away twice with the verdicts it can give, and then only through the gate a `report_done` passes.
@@ -328,11 +338,20 @@ and appearing in no log as anything but a heartbeat. A chronicle task and a port
 should read forward differently, and the only honest source of that difference is the task
 document.
 
-So the continuance is a field of the task, and the idle turn is **assembled from the TODO
-structure the way a place description is assembled from a map** — authored English in the
-data, a pure function turning it into prose, the same bytes every time. A task with no
-continuance is refused at load, because the fallback for a missing one is precisely the
-generic string being avoided, and it would install itself silently.
+So what an idle turn carries is the task's, and it is **assembled from the TODO structure the
+way a place description is assembled from a map** — authored English in the data, a pure
+function turning it into prose, the same bytes every time. A character carrying a mission
+reads `Mission::standing_text` each quiet turn: "What has been asked of you:", the mission's
+text, the steps that see it through, and where it ends (`engine/mission/lifecycle.rs`).
+
+*Replaced design:* the first design made the continuance a field of the task and refused a
+task without one at load. A mission carries no separate continuance field, and a character
+with no mission reads `NO_MISSION` (`engine/runtime/instructions.rs`) — one engine-written
+string, worded as a disposition that names no place, no object and no verb of motion
+because every restated destination became a route the whole cast followed identically
+(nineteen acts in nineteen were `move_to`). A character that takes no orders reads
+`YOUR_OWN_TIME`, and one at the table with only the report left reads
+`REPORT_AT_THE_TABLE`.
 
 One property this buys, beyond keeping the task in view: the idle turn is **externally
 authored**, so an NPC drifting inward is pulled back by something it did not write. A
@@ -343,20 +362,31 @@ continuance derived from the NPC's own state would be self-echo wearing an ancho
 
 ## Part IV — Interactions
 
-### An interaction is a conversation on the NPC's substrate
+### An interaction is a session on the character's own life
 
 ```
 POST /v1/npc/{npc_id}/interaction
-  { "mode": "physical" | "video_call" | "voice_call" | "instant_message",
-    "interlocutor": { "kind": "player"|"npc"|"operator", "id": "…" },
-    "idle_timeout_secs": 900 }
-  → { "interaction_id": … }
+  { "mode": "physical" | "instant_message" }          (physical when omitted)
+  → the session: id, mode, interlocutor, idle_timeout_secs, …
 ```
 
-Creating one calls `fork_resuming(timeline_of_interaction(npc, ix))` against the
-`interaction` layer. The fork inherits the NPC's sealed prefix by reference and diverges
-only at its suffix — so the tenth concurrent interaction with a popular NPC costs a suffix,
-not a mind.
+An interaction is a **session** (`npcd/src/engine/interaction.rs`): somebody outside the
+world is present to a character, in a mode, for as long as neither walks away. Opening
+one forks nothing and starts no second loop — the character goes on ticking on its own
+schedule in the one world it stands in, and what is said goes through the same door
+everything else does (`engine::pulse::inject`), so the character perceives it on its next
+turn and answers with the acts it always had. The session holds who is present, in what
+mode, and since when; the conversation itself lives where everything else that happened
+lives. The interlocutor is the signed-in caller (`kind: "operator"`), not a request field.
+A character has at most one session per person and mode; opening a second continues the
+first. A physical session needs a character with a body (`409 not_in_a_world` otherwise).
+
+*Replaced design:* the first design forked a timeline per interaction on the `interaction`
+layer (`fork_resuming(timeline_of_interaction(npc, ix))`), so that an operator got a
+private copy of the mind to talk at. That copy would have remembered nothing afterwards and
+the rest of the world could not have seen that the talk took place, so the session model
+replaced it. A character's long-lived conversations with one party each are the `talk`
+layer (`docs/npc_conversations.md`).
 
 ### Two NPCs in one room are not an interaction
 
@@ -366,12 +396,14 @@ of it: one speaks, the act lands in the place, and everyone standing there perce
 The room is the channel.
 
 This matters at scale rather than in principle. Sixteen NPCs sharing a building would be 240
-pairwise forks under an interaction-per-pair reading of `interlocutor: {kind: "npc"}`, all
-to model something the act stream already carries. It is the mind document's own result one
-level down: a conversation is a *reading* of the stream, not a thread in anybody's head.
+pairwise sessions under an interaction-per-pair reading, all to model something the act
+stream already carries. It is the mind document's own result one level down: a
+conversation is a *reading* of the stream, not a thread in anybody's head.
 
-`kind: "npc"` is therefore reserved for a genuinely private NPC-to-NPC channel — a message,
-a call — and is never how two characters standing together talk.
+An interaction's interlocutor is therefore the person at the console (`kind: "operator"`).
+A genuinely private NPC-to-NPC channel — a message — is a `message` thread, and a
+character's conversation with one other party is a `talk` timeline
+(`docs/npc_conversations.md`); neither is how two characters standing together talk.
 
 ### Speech is delivered by place and directed by address
 
@@ -401,40 +433,45 @@ become one between all of them (`Event::wakes`).
 
 ### Mode is a projection input, not a branch
 
-The four modes are **not** four code paths. Mode selects a template from the `response`
-collection and sets the observability envelope:
+There are **two** modes, and they are not two code paths. Mode decides which tools the
+character is offered while the person is there (`engine::tools::specs_within`) and how long
+the session lives:
 
-| Mode | Observable | Not observable |
-|---|---|---|
-| `physical` | speech, movement, gesture, expression, ambient world acts | internal broadcasts |
-| `video_call` | speech, expression, framed gesture | movement outside frame, ambient |
-| `voice_call` | speech, audible action | all visual acts |
-| `instant_message` | speech only, text-shaped | everything else |
+| Mode | The person is | Offered | Idle timeout |
+|---|---|---|---|
+| `physical` (default) | in the room: the session enters a body beside the character, so it appears in `Within::company` | `tell`, `ask`, `give`, `gesture` and the rest that need somebody present; no picture to send | 300 s |
+| `instant_message` | wherever they are, no body needed | text to somebody who may be nowhere near; `send_image` | 86,400 s |
 
 This is the mind document's *scoping by observability, not relevance* made concrete: the
-mode is the vantage. A voice call is not a "chat mode" — it is the same act stream narrated
-through a vantage that cannot see. An NPC that breaks off mid-sentence to look east is
-narrated as a pause on a voice call and as a turn of the head in a physical encounter,
-because it is one act read through two envelopes.
+mode is the reach each party has. A character standing in front of you does not text you a
+photo, so `send_image` is absent from the catalog in `physical` mode, not present-and-
+refused.
 
-Mode is fixed for the life of the interaction. Changing modes ends one interaction and
-starts another — which is also what happens in the fiction.
+*Replaced design:* the first design had four modes, adding `video_call` and `voice_call`.
+They were the same two pieces of machinery — is the other party in the room, can a picture
+go down the channel — sliced again to no purpose, and no surface used them.
+
+A different mode is a different conversation: standing in the room with somebody and
+messaging them are two sessions. Mode is fixed for the life of a session.
 
 ### Ending on idle
 
-An interaction ends when no event has touched it for `idle_timeout_secs`. A reaper task
-sweeps live interactions on a coarse tick.
+A session ends when nothing has been said on it for its mode's idle timeout, or when it is
+ended by hand. There is no reaper task: the time left (`idle_remaining`) is computed from
+the last thing said, on the **wall clock** — going quiet is a fact about a person at a
+console, and the world's clock can be paused or run at another rate — and an expired
+session is dropped the next time the map is touched (`Interactions::sweep`), so a daemon
+that was asleep wakes owing nobody a sweep. An ended session takes its visitor's body out of
+the room.
 
-Ending **archives**, it does not delete. The substrate already distinguishes archived
-(`TimelineEntry::archived`, filtered out of `active_timelines_for_group`) from tombstoned
-(permanently dead). An ended interaction is archived: it stops being enumerated, its turns
-stop being gathered, and its content survives for consolidation to fold into `memory` on
-the sleep clock. This is the mind document's *soft fade by non-selection* — reversible,
-cue-resurfaceable — rather than its *hard forget*, which belongs only to the sleep fold.
+The timeout is the mode's, fixed in code: a physical encounter lapses faster than an
+instant-message thread, because standing silently in front of someone means something
+different from not replying to a message. What was said lives in the character's stream
+like everything else that happened; ending a session archives and deletes nothing.
 
-The idle timeout is per-interaction and set at creation, defaulting per mode: a physical
-encounter lapses faster than an instant-message thread, because standing silently in front
-of someone means something different from not replying to a message.
+*Replaced design:* the first design set `idle_timeout_secs` per interaction at creation,
+reaped on a coarse tick, and archived the forked timeline
+(`TimelineEntry::archived`) so consolidation could fold it.
 
 ---
 
@@ -464,13 +501,15 @@ class the architecture did not previously name:
 | Class | Scored | Refreshed | Placed by |
 |---|---|---|---|
 | Immutable core (the lens) | never | never | the CoW prefix |
-| **Environment-placed** | **never** | **every tick** | `ConversationEnvironment` |
+| **Environment-placed** | **never** | **when it changes** | `engine::environment` (`npcd/src/engine/environment.rs`) |
 | Gathered substrate | under budget | accumulates | provenance |
 
 `SelectionRule::Named` is the closest existing primitive — it is explicitly
 score-independent — but it names a *collection member*. Environment placement puts a
-**block** at a fixed position with no scoring at all. That mechanism is what "deterministic
-provenance" means, and it is what the environment owns.
+**block** at a fixed position with no scoring at all: an event of a kind that
+`EventKind::replaces` gives a band (`situation`, `unread`, `nudge`), delivered by
+`engine::environment`. That mechanism is what "deterministic provenance" means, and it is
+what the environment owns.
 
 ### Supersession is how a point in time lives in an append-only window
 
@@ -491,7 +530,8 @@ mechanism is right and the map was the wrong thing to put in it: a picture that 
 survive tokenization. **A situation is the honest use of the band the map was occupying.**
 
 The NPC's current mission and task sit in the same middle row by the same mechanism, in
-their own band.
+their own band (`nudge`: a task, a mind-control thought and their restatements replace
+one another).
 
 ### Push and pull, and why both
 
@@ -499,10 +539,10 @@ The world simulation is authoritative and the engine is its consumer, but the di
 travel differs by what is being carried.
 
 **Change is pushed.** After each world tick the environment computes every NPC's delta and
-pushes it, and that push is **one batched prefill across every NPC at once** — the mind
-document's central asymmetry, actually delivered. Pulling at gather time would serialise it:
-each NPC would compute its own delta inside its own gather, one at a time, on the decode
-path.
+pushes it, in **one sweep over one lock** (`engine::environment`) — perception is prefill and
+action is decode, so the cheap half is delivered off the decode path entirely, the mind
+document's central asymmetry. Pulling at gather time would serialise it: each NPC would
+compute its own delta inside its own gather, one at a time, on the decode path.
 
 **State is pulled.** The percept is a pure function of world state, so the environment reads
 it rather than being told it. This is what keeps two sources of truth from existing for
@@ -517,21 +557,24 @@ Nothing is dropped at emission. The mind document is explicit that a filter remo
 contradicting evidence before it lands makes a delusion permanent; salience biases the
 gather and the fade, never the write.
 
-### Injection is between turns *and* between tool calls
+### Injection happens at tick boundaries
 
-Events do not wait for turn boundaries. They are injected at every boundary the NPC's own
-execution offers — including between tool invocations within one turn — in the same position
-and the same shape as a tool result. This is the `<system-reminder>` discipline Claude Code
-uses, and it has two consequences worth stating:
+Each character is one loop sleeping on its own inbox (`engine::tick`). An arrival that asks
+something of the character wakes it at once; quieter information waits for its next wake. A
+tick has three phases around the decode: perception lands in the window before the decode
+reads it, the decode runs with no lock held, and the acts land after. What a character reads
+at the start of a tick is the answers to what it did, one `<tool_response>` block per call in
+the order it made them, then the world's events as one passage of third-person prose written
+by the character's narrator thread (`engine::mind::perception`, `engine::narrator`); a refusal
+is returned like any other answer. Answers come first because they answer the turn before.
 
-- **The world can move underneath a multi-step plan**, and the NPC finds out mid-plan rather
-  than at the end. This is the mind document's *perception never blocks on action* at finer
-  grain than that document imagined.
-- **A mutation from one tool call is visible to the next injection in the same turn**, because
-  the world is one shared state behind one lock.
+- **A mutation from one tool call is visible to the next tick's injection**, because the
+  world is one shared state behind one lock.
+- The percept is computable at any instant — it is a pure function with no cursor.
 
-The percept must therefore be computable at any instant, which it is — it is a pure function
-with no cursor. The change cursor advances at injection points rather than tick boundaries.
+**Not built:** injection *within* a decode, between the tool invocations of one turn, in the
+position and shape of a tool result. A tick's decode reads one window, and what the world did
+while it ran is read by the next.
 
 ### The batch endpoint remains, for worlds the engine does not host
 
@@ -544,6 +587,10 @@ of truth for where a body is standing is the same bug as two world simulators. F
 whose world lives entirely in an external game, it is the only path, and it stays a batch
 endpoint with no single-event variant — a per-event endpoint would silently destroy the
 prefill batching that makes perception cheap.
+
+**Not built.** The route is registered (`/v1/npc/:nid/perceive`, `character_state::perceive`)
+and, after the ownership check, answers `503 no_engine`; nothing delivers an external batch
+to a character yet. Every hosted character is perceived through `engine::environment`.
 
 **ASCII maps are gone.** They were a `kind: "map"` event carrying a zoom band, a fenced
 block and a legend, superseding the previous map for that band. Two things were wrong with
@@ -603,9 +650,10 @@ of it an operator gets.
 There is no physics and no metres. A journey is measured in the places somebody would
 actually pause, and a stop is a tick, which is a turn.
 
-Concretely, in the six-level building the vault ships: anywhere on your own level is **one**
-stop, the lift ride however many levels is **one**, and the far corner of the top level to
-the command room is **three** — against nine doorways. That is a compression of the
+Concretely, in the multi-level building the vault ships (`npc-map/maps/creators-vault.yaml`
+names eight levels; `npc-map/tests/movement.rs` walks it): anywhere on your own level is
+**one** stop, the lift ride however many levels is **one**, and the far band of the casting
+level to the command room is **three** — against nine doorways. That is a compression of the
 building, not a flattening of it, and the three stops are the three a person would name:
 *you go to the lift, you ride it, you walk to the room.* Cutting a journey there rather than
 at every doorway is what makes each pause worth a turn. Nobody reconsiders halfway down a
@@ -652,12 +700,20 @@ invariant:
 > designer, or world simulator can do — and on it, beliefs are writable, because someone
 > has to be able to say what this character believes when the world is built.
 
-An API belief write is an authoring act. It is recorded as such — with a provenance marker
-distinguishing it from an evidence-threshold rewrite — and it is available to the GUI
-because building a cast of characters requires it. What remains impossible is for the NPC's
-own decode to emit a belief mutation. No tool in the generic catalog writes to the belief
-layer, and the tool registry rejects an extension tool that declares the belief layer as a
-write target.
+An API belief write is an authoring act: `PUT`/`DELETE /v1/npc/:nid/beliefs/:bid` states or
+removes an operator's belief on the character's record (`statement`, `confidence`,
+`threshold`; `Role::User`, with ownership checked per record), and the GUI uses it because
+building a cast of characters requires it. Relationships (`PUT .../relationships/:eid`) and
+agency (`PUT .../agency/:sid`) are written the same way. What remains impossible is for the
+NPC's own decode to emit a belief mutation: no act in the catalog writes to the belief layer
+(an act's `Plane` is `Speech`, `World`, `Internal` — the character's own non-belief layers —
+or `Meta`).
+
+**Not built:** the evidence-threshold rewrite of a belief on the slow clock, and the
+provenance marker that would distinguish it from an authoring write; nothing in npcd weighs
+evidence against a belief yet, so a belief reads as having no disconfirmation until it does.
+The same holds for the extension-tool registry (Part VII), which would reject a tool that
+declares the belief layer as a write target.
 
 ```
    AUTHORING PLANE (operator / GUI / API / world sim)
@@ -684,24 +740,36 @@ point of having both.
 
 ### The generic catalog
 
-Every NPC gets a base vocabulary. These are the acts the mind document's fan-out produces,
-and `speak` is among them rather than beside them — dialogue is a tool call, which is what
-welds the conversational surface to ground truth.
+Every NPC gets a base vocabulary: the acts the mind document's fan-out produces, with
+speech among them rather than beside them — dialogue is a tool call, which is what welds the
+conversational surface to ground truth. They are `Tool` constants in
+`npcd/src/engine/tools/act_tools.rs` and `npcd/src/engine/acts/`, each carrying a `Plane`
+(what it changes), an availability, its parameters, worked examples and the modes it runs in
+(`engine/tools/types.rs`):
 
-| Category | Tools | Availability |
-|---|---|---|
-| Speech | `speak` | always |
-| Movement | `move_to`, `face`, `follow`, `flee` | always |
-| Gesture | `gesture`, `express` | always |
-| Attention | `observe`, `listen`, `inspect` | always |
-| Social | `greet`, `offer`, `refuse`, `threaten` | always |
-| Internal | `note_concern`, `set_intent`, `broadcast_strategy` | always |
-| Messaging | `send_image` | **messaging modes only** |
-| Meta | `wait`, `end_interaction` | always |
+| Category | Acts |
+|---|---|
+| Speech | `tell`, `ask`, `whisper`, `shout` |
+| Movement | `move_to`, `follow`, `focus`, `recall`, `lift_call`, `lift_use` |
+| Gesture | `gesture` |
+| Attention and thought | `reflect`, `scan`, `read` |
+| Things | `give`, `equip`, `use`, `gather`, `claim`, `release`, `post_notice` |
+| Messaging | `reach_out`, `message`, `reply`, `invite`, `open_group`, `send_image` (**instant-message mode only**) |
+| Machines, fighting and work | `operate`, `engage`, `command_tower`, `produce`, `promise`, `remind`, `record_verdict`, `sign_off`, `invoke` |
+| Agenda | `mission_add`, `mission_edit`, `mission_cancel`, `mission_done` |
+| Meta | `sleep` |
 
-`speak` is append-only and conflict-free; world-mutating acts commit through an arbiter
-carrying the world-version they reasoned over, per the mind document's two commit paths —
-except claim-shaped acts, which are compare-and-swap with a typed refusal (Part V-bis).
+Speech is append-only and conflict-free (`Plane::Speech`); world-mutating acts commit
+through an arbiter carrying the world-version they reasoned over (`Plane::World`), per the
+mind document's two commit paths — except claim-shaped acts, which are compare-and-swap with
+a typed refusal (Part V-bis). `Plane::Internal` writes only the character's own non-belief
+layers, and `Plane::Meta` changes only the loop's own scheduling.
+
+*Replaced design:* the first catalog was a fixed list (`speak`, `face`, `flee`, `observe`,
+`listen`, `inspect`, `greet`, `offer`, `refuse`, `threaten`, `note_concern`, `set_intent`,
+`broadcast_strategy`, `wait`, `end_interaction`). The built catalog grew from the worlds'
+needs instead; speech is `tell`/`ask`/`whisper`/`shout`, and an interaction ends by idle or
+by hand through the API, not by an act of the character's.
 
 ### Availability is a product of location
 
@@ -728,13 +796,13 @@ Each part carries its own provenance text — what it is and what its tools do �
 injected alongside the tools it offers. That text is authored beside the part, once, so
 every room holding one describes it identically.
 
-**Tools carry intent, not output.** `speak` does not take a sentence and `send_image` does not
-take an image prompt — each takes what the character *means* to convey, and the narrator renders
-it into prose or into a scene prompt. This is the mind document's "narrate acts, never
-fabricate" applied one level deeper: the mind decides substance, the surface decides wording,
-and neither can produce what the other did not license. The wire format is
-`candle-conversation::narrator`'s existing `NarratorInput` enum. See
-`npc_api_gui_design.md` §18.
+**Tools carry intent, not output.** `tell` takes an `intent` and a `manner`, not a sentence,
+and `send_image` takes an `intent`, not an image prompt — each takes what the character
+*means* to convey, and the narrator renders it into prose or into a scene prompt. This is the
+mind document's "narrate acts, never fabricate" applied one level deeper: the mind decides
+substance, the surface decides wording, and neither can produce what the other did not
+license. The wire format is `candle-conversation::narrator`'s `NarratorInput` enum
+(`docs/archived/npc_api_gui_design.md` §18 is the original argument).
 
 `send_image` is absent from the catalog in `physical` mode rather than present-and-refused — a
 character standing in front of you does not text you a photo, and the model should never be
@@ -742,6 +810,11 @@ invited to try. It takes the interlocutor's **unique name** as its target, valid
 interaction.
 
 ### Extension with strongly-typed parameters
+
+> **Not built.** npcd's acts are static `Tool` constants compiled into the daemon
+> (`engine/tools/`, `engine/acts/`); there is no `NpcTool` trait, no `ToolRegistry::register`,
+> and no dynamic registry. The design below is the plan of record for a framework consumer that
+> must add a tool carrying state.
 
 zend's tool system has exactly the right ergonomics and the wrong lifetime. `Tool` is a
 trait with associated `Request: DeserializeOwned + JsonSchema + Validate`, `Response:
@@ -787,15 +860,26 @@ zend's tool *selection* quality comes from calibration: each tool definition car
 reserved calibration layer to seed the wide-Q reference substrate. A tool with no examples
 is uncalibrated and selects worse.
 
-So `register` accepts optional examples, and a tool registered **before** the calibration
-phase is calibrated with the rest. A tool registered **after** the engine is live is usable
-but uncalibrated until the next calibration pass. The API surfaces this honestly rather than
-hiding it: registration returns whether the tool was calibrated, and there is an explicit
-endpoint to trigger a calibration pass over newly-registered tools.
+In npcd an act is calibrated by the worked `examples` authored on its `Tool` constant, which
+teach the choice between neighbouring acts. `POST /v1/tools/calibrate?tenant=npcd` answers
+`409 calibrated_by_examples` (`docs/shared_model_host.md` §3.5), and the catalog reports each
+act's `calibrated` flag and `examples` count.
+
+**Not built:** for the dynamic registry above, `register` would accept optional examples, a
+tool registered before the calibration phase would be calibrated with the rest, one registered
+after the engine is live would be usable but uncalibrated until the next pass, and
+registration would return whether the tool was calibrated.
 
 ---
 
 ## Part VIII — The environment simulator
+
+> **Status.** Built: the `environment` layer (a sliding window of scene continuity,
+> `recent: 24`, `window` 6,000 in `npcd/projection.yaml`) and the deterministic hosted world
+> (Part V-bis) that `engine::environment` reads to deliver every character's percept and
+> changes. **Not built:** the language-model environment simulator described below — its own
+> conversation and system prompt, its per-NPC toggle with the GUI and API defaults, and its
+> refusal for a bound NPC.
 
 An NPC acts on a world. During authoring, and during any run where no external world
 simulation is attached, there needs to be something that answers *what happened next*. The
@@ -849,15 +933,18 @@ than the current decode.
 
 ## Part IX — Templating
 
-The templating engine is kept as-is in mechanism and generalised in sourcing.
+**Built.** A collection the schema's `system_prompt` declares with `sections: []` is
+folder-backed: npcd fills it at startup from the mind's folders — `<mind>/personalities/`,
+`<mind>/responses/` and `<mind>/moods/` (`npcd/projection.yaml`, `npcd/src/collections.rs`).
+Each response or mood file is one section — `id`, `category`, `description`, `template`,
+`examples` — whose `template` is installed as the section's content and whose `examples` train
+its selection. Responses and moods are ingested untagged, so every world shares both the text
+and its KV. zend's own loader is `zend/src/response_section.rs`, which validates a file and
+substitutes `{CHAR_NAME}`/`{USER_NAME}`.
 
-Today: any collection declared empty in the schema's `system_prompt` is auto-filled from a
-workspace folder named by pluralising the collection (`response` → `responses/`, `mood` →
-`moods/`, `identity` → `identities/`). Each file is one `ResponseSection` — `id`, `category`,
-`description`, `template`, `examples` — validated, `{CHAR_NAME}`/`{USER_NAME}` substituted,
-and installed as the section's content with the examples driving calibration.
-
-Three changes:
+**Not built.** The three changes below are the plan of record; the sourcing is the mind's
+folders only, and the library `GET /v1/world/:id/collections` serves is the same for every
+world.
 
 1. **Sources are explicit.** A collection may be sourced from a path, from an embedded
    default set, or from templates passed directly over the API — so a caller embedding the
@@ -883,6 +970,17 @@ Three changes:
 ---
 
 ## Part X — The crate refactor
+
+> **Status: Not built. Plan of record.** None of the modules below has moved: the
+> `templates`, `runtime` and `tools` modules do not exist in `candle-conversation`
+> (`candle-conversation/src/`), and the listed files are still in `zend`
+> (`zend/src/response_section.rs`, `chatml.rs`, `conv_files.rs`, `loading.rs`,
+> `turn_sink.rs`, `projection_event.rs`, `refresh_ctx.rs`, `tools/catalog.rs`;
+> `IdentityBuilders` in `zend/src/session/builders.rs`). `ScopeBuilders` does not
+> exist; `npcd` builds its projections through its own `engine/schema.rs` and its
+> bearings scope (`docs/npcd_worlds_and_layers.md` §4) rather than a generalised
+> scope resolver. What was built instead of the shared-crate move is the `host`
+> crate (below) and `npc-map`.
 
 The requirement is that everything reusable in zend moves into `candle-conversation` and is
 shared. This is the concrete inventory.
@@ -921,7 +1019,7 @@ language model.
 
 ### Stays in zend
 
-`code_read/` (7.3k), `repo_scan/` (4.0k), `raw_read/`, `watcher.rs`, `ingest*.rs`, and the
+`code_read/`, `repo_scan/`, `raw_read/`, `watcher.rs`, `ingest*.rs`, and the
 coding-assistant halves of `session/` and `api/`. These are workspace-and-code specific and
 have no NPC counterpart.
 
@@ -954,29 +1052,36 @@ unparseable id and somebody else's id are the same 404.
     DELETE /v1/npc/{id}                     tombstone
 
   Perception
-    POST   /v1/npc/{id}/perceive            batched events — unbound NPCs only
-    GET    /v1/npc/{id}/percept             what it would perceive now (introspection)
-    GET    /v1/npc/{id}/tools               what is within reach where it stands
+    POST   /v1/npc/{id}/perceive            batched events — Not built: after the ownership
+                                            check it answers 503 no_engine (Part V)
 
-  Worlds  (Part V-bis)
-    POST   /v1/world                        load a map set, bind it
-    GET    /v1/world/{id}/map               areas, places, what joins what
-    GET    /v1/world/{id}/where             every body in it
-    POST   /v1/world/{id}/tick              advance one moment
-    GET    /v1/world/{id}/stream            the unfiltered record — never an NPC's input
+  Worlds  (authored documents; the binding of Part V-bis is the runtime's)
+    GET    /v1/world                        list                              (unauthenticated)
+    GET    /v1/world/{id}                   one world's document              (unauthenticated)
+    GET    /v1/world/{id}/collections       the response and mood libraries   (unauthenticated)
+    PUT    /v1/world/{id}                   write the document                (admin)
+    DELETE /v1/world/{id}                   remove it                         (admin)
+    PUT    /v1/world/{id}/time              the narrative clock               (admin)
+    GET/POST /v1/world/{id}/channel         the world's channel: read, post
+    POST   /v1/world/{id}/posting           write on a surface in a room
 
   State (authoring plane)
     GET    /v1/npc/{id}/relationships       list
     PUT    /v1/npc/{id}/relationships/{e}   set/adjust
     GET    /v1/npc/{id}/beliefs             list
-    PUT    /v1/npc/{id}/beliefs/{b}         authoring write (marked as such)
+    PUT    /v1/npc/{id}/beliefs/{b}         authoring write
+    DELETE /v1/npc/{id}/beliefs/{b}         remove one
     GET    /v1/npc/{id}/agency              missions, strategies, sub-goals
-    GET    /v1/npc/{id}/memory              consolidated memory
+    PUT    /v1/npc/{id}/agency/{s}          set one
+    GET    /v1/npc/{id}/memory              Not built: answers an empty page with
+                                            engine_connected false
 
-  Interactions
-    POST   /v1/npc/{id}/interaction         open (mode, interlocutor, idle timeout)
-    POST   /v1/interaction/{ix}/inject      operator/player event into the inbox
-    GET    /v1/interaction/{ix}/stream      SSE: live acts, then tick-bounded narration
+  Interactions  (Part IV)
+    POST   /v1/npc/{id}/interaction         open (mode: physical | instant_message)
+    GET    /v1/npc/{id}/interaction         its live sessions
+    GET    /v1/interaction/{ix}             one session
+    POST   /v1/interaction/{ix}/inject      a line from the person into the character's world
+    GET    /v1/interaction/{ix}/stream      SSE: open, then act and tick frames
     DELETE /v1/interaction/{ix}             end explicitly
 
   Operator writes  (owner only — 404 for a character that is not yours)
@@ -989,35 +1094,42 @@ unparseable id and somebody else's id are the same 404.
                                             steps with their ticks, the answer and the report)
     POST   /v1/npc/{id}/mission/cancel      call it off
 
-  Environment
-    GET    /v1/npc/{id}/environment         simulator state + enabled flag
-    PUT    /v1/npc/{id}/environment         toggle, set system prompt
-    POST   /v1/npc/{id}/environment/inject  world event into the simulator
+  Environment  (Part VIII)
+    Not built: no `/v1/npc/{id}/environment` routes exist.
 
-  Tools
-    GET    /v1/tools                        catalog (generic + registered extensions)
-    POST   /v1/tools/calibrate              calibration pass over uncalibrated tools
+  Tools  (the host's, `docs/shared_model_host.md` §3.5)
+    GET    /v1/tools                        every catalog, npcd's under tenant npcd
+    POST   /v1/tools/calibrate?tenant=npcd  409 calibrated_by_examples
 
   Introspection  (mirrors zend's /v1/substrate/*)
     GET    /v1/npc/{id}/substrate           layer occupancy for this NPC
-    GET    /v1/npc/{id}/substrate/layer/{n} turns in one layer
-    GET    /v1/npc/{id}/projection          what the last tick actually gathered
-    GET    /v1/npc/{id}/monitor             metacognition health signal
-    GET    /v1/status, /v1/telemetry        daemon-wide
+    GET    /v1/npc/{id}/substrate/layer/{n} conversations in one layer, newest first
+    GET    /v1/npc/{id}/projection          Not built: 404 no_projection
+    GET    /v1/npc/{id}/monitor             Not built: a null band, engine_connected false
+    GET    /v1/status, /v1/telemetry        daemon-wide (the host's)
 ```
 
-### The interaction stream is two streams
+### The interaction stream
 
-`GET /v1/interaction/{ix}/stream` is an SSE endpoint carrying two event kinds at two
-latencies, per the mind document's Part VII:
+`GET /v1/interaction/{ix}/stream` is an SSE endpoint carrying one stream of the character's
+acts, polled off the scheduler's own ring (every 500 ms) rather than pushed from the decode
+loop, so it cannot disagree with the Pulse view. Frames:
 
 ```
-  event: act          ← live, as each act commits
-  event: narration    ← at tick close, the woven summary of the elapsed window
+  event: open     ← once: interaction_id, mode, resume_from
+  event: act      ← per act: act_id, tick, tool, intent, world_ms
+  event: tick     ← at the close of each tick: tick, acts
+  event: state    ← { "state": "ended" } when the session goes quiet; the stream then ends
 ```
 
-The client renders acts immediately and narration when it arrives. Collapsing these into one
-stream would destroy the property that makes the interaction read as live.
+`?since=<tick>` resumes an attachment where a console left off (a fresh attachment starts at
+the newest tick). Holding the stream open counts as being in the room: it keeps the session
+from going idle (`Interactions::attended`).
+
+*Replaced design:* the first design carried a second event kind, `narration`, at tick close —
+the woven summary of the elapsed window — so a client could render acts live and the narration
+when it arrived. The daemon renders an act as its own line rather than producing a separate
+account afterwards, so a `narration` frame would be prose nothing wrote.
 
 ### Introspection is a first-class product surface
 
@@ -1025,28 +1137,35 @@ zend already exposes `/v1/substrate`, `/v1/substrate/zend/layer/:name`,
 `/v1/substrate/zend/timeline/:tl` and a `project` endpoint, and the GUI renders them. For NPCs
 this matters more, not less: the mind document says every open question is a calibration
 question answerable only by watching real runs, and `/v1/npc/{id}/projection` — *what did
-this NPC actually gather on that tick* — is the instrument that makes that possible.
+this NPC actually gather on that tick* — is the instrument that makes that possible. Built
+today: the layer views (`/v1/npc/{id}/substrate`, `/v1/substrate/npcd/…`) and the Pulse feed
+(`/v1/pulse`); **not built:** the per-tick projection record, which answers
+`404 no_projection`.
 
 ---
 
 ## Part XII — GUI
 
-The GUI manages many NPCs and is a pure API client. Its screens follow the substrate rather
-than inventing an organisation:
+The GUI manages many NPCs and is a pure API client: the console in `web/content/npcd/`,
+served at `bot.tokera.com` and compiled into the daemon (`docs/shared_model_host.md` §3.4).
+Its screens follow the substrate rather than inventing an organisation:
 
-- **Roster** — every NPC, personality, world, tick rate, monitor health at a glance.
-- **NPC detail** — the six layers as browsable streams, with the authoring plane exposed:
-  edit relationships, author beliefs, set intent, adjust modulation parameters.
-- **Interaction console** — open an interaction in a chosen mode, inject, watch the two
-  streams side by side.
-- **Environment panel** — toggle the simulator, edit its system prompt, inject world events.
-- **Projection inspector** — for a given tick, what was gathered, what was dropped, what won
-  the budget. The debugging surface for every calibration question.
-- **Monitor** — the narration/substrate overlap metric over time, with the expressive band
-  marked, so an NPC sliding from characterful fixation toward incoherence is visible before
-  it arrives.
+- **Roster** (`pages/roster.js`) — every NPC, personality, world and monitor health at a
+  glance.
+- **NPC detail** (`pages/npc.js`) — the layers as browsable streams, with the authoring plane
+  exposed: edit relationships, author beliefs, adjust modulation parameters; tabs for
+  projection and monitor beside them.
+- **Interaction console** — open an interaction in a chosen mode (`physical` or
+  `instant_message`), inject, and watch the act stream (`lib/sessions.js`).
+- **Beside them:** `pages/pulse.js` (the cast's loop as an instrument), `substrate.js`,
+  `system.js`, `tools.js`, `worlds.js`, `personalities.js`, `mind.js`, `operations.js`,
+  `life.js`, `images.js`, `logs.js`, `owners.js`, `create.js`, `profile.js`.
 
-An NPC created here gets the environment simulator on by default (Part VIII).
+**Not built:** the environment panel (toggle the simulator, edit its system prompt, inject
+world events), since there is no simulator (Part VIII); and the data behind the projection
+inspector (what was gathered, dropped and won the budget on a tick) and the monitor (the
+narration/substrate overlap metric with its expressive band), whose routes answer absent
+values until the engine records them (Part XI).
 
 ---
 
@@ -1059,7 +1178,7 @@ concentrates.
 drives itself. The loop — drain, gather, decode one step, fan out — is new code, and with it
 the salience-gated tick, preemption on high-salience events, the heartbeat whose interval is
 the NPC's idle metabolism, and the scheduler that batches across all NPCs with pending
-events. The existing scheduler (`candle-conversation::scheduler`, 17.6k LOC, with admission
+events. The existing scheduler (`candle-conversation::scheduler`, with admission
 control) is the right substrate for it, but the loop above it is new.
 
 Two amendments to the mind document's version of it, both from Part V:
@@ -1072,10 +1191,11 @@ Two amendments to the mind document's version of it, both from Part V:
   world's `time:` block carries an anchor, a scale, a pause flag and a
   `year_offset` (whole years added to the reading, so a world can sit in the
   year its setting requires — the offset is a constant, so the clock stays
-  monotonic). Everything that needs the time asks `clock::world_ms_for`
-  (installed on the runtime as `Runtime::world_ms`) and formats it through
-  `clock::WorldTime`; journal stamps, wake and day-roll prose, and the stamps
-  on perceived events all come from there, never from a step counter.
+  monotonic). Everything that needs the time asks `Runtime::world_ms(npc_id)`
+  (a lock-free read of `world_clocks::WorldClocks`, built from each world's
+  `clock::Clock`) and formats it through `clock::WorldTime`; journal stamps,
+  wake and day-roll prose, and the stamps on perceived events all come from
+  there, never from a step counter.
 - **"Blocked costs nothing" becomes "a body nothing happened to costs nothing."** A high-pace
   NPC never blocks, so the saving cannot come from the inbox being empty. It comes from the
   percept being deterministic: an unchanged situation re-renders to identical tokens, so
@@ -1085,17 +1205,28 @@ Two amendments to the mind document's version of it, both from Part V:
 
 **The evidence-threshold belief process.** Slow-clock accumulation of disconfirming events
 against a per-frame threshold — the only writer on the action plane's forbidden layer.
+**Not built** (Part VI): beliefs are written by the authoring plane alone.
 
 **The metacognition monitor.** N-gram / mutual-information overlap between the narration
 stream and the substrate streams, computed outside the gather. Cheap, but new, and the only
-instrument for the failure mode the architecture cannot prevent structurally.
+instrument for the failure mode the architecture cannot prevent structurally. **Not built:**
+`GET /v1/npc/{id}/monitor` answers a null band.
 
-Everything else — substrate, projection, templating, tools, streaming, persistence, model
-loading, the API posture — is machinery that exists and runs today.
+The tick loop, the world clock, the hosted worlds and the percept delivery are built and run;
+so are substrate, projection, templating from the mind's folders, streaming, persistence and
+model loading. The pieces marked Not built in Parts V, VI, VII, VIII, IX and XI are the
+exceptions.
 
 ---
 
 ## Part XIV — The test harness
+
+> **Status: Not built. Plan of record.** There is no `tests/harness.rs`, no shared
+> `OnceLock` engine and no `deep-tests` feature. `candle-conversation/tests/` is 24
+> separate test binaries, as this part describes it, and `npcd/tests/` holds its
+> own binaries (`drafts.rs`, `effector.rs`, `makers.rs`, `pulse_routes.rs`,
+> `tools.rs`, `vault.rs`, `worlds.rs`). The tier, budget and sizing figures below
+> (suite times, test counts, token caps) are design targets, not measurements.
 
 A system whose behaviour is "what the salience function selected" cannot be verified by reading
 it. It needs a suite broad enough to cover every API and every interaction path, fast enough to
@@ -1272,6 +1403,15 @@ asserting that the mocks work:
 ---
 
 ## Part XV — Phasing
+
+> **Status.** Step 1 (the refactor) and step 3 (the shared harness) are **Not
+> built** (Parts X and XIV). Step 4's `ScopeBuilders` is **Not built**; scope is
+> resolved by `npcd`'s own schema and bearings. `npcd` boots, serves its `/v1`
+> routes and has a tick scheduler (`npcd/src/engine/tick/`), so step 2 and the
+> tick loop of step 8 exist. Steps 5–7 and 9–11 (interactions, perception and
+> authoring, tools, the environment simulator, the slow clocks and the monitor,
+> the GUI) were not individually re-verified against the code in this pass, and
+> no status is claimed for them.
 
 1. **Refactor.** Move the shared modules to `candle-conversation`, convert zend to a consumer,
    keep zend green. No NPC code yet. This is the change that de-risks everything after it.

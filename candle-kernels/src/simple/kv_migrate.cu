@@ -3,7 +3,7 @@
 // =============================================================================
 //
 // The migration primitive behind kv_pack (evict / gather) and kv_unpack
-// (load / scatter) — see docs/archived/kv_tier_migration.md §9.
+// (load / scatter).
 //
 // One WARP per migration-plan record, grid-stride (`scatter_copy.cuh`): a
 // record is a KV band, ~1-4 KB, which a whole block left mostly idle and paid

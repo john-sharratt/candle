@@ -29,7 +29,6 @@
 //! stride — `base + idx * stride`, and the extent that must be zeroed on
 //! recycle because the next tenant may be any format. Conflating them either
 //! moves pad over PCIe and grows on-disk images, or addresses the wrong slot.
-//! See `docs/archived/arena_unification.md` invariant 8.
 
 use candle::DType;
 
@@ -53,7 +52,7 @@ use super::types::{CHUNK_SIZE, TARGET_ARENA_BYTES};
 /// rounding up — `Q8_0` 1088→1152 (5.6 %) and `Q4_0` 576→640 (10.0 %). Those
 /// were the gate's only two configs below the pre-unification baseline, five
 /// runs of five, at the width where KV bandwidth dominates. Adding their rungs
-/// moved both above it. See `docs/archived/arena_unification_results.md`, step 6.
+/// moved both above it.
 ///
 /// # Head dims other than 128
 ///
@@ -104,8 +103,9 @@ pub const GID_STRIDE: usize = 1 << 16;
 /// One rung of [`LADDER`], as an index into it.
 ///
 /// Ordered by size, so `SizeClass::promote` is `+1` and the ordering is also
-/// the promotion order used when a class is starved (see
-/// `docs/archived/arena_unification.md` §3.4, scarcity-only promotion).
+/// the promotion order used when a class is starved (promotion is
+/// scarcity-only: a chunk takes a wider class's slot only when its own class
+/// has no free slot and no region can be had).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct SizeClass(u8);
 
@@ -166,8 +166,7 @@ impl SizeClass {
 /// `CHUNK_SIZE * sub_head_dim` elements. Passing `sub_head_dim` explicitly is
 /// deliberate: the legacy `arena_bytes_per_chunk` assumed
 /// `sub_head_dim == CHUNK_SIZE`, which holds only for `head_dim / N_PALETTE ==
-/// 32` and silently mis-sized every arena for any other geometry
-/// (`docs/archived/arena_unification.md` A9).
+/// 32` and silently mis-sized every arena for any other geometry.
 #[inline]
 pub fn elems_per_chunk(sub_head_dim: usize) -> usize {
     CHUNK_SIZE * sub_head_dim
@@ -397,8 +396,7 @@ mod tests {
     /// `Vec<AtomicU16>`, and a free slot's word holds the recycle-stack link —
     /// which may be the empty-stack sentinel `chunks_per_region` itself. So the
     /// bound is `<= 65_535`, not `< 65_536`: `Q0_M4` at exactly 65,536 chunks
-    /// made the sentinel wrap to 0 and alias slot 0 (`docs/archived/arena_unification.md`
-    /// §2.1). The 320 B minimum caps every class at 52,428.
+    /// made the sentinel wrap to 0 and alias slot 0. The 320 B minimum caps every class at 52,428.
     #[test]
     fn every_class_fits_u16_recycle_links() {
         for class in SizeClass::all() {
@@ -418,7 +416,7 @@ mod tests {
     /// `arena_bytes_per_chunk` hard-coded `CHUNK_SIZE × CHUNK_SIZE`, which is
     /// the same number only at `head_dim == 128` — it returned 8,192 chunks for
     /// an F16 arena at *every* geometry and so silently mis-sized every arena on
-    /// any other model (`docs/archived/arena_unification.md` §9). This pins that the
+    /// any other model. This pins that the
     /// ladder reads the geometry: same format, different `head_dim`, different
     /// class.
     #[test]

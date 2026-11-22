@@ -1,5 +1,5 @@
 //! Prefill kernel tests — the development harness for the int8
-//! prefix-attention kernel (`docs/archived/prefill_optimization.md` §11).
+//! prefix-attention kernel.
 //!
 //! Four oracle legs:
 //!

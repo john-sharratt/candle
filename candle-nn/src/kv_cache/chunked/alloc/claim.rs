@@ -178,8 +178,7 @@ impl BackingInner {
     ///
     /// Correctness is untouched by the wider slot: every read takes its extent
     /// from the band's *format* bytes, never from the stride, so a chunk in a
-    /// larger class is simply a chunk with more unread pad
-    /// (`docs/archived/arena_unification.md` §3.4, invariant 8). Only the waste changes.
+    /// larger class is simply a chunk with more unread pad. Only the waste changes.
     ///
     /// **The claim names the arena the stamp produced**, while that arena's creation
     /// window is still open — so no sweep can release it in between — and the window is

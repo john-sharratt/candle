@@ -16,8 +16,7 @@ use super::*;
 /// `dst.len()` is the band's **payload** — how many bytes of the slot are the
 /// chunk — while the slot's address step is the arena's class stride. They are
 /// different numbers, so the offset must never be derived from `dst.len()`:
-/// doing so addresses slot `n` at `n * payload` and walks into a neighbour
-/// (`docs/archived/arena_unification.md` invariant 8).
+/// doing so addresses slot `n` at `n * payload` and walks into a neighbour.
 pub(super) fn read_chunk_into_pinned_bytes(
     arena: &Arena,
     chunk_idx: usize,
@@ -58,7 +57,7 @@ impl ChunkedKvBacking {
     /// This is the tier move — hot↔warm — and nothing more. It copies the
     /// slot's bytes verbatim; it does not, and cannot, change a chunk's
     /// format. An arena is a run of fixed-stride byte slots that says nothing
-    /// about what occupies them (`docs/archived/arena_unification.md` principle 8), so
+    /// about what occupies them, so
     /// a per-chunk *conversion* has no source format to read here. Format
     /// changes happen where the formats are known: the quantize / dequantize
     /// passes in `compress.rs`, which work from the chunk's own band tags.

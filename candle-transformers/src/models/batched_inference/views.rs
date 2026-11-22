@@ -149,9 +149,9 @@ impl BatchedInferenceSession {
     }
 
     /// Mark every block `idx` currently holds (all layers) as immutable
-    /// prefix — later writes append after them in a fresh writer chunk. The
-    /// turn-seal re-prefill calls this after its truncate so the clean grid
-    /// lands exactly at the seal anchor block.
+    /// prefix — later writes append after them in a fresh writer chunk, so
+    /// the next write lands exactly at the block count the slot holds now.
+    /// Callable after a truncate to keep the kept blocks immutable.
     pub fn seal_writer_boundary(&self, idx: usize) -> Result<()> {
         for backing in &self.backings {
             backing.seal_writer_boundary(idx)?;

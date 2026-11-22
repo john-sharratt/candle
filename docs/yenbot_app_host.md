@@ -215,10 +215,14 @@ a strong `ETag` over the content, `304` when it matches, gzip, and a short
 
 ### 5.3 Hot reload
 
-A watcher on `apps/`, `library/` and `web/` reloads a changed manifest, its
-schedules and its workflows, and drops its cached files, within a second. A
-page open in
-a browser reloads itself when its app changes: the framework keeps an
+There is no file-system watcher. The live checkout moves only by a
+fast-forward to `origin/main` (`src/publish/`), made when the gateway's bus
+announces a push to `main` and otherwise every 60 seconds. Each move reloads
+the apps and the library — a changed manifest, its schedules and its workflows
+— and drops their cached files, within a second of the push. `web/` is not
+reloaded: it is embedded in the binary (§5.2), so a change to it takes a
+release. A page open in
+a browser reloads itself when the site moves to a new commit: the framework keeps an
 `EventSource` on `/api/v1/events/_reload` while the page is open — a page
 hidden when a change landed would otherwise show the old one when it comes
 back. Yen sees a change Claude made without touching her phone.
@@ -1718,7 +1722,7 @@ Taken 2026-11-07:
    archive, the bus, `repo/<name>`, gates, the connector's file and log tools.
 2. The repository, `AGENTS.md`, and the binary's skeleton: serving, identity,
    accounts, the landing page, the store and its migrations, backups, the
-   watcher and the publisher, its logs and `/v1/logs`, health, keep and
+   publisher (the live checkout's follow of `main`) and the reload, its logs and `/v1/logs`, health, keep and
    `INFO serving`.
 3. The API — fields and validation, queries, sums, search, batches, groups and
    shares, every admin route, API tokens, OpenAPI and `docs/api/` with the

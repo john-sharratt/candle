@@ -23,9 +23,8 @@ pub const GIDS_PER_HEAD: usize = N_PALETTE * 2;
 /// interleaved K,V order of [`HeadGids::as_slice`].
 ///
 /// The gid says *where* a band's bytes are; the tag says *how to read them*.
-/// Under size classes only the chunk can answer the second question
-/// (`docs/archived/arena_unification.md` principle 8), so every predicate over a
-/// chunk's formats walks this rather than the arenas its gids point into.
+/// Under size classes only the chunk can answer the second question, so every
+/// predicate over a chunk's formats walks this rather than the arenas its gids point into.
 ///
 /// This is the one place the `[h * N_PALETTE + p]` tag indexing is written
 /// down; `SealedChunk::bands` and `ChunkWindow::bands` both come through here
@@ -226,8 +225,7 @@ impl HeadGids {
     /// Every band contributes **its own format's payload**, read from the
     /// chunk's tags. The arenas cannot supply it: a size-class arena holds
     /// whatever fits its stride, so its slot width is an upper bound on a
-    /// band's bytes, not the bytes themselves (`docs/archived/arena_unification.md`
-    /// invariant 8). Bands whose tag names no storage format contribute
+    /// band's bytes, not the bytes themselves. Bands whose tag names no storage format contribute
     /// nothing — they have no length to contribute.
     ///
     /// Deduplication is by `(arena_idx, chunk_idx)`: a single chunk's sub-band
@@ -355,7 +353,7 @@ impl Eq for HeadGids {}
 /// The two halves are inseparable and were previously carried as parallel
 /// vectors: the gid gives a band's *address*, the tag gives its *layout*. An
 /// arena can answer the first and, under size classes, not the second
-/// (`docs/archived/arena_unification.md` principle 8), so the selection table is built
+/// so the selection table is built
 /// from these rather than from arena state.
 ///
 /// Cheap to clone: `HeadGids` is one `Arc` bump and the tags are `Arc`-shared

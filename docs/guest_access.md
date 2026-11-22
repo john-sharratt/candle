@@ -2,10 +2,10 @@
 
 Who may use the estate, and how much of the card a stranger gets. Written
 2026-10-28 after an inventory found that every Google account that signs in is
-a `User` (`web/src/auth/role.rs:210-226`), that `/mcp` consent asks only that
-the caller be signed in (`web/src/auth/mcp/authorize.rs:180`), and that zend's
+a `User` (`web/src/auth/role.rs`), that `/mcp` consent asks only that
+the caller be signed in (`web/src/auth/mcp/authorize.rs`), and that zend's
 `POST /v1/chat/completions` runs the model for a caller who has not signed in
-at all (`zend/src/api/mod.rs:81-82`; reached from the internet through
+at all (`zend/src/api/mod.rs`; reached from the internet through
 `code.tokera.com`, answered `422` for a body missing `messages` rather than
 `401`).
 
@@ -59,7 +59,7 @@ From the inventory (every route at `User` today, by daemon). The lockdown
 (§8, step 1) gives a guest their own account and nothing else; the inference
 below opens with the queue (step 2).
 
-- **Inference, through the guest queue (§4):**
+- **Inference, through the guest queue (§4; not built, so a guest runs none today):**
   - npcd `POST /v1/generate/description`, `/description/stream`, `/name`;
   - npcd `POST /v1/image/generate`, `/v1/image/cutout`;
   - zend `POST /v1/chat/completions` (§5).
@@ -74,6 +74,9 @@ below opens with the queue (step 2).
     `/v1/image/:iid`. These stay at `User` and above.
 
 ## 4. The guest queue
+
+**Not built** (§8 step 2; plan of record). `host/src/guest_gate/`, `Cost` in
+`host/src/guard.rs` and `people_busy` in a member's status do not exist.
 
 Guests run inference only while the listed people are not. It is a gate in
 front of the engine, per member, in the host crate so every tenant shares it
@@ -127,7 +130,7 @@ routes and zend's chat above, and every `User` route that runs the model, so a
 listed person's use of them counts as person work.
 
 **MCP tools.** npcd's tools call route handlers in-process and so skip the
-route table (`npcd/src/mcp/mod.rs:7-14`): `image_generate` reaches `post_image`,
+route table (`npcd/src/mcp/mod.rs`): `image_generate` reaches `post_image`,
 whose route is `Admin`, at `User`. Each tool takes its route's minimum role
 and cost from the table instead of restating it, so a tool can never be wider
 than its route.
@@ -191,7 +194,7 @@ refused for depth, and timed out, with the queue depth and wait.
    one motherd build — the table is compiled in, and a daemon that does not
    know `Guest` would read every unlisted person as a `User` — and a gateway
    restart, for its copy of the table, the consent check and the logging.
-2. **Guests run inference:** the queue (§4), §3's inference routes opened to
+2. **Guests run inference (not built):** the queue (§4), §3's inference routes opened to
    `Guest`, zend chat at `Guest` through it, the `people_busy` placement, MCP
    tools taking their route's role and cost, and the clients of §5
    presenting an identity.
@@ -206,6 +209,9 @@ and zend's chat, repo map and conversation routes are at `User`
 routes and §4's queue describe the design, not the code.
 
 ## 9. Tests
+
+The gate, clamps, MCP-cost and placement tests below belong to step 2 and are
+not written; the table, `Role` and consent tests belong to step 1.
 
 - The table: the `people` form parses; a role names one of three; a person
   listed twice, an entry naming both `sub` and `email`, an unknown field all

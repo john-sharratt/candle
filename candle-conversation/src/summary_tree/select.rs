@@ -1,8 +1,7 @@
 //! Score-density selection — the projection algorithm that fills the
 //! layer's token budget with the highest-scoring subset of the summary
 //! **forest**'s nodes, then eliminates redundant ancestors and fills
-//! coverage gaps until convergence (`docs/archived/immutable_summary_forest.md` —
-//! *Window of attention*).
+//! coverage gaps until convergence.
 //!
 //! # The five steps
 //!
@@ -186,8 +185,7 @@ pub fn select_dense(
         }
         let cover_tokens = tree.get(covering).map(|n| n.tokens).unwrap_or(0);
         if used.saturating_add(cover_tokens) > budget {
-            // Per `docs/archived/infinite_conversations.md` §8.4:
-            // covering-node size grows monotonically with gap
+            // Covering-node size grows monotonically with gap
             // depth, so once one gap's cover is unaffordable, every
             // larger gap's cover is also unaffordable.  Break out.
             //
@@ -809,8 +807,7 @@ mod tests {
 
     #[test]
     fn covered_is_subtree_semantics_not_ancestor_walk() {
-        // `covered(node, sel)` (`docs/archived/infinite_conversations.md`
-        // §8.4) means: every leaf descendant
+        // `covered(node, sel)` means: every leaf descendant
         // of `node` is in `sel` (or `node` itself is).  It does NOT
         // walk upward.  This is the redundancy-elimination semantics.
         let (tree, _) = build_uniform_tree(MERGE_FANOUT as u32, 2, 10, 20);

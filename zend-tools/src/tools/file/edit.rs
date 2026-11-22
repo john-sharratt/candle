@@ -280,7 +280,7 @@ const STALE_PARTS: usize = 60;
 
 /// `e` as the call's error. A stale anchor carries the parts the file has
 /// now, one line each, so the next edit can name one without a read in
-/// between (`docs/archived/zen_coding_challenge_fixes.md` Cause 8).
+/// between: a refusal that names no way on costs the caller a round.
 fn refused(doc: &Doc, e: EditError) -> FileError {
     let EditError::Stale(_) = &e else {
         return e.into();

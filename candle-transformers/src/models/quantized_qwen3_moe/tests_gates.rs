@@ -81,7 +81,7 @@ pub(super) mod tests {
 
     /// **Does Qwen3-MoE decode reproduce itself, run to run?**
     ///
-    /// DeepSeek-V4-Flash does not (`docs/archived/deepseek/deepseek_decode_reproducibility.md`).
+    /// DeepSeek-V4-Flash does not (its decodes diverge run to run).
     /// This test answers the question that result cannot: is the fault in
     /// shared infrastructure, or in DeepSeek-specific code?
     ///

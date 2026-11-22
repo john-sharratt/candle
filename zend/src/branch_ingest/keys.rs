@@ -86,8 +86,8 @@ pub const COMMIT_KEY: &str = "commit";
 /// holds line-numbered pages, a format no tool returns any more.
 ///
 /// 4: each part is a fenced block of its own, its lines numbered from `+1`, and
-/// a file is read by `lines` ranges of whole parts rather than by page
-/// (`docs/archived/zen_coding_challenge_fixes.md` Cause 4). A unit read under 3 holds
+/// a file is read by `lines` ranges of whole parts rather than by page, so an
+/// edit names a piece of a part by those numbers. A unit read under 3 holds
 /// anchors written inline and `page` calls, which nothing reads any more, and
 /// its parts were carved with doc comments cut from their items.
 ///

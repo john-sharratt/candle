@@ -3,8 +3,7 @@
 //! A page holds [`PAGE_TOKENS`] tokens of the fold groups its turn keeps
 //! resident, laid out **group-major** — `[group][token][word]`, the groups packed
 //! in group order — so the scan kernel, which fixes a layer-group per block and
-//! reads consecutive tokens' `gw`-word signatures, gets coalesced loads (see
-//! `docs/archived/paged_gallery_arena.md` §4.2). A group nothing weighs is not
+//! reads consecutive tokens' `gw`-word signatures, gets coalesced loads. A group nothing weighs is not
 //! in the page at all (`docs/gallery_residency.md` §4). A [`WideQSig`]'s `words`
 //! are already group-contiguous within a token (the 4 heads of a group are
 //! adjacent and head-major), so the transpose is a pure regroup, no per-word

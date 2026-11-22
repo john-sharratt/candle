@@ -131,7 +131,7 @@ and that callback registered on the same Google client. No code: `/auth/*` is se
 
 ## 7. Where the work stands
 
-**Written here, not compiled or run** (the laptop builds nothing of this repository; the BlackWorld session builds, tests and merges):
+**In the tree, with unit tests** (all of it lives in workspace members of this repository — `cluster`, `zend`, `agent`, `web`, `keep`; whether a given test passes at a given commit is for `cargo test -p <crate>` to say, and this document does not record a result beyond the dated check below):
 
 - The app's name among the services and its build kind (`cluster/src/gateway/hub/constants.rs`, `cluster/src/gateway/admission.rs`, `cluster/src/version/info.rs`).
 - The deploy engine's service, repository and package (`zend/src/mcp/tools/service/mod.rs`, `deploy.rs`, `zend/src/mcp/tools/service_control.rs`), with their tests.
@@ -146,14 +146,14 @@ and that callback registered on the same Google client. No code: `/auth/*` is se
 - `service_deploy`'s and `service_control`'s descriptions name one more service. The tool calibration reads them, so the next calibration pass after the deploy recalibrates those two tools.
 - `web/src/roles.rs`'s assertions of the `battlecities` site hold with its route.
 
-**Written on the laptop after that, not compiled or run** (branch `aw/battlecities-gateway`; BlackWorld builds, tests, merges and deploys):
+**Written later, also in the tree with unit tests** (the web crate's `hooks/`, `udp_forward/` and `auth/mcp/` carry `#[test]`s; `zend/src/api/deploys.rs` and `zend/src/mcp/tools/service/on_push.rs` carry theirs; no build or test run of this second batch is recorded here, so it is unverified that it compiles and passes at the current commit):
 
 - The webhook's route and the telling of a member, with the watch (§4.1, §4.2, §4.4): `web/src/hooks/http.rs`, `pushes.rs`, `Gateway::watch_pushes`, `cluster.deploy_on_push`; `zend/src/api/deploys.rs` and `zend/src/mcp/tools/service/on_push.rs`.
 - The forwarder (§5): `web/src/udp_forward/` (`pick`, `table`, `flow`), `cluster.udp_forward`, the address the hub keeps for each member's socket and `Hub::serving`. `flow.rs`'s tests carry real datagrams over loopback.
 - Tokens for a site's API (§6): `sites[].api_scopes`, `Grant::scopes`, `authorize::Api`, `Auth::api` and `Auth::api_grant`, the scope stated upstream in `proxy::forward`.
 - `web/web.yaml` names the pushes to deploy, the ports to forward and the game's scopes; `keep/keep.yaml` runs the game on ports 14300 and 14123.
 
-**To check when it is first built:**
+**To check when it is first run against a live cluster** (no test covers these; they need two machines or a real socket):
 
 - A service member that joins while another already serves starts as syncing; a service replicates nothing, so it should stop being so at the next receipt tick. `Hub::serving` lists only members that are routable, so a second game member that stayed syncing would be given no flows.
 - `transport::send` sends no `Host` header. The game's routes need none; if hyper's client refuses a request without one, the two requests the gateway makes of its own (`/v1/deploys/pushed`, `/api/v1/flows`) need it set.

@@ -18,7 +18,8 @@
 //!
 //! Each part of the file — a function, a type, a block of imports, a
 //! paragraph — is a fenced block of its own ([`doc_units::render`],
-//! `docs/archived/zen_coding_challenge_fixes.md` Cause 4): the fence names the file as a
+//! so an edit can name a piece of a part by its line numbers rather than
+//! restate the whole part): the fence names the file as a
 //! workspace path (`<repo>/<path>` — a path alone is ambiguous across a
 //! workspace of several repositories), the part's anchor, the lines it holds
 //! and its scope, and every line follows behind its number in the part.

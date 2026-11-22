@@ -89,8 +89,8 @@ impl LoadInputs<'_, NoExperts, ResidentLayers> {
     ///
     /// What a test harness wants — it dequantizes projections to build a
     /// reference, which needs the weights in hand rather than a slot's view of
-    /// them — and never what production wants, since §7 of
-    /// `docs/archived/qwen38_layer_streaming.md` streams every dense checkpoint.
+    /// them — and never what production wants, since production streams every
+    /// dense checkpoint.
     pub fn resident() -> Self {
         Self {
             host_embed: None,

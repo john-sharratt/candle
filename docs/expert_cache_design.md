@@ -44,7 +44,12 @@ document follows from that.
 
 ---
 
-## 2. What is wrong today
+## 2. What was wrong
+
+*This section describes the two-tier cache this design replaced. Neither
+`ExpertLocation`, `evict_to_pinned`, `load_from_pinned` nor
+`CHURN_RESERVE_LAYERS` exists in the tree; they are quoted as the record of the
+defect.*
 
 ```rust
 pub(crate) enum ExpertLocation {
@@ -283,11 +288,12 @@ and a caller-supplied checkpoint is packed into the model cache instead
 ### 5.3 How the pack reaches the cache
 
 The loaders take the pack's path. `ModelBuilder::resolve_model` finds or builds
-it (`candle-conversation/src/models/pack_source.rs`), `load_model` opens it, and
-each loader opens the expert section at the offset the pack records:
+it (`candle-conversation/src/models/builder/pack.rs`, resolving through
+`models/pack_source.rs`), `load_model` (`models/builder/load_arch.rs`) opens it,
+and each loader opens the expert section at the offset the pack records:
 
 ```text
-ModelBuilder::resolve_model              pack_source.rs → model_pack::model_pack
+ModelBuilder::resolve_model              builder/pack.rs → pack_source.rs → model_pack::model_pack
   → ModelBuilder::load_model             the pack's own int8 mode
     → ModelWeights::from_pack            quantized_qwen3_moe/loader.rs (and each routed model's own)
       → expert_lre::section::open_section
@@ -375,13 +381,19 @@ per-tensor checksum of its own.
 > **Superseded for the pinned part by §6.5.** The warm tier's pinned block is
 > now the pad's resident region, whose membership is re-chosen between waves
 > from decode's host accesses; the startup fill below is only where it begins.
-> What stays static is the pageable part. The reasoning of §6.1 — that VRAM has
-> already skimmed the skew — did not survive measurement on a card whose VRAM
-> holds 12 % of the experts (§6.5).
+> The pinned part's *size* is fixed at load for the process
+> (`docs/elastic_warm_tier.md`); the pageable part, which no kernel addresses,
+> is the one the elastic controller grows and shrinks in chunks while the
+> process runs. The reasoning of §6.1 — that VRAM has already skimmed the skew —
+> did not survive measurement on a card whose VRAM holds 12 % of the experts
+> (§6.5).
 
-The warm tier is filled **once**, at startup, and never changes. No eviction
-policy, no ranking, no background filler, no demand-versus-speculative priority,
-no thrash. It is a partial mirror of the pack file, pinned for DMA.
+The warm tier is filled **once**, at startup, from a membership drawn once, and
+no slot's bytes change after that. No eviction policy, no ranking, no
+background filler, no demand-versus-speculative priority, no thrash. It is a
+partial mirror of the pack file: pinned for DMA first (`expert_lre/pinned.rs`,
+`WarmPool`), then pageable (`expert_lre/warm_tier.rs`, `WarmTier`) for whatever
+the driver will not page-lock.
 
 Immutability is what licenses §4's fall-back-to-RAM. Because no other expert can
 ever claim a pinned slot, a promoted expert's slot is not worth reclaiming and
@@ -459,20 +471,39 @@ starts, so a tier sized against the total succeeds by consuming every free page
 and leaves the next pinned allocation in the same process to fail with
 `CUDA_ERROR_OUT_OF_MEMORY` — which is what a 46 MB staging ring did.
 
-The rule that survives contact:
+The rule that survives contact (`expert_lre/handle/sizing.rs`,
+`warm_sizing_from`):
 
 ```text
-ask for   every expert
-bounded by min(what the machine is big enough for, what it has free now − headroom)
-backed by cuMemAllocHost halving on refusal
+ask for   every evictable expert
+bounded by min( ceiling 1  the tier's share of the host partition (expert_pinned_budget)
+              , ceiling 2  RAM free before this process started, less its own
+                           non-droppable heap, less headroom
+                           (never below the live reading, less what is pinned)
+              , ceiling 3  total RAM − PAGEABLE_RESERVE (10 GiB)
+                           − already pinned − headroom )
+backed by cuMemAllocHost stepping down 512 MiB on refusal (WarmPool), then
+          a margin the driver must still be able to lock (DRIVER_LOCK_MARGIN)
+          and a margin of GPU-addressable room; what the draw wants past the
+          pinned part is held pageable (WarmTier)
 ```
 
-with the headroom (3 GiB, `WARM_TIER_HEADROOM`) reserved for everything the process allocates *after*
-the warm tier — the mapped live table, routing-summary ring and promotion
-ring of the live dispatch, the substrate's pinned
-cold-load scratch, the `PinnedStager` arenas, and the warm KV tier. Pinned pages
-cannot be reclaimed under pressure, so a tier that fits by exactly nothing does
-not degrade, it fails.
+The binding ceiling is named in the report (`WarmTierSizing::bound_by`), so a
+reader never has to infer it from three numbers.
+
+**The headroom is 3 GiB** (`WARM_TIER_HEADROOM`, in `handle/sizing.rs`). It is
+reserved for everything the process allocates *after* the warm tier — the
+mapped live table, routing-summary ring and promotion ring of the live
+dispatch, the substrate's pinned cold-load scratch, the `PinnedStager` arenas,
+and the warm KV tier's pageable arenas. Pinned pages cannot be reclaimed under
+pressure, so a tier that fits by exactly nothing does not degrade, it fails.
+The figure is a measurement, not a derivation: it was 4 GiB while the wave's
+transients were large, and is 3 GiB now that they live on the span's bump tiers
+(§6.3.1 gives the runs). The comment beside the constant keeps the earlier
+run's "free RAM low-water 2.94 GiB under a 4 GiB headroom" as history; the
+constant is 3 GiB. Calibration's much larger one-time transient is deliberately
+not folded into it: it would tax every boot, so calibration backs its own
+concurrency off against live free RAM.
 
 ### 6.3.1 The tier does not have to hold the model, and past a point should not
 
@@ -788,9 +819,9 @@ mean on the dev box is the point of the whole change:
 
 | | before (`d2cecd84`) | after |
 |---|---|---|
-| pinned expert pool | 14.1 GB, fixed by `total − total/4 + churn` | half of what is spare after weights and the OS |
-| what sets it | how far the boundary might retract | how much RAM the machine has |
-| KV warm budget (`host_ram_budget`) | negative — pinned + mmap exceeded RAM | the other half |
+| pinned expert pool | 14.1 GB, fixed by `total − total/4 + churn` | the lowest of the three ceilings of §6.3 (originally half of what was spare) |
+| what sets it | how far the boundary might retract | how much RAM the machine has free |
+| KV warm budget (`host_ram_budget`) | negative — pinned + mmap exceeded RAM | what the expert tier's ceiling 1 leaves it |
 
 `candle::vram::host_ram_budget` computes the warm-KV budget as
 `total − pinned − weights_mmap − os_keep`. With a 14.1 GB pinned pool and a
@@ -1000,7 +1031,12 @@ keeps `O_DIRECT`; other unixes open buffered, which is correct but cached.
 made this an error where it had been a silent success followed by a panic on the
 first MoE layer — but the doc still advertised a non-CUDA path and the caller
 still built a plausible-looking host-side `WeightZone` for it. Both are gone, and
-the message now names the reason and the two ways out. This refusal is about a
+the message now names the reason and the two ways out. `ExpertCache::new`
+(`expert_lre/handle/construction.rs`) refuses, before anything is loaded: a
+build without `cuda`; `Int8Mode::Off` (no expert kernel runs it); a pack whose
+int8 mode or experts-per-layer differ from the load's; a weight zone below the
+floor (`minimum_resident_slots`: the permanently pinned layers plus one layer's
+worst-case routed set); and a non-CUDA device. This last refusal is about a
 cache on a CPU *device*, and it stands. The CPU expert class
 (`docs/cpu_expert_compute.md`) is a different thing: a CUDA cache whose device
 hands some pinned misses to a host pool, per layer.

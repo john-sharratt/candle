@@ -3,8 +3,7 @@
 // `run_kv_migrate_copy` launches one thread block per migration-plan record;
 // each block copies `byte_lens[r]` bytes from `src_ptrs[r]` to `dst_ptrs[r]`.
 // It is the primitive behind both kv_pack (gather: scattered arena chunks →
-// contiguous staging) and kv_unpack (scatter: staging → fresh arena chunks);
-// see docs/archived/kv_tier_migration.md §9.
+// contiguous staging) and kv_unpack (scatter: staging → fresh arena chunks).
 //
 // A record may also copy a **run of equally-spaced rows**, which is what the
 // prefill KV write needs: a band's destination is a contiguous run inside an

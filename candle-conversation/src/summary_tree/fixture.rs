@@ -49,8 +49,7 @@ pub struct FixtureManifest {
     /// the same timeline).
     pub debug_id: String,
     /// Manifest format version — bumped when this struct changes.
-    /// `1` is the v1 layout described in
-    /// `docs/archived/infinite_conversations.md` §10.3.
+    /// `1` is the v1 layout.
     pub schema_version: u32,
     /// Git SHA of the workspace at fixture creation time.  Used to
     /// detect "fixture was built before a relevant algorithm change"
@@ -101,8 +100,7 @@ pub struct ProbeSpec {
     pub expected_top: Vec<String>,
 }
 
-/// Algorithm-level invariants the fixture must satisfy at load time
-/// (`docs/archived/immutable_summary_forest.md` — *Invariants*).
+/// Algorithm-level invariants the fixture must satisfy at load time.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExpectedInvariants {
     /// The persisted forest matches the canonical shape for its leaf count:

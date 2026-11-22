@@ -1,5 +1,4 @@
-//! Recency score for the window's right edge (`docs/archived/immutable_summary_forest.md`,
-//! *Window of attention*).
+//! Recency score for the window's right edge.
 //!
 //! ```text
 //!   recency_score(node) =

@@ -40,7 +40,7 @@ use super::*;
 /// below is what the figure was before, when the tier was past its knee and the
 /// transient was larger.
 ///
-/// **4 GiB, and that figure was measured rather than reasoned.** The run's
+/// **The earlier figure was 4 GiB, measured rather than reasoned.** The run's
 /// non-pinned transient — everything the process takes after the tier is
 /// pinned — is **3.30 GiB** on the 3.6-35B gate: launch 16.45 GiB, tier 12.14,
 /// other pinned 0.62, and a free-RAM low-water of 0.39 GiB
@@ -79,7 +79,7 @@ use super::*;
 /// every boot; calibration's much larger, one-time transient is the exception,
 /// not the common case, and belongs in the exception's own code —
 /// `zend::session`'s calibration loop backs its concurrency window off directly
-/// against live free RAM instead. See `zend_run_iteration_traps.md` §4.
+/// against live free RAM instead (`docs/expert_cache_design.md` §6.3).
 pub const WARM_TIER_HEADROOM: u64 = 3 * 1024 * 1024 * 1024;
 
 /// How many warm slots to ask for: **every expert the machine will actually

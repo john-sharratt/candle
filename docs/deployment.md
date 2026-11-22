@@ -34,29 +34,38 @@ repository is readable by the model.
  Internet ──TLS──► Cloudflare (proxied names; terminates TLS)
                       │  HTTP :80 to the public IP
                       ▼
-                router ── DMZ ──► 192.168.0.5:80   web  (the gateway, by Host header;
-                                     │                   cluster `tokera.com` on :443)
-                     ┌───────────────┴────────────────┐
-                     ▼                                ▼
-          192.168.0.5:8081  motherd            192.168.0.6:8081  (stopped)
-          zend + npcd members, joined          bot.tokera.com's configured
-          to the gateway's cluster             upstream; rebuilt later as a member
-          (code.tokera.com, bot.tokera.com)
+                router ──► BlackWorld 192.168.1.2:80   web  (the gateway, by Host header;
+                              │                              cluster `tokera.com` on :443)
+                 ┌────────────┴─────────────┐
+                 ▼                          ▼
+   BlackWorld 192.168.1.2:8081      WhiteWorld 192.168.1.3:8081
+   motherd: zend + npcd members,    motherd: zend + npcd members,
+   joined to the gateway's cluster  joined to the gateway's cluster
+   (zend's upstream: :8444, TLS)    (npcd's upstream: :8081)
 ```
 
+The upstreams are the ones in `web/web.yaml`: zend's is BlackWorld's motherd
+(`https://192.168.1.2:8444`), npcd's is WhiteWorld's (`http://192.168.1.3:8081`).
+The services beside the gateway are loopback upstreams: `mcp` `127.0.0.1:8095`,
+`yenbot` `127.0.0.1:8096`, `zenj` `127.0.0.1:8097`, and the game server
+`127.0.0.1:4080`.
+
 - **Cloudflare** proxies every public name and connects to the origin on port 80. The
-  router puts `192.168.0.5` in its DMZ, so port 80 on the public IP is the gateway.
+  router forwards port 80 on the public IP to the gateway on BlackWorld; the router's
+  own setting is not in the repository, so it is not checked here. (It was a DMZ entry
+  for `192.168.0.5`, BlackWorld's address before 2026-11-12.)
 - **web** is the only process reachable from outside. It owns sign-in and forwards to the
-  daemons over the LAN, so no daemon may bind `127.0.0.1` — loopback takes its site
-  down. motherd shares the DMZ box with the gateway, so it binds the LAN address only,
-  never `0.0.0.0`. npcd's box is not in the DMZ and binds `0.0.0.0`.
+  daemons over the LAN, so zend and npcd must listen on their LAN address — a daemon bound
+  to `127.0.0.1` takes its site down. motherd on BlackWorld shares the box with the
+  gateway, so it binds the LAN address only, never `0.0.0.0`.
 - **The cluster.** motherd's zend and npcd tenants join the gateway's cluster
   (`docs/replicated_substrate.md`): the gateway routes each name to a joined, ready
   member of its app over the member's socket, and to the route's `upstream` only while
   the app has no member (dumb mode). While every admitted member is still loading, the
   gateway answers with its own reconnecting page, which the consoles retry.
-  npcd on `.6` was stopped on 2026-10-12: `bot.tokera.com` is motherd's npcd alone until
-  `.6` is rebuilt onto this framework and joins.
+- **History.** Until 2026-10-12 npcd also ran standalone on a separate machine at
+  `192.168.0.6:8081`; it was stopped, and `bot.tokera.com` was motherd's npcd alone. The
+  upstream of `bot.tokera.com` is now WhiteWorld's motherd, as above.
 - **cf-ddns** keeps the Cloudflare A records at the public IP, so a router reboot that
   changes the address heals on its own within one 30 s interval.
 
@@ -69,7 +78,7 @@ not identities.
 
 | Address | Hostname | Runs | Repo |
 |---|---|---|---|
-| `192.168.1.2` | BlackWorld | web, keep, and under it motherd (`D:/prog/motherd-local.yaml`), mcp, yenbot and battlecities (`keep/keep.yaml`), cf-ddns | `D:\prog\candle` |
+| `192.168.1.2` | BlackWorld | keep, and under it (`keep/keep.yaml`) web, motherd (`D:/prog/motherd-local.yaml`), mcp, yenbot and battlecities; zenj, started at logon outside keep (`docs/zenj.md` §3.2); cf-ddns | `D:\prog\candle` |
 | `192.168.1.3` | WhiteWorld | keep, and under it motherd and mcp, from `C:\prog\keep-local.yaml` and `C:\prog\motherd-local.yaml` | `C:\prog\candle`; its substrate on `D:\prog` |
 | `192.168.0.237` | AlienWorld (the laptop) | keep, and under it `tokera-agent`: the cluster's standby agent. No motherd since 2026-10-25 | `C:\Users\johna\prog\candle`; the agent's own checkouts under `C:\Users\johna\prog\agent` |
 
@@ -99,12 +108,14 @@ as its working directory. cf-ddns is the exception — see below.
 
 | Service | Machine | Listens | Build | Stop by default in `/down` |
 |---|---|---|---|---|
-| web | .5 | `0.0.0.0:80` (from `web/web.yaml`); `0.0.0.0:443` tcp + udp, HTTPS with Let's Encrypt certificates (from `web/secrets/tls.yaml`); UDP 4300 and 4123, the game's datagrams it forwards (`docs/battlecities_app.md` §5) | `cargo build --release -p web` | **no** — only `/down web` or `/down all` |
-| motherd | .5 | `192.168.1.2:8081`; `192.168.1.2:8444` tcp + udp, HTTPS self-signed at startup — the zend route's upstream in dumb mode; outbound to the gateway's cluster on `:443` | `cargo build --release -p motherd` | yes |
-| keep | .5 | — (watches web on `:80` and motherd on `:8081`) | `cargo build --release -p keep` | **never** |
-| yenbot | .5 | `127.0.0.1:8096` (from `D:\yenbot\live\yenbot.yaml`) — loopback only; the gateway's `yenbot` site forwards yenbot.com.au to it | `cargo build --release` in `D:\prog\yenbot` (its own repository, `docs/yenbot_app_host.md` §5.5); released with `service_deploy {host: BlackWorld, service: yenbot}` | yes |
-| npcd | .6 | `0.0.0.0:8081` (`--host 0.0.0.0 --port 8081`) | `cargo build --release -p npcd` | yes |
-| cf-ddns | .5 | — (outbound only) | scheduled task, see below | **never** |
+| web | BlackWorld | `0.0.0.0:80` (from `web/web.yaml`); `0.0.0.0:443` tcp + udp, HTTPS with Let's Encrypt certificates (from `web/secrets/tls.yaml`); UDP 4300 and 4123, the game's datagrams it forwards (`docs/battlecities_app.md` §5) | `cargo build --release -p web` | **no** — only `/down web` or `/down all` |
+| motherd | BlackWorld (and WhiteWorld, its own config) | `192.168.1.2:8081`; `192.168.1.2:8444` tcp + udp, HTTPS self-signed at startup — the zend route's upstream in dumb mode; outbound to the gateway's cluster on `:443` | `cargo build --release -p motherd` | yes |
+| keep | BlackWorld | `127.0.0.1:8092` (its switch); watches web on `:80` and motherd on `192.168.1.2:8081` | `cargo build --release -p keep` | **never** |
+| mcp | BlackWorld, WhiteWorld | `127.0.0.1:8095` (`mcp/mcp.yaml`, `mcp/mcp.whiteworld.yaml`); joins the gateway as the app `mcp` (`docs/mcp_app.md` §5, §6) | `cargo build --release -p mcp`; released with `service_deploy {host, service: mcp}` | not covered by `/down`; stop with `service_control` |
+| battlecities | BlackWorld | UDP `14300` and `14123` (the gateway forwards the game's 4300 and 4123 to them); the site itself is served over the cluster socket, with `127.0.0.1:4080` as the gateway's fallback upstream (`keep/keep.yaml`, `web/web.yaml`, `docs/battlecities_app.md` §3, §5) | built from the game's own repository; released with `service_deploy {host: BlackWorld, service: battlecities}` | not covered by `/down`; stop with `service_control` |
+| zenj | BlackWorld | `127.0.0.1:8097` (`keep/keep.yaml` `guards`) | its own Cargo workspace, `--manifest-path zenj/Cargo.toml` (`docs/zenj.md` §3.2); not run by keep, started at logon | not covered by `/down`; it reserves the machine itself while rekordbox is open |
+| yenbot | BlackWorld | `127.0.0.1:8096` (from `D:\yenbot\live\yenbot.yaml`) — loopback only; the gateway's `yenbot` site forwards yenbot.com.au to it | `cargo build --release` in `D:\prog\yenbot` (its own repository, `docs/yenbot_app_host.md` §5.5); released with `service_deploy {host: BlackWorld, service: yenbot}` | yes |
+| cf-ddns | BlackWorld | — (outbound only) | scheduled task, see below | **never** |
 
 ### Launch lines
 
@@ -114,11 +125,20 @@ Paths are relative to the repo root.
 
 | Machine | Service | Command line | Recorded |
 |---|---|---|---|
-| .5 | web | `keep\stable\web.exe --config web/web.yaml` | 2026-10-14, keep restarts a proven trial from this path |
-| .5 | motherd | `keep\stable\motherd.exe --config D:/prog/motherd-local.yaml` | keep restarts a proven trial from this path (`keep/keep.yaml`); every setting is in the config file, whose shape is `motherd/motherd.yaml`'s |
-| .5 | yenbot | `keep\stable\yenbot.exe --config D:/yenbot/live/yenbot.yaml`, working directory `D:\yenbot` | 2026-11-07, keep restarts a proven trial from this path. Its store, files, backups and library cache are under `D:\yenbot\data\`, its bus key at `D:\yenbot\secrets\gateway.key`, and the live checkout it serves at `D:\yenbot\live` (yenbot's `docs/running.md`) |
-| .5 | keep | `target\release\keep.exe keep/keep.yaml` | 2026-10-14. Supervisor `C:\Users\johna\AppData\Local\keep\supervise.ps1` (restart 10 s after exit), run by the scheduled task `\keep` at boot since 2026-10-15. keep is not swapped by a rollout |
-| .6 | npcd | `target\release\npcd.exe --host 0.0.0.0 --port 8081 --gateway 192.168.0.5 --mind D:/prog/mind --forget-conversations` | 2026-09-29, from /up — mind moved to `D:\prog\mind`, which also holds its `.substrate\` and `accounts\` (`--data` defaults to `--mind`). Rewritten 2026-10-10 for the host's flags (not yet run): `--bind` became `--host`/`--port`, `--content` is gone, and `--gateway 192.168.0.5` is new — without it every signed-in visitor is anonymous. Its store was written by the AntiLoop + StyleTune fine-tune; since 2026-10-11 the host prescribes Flash-Next, so that store is refused at open, before anything in it is rewritten, and npcd's first run on this build needs a new `--data` |
+| BlackWorld | web | `keep\stable\web.exe --config web/web.yaml` | 2026-10-14, keep restarts a proven trial from this path |
+| BlackWorld | motherd | `keep\stable\motherd.exe --config D:/prog/motherd-local.yaml` | keep restarts a proven trial from this path (`keep/keep.yaml`); every setting is in the config file, whose shape is `motherd/motherd.yaml`'s |
+| BlackWorld | mcp | `keep\stable\mcp.exe --config mcp/mcp.yaml`, working directory `D:/prog/candle` | `keep/keep.yaml`; WhiteWorld runs `--config mcp/mcp.whiteworld.yaml` from its own keep config |
+| BlackWorld | battlecities | `keep\stable\battle-cities-server.exe --game-port 14300 --time-port 14123 --data D:/battle-cities/data --seed-from data --state D:/battle-cities/state --cluster-url "https://gateway.tokera.local https://gateway.tokera.com" --cluster-name tokera.com --group-key D:/prog/candle/web/secrets/group.key --host blackworld`, working directory `D:/agent/battle-cities` | `keep/keep.yaml` |
+| BlackWorld | yenbot | `keep\stable\yenbot.exe --config D:/yenbot/live/yenbot.yaml`, working directory `D:\yenbot` | 2026-11-07, keep restarts a proven trial from this path. Its store, files, backups and library cache are under `D:\yenbot\data\`, its bus key at `D:\yenbot\secrets\gateway.key`, and the live checkout it serves at `D:\yenbot\live` (yenbot's `docs/running.md`) |
+| BlackWorld | keep | `target\release\keep.exe keep/keep.yaml` | 2026-10-14. Supervisor `C:\Users\johna\AppData\Local\keep\supervise.ps1` (restart 10 s after exit), run by the scheduled task `\keep` at boot since 2026-10-15. keep is not swapped by a rollout |
+
+*History — the standalone npcd (stopped 2026-10-12, no longer run).* Its last recorded line on the
+separate machine `192.168.0.6` was `target\release\npcd.exe --host 0.0.0.0 --port 8081 --gateway
+192.168.0.5 --mind D:/prog/mind --forget-conversations`, written 2026-10-10 and never run: `--bind`
+became `--host`/`--port`, `--content` went, and `--gateway` was new — without it every signed-in
+visitor is anonymous. Its store was written by the AntiLoop + StyleTune fine-tune, which the host
+stopped prescribing on 2026-10-11, so that store would be refused at open. npcd now runs only as
+a tenant of motherd.
 
 Notes on the arguments:
 
@@ -144,7 +164,8 @@ Notes on the arguments:
 - **`--gateway <ip>`** (zend and npcd) names a gateway whose identity headers are
   believed; loopback and the bound address always are. npcd believed them from anyone
   before; it now clears them from any other peer, so an npcd behind the gateway on
-  another machine needs `--gateway 192.168.0.5` to see who is signed in.
+  another machine needs `--gateway 192.168.1.2` (BlackWorld) to see who is signed in. A
+  member that joins the gateway's cluster (`host:` in `motherd/motherd.yaml`) needs no flag.
 - **`--model`** (zend) is gone: every daemon runs the prescribed model (`host::MODEL`).
   A substrate written under another model refuses to open, naming both — start on a new
   `--working-dir`, or move the old substrate aside.
@@ -163,7 +184,7 @@ Notes on the arguments:
 ### motherd
 
 `motherd` runs zend and npcd in one process on one model
-(`docs/shared_model_host.md`), and on `.5` it is what runs in zend's place. The config,
+(`docs/shared_model_host.md`), and on BlackWorld it is what runs in zend's place. The config,
 `motherd/motherd.yaml`, holds the process's settings under `host:` and each daemon's
 under its name, in the same shape as that daemon's own flags:
 
@@ -198,16 +219,19 @@ of an app it routes to the configured upstream.
 
 ### The cluster
 
-The gateway on `.5` is the cluster `tokera.com` (`web/web.yaml`'s `cluster:` block):
+The gateway on BlackWorld is the cluster `tokera.com` (`web/web.yaml`'s `cluster:` block):
 
 - **The group key** is `web/secrets/group.key`, written once by
   `target\release\web.exe --new-group-key web/secrets/group.key` (it refuses to
   overwrite one). The gateway and every member on every machine hold the same file;
   it is a secret, gitignored with the rest of `web/secrets`, and never printed.
-- **Members join over the TLS entrance**, `https://gateway.tokera.com` on 443, checked
-  against the gateway's `tokera.com` certificate (`cluster_name: tokera.com`).
+- **Members join over the TLS entrance** on 443, trying `https://gateway.tokera.local`
+  (the hosts file's `192.168.1.2`, so a member on the gateway's machine or LAN never
+  hairpins out through the router) and then `https://gateway.tokera.com`, checked
+  against the gateway's `tokera.com` certificate (`cluster_name: tokera.com`;
+  `clusters:` in `motherd/motherd.yaml`, `cluster.urls` in `mcp/mcp.yaml`).
   `gateway.tokera.com` is a DNS-only record (not proxied) for the public IP, with
-  443 tcp + udp forwarded to `.5`; `tokera.com` itself is behind Cloudflare's proxy,
+  443 tcp + udp forwarded to BlackWorld; `tokera.com` itself is behind Cloudflare's proxy,
   which does not carry a cluster socket. The entrance was on 9443 while a
   remote-desktop tunnel held 443 (until 17 November 2026); the firewall forwards 9443
   to the entrance's 443 until every member runs a configuration that names no port.
@@ -362,8 +386,8 @@ uptime resets the count — it's a fresh occurrence, not a continuation of the s
 and so does any start that is not the watchdog's own relaunch: a process started by hand,
 by an install or by a clean restart begins at zero whatever the file holds.
 
-A binary built before the host (the npcd running on `.6` until it is rebuilt) has no
-watchdog of its own, so the same class of stuck device still needs a human there.
+*History:* the standalone npcd on `192.168.0.6`, built before the host, had no watchdog of its
+own; it is no longer run, and npcd now has the host's watchdog as a motherd tenant.
 
 ## Health checks
 
@@ -373,7 +397,7 @@ Expected results, as measured 2026-09-13:
 | Check | How | Healthy |
 |---|---|---|
 | motherd on the LAN | `curl http://192.168.1.2:8081/v1/status` | `"tenants":{"zend":{"state":"ready",…},"npcd":{"state":"ready",…}}` and `"cluster":{…"apps":{"zend":{"link":"joined",…},"npcd":{"link":"joined",…}}}` — it answers `200` with `"loading"` throughout startup, and npcd's first start on a fresh substrate ingests its mind for a while after zend is ready |
-| npcd on the LAN | `curl http://192.168.0.6:8081/v1/status` | `200`; a host-built npcd answers with `"tenants":{"npcd":…}` |
+| WhiteWorld's motherd on the LAN | `curl http://192.168.1.3:8081/v1/status` (the npcd upstream in `web/web.yaml`) | `200`, the same shape as BlackWorld's |
 | yenbot on loopback | `curl http://127.0.0.1:8096/v1/status` | `{"state":"ready","build":"<count>-<hash>","store":{"schema":…}}` |
 | gateway config | `target\release\web.exe --config web/web.yaml --check` | exit 0 |
 | gateway routing | `curl -H "Host: <name>" http://127.0.0.1/` for `tokera.com`, `code.tokera.com`, `bot.tokera.com` | `200` / `30x` / `401`; `503` = that upstream is down |
@@ -389,8 +413,8 @@ Reading a failure:
   IP is right — and the one the members' internet path depends on.
 - **Cloudflare `521` / `522` / `523`** with the gateway healthy locally means Cloudflare
   cannot reach port 80 on the public IP: a stale A record (check DNS vs public IP, then
-  cf-ddns), the router's DMZ no longer pointing at `192.168.0.5` (e.g. DHCP handed this box
-  a new address), or the firewall.
+  cf-ddns), the router's forward to the gateway no longer pointing at BlackWorld's `192.168.1.2` (e.g.
+  DHCP handed this box a new address), or the firewall.
 - **`503` from the gateway** is web's own page for an upstream that is down — web backs off
   and recovers on its own once the daemon answers.
 - **`www.tokera.com` answers `301`** (to `tokera.com`, per `web.yaml`) — confirmed
@@ -398,7 +422,7 @@ Reading a failure:
   the redirect and wants a rebuild and restart.
 - **`bot.tokera.com` `503`** while the gateway is healthy means no npcd is serving: motherd's
   npcd member is not joined at all (a member joined and loading shows its loading page from
-  the second request on), and the configured upstream on `.6` is down.
+  the second request on), and the configured upstream, WhiteWorld's motherd on `192.168.1.3:8081`, is down.
 - **A console says "no zend member answered"** (or npcd) while the status page shows the
   member joined: the gateway asked the member and it did not answer within 3 s. Its
   forwarded requests are queued behind something on its socket — `"in_flight"` and

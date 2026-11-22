@@ -394,7 +394,7 @@ pub(super) fn dense_qmatmul_float(
 /// dispatch), output F32; `Float` runs the dequant-weight float path
 /// ([`dense_qmatmul_float`]), output matching the activation dtype. The caller stays
 /// agnostic to which numeric mode runs. `weight_len` is the quantized-weight byte length
-/// used by the float path; the int8 path ignores it. See docs/archived/q8_matmul_pipeline.md.
+/// used by the float path; the int8 path ignores it.
 /// KO format code for the segmented qkv kernel's `fmt` field.
 ///
 /// **This table and the switch in `qkv_segmented_f32.cu` are one mapping split across two

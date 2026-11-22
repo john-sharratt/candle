@@ -10,8 +10,6 @@
 //! in one region, which collapses `arena_idx` — so the sub-entry dimension has
 //! to carry the variety instead. These tests pin that contract from the host
 //! side; the model gate exercises the kernel half.
-//!
-//! See `docs/archived/arena_unification.md` §2 and §5 step 1.
 
 use std::sync::Arc;
 
@@ -162,7 +160,7 @@ fn sub_entries_carry_a_real_slot_stride() {
         for p in 0..N_PALETTE {
             let base = p * PaletteSubEntry::COLS;
             // The stride the kernel steps by is the arena's **class** stride,
-            // not the band's payload (`docs/archived/arena_unification.md` invariant 8).
+            // not the band's payload.
             // This fixture's BF16 band is 32 tokens x 8 dims x 2 B = 512 B,
             // which is its own rung, so here the two happen to coincide —
             // `every_format_above_the_catch_all_lands_exactly` is why. The row

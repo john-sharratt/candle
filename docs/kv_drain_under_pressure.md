@@ -64,7 +64,8 @@ cycle in the engine, and every throttle goes (§1).
   at least one arena's worth of **free slots**.
 - The empty sweep (`ArenaPool::try_tombstone`) releases an empty arena of a
   reserve class only while the class keeps a whole arena free without it, and
-  takes the highest-index empty first, so the lowest stands.
+  takes the highest-placed empty first (the greatest offset into the reservation, never
+  the greatest arena index), so the lowest-placed stands.
 
 Because the reserve is free capacity rather than a particular arena,
 allocation and compaction need no special case. Allocation's lock-free path
@@ -95,7 +96,9 @@ keeps one for each native hot class (F16/R16) that sealing writes into.
   region 487 with ~430 free regions (6.7 GB) below it. The frontier could not
   come down, and the expert zone sat 1 GB under its floor. So the sweep releases
   an empty arena the reserve would keep when the lowest free region lies below
-  it (`try_tombstone`'s `lowest_hole`, read from `region_pool::lowest_free_region`).
+  it (`try_tombstone`'s `lowest_hole`, read by `BackingInner::lowest_hole` from
+  `region_pool::lowest_free_region`; the comparison is against the highest-placed empty
+  arena, and applies to ranked places only).
   The class then falls short, the next gap owes it an arena, and the claim takes
   the lowest free region. The re-made arenas fill the lowest holes in order, so
   one round settles it.
@@ -116,7 +119,11 @@ The gap runs on every loop iteration, so admission needs no third site.
 
 Replenishing one reserve costs one region claim per class consumed.
 
-**Never thrashed:**
+**Never thrashed.** As built, a reserve is the free capacity the pool's
+`reserve_keys` name (`GidPool::keep_reserve`; `reserve_target` is one arena's
+worth of slots), and the headroom rule above is what keeps it. `protected_arenas`
+holds arenas created ahead of demand (`finish_creation`, `settle_fresh`), not the
+reserve. The marked-arena design reads:
 1. A reserve is in `protected_arenas`, which every empty sweep honours:
    - `release_empty_arenas`;
    - `global_release_empty_arenas` (including from `claim_region`);
@@ -344,16 +351,33 @@ The fairness flag (`COMPACTION_WAITING`) and section persist's
 
 ## 4. A refused wave relieves before it retries
 
-The tier-refusal retry (`WaveRetry` and `GIVE_UP_AFTER = 1024` in
-`wave_retry.rs`; `decode::retry_step`) today only lowers the frontier and backs
-off. It is changed to run the relief ladder before retrying, with eviction of
-what has a warm copy, and to fail a wave only when a full relief cycle frees
-nothing. With §2 and §3 in place, warm copies exist under pressure, so the
-ladder's evict rung has something to evict.
+**As built.** The tier-refusal retry (`WaveRetry` and `GIVE_UP_AFTER = 1024` in
+`scheduler/wave_retry.rs`; `decode::retry_step` in `scheduler/decode/failure.rs`)
+keeps the turns in place and backs off: the wait doubles from 0.5 ms to a 5 ms cap, a
+request ends it, and the turns fail with the error only after 1,024 consecutive
+failed attempts (about five seconds). `retry_step` runs no relief itself. The relief
+ladder (`relieve_vram_pressure`) runs in the scheduler loop — at each decode quantum
+boundary when the card is under pressure (`run_decode_until_budget`), and on a
+compression starvation signal — and the compaction and the weight side's
+between-step concessions run there too; the retry waits for the ground they hand
+back.
+
+**Not built.** The plan of record is for the retry to run the relief ladder before
+retrying, with eviction of what has a warm copy, and to fail a wave only when a full
+relief cycle frees nothing. With §2 and §3 in place, warm copies exist under
+pressure, so the ladder's evict rung has something to evict.
 
 ## 5. Tests
 
-Assertions are on exact counts and indices:
+Assertions are on exact counts and indices. In the tree: items 1–2 are covered by
+`gid_pool/tests_reserve.rs` (`a_reserve_class_keeps_one_arenas_worth_free_at_its_lowest`,
+`a_reserve_above_a_hole_is_released_to_move_down`, `a_reserve_sweeps_down_to_one_free_arena`
+and its siblings) without the 1,000-sweep loop; item 3 by `tests/alloc_tests.rs`
+(`a_drained_reserve_gets_one_arena_back_and_no_more`); item 5 by `migrate_flight.rs`
+(`flights_compose_and_exclude_a_compaction`); item 6 by
+`held_chunks_are_skipped_until_every_holder_lets_go` and
+`a_replace_lands_over_a_relocation_of_the_copy_it_read` (`substrate/residence.rs`).
+Items 4 and 7 have no test of this shape in the tree and are the plan of record.
 
 1. **The reserve stands.** After each sweep kind, every reachable class has
    exactly one empty, protected arena, at the lowest index its class can take.

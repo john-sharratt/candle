@@ -266,8 +266,8 @@ impl Sequence {
     ///
     /// - Turn A (call): `user(request)` → `assistant(<tool_call>…)`, prefilled.
     /// - Turn B (response): `user(<tool_response>…code…)` → `assistant(summary)`,
-    ///   DECODED under `/no_think` (short) — so `<think>` is stripped by the
-    ///   normal clean re-prefill and `/no_think` rides as live glue, never baked.
+    ///   DECODED under `/no_think` (short) — which rides as live glue, never
+    ///   baked.
     ///
     /// The two turns are coupled, so provenance selecting either injects both,
     /// adjacent, with the seam regenerated between them. Serial by construction:

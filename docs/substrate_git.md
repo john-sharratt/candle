@@ -509,9 +509,11 @@ Built:
   into the log reads with no checkout, from a database naming it; an absolute ledger key
   becomes a mind path.
 
-Still to run: end to end on `.6` against `.5` — two members agreeing on a mind commit at
+Not run: end to end on `.6` against `.5` — two members agreeing on a mind commit at
 one log point, a pending mind pulled and taken in without a restart, and a conversation's commits
-read on another member.
+read on another member. No test in `substrate-git/` or `zend-vfs/` drives two members; the
+tests above each run one member against its own log, so this is a procedure to run by hand
+on two machines, not a gap a `cargo test` closes.
 
 ---
 

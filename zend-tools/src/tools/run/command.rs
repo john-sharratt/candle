@@ -98,8 +98,8 @@ impl Tool for RunCommand {
     /// A program that only reads the conversation's files and writes its own
     /// build output — which the sandbox keeps out of the conversation's
     /// changes — leaves the files as it found them, so a resumed turn runs it
-    /// again rather than refusing it (`docs/archived/zen_coding_challenge_fixes.md`
-    /// Cause 9). Anything else may change a file, and is refused on resume.
+    /// again rather than refusing it, which would cost the caller a round.
+    /// Anything else may change a file, and is refused on resume.
     fn replay(req: &Self::Request) -> Replay {
         match reads_only(&req.program, &req.args) {
             true => Replay::Safe,

@@ -311,8 +311,10 @@ const EVIDENCE_MIN_PREFILL_TOKENS: u64 = 256;
 /// `disable_reprojection` path — `code_reading` / `repo_map`): each such turn
 /// attends only the system prompt + the last `CODE_READ_WINDOW_TURNS` sealed
 /// turns, bounding otherwise-unbounded ingest context that would exhaust the
-/// window and blow up KV VRAM (design `docs/archived/unified_wave_inference_engine.md`
-/// §4.7 and [`crate::projection::resolver::Conversation::windowed_ingest_ranges`]).
+/// window and blow up KV VRAM (see
+/// [`crate::projection::resolver::Conversation::windowed_ingest_ranges`]). These
+/// turns skip projection, so without the window each would borrow the whole
+/// parent and prefill against every prior turn.
 /// `0` = unbounded (whole-parent borrow).
 const CODE_READ_WINDOW_TURNS: usize = 8;
 
@@ -380,7 +382,7 @@ pub(crate) struct Scheduler {
     device: Device,
     /// Resident VRAM gallery arena for the paged belief scan (one per device,
     /// shared across conversations). `None` on non-CUDA devices — the reproject
-    /// then falls back to the CPU per-file scan. See `docs/archived/paged_gallery_arena.md`.
+    /// then falls back to the CPU per-file scan.
     gallery_arena: Option<Arc<GalleryArena>>,
     /// The state band's last census — the gallery's, and each substrate's
     /// group names — reused by the memory report until it is
@@ -658,9 +660,9 @@ pub(crate) struct Scheduler {
     attached_substrates: Vec<Conversation>,
 
     /// Trigger handle for the async summariser thread.  Fired after
-    /// every turn-seal (`docs/archived/infinite_conversations.md` §4 step ③)
+    /// every turn-seal
     /// so the freshly-pending Normal turn is absorbed into the immutable
-    /// summary forest (`docs/archived/immutable_summary_forest.md`) on the next
+    /// summary forest on the next
     /// pass instead of waiting up to 250 ms
     /// for the periodic tick.  Backpressure-clearing is purely a
     /// latency optimisation — the tick alone is correct.

@@ -7,8 +7,8 @@
 //! `sync_decode_gpu_chunks` returns `Reuse` with the existing device pointer
 //! whenever the chunk count still matches — so a per-wave cursor reset would
 //! recycle it under a live sequence. Anything outliving a wave is
-//! arena-managed (`docs/archived/arena_unification.md` principle 2's corollary, audit
-//! A13).
+//! arena-managed: a long-lived buffer left on the CUDA pool would mean
+//! recurring allocation and free in steady state.
 //!
 //! # What this replaces
 //!

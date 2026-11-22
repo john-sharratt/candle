@@ -34,8 +34,7 @@ use super::*;
 /// [`Reclaim::StreamOrdered`] argues about: that argument is a phase reusing
 /// *its own* span with a whole other phase's same-stream work in between. Two
 /// different extents, on two streams, have nothing ordering them. It cost
-/// `Q8_0 x20` every session's output while the region pool looked untouched
-/// (`docs/archived/elastic_vram_partition.md` §13b).
+/// `Q8_0 x20` every session's output while the region pool looked untouched.
 ///
 /// So the address is decided **here**, once, and held for the forward: the
 /// ceiling stands across the inter-phase gaps, `begin_wave` rebases onto an

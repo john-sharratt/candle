@@ -315,10 +315,13 @@ What does **not** end a segment:
   graveyard and is freed right after its segment is launched, in stream order behind it —
   dropped on any thread, since the last reference to memory a recorded launch reads may be
   released elsewhere. The graveyard is emptied outside the hub's lock.
-- **Uploads to existing or freshly carved device memory** (`upload_raw`, `upload_into_slice`,
-  `wave_from_vec_ticketed`, `upload_into`, `record_upload`, the selection and QSA index
-  tables, the KV slot-state buffers and the paged slot headers). The bytes are copied into
-  the wave's pinned, device-mapped ring and a `copy_bytes` from the ring is recorded. Its
+- **Uploads to existing or freshly carved device memory** (`CudaDevice::{upload_raw,
+  upload_into_slice, record_upload}` in `device/memory.rs`; the wave-buffer helpers
+  `wave_from_vec_ticketed` and `upload_into` in `candle-transformers/src/models/wave_buffers.rs`,
+  which reach the device through them; the selection and QSA index tables, the KV slot-state
+  buffers and the paged slot headers). The bytes are copied into
+  the wave's pinned, device-mapped ring and the `copy_bytes` kernel (`run_copy_bytes`,
+  `candle-kernels/src/simple/fill.cu`, launched from `graph/staging.rs`) from the ring is recorded. Its
   grid comes from a power-of-two ladder rather than from the size, so a table that grows a
   little from one wave to the next — a slot-state buffer gaining a chunk — keeps its
   segment's shape and folds in place. A slot-state buffer gaining a chunk uploads only its
@@ -614,7 +617,7 @@ per segment, in-place updates, instantiations — and is unit-tested on its text
 
 ---
 
-## 5. Next
+## 5. Known limits and open items
 
 1. **Flash-Next's C8×2 prefill.** It runs 3.6% under its pre-graphs rate (861.5 against
    893.4 t/s) under every policy that keeps the wide decode gains; only scoring decode misses
@@ -622,11 +625,11 @@ per segment, in-place updates, instantiations — and is unit-tested on its text
    hits more of the zone when the zone holds old residents rather than decode's recent
    experts; a prompt-side long memory (prompt hits earning reuse) did not move it and cost
    Qwen3.6's prefill 3–5%.
-2. **Qwen3.6's verify rows.** `DecodeRows` reaches its hybrid sweep through
+2. **Qwen3.6's verify rows (built).** `DecodeRows` reaches its hybrid sweep through
    `BatchedAttentionLayer::ffn_residual`, and the sweep builds the set as Flash-Next's does
    (`residency_decode_rows`: the decode rows, the verify segments and each prompt's last
    row).
-3. **Fewer segments — done for the MoE flushes.** The dispatch's host readers poll the
+3. **Fewer segments (built for the MoE flushes).** The dispatch's host readers poll the
    summary word bucketize writes *when it executes*, so launching each MoE invocation's
    segment at once bought nothing past the start of a wave, where the GPU must not idle
    while the host records. `expert_lre::flush_schedule` now launches a wave's segments at
@@ -638,7 +641,7 @@ per segment, in-place updates, instantiations — and is unit-tested on its text
    121.9 → 134.2 at 128K (RTX PRO 5000, 2026-10-09). What remains of the attention layers'
    header builds cuts only when its slot-state buffer needs a device call a recording cannot
    make: a full ring, a fence, a slab claim.
-4. **Fuse MoE layers whose experts are all resident.** With the flush schedule a segment
+4. **Fuse MoE layers whose experts are all resident (not built).** With the flush schedule a segment
    already spans up to 32 MoE layers; what is left is the host protocol's per-invocation
    bookkeeping (`before`), not a segment cut.
 

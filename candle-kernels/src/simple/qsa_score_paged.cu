@@ -595,7 +595,8 @@ extern "C" void run_qsa_score_paged(
     // warp at a time and so runs few of them at once: under
     // `QSA_MMA_MIN_ROWS` rows or `QSA_MMA_MIN_CELLS` cells — a decoding
     // sequence, a shallow index — the launch is latency-bound and a thread per
-    // candidate is faster (`docs/qsa_index_q8.md` §9, round 7).
+    // candidate is faster (measured where the thresholds are defined,
+    // `qsa_score_mma.cuh`).
     if (D == QSA_MMA_D && (pairs & 31) == 0 && pairs <= QSA_MMA_MAX_PAIRS
         && rows >= QSA_MMA_MIN_ROWS && (long long)rows * n_grid >= QSA_MMA_MIN_CELLS) {
         switch (H) {

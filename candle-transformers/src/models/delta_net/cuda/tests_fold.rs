@@ -222,7 +222,7 @@ pub(super) mod tests {
     }
 
     /// **A replay is the captured span's state, and nothing else of it**
-    /// (`docs/archived/recurrent_reply_calibration.md` §10). Span A runs with its rows
+    /// (`docs/deltanet_timeline.md` §14.3). Span A runs with its rows
     /// captured; span B — other rows, another length — runs from the same
     /// entering state replaying A's rows. B's advanced state is A's, bit for
     /// bit, while B's outputs and conv tail are B's own, bit for bit what B

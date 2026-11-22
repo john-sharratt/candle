@@ -1,5 +1,7 @@
 // Job blocks and streaming replies redraw only what moved
-// (docs/archived/performance_patch.md G1, G2, G3, G6, G7). Against the mock (?mock=1).
+// — a message re-renders only when a job it shows changes, a streaming reply
+// redraws only its live part, and the job poll runs one at a time on a visible
+// tab. Against the mock (?mock=1).
 const { test, expect } = require('@playwright/test');
 
 const URL = '/index.html?mock=1';

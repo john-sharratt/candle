@@ -58,6 +58,7 @@ code no longer has.
 | [`unified_wave_inference_engine.md`](unified_wave_inference_engine.md) | Design draft (pre-implementation, superseded by `continuous_fair_waves.md`). Packs decode+prefill+glue into one forward with a small/large batch flip and cooldown, to amortise all-expert PCIe streaming cost on VRAM-constrained hardware. |
 | [`recurrent_reply_calibration.md`](recurrent_reply_calibration.md) | **Design, not built.** Why a page served `in_context` is read but never "seen" (the 36 DeltaNet layers never ran over it), and the fix: a calibration step that records, per page, the delta-rule inputs of the `in_context` reply as a reader's recurrence takes it, and a live conversation served that page whose state past the reply comes from those rows. Record format, recipe hash and staleness, the sweep, the replay scan, tests and gates. |
 | [`perplexity_results.md`](perplexity_results.md) | WikiText-2 perplexity measurements across model/quant combinations (Qwen3-30B-A3B, Qwen2/3, Llama-3.2-3B), methodology and per-context-size result tables. |
+| [`coding_assistant.md`](coding_assistant.md) | The original Zen Code design: the `zend` daemon + `zen-vscode` (Continue fork) + read-only web chat, `/v1/zen/*` routes, `.zend.yaml` shadow files and phased-ingestion trunk sessions. Superseded: the product is built on the substrate and layers (`zend_workspace_execution.md`, `zend_branch_ingest.md`, `zend_working_set.md`, `zend_layers.md`). |
 
 ## Conversation substrate & NPC design (early)
 

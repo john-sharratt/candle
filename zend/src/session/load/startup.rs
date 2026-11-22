@@ -434,7 +434,7 @@ impl InferenceState {
 
         // Reclaim is normally fully background: the segmented log's
         // persistence-thread maintenance pass drops / compacts / combines
-        // segments incrementally (`docs/archived/segmented_substrate_log.md` §6), so a
+        // segments incrementally, so a
         // startup pays no whole-store rewrite. `--compact-substrate` forces the
         // eager path instead — a whole-store rewrite here, after the reload (so
         // the live set is known) and before serving. It always runs when the

@@ -495,7 +495,7 @@ fn allocator_worker(
     let n_layers = backings.len();
 
     // A CUDA context is CURRENT PER THREAD, and this runs on a spawned worker.
-    // `alloc_sealed_blocks_bulk` → `build_meta_records` → `MetaPool::write_records_batched`
+    // `alloc_sealed_blocks_bulk` → `build_meta_records` → `fill_records_on_device`
     // issues driver calls, which fail `CUDA_ERROR_INVALID_CONTEXT` on a thread
     // that never bound one — the same binding `persistence::thread` and the
     // scheduler do at their worker entry points.

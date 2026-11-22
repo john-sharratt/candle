@@ -791,10 +791,9 @@ impl SchedulerRequest {
 /// Sum of not-yet-processed prefill tokens across pending/in-flight work — the
 /// scheduler's prefill **backlog**. `items` yields `(total_tokens,
 /// consumed_offset)` per work unit (queued work has `consumed == 0`; an
-/// in-flight prefill/section has `consumed == offset`). This is the signal the
-/// unified-wave engine's large-batch trigger keys on (design
-/// `docs/archived/unified_wave_inference_engine.md` §4.5). Pure over its input so it is
-/// unit-testable without a live scheduler.
+/// in-flight prefill/section has `consumed == offset`). The wave log line
+/// reports executed forwards only, so this sum is the one view of pending work.
+/// Pure over its input so it is unit-testable without a live scheduler.
 pub(in super::super) fn sum_pending_prefill_tokens(
     items: impl IntoIterator<Item = (usize, usize)>,
 ) -> u64 {

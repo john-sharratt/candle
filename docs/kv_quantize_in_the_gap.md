@@ -2,12 +2,16 @@
 
 **Status:** the gap quantize, the lease, the claim, the catch-up and the
 copy-only persistence pass are built (`candle-nn/src/kv_cache/chunked/gap/`,
-`scheduler/run/scheduler_loop.rs`, `persistence/thread/warm_copy.rs`). Of the
-deletions in §6, `MigrateFlight` and the selection's `run_palette4` readback
-remain in the code. Where this document and the code disagree, the
-code is to be brought to this document. It supersedes the hot→warm quantize of
+`scheduler/run/scheduler_loop.rs`, `persistence/thread/warm_copy.rs`). The
+pieces of the design the code has not yet reached are listed under **Open
+items** at the end of this document, which is the one place that tracks them.
+Where this document and the code disagree, the code is to be brought to this
+document. It supersedes the hot→warm quantize of
 `docs/kv_drain_under_pressure.md` §2a–§2c and §3, and restores the write path of
-`docs/archived/kv_tier_migration.md` §3 and §11, which the build departed from.
+`docs/archived/kv_tier_migration.md` §3 and §11, which the build departed from
+(the reason it is restored: a persistence thread that quantizes writes device
+memory beside the forwards and must fence them, §1; a thread that only copies
+does not).
 
 ## 1. What is wrong now
 
@@ -560,7 +564,9 @@ scale whichever gap quantizes them.
 
 ## 5. Persistence
 
-- **A dedicated copy stream for each persistence thread.** Every attachment's
+- **A dedicated copy stream for each persistence thread.** *Not built: the copy
+  runs on the device's primary stream today (§5, last-but-one bullet; Open items).*
+  Every attachment's
   persistence thread owns a non-primary stream of its own, so two tenants'
   copies never queue behind each other or behind a forward. Today both
   threads run their hot→warm pass on the shared primary stream and each fences
@@ -846,7 +852,7 @@ Paths and line numbers are as of the current tree.
   layers before launching, drops the device state mid-gap cleanly, and does
   not see the gap after a sequence wrap complete early.
 - `candle-nn/src/kv_cache/chunked/sampled_selection/gpu/paged_inputs.rs:49`, `run_palette4`,
-  and its readback: to be removed; still present, called at `:624` and `:816`.
+  and its readback: the selection's host readback the gap replaces (§3.4, §6).
 
 **5. The summary and the catch-up (§3.4, §3.5).**
 - New `candle-nn/src/kv_cache/chunked/gap/summary.rs`: the mapped buffer, its
@@ -909,9 +915,8 @@ Paths and line numbers are as of the current tree.
 - `candle-conversation/src/persistence/`: `PersistenceTrigger::warm_turns`, a
   cold-to-warm read on the persistence thread. `persistence/warm_ledger.rs`
   gives each thread its share of the warm budget, as today.
-- `candle-nn/src/kv_cache/chunked/migrate_flight.rs:131` (`MigrateFlight`,
-  to be deleted; the warm copy in `persistence/thread/warm_copy.rs` and `pass.rs` still
-  takes it) and `:212` (`HeldChunks`, kept).
+- `candle-nn/src/kv_cache/chunked/migrate_flight.rs:131` (`MigrateFlight`, the
+  quantize lock §6 deletes) and `:212` (`HeldChunks`, kept).
 - `candle-conversation/src/persistence/group_cap.rs` and `reserve_log.rs`:
   deleted.
 
@@ -991,3 +996,30 @@ Paths and line numbers are as of the current tree.
   and the device tests need the card alone.
 - `elevate.rs` keeps its own `device.synchronize()` on the warm→hot path. It is
   outside this change and will still show in the wave windows.
+
+## Open items
+
+Code that still stands where this design removes or replaces it, checked
+against the tree on 2026-11-22. Each is work the design calls for; this list is
+the single place that tracks them.
+
+1. **`MigrateFlight` is still defined and taken.**
+   `candle-nn/src/kv_cache/chunked/migrate_flight.rs` defines it
+   (`try_migrate_flight`, `COMPACTION_WAITING`, the location freeze), and the
+   warm copy takes it per group (`persistence/thread/pass.rs`,
+   `persistence/thread/warm_copy.rs`, which `settle`s it before the copy). §5
+   and §6 delete it as a quantize lock; `HeldChunks` and `retain_unheld` in the
+   same file stay. Section persist's `try_hold_chunk_locations` also lives there.
+2. **`run_palette4`'s host readback is still present.**
+   `candle-nn/src/kv_cache/chunked/sampled_selection/gpu/paged_inputs.rs`
+   defines it (`:49`) and calls it from the two selection paths (`:624`,
+   `:816`). The gap's summary carries what that readback returns (§3.4); §6
+   deletes the readback.
+3. **The persistence pass still calls `device.synchronize()`.**
+   `persistence/thread/pass.rs` fences before the copy (`:62`) and after the
+   groups (`:250`). §5 removes both once the copy runs on its own stream.
+4. **The per-thread copy stream and the `E_gap` wait are not built.** The pass
+   copies on the device's primary stream (`pass.rs:183`, `cuda.cuda_stream()`);
+   no code records or waits on a gap event. §3.8 rule 6's ordering holds
+   because a block reaches persistence only after its install, and the pass's
+   fences are what order the copy after the forwards' writes.
