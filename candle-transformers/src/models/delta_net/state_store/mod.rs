@@ -17,7 +17,7 @@
 //! - `compaction`: moving halves into lower slots.
 //! - `host_buffers`: the pinned readback and upload buffers.
 //! - Tests: `tests_layers`, `tests_memory`, `tests_snapshots`, `tests_steps`,
-//!   `tests_cuda`.
+//!   `tests_compaction`, `tests_cuda`.
 
 #[cfg(feature = "cuda")]
 use std::collections::HashMap;
@@ -99,6 +99,8 @@ mod store_access;
 mod store_io;
 mod store_steps;
 mod store_waves;
+#[cfg(test)]
+mod tests_compaction;
 #[cfg(test)]
 mod tests_cuda;
 #[cfg(test)]

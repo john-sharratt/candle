@@ -10,6 +10,8 @@
 //! order is restored at the end.
 
 use super::*;
+#[cfg(feature = "tensor-assert")]
+use crate::models::nan_capture::{forward_done, watch_after_failure};
 
 /// A forward's caller-order rows: decode, prefill and glue, each with its inputs.
 #[derive(Clone, Copy)]
@@ -241,10 +243,13 @@ pub(super) fn forward_core<S: WaveSweep + ?Sized>(
     // unrecoverable shape as a failed rollback: report both.
     let fail = |session: &mut BatchedInferenceSession, e: Error| -> Error {
         // The failed forward's asserts go with it: drained by the next wave
-        // instead, a cold expert's given-up rows read as that wave's NaN.
+        // instead, a cold expert's given-up rows read as that wave's NaN. The
+        // state its rollback restored is not the forward's, and is reported.
         #[cfg(feature = "tensor-assert")]
         if let Some(dev) = Some(model.device().clone()).filter(|d| d.is_cuda()) {
-            if let Err(d) = candle::tensor_assert::discard(&dev) {
+            let restored = |name: &str| name.starts_with("gdn.rollback.");
+            watch_after_failure();
+            if let Err(d) = candle::tensor_assert::discard(&dev, restored) {
                 tracing::warn!(
                     target: "candle_transformers::wave_driver",
                     "tensor_assert: the failed forward's findings could not be discarded: {d}"
@@ -422,6 +427,7 @@ pub(super) fn forward_core<S: WaveSweep + ?Sized>(
             }
             candle::tensor_assert::epoch(&dev)?;
         }
+        forward_done();
     }
 
     Ok(out)

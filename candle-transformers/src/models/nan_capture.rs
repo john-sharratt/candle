@@ -332,10 +332,45 @@ fn first_of_report(ticket: Option<u32>, last: &AtomicU64) -> bool {
     prev == 0 || t <= prev
 }
 
-/// Whether `name` is the site a drain has named. One relaxed load and a compare.
+/// Forwards left in which every attention output is checked synchronously.
+static AFTER_FAILURE: AtomicUsize = AtomicUsize::new(0);
+
+/// Forwards a failed one arms every attention checkpoint for.
+///
+/// A step's segments and the creep's other windows run between the failure and
+/// the retry of the window that failed, so the retry is rarely the next forward.
+const FORWARDS_AFTER_FAILURE: usize = 16;
+
+/// The site prefix of the attention checkpoints (`attention_checkpoint`).
+const ATTENTION_SITES: &str = "q4e.mix.y.";
+
+/// A forward failed and was rolled back: check every attention output
+/// synchronously for the next [`FORWARDS_AFTER_FAILURE`] forwards.
+///
+/// **The retry is where a rollback that missed something shows, and only
+/// there.** On WhiteWorld (2026-11-22 08:49) a creep window gave an expert up
+/// and was rolled back, and its retry's layer-19 attention came out NaN on
+/// three rows from finite inputs — then every later wave was bad downstream of
+/// the state that retry committed, each report re-arming the capture at its own
+/// first site, so no wave ever reached the attention with it armed. A failure
+/// is rare, so the fences this costs are too, and the race behind the failure
+/// has already happened by the time they run.
+pub fn watch_after_failure() {
+    AFTER_FAILURE.store(FORWARDS_AFTER_FAILURE, Ordering::Relaxed);
+}
+
+/// A forward finished: one fewer left in the watch.
+pub fn forward_done() {
+    let _ = AFTER_FAILURE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+}
+
+/// Whether `name` is the site a drain has named, or an attention checkpoint
+/// while a failure's watch lasts. One relaxed load and a compare on the
+/// common path.
 #[inline]
 fn armed_for(name: &'static str) -> bool {
     ARMED_SITE.load(Ordering::Relaxed) == name.as_ptr() as usize
+        || (AFTER_FAILURE.load(Ordering::Relaxed) > 0 && name.starts_with(ATTENTION_SITES))
 }
 
 /// A checkpoint: examine `out` now, and if it is non-finite dump it — with
@@ -576,6 +611,25 @@ mod tests {
     use super::*;
     use crate::models::expert_lre::ExpertFault;
     use candle::Device;
+
+    /// **A failure arms every attention checkpoint, and only those, for its
+    /// watch's forwards.**
+    #[test]
+    fn a_failure_arms_every_attention_checkpoint_for_its_watch() {
+        let attention = candle::tensor_assert::site("q4e.mix.y.L", 19);
+        let other = candle::tensor_assert::site("q4e.post_mix.res.L", 19);
+        assert!(!armed_for(attention), "nothing failed yet");
+        watch_after_failure();
+        assert!(armed_for(attention), "an attention output is checked");
+        assert!(!armed_for(other), "nothing else is");
+        for _ in 0..FORWARDS_AFTER_FAILURE {
+            assert!(armed_for(attention));
+            forward_done();
+        }
+        assert!(!armed_for(attention), "the watch ran out");
+        forward_done();
+        assert!(!armed_for(attention), "and stays out");
+    }
 
     /// **A capture stands down while a watched fault word is claimed**, and
     /// not once it is cleared or its cache is gone.

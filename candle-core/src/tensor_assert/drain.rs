@@ -155,10 +155,23 @@ pub fn report(device: &Device) -> Result<Vec<Finding>> {
 /// next wave instead, those rows were reported as that wave's corruption and
 /// armed captures on it — on WhiteWorld, every non-finite report of a run was a
 /// give-up the engine had already handled.
-pub fn discard(device: &Device) -> Result<()> {
-    let bad: Vec<Finding> = drain(device)?.into_iter().filter(Finding::is_bad).collect();
+///
+/// **Except what the rollback leaves.** A site `survives` names describes state
+/// the failed forward hands on — what its rollback restored — so a bad one is
+/// not discarded with the forward but reported, each on its own line.
+pub fn discard(device: &Device, survives: impl Fn(&str) -> bool) -> Result<()> {
+    let (kept, bad): (Vec<Finding>, Vec<Finding>) = drain(device)?
+        .into_iter()
+        .filter(Finding::is_bad)
+        .partition(|f| survives(&f.name));
     if let Some(line) = discarded_line(&bad) {
         tracing::warn!(target: "candle_core::tensor_assert", "{line}");
+    }
+    for f in &kept {
+        tracing::error!(
+            target: "candle_core::tensor_assert",
+            "tensor_assert: a failed forward left non-finite state behind its rollback: {f}"
+        );
     }
     super::epoch(device)
 }

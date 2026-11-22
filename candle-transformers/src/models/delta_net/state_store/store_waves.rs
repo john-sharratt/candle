@@ -188,6 +188,10 @@ impl RecurrentStateStore {
             }
         }
         self.open = false;
+        // The state a rollback leaves is the state the wave entered with; a bad
+        // one here and a good `gdn.entry` before it is a write the wave made
+        // outside its timelines and scratch.
+        self.assert_state("gdn.rollback.s.L", "gdn.rollback.tail.L");
         Ok(())
     }
 

@@ -9,6 +9,8 @@
 //! otherwise start a span behind its parent.
 
 use super::*;
+#[cfg(feature = "tensor-assert")]
+use candle::tensor_assert::names::site;
 
 impl RecurrentStateStore {
     /// Open a step: several waves that stand or fall together.
@@ -67,6 +69,7 @@ impl RecurrentStateStore {
                 slot.pending = None;
             }
         }
+        self.assert_state("gdn.undo.s.L", "gdn.undo.tail.L");
         Ok(())
     }
 
@@ -193,6 +196,8 @@ impl RecurrentStateStore {
             } else {
                 block.state_end
             };
+            #[cfg(feature = "tensor-assert")]
+            let layer = slot.layer_index;
             let halves = std::iter::once((&mut slot.live, true))
                 .chain(slot.scratch.as_mut().map(|s| (s, false)));
             for (half, carries_state) in halves {
@@ -202,6 +207,18 @@ impl RecurrentStateStore {
                 let Some(dst) = moves.remove(&at.ptr()) else {
                     continue;
                 };
+                // **A moved state is checked on both sides of its copy.** A state
+                // that reads non-finite at the next wave's entry after a clean exit
+                // changed while the store sat idle, and a move is the one thing that
+                // rewrites a live half between waves: the pair says whether it was
+                // bad before it moved or the move made it so.
+                #[cfg(feature = "tensor-assert")]
+                if carries_state {
+                    half.state.s.assert(site("gdn.moving.s.L", layer));
+                    half.state
+                        .conv_tail
+                        .assert(site("gdn.moving.tail.L", layer));
+                }
                 if carries_state {
                     // SAFETY: both ranges are state-arena slots of at least `copy`
                     // bytes — the source held by this store, the destination claimed
@@ -211,6 +228,11 @@ impl RecurrentStateStore {
                         .map_err(|e| Error::Msg(format!("relocating recurrent state: {e}")))?;
                 }
                 *half = Half::in_slot(&self.dims, &self.device, Arc::new(dst))?;
+                #[cfg(feature = "tensor-assert")]
+                if carries_state {
+                    half.state.s.assert(site("gdn.moved.s.L", layer));
+                    half.state.conv_tail.assert(site("gdn.moved.tail.L", layer));
+                }
                 moved += 1;
             }
         }
