@@ -1,6 +1,6 @@
-# The §9.12 dependency battery — production, 2026-11-23 (l) and (m): the probe's reach and reprojection in thinking
+# The §9.12 dependency battery — production, 2026-11-23 (l), (m) and (n): the probe's reach and reprojection in thinking
 
-Two runs on BlackWorld, by the method of (j): each question in a fresh private chat, one at a
+Three runs on BlackWorld, by the method of (j): each question in a fresh private chat, one at a
 time, with the prefix "Answer from your memory of the repository only — do not call any tool, do
 not read or search any file. If you do not remember, say so.", scored by `score.rs`'s
 case-insensitive substring rules.
@@ -11,15 +11,23 @@ case-insensitive substring rules.
   `reproject_probe_tokens: 128` and `reproject_in_thinking: false` in BlackWorld's
   `motherd-local.yaml`. The think block decodes on the projection it opened on, and the committed
   `</think>` reprojects once.
+- **(n)** on (m)'s build, restarted through keep with `reproject_in_thinking: true` and the probe
+  still at 128, one minute after the load's normalization replay drained: the probe's reach
+  alone changed against (l).
 
 ## Results
 
-| Category | (l) recall | (l) full | (m) recall | (m) full |
-|---|---:|---:|---:|---:|
-| Direct | 25.0% | 0 of 8 | 20.8% | 0 of 8 |
-| Transitive | 56.3% | 2 of 8 | 51.0% | 1 of 8 |
-| Architectural | 66.7% | 5 of 8 | 47.9% | 3 of 8 |
-| **All 24** | **49.3%** | **7** | **39.9%** | **4** |
+| Category | (l) 256, in thinking | (m) 128, held | (n) 128, in thinking |
+|---|---:|---:|---:|
+| Direct | 25.0%, 0 full | 20.8%, 0 | 26.0%, 0 |
+| Transitive | 56.3%, 2 full | 51.0%, 1 | 64.6%, 2 |
+| Architectural | 66.7%, 5 full | 47.9%, 3 | 70.8%, 5 |
+| **All 24** | **49.3%, 7** | **39.9%, 4** | **53.8%, 7** |
+
+(n) by question: d1 1/2, d2 0/2, d3 1/2, d4 1/6, d5 1/4, d6 0/2, d7 2/3, d8 0/2; t1 3/4,
+t2 2/4, t3 3/4, t4 2/4, t5 2/3, t6 0/4, t7 3/3, t8 3/3; a1 3/3, a2 2/2, a3 1/3, a4 0/2, a5 2/2,
+a6 2/2, a7 1/3, a8 2/2. t7 reached full marks for the first time (`glue_islands`, the content
+hash, `GLUE_ISLAND_RETAIN_GENERATIONS = 4`), and t8 named `elevate.rs`.
 
 | Id | (l) | (m) | (m)'s answer |
 |---|---:|---:|---|
@@ -56,6 +64,10 @@ case-insensitive substring rules.
 - **Gains and losses cross.** t1 rose 1 → 3 and t5 1 → 2, while t6 fell 4 → 0 and a2 2 → 0.
   That is the per-question selection noise (j) and (k) recorded, where identical configurations
   moved categories by ±25 points.
-- **The overall spread is the question.** The five runs before these, (h) to (l), span 46.9% to
-  57.6%. (m)'s 39.9% is below that range, but one run per arm cannot separate the setting from
-  the noise. Both settings changed at once, so a real drop is not attributed to either.
+- **The overall spread is the question.** The other six runs, (h) to (l) and (n), span 46.9% to
+  57.6%. (m)'s 39.9% is the only run below that range.
+- **(n) separates the two settings.** With the probe at 128 and the think block reprojecting,
+  the battery scored 53.8% with seven full marks, level with or above (l) at 256. The 128-token
+  probe costs nothing measurable here, and (m)'s drop goes with holding the think block on its
+  opening projection. It is one run per arm, so the hold's cost is a strong indication, not a
+  measured figure.
