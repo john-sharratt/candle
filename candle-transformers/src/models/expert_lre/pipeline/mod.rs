@@ -34,6 +34,7 @@ use super::regret::{eviction_costs, just_ahead, prediction_band, RegretLedger, V
 use super::residency::{Fallback, Residency};
 use super::routing_trace::RoutingTrace;
 use super::slot_image::{build_slot_view, slot_offsets};
+use super::stack_distance::{marginal_window, MarginalSlots};
 use super::stager::StagerMsg;
 use super::transition::{TransitionMatrix, HOPS};
 use super::types::{PipelineMessage, PipelineStats, RoutedLayer};
@@ -172,6 +173,9 @@ pub(crate) struct PipelineState {
     /// Every routed invocation served, for the residency references
     /// (`ExpertCache::hit_references`).
     trace: Arc<Mutex<RoutingTrace>>,
+    /// The misses a zone a window larger would have served
+    /// (`stack_distance`), over the evictable rows' experts.
+    marginal: MarginalSlots,
     /// The router look-ahead's votes (`votes`), and per row and hop the latest
     /// prediction made for it, which the row's routing judges.
     votes: Arc<VoteRing>,
@@ -272,6 +276,7 @@ impl PipelineState {
             predicted: vec![Vec::new(); num_moe_layers],
             landed_ahead,
             trace,
+            marginal: MarginalSlots::new(num_moe_layers * experts),
             votes,
             pending: vec![Default::default(); num_moe_layers],
             link_time: LinkTime::new(all_resident),

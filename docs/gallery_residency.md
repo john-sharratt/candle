@@ -17,8 +17,20 @@ the schema already says who can read what:
   `world`), and every turn a section collection gathers (zend's
   `tools` calibration turns; npcd's `response` and `mood` votes, which are
   drawn from every character's turns). Any conversation's next projection may
-  scan them, so they are preloaded at start and stay until the keep trade
-  gives them up.
+  scan them, so on a card of 64 GiB or more they are preloaded at start and
+  stay until the keep trade gives them up. On a smaller card they are not
+  preloaded (`gallery_arena::eviction::preloads_on`): there the expert zone
+  does not hold the model, every gallery byte is one the experts stream
+  without, and the scans upload the turns they actually read. On WhiteWorld's
+  24 GB card (2026-11-22) the preload put 7.2 GiB of turns beside a ~900-slot
+  expert zone.
+
+  **The keep trade** prices that ground from the weight side's measured
+  marginal value — the misses a zone a window of slots larger would have
+  served, by LRU stack distance on the routing, times the stall a miss costs
+  (`gallery_arena::keep_price`) — and never sets a keep time under a minute
+  (`eviction::MIN_KEEP`), so a working set scanned every few seconds is never
+  shed only to be uploaded again at its next scan.
 - **Conversation turns** — read only by their own conversation. A belief scan
   masked to its target's own timeline (the target's own group, or every group
   of an append-only target) reads nothing else. zend's `dialogue` layer is the

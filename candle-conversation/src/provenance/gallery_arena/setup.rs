@@ -14,15 +14,22 @@ impl GalleryArena {
     /// (`wpt` words per token, `n_groups` layer-groups). For the production fold
     /// that is `wpt = 24`, `n_groups = 3`.
     pub fn new(device: &Device, wpt: usize, n_groups: usize) -> Result<Self> {
+        let Device::Cuda(cuda) = device else {
+            candle::bail!("gallery arena requires a CUDA device");
+        };
+        let (_, total) = cuda.mem_get_info()?;
+        Self::sized_for(device, wpt, n_groups, total as u64)
+    }
+
+    /// [`Self::new`] on a card of `total` bytes: the share its scan indices
+    /// may hold ([`index_cache_budget`]) and whether a preload fills it
+    /// ([`preloads_on`]) are both that card's.
+    pub fn sized_for(device: &Device, wpt: usize, n_groups: usize, total: u64) -> Result<Self> {
         assert!(wpt > 0 && n_groups > 0 && wpt.is_multiple_of(n_groups));
         if !matches!(device, Device::Cuda(_)) {
             candle::bail!("gallery arena requires a CUDA device");
         }
         assert!(n_groups <= GroupSet::MAX, "{n_groups} fold groups");
-        let Device::Cuda(cuda) = device else {
-            candle::bail!("gallery arena requires a CUDA device");
-        };
-        let (_, total) = cuda.mem_get_info()?;
         Ok(Self {
             residency: Mutex::new(HashMap::new()),
             lru_clock: AtomicU64::new(0),
@@ -37,12 +44,20 @@ impl GalleryArena {
             zero_page: Mutex::new(None),
             dedup: Dedup::new(wpt),
             tensor_caps: OnceLock::new(),
-            index_cache_bytes: index_cache_budget(total as u64),
+            index_cache_bytes: index_cache_budget(total),
+            preloads: preloads_on(total),
             device: device.clone(),
             wpt,
             n_groups,
             gw: wpt / n_groups,
         })
+    }
+
+    /// Whether a startup preload fills this arena — only on a card of
+    /// [`eviction::PRELOAD_MIN_CARD`] or more ([`eviction::preloads_on`]).
+    #[inline]
+    pub fn preloads(&self) -> bool {
+        self.preloads
     }
 
     /// Words a token holds per fold group.

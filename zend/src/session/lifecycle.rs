@@ -306,6 +306,7 @@ impl ZendSession {
                             turns = preload.turns,
                             resident = preload.resident,
                             tokens = preload.tokens,
+                            skipped = preload.skipped,
                             ms = t_preload.elapsed().as_millis() as u64,
                             "projection galleries preloaded"
                         );

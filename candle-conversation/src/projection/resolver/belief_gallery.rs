@@ -23,6 +23,9 @@ pub struct GalleryPreload {
     /// Turns resident on the arena, and their signature tokens.
     pub resident: usize,
     pub tokens: usize,
+    /// The card is too small to preload on ([`GalleryArena::preloads`]):
+    /// nothing was walked, and the scans upload what they read.
+    pub skipped: bool,
 }
 
 /// Which gallery an assembly is for: the collection's name, its scope tags, and
@@ -159,11 +162,21 @@ impl Conversation {
     /// A failed upload is logged and skipped — the scan uploads what it does
     /// not find, so a preload that stops short costs that projection the
     /// difference and nothing else.
+    ///
+    /// **Not on a card under 64 GiB** (`gallery_arena::eviction::preloads_on`):
+    /// there the turns it would load hold ground the expert zone streams
+    /// without, and the first projections upload what they read instead.
     pub fn preload_galleries(
         &self,
         schema: &Schema,
         arena: Option<&GalleryArena>,
     ) -> GalleryPreload {
+        if arena.is_some_and(|a| !a.preloads()) {
+            return GalleryPreload {
+                skipped: true,
+                ..GalleryPreload::default()
+            };
+        }
         // Each turn with the fold groups its scans weigh — a file's content by
         // its group's `layer_weights`, its calibrations by the
         // `calibration_layer_weights`, a collection's gallery by the

@@ -130,6 +130,7 @@
 //! | `blend`        | one prediction list from votes, Markov and recency, ranked by learned cells |
 //! | `fault`        | the word a launch reports a lost cold expert in, and the forward's error |
 //! | `belady`, `routing_trace`, `replay` | the residency references and the offline policy replay |
+//! | `stack_distance` | the misses a few more slots would catch — the weight side of the gallery's keep trade |
 //! | `cpu_pool`     | the host CPU's pool for routed experts (`docs/cpu_expert_compute.md`) |
 //! | [`handle`]     | `ExpertCache` public API |
 
@@ -234,6 +235,9 @@ pub mod slot_integrity;
 /// The slot-tenancy tags bucketize's owner check reads.
 #[cfg(feature = "tensor-assert")]
 mod slot_owners;
+/// LRU stack distances over the routing: the misses a few more slots catch.
+#[cfg(feature = "cuda")]
+mod stack_distance;
 #[cfg(feature = "cuda")]
 mod stager;
 /// Which invocation of each row the device has begun — the reclaim key.

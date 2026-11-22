@@ -224,6 +224,7 @@ use crate::projection::{
     CollectionWarm, DecodePriority, GalleryPreload, GroupId, GroupVotes, LayerId, Schema,
     SelectionRule, SubstrateRef, LINEAGE_BASE,
 };
+use crate::provenance::gallery_arena::keep_price::KeepPrice;
 use crate::provenance::gallery_arena::{BeliefArena, GroupSet, HeldScan, Keep, ScanReply};
 use crate::provenance::{
     encode_wide_sigs_with, extract_q_vector_r16, fold_fits, fold_provenance_fitted, FoldParams,
@@ -810,11 +811,10 @@ pub(crate) struct Scheduler {
     /// drain). See [`projection_assembler::apply_segments`].
     batch_drain_gap_fills: bool,
     deferred_glue_fires: Vec<projection_assembler::GapFillPlan>,
-    /// The expert cache's miss count when last read, and its rate since,
+    /// The expert cache's tallies when last read, and their rates since,
     /// averaged — the weight side's half of the gallery's keep time
     /// (`update_gallery_keep`).
-    gallery_misses_seen: Option<(Instant, usize)>,
-    gallery_miss_rate: f64,
+    gallery_price: KeepPrice,
     /// When the gallery keep trade's inputs were last logged (`update_gallery_keep`).
     gallery_logged_at: Option<Instant>,
     /// When the gallery last gave up the turns past its keep time.

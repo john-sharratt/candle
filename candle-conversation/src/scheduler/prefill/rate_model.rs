@@ -11,6 +11,8 @@
 //! step cost more than the steps it measured.
 
 use super::*;
+use crate::provenance::gallery_arena::eviction::keep_within;
+use crate::provenance::gallery_arena::keep_price::WeightTallies;
 
 /// How often the learned rates are logged — and, with no reader registered
 /// (`phase_ring::rates_read_every`), how often they are priced at all.
@@ -50,38 +52,37 @@ impl Scheduler {
     /// scan uses it more often than its re-upload costs, per byte, over what
     /// the same ground would save the weights per byte per second.
     ///
-    /// **The weights' side is the miss stall one more slot would spare.** A
-    /// routed expert not resident streams its image over the link — served from
-    /// pinned memory, so a miss need not evict anything, and a zone held small
-    /// and saturated can stall on every layer with its evictions near zero. So
-    /// the measure is the misses, not the evictions: one more slot keeps one
-    /// more of the experts not resident, and with routing spread over them it is
-    /// `1 / (experts − resident slots)` of the misses that then hit, each
-    /// sparing an image's link time, `slot bytes / link rate`. Per byte of the
-    /// slot, the slot's size cancels:
+    /// **The weights' side is the miss stall one more slot would spare**
+    /// (`provenance::gallery_arena::keep_price`): the routed experts a zone a
+    /// window larger would have served, measured on the routing by LRU stack
+    /// distance, over the window, times the stall a miss costs as the expert
+    /// pipeline prices it — per byte of the slot. A miss is the measure, not an
+    /// eviction: a routed expert not resident streams from pinned memory, so a
+    /// zone held small and saturated can stall on every layer with its
+    /// evictions near zero.
     ///
-    /// ```text
-    /// misses/s × 1e6 / (link bytes/s × (experts − resident slots))   µs/s per byte
-    /// ```
-    ///
-    /// No misses, no pressure: the gallery keeps what it holds.
+    /// No miss one more slot would spare, no pressure: the gallery keeps what
+    /// it holds.
     pub(in super::super) fn update_gallery_keep(&mut self) {
-        /// Time constant of the miss rate's average, in seconds.
-        const RATE_TAU_SECS: f64 = 10.0;
         let Some(arena) = self.gallery_arena.clone() else {
             return;
         };
-        let Some((misses, link, total, slots)) = self.model.expert_stats_shared().and_then(|s| {
-            s.lock().ok().map(|s| {
-                let slots = s.zone_bytes.checked_div(s.expert_slot_bytes).unwrap_or(0);
-                (
-                    s.expert_misses,
-                    s.link_bytes_per_sec,
-                    s.total_experts,
-                    slots,
-                )
+        let Some((tallies, link, window, slot_bytes)) =
+            self.model.expert_stats_shared().and_then(|s| {
+                s.lock().ok().map(|s| {
+                    (
+                        WeightTallies {
+                            misses: s.expert_misses,
+                            marginal_hits: s.marginal_hits,
+                            stall_us: s.miss_stall_us,
+                        },
+                        s.link_bytes_per_sec,
+                        s.marginal_window,
+                        s.expert_slot_bytes,
+                    )
+                })
             })
-        }) else {
+        else {
             return;
         };
         // **The link the scheduler measured, where the pipeline measured none.**
@@ -99,27 +100,10 @@ impl Scheduler {
                 .map_or(0.0, |r| r.link_bytes_per_s())
         };
         let now = Instant::now();
-        if let Some((then, seen)) = self.gallery_misses_seen {
-            let secs = now.duration_since(then).as_secs_f64();
-            if secs > 0.0 {
-                // The tally restarts each interval: a count below the last one
-                // read is all new.
-                let new = if misses >= seen {
-                    misses - seen
-                } else {
-                    misses
-                };
-                let w = 1.0 - (-secs / RATE_TAU_SECS).exp();
-                self.gallery_miss_rate += w * (new as f64 / secs - self.gallery_miss_rate);
-            }
-        }
-        self.gallery_misses_seen = Some((now, misses));
-        let not_resident = total.saturating_sub(slots);
-        let weight_us_per_byte_sec = if link > 0.0 && not_resident > 0 {
-            self.gallery_miss_rate * 1e6 / (link * not_resident as f64)
-        } else {
-            0.0
-        };
+        self.gallery_price.observe(now, tallies);
+        let weight_us_per_byte_sec = self
+            .gallery_price
+            .weight_us_per_byte_sec(window, slot_bytes);
         // The rebuild a scan waits for, as timed on the scans that rebuilt;
         // before one has, its least part — the copy over the link — so a cold
         // gallery is priced rather than kept whole.
@@ -128,8 +112,7 @@ impl Scheduler {
             _ if link > 0.0 => 1e6 / link,
             _ => 0.0,
         };
-        let keep =
-            crate::provenance::gallery_arena::eviction::keep_within(upload, weight_us_per_byte_sec);
+        let keep = keep_within(upload, weight_us_per_byte_sec);
         arena.set_keep_within(keep);
         // The trade's inputs, once a minute: a gallery that never gives a turn
         // up is either priced to keep everything or scanned within its keep
@@ -144,9 +127,11 @@ impl Scheduler {
             let (turns, pinned) = arena.residency_counts();
             tracing::info!(
                 target: "candle_conversation::provenance",
-                miss_per_s = format!("{:.0}", self.gallery_miss_rate),
+                miss_per_s = format!("{:.0}", self.gallery_price.misses_per_s),
+                marginal_per_s = format!("{:.1}", self.gallery_price.marginal_per_s),
+                window,
+                stall_us_per_miss = format!("{:.0}", self.gallery_price.stall_us_per_miss()),
                 link_gb_s = format!("{:.2}", link / 1e9),
-                not_resident,
                 upload_ns_per_kib = (upload * 1024.0 * 1000.0) as u64,
                 keep_ms = keep.map(|k| k.as_millis() as u64),
                 turns,

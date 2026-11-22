@@ -45,6 +45,18 @@ pub struct PipelineStats {
     /// samples. Filled when the stats are read, not by the pipeline thread.
     pub cold_wait_ns: u64,
     pub cold_waits: usize,
+    /// The stall the misses cost, µs, as the pipeline thread prices them: a
+    /// pinned miss its image's copy over the link, a cold one the measured mean
+    /// pack read, one the CPU pool served nothing (`read_ahead_gate::link_us`).
+    /// Over `expert_misses`, what a miss costs.
+    pub miss_stall_us: f64,
+    /// Of the routed experts, those a zone [`Self::marginal_window`] slots
+    /// larger would have served under LRU (`stack_distance`) — over the
+    /// window, the misses one more slot spares.
+    pub marginal_hits: usize,
+    /// **Gauge**: the slots past the zone's evictable capacity that
+    /// `marginal_hits` is counted over.
+    pub marginal_window: usize,
     /// Experts evicted from VRAM. A retarget, not a copy — every expert has a
     /// copy in the pack, and usually one in pinned memory.
     pub evictions: usize,
@@ -309,6 +321,8 @@ impl PipelineStats {
             s.worker_cpu = 0;
             s.cold_wait_ns = 0;
             s.cold_waits = 0;
+            s.miss_stall_us = 0.0;
+            s.marginal_hits = 0;
             s.evictions = 0;
             s.worker_promotions = 0;
             s.staged_cold = 0;

@@ -262,6 +262,33 @@ impl PipelineState {
                 }
             }
         }
+        // ── What one more slot would have spared, and what the misses cost ──
+        // The permanently resident rows are always hits and hold no evictable
+        // slot, so they are neither counted nor tracked. A zone holding every
+        // routed expert counts nothing here — each distance is under its
+        // capacity — so the gallery beside it keeps what it holds.
+        let capacity = self
+            .inner
+            .zone
+            .capacity()
+            .saturating_sub(self.inner.pinned_slots());
+        let mut marginal = 0usize;
+        if row >= self.inner.pinned_layers {
+            let base = row * self.inner.experts_per_layer;
+            for &e in &expert_ids {
+                marginal += usize::from(self.marginal.caught(base + e, capacity));
+            }
+        }
+        let cold_secs = self
+            .pack_read_secs
+            .unwrap_or(self.image_bytes as f64 / self.link_rate.max(1.0));
+        let stall_us = link_us(
+            misses.saturating_sub(cold + cpu),
+            cold,
+            self.image_bytes,
+            self.link_rate,
+            cold_secs,
+        );
         if let Ok(mut s) = self.stats.lock() {
             s.routed_messages += 1;
             s.pipeline_lag += lag;
@@ -272,6 +299,9 @@ impl PipelineState {
             s.worker_pinned += pinned;
             s.worker_cold += cold;
             s.worker_cpu += cpu;
+            s.miss_stall_us += stall_us;
+            s.marginal_hits += marginal;
+            s.marginal_window = marginal_window(capacity);
         }
         // ── Whether reading ahead pays (`read_ahead_gate`), judged on decode
         // invocations — the width the look-ahead runs at. The misses bucketize
@@ -282,9 +312,6 @@ impl PipelineState {
         if !msg.prefill_width {
             let copies =
                 misses.saturating_sub(cold + cpu) + std::mem::take(&mut self.ahead_uncounted);
-            let cold_secs = self
-                .pack_read_secs
-                .unwrap_or(self.image_bytes as f64 / self.link_rate.max(1.0));
             let us = link_us(copies, cold, self.image_bytes, self.link_rate, cold_secs);
             // Decided at the pass's end (`decide_read_ahead`), not here.
             self.link_time.observe(us);

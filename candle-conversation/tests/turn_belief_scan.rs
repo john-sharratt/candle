@@ -191,8 +191,31 @@ fn a_preload_without_an_arena_walks_the_scanned_turns() {
             turns: 3,
             resident: 0,
             tokens: 0,
+            skipped: false,
         }
     );
+}
+
+/// **A card under 64 GiB preloads nothing**: the 24 GB card's arena is left
+/// empty, so the expert zone keeps the ground, and the first scan uploads
+/// what it reads. Skips without CUDA.
+#[test]
+fn a_card_under_64_gib_preloads_nothing() {
+    let device = match candle::Device::new_cuda(0) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let (conv, builder) = preload_fixture(dir.path());
+    let arena = GalleryArena::sized_for(&device, 24, 3, 24 << 30).unwrap();
+    assert_eq!(
+        conv.preload_galleries(builder.schema(), Some(&arena)),
+        GalleryPreload {
+            skipped: true,
+            ..GalleryPreload::default()
+        }
+    );
+    assert_eq!(arena.resident_turns(), 0);
 }
 
 /// **A preloaded gallery is the one the first scan reads.** Every turn the
@@ -229,13 +252,15 @@ fn the_first_scan_after_a_preload_uploads_nothing_and_scores_the_same() {
             .collect::<Vec<u32>>()
     };
 
-    let preloaded = GalleryArena::new(&device, 24, 3).unwrap();
+    // On the 72 GB card, whatever card runs the test: the preload's own.
+    let preloaded = GalleryArena::sized_for(&device, 24, 3, 72 << 30).unwrap();
     assert_eq!(
         conv.preload_galleries(builder.schema(), Some(&preloaded)),
         GalleryPreload {
             turns: 3,
             resident: 3,
             tokens: 3,
+            skipped: false,
         }
     );
     assert_eq!(preloaded.resident_turns(), 3);

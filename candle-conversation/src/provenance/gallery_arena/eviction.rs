@@ -12,9 +12,9 @@
 //! its upload — `bytes × upload cost per byte` — and a turn scanned every `T`
 //! saves `upload cost per byte / T` per byte per second. The same ground under
 //! the weights saves the expert stalls it would avoid: the weight side's
-//! marginal value per byte per second: the miss stall one more slot spares,
-//! measured from the expert cache's misses and the link's rate
-//! (`Scheduler::update_gallery_keep`).
+//! marginal value per byte per second, the miss stall one more slot spares —
+//! the misses a slightly larger zone would have served, measured on the
+//! routing, times what a miss stalls ([`super::keep_price`]).
 //! So a turn earns its ground while it is scanned more often than
 //!
 //! ```text
@@ -23,8 +23,9 @@
 //!
 //! and gives it up once the longer of its scan interval and its idle time
 //! passes `T*` — [`past_keep`]. With no weight pressure `T*` is unbounded and
-//! everything stays; under a reader workload whose experts stream, it falls to
-//! the seconds a working set's scans actually come at.
+//! everything stays; under a reader workload whose experts stream, it falls
+//! toward the seconds a working set's scans come at, but never under
+//! [`MIN_KEEP`], so a working set is never shed for its next scan to upload.
 //!
 //! # Why not a byte ceiling with a recency exemption
 //!
@@ -78,18 +79,32 @@ pub fn past_keep(turns: &[Resident], keep_within: Option<Duration>) -> Vec<usize
     out
 }
 
+/// The shortest keep time the trade sets, however hard the weights press.
+///
+/// **The guard against churn.** A turn scanned within it is a working set — a
+/// reprojection comes every few seconds, and the cached scan index over it is
+/// itself kept a minute idle (`INDEX_IDLE_MS`) — and giving it up only makes
+/// its next scan upload it again and rebuild that index. Without the floor,
+/// a weight side priced from rates averaged over ten seconds could set `T*`
+/// under a working set's scan interval on a burst of misses, shed the set,
+/// and re-upload it at the next scan, again and again. Above it the trade
+/// decides alone; a turn no scan has used for a minute is no working set.
+pub const MIN_KEEP: Duration = Duration::from_secs(60);
+
 /// `T*`: how often a turn must be scanned to earn its ground — the upload cost
 /// per byte over the weight side's marginal value per byte per second, both in
-/// microseconds. `None` when the weights lose nothing to the ground (no miss
-/// measured), and the gallery keeps what it holds. So too when they lose so
-/// little that `T*` is past what a `Duration` holds: a vanishing marginal value
-/// divided up to overflow, and panicked the scheduler thread with it
-/// (BlackWorld, 2026-10-31).
+/// microseconds, never under [`MIN_KEEP`]. `None` when the weights lose
+/// nothing to the ground (no miss one more slot would spare), and the gallery
+/// keeps what it holds. So too when they lose so little that `T*` is past what
+/// a `Duration` holds: a vanishing marginal value divided up to overflow, and
+/// panicked the scheduler thread with it (BlackWorld, 2026-10-31).
 pub fn keep_within(upload_us_per_byte: f64, weight_us_per_byte_sec: f64) -> Option<Duration> {
     if !(weight_us_per_byte_sec > 0.0 && upload_us_per_byte > 0.0) {
         return None;
     }
-    Duration::try_from_secs_f64(upload_us_per_byte / weight_us_per_byte_sec).ok()
+    Duration::try_from_secs_f64(upload_us_per_byte / weight_us_per_byte_sec)
+        .ok()
+        .map(|t| t.max(MIN_KEEP))
 }
 
 /// Which cached scan indices go before one of `incoming` bytes joins them:
@@ -149,11 +164,42 @@ pub fn index_cache_budget(total: u64) -> u64 {
     (total / INDEX_CACHE_SHARE).max(INDEX_CACHE_FLOOR)
 }
 
+/// The smallest card the startup preload fills the gallery on: 64 GiB.
+pub const PRELOAD_MIN_CARD: u64 = 64 << 30;
+
+/// Whether a card of `total` bytes preloads the gallery at start.
+///
+/// **A preload spends the ground the weights need on a smaller card.** It puts
+/// every shared turn on the card before the first projection, so that
+/// projection uploads nothing — but most of those turns are read by no scan
+/// for a long while, and on a card the model's experts do not fit, every byte
+/// of them is a byte the expert zone streams instead. On WhiteWorld's 24 GB
+/// card (2026-11-22) zend's preload left 217,500 turns, 7.2 GiB, beside an
+/// expert zone of ~900 slots hitting 12–45%; the keep trade gives such turns
+/// back, but only after its keep time, while the first projection's uploads
+/// cost it seconds once. Below this size the scans upload what they read; on
+/// the 72 GB card the experts and the gallery both fit.
+pub fn preloads_on(total: u64) -> bool {
+    total >= PRELOAD_MIN_CARD
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const MIB: u64 = 1024 * 1024;
+
+    /// **The preload runs on the 72 GB card only** — each development card at
+    /// the total it reports.
+    #[test]
+    fn only_a_card_of_64_gib_or_more_preloads() {
+        let gib = 1024 * MIB;
+        assert!(preloads_on(72 * gib), "RTX PRO 5000");
+        assert!(preloads_on(64 * gib));
+        assert!(!preloads_on(64 * gib - 1));
+        assert!(!preloads_on(24 * gib), "RTX 3090");
+        assert!(!preloads_on(16 * gib), "RTX 4090 Mobile");
+    }
 
     /// **An idle index goes, however small**: one used within the limit
     /// stays, one used exactly at it too, and a cache under its cap loses
@@ -247,7 +293,45 @@ mod tests {
     #[test]
     fn the_threshold_is_the_upload_over_the_weights_value() {
         assert_eq!(keep_within(1e-4, 0.0), None, "no weight pressure, no limit");
-        assert_eq!(keep_within(1e-4, 1e-5), Some(Duration::from_secs(10)));
+        assert_eq!(keep_within(1e-3, 1e-5), Some(Duration::from_secs(100)));
+    }
+
+    /// **However hard the weights press, a turn scanned within a minute
+    /// stays** — the churn guard: a working set is never shed only for its
+    /// next scan to upload it again.
+    #[test]
+    fn the_threshold_never_falls_under_a_minute() {
+        assert_eq!(keep_within(1e-4, 1e-5), Some(MIN_KEEP), "10 s, floored");
+        assert_eq!(keep_within(1e-4, 1.0), Some(MIN_KEEP));
+        let turns = [turn(0, 2, Some(45), false), turn(1, 59, Some(5), false)];
+        assert!(past_keep(&turns, keep_within(1e-4, 1.0)).is_empty());
+    }
+
+    /// **The trade as WhiteWorld measured it (2026-11-22)**, priced both ways.
+    /// The gallery's uploads cost 3,386 ns a KiB; 263 misses a second over a
+    /// 12.74 GB/s link. Spread evenly over the 23,551 experts not resident,
+    /// one more slot was worth a link copy of a 23,551th of them, and `T*`
+    /// came to over an hour — the preload's 7.2 GiB never moved. Measured at
+    /// the zone's edge — a 112-slot window catching 40 misses a second, each
+    /// stalling 2 ms on the link and the drive — a 3.4 MB slot is worth
+    /// 0.71 ms a second, and a turn not scanned for ~16 s is worth less than
+    /// that ground: floored, a minute.
+    #[test]
+    fn whiteworlds_trade_sheds_what_no_scan_reads() {
+        let upload = 3386.0 / 1024.0 / 1000.0; // µs per byte
+        let link = 12.74e9;
+        let uniform = 263.0 * 1e6 / (link * 23_551.0);
+        let old = keep_within(upload, uniform).unwrap();
+        assert!(old > Duration::from_secs(3_700), "{old:?}");
+        let measured = 40.0 / 112.0 * 2_000.0 / 3.4e6;
+        let new = keep_within(upload, measured).unwrap();
+        assert_eq!(new, MIN_KEEP, "{:?} unfloored", upload / measured);
+        // The preload's turns no scan has read go; a working set stays.
+        let turns = [
+            turn(0, 70, None, false),   // preloaded, never scanned
+            turn(1, 3, Some(5), false), // the working set
+        ];
+        assert_eq!(past_keep(&turns, Some(new)), vec![0]);
     }
 
     /// A marginal value too small to divide by is no limit, not a panic.

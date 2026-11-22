@@ -12,6 +12,7 @@
 //! - `accounting`: the bytes the gallery holds and can give back.
 //! - `compaction`: packing pages toward the low end of the span.
 //! - `evict`: giving up turns by recency and keep time.
+//! - `eviction`, `keep_price`: the keep trade's rule, and its weight side's price.
 //! - `held`: who holds a turn, and which tokens and groups it holds.
 //! - `index_cache`: reusing a scan's index while its turns are unchanged.
 //! - `reports`: the footprint, miss and address views.
@@ -28,6 +29,7 @@ mod groups;
 mod held_scan;
 mod holder;
 mod index_entries;
+pub(crate) mod keep_price;
 mod lease;
 mod page_io;
 mod pages;
@@ -68,7 +70,7 @@ use candle_nn::kv_cache::{
 use crate::persistence::streams::StreamId;
 
 use dedup::Dedup;
-use eviction::{index_cache_budget, index_cache_evictions, past_keep, Resident};
+use eviction::{index_cache_budget, index_cache_evictions, past_keep, preloads_on, Resident};
 use lease::IndexLease;
 
 /// How long a cached scan index stays once no scan stores or reuses it — a
@@ -108,6 +110,9 @@ pub struct GalleryArena {
     /// Device bytes the cached indices may hold together
     /// ([`index_cache_budget`] of this arena's card).
     index_cache_bytes: u64,
+    /// Whether this arena's card is large enough for the startup preload
+    /// ([`eviction::preloads_on`]).
+    preloads: bool,
     /// Per-scan indices (page_ptr / page entries / seg prefixes) keyed by segment
     /// fingerprint, reused when the same segment set is rescanned and every turn
     /// it references still holds the run it was built against — skipping the
