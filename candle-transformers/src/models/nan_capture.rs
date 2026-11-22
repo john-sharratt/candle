@@ -634,11 +634,23 @@ mod tests {
     fn a_report_opens_where_the_tickets_restart() {
         let last = AtomicU64::new(0);
         assert!(first_of_report(None, &last), "nothing before it");
-        assert!(first_of_report(Some(4), &last), "the first ticketed finding");
+        assert!(
+            first_of_report(Some(4), &last),
+            "the first ticketed finding"
+        );
         assert!(!first_of_report(Some(9), &last), "later in the same report");
-        assert!(!first_of_report(None, &last), "the unticketed tail of a report");
-        assert!(first_of_report(Some(2), &last), "the tickets restarted: a new report");
-        assert!(first_of_report(Some(2), &last), "the same ticket again: a new report");
+        assert!(
+            !first_of_report(None, &last),
+            "the unticketed tail of a report"
+        );
+        assert!(
+            first_of_report(Some(2), &last),
+            "the tickets restarted: a new report"
+        );
+        assert!(
+            first_of_report(Some(2), &last),
+            "the same ticket again: a new report"
+        );
         assert!(!first_of_report(Some(3), &last));
     }
 }
