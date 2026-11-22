@@ -437,11 +437,22 @@ path do the freeing — is wrong twice over, and the shape of the flag is why.
 `evict_when_cold` is a statement about a residence's *kind*: this KV belongs to a
 transient timeline (a `code_read` fork, a calibration exemplar) whose cold copy
 is disposable, so drop it the moment cold lands. Idleness is not that; a dormant
-conversation's KV is as durable as any other. And the flag is **latched** —
-every write in the tree is `= true` and nothing ever clears it — so one quiet
-minute would permanently condemn ordinary KV to be dropped rather than persisted.
+conversation's KV is as durable as any other. And the flag is **set by kind and
+cleared only by a recall**, so latching it on a quiet residence would condemn
+ordinary KV to be dropped rather than kept until something retrieved it.
 Dropping `hot` directly says exactly what is meant, is undone by the next
 `elevate_to_hot`, and leaves the flag to mean the one thing it means.
+
+**A recall clears the flag** (`Substrate::install_promoted`). The flag's premise
+is "not attended again until retrieval", and a projection lifting the residence
+is that retrieval. Left set, it shed the recall's hot *and* warm copies on the
+first pass after the residence left the working set, ignoring the idle grace
+and the RAM budget, so a projection that re-selected the same `code_read` turn
+one boundary later read it off the log again. Measured on BlackWorld on
+2026-11-22: 15–36 turns and 120–236 MiB recalled cold at every 64-token
+boundary of one thinking block, which was 75–180 ms of each rebuild. Cleared, a
+recall keeps hot through the grace, takes its warm copy from the migrate, and
+leaves RAM only through the warm budget's LRU purge.
 
 **The clock is one scan**, ticked by `Substrate::demote_idle_hot`, which the
 scheduler calls each gap between forwards (`Scheduler::demote_idle_hot`,

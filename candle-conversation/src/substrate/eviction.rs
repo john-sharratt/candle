@@ -216,6 +216,18 @@ impl Substrate {
     /// tombstoned while its copy was being built takes nothing. Empty payloads
     /// are skipped: a phase that produced nothing usable leaves the residence
     /// as it was. Returns how many were installed.
+    ///
+    /// **A promotion ends a residence's offload.** `EVICT_WHEN_COLD` says the
+    /// KV is not attended again until retrieval pulls it back, and a promotion
+    /// is that retrieval. Left set, the flag sheds the recall's hot *and* warm
+    /// copies the first pass after it leaves the working set — no idle grace,
+    /// no RAM budget consulted — so a projection that re-selects it a boundary
+    /// later reads it off the log again. Measured on BlackWorld (2026-11-22):
+    /// 15–36 code_read turns, 120–236 MiB, recalled cold at every 64-token
+    /// boundary of one thinking block, 75–180 ms of each rebuild. Cleared, the
+    /// recall ages like any residence: its hot copy goes after
+    /// [`IDLE_DEMOTE_GRACE_EPOCHS`] once warm holds it, and its warm copy goes
+    /// to the RAM budget's LRU purge.
     pub fn install_promoted(&self, recalls: Vec<ColdRecall>, lifts: Vec<WarmLift>) -> usize {
         let mut installed = 0usize;
         let promoted = recalls
@@ -224,6 +236,7 @@ impl Substrate {
             .chain(lifts.into_iter().map(|l| (l.residence, l.hot)));
         for (residence, hot) in promoted {
             if !hot.is_empty() && self.residences.install_hot_if_absent(residence, hot) {
+                self.residences.get(residence).clear_flag(EVICT_WHEN_COLD);
                 installed += 1;
             }
         }

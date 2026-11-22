@@ -51,6 +51,9 @@ pub const PENDING_QUANTIZE: u32 = 1 << 0;
 /// `elevate_to_hot` pulls it back. Set for collection-member sections (nothing
 /// attends back over them during the build) and completed-ingest turns (not
 /// attended again until retrieval). Live dialogue turns never carry it.
+/// Cleared by that retrieval (`Substrate::install_promoted`): a recalled
+/// residence is attended, and from then on ages out of VRAM and RAM like any
+/// other rather than straight back to cold-only.
 pub const EVICT_WHEN_COLD: u32 = 1 << 1;
 /// A warm→cold write is queued on the writer and has not landed, so the next
 /// persistence pass must not gather and write the same KV again. Distinct from

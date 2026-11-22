@@ -666,6 +666,85 @@ pub(super) mod tests {
         assert!(sub.residence(kept).has_warm(), "kept stays warm");
     }
 
+    /// **A projection's recall ends the offload.** A completed-ingest turn,
+    /// offloaded to cold-only, is pulled back hot by `install_promoted`. Once
+    /// it leaves the working set it must not be shed the next pass: it keeps
+    /// hot through the idle grace, takes a warm copy from the migrate without
+    /// losing hot, and is shed to warm — never to cold-only — only once the
+    /// grace runs out. A flagged turn that was never recalled is still
+    /// offloaded at once.
+    #[test]
+    fn a_recalled_offload_turn_ages_like_any_residence() {
+        let (_, _, timeline, mut sub) = make_timeline();
+        let cold = || {
+            vec![StoredSequence {
+                chunks: vec![StoredChunk {
+                    log_offset: 0,
+                    record_len: 1024,
+                    token_count: 32,
+                }],
+                token_count: 32,
+            }]
+        };
+        let (recalled_idx, recalled) = install_hot_and_warm(&mut sub, timeline, 10);
+        let (_, untouched) = install_hot_and_warm(&mut sub, timeline, 10);
+        for r in [recalled, untouched] {
+            sub.residence(r).set_flag(EVICT_WHEN_COLD);
+            sub.install_cold(r, cold());
+            assert!(
+                !sub.residence(r).has_hot() && !sub.residence(r).has_warm(),
+                "offloaded to cold-only"
+            );
+        }
+
+        // The projection recalls one turn: pinned, then lifted hot.
+        let key = TurnKey::new(timeline, recalled_idx);
+        sub.set_working_set_pins(&[key], &[]);
+        let installed = sub.install_promoted(
+            vec![ColdRecall {
+                kind: PromotionItemKind::Turn(key),
+                residence: recalled,
+                hot: vec![minimal_sealed_layer()],
+            }],
+            Vec::new(),
+        );
+        assert_eq!(installed, 1);
+        assert!(
+            !sub.residence(recalled).has_flag(EVICT_WHEN_COLD),
+            "the recall cleared the offload"
+        );
+
+        // It leaves the working set; the next pass must not shed it.
+        sub.set_working_set_pins(&[], &[]);
+        assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 0);
+        assert!(sub.residence(recalled).has_hot(), "hot through the grace");
+
+        // The migrate's warm copy lands beside hot, not instead of it.
+        let read = sub.residence(recalled).hot().unwrap();
+        assert!(sub.install_copied(recalled, &read, vec![minimal_sealed_layer()]));
+        assert!(sub.residence(recalled).has_hot() && sub.residence(recalled).has_warm());
+
+        // Past the grace, hot goes and warm stays: RAM, not the log. The pass
+        // above was the first of the grace's sixteen.
+        for _ in 1..IDLE_DEMOTE_GRACE_EPOCHS {
+            assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 0);
+        }
+        assert_eq!(sub.demote_idle_hot(IDLE_DEMOTE_GRACE_EPOCHS), 1);
+        assert!(
+            !sub.residence(recalled).has_hot(),
+            "hot shed past the grace"
+        );
+        assert!(
+            sub.residence(recalled).has_warm(),
+            "warm kept for the next recall"
+        );
+        assert!(sub.residence(recalled).has_cold());
+
+        // The turn no projection recalled is still offload-only.
+        assert!(sub.residence(untouched).has_flag(EVICT_WHEN_COLD));
+        assert!(!sub.residence(untouched).has_hot() && !sub.residence(untouched).has_warm());
+    }
+
     /// `mark_timeline_evict_when_cold` flags every turn residence of exactly the
     /// named timeline (leaving other timelines' turns untouched) and reports the
     /// count; an unknown timeline is a no-op.

@@ -359,10 +359,10 @@ impl Substrate {
     /// **Sets no flag.** An earlier version latched `evict_when_cold`, which was
     /// wrong twice over: that flag is a statement about a residence's *kind*
     /// (collection members and completed-ingest turns are offload-only by
-    /// nature) and nothing in the tree ever clears it — all nine writes are
-    /// `= true`. Latching it on a live dialogue turn that merely went quiet made
-    /// the residence permanently offload-only, so every later warm purge cost it
-    /// its hot copy where an unflagged residence would have kept it. Dropping
+    /// nature) and only a recall clears it (`install_promoted`). Latching it on
+    /// a live dialogue turn that merely went quiet made the residence
+    /// offload-only until something retrieved it, so every later warm purge cost
+    /// it its hot copy where an unflagged residence would have kept it. Dropping
     /// hot directly says exactly what is meant, is undone by the next elevate,
     /// and leaves no state to reset.
     ///
