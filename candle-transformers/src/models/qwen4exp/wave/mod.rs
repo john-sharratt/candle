@@ -52,7 +52,7 @@ use super::index_keys::key_page_growth_bytes;
 use super::indexer::{
     compact_index_caches, select_layer, selection_stride, IndexCache, IndexSnapshot, SplicePiece,
 };
-use super::key_q8::Q8Keys;
+use super::key_q8::KeyPlanes;
 use super::paged_index;
 use super::paged_index::SealedIndex;
 use super::ple::{PleSpan, PleState};

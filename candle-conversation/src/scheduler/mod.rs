@@ -126,7 +126,6 @@ mod pinned_report;
 pub mod pool;
 mod pool_fetch;
 mod pool_linger;
-mod pool_read_ring;
 mod pool_refresh;
 mod pooled_rounds;
 mod prefill;
@@ -184,7 +183,6 @@ use turn_probe::TurnProbe;
 
 use self::paused_creep::PausedCreep;
 use self::phase_ring::{ProjectedKind, VramBands};
-use self::pool_read_ring::PoolReadRing;
 use self::relief_pacing::ReliefPacing;
 use self::reproject_census::{Outcome as ReprojectOutcome, Part as ReprojectPart, ReprojectCensus};
 use self::request_laps::RequestLaps;
@@ -945,9 +943,6 @@ pub(crate) struct Scheduler {
     section_relief_pacing: ReliefPacing,
     /// Every live reprojection's parts, summed and written once a minute.
     reproject_census: ReprojectCensus,
-    /// The index pages the pool read last, so a piece that comes back reads
-    /// them from memory (`pool_read_ring`).
-    pool_read_ring: PoolReadRing,
     /// The query×key pairs the creep attended through those layers this step.
     wave_step_creep_layer_pairs: f64,
     /// Consecutive failures of the decode-less wave step and the wait owed

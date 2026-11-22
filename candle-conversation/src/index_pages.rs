@@ -31,6 +31,8 @@ use std::sync::{Arc, OnceLock};
 
 use candle_transformers::models::piece_key::PieceKey;
 
+use crate::index_page_cache::CachedBytes;
+
 /// A malformed page payload.
 ///
 /// Framing errors are reported rather than silently truncated: a payload that
@@ -265,34 +267,68 @@ fn kept_outside(pages: &[Page<'_>], span: std::ops::Range<usize>) -> Option<Vec<
 /// page, read through [`Self::whole_key`].
 #[derive(Debug)]
 pub struct StoredPages {
-    bytes: Arc<[u8]>,
+    bytes: PageBytes,
     page_keys: OnceLock<Box<[PieceKey]>>,
     whole_key: OnceLock<PieceKey>,
 }
 
+/// Where a payload's bytes live: shared heap memory, or a block of the index
+/// page cache (`docs/hit_driven_projection.md` §7.6).
+#[derive(Debug, Clone)]
+enum PageBytes {
+    Shared(Arc<[u8]>),
+    Cached(Arc<CachedBytes>),
+}
+
 impl StoredPages {
     pub fn new(bytes: impl Into<Arc<[u8]>>) -> Self {
+        Self::with_bytes(PageBytes::Shared(bytes.into()))
+    }
+
+    /// A payload held in a block of the index page cache.
+    pub(crate) fn cached(bytes: Arc<CachedBytes>) -> Self {
+        Self::with_bytes(PageBytes::Cached(bytes))
+    }
+
+    fn with_bytes(bytes: PageBytes) -> Self {
         Self {
-            bytes: bytes.into(),
+            bytes,
             page_keys: OnceLock::new(),
             whole_key: OnceLock::new(),
         }
     }
 
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        match &self.bytes {
+            PageBytes::Shared(b) => b,
+            PageBytes::Cached(b) => b.bytes(),
+        }
     }
 
-    /// The same bytes as [`Self::bytes`], as a second owner rather than a copy.
+    /// The same bytes as [`Self::bytes`], as an owner of their own: a second
+    /// owner of shared bytes, a copy of cached ones.
     pub fn shared_bytes(&self) -> Arc<[u8]> {
-        Arc::clone(&self.bytes)
+        match &self.bytes {
+            PageBytes::Shared(b) => Arc::clone(b),
+            PageBytes::Cached(b) => Arc::from(b.bytes()),
+        }
+    }
+
+    /// How many payloads hold this one's cached bytes, itself included; 0
+    /// for bytes not in the cache. What the cache reads to tell a held entry
+    /// from one it may evict.
+    pub(crate) fn cached_holders(&self) -> usize {
+        match &self.bytes {
+            PageBytes::Shared(_) => 0,
+            PageBytes::Cached(b) => Arc::strong_count(b),
+        }
     }
 
     /// Each framed page's key, in page order — empty for a payload that does
     /// not decode, which [`push_in_order`] refuses before it reads a key.
     pub fn page_keys(&self) -> &[PieceKey] {
         self.page_keys.get_or_init(|| {
-            decode(&self.bytes)
+            decode(self.bytes())
                 .map(|pages| pages.iter().map(|(_, p)| PieceKey::of(p)).collect())
                 .unwrap_or_default()
         })
@@ -300,14 +336,14 @@ impl StoredPages {
 
     /// The key of the bytes as one page.
     pub fn whole_key(&self) -> PieceKey {
-        *self.whole_key.get_or_init(|| PieceKey::of(&self.bytes))
+        *self.whole_key.get_or_init(|| PieceKey::of(self.bytes()))
     }
 
     /// [`without_span`], keyed: the pages outside `span` with the keys they
     /// already had. `None` when the span does not fall on page boundaries or
     /// the payload does not decode.
     pub fn without_span(&self, span: std::ops::Range<usize>) -> Option<StoredPages> {
-        let pages = decode(&self.bytes).ok()?;
+        let pages = decode(self.bytes()).ok()?;
         let kept = kept_outside(&pages, span)?;
         if kept.len() == pages.len() {
             return Some(self.clone());
@@ -320,7 +356,7 @@ impl StoredPages {
                 .collect::<Vec<_>>(),
         );
         Some(StoredPages {
-            bytes: framed.into(),
+            bytes: PageBytes::Shared(framed.into()),
             page_keys: kept
                 .iter()
                 .map(|&i| keys[i])
@@ -335,7 +371,7 @@ impl Clone for StoredPages {
     /// The same bytes, and whatever keys were already taken of them.
     fn clone(&self) -> Self {
         Self {
-            bytes: Arc::clone(&self.bytes),
+            bytes: self.bytes.clone(),
             page_keys: self
                 .page_keys
                 .get()

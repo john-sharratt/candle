@@ -55,7 +55,6 @@ use super::fill_report::{Standing, Unpooled};
 use super::group_assembly::{
     held, keep, Assemblies, AssemblyKey, AssemblyStamp, GroupAssembly, Whose,
 };
-use super::held_index_pages::HeldIndexPages;
 use super::ids::{
     process_timeline_allocator, GroupId, LayerId, SectionId, TimelineAllocator, TimelineId,
     TurnIndex, TurnKey,
@@ -217,9 +216,6 @@ pub struct Conversation {
     /// Each belief turn group's assembled scan, per target, reused while the
     /// substrate it was gathered from stands (`group_assembly`).
     group_assemblies: Arc<Assemblies>,
-    /// The index pages a live slot holds, found again by their record rather
-    /// than read off the log at every reprojection — see [`HeldIndexPages`].
-    held_index_pages: Arc<HeldIndexPages>,
     /// How this workspace's prompt sections came to be resident since it was
     /// opened: restored from the redo log, or prefilled. A restart on an
     /// unchanged prompt restores every one; a prefill there is a section the

@@ -31,7 +31,7 @@
 use candle::{Device, Result, Tensor};
 
 use super::indexer::IndexCache;
-use super::key_q8::{blocks, Fidelity, Q8Keys};
+use super::key_q8::{blocks, Fidelity, KeyPlanes, Q8Keys};
 use super::resident_page::ResidentPage;
 #[cfg(feature = "cuda")]
 use crate::models::operand_guard::expect_dense;
@@ -699,6 +699,32 @@ fn floats(bytes: &[u8]) -> Vec<f32> {
 /// The codes are taken as they stand and the rest converted in one pass. A
 /// page is thousands of rows, and a bounds-checked read per value was once the
 /// larger part of every injection's host time.
+/// A page's completed rows as borrowed planes of `blob`, and the tokens its
+/// last row covers: what [`decode_page`] copies out, read in place. Refused as
+/// [`decode_page`] refuses a short blob.
+pub fn page_planes(blob: &[u8]) -> Result<(KeyPlanes<'_>, usize)> {
+    let (rows, dim, last_cells, n_open) = page_header(blob)?;
+    let codes = rows * dim;
+    let scales = rows * blocks(dim) * 2;
+    let want = 16 + codes + scales + n_open * dim * 4;
+    if blob.len() < want {
+        candle::bail!(
+            "index page: blob is {} bytes but [{rows}, {dim}] with {n_open} open rows needs \
+             {want}",
+            blob.len()
+        );
+    }
+    let at = 16 + codes;
+    Ok((
+        KeyPlanes {
+            codes: &blob[16..at],
+            scales: &blob[at..at + scales],
+            dim,
+        },
+        last_cells,
+    ))
+}
+
 pub fn decode_page(blob: &[u8]) -> Result<SealedIndex> {
     let (rows, dim, last_cells, n_open) = page_header(blob)?;
     let codes = rows * dim;
@@ -829,6 +855,46 @@ pub fn migrate_aux(blob: &[u8]) -> Result<AuxMigration> {
         bytes: encode_aux(ple, &layers)?,
         fidelity,
     })
+}
+
+#[cfg(test)]
+mod page_planes_tests {
+    use super::super::index_keys::scale_bytes;
+    use super::super::key_q8::Q8Keys;
+    use super::{decode_page, encode_page, page_planes, SealedIndex};
+
+    /// **The planes read in place are the bytes a decode copies out**: the
+    /// codes as they are, the scales as their little-endian bytes, the same
+    /// last-row width; and a blob cut short is refused as the decode refuses it.
+    #[test]
+    fn a_pages_planes_are_its_decoded_keys_in_place() {
+        let dim = 64;
+        let page = SealedIndex {
+            keys: Q8Keys {
+                codes: (0..3 * dim).map(|i| (i * 7) as u8).collect(),
+                scales: vec![0x3C00, 0x3800, 0x4000, 0x4200, 0x3400, 0x3E00],
+                dim,
+            },
+            last_cells: 5,
+            open: vec![0.5; dim],
+        };
+        let blob = encode_page(&page).unwrap();
+        let decoded = decode_page(&blob).unwrap();
+        let (planes, last) = page_planes(&blob).unwrap();
+        assert_eq!(last, 5);
+        assert_eq!(planes.dim, dim);
+        assert_eq!(planes.n_rows(), 3);
+        assert_eq!(planes.codes, &decoded.keys.codes[..]);
+        assert_eq!(planes.scales, &scale_bytes(&decoded.keys.scales)[..]);
+        assert_eq!(
+            planes.scales,
+            &[0x00, 0x3C, 0x00, 0x38, 0x00, 0x40, 0x00, 0x42, 0x00, 0x34, 0x00, 0x3E][..]
+        );
+        let (codes, scales) = planes.rows(1, 2);
+        assert_eq!(codes, &decoded.keys.codes[dim..3 * dim]);
+        assert_eq!(scales, &planes.scales[4..12]);
+        assert!(page_planes(&blob[..blob.len() - dim * 4 - 1]).is_err());
+    }
 }
 
 #[cfg(test)]

@@ -44,6 +44,36 @@ pub struct Q8Keys {
     pub dim: usize,
 }
 
+/// Rows of Q8_0 keys as borrowed planes, in the bytes a page holds them in:
+/// `codes` as for [`Q8Keys`], `scales` as each `f16` scale's two
+/// little-endian bytes. What a placement uploads from a page without copying
+/// it out first.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyPlanes<'a> {
+    pub codes: &'a [u8],
+    pub scales: &'a [u8],
+    pub dim: usize,
+}
+
+impl KeyPlanes<'_> {
+    pub fn n_rows(&self) -> usize {
+        self.codes.len().checked_div(self.dim).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.codes.is_empty()
+    }
+
+    /// Rows `[first, first + n)`: their codes, and their scales' bytes.
+    pub fn rows(&self, first: usize, n: usize) -> (&[u8], &[u8]) {
+        let nb2 = 2 * blocks(self.dim);
+        (
+            &self.codes[first * self.dim..(first + n) * self.dim],
+            &self.scales[first * nb2..(first + n) * nb2],
+        )
+    }
+}
+
 impl Q8Keys {
     /// No rows of `dim`-wide keys.
     pub fn empty(dim: usize) -> Self {

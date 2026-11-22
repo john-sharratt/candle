@@ -89,6 +89,17 @@ pub(super) mod tests {
                 pages_in_per_sec: Some(12.5),
                 commit_total_bytes: Some(30),
                 commit_limit_bytes: Some(40),
+                index_cache: IndexCacheSection {
+                    target_bytes: 8,
+                    pinned_bytes: 4,
+                    pageable_bytes: 4,
+                    held_bytes: 3,
+                    entries: 2,
+                    hits: 5,
+                    misses: 2,
+                    uncached: 1,
+                    evicted: 0,
+                },
             },
             admission: AdmissionSection {
                 setpoint_bytes: 10,
@@ -266,6 +277,8 @@ pub(super) mod tests {
             "host_pinned_bytes",
             "pages_in_per_sec",
             "commit_limit_bytes",
+            "\"index_cache\"",
+            "\"evicted\"",
             "resident_bytes",
             // The two consumers a whole-card sum could otherwise only reach by
             // subtraction: dense weights sit outside the KV pool, and the

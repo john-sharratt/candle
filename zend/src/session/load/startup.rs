@@ -10,6 +10,7 @@
 //! than a failure. Each step reports its progress against the loading bar.
 
 use super::*;
+use candle_conversation::index_page_cache;
 
 impl InferenceState {
     // Every argument is a distinct piece of deployment config read from the CLI
@@ -323,6 +324,13 @@ impl InferenceState {
             elapsed_ms = t_engine.elapsed().as_millis() as u64,
             "load timing: model weights loaded (engine built; substrate reload now running in background)",
         );
+
+        // The index page cache's slab, taken once per process and only now:
+        // the model has loaded, so the expert tier has pinned its pool and the
+        // cache takes what the host partition left it
+        // (`docs/hit_driven_projection.md` §7.6).
+        let host_total = vram::total_physical_ram().unwrap_or(0);
+        index_page_cache::install(vram::index_cache_target(host_total), &device);
 
         // AFTER the engine build, never before. The builder resolves the
         // `<think>`/`</think>` ids into its sampling config while loading the

@@ -405,7 +405,7 @@ At each boundary:
      set's members in their order (`scheduler::pool::pool_order`).
    - **Admission is not throttled.** Every piece that ranks in at a boundary
      enters the pool at that boundary. Its index pages come from memory when
-     resident, from the redo log when cold; the reads run in the
+     resident or cached (§7.6), from the redo log when cold; the reads run in the
      reprojection's `pool:index_read` span, and their count, bytes and time
      are logged (§12 item 26).
    - **The pool keeps an insertion order.** A piece keeps its place in it
@@ -630,6 +630,51 @@ score. It no longer decides what is attended: with only index rows to pay for,
 it can propose many times what the slot holds, and the indexer's hits — the
 real selection's on placed rounds, the shadow scan's on pooled ones — decide
 which of that is loaded. Only what the fill places moves its K/V.
+
+### 7.6 The index page cache
+
+Every pooled turn's index pages are read at each boundary that admits its
+piece, and the redo log is opened unbuffered, so a page found nowhere in memory
+is an NVMe read. The pages a pool reads are kept in one host-memory cache
+(`index_page_cache/`), process-wide and shared by every substrate. It replaces
+the weak map of the pages a slot held and the pool's read ring: one structure,
+one eviction rule.
+
+- **One slab, allocated once at startup, after the expert tier.** Its target is
+  a share of host RAM, `total / 24` capped at 8 GiB (`HostRamBudget::
+  index_cache_bytes`): 8.47 GB on BlackWorld's 189 GiB host, ~2.7 GiB on a
+  64 GB host, ~1.3 GiB on a 32 GB one. The bytes come out of the tier pool beside the warm
+  KV floor, so the expert tier is sized against a machine that already holds
+  the cache. The slab is taken by the first of these that succeeds: the whole
+  target pinned; half pinned and half pageable; the whole target pageable;
+  then halving the pageable target down to 1 GiB. Below 1 GiB nothing is held
+  and every page is read from the log. Pinned bytes are accounted as
+  `PinnedUse::IndexPages`.
+- **Blocks of power-of-two size classes**, 4 KiB to 4 MiB, carved from the
+  slab as they are first needed and returned to their class's free list. A
+  page larger than the largest class is read into ordinary heap memory and
+  not cached.
+- **A read lands in its block.** A cold page is read from the log straight
+  into the block its record's size names — one copy out of the log's aligned
+  window, where it was a zeroed buffer, a payload copy and a shared copy. The
+  record's header and CRC are checked in the block, and the page is the
+  payload's range of it.
+- **Found by record, not by stream.** An entry answers only while the
+  substrate names the same page record (`RecordIdentity`) for its stream, as
+  the weak map's did.
+- **Least recently used, unheld first.** A page a slot, a pool or a placement
+  still holds is never evicted; a hit moves its entry to the newest end. When
+  a class has no free block and the slab has nothing left to carve, the least
+  recently used unheld entries of that class are evicted.
+- **A block outlives its uploads.** Placement uploads a page's codes and
+  scales from the page's own bytes, without decoding them into copies. From
+  pinned memory that upload is asynchronous, so placement waits for its own
+  copies before it returns: the caller's borrow of the bytes covers the
+  copy, and an entry is evicted only when nothing holds it. No block is ever
+  re-tenanted while a copy reads it, and nothing else has to know.
+- **The cache's state is reported** in the memory report's host section:
+  the slab's pinned and pageable bytes, bytes in use, entries, and hits and
+  misses since start.
 
 ## 8. The conversation
 

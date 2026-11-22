@@ -423,7 +423,9 @@ pub fn pages_in_per_sec() -> Option<f64> {
 /// The pinned expert tier takes the whole pool — pinned pages are the scarce
 /// resource, capped by what the driver will page-lock — and warm KV, which is
 /// pageable, keeps a fixed [`KV_WARM_FLOOR`] beside it that the OS may page
-/// rather than a share of the pool.
+/// rather than a share of the pool. The QSA index page cache's slab
+/// ([`index_cache_target`]) is taken out before the pool too, so the expert
+/// tier is sized against a machine that already holds it.
 ///
 /// # `pinned_bytes` is reported, never subtracted
 ///
@@ -441,9 +443,9 @@ pub fn pages_in_per_sec() -> Option<f64> {
 /// cannot hold its model resident must swap by definition, and the budget states
 /// that instead of hiding it.
 ///
-/// Dev box (31.5 GiB, 2.4 GiB live weight pages): `31.5 − 2.4 − 10 − 1 = 18.1`
-/// GiB of tier pool, all of it the expert tier's, and 4 GiB of pageable warm KV
-/// beside it.
+/// Dev box (31.5 GiB, 2.4 GiB live weight pages): `31.5 − 2.4 − 10 − 1 − 4 −
+/// 1.31 = 12.8` GiB of tier pool, all of it the expert tier's, with 4 GiB of
+/// pageable warm KV and a 1.31 GiB index page cache beside it.
 /// The weights term is small because the MoE loader declares only the GGUF's
 /// *live* pages — its expert regions move to the pack file at startup and are
 /// never read again.
@@ -467,8 +469,35 @@ pub struct HostRamBudget {
     /// The warm KV tier's pageable budget: [`KV_WARM_FLOOR`], whatever the
     /// pool.
     pub kv_warm_budget_bytes: u64,
+    /// The QSA index page cache's slab: [`index_cache_target`] of the machine,
+    /// taken out before the tier pool, pinned where the driver grants it.
+    pub index_cache_bytes: u64,
     /// What the expert cache's warm tier may page-lock: the whole pool.
     pub expert_pinned_budget_bytes: u64,
+}
+
+/// One part in this many of host RAM is the index page cache's
+/// (`docs/hit_driven_projection.md` §7.6).
+pub const INDEX_CACHE_SHARE: u64 = 24;
+
+/// The largest index page cache: 8 GiB holds a 2M-token pool's pages at
+/// ~900 bytes a token several times over, with the pieces at its edge.
+pub const INDEX_CACHE_MAX: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The smallest index page cache worth holding. Below it, a machine reads every
+/// page from the log.
+pub const INDEX_CACHE_MIN: u64 = 1024 * 1024 * 1024;
+
+/// The index page cache's slab on a machine of `total` bytes of host RAM:
+/// [`INDEX_CACHE_SHARE`]th of it, at most [`INDEX_CACHE_MAX`], and nothing when
+/// that is under [`INDEX_CACHE_MIN`].
+pub fn index_cache_target(total: u64) -> u64 {
+    let share = (total / INDEX_CACHE_SHARE).min(INDEX_CACHE_MAX);
+    if share < INDEX_CACHE_MIN {
+        0
+    } else {
+        share
+    }
 }
 
 /// Weights-cap buffer percentage: 30 (of total RAM); `host_ram_budget_from`
@@ -583,11 +612,13 @@ pub fn host_ram_budget_from(
     // fixed, and covered by the margin `PAGEABLE_RESERVE` carries over the 9.5
     // GiB it was measured against; the expert tier subtracts them again from its
     // own page-lock ceiling, which is where that belongs.
+    let index_cache = index_cache_target(total);
     let tier_pool = total
         .saturating_sub(weights_reserved)
         .saturating_sub(PAGEABLE_RESERVE)
         .saturating_sub(os_keep)
-        .saturating_sub(KV_WARM_FLOOR);
+        .saturating_sub(KV_WARM_FLOOR)
+        .saturating_sub(index_cache);
     HostRamBudget {
         total_bytes: total,
         buffer_bytes: buffer,
@@ -597,6 +628,7 @@ pub fn host_ram_budget_from(
         pageable_reserve_bytes: PAGEABLE_RESERVE,
         tier_pool_bytes: tier_pool,
         kv_warm_budget_bytes: KV_WARM_FLOOR,
+        index_cache_bytes: index_cache,
         // A stated pin says how much less than the pool the engine's own heap
         // leaves the experts; it never buys more than the machine has after
         // its fixed obligations, whatever the table says.
@@ -670,7 +702,8 @@ mod tests {
             let fixed = b.weights_reserved_bytes
                 + b.pageable_reserve_bytes
                 + OS_KEEP_BYTES
-                + b.kv_warm_budget_bytes;
+                + b.kv_warm_budget_bytes
+                + b.index_cache_bytes;
             // A machine whose fixed obligations alone exceed it — 16 GiB holds
             // 17.4 — pins nothing: the pool is empty, not wrapped.
             if fixed >= total {
@@ -708,15 +741,22 @@ mod tests {
             "30% of 31.5 > 4 GiB floor"
         );
         assert!(!b.weights_capped);
+        assert_eq!(b.index_cache_bytes, total / INDEX_CACHE_SHARE);
         assert_eq!(
             b.tier_pool_bytes,
-            total - weights - PAGEABLE_RESERVE - OS_KEEP_BYTES - KV_WARM_FLOOR,
+            total
+                - weights
+                - PAGEABLE_RESERVE
+                - OS_KEEP_BYTES
+                - KV_WARM_FLOOR
+                - b.index_cache_bytes,
         );
-        // ~14.1 GiB of pool, all expert; 4 GiB of pageable KV beside it.
+        // ~12.8 GiB of pool, all expert; 4 GiB of pageable KV and a 1.31 GiB
+        // index page cache beside it.
         let ex = b.expert_pinned_budget_bytes as f64 / GIB as f64;
         assert_eq!(b.kv_warm_budget_bytes, 4 * GIB);
         assert!(
-            (13.9..14.3).contains(&ex),
+            (12.6..13.0).contains(&ex),
             "expert budget reads {ex:.2} GiB"
         );
         // **The expert tier must not shrink to pay for the honest accounting.**
@@ -788,6 +828,21 @@ mod tests {
         assert_eq!(OS_KEEP_BYTES, GIB);
     }
 
+    /// **The index page cache is a 24th of the machine, 1–8 GiB.** BlackWorld's
+    /// 203,277,299,712 bytes give 8.47 GB (7.89 GiB), under the cap; a 256 GiB
+    /// host is held to 8 GiB; a 64 GiB host gives 2.67 GiB, a 32 GiB one 1.33
+    /// GiB; a 16 GiB host's 0.67 GiB is under the floor, so it holds none.
+    #[test]
+    fn the_index_cache_is_a_24th_of_the_machine_within_its_bounds() {
+        assert_eq!(index_cache_target(203_277_299_712), 8_469_887_488);
+        assert_eq!(index_cache_target(256 * GIB), 8 * GIB);
+        assert_eq!(index_cache_target(64 * GIB), 2_863_311_530);
+        assert_eq!(index_cache_target(32 * GIB), 1_431_655_765);
+        assert_eq!(index_cache_target(24 * GIB), GIB);
+        assert_eq!(index_cache_target(24 * GIB - 1), 0);
+        assert_eq!(index_cache_target(16 * GIB), 0);
+    }
+
     /// The 186 GB box: the reserve stays an absolute 10 GiB, so a large machine
     /// puts nearly all of itself into the pinned expert pool, with warm KV at
     /// its pageable floor beside it.
@@ -795,11 +850,13 @@ mod tests {
     fn big_box_gives_the_pool_to_the_experts() {
         let b = host_ram_budget_from(186 * GIB, 12 * GIB, 18 * GIB, 30, 2 * GIB, None);
         assert!(!b.weights_capped);
+        // 186 / 24 = 7.75 GiB of index page cache, under its 8 GiB cap.
+        assert_eq!(b.index_cache_bytes, 7 * GIB + 3 * GIB / 4);
         assert_eq!(
             b.tier_pool_bytes,
-            186 * GIB - 18 * GIB - PAGEABLE_RESERVE - 2 * GIB - KV_WARM_FLOOR,
+            186 * GIB - 18 * GIB - PAGEABLE_RESERVE - 2 * GIB - KV_WARM_FLOOR - b.index_cache_bytes,
         );
-        assert_eq!(b.tier_pool_bytes, 152 * GIB);
+        assert_eq!(b.tier_pool_bytes, 144 * GIB + GIB / 4);
         assert_eq!(b.expert_pinned_budget_bytes, b.tier_pool_bytes);
         assert_eq!(b.kv_warm_budget_bytes, KV_WARM_FLOOR);
     }
@@ -817,7 +874,12 @@ mod tests {
         assert_eq!(stated.tier_pool_bytes, derived.tier_pool_bytes);
         assert_eq!(
             derived.tier_pool_bytes,
-            64 * GIB - weights - PAGEABLE_RESERVE - OS_KEEP_BYTES - KV_WARM_FLOOR,
+            64 * GIB
+                - weights
+                - PAGEABLE_RESERVE
+                - OS_KEEP_BYTES
+                - KV_WARM_FLOOR
+                - 64 * GIB / INDEX_CACHE_SHARE,
         );
         assert_eq!(stated.kv_warm_budget_bytes, KV_WARM_FLOOR);
 

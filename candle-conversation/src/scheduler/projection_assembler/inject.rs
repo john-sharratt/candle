@@ -272,8 +272,8 @@ pub(super) fn inject_sealed_turn(
     // reliably the most recent turn.
     //
     // The rows come from the turn's stored record: its bytes while the
-    // substrate still holds them, a slot's held copy while one places the turn
-    // (`HeldIndexPages`), and the log otherwise.
+    // substrate still holds them, the index page cache's copy while it has
+    // one, and the log otherwise.
     let t_resolve = Instant::now();
     let fetch = profile::span("inject:turn:fetch_page");
     // Before the substrate lock: a page left in the log is read through the

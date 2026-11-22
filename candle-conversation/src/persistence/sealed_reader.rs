@@ -47,10 +47,12 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use super::identity::RecordIdentity;
 use super::manifest::RecordLoc;
 use super::record::{
     decode_header, decode_record, padded_record_len, verify_record_crc, Record, HEADER_PROBE_SIZE,
@@ -186,6 +188,40 @@ impl SealedReader {
                 .and_then(|f| read_sealed(&f, loc, &mut AlignedScratch::new()))
                 .map(|r| r.payload),
         )
+    }
+
+    /// The durable record at `loc` read whole into `dest` — exactly
+    /// `loc.record_size` bytes — with its header and CRC checked there,
+    /// answering the payload's range of `dest`: a read that lands in a block
+    /// of the index page cache with no buffer between (`index_page_cache`).
+    ///
+    /// Only the record `id` of `stream_id` is answered: a header naming
+    /// another stream or identity is declined, so what the caller caches under
+    /// `id` is that record's bytes whatever came to sit at `loc`. `None` too
+    /// when the record is not yet durable or does not read cleanly at `loc`;
+    /// the caller then reads it through [`Self::read_record_payload`]'s path,
+    /// which follows a relocation and reports a real failure.
+    pub fn read_payload_into(
+        &self,
+        loc: &RecordLoc,
+        stream_id: u64,
+        id: RecordIdentity,
+        dest: &mut [u8],
+    ) -> Option<Range<usize>> {
+        if !self.active.is_durable(loc) || dest.len() != loc.record_size as usize {
+            return None;
+        }
+        let file =
+            UnbufferedFile::open(&segment_path(&self.dir, loc.segment), Access::ReadOnly).ok()?;
+        file.read_span(loc.offset, dest, &mut AlignedScratch::new())
+            .ok()?;
+        let (header, payload, _) = decode_record(dest).ok()?;
+        if header.stream_id != stream_id || header.identity() != id {
+            return None;
+        }
+        verify_record_crc(&header, payload).ok()?;
+        let start = payload.as_ptr() as usize - dest.as_ptr() as usize;
+        Some(start..start + payload.len())
     }
 
     /// The records at `locs`, in `(segment, offset)` order, or `None` when any
@@ -346,6 +382,67 @@ mod tests {
             .expect("a sealed segment is read")
             .expect("and the read succeeds");
         assert_eq!(payload, b"sealed and immutable");
+    }
+
+    /// **A record read into a caller's buffer is the payload, in place**: the
+    /// range it answers holds exactly the bytes [`SealedReader::read_record_payload`]
+    /// returns. A record not yet durable, a buffer of the wrong size, and a
+    /// payload whose CRC fails are declined.
+    #[test]
+    fn a_record_read_into_a_buffer_answers_its_payload_range() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut log = open(dir.path());
+        let payload = b"read straight into the cache";
+        let loc = write(&mut log, 9, payload);
+        let staged = stage(&mut log, 10, b"not yet committed");
+        let reader = log.sealed_reader();
+
+        let none = RecordIdentity::NONE;
+        let mut dest = vec![0u8; loc.record_size as usize];
+        let range = reader
+            .read_payload_into(&loc, 9, none, &mut dest)
+            .expect("durable");
+        assert_eq!(&dest[range], payload);
+
+        assert!(
+            reader
+                .read_payload_into(&loc, 10, none, &mut dest)
+                .is_none(),
+            "another stream's record is not this one"
+        );
+        let other = RecordIdentity {
+            origin: 1,
+            ..RecordIdentity::NONE
+        };
+        assert!(
+            reader
+                .read_payload_into(&loc, 9, other, &mut dest)
+                .is_none(),
+            "another identity is not this record"
+        );
+        let mut short = vec![0u8; loc.record_size as usize - 1];
+        assert!(reader
+            .read_payload_into(&loc, 9, none, &mut short)
+            .is_none());
+        let mut later = vec![0u8; staged.record_size as usize];
+        assert!(reader
+            .read_payload_into(&staged, 10, none, &mut later)
+            .is_none());
+
+        log.commit().expect("commit");
+        log.seal_and_rotate().expect("seal");
+        let path = segment_path(dir.path(), loc.segment);
+        let mut bytes = std::fs::read(&path).expect("read segment");
+        let at = bytes
+            .windows(payload.len())
+            .position(|w| w == payload)
+            .expect("the payload is on disk");
+        bytes[at] ^= 0xFF;
+        std::fs::write(&path, &bytes).expect("rewrite segment");
+        assert!(
+            reader.read_payload_into(&loc, 9, none, &mut dest).is_none(),
+            "a changed payload fails its crc"
+        );
     }
 
     /// Stage one record into the active segment without committing it.

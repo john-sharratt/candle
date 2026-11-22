@@ -423,8 +423,8 @@ impl Scheduler {
                         // names both numbers.
                         //
                         // The substrate holds the bytes until the write lands and
-                        // the log after it; a slot that places the turn holds them
-                        // again for as long as it does (`HeldIndexPages`).
+                        // the log after it; a read of them lands in the index page
+                        // cache, which keeps them while a slot places the turn.
                         if covered == turn_token_count {
                             conversation.enqueue_index_page(
                                 turn_stream_id(target.timeline.raw(), idx.0),

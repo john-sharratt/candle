@@ -93,6 +93,7 @@ pub mod forbidden_alloc;
 pub mod gpu_keepalive;
 pub mod gpu_memory;
 pub mod gpu_poison;
+pub mod host_region;
 mod indexer;
 pub mod layout;
 #[cfg(feature = "metal")]

@@ -52,8 +52,9 @@ pub use driver_model::DriverModel;
 pub use gpu_addressable::{gpu_addressable_budget, gpu_addressable_room};
 pub use host_probe::{
     available_low_water, available_physical_ram, host_perf, host_ram_budget, host_ram_budget_from,
-    launch_available_ram, pages_in_per_sec, process_private_resident, sample_available_low_water,
-    snapshot_launch, state_expert_pin, total_physical_ram, HostPerf, HostRamBudget, KV_WARM_FLOOR,
+    index_cache_target, launch_available_ram, pages_in_per_sec, process_private_resident,
+    sample_available_low_water, snapshot_launch, state_expert_pin, total_physical_ram, HostPerf,
+    HostRamBudget, INDEX_CACHE_MAX, INDEX_CACHE_MIN, INDEX_CACHE_SHARE, KV_WARM_FLOOR,
     PAGEABLE_RESERVE,
 };
 pub use managed::is_oom;
@@ -420,15 +421,19 @@ pub enum PinnedUse {
     HostMapped,
     /// Device-visible descriptor rings: the kernel dispatch table ring.
     DispatchTables,
+    /// The QSA index page cache's slab, where the driver grants it pinned
+    /// (`docs/hit_driven_projection.md` §7.6).
+    IndexPages,
 }
 
 impl PinnedUse {
     /// Every variant, for reporting.
-    pub const ALL: [PinnedUse; 4] = [
+    pub const ALL: [PinnedUse; 5] = [
         PinnedUse::WeightWarmTier,
         PinnedUse::Staging,
         PinnedUse::HostMapped,
         PinnedUse::DispatchTables,
+        PinnedUse::IndexPages,
     ];
 
     /// A short label for a report line.
@@ -438,6 +443,7 @@ impl PinnedUse {
             PinnedUse::Staging => "staging buffers",
             PinnedUse::HostMapped => "host-mapped weights",
             PinnedUse::DispatchTables => "dispatch tables",
+            PinnedUse::IndexPages => "index page cache",
         }
     }
 
@@ -447,11 +453,13 @@ impl PinnedUse {
             PinnedUse::Staging => &PINNED_BY_USE[1],
             PinnedUse::HostMapped => &PINNED_BY_USE[2],
             PinnedUse::DispatchTables => &PINNED_BY_USE[3],
+            PinnedUse::IndexPages => &PINNED_BY_USE[4],
         }
     }
 }
 
-static PINNED_BY_USE: [AtomicU64; 4] = [
+static PINNED_BY_USE: [AtomicU64; 5] = [
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),

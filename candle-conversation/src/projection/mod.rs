@@ -211,7 +211,6 @@ pub mod fill;
 mod fill_report;
 mod group_assembly;
 mod group_votes;
-mod held_index_pages;
 mod hits;
 mod ids;
 pub mod layer_toggle;

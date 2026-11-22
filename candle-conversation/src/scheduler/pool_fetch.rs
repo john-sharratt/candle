@@ -23,15 +23,22 @@ const READERS: usize = 8;
 /// threads costs more than a held page's read.
 const ALONE_BELOW: usize = 4;
 
-/// What one turn's index page read gave.
-pub(super) type Fetched = Result<Option<Arc<StoredPages>>, ConversationError>;
+/// What one turn's index page read gave, and whether it came off the log —
+/// in neither the substrate nor the index page cache.
+pub(super) type Fetched = (Result<Option<Arc<StoredPages>>, ConversationError>, bool);
 
 /// Every page of `wanted`, by its turn.
 pub(super) fn fetch_pages(
     conversation: &Conversation,
     wanted: &[(TimelineId, TurnIndex)],
 ) -> HashMap<(TimelineId, TurnIndex), Fetched> {
-    let read = |&(tl, i): &(TimelineId, TurnIndex)| ((tl, i), conversation.turn_index_page(tl, i));
+    let read = |&(tl, i): &(TimelineId, TurnIndex)| {
+        let fetched = match conversation.turn_index_page_in_memory(tl, i) {
+            Some(page) => (Ok(Some(page)), false),
+            None => (conversation.turn_index_page(tl, i), true),
+        };
+        ((tl, i), fetched)
+    };
     if wanted.len() < ALONE_BELOW {
         return wanted.iter().map(read).collect();
     }

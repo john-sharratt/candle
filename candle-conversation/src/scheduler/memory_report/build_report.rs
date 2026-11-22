@@ -165,6 +165,9 @@ impl Scheduler {
             .warm_resident_bytes()
             .saturating_add(self.persist_triggers.pending_warm_bytes());
         let perf = candle::vram::host_perf();
+        let cache = index_page_cache::global()
+            .map(|c| c.stats())
+            .unwrap_or_default();
         let host = HostSection {
             total_bytes: total,
             available_bytes: available,
@@ -178,6 +181,17 @@ impl Scheduler {
             pages_in_per_sec: candle::vram::pages_in_per_sec(),
             commit_total_bytes: perf.map(|p| p.commit_total_bytes),
             commit_limit_bytes: perf.map(|p| p.commit_limit_bytes),
+            index_cache: IndexCacheSection {
+                target_bytes: budget.index_cache_bytes,
+                pinned_bytes: cache.pinned_bytes,
+                pageable_bytes: cache.pageable_bytes,
+                held_bytes: cache.held_bytes,
+                entries: cache.entries,
+                hits: cache.hits,
+                misses: cache.misses,
+                uncached: cache.uncached,
+                evicted: cache.evicted,
+            },
         };
 
         // ── Admission ───────────────────────────────────────────────────────

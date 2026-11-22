@@ -103,7 +103,6 @@ impl Conversation {
             branch_checkpoint: Arc::new(ArcSwapOption::empty()),
             gallery_cache: Arc::new(papaya::HashMap::new()),
             group_assemblies: Arc::new(Assemblies::new()),
-            held_index_pages: Arc::default(),
             section_loads: Arc::default(),
         }
     }

@@ -518,20 +518,24 @@ impl Qwen4ExpBatched {
                 sections.len()
             );
         }
-        let sealed: Vec<SealedIndex> = missing
+        // Placed from the page's own bytes, read in place. They may be the
+        // index page cache's pinned memory, which the copies read
+        // asynchronously, so the stream is waited for before `blob` is let go:
+        // the caller's borrow then covers every copy out of it.
+        let planes: Vec<(KeyPlanes<'_>, usize)> = missing
             .iter()
-            .map(|&kv| paged_index::decode_page(sections[kv]))
+            .map(|&kv| paged_index::page_planes(sections[kv]))
             .collect::<Result<_>>()?;
-        let host: Vec<(&Q8Keys, usize)> = sealed.iter().map(|s| (&s.keys, s.last_cells)).collect();
         let placed: Vec<(usize, Arc<ResidentPage>)> = missing
             .iter()
             .copied()
-            .zip(ResidentPage::place_host(
-                &host,
+            .zip(ResidentPage::place_planes(
+                &planes,
                 cfg.indexer.head_dim,
                 &self.model.device,
             )?)
             .collect();
+        self.model.device.synchronize()?;
         for (kv, page) in &placed {
             page.placed_from(*key);
             layers[*kv] = Some(Arc::clone(page));

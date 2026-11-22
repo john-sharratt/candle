@@ -209,8 +209,9 @@ pub(in super::super) struct PlacedPiece {
     /// splice moves it; `None` for glue and turn halves, which record none.
     pub(super) range: Option<PieceRange>,
     /// The index page the piece was placed with, held while the slot holds the
-    /// piece: a rebuild that re-walks the turn finds the page again without
-    /// reading the log (`HeldIndexPages`), and a cut or a freed slot lets it go.
+    /// piece: the index page cache evicts nothing held, so a rebuild that
+    /// re-walks the turn finds the page again without reading the log, and a
+    /// cut or a freed slot lets it go.
     pub(super) page: Option<Arc<StoredPages>>,
 }
 

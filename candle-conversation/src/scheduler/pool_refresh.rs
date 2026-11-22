@@ -10,11 +10,11 @@
 //! for a pooled piece: its rounds' K/V comes up only when the fill places one.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Instant;
 
 use candle_transformers::models::piece_key::PieceKey;
 
+use crate::index_page_cache;
 use crate::index_pages;
 use crate::projection::{Conversation, TimelineId, TurnIndex, WorkingSetShare};
 use crate::sequence_handle::SequenceId;
@@ -51,8 +51,8 @@ pub(super) struct PoolRefresh {
     pub fetch_us: u64,
     /// Of `read_us`, placing the sampled layers' pages on the device.
     pub place_us: u64,
-    /// Of `walked`, the turns whose pages came off the log: held by nothing,
-    /// the ring included.
+    /// Of `walked`, the turns whose pages came off the log: in neither the
+    /// substrate nor the index page cache.
     pub cold: usize,
     /// Of `admitted`, pieces taken up from lingering, their pages still held.
     pub revived: usize,
@@ -186,6 +186,7 @@ impl Scheduler {
                 let fetched = pages_of
                     .remove(&(tl, TurnIndex(i)))
                     .expect("every walked turn was fetched");
+                let (fetched, from_log) = fetched;
                 let pages = match fetched {
                     Ok(Some(p)) => p,
                     Ok(None) => continue,
@@ -198,14 +199,9 @@ impl Scheduler {
                     }
                 };
                 stats.read_bytes += pages.bytes().len();
-                // A page whose one owner is this read came off the log.
-                if Arc::strong_count(&pages) == 1 {
+                if from_log {
                     stats.cold += 1;
                 }
-                // Held past this refresh as the ring's newest, so a piece that
-                // leaves the pool and comes back reads it from memory
-                // (`pool_read_ring`).
-                self.pool_read_ring.keep(&pages);
                 let Ok(framed) = index_pages::decode(pages.bytes()) else {
                     whole = false;
                     break;
@@ -287,6 +283,9 @@ impl Scheduler {
             return;
         };
         let placed: HashSet<TimelineId> = placed.iter().copied().collect();
+        let cache = index_page_cache::global()
+            .map(|c| c.stats())
+            .unwrap_or_default();
         tracing::info!(
             target: "candle_conversation::scheduler::pool",
             pooled = stats.pooled,
@@ -300,8 +299,12 @@ impl Scheduler {
             place_us = stats.place_us,
             revived = stats.revived,
             lingering = stats.lingering,
-            ring_pages = self.pool_read_ring.len(),
-            ring_mib = self.pool_read_ring.bytes() >> 20,
+            cache_entries = cache.entries,
+            cache_held_mib = cache.held_bytes >> 20,
+            cache_hits = cache.hits,
+            cache_misses = cache.misses,
+            cache_uncached = cache.uncached,
+            cache_evicted = cache.evicted,
             "pool:index_read"
         );
         for kind in [

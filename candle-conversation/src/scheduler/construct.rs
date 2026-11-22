@@ -309,7 +309,6 @@ impl Scheduler {
             wave_step_creep_layers: 0,
             section_relief_pacing: ReliefPacing::default(),
             reproject_census: ReprojectCensus::new(Instant::now()),
-            pool_read_ring: PoolReadRing::for_pool(pool_size),
             wave_step_creep_layer_pairs: 0.0,
             wave_retry: wave_retry::WaveRetry::default(),
             decode_retry: wave_retry::WaveRetry::default(),

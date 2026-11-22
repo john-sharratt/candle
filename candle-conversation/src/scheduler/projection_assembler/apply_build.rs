@@ -117,7 +117,8 @@ pub(in super::super) fn apply_segments_build(
     // A record is trusted only while the slot still reaches its end: anything
     // that cut the slot shorter since has taken the kept pieces with it. The
     // records live until the rebuild ends, and with them every page they hold:
-    // a piece re-placed finds its page still held (`HeldIndexPages`).
+    // a piece re-placed finds its page still in the index page cache, which
+    // evicts nothing held.
     let slot_blocks = block_count_of(ctx, parent_id)?;
     let held_records: Vec<PlacedPiece> = std::mem::take(&mut state.placed_pieces);
     let trusted = held_records

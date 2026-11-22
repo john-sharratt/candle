@@ -25,7 +25,10 @@ pub(super) mod tests {
 
     use crate::turn::Role;
 
+    use candle::host_region::HostRegion;
     use candle_nn::kv_cache::{ArenaLocation, SealedChunk, SealedSequence};
+
+    use crate::index_page_cache::{self, IndexPageCache};
 
     pub(in super::super) fn tags(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -300,16 +303,25 @@ pub(super) mod tests {
         );
     }
 
-    /// **A page a slot holds is not read off the log again.**
+    /// The index page cache the tests in this module read through: small,
+    /// pageable, and the process's (`index_page_cache::install_for_tests`).
+    fn test_cache() -> &'static IndexPageCache {
+        index_page_cache::install_for_tests(|| {
+            vec![HostRegion::pageable(16 << 20).expect("a test slab")]
+        })
+    }
+
+    /// **A page read once is not read off the log again.**
     ///
     /// A reprojection re-injects every turn behind the first piece that
     /// changed, and each one read its page from the log — 3,590 reads in a
-    /// 56 s turn, 7.1 s of its rebuilds. While a caller holds the bytes a read
-    /// produced, the same record hands back that very allocation; once the
-    /// last holder lets go, the next read goes to the log; and a new page for
-    /// the stream is read fresh, though the old one is still held.
+    /// 56 s turn, 7.1 s of its rebuilds. A page read from the log lands in the
+    /// index page cache, and the same record hands back that very allocation
+    /// whether or not anyone still holds it; a new page for the stream is read
+    /// fresh, though the old one is still cached.
     #[test]
-    fn a_held_page_is_read_from_the_log_once() {
+    fn a_page_is_read_from_the_log_once() {
+        let cache = test_cache();
         let conv = Conversation::ephemeral();
         let layer = LayerId::from_raw(1).expect("layer id");
         let group = GroupId::from_raw(1).expect("group id");
@@ -358,20 +370,23 @@ pub(super) mod tests {
             .expect("the turn has a page");
         assert!(
             Arc::ptr_eq(&held, &again),
-            "a held page is handed back, not read again"
+            "a cached page is handed back, not read again"
         );
         assert_eq!(again.bytes(), first.as_slice());
+        assert!(cache.stats().entries > 0);
 
+        let at = held.bytes().as_ptr();
         drop(again);
         drop(held);
         let fresh = conv
             .turn_index_page(tl, idx)
             .expect("the page reads")
             .expect("the turn has a page");
+        assert_eq!(fresh.bytes(), first.as_slice());
         assert_eq!(
-            fresh.bytes(),
-            first.as_slice(),
-            "with no holder left, the page is read from the log again"
+            fresh.bytes().as_ptr(),
+            at,
+            "with no holder left, the page is still the cache's, not read again"
         );
 
         let second = crate::index_pages::encode(&[(2, vec![9u8; 96])]);
@@ -384,16 +399,17 @@ pub(super) mod tests {
         assert_eq!(
             newer.bytes(),
             second.as_slice(),
-            "a new page for the stream is read, though the old one is still held"
+            "a new page for the stream is read, though the old one is still cached"
         );
         assert!(!Arc::ptr_eq(&newer, &fresh));
     }
 
-    /// **The in-memory lookup never reads the log.** A written page that no
-    /// caller holds is not found; once a read holds it, the lookup hands back
-    /// that very allocation; and when the holder lets go it is not found again.
+    /// **The in-memory lookup never reads the log.** A written page no read
+    /// has taken into the cache is not found; once a read has, the lookup
+    /// hands back that very allocation, whoever still holds it.
     #[test]
-    fn the_in_memory_lookup_finds_only_pages_held() {
+    fn the_in_memory_lookup_finds_only_cached_pages() {
+        test_cache();
         let conv = Conversation::ephemeral();
         let layer = LayerId::from_raw(1).expect("layer id");
         let group = GroupId::from_raw(1).expect("group id");
@@ -426,23 +442,23 @@ pub(super) mod tests {
 
         assert!(
             conv.turn_index_page_in_memory(tl, idx).is_none(),
-            "written and held by no one, the page is only in the log"
+            "written and read by no one, the page is only in the log"
         );
-        let held = conv
+        let read = conv
             .turn_index_page(tl, idx)
             .expect("the page reads")
             .expect("the turn has a page");
         let found = conv
             .turn_index_page_in_memory(tl, idx)
-            .expect("a held page is in memory");
-        assert!(Arc::ptr_eq(&held, &found), "the held allocation itself");
+            .expect("a cached page is in memory");
+        assert!(Arc::ptr_eq(&read, &found), "the cached allocation itself");
         assert_eq!(found.bytes(), page.as_slice());
 
         drop(found);
-        drop(held);
+        drop(read);
         assert!(
-            conv.turn_index_page_in_memory(tl, idx).is_none(),
-            "with no holder left, the page is the log's alone"
+            conv.turn_index_page_in_memory(tl, idx).is_some(),
+            "with no holder left, the cache still has it"
         );
     }
 }

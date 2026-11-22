@@ -37,7 +37,7 @@ use super::index_keys::{
     alloc_key_pages, bytes_ptr, scale_bytes, scale_plane_offset, scales_of, write_bytes,
     PAGE_BLOCKS,
 };
-use super::key_q8::{blocks, Q8Keys};
+use super::key_q8::{blocks, KeyPlanes, Q8Keys};
 use super::place::PLACE_TILE_R;
 use crate::models::piece_key::PieceKey;
 
@@ -111,6 +111,33 @@ impl ResidentPage {
         d: usize,
         device: &Device,
     ) -> Result<Vec<Arc<Self>>> {
+        let scales: Vec<Vec<u8>> = pages.iter().map(|(k, _)| scale_bytes(&k.scales)).collect();
+        let planes: Vec<(KeyPlanes<'_>, usize)> = pages
+            .iter()
+            .zip(&scales)
+            .map(|(&(k, last), s)| {
+                (
+                    KeyPlanes {
+                        codes: &k.codes,
+                        scales: s,
+                        dim: k.dim,
+                    },
+                    last,
+                )
+            })
+            .collect();
+        Self::place_planes(&planes, d, device)
+    }
+
+    /// [`Self::place_host`] from borrowed planes — a page's own bytes, read in
+    /// place. The uploads are queued on the device's stream; from pinned
+    /// memory they run asynchronously, so a caller whose bytes may be pinned
+    /// waits for the stream before it lets them go.
+    pub fn place_planes(
+        pages: &[(KeyPlanes<'_>, usize)],
+        d: usize,
+        device: &Device,
+    ) -> Result<Vec<Arc<Self>>> {
         let Device::Cuda(cuda) = device else {
             candle::bail!("qsa resident page: placed on a CUDA device");
         };
@@ -144,10 +171,9 @@ impl ResidentPage {
                 let used = chunk_rows(rows, c);
                 let (codes, scales) = host.rows(first, used);
                 // Both uploads are ordered on the stream the placement below
-                // and every later reader use; the driver has staged the bytes
-                // before each returns, so `host` may go.
+                // and every later reader use.
                 write_bytes(&stage[c], 0, codes)?;
-                write_bytes(&chunks[c], scale_plane_offset(d), &scale_bytes(scales))?;
+                write_bytes(&chunks[c], scale_plane_offset(d), scales)?;
                 jobs.push(bytes_ptr(&stage[c])? as i64);
                 jobs.push(bytes_ptr(&chunks[c])? as i64);
                 jobs.push(used as i64);

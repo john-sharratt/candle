@@ -70,6 +70,7 @@ pub mod fragmentation_probe;
 mod group_scanner;
 pub mod guest;
 mod handle;
+pub mod index_page_cache;
 pub mod index_pages;
 mod ingest_warmer;
 mod line_ends;

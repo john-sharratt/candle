@@ -158,6 +158,28 @@ pub struct HostSection {
     /// actually fail against. `None` off-Windows.
     pub commit_total_bytes: Option<u64>,
     pub commit_limit_bytes: Option<u64>,
+    /// The QSA index page cache (`docs/hit_driven_projection.md` §7.6): its
+    /// slab, what it holds, and its hits and misses since start. All zero when
+    /// the process holds none.
+    pub index_cache: IndexCacheSection,
+}
+
+/// The index page cache's slab and traffic.
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexCacheSection {
+    /// The share of host RAM the partition gives it.
+    pub target_bytes: u64,
+    pub pinned_bytes: u64,
+    pub pageable_bytes: u64,
+    /// Bytes of the blocks its entries hold.
+    pub held_bytes: u64,
+    pub entries: u64,
+    pub hits: u64,
+    pub misses: u64,
+    /// Pages read and not cached: larger than the largest block, or no block
+    /// could be had.
+    pub uncached: u64,
+    pub evicted: u64,
 }
 
 /// The admission throttle's live inputs and setpoint.

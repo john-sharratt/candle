@@ -66,7 +66,7 @@ replaced; §3 onward describes what replaced it.
 | `base_conv: Mutex<Sequence>`, ingest bases | `session/mod.rs` | the dialogue base, each ingest layer's base | forks, history reads | across `fork_resuming` |
 | `ConvLock<ConvState>` (tokio mutex) | per conversation | one turn in flight per conversation | turn path | the whole turn — **by design** (§8.4) |
 | `events_cache: Mutex` (inside the substrate) | `substrate/mod.rs` | decoded events memo | belief scans under the substrate read | decode under the inner lock |
-| `Conversation` side locks | `projection/resolver/mod.rs` | `normalization`, `maintenance` (status), `branch_checkpoint`, `gallery_cache`, `held_index_pages`, `conv_state_writes` | scheduler, persistence, API | `gallery_cache` taken inside a substrate read |
+| `Conversation` side locks | `projection/resolver/mod.rs` | `normalization`, `maintenance` (status), `branch_checkpoint`, `gallery_cache`, `conv_state_writes` | scheduler, persistence, API | `gallery_cache` taken inside a substrate read |
 | GalleryArena `residency`, `index_cache`, `zero_page`, dedup `book`/`masks` | `provenance/gallery_arena/` | resident pages, indices, codebook, masks | scheduler | `residency` across device uploads |
 | Writer `Backpressure` / `Progress` / handle | `persistence/writer.rs` | queue depth, write tickets | producers, the writer | flow control |
 | Minter | `persistence/identity/minter.rs` | origin sequence, section generations | every minting path | leaf |

@@ -27,6 +27,7 @@ use serde::Serialize;
 use super::admission::admit_quantum;
 use super::state_census::StateSection;
 use super::Scheduler;
+use crate::index_page_cache;
 
 /// One full memory snapshot. All byte quantities are raw bytes; consumers
 /// derive MiB. `None` sections mean the underlying source is unavailable in
