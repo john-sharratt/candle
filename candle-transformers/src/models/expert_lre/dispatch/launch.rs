@@ -581,8 +581,9 @@ impl Dispatch {
             use crate::models::nan_capture::checkpoint_q8a128;
             let (r, c, n) = (acts.rows, acts.cols, acts.byte_len());
             let nm = candle::tensor_assert::site("moe.norm_out.L", row);
+            let by = candle::tensor_assert::site("moe.routed_out.L", row);
             acts.with_device_ptr(cuda_dev, |p| unsafe {
-                checkpoint_q8a128(nm, p, r, c, n, cuda_dev)
+                checkpoint_q8a128(nm, by, p, r, c, n, cuda_dev)
             })?;
         }
         // The CPU experts' inputs out to the pool's ring — each distinct token
@@ -632,9 +633,13 @@ impl Dispatch {
         {
             use crate::models::nan_capture::checkpoint_q8a128;
             let (r, c, n) = (stacked.rows, stacked.cols, stacked.byte_len());
+            // Armed by its own name alone: the gather is sized to an upper
+            // bound with its padding rows unwritten, so a whole-buffer check
+            // reached from a downstream NaN would dump stale bytes. The gate
+            // capture dumps this operand beside the call that read it.
             let nm = candle::tensor_assert::site("moe.gathered.L", row);
             stacked.with_device_ptr(cuda_dev, |p| unsafe {
-                checkpoint_q8a128(nm, p, r, c, n, cuda_dev)
+                checkpoint_q8a128(nm, nm, p, r, c, n, cuda_dev)
             })?;
         }
 
