@@ -1,6 +1,6 @@
-# The §9.12 dependency battery — production, 2026-11-23 (l), (m) and (n): the probe's reach and reprojection in thinking
+# The §9.12 dependency battery — production, 2026-11-23 (l)–(o): the probe's reach and reprojection in thinking
 
-Three runs on BlackWorld, by the method of (j): each question in a fresh private chat, one at a
+Four runs on BlackWorld, by the method of (j): each question in a fresh private chat, one at a
 time, with the prefix "Answer from your memory of the repository only — do not call any tool, do
 not read or search any file. If you do not remember, say so.", scored by `score.rs`'s
 case-insensitive substring rules.
@@ -14,15 +14,22 @@ case-insensitive substring rules.
 - **(n)** on (m)'s build, restarted through keep with `reproject_in_thinking: true` and the probe
   still at 128, one minute after the load's normalization replay drained: the probe's reach
   alone changed against (l).
+- **(o)** is (m) repeated: the same build, restarted through keep with `reproject_in_thinking:
+  false` and the probe at 128, one minute after the normalization replay drained.
 
 ## Results
 
-| Category | (l) 256, in thinking | (m) 128, held | (n) 128, in thinking |
-|---|---:|---:|---:|
-| Direct | 25.0%, 0 full | 20.8%, 0 | 26.0%, 0 |
-| Transitive | 56.3%, 2 full | 51.0%, 1 | 64.6%, 2 |
-| Architectural | 66.7%, 5 full | 47.9%, 3 | 70.8%, 5 |
-| **All 24** | **49.3%, 7** | **39.9%, 4** | **53.8%, 7** |
+| Category | (l) 256, in thinking | (m) 128, held | (n) 128, in thinking | (o) 128, held |
+|---|---:|---:|---:|---:|
+| Direct | 25.0%, 0 full | 20.8%, 0 | 26.0%, 0 | 14.6%, 1 |
+| Transitive | 56.3%, 2 full | 51.0%, 1 | 64.6%, 2 | 50.0%, 2 |
+| Architectural | 66.7%, 5 full | 47.9%, 3 | 70.8%, 5 | 47.9%, 3 |
+| **All 24** | **49.3%, 7** | **39.9%, 4** | **53.8%, 7** | **37.5%, 6** |
+
+(o) by question: d1 0/2, d2 0/2, d3 2/2, d4 1/6, d5 0/4, d6 0/2, d7 0/3, d8 0/2; t1 2/4,
+t2 2/4, t3 4/4, t4 4/4, t5 2/3, t6 0/4, t7 0/3, t8 1/3; a1 3/3, a2 2/2, a3 0/3, a4 0/2, a5 2/2,
+a6 1/2, a7 1/3, a8 0/2. t3 reached full marks with `blocks.cuh` for the first time. a8, full in
+every earlier run, declined: the answer said both of its placed reads "came back empty".
 
 (n) by question: d1 1/2, d2 0/2, d3 1/2, d4 1/6, d5 1/4, d6 0/2, d7 2/3, d8 0/2; t1 3/4,
 t2 2/4, t3 3/4, t4 2/4, t5 2/3, t6 0/4, t7 3/3, t8 3/3; a1 3/3, a2 2/2, a3 1/3, a4 0/2, a5 2/2,
