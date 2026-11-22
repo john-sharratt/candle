@@ -317,7 +317,12 @@ out loud.*
 > `a_recurrent_model_reports_it_cannot_gap_fill`, which is the property the
 > test double once got wrong. F3 is asserted per-refusal where each is
 > exercised (see the D8 note). F4: the spec-decode accept path is the only
-> caller of sequence truncation and is refused (F1); the `<think>` partial
+> caller of sequence truncation (`truncate_sequences` in
+> `scheduler/decode/decode_step.rs`). A model that does not declare
+> `can_rewind_speculative_block` is refused (F1); the hybrid DeltaNet models
+> declare it and accept a block at `m` of its rows by folding the first `m`
+> rows of a per-layer timeline into the state (`deltanet_timeline.md`), which
+> chooses a row rather than rewinding the memory. The `<think>` partial
 > truncate was removed by P3.
 
 ---

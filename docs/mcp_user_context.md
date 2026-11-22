@@ -31,7 +31,7 @@ the context over on whatever tool the model calls first.
 | Piece | Where | What |
 |---|---|---|
 | The user's memory, `@group` | zend | The memory backbone's tree (`docs/memory_backbone.md`): each group's master, its people, topics and conversations, and `here`, beside every thread's and project's journal. Needs no attach. |
-| `journal_note` / `journal_read` / `journal_grep` on a memory path | zend | The journal tools take `@group/…`, a bare path in the conversation's group, and `here`, beside `T:` and `P:`. A memory note takes its terms: `by`, `source`, `expires`, `replaces` (`docs/zen_memory_and_guides.md` Phase 2). |
+| `journal_note` / `journal_read` / `journal_grep` on a memory path | zend | The journal tools take `@group/…`, a bare path in the conversation's group, and `here`, beside `T:` and `P:`. A memory note takes its terms: `by`, `source`, `expires`, `replaces` (`docs/zen_memory_and_guides.md`). |
 | `journal_forget {journal, says}` | zend | Removes the one line of a memory journal that says `says`. Thread and project journals stay append-only. |
 | `get_user_context` | zend, decorated by the aggregator | The conversation's frame: its own journal, each above it, the person, each group they frame — within the client's budget. The aggregator puts the client's guide in front of it. |
 | `user_episode_note` | zend, called by the aggregator only | Records a tool call that did something on the conversation's `journal.yaml`, its `activity` — never a line of its own. In no listing; the aggregator refuses it from a client. |

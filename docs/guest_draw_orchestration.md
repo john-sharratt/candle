@@ -25,6 +25,11 @@ Two releases:
 - **(b)** `MemberState::Paused`: while a draw holds a member's card, gateways
   route new work elsewhere. A wire change (protocol 7), §4.
 
+Release (a) is built (`npcd/src/authorize/`, `PREFER_PEER` and `Registry::pick_from`
+in the cluster crate). Release (b) is not: `MemberState` in
+`cluster/src/frame/types.rs` has no `Paused`, and there is no `GuestOccupancy`;
+§4 is the design.
+
 ## 1. Prompt authorization (a)
 
 A general layer: anything that must be cleared before it is acted on asks for
@@ -38,7 +43,7 @@ POST /v1/prompt/authorize   {purpose, prompt}
 ```
 
 **Who may call it.** A member, over a cluster socket (`from_member`,
-`host/src/cluster/up.rs:146`; the precedent is `npcd/src/authority/routes.rs`),
+`host/src/cluster/up.rs`; the precedent is `npcd/src/authority/routes.rs`),
 and an Admin. A member's call runs the check. An Admin's call with
 `"mint": true` issues the authorization without the check — the Admin vouches
 for content cleared another way (a curated set of portrait prompts, an
@@ -49,7 +54,7 @@ probing the filter (decided 2026-10-28).
 **The token.** `{purpose, prompt_sha256, exp_ms, sig}`:
 
 - `sig` is HMAC-SHA256 under `Join::derive_key("npcd prompt authorization")`
-  (`host/src/cluster/mod.rs:627`), over exactly the bytes
+  (`host/src/cluster/mod.rs`), over exactly the bytes
   `"{purpose}\n{prompt_sha256_hex}\n{exp_ms}"`, verified in constant time —
   as image links are (`npcd/src/image_links.rs:115-146`), but a type of its
   own with its own key. With no cluster the key is minted per process, as
@@ -156,11 +161,11 @@ footprint, which can push a batch-mate to `no_room` — the same as any draw.
 
 **Cancelling a queued job.** `GuestQueue::cancel(seq) -> bool`
 (`candle-conversation/src/guest/queue.rs`) and `ConversationEngine::cancel_guest`
-beside `submit_guest_watched` (`engine/services.rs:839`): removes the job while it is
+beside `submit_guest_watched` (`engine/services.rs`): removes the job while it is
 still queued — including one requeued to wait for room — answers its receipt
 `GuestError::Cancelled`, and **clears `waiting` and `retry_at_ms` when no job
 with `waiting_since` remains**: `waiting` closes prefill admission
-(`scheduler/prefill/admitting.rs:2144`), and a cancel that removed the last waiting job
+(`scheduler/prefill/admitting.rs`), and a cancel that removed the last waiting job
 without clearing it would close admission for good. `GuestError::Cancelled` is
 added to the exhaustive matches (`guest_routes.rs:312-319, 491-498`).
 
@@ -206,10 +211,10 @@ released or stopped.
 A member that wants a peer says so: the authorize request carries
 `x-tokera-prefer-peer` (`cluster::member::PREFER_PEER`), honoured only on a
 request that came up from a member — `from_member` set
-(`web/src/proxy.rs:253`). Placed by `Best`, it goes to a member that is neither
+(`web/src/cluster/route.rs`). Placed by `Best`, it goes to a member that is neither
 the sender nor a canary certifying; when none is left, back to the sender
 rather than to an unproven canary; and to the canary only when it is all there
-is (`Registry::pick_from`, `best_for_peer`; `Hub::pick_from`). Such a request is
+is (`Registry::pick_from`, `best_for_peer` in `cluster/src/gateway/registry/pick.rs`; `Hub::pick_from`). Such a request is
 never a canary's share and never mirrored to one: certification samples
 clients' traffic, and an unproven build is not handed the members' own. Every
 other request — a member's without the header included — is placed as a

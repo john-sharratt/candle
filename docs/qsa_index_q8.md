@@ -1,7 +1,11 @@
 # QSA index keys in Q8_0
 
-**Status:** design, agreed 2026-11-15; reviewed against the code the same day
-(§10 lists what the review changed). Built in the order of §9.
+**Status:** built. Agreed 2026-11-15 and reviewed against the code the same day
+(§10 lists what the review changed). Every completed key is Q8_0 on the card
+and on disk (`AUX_VERSION` 4), the migration program exists, and the scorer's
+wide arm runs on the INT8 tensor cores (§5). §2 describes the F32 layout the
+change started from; §3–§7 describe what stands; §9 keeps the rounds'
+measurements.
 
 The QSA index cache holds, per sequence and per full-attention layer, one pooled,
 RMS-normed, **un-rotated** key per block of `ratio` tokens: 128 channels, `ratio`
@@ -183,7 +187,9 @@ are never the same commit:
    baseline does not have. So it must hold the selection gate on its own, and
    the shadow scan, which scores in float, would no longer share the scorer's
    arithmetic to the last bit (its cut is a threshold on a ranking, so that is
-   tolerable, and is stated here so it is not discovered).
+   tolerable, and is stated here so it is not discovered). No `__dp4a` arm
+   stands in the kernel; the integer scoring that was built is the INT8
+   tensor-core arm below.
 
 The register budget is the constraint to watch: the `(4, 4, 2)` arm holds 32
 accumulators inside 80 registers, and the baseline adds the held `int4`s
@@ -217,10 +223,17 @@ operands. So:
   candidates' rotary channels into an `f16` tile in shared, then `mma.sync`
   `f16` against the `f16` query.
 
-Whether either beats `dp4a` at decode widths is the harness's question: at
-single-digit rows the scorer is load-bound, not FMA-bound. sm_86 has no int8
-MMA rung beyond what the BDP scan already degrades from; the round is measured
-on each machine it would ship to.
+Built: `qsa_score_mma.cuh` scores the wide arm on `mma.sync` INT8, at the
+released geometry (`D` = 128, a rotary width of 0, 64 or 128 channels). It
+quantizes the query tile to int8 once a block and requantizes the rotated half
+of a key, so its error carries its own bound
+(`candle-transformers/tests/qsa_score_rot_harness.rs`). `run_qsa_score_paged`
+takes it only from `QSA_MMA_MIN_ROWS` (16) rows and `QSA_MMA_MIN_CELLS`
+(2²² cells); under those, a decoding sequence or a shallow index is
+latency-bound and a thread per candidate is faster, so the float-dequantize
+arms (§5's baseline) still score it. sm_86 has no int8 MMA rung beyond what the
+BDP scan already degrades from; the arm is measured on each machine it ships
+to.
 
 ## 6. The host side
 
@@ -311,8 +324,8 @@ records rewritten in 40 s, the store read back with no `F32` record, and build
 
 **BlackWorld's zend store, dry run 2026-11-15:** 113,718 pages, 81,947 MiB →
 21,828 MiB; 28 snapshots; 0 foreign, 0 unreadable; 167,675,482 keys at 45.0 dB,
-cosine mean 0.999984, least 0.999955. Not yet migrated — BlackWorld deploys no
-motherd from main until it is.
+cosine mean 0.999984, least 0.999955. Whether BlackWorld has been migrated is
+not recorded here.
 
 ## 9. The micro-harness, and the tuning method
 

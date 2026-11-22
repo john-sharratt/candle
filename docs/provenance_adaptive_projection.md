@@ -1,8 +1,14 @@
 # Provenance-Adaptive Projection — Scoring Coverage, Attention Budgets, Turn Locality, Anchors, Momentum, Probe Composition, Consensus Fusion
 
-**Status:** design — approved direction, pre-implementation. Revised 2026-08-02
-with the experiment-battery evidence (§2.4); v1's Concepts A–E stand refined,
-Concepts F and G are new and measurement-driven.
+**Status:** built — Concepts A (normalization), B (adaptive budgets: `adaptive`
+on a layer's budget, `budget_adaptive` on a group), C (`locality`), D
+(`anchor`), F (`question_pin`) and G (`fusion`) are policy and group values in
+`projection/adaptive.rs` and the scan; E (momentum) was measured and rejected
+and ships nothing. Revised 2026-08-02 with the experiment-battery evidence
+(§2.4); v1's Concepts A–E stand refined, Concepts F and G are new and
+measurement-driven. §2 records the state the design started from, and its
+`file:line` references are to the `provenance-projection` branch head of that
+date. A.4's level prior was later removed (see there).
 **Branch:** `provenance-projection`.
 **Prereq reading:** `docs/tool_selection_provenance_results.md` (§23+ shipped design),
 `docs/provenance_score_normalization.md`. Companion harness:
@@ -70,8 +76,9 @@ for an observed failure — and §2.4's contamination finding constrains it.
 
 ## 2. Current state (verified against the tree)
 
-This section is the ground truth the design builds on. File:line refs are to the
-`provenance-projection` branch head.
+This section records the ground truth the design was built on, as of 2026-08-02
+(Concepts A–G have since landed on it). File:line refs are to the
+`provenance-projection` branch head of that date.
 
 ### 2.1 Scoring pipeline
 
@@ -215,16 +222,17 @@ everywhere, (b) Concept B can compare attention *across* layers and collections.
 
 ### A.1 Normalize the collection path
 
-`ScopeKey::Collection{group, name}` already exists in the normalization keyspace
-(`normalization/mod.rs:38-46`) but is never invoked. Change
-`score_belief_collections` to mirror the turn-group path:
+`ScopeKey::Collection{group, name}` sits in the normalization keyspace
+(`normalization/mod.rs`), and `score_belief_collections` mirrors the turn-group
+path:
 
-- scope = `ScopeKey::collection(collection_name)`, child = `ChildKey::Named(section
-  name)`;
+- scope = `ScopeKey::collection(group, collection_name)`, child =
+  `ChildKey::Named(section name)`;
 - `normalize` on every reprojection, `observe` only at seal (same
-  read/learn split as turn groups, `projection/resolver/belief_groups.rs:1100-1107`);
-- warm replay (`ensure_normalization_warm`, `projection/resolver/warm_replay.rs:648`) extends to collection
-  scopes so a daemon restart does not reset tool scoring to priors.
+  read/learn split as turn groups, `projection/resolver/belief_groups.rs`);
+- warm replay (`Conversation::take_warm_replay`, `projection/resolver/warm_replay.rs`;
+  `warm_collection_normalization` for the tool catalog's exemplars) covers
+  collection scopes so a daemon restart does not reset tool scoring to priors.
 
 **Threshold migration.** `committed_tool_scope` min 800 / evict 600 are raw-scale;
 under normalization a *sustained strong* match sits near 1000 by construction —
@@ -417,11 +425,12 @@ no selector change.
 ### B.5 What a layer needs — open (measured 2026-10-24)
 
 The analysis layers above a file's reading project by their scan scores, and
-those scores do not say whether a layer is needed. `dependency_analysis` is the
-one left; `static_analysis`, `architectural_analysis`, `critical_analysis` and
-`bug_analysis`, with `daily_history` and `dream_log`, were removed from the
-design and their conversations tombstoned on 2026-10-25, to be built again
-another way. Replaying a conversation about the paper (`1f283ffd`, then
+those scores do not say whether a layer is needed. `static_analysis`,
+`architectural_analysis`, `critical_analysis` and `bug_analysis`, with
+`daily_history` and `dream_log`, were removed from the design and their
+conversations tombstoned on 2026-10-25, to be built again another way;
+`dependency_analysis`, `code_review` and `security_review` have since left the
+schema too (`zend/src/layers/removed.rs`). Replaying a conversation about the paper (`1f283ffd`, then
 `cbac2859` with every group's raw order statistics on the projection event),
 while they stood:
 
@@ -743,14 +752,10 @@ values proposed for the first iteration:
 # no surface.
 default_policy:
   preset: high_recall_scope
-  normalized: true           # all belief scoring on the normalized band (the only mode
-                             # after migration; the key exists so presets can carry
-                             # re-derived thresholds explicitly)
   fusion:                    # additive | content_gated | consensus_min | consensus_geo
     mode: content_gated      # (per axis: content axes gated, tools additive — F8/F9)
     gate_group: 0            # which fold group gates (the content fold for this model)
-  probe:
-    question_pin: true       # Concept F: pinned Q-window (the persisted user span,
+  question_pin: true         # Concept F: pinned Q-window (the persisted user span,
                              # F12) + decode tail, max-fused
   mass:                      # Concept B — mass definition; a policy knob like any
     concentration_top_k: 1   # other (inherited from default_policy, overridable
@@ -760,8 +765,9 @@ default_policy:
 Parsing lands in `projection/yaml/parse_groups.rs` beside the existing `parse_selection`/`parse_default`;
 validation (rails: `adaptive.max_percent ≥ max_percent ≥ min_percent`,
 `absolute_max ≥ k`, `decay ∈ (0,1]`, `gain ≥ 0`,
-`concentration_rho ≥ 0`, fusion ∈ the three modes) in `validate_policy`'s
-sibling. Every knob has a schema-level default equal to today's behavior
+`concentration_rho ≥ 0`, fusion ∈ the four modes) in `validate_policy`'s
+sibling. All belief scoring reads the normalized band; there is no
+`normalized:` key. Every knob has a schema-level default equal to today's behavior
 (`fusion: additive`, `question_pin: false`, static mass), so
 existing YAML files parse and behave unchanged until they opt in.
 
@@ -820,12 +826,13 @@ Per dialogue turn of the target conversation, in order:
 
 Determinism: the harness is pure CPU scoring over stored bytes — no model, no
 sampling — so every run is bit-identical and CI-able. Normalization state is
-rebuilt by corpus-order warm replay (the shipped `ensure_normalization_warm` path)
+rebuilt by corpus-order warm replay (the shipped `take_warm_replay` path)
 so learned levels are reproducible.
 
 ### 11.2 Expectations fixture for the tour conversation
 
-`candle-conversation/tests/fixtures/selection_replay_tour.json` (checked in):
+The hand-authored spec is `candle-conversation/tests/selection_replay_data/ideal_projections.json`
+(checked in, with the recorded probes beside it); the shape the original sketch gave it:
 
 ```json
 {
@@ -983,7 +990,7 @@ Concept E ships nothing (measured-rejected, §7/F13); there is no phase 6.
   concentration `k`/`ρ` first values (B.1 — measured low-stakes), repo_map
   `layer_weights` (F6 invalidates the `[0,1,1]` inheritance).
 - **Production-faithful confirmation:** the §11 selection-replay harness
-  against the snapshot (full `ensure_normalization_warm` + belief chain — the
+  against the snapshot (full `take_warm_replay` + belief chain — the
   venue where F15's cross-axis discrimination and F17's warm-level code
   verification are asserted), then the live `provenance_query_eval` suite
   (100 labeled queries) after the daemon restarts as the end-to-end check.

@@ -43,9 +43,9 @@ tools today:
 
 | Conversation | Made by | Tools mode | Operations tools (`OpsRunner`) |
 |---|---|---|---|
-| **Dialogue**: a person talking to Zen in zend's own UI, or any conversation not made by `/mcp` | the zend GUI and API | the person's role: Comprehensive for an Admin (`zend/src/access.rs:43-49`) | **none.** `OpsTools::run` refuses any conversation whose id is not `mcp:<owner>:<thread>/<name>`: "is for a task Claude delegated through this MCP server, and this conversation is not one" (`zend/src/mcp/ops_tools.rs:213-218`) |
-| **Task worker**: `repo_task_start` | Claude through `/mcp` | the caller's role (`docs/claude_zend_gateway.md` §3.4) | the eleven of `WORKER_TOOLS` (`ops_tools.rs:140-152`); the two that change something only for a `coder` |
-| **Chat**: `zen_chat_send` | Claude through `/mcp` | the caller's role (`docs/zen_chat.md`) | as a worker of kind `Chat`, so read only: `Needs::Changes` refuses every kind but `Coder` (`ops_tools.rs:166-168`) |
+| **Dialogue**: a person talking to Zen in zend's own UI, or any conversation not made by `/mcp` | the zend GUI and API | the person's role: Comprehensive for an Admin (`zend/src/access.rs`, `effective_mode`) | **none** when this was written: `OpsTools::run` refused any conversation whose id is not `mcp:<owner>:<thread>/<name>` (`zend/src/mcp/ops_tools.rs`); §4.1 is what changed it |
+| **Task worker**: `repo_task_start` | Claude through `/mcp` | the caller's role (`docs/claude_zend_gateway.md` §3.4) | the eleven of `WORKER_TOOLS` when this was written (`zend/src/mcp/ops_tools.rs`; the table has grown with §4–§6); the two that change something only for a `coder` |
+| **Chat**: `zen_chat_send` | Claude through `/mcp` | the caller's role (`docs/zen_chat.md`) | as a worker of kind `Chat`, so read only when this was written: `Needs::Changes` refused every kind but `Coder` (`ops_tools.rs`); §6.1 (D5) is what changed it |
 
 The zend-tools catalogue itself is the same for all three. In Comprehensive
 mode it holds the file, git, run, web, network, crypto, credential, notes,
@@ -59,7 +59,7 @@ are in what the operations runner will serve, and in which tools only
 
 | # | Gap | Today |
 |---|---|---|
-| S1 | A dialogue cannot read the cluster at all | `ops_tools.rs:213` |
+| S1 | A dialogue cannot read the cluster at all | `OpsTools::run` in `ops_tools.rs` |
 | S2 | No member's replication state is readable: phase, link, generation, catch-ups per substrate | `/v1/status` carries them, but `cluster_status` renders members and tenants and none of them (`zend/src/mcp/tools/cluster_status.rs`) |
 | S3 | A machine whose motherd is restarting simply vanishes from `cluster_status`. keep knows it is mid-trial; the member list does not say so | `cluster_status` reads `/v1/status` and `/gateway/status.json`; `service_status` reads keep, separately |
 | S4 | `layer_read` is not offered to Zen | `/mcp` only (`docs/claude_zend_gateway.md` §8.5) |
@@ -69,11 +69,11 @@ are in what the operations runner will serve, and in which tools only
 
 | # | Gap | Today |
 |---|---|---|
-| D1 | `repo_job_start` is not a Zen tool. The runner dispatches it (`ops_tools.rs:189`), but it is not in `WORKER_TOOLS` and zend-tools defines no tool for it | A worker builds only its overlay through `run_command`, on whichever agent the gateway picks |
+| D1 | `repo_job_start` is not a Zen tool. The runner dispatches it (`ops_tools.rs`), but it is not in `WORKER_TOOLS` and zend-tools defines no tool for it | A worker builds only its overlay through `run_command`, on whichever agent the gateway picks |
 | D2 | No maintenance command: neither the Look and Care classes nor Decide | `cluster_command` is `/mcp` only (`claude_zend_gateway.md` §8.2) |
 | D3 | No `service_control` (restart, start, stop through keep) | `/mcp` only (§8.4) |
 | D4 | No `gateway_command`, `layer_toggle` or `timeline_delete` | `/mcp` only (§8.2, §8.5) |
-| D5 | A chat may not deploy or cancel | `Needs::Changes` (`ops_tools.rs:166`) |
+| D5 | A chat may not deploy or cancel | `Needs::Changes` (`ops_tools.rs`) |
 | D6 | Zen cannot write memory: no `journal_note`, `_create`, `_link` | Zen holds `journal_read`, `_grep`, `_check`, `_move` (`zend-tools/src/tools/journal/`); memory reaches its journals only by distillation |
 | D7 | A dialogue or a chat cannot start long work: no `repo_task_start` or task tools | Nothing starts a task from a dialogue; §6.3 gives dialogues, chats and tasks the task tools, nesting one level |
 | D8 | No bot actions: mission give/step/cancel, message send, channel post | npcd's tools, on `/mcp` only |
@@ -86,7 +86,7 @@ are in what the operations runner will serve, and in which tools only
 | K1 | A Decide command runs only with a person's approval | `claude_zend_gateway.md` §11. §5 is how Zen asks |
 | K2 | Wipes, `offline`/`online`, `drain-gateway`/`undrain-gateway`, keep's `/accept` and `/exit` | Done on the machine: none can be undone through the gateway, or reached back once done (§8.2, §8.4) |
 | K3 | Pushing to `main` | Branches only (§11) |
-| K4 | `run_command` runs only `cargo` | The agents' allow-list (`agent/src/member.rs`, `CommandPolicy::allowing(["cargo"])`). A wider list is a separate decision, not part of this |
+| K4 | `run_command` runs only the build, test and packaging toolchains, never a shell | The agents' allow-list (`zend-vfs/src/sandbox/programs.rs`, `PROGRAMS`: `node`, `npm`, `cargo`, `python`, `go`, `dotnet`, `make` and their kin). A wider list is a separate decision, not part of this |
 | K5 | The person's own accounts as Claude's connectors hold them: mail, calendar, drive, documents, artifacts | They are bound to the person's claude.ai account, not to the estate. Zen reaching them would be a separate grant of the person's, designed on its own |
 | K6 | Editing, forgetting or accepting another's memory lines, and changing groups | The person's and Claude's (§6.2) |
 | K7 | A shell on a machine | Zen sees through tools that state what they read (§4.2). An arbitrary shell is what K4 already refuses |

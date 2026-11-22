@@ -17,8 +17,8 @@ for however long the owner was busy with the engine's own appends ahead of it.
 | Writer | Where | How often |
 |---|---|---|
 | an agency act (`plan_*`, `orders_*`) | `effector/plan.rs` | every act a character takes in a turn |
-| a mood | `tenant/mod.rs` (`remember_mood`) | whenever a character names a new register |
-| the replication refresh | `tenant/mod.rs`, `authority/cast.rs` | every pass that takes in another member's writes — and it walked every character's record location inside the same owner call |
+| a mood | `tenant/routes_and_sinks.rs` (`remember_mood`) | whenever a character names a new register |
+| the replication refresh | `tenant/tenant_start.rs`, `authority/cast.rs` | every pass that takes in another member's writes — and it walked every character's record location inside the same owner call |
 | a console edit | `api/mod.rs`, `portrait.rs` | a person pressing save |
 
 `tokio::sync::RwLock` is fair: a writer waiting holds back every reader that
@@ -84,7 +84,7 @@ cast it publishes.
 
 A write's computation runs on the persistence owner's thread. It must be pure
 over the `Cast` it is handed: no call back into the owner (that would wait on
-itself), no await, no I/O. Every write in `npcs/mod.rs` is validation and a record
+itself), no await, no I/O. Every write in `npcs/methods.rs` is validation and a record
 built from the snapshot.
 
 ## 3. What remains
@@ -102,8 +102,8 @@ the owner, and the owner serves every queued call before it stops
 
 | Invariant | Test |
 |---|---|
-| a refused write publishes nothing and appends nothing | `npcs::tests::a_refused_write_publishes_nothing` |
-| a reader's snapshot is unchanged by a later write | `npcs::tests::a_snapshot_is_not_moved_by_a_write` |
-| concurrent writes to one character lose nothing | `npcs::tests::concurrent_writes_to_one_character_all_land` |
+| a refused write publishes nothing and appends nothing | `a_refused_write_publishes_nothing` (`npcs/tests_fields.rs`) |
+| a reader's snapshot is unchanged by a later write | `a_snapshot_is_not_moved_by_a_write` (`npcs/tests_concurrency.rs`) |
+| concurrent writes to one character lose nothing | `concurrent_writes_to_one_character_all_land` (`npcs/tests_concurrency.rs`) |
 | `break_down`s in a row never share a child id | `effector::plan::tests::break_downs_in_a_row_each_mint_their_own_child` |
 | the refresh takes in another member's records | the existing replication tests (`authority/cast.rs`) |

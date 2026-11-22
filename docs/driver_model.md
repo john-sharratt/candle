@@ -198,7 +198,7 @@ driver refuses honestly; under WDDM the cap on free memory is what stops it.
 
 WDDM batches submissions in the driver until something flushes them, and the
 graph hub ends a segment with a `cuStreamQuery` for that purpose alone
-(`graph/hub.rs`, `query_submits`) — the host threads that wait on a summary
+(`cuda_backend/graph/hub.rs`, `query_submits`) — the host threads that wait on a summary
 word would otherwise wait for WDDM to submit the bucketize writing it. Under
 TCC and Linux a launch is submitted as it is issued, so `query_submits` returns
 without the call.

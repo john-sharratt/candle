@@ -27,20 +27,23 @@ append, rotated at read):
 | ROPE bands 14–15 | `[448, 512)` | **BF16** (pre-rotation) | 128 | float, 8-bit mantissa, matches the window tier; no √2 margin, no clip |
 
 Total **576 B/entry** (vs 2048 f32 → 3.6× smaller hot; vs 512 all-int8 → +12.5%
-to buy back the rope precision). The canonical `attn` f32 stays for merge/rebuild
-but becomes ARCHIVAL — always CPU-resident, off the hot substrate.
+to buy back the rope precision). No f32 copy of the latent
+is kept: the int8+BF16 two-region cache is the canonical stored form.
 
-Gallery buffers:
-- `attn_i8`   `[cap, NOPE_DIM=448]` u8      — nope int8
-- `attn_scale``[cap, NOPE_BANDS=14]` f32    — per-nope-band amax scale
-- `attn_rope` `[cap, ROPE_DIM=64]` bf16     — rope bands, pre-rotation
-- `attn`      `[cap, HEAD_DIM]` f32          — canonical, now ARCHIVAL (always CPU)
+Gallery buffers (`FloatGallery`, `latent_moe/gallery/mod.rs`):
+- `nope_i8`    `[cap, NOPE_DIM=448]` u8      — nope int8
+- `nope_scale` `[cap, NOPE_BANDS=14]` f32    — per-nope-band amax scale
+- `rope_bf`    `[cap, ROPE_DIM=64]` bf16     — rope bands, pre-rotation
+
+There is no f32 `attn` buffer: the two-region cache IS the stored latent. Reference and
+bench callers that want dense f32 rows reconstruct them from it
+(`FloatGallery::two_region_rows_f32`).
 
 ## Read contract (decode + prefill comp path)
 
 For entry `gid`, dim `d`:
-- `d < NOPE_DIM`: `attn_i8[gid][d] * attn_scale[gid][d/32]`
-- `d >= NOPE_DIM`: `bf16→f32 attn_rope[gid][d-NOPE_DIM]`
+- `d < NOPE_DIM`: `nope_i8[gid][d] * nope_scale[gid][d/32]`
+- `d >= NOPE_DIM`: `bf16→f32 rope_bf[gid][d-NOPE_DIM]`
 Then rotate the rope dims at the entry's position and re-quantize into the int8 QK
 operand (decode: per-slot pos; prefill: baked at `comp_pos`). Both paths now derive
 from the SAME position-free bytes → the divergence closes (only `comp_v8`'s
@@ -57,9 +60,9 @@ corpus-global PV scale remains, already documented).
    buffers — no per-wave build. Validate paged gate + wave_paris.
 4. **Prefill** pre-pass reads the two-region cache, dequant → rope → requant into
    the baked `comp_i8`/`comp_v8`. Validate prefill parity + wave_paris.
-5. **Tier flip.** `attn` f32 is CPU-archival at all depths; the int8 two-region
+5. **Tier flip.** The int8 two-region
    cache + Indexer `keys` are the HOT tier — GPU-resident below `HOT_ENTRY_CAP`,
-   spilling together to CPU RAM past it (re-heated per query by `gather_corpus`,
+   spilling together to CPU RAM past `HOT_ENTRY_CAP` (8192 entries; re-heated per query by `gather_corpus`,
    ~576 B/entry — 3.5× cheaper than the old f32 pair). `signs`/`pos` stay GPU at
    any depth so the BDP scan never touches RAM. This keeps the resident footprint
    bounded at unbounded corpus depth. Validate memory + a large-ingest run.
@@ -76,11 +79,11 @@ corpus-global PV scale remains, already documented).
 
 - **Stage 1** — `latent_build_corpus_cache_kernel` + FFI + CPU mirror `build_corpus_cache` + byte-exact test `corpus_cache_two_region_bytes`. ✅
 - **Stage 2** — decode reads the two-region cache (`comp_i8`→`nope_i8`+`nope_scale`+`comp_rope`); `CorpusCache` holds the three buffers + `comp_pos`. ✅
-- **Stage 3** — prefill closes the divergence: the nope bands already agree (both int8 of f32); the pre-pass now sources the two-region cache directly (or, transitionally, rounds the rope tail through BF16), so both paths derive from ONE representation. ✅
+- **Stage 3** — prefill closes the divergence: the nope bands already agree (both int8 of f32); the pre-pass sources the two-region cache directly, so both paths derive from ONE representation. ✅
 - **Stage 4** — the `FloatGallery` builds the two-region cache on append (`build_corpus_cache_into`) and serves it via `gather_corpus`; decode and prefill are unified on `&CorpusCache` (no per-assembly rebuild). ✅
-- **Stage 5** — tier flip: `attn` f32 is CPU-archival (built from the incoming GPU rows, then archived — never in VRAM); the two-region cache + Indexer `keys` are the HOT tier, GPU below `HOT_ENTRY_CAP` and spilling together to CPU RAM past it (`gather_corpus` re-heats the bounded selection); `signs`/`pos` stay GPU at any depth. Hot VRAM is bounded at unbounded depth. ✅
+- **Stage 5** — tier flip: the two-region cache + Indexer `keys` are the HOT tier, GPU below `HOT_ENTRY_CAP` and spilling together to CPU RAM past it (`gather_corpus` re-heats the bounded selection); `signs`/`pos` stay GPU at any depth. The f32 latent is not kept at all (the two-region cache is canonical). Hot VRAM is bounded at unbounded depth. ✅
 - **Cleanup** — removed the dead uniform builder (`latent_quant_corpus_range_kernel`), its FFI (`run_latent_corpus_cache_build`), and `quant_bands_corpus`; repurposed `corpus_cache_is_position_free` to the two-region format.
 
-**Net:** the hot retrieval artifact is the position-free int8+BF16 cache (~576 B/entry vs 2 KB f32); the compressed rope bands match the window tier's BF16 (no √2 int8 margin); decode and prefill share one representation (divergence closed); the canonical f32 is archival.
+**Net:** the hot retrieval artifact is the position-free int8+BF16 cache (~576 B/entry vs 2 KB f32); the compressed rope bands match the window tier's BF16 (no √2 int8 margin); decode and prefill share one representation (divergence closed); there is no separate f32 archive.
 
-**Validation:** `latent_moe::paged::tests` (22/0, incl. `corpus_cache_two_region_bytes` + prefill↔decode parity), `corpus_cache_is_position_free` (CPU), gallery spill/gather tests, `wave_paris` (3/3) — all green.
+**Validation:** the `latent_moe::paged` tests (`tests_oracle.rs`: `corpus_cache_two_region_bytes`, `corpus_cache_is_position_free`; `tests_prefill.rs`: prefill↔decode parity), the gallery spill/gather tests (`gallery/tests_selection.rs`, `gallery/tests_gather.rs`), and the wave gates in `latent_moe/wave/tests_prefill.rs` (`wave_prefill_then_decode_end_to_end`, `wave_prefill_state_matches_decode_steps`).

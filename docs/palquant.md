@@ -2,6 +2,8 @@
 
 **John Sharratt**
 
+*Status of this text: it reports the measurements and candidate lists of the system as the paper evaluated it. The engine's production candidate lists and thresholds have since been re-derived per model (`candle-nn/src/kv_cache/chunked/sampled_selection/params/production_tables.rs`), and the format set has grown past the 16-format codebook of §3.1 and Appendix B: Q5_0 and Q5_1 fill the Q4_1 to Q8_0 gap in the mid levels, and R16 and Q4_KS are in the format enum (`candle-nn/src/kv_cache/mod.rs`). The tables below are the paper's, not the production ones.*
+
 ---
 
 ## Abstract

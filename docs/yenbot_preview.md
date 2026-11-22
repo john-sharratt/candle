@@ -1,6 +1,9 @@
 # Yen Bots previews: an app on claude.ai, published from the page
 
-**Status: design, not built.** This document is authoritative for how a Yen
+**Status: the connector's side is built; the kit lives in the yenbot repository.**
+In this repository the file tools and transfers (`file_upload_and_commit`,
+`file_download_and_commit`), the tool-list-changed notice, and the guides
+(`mcp/src/guides/claude.md`, `files.md`, `yen-apps.md`) are in place. This document is authoritative for how a Yen
 Bots app is previewed on claude.ai and published from that preview. It rests
 on the file tools and transfers of `docs/mcp_file_tools.md` (§2, §3, §3.6) and
 on the app host of `docs/yenbot_app_host.md`, which it amends in §5.4, §16 and
@@ -136,7 +139,7 @@ Three sources, the last of them ours:
    call contract, current for the contract version a page is built on.
 2. **The connector's tool descriptions** teach each tool's arguments.
 3. **Ours** teaches the recipe:
-   - The Claude client guide (`mcp/src/guides/memory.md`, `clients:
+   - The Claude client guide (`mcp/src/guides/claude.md`, `clients:
      [claude-code, claude-ai, other]`) carries one line, at the front of the
      first call of every conversation (`docs/mcp_user_context.md` §2.4–§2.5):
      building or changing a Yen Bots app starts with `yen-apps`, and is

@@ -310,7 +310,7 @@ read and write, which seal or open its whole file; none holds a lock while it st
    subject that names none and draws nothing is no unit of work and waits for no card
    (`is_errand`).
 6. **Nothing waits on what it does not need.** A first call never waits for the user's
-   context (`mcp/src/reading.rs`); independent requests run together, not one after another; a
+   context (`mcp/src/context.rs`, and `App::note_use` in `mcp/src/app.rs`, which tells the record off the call); independent requests run together, not one after another; a
    log search reads back only as far as its answer needs.
 
 The gate is `cargo test --release -p zend --lib latency -- --ignored --test-threads=1`

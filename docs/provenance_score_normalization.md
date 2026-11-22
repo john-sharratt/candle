@@ -105,7 +105,7 @@ formula the normalization gate measured best (`provenance_gates normalization`,
   a dozen tools past 2600 — a flat, high band nothing was told apart in. So
   `fold_warm_probes` scores each tool's exemplars against the gallery minus
   that whole tool (its sibling exemplars win every vote as surely as its own
-  window), and `warm_timeline` each self-probe against its file minus its
+  window), and `warm_timeline_normalization` each self-probe against its file minus its
   exchange (`FileScan::without_exchange`). Each sample is then what the
   other candidates score on a probe that is not about them, which is what a
   background is. One scan per member or exchange probed, the same probe work
@@ -370,6 +370,8 @@ nothing per candidate and the cache can reason about them (§4.3 eviction):
   token distribution, not a score competition (§3.3):
   - `TurnGroup { group: u64, timeline: u64 }` — a turn group's gallery on a
     specific timeline. A re-scan mints a new timeline → a new scope.
+  - `Pool { group: u64 }` — a group's one-exchange documents competing as one
+    gallery (§3.3a); children are keyed `ChildKey::Timeline`.
   - `Collection { group: u64, name: String }` — a section collection (tool
     catalog); its gallery is stable, so no timeline.
   - `CollectionPhase { group: u64, name: String, phase: Phase }` — the same
@@ -378,8 +380,9 @@ nothing per candidate and the cache can reason about them (§4.3 eviction):
     `(group, name)`, which is what a child it has not yet learned falls back to.
   - `SubWindow { turn: u64 }` — a sub-window within one turn (future).
 - `ChildKey` — a candidate within a scope: `Turn(u64)` (turn index — allocation-
-  free, stable within a gallery version) or `Named(String)` (tool / section name,
-  how `belief_gallery` already keys collection members via `slot_of(tag)`).
+  free, stable within a gallery version), `Named(String)` (tool / section name,
+  how `belief_gallery` already keys collection members via `slot_of(tag)`) or
+  `Timeline(u64)` (a pooled document, by its timeline's raw id).
 - `Background { zeros: u32, bins: Vec<(u16, u32)>, total: u32 }` — one child's
   samples: those of no evidence, and the rest as `(bin, count)` ascending.
 - `ScopeState { children: HashMap<ChildKey, Background>, pooled: Background,
@@ -472,18 +475,23 @@ evicted.
 
 ### 4.4 Warm-on-load
 
-The cache is **not** left cold on restart. On the first belief scan after load,
-`ensure_normalization_warm` replays the substrate's existing **sealed dialogue
-turns** (empty-tagged; gallery turns are tagged) through the same turn-group scan
-with `observe = true`, so the backgrounds are rebuilt to what live traffic would
-have produced. The tool collection's exemplars and each ingested file's own turns
-are folded too (`warm_collection_normalization`, `warm_ingest_normalization`),
-each with its own member or exchange as the probe's answer, and scored against
-the gallery without it (§3.1). Details that matter:
+The cache is **not** left cold on restart. At the first projection of a
+dialogue target after load, `Conversation::take_warm_replay` hands back the
+substrate's existing **sealed dialogue turns** (empty-tagged; gallery turns are
+tagged), and the scheduler scores each with `Conversation::score_warm_probe`
+through the same turn-group scan with `Observe::Yes`, on its gallery arena in the
+gaps higher-priority work leaves, so the backgrounds are rebuilt to what live
+traffic would have produced. The tool collection's exemplars and each ingested
+file's own turns are folded too (`warm_collection_normalization`,
+`warm_ingest_normalization`), each with its own member or exchange as the probe's
+answer, and scored against the gallery without it (§3.1). Details that matter:
 
-- **Exactly once, no half-warm reads.** Guarded by `std::sync::Once`, which blocks
-  any concurrent first callers until the replay completes — so a second session
-  can't score against a partially-warmed cache.
+- **Once, re-armable, best-effort.** An atomic flag arms the replay: the first
+  call takes it, and `reset_normalization_warm` clears it after an ingest
+  reconcile so files added later are learned too. A reprojection that runs while
+  the replay is still scoring may read a still-warming cache; the once-per-turn
+  seal-observe keeps warming it. A replay is never armed from an ingest-time
+  (append-only target) scoring pass.
 - **Order-free.** A background is counts, so the warmed state does not depend on
   the order turns are folded in.
 - **Bounded cost.** Only the most recent `WARM_REPLAY_MAX_TURNS` (512) turns are
@@ -493,24 +501,20 @@ the gallery without it (§3.1). Details that matter:
   reuses the live scan, so it also computes normalized scores it discards — reusing
   the scan beats duplicating the sub-window flattening for a marginal saving.
 
-Remaining follow-up: the replay still runs on the *first reprojection* (hot path).
-At 512 turns that is negligible; moving it to an explicit pre-serving startup step
-would remove even that first-scan blip.
-
 ---
 
 ## 5. Integration points
 
 The cache lives on the `Conversation` substrate handle (`Arc<Mutex<…>>`, shared
-across clones, not persisted). `score_beliefs` carries an `observe: bool` that
-splits read from write:
+across clones, not persisted). `score_beliefs` carries an `Observe` that
+splits read from write (`Observe::No`, or `Observe::Yes { tags, source }`):
 
-- **Read** (`observe = false`, every reprojection): `projection/resolver/belief_groups.rs::score_belief_groups`
+- **Read** (`Observe::No`, every reprojection): `projection/resolver/belief_groups.rs::score_belief_groups`
   computes the raw fresh scores, calls `cache.normalize(scope, raw)`, and feeds the
   **normalized** scores to `set_turn` / the challenger candidates. Runs from the
-  scheduler reproject loop (`mod.rs`, passes `false`).
-- **Write** (`observe = true`, once per turn): `conversation/sequence_lifecycle.rs::last_turn_belief_scores`
-  is the seal-time whole-turn scan; it passes `observe = true`, so after computing
+  scheduler reproject loop.
+- **Write** (`Observe::Yes`, once per turn): `conversation/sequence_lifecycle.rs::last_turn_belief_scores`
+  is the seal-time whole-turn scan; it observes, so after computing
   the same raw scores the group scan folds them into the backgrounds. The only
   live writer — reprojections never learn.
 

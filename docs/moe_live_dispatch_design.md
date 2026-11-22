@@ -106,7 +106,7 @@ next layer …
   no bytes itself: the GEMM workers fill the slots it offers, for misses and
   for read-ahead alike, and no GPU wait depends on anything it does.
 - **Bit-identical results.** A warm slot and a pad slot hold the pack record,
-  which is the VRAM slot image (`slot_offsets`, `slot_image.rs:666`): the kernel
+  which is the VRAM slot image (`slot_offsets`, `slot_image.rs`): the kernel
   reads the same bytes whichever address the entry names, and the scatter's
   canonical order (§4.3) is unchanged.
 
@@ -115,7 +115,7 @@ next layer …
 | Store | What | Allocation | Size | Mutable |
 |---|---|---|---|---|
 | Weight zone | VRAM cache slots | the span's right side (unchanged) | elastic (§9) | yes — pipeline thread |
-| Warm tier | slot images, pinned + pageable parts | `cuMemAllocHost` once at startup (`pinned.rs:464`), pageable `PagedSlots` beyond it | sized by `warm_sizing_from` (`handle/sizing.rs:224`) | **no** — filled once (`pinned.rs:1-15`) |
+| Warm tier | slot images, pinned + pageable parts | `cuMemAllocHost` once at startup (`pinned.rs`), pageable `PagedChunks` beyond it | sized by `warm_sizing_from` (`handle/sizing.rs`) | **no** — filled once (`pinned.rs`) |
 | **Pad** (new) | slot images staged from the pack | one `cuMemAllocHost` block at startup | §0.8 | yes — stager |
 | Live table | `[rows × E]` × 3 u64 | `cuMemHostAlloc(DEVICEMAP)` | 240 KiB (35B) | host stores |
 | Summary ring | `[RING × (E + 1)]` u32 | `cuMemHostAlloc(DEVICEMAP)` | 66 KiB | `bucketize` |
@@ -131,16 +131,17 @@ warm tier was only ever a copy source); it is confirmed on the 3090 — a groupe
 GEMM reading `cuMemAllocHost` copies through their host addresses is
 bit-identical to the VRAM run (§0.10.1, test 1 of §0.15).
 
-**Pageable warm slots are not GPU-readable** (`WarmTier`'s `PagedSlots`,
-`warm_tier.rs:95-116`). An expert whose warm copy is pageable is treated as cold:
-its entry is 0 and the stager stages it into the pad by a host `memcpy` (0.59 ms
-per 13.5 MiB slot, `warm_tier.rs:21-23`) instead of a pack read.
+**Pageable warm slots are not GPU-readable** (`WarmTier`'s `PagedChunks`,
+`elastic/paged.rs`, `warm_tier.rs`). An expert whose warm copy is pageable is treated as cold
+by the device: its entry is 0 and the stager stages it into the pad by a host `memcpy` (0.59 ms
+per 13.5 MiB slot) instead of a pack read. The CPU expert pool, which reads host RAM
+directly, computes such an expert in place (`docs/cpu_expert_compute.md` §5.4, §5.7).
 
 ### 0.4 The live table
 
 **Initial state**, written at load before the first forward: VRAM-resident →
 VRAM address; pinned warm slot → its address; everything else → 0. Pinned
-layers (`PINNED_LAYERS`, `cache/policy.rs:73`) are always VRAM.
+layers (`PINNED_LAYERS`, `cache/policy.rs`) are always VRAM.
 
 **Every write is a host store** to the mapped table (`[3][rows][E]`: gate, up,
 down planes). A publish writes up, down, full fence, gate; a clear writes gate,
@@ -240,8 +241,8 @@ Neither thread ever waits for a reclaim on a path a GPU wait depends on.
 
 One dedicated thread owns the pad and is the **only reader of the pack**. It
 replaces `ColdStaging` and every pack read on the pipeline thread
-(`load_expert`, `load_experts_batched`, `pipeline/mod.rs:1627, 1734`) and the
-streamer's own pack reads (`streamer.rs:195-256`).
+(`load_expert`, `load_experts_batched`) and the
+streamer's own pack reads (`streamer.rs`), all deleted.
 
 **It never calls CUDA on the demand path.** Its work is: poll mapped summary
 words, read the pack (Windows `ReadFile`, Linux `pread` — `direct_io.rs`), copy
@@ -262,11 +263,11 @@ what makes a cold tile's wait driver-free.
    publish (under the `Residency` lock): up, down, fence, gate.
 4. **Publish each expert as its read lands**, not after the batch: reads are
    issued to a small pool of persistent reader threads, one `DirectFile`
-   handle each (`read_at_with_handle`, `direct_io.rs:232`), at a queue depth of
+   handle each (`read_at_with_handle`, `candle-core/src/direct_io.rs`), at a queue depth of
    `NVME_QD` (8 by default, sized from the drive — "QD8 saturates" the
-   dev-box Gen4, `direct_io.rs:66`). Completions publish in order of
+   dev-box Gen4, `direct_io.rs`). Completions publish in order of
    completion. `read_stripes_concurrent`'s per-call thread spawn and all-or-
-   nothing return (`direct_io.rs:265`) are not used on this path.
+   nothing return (`direct_io.rs`) are not used on this path.
 5. Speculative staging requests (pipeline thread → stager channel) are served
    only when no demand row is outstanding, and are cancelled if their row has
    passed.
@@ -308,9 +309,9 @@ Changed:
   stager as a staging request (pack → pad, ahead of the router).
 - **Eviction** from VRAM retargets the entry to the expert's pinned or pad copy
   (or 0) and frees the slot by Rule R. Demand eviction (`demand_eviction`,
-  `cache/mod.rs:839`, Rule D) is deleted: demand never takes a slot.
+  Rule D) is deleted: demand never takes a slot.
 - **No host wait on the GPU anywhere**: `ColdStaging::acquire`'s
-  `event.synchronize()` (`pipeline/mod.rs:1118`) goes with `ColdStaging`; the
+  `event.synchronize()` went with `ColdStaging`; the
   summary wait is the mapped-word poll.
 - **Whole-layer streaming** (`streamer.rs`) is deleted, thread and staging ring.
   What replaced it — the pipeline thread promoting the next row's scored experts
@@ -318,20 +319,15 @@ Changed:
   row (many sequences decoding together), where the link has room. A
   prompt-prefill launch's workers saturate the link and are not given
   speculation to compete with (§0.7.1).
-- **A decode launch restocks from free ground.** A long prompt leaves the zone
-  thousands of slots short (it fills holes and never evicts), and a decode row
-  routed by a few sequences (single-session decode, a speculative verify) is too
-  narrow for the wide-row prediction — so its misses stream through the workers
-  every step. After any row whose every token is decode, the pipeline thread
-  promotes up to `RESTOCK_PER_LAYER` (2) of that row's highest-scored
-  non-resident experts **with a pinned copy** — score descending, then expert
-  id — into **free slots only**, keeping `RESTOCK_KEEP_FREE` (64) back for the
-  promotion ring's empty offers. It evicts nothing and stages nothing (a cold
-  expert would go to the pad, not the zone), so a wrong guess costs one copy on
-  an idle link and never a resident expert; a zone ~2,000 slots short refills in
-  ~20 steps. A landed restock counts as a promotion and its bytes against the
-  link, but not as a prediction: it stays out of the speculative set the
-  prefetch depth is tuned from.
+- **A decode launch refills free ground through the ring's empty offers.** A
+  long prompt leaves the zone thousands of slots short (it fills holes and never
+  evicts), and a decode row routed by a few sequences (single-session decode, a
+  speculative verify) is too narrow for the wide-row prediction — so its misses
+  would stream through the workers every step. The pipeline thread has no
+  separate restock pass: **every empty slot is offered** (§0.7.1), so a decode
+  miss that finds one is promoted by the copy its worker made anyway, evicts
+  nothing, and a wrong guess costs no resident expert
+  (`pipeline/ring.rs`, `ring_stock`).
 
 ### 0.7.1 Promotion by the workers
 
@@ -471,10 +467,15 @@ experts carry several token tiles each, all computed by the workers, so 8 made
 the cold prefill compute-bound: 814 t/s at 8, 1,083 at 32, no better at 64 —
 while every surplus worker is a block launched to exit on every decode launch
 (single-context decode ~123 → ~117 t/s at 64). So launches over more than 64
-tokens take 64 workers, the rest 8 (`dispatch::workers_for`). 64 rather than 32
-for the model whose misses are most of a launch: Qwen3.8-Flash-Next at ×8–×16
+tokens take 128 workers (`dispatch::WORKERS_PREFILL`), the rest 32
+(`dispatch::workers_for`). More than 32 for the model whose misses are most of a
+launch: Qwen3.8-Flash-Next at ×8–×16
 prefill (a working set 3× the zone) ran C10 ×8 at 969 t/s with 32, 1,031 with 64,
-1,044 with 128 — and 128 cost the ×16 decode rows ~4%. The workers take their
+1,044 with 128 — and 128 cost the ×16 decode rows ~4% where it applied to them,
+which is why a launch of 64 tokens or fewer stays at 32. At the Q3_KO rung on the
+16 GB laptop, whose prefill is bound by the link (Gen4 ×8) once its staging keeps
+up, 128 ran every prefill row level or ahead of 64 (C5×2 373.0 → 382.5, BF16×8
+1131 → 1141 t/s) with decode no lower. The workers take their
 own grid rows ahead of the tiles (`⌈W / row_tiles⌉` of them): a single worker row
 set the grid's width for every tile row, which at 128 workers over a 16-row-tile
 projection launched 112 blocks per tile row only to exit.
@@ -674,19 +675,19 @@ and is within ~10 % of the link's floor for those bytes.
 **A mutable pinned tier with LRE eviction**, owned by the stager. Slot images,
 one pack stride each, allocated once at startup in one `cuMemAllocHost` block and
 booked as pinned host memory like the warm tier
-(`note_host_pinned_alloc`, `pinned.rs:470`).
+(`note_host_pinned_alloc`, `pinned.rs`).
 
 **Size: one full layer of experts at least** (`E × stride`): a layer's cold set
 is then always stageable without reusing a slot of the same row, so the demand
 path never needs a "consumed" handshake from the GPU. Above that, the pad is
 cache: every additional slot keeps a cold expert pinned-readable for its next
 use. It comes out of the same pinned budget as the warm tier
-(`warm_sizing_from`, `handle/sizing.rs:224`) — the warm tier is sized after the pad.
+(`warm_sizing_from`, `handle/sizing.rs`) — the warm tier is sized after the pad.
 
 | Machine / model | One layer | Notes |
 |---|---|---|
-| 3090 (64 GB), Qwen3.6-35B | ~0.6 GB | every evictable expert fits the warm tier already (`docs/performance.md:1037-1040`): the pad sees no demand here |
-| 4090 Mobile (32 GB), Flash-Next | ~E × 14.2 MB | warm tier covers ~30 % (`docs/expert_cache_design.md:822-836`): the pad is the hot set of the other 70 % |
+| 3090 (64 GB), Qwen3.6-35B | ~0.6 GB | every evictable expert fits the warm tier already (`docs/performance.md`): the pad sees no demand here |
+| 4090 Mobile (32 GB), Flash-Next | ~E × 14.2 MB | warm tier covers ~30 % (`docs/expert_cache_design.md` §6.3.1): the pad is the hot set of the other 70 % |
 | any, DeepSeek-V4-Flash | ~3.4 GB | 147 GB of experts: the pad is the main cold-miss cache |
 
 **Eviction (LRE).** The stager keeps the pad's own score table: it reads every
@@ -841,12 +842,14 @@ grid — the order §0.10.1 showed overlaps and the reverse serialises.
      arithmetic, bit for bit (`cuda_live_launch_*`, including a ring that runs
      short mid-list).
   5. `__syncthreads()`, next item.
-- **`W` = 8** (§0.10.1–2): 8 workers reach the link's 12.2 GB/s; a ninth adds
-  nothing and holds an SM slot. A launch with no remote expert pays 8 blocks
-  that exit at once (a prefill launch 64 — see §0.7.1).
+- **`W`** is 32 for a decode launch and 128 over 64 tokens (§0.7.1). §0.10.1–2
+  measured a pure copy, where 8 workers reach the link's 12.2 GB/s and a ninth
+  adds nothing; a worker that also computes its slice is latency-bound and needs
+  more. A launch with no remote expert pays `W` blocks that exit at once.
 - **Scratch**: `W` slots of the largest `(K/128) × 4 × chunk_bytes` over the
-  three projections — 51.2 KB for qwen36's gate/up, so 410 KB in all; one device
-  allocation at load. The gate, up and down launches of a layer reuse it in
+  three projections — 51.2 KB for qwen36's gate/up, so 6.5 MB for the 128 a
+  prefill launch takes; one device allocation at load, sized for
+  `WORKERS_PREFILL` slots. The gate, up and down launches of a layer reuse it in
   stream order.
 - **Up and down** use the same snapshot, workers and scratch, each projection
   copying its own slice: a remote expert crosses PCIe once per projection per
@@ -1163,10 +1166,10 @@ only pinned tier; demand misses no longer load), AGENTS.md hot-path invariant 3
 | Question | Decision |
 |---|---|
 | Kernel side | §0.10: workers in the same launch, mini-loop copy + one sync, the unmodified impl over a scratch slot |
-| `W` | 32 for a decode launch, 64 over 64 tokens (§0.7.1) |
+| `W` | 32 for a decode launch, 128 over 64 tokens (§0.7.1) |
 | Promotion of misses | by the workers into ring slots; a miss with no slot is claimed on its next launch, never re-sent (§0.7.1) |
 | Prefetch | read-ahead by the gate launch's workers into ring slots, published by the device, within the link window a launch's misses leave; from host-vetted sources — warm slots, and pad slots pinned for the listing (§0.7.3) |
-| Scratch | `W` slots of the largest projection slice — ~410 KB for qwen36 |
+| Scratch | `WORKERS_PREFILL` slots of the largest projection slice — 51.2 KB a slot for qwen36 |
 | Pad size | one full layer, the floor that never needs a GPU→host "consumed" signal; anything above it is a pinned-budget split left at zero in this revision |
 | Promotion policy | every miss is a promotion candidate, admitted by the pipeline's existing score policy (today's behaviour minus the critical path) |
 | Pad eviction scores | the stager's own table, from the summaries it reads |
@@ -2184,9 +2187,12 @@ code §12 deletes go with that code and are not repeated.
   dispatch host protocol run per layer between graph launches (§4.5).
 - **`docs/archived/deepseek/deepseek_decode_launch_overhead.md:147-163`** — "why the
   readback cannot simply be removed". The rest of the doc is a measurement
-  record (B), including the −8% lesson §5.1 answers.
+  record (B), including the −8% lesson §5.1 answers. Archived: the source of
+  the premise this design removes, kept as historical evidence, not the
+  current design.
 - **`docs/archived/deepseek/deepseek_hot_path_optimization_findings.md`** — lines 49-51,
-  264-267 ("routing must be host-visible").
+  264-267 ("routing must be host-visible"). Archived, as above: the current
+  hot-path rules are `docs/deepseek/deepseek_hot_path_invariants.md`.
 - **`docs/deepseek/deepseek_v4_speculative_decode.md`** — §1 52-59, §4.1 168-172,
   §4.2 208-209, §7 433-437: the "routing readback is the WDDM wall" premise.
 - **`docs/deepseek/deepseek_v4_flash.md:486-499`** and

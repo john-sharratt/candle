@@ -1,8 +1,11 @@
 # CPU Expert Compute
 
-**Status:** design, being built. Reviewed 2026-10-16: an adversarial review
-against the code, and an inventory of candle's CPU side. Both are folded in
-below.
+**Status:** built (§9 steps 1–5): the pool, the rings, `SplitParams`, the CPU
+class in `moe_bucketize`, the down launch's CPU item, pageable warm slots, the
+partition's refill price and residency priced by backing. Not built: half-waves
+at ×N (§5.9, §9 step 6, kept only if measurement 5 shows a win) and several
+GPUs (§5.12, §9 step 7). Reviewed 2026-10-16: an adversarial review against the
+code, and an inventory of candle's CPU side. Both are folded in below.
 
 Decisions taken by the author, 2026-10-16:
 - **CPU results are not byte-identical to the GPU's.** Output may depend on
@@ -39,7 +42,8 @@ A routed expert that misses VRAM is served today in one of two ways:
 
 - **Warm.** The expert sits in pinned host RAM. The grouped GEMM's worker
   blocks copy each 32-row slice into VRAM scratch over PCIe, then run the int8
-  GEMM on it (`kernel.cuh:1625-1680`, `moe_live_worker` at `:2918`).
+  GEMM on it (`moe_live_worker`,
+  `candle-kernels/src/quantized/kernel/moe_live_worker_and_entry.cuh`).
 - **Cold.** The stager reads the expert from the pack on NVMe into a pad slot,
   and the GPU then copies it the same way (`expert_lre/stager.rs`).
 
@@ -59,7 +63,7 @@ Strata reports about 75–94 tok/s single-stream (self-reported) from a 12 GB RT
 
 - **Cold experts.** An expert that is only on NVMe is read at the drive's rate
   whoever computes it. On the 16 GB laptop, 61–68% of expert loads read the
-  pack (`expert_cache_design.md:814-829`). For those, CPU compute saves one PCIe
+  pack (`expert_cache_design.md` §12.6). For those, CPU compute saves one PCIe
   crossing and nothing else.
   - The laptop is bound first by RAM *capacity*. Flash-Next at Q3_KO is 25,088
     experts × 1,996,800 B = **50.1 GB**, against 31.5 GiB of RAM.
@@ -193,7 +197,7 @@ efficiencies. §8 replaces each with a measurement before anything is built.
 
 ### 3.1 The expert
 
-Flash-Next (`host::MODEL = Qwen38_FlashNext`, `host/src/model.rs:18`):
+Flash-Next (`host::MODEL = Qwen38_FlashNext`, `host/src/model.rs`):
 
 | Item | Value |
 |---|---|
@@ -205,7 +209,7 @@ Flash-Next (`host::MODEL = Qwen38_FlashNext`, `host/src/model.rs:18`):
 | Expert weights | `gate`, `up` [640, 2560], `down` [2560, 640] |
 
 Experts are Q3_KO under 64 GiB of VRAM and Q4_KO at or above it
-(`quant_ladder.rs:36-41`):
+(`candle-transformers/src/models/quant_ladder.rs`, `LADDER`):
 
 | | Q3_KO | Q4_KO |
 |---|---:|---:|
@@ -220,7 +224,7 @@ Experts are Q3_KO under 64 GiB of VRAM and Q4_KO at or above it
 - Per token, the expert input is one q8a128 row: 20 blocks × 144 B = **2,880 B**.
 - The pool returns one F32 row per *token*: **10,240 B**. That row is the
   routing-weighted sum of the token's CPU experts (§5.5). `down_out` is F32,
-  and the scatter reads F32 only (`quantized/cuda/moe_routing.rs:7449-7455`).
+  and the scatter reads F32 only (`quantized/cuda/moe_routing.rs`).
 
 ### 3.2 Bandwidth per machine
 
@@ -236,9 +240,9 @@ Experts are Q3_KO under 64 GiB of VRAM and Q4_KO at or above it
   reaches far less: 28% for PyTorch in Huang et al.
 - **The laptop's link is Gen4 ×8.** `nvidia-smi` read on 2026-10-16:
   `pcie.link.width.current = 8` against a maximum of 16. The generation reads
-  1 at idle and trains up to 4 under load. `dispatch/mod.rs:112` and the
-  CPU-throttle memory note were right; `AGENTS.md` and
-  `docs/performance.md:229` (×16, ~25 GB/s) are corrected in this change.
+  1 at idle and trains up to 4 under load. The link figure in the dispatch
+  and the CPU-throttle memory note were right; `AGENTS.md` and
+  `docs/performance.md` (which had ×16, ~25 GB/s) were corrected.
 - **The laptop's memory is LPDDR5X-7467** on Meteor Lake's 128-bit bus (SMBIOS
   type 35, 8 × 4 GB packages), for a 119.5 GB/s peak. Measurement 1 on
   2026-10-16, GPU idle, read **81.2 GB/s** with one worker on each of the 16
@@ -348,23 +352,24 @@ The amendments below land in `AGENTS.md` and
    exception: the CPU expert pool, for the experts the device assigned to it.
    The decision of what the pool gets stays on the GPU (§5.3).
 3. **"Once a gate block can wait, nothing it waits for may need the driver"**
-   (`moe_live_dispatch_design.md:60-62`). This is unchanged. The pool makes no
+   (`moe_live_dispatch_design.md` §0.1). This is unchanged. The pool makes no
    CUDA calls and talks through mapped words only, like the stager
-   (`stager.rs:17-21`).
+   (`expert_lre/stager.rs`).
 4. **Only worker blocks spin; no block ever waits on another block.** The CPU
    wait is a worker item of the down launch (§5.5), honouring `SPIN_LIMIT_NS`,
-   the abort word and the fault word (`kernel.cuh:1665-1674`). No new
+   the abort word and the fault word (`moe_live_cpu_wait`,
+   `candle-kernels/src/quantized/kernel/moe_live_device_helpers.cuh`). No new
    block-to-block dependency is created.
-5. **Decode graphs** (`decode_graphs.md:96`). Every new device action is a
+5. **Decode graphs** (`docs/decode_graphs.md`). Every new device action is a
    kernel that reads or writes mapped memory. Recorded segments already do
    this: bucketize writes the summary ring, and read-ahead publishes
-   live-table words (`kernel.cuh:2892-2899`).
-6. **Reclaim rules R/R′** (`moe_live_dispatch_design.md:184-229`).
+   live-table words (`candle-kernels/src/quantized/kernel/moe_live_worker_and_entry.cuh`).
+6. **Reclaim rules R/R′** (`moe_live_dispatch_design.md` §0.5).
    - The device waits for the pool's `done` inside invocation T's down launch,
      before T+1's bucketize in stream order. Any started word at T+1 or above
      therefore already implies the pool is finished with T's slots, so Rule R
      covers pool reads as it stands.
-   - Rule R′'s premise ("the GPU is inside T's gate launch", `stager.rs:23-27`)
+   - Rule R′'s premise ("the GPU is inside T's gate launch", `expert_lre/stager.rs`)
      is reworded to "inside T".
    - The pool only ever receives addresses bucketize classified as pinned warm
      or pad.
@@ -374,13 +379,13 @@ The amendments below land in `AGENTS.md` and
 8. **Pinned and mapped budgets.**
    - Pinned memory counts against WDDM's non-local budget (17.22 GiB on the
      laptop).
-   - The 64 MiB / 256 MiB observation (`quantized/cuda/dequantize.rs:2446-2450`) is a *time* limit:
+   - The 64 MiB / 256 MiB observation (`quantized/cuda/dequantize.rs`) is a *time* limit:
      one launch writing host memory past the 2 s TDR. It is not a size cap. The
      rings are sized against the non-local budget, and no single launch writes
      more than the TDR allows.
    - Pageable warm slots need no pinning at all (§5.7).
-9. **The existing refusals** (`expert_cache_design.md:898-902`,
-   `expert_lre/handle/construction.rs:11-12, 612`) refuse a CPU *device* build, which stays
+9. **The existing refusals** (`expert_cache_design.md` §12.7,
+   `expert_lre/handle/construction.rs`) refuse a CPU *device* build, which stays
    true. They are amended to point here, not replaced.
 
 ---
@@ -390,14 +395,14 @@ The amendments below land in `AGENTS.md` and
 ### 5.1 One more class in `moe_bucketize`
 
 `moe_bucketize` sorts every routed expert into VRAM, pinned or cold
-(`quantized/cuda/bucketize.rs:905-937`). It gains a fourth class, **CPU**, decided on the
+(`quantized/cuda/bucketize.rs`). It gains a fourth class, **CPU**, decided on the
 device per layer from:
 - the expert's count;
 - its live-table entry;
 - `SplitParams` (§5.3.1).
 
 The summary word is `count | pinned<<29 | cold<<30 | decode<<31`
-(`dispatch/ring.rs:249-250`). Bit 28 becomes the CPU class, which leaves the count
+(`dispatch/ring.rs`, `SUMMARY_CPU_BIT` in `candle-kernels/src/simple/moe_bucketize.rs`). Bit 28 becomes the CPU class, which leaves the count
 28 bits. A CPU-class cold expert keeps bit 30, so the stager still stages it
 (§5.4).
 
@@ -437,9 +442,9 @@ scatter input, and the bytes it saves are small next to the experts' (a 10 KB
 row against a 2 MB expert).
 
 - **The stacked launch stays.** The shared SwiGLU and down run after the
-  stack (`qwen35/quantized_moe.rs:173-175`, before the routed path at `:202-204`).
+  stack (`qwen35/quantized_moe.rs`, before the routed path).
 - **These launches are serial.** Everything is on one stream
-  (`live_table.rs:103-110`), so the overlap is between the CPU pool and the GPU
+  (`expert_lre/live_table.rs`), so the overlap is between the CPU pool and the GPU
   stream, not among GPU branches. The GPU work behind bucketize is what hides
   the pool's time:
   - the GPU-class experts' copies and grouped gate/up GEMMs;
@@ -626,7 +631,7 @@ the offsets byte for byte.
   under 4 KB of kernel parameters, to bucketize and the down launch at every
   invocation.
   - Decode graphs rewrite a changed parameter in place at each wave's
-    recapture (`decode_graphs.md:124-134`), the same way they rewrite tier
+    recapture (`docs/decode_graphs.md`), the same way they rewrite tier
     addresses and the dispatch sequence number.
   - A value written between waves therefore takes effect on the next wave,
     with no rebuild, no restart and no extra kernel.
@@ -831,7 +836,7 @@ params, timing.
   P-cores first, then E-cores, because the laptop's E-cores add ~12 GB/s of
   read bandwidth over its six P-cores (§3.2). They are pinned with
   `SetThreadSelectedCpuSets`. `windows-sys`'s `Win32_System_Threading` is
-  already enabled (`candle-core/Cargo.toml:59-73`). Elsewhere it uses the
+  already enabled (`candle-core/Cargo.toml`). Elsewhere it uses the
   affinity mask.
 - **Reserved cores.** The pool takes the remainder after reserving cores for
   the threads that must not be starved:
@@ -841,7 +846,7 @@ params, timing.
   - the persistence thread (hot→warm copies, compaction);
   - HTTP, ingest and calibration;
   - in motherd, the agent's build, git and mind jobs, which run in the same
-    process at low priority (`motherd.yaml:23-24`).
+    process at low priority (`motherd.yaml`).
 - **Starting sizes.** The size is derived from the topology at load, and the
   §5.10 core sweep replaces these starting points:
 
@@ -919,13 +924,13 @@ The pool reads host RAM directly. A warm slot only the CPU computes therefore
 needs no pinning, no mapping and no share of the WDDM non-local budget.
 
 - **Today** pageable warm slots are treated as cold: a pageable expert is
-  published to the live table as 0 (`live_table.rs:9`,
-  `moe_live_dispatch_design.md:134-137`), and a hit costs a `memcpy` into the
-  pad (`warm_tier.rs:20-24`).
+  published to the live table as 0 (`live_table.rs`,
+  `moe_live_dispatch_design.md` §0.4), and a hit costs a `memcpy` into the
+  pad (`warm_tier.rs`).
 - **The GPU planes stay as they are.** A pageable address is never written into
   a live-table plane the GPU reads. Every GPU reader treats a non-zero entry as
-  device-readable: bucketize's classifier (`pinned.rs:611-616`) and the cold
-  workers (`kernel.cuh:1750-1753`). A host address there would be dereferenced
+  device-readable: bucketize's classifier (`pinned.rs`) and the cold
+  workers (`moe_live_device_helpers.cuh`). A host address there would be dereferenced
   by the GPU and lose the context.
 - **A separate host-only plane** in the work ring's metadata holds pageable
   addresses by (layer, expert). Bucketize reads only a *bit* from a
@@ -936,7 +941,7 @@ needs no pinning, no mapping and no share of the WDDM non-local budget.
 The warm tier can then grow to whatever RAM is free, past the pinned budget.
 On the laptop that is the gain this design can offer against the capacity gap
 of §1.1. On the 3090 box it decides how much of the 50.1 GB expert set is RAM
-at all: the pinned part is capped by WDDM (`warm_tier.rs:45-56`), and that size
+at all: the pinned part is capped by WDDM (`warm_tier.rs`), and that size
 is measured, not assumed (§8).
 
 ### 5.8 The VRAM partition
@@ -969,11 +974,11 @@ Each target is an estimate until measurement 0 replaces it.
 
 **Rows before routing (decode).**
 - `hc_mix_with_operand`'s epilogue already writes the q8a128 operand
-  (`qwen4exp/wave/layers.rs:4162`). At decode widths it also stores the rows into the row-ring
+  (`qwen4exp/wave/layers.rs`). At decode widths it also stores the rows into the row-ring
   slot the forward thread reserved for this invocation.
 - **Where it applies.** It applies wherever the operand is emitted, including
-  the MTP head's FFN (`qwen4exp/draft.rs:527`).
-- **Where the operand comes from `to_dynamic`** (`qwen4exp/wave/layers.rs:4195-4204`,
+  the MTP head's FFN (`qwen4exp/draft.rs`).
+- **Where the operand comes from `to_dynamic`** (`qwen4exp/wave/layers.rs`,
   `h2_q8 = None`), there is no epilogue to extend. A small row-export kernel
   runs there instead.
 - **Cost.** These writes happen on every decode layer, whether or not the split
@@ -1048,23 +1053,23 @@ measured campaign. A change stays only if a measurement says so.
 
 **Nothing to inherit from candle's CPU side** (inventory, 2026-10-16):
 - `k_quants::matmul` quantises and walks one token at a time, re-reading the
-  whole weight matrix per token (`k_quants/mod.rs:6082-6129`), on the global rayon
+  whole weight matrix per token (`k_quants/mod.rs`), on the global rayon
   pool.
-- SIMD is chosen at compile time (`cpu/mod.rs:1-9`, `utils.rs:31-33`) under
+- SIMD is chosen at compile time (`cpu/mod.rs`, `cpu_backend/utils.rs`) under
   `target-cpu=native`.
 - gemm's AVX-512 path needs its `nightly` feature, which is off.
 - There is no AVX-512, VNNI, runtime dispatch, pinning, monitor-wait or MXCSR
   code anywhere.
-- Q3_KO has no CPU form (`quantized/mod.rs:1333-1341`).
+- Q3_KO has no CPU form (`quantized/mod.rs`).
 
 **What carries over is specification:**
-- the KO plane layout (`ko_quant/affine_ko.rs:306-389`, `dequant_ko` at `:641-699`);
-- the affine fold's arithmetic (`ko_affine_fold`, `kernel.cuh:2173-2183`): the
+- the KO plane layout (`ko_quant/affine_ko.rs`, `dequant_ko`);
+- the affine fold's arithmetic (`ko_affine_fold`, `candle-kernels/src/quantized/kernel/int8_matmul_entries.cuh`): the
   scale and min terms and the sum convention, though not its rounding order
   (§6);
-- the q8a128 byte layout (`quantized/cuda_tests/tests_q8a128_format.rs:2875-2960`) and the Σx conventions
-  (`SumScale::Raw` for the SwiGLU operand, `dispatch/launch.rs:1063-1069`);
-- the u8×s8 `maddubs` idioms in `quantized/avx.rs:21-44`;
+- the q8a128 byte layout (`quantized/cuda_tests/tests_q8a128_format.rs`) and the Σx conventions
+  (`SumScale::Raw` for the SwiGLU operand, `dispatch/launch.rs`);
+- the u8×s8 `maddubs` idioms in `quantized/avx.rs`;
 - crossbeam's `CachePadded` for ring words;
 - `raw-cpuid` (already in the lockfile) for WAITPKG, MONITORX and topology.
 
@@ -1301,7 +1306,7 @@ pack refill = cold_bias · pack_read + copy
 
 **Promotion.** A decode miss's GPU copy also installs the expert into a
 promotion slot: the workers store each slice into `remote_dst` as they copy it
-(`kernel.cuh:1650-1653`, `dispatch/mod.rs:16-23`). A CPU-served miss has no GPU
+(`moe_live_worker_and_entry.cuh`, `dispatch/mod.rs`). A CPU-served miss has no GPU
 copy to ride on, so its own launch claims nothing for it.
 
 **Promotion behind the pool** (`promote`: `none`, `cold`, `all`). The launch
@@ -1330,7 +1335,7 @@ split arm was measured on a CPU the pool's load throttled to ~75% of base
 Without a carry, an expert the CPU served and that recurs is brought into VRAM
 by prediction and read-ahead ahead of its next use. The gate launch's
 read-ahead workers fill spare link time with plain byte copies into claimed
-slots (`kernel.cuh:1654-1663`). Three things keep that path working:
+slots (`moe_live_worker_and_entry.cuh`). Three things keep that path working:
 
 1. **A CPU-served miss is still recorded as a miss.** Its summary word carries
    the CPU bit, and the pipeline thread scores it like any miss
@@ -1338,7 +1343,7 @@ slots (`kernel.cuh:1654-1663`). Three things keep that path working:
    see it.
 2. **Read-ahead's gate counts GPU-class copies only; its window counts the
    CPU's experts too.** The gate prices link time per invocation
-   (`read_ahead_gate.rs:12-20, 39-44`, hysteresis `ON_US = 80` /
+   (`read_ahead_gate.rs`, hysteresis `ON_US = 80` /
    `OFF_US = 40`). `link_us` counts only GPU-class copy time, so a CPU-heavy
    split keeps read-ahead *on* instead of switching it off. But each launch's
    budget — the layer's window less what it already spends — charges a CPU
@@ -1359,13 +1364,13 @@ Measurement 6 (§8) confirms the expectation: steady-state VRAM hit rate with
 the split on versus off.
 
 **The warm tier.** It is filled once at startup and never changes
-(`pinned.rs:1-15`), and it now decides which misses are cheap.
+(`pinned.rs`), and it now decides which misses are cheap.
 - It should hold the most misses *not already absorbed by VRAM*. A copy of an
   expert that is nearly always resident buys little, and the next expert VRAM
   can't hold is a better use of the RAM.
 - It ships with the better static choice. Whether it should adapt at run time
   is measured with the eviction counters' "routed again at next visit" share
-  (`regret.rs:301-309`).
+  (`regret.rs`).
 
 **Sweeps.** Run `cold_bias` on the laptop at ×1, ×8 and C5×8, alternating, as
 the `FADE_FLOOR` sweep was. Record the pack-read share, the hit rate and t/s.

@@ -15,6 +15,11 @@
 > Supersedes `docs/expert_cache_design.md` §5.2 (where the pack lives) and
 > refines its §5.6 (the fingerprint). Every disk figure below is measured on the
 > RTX 4090 Mobile 16 GB dev machine on 2026-10-10.
+>
+> §1 and §2 describe the code as it stood before the pack was built, and are
+> kept because §3 onward answers them; their file and line citations are of that
+> code (`PackIdentity` and the pinned-layer repack are gone). §3 onward describes
+> the code as built.
 
 ---
 
@@ -84,7 +89,7 @@ A **model pack** is one file holding everything a load reads:
 - `<mode>` is the int8 mode the records target (`off`, `performance`,
   `precision`) — the records differ per mode, so the file does.
 - `.n<N>` is the layer-stream narrowing, present only when the tight-VRAM
-  schedule is active (`qwen35/layer_loader.rs:144`), because it changes record
+  schedule is active (`qwen35/layer_loader.rs`), because it changes record
   lengths.
 
 **The container is a GGUF part followed by the record sections.**
@@ -129,8 +134,8 @@ they are never reloaded (`pack/header.rs:25-29`), so they are repacked from the
 GGUF on every boot (`startup.rs:264`). In a self-contained pack there is nowhere
 else to get them, so **every layer has records**. Two consequences:
 
-- `startup_pinned_prefix` reads records from the pack instead of repacking from
-  the mapping — the same read `startup_from_pack` already does for the rest.
+- `startup_from_pack` reads the pinned layers' records from the pack, the same
+  read it does for the rest, instead of repacking them from the mapping.
 - The pinned count stops being part of the pack's identity. A change to
   `PINNED_LAYERS` no longer invalidates any pack.
 
@@ -203,7 +208,7 @@ That rule is right when invalidation is cheap — a stale pack costs one local
 repack. It is wrong once the source is gone, because every repack change then
 costs re-downloading **every model**. So:
 
-- **Each pair is hashed on its own.** `pair_fp(src, tgt)` = FNV-1a over the
+- **Each pair is hashed on its own.** `pair_fingerprint(device, src, tgt)` = FNV-1a over the
   sweep's version tag, the reference geometry, the pair, and the repacked bytes
   (or the refusal), exactly as now but not folded together.
 - **The pack records the pairs it contains**, with their hashes: a table of
@@ -225,13 +230,13 @@ pair (a common permutation, the slot writer) moves every pair's hash, so every
 pack that uses any of them is invalidated — as it should be.
 
 **What stays global.** A change to the container or record layout bumps the
-header `VERSION` (`pack/header.rs:228`) and invalidates every pack. That is
+header `VERSION` (`expert_lre/pack/header.rs`, `layer_stream/pack/header.rs`) and invalidates every pack. That is
 untargeted by nature and is rare; it is the one event that re-downloads
 everything.
 
-The layer packs use the same fingerprint today, XOR'd with the gate donor's
-length (`qwen35/quantized_loader.rs:316-322`). The donor moves into provenance
-(§4.1), and the layer records take the per-pair table like the expert records.
+The layer packs use the same per-pair fingerprint table in their header
+(`layer_stream/pack/header.rs`), like the expert records. The gate donor is a
+source of the pack's provenance (§4.1), not an input to the fingerprint.
 
 ## 5. Where it lives, how it is found, how it is rebuilt
 
@@ -246,7 +251,7 @@ root is found — zend tried `XDG_CACHE_HOME`, `HOME`, then `USERPROFILE`; the
 builder tried `USERPROFILE` then `HOME`. There is now one function,
 `model_pack::cache_root` (`USERPROFILE`, then `HOME`), in the crate the gates,
 the prepare step and the loaders share; `candle-conversation` re-exports it, and
-zend calls it through that.
+`host::download` calls it through that.
 
 ### 5.2 Resolution
 
@@ -256,7 +261,7 @@ One entry point resolves every model, for zend and the gates alike:
 model_pack(request, root, device, fetch) -> path        (model_pack/resolve.rs)
   1. a pack under <root>/<repo>/ whose name the request owns, whose provenance
      names the request's sources, whose mode and narrowing are this card's, and
-     whose sections pass this build's VERSION and pair_fp checks → return it
+     whose sections pass this build's VERSION and pair-fingerprint checks → return it
   2. otherwise → build (§5.3), then return it
 ```
 
@@ -283,7 +288,7 @@ from, and how a fetched source is released.
   a path that is already a pack is used as it is. A gate donor is added to the
   request only when the checkpoint stores its DeltaNet gates below F32, judged
   from its header — or when a pack built with one is already there.
-- **zend** passes `ZendFetch` (`zend/src/download.rs`): its own download step
+- **The host** passes `HostFetch` (`host/src/download.rs`), for zend and npcd: its own download step
   survives as the source fetcher, because it reports progress to the status
   pane.
 - **Flash-Next** resolves through `prepared_engine_pack`, whose fetch is the

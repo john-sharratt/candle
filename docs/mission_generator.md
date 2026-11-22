@@ -110,7 +110,7 @@ step's prompt, `edits`, `context`, `checks` and `tools`. The steps of the workfl
    (`run::reading_prompt`) — and one that does not tell that event is not `sound`. The review carries the draft's own brief's "What
    happens" (`Operation::brief`), so a reviewer writing it anew knows the event it was to tell.
 3. **Review.** A review mission goes on the table carrying that reading. **No Maker takes two
-   steps of one round** (`Operations::may_take`, a step `by: another`): the writer never reviews
+   steps of one round** (`workflow::may_take`, a step `by: another`): the writer never reviews
    its own draft, and a review reported stuck goes to somebody new. The reviewer reads the draft and what it
    answers to, mends what can be mended with `file_edit`, and `report_done` passes the
    operation — held to the same gate — or `report_rejected` fails it.
@@ -173,7 +173,7 @@ to find.
 document becomes — a layer document, a life episode, each belief and relationship the episode
 forms — is marked with the document's path. At boot, a document gone from disk or changed is
 retired from the substrate before it is ingested again. The mind folder holds only published
-work, so everything in it is memory's to take; a publish lands in it (`opstore::merge::follow`,
+work, so everything in it is memory's to take; a publish lands in it (`MindStores::moved`, which `MindStores::moves` subscribers watch,
 on this member at once and on every other within a minute), and the watcher ingests the change.
 Conversations written before the mark are found by a life event's date and title, or a layer
 document's address.

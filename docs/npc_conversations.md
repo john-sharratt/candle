@@ -3,9 +3,31 @@
 Every NPC — Zen, the moon household, a Battle Cities citizen — talks one-to-one
 with people and with other NPCs in **conversations**: preserved, parked
 exchanges that run beside the NPC's main loop, as the same person, with the same
-mood, mission and memory. This document is the design. It is grounded in the
-code as it stands (anchors are `file:line` against `origin/main` 662baa9d8) and
-names, for every piece, what exists and what is built.
+mood, mission and memory. This document is the design, and all of it is built.
+Its `file:line` anchors were taken against `origin/main` 662baa9d8, before the
+module splits, so the line numbers are only indicative and a cited thing is
+found by its name. The files those anchors name have since become folders, as
+follows:
+
+| Cited file | Now |
+|---|---|
+| `engine/enact.rs` | `engine/enact/` (`messaging.rs`: `message`, `reach_out`, `sign_off`; `notices.rs`: `promise`, `remind`; `reading.rs`: `read_phone`) |
+| `engine/mind/mod.rs` | `engine/mind/` (`conversation.rs`: `resumable`, `retire_superseded`, `retire_npc`; `mind_schema.rs`: `grammar_for`, `act_specs`; `perception.rs`: `narrate_act`, `compose_narrated`; `talk.rs`; `voice.rs`; `ask.rs`) |
+| `engine/runtime/mod.rs` | `engine/runtime/` (`acting.rs`, `messages.rs`, `perceiving.rs`, `supervise.rs`, `moments.rs`, ...) |
+| `engine/tools/mod.rs` | `engine/tools/` (`compile.rs`: `performable`, `estimated_paths`, `ACTS_PER_TURN`, `TALK_ACTS`, `MAX_TURN_PATHS`; `show.rs`: `show_within`, `narrates`, `variant`; `types.rs`: `Mode`; `choices.rs`: `Choices`; `act_tools.rs`, `within_tools.rs`) |
+| `engine/acts.rs` | `engine/acts/` (`conversation_acts.rs`: `MESSAGE`, `reach_out`, ...) |
+| `engine/mission/mod.rs` | `engine/mission/` (`lifecycle.rs`: `critical_next`, `authorize`; `compass.rs`) |
+| `sim/missions/mod.rs` | `sim/missions/` (`active.rs`: `edit_active`; `agendas.rs`: `agenda_edit`, `agenda_done`) |
+| `engine/work.rs` | `engine/work/` (`mission_acts.rs`, `report.rs`) |
+| `engine/pulse.rs` | `engine/pulse/` (`vocabulary.rs`) |
+| `sim/phone/mod.rs` | `sim/phone/` (`thread.rs`, `direct.rs`, `channel.rs`, `read.rs`, `line.rs`) |
+| `Within` | `engine/reach.rs` |
+| `candle-conversation/src/conversation/mod.rs` | `conversation/` (`submitted_sections.rs`: `publish_sections`; `carried.rs`: `Carried::reconcile`; `ephemeral_turn.rs`) |
+| `candle-conversation/src/engine.rs` | `engine/` (`creation.rs`: `resume_conversation_with_projection`) |
+| `candle-conversation/src/scheduler/mod.rs` | `scheduler/` (`recurrent.rs`: `restore_recurrent_state`; `gap_residence.rs`: `demote_idle_hot` pass; `band.rs`) |
+| `candle-conversation/src/substrate/mod.rs` | `substrate/` (`tiers.rs`: `Substrate::demote_idle_hot`) |
+| `candle-conversation/src/projection/schema.rs` | `projection/schema/` (`selection.rs`: `SelectionRule`) |
+| `candle-conversation/src/stencil/tool_call/mod.rs` | `stencil/tool_call/` (`call_tree.rs`: `compile_action_loop`) |
 
 ---
 
@@ -119,15 +141,19 @@ account. §11 rebuilds the phone, and §12 makes room speech for people only.
 | Journals | `Store` (one private ref per checkout); `Section::Bots`; `Actor::Npcd`; `fold_period`; zend's `Memory` wrapper and memory writer | `journals/src/store/mod.rs:46, 117-173, 269-334`; `journals/src/scope.rs:19, 84, 130`; `journals/src/actor.rs:35`; `journals/src/ops/period_fold.rs:58-116`; `zend/src/mcp/memory/mod.rs:121-290`; `zend/src/session/memory_writer.rs:65-86` |
 | A visitor's body | `visitor:{handle}` | `npcd/src/engine/interaction.rs:105-112, 280-287`; `npcd/src/engine/order_table.rs:56` |
 
-What does **not** exist, and this design builds:
+What this design adds on top of those pieces, all built:
 
-- the conversation runner on the lease holder, and its delivery;
-- the decide-then-voice turn, and voicing on the lease holder;
-- the catalog compiled for a thread under a `Mode`;
-- npcd writing journals (`npcd/Cargo.toml:20` depends only on `journal-core`);
-- typed experience on journal lines;
-- a journal read since a point;
-- a non-consuming durability query;
+- the conversation runner on the lease holder, and its delivery
+  (`npcd/src/engine/talk/runner.rs`);
+- the decide-then-voice turn, and voicing on the lease holder
+  (`talk/decide.rs`, `talk/voice.rs`, `talk/turn.rs`);
+- the catalog compiled for a thread under a `Mode` (`talk/within.rs`);
+- npcd writing journals (`npcd/Cargo.toml` depends on `journals` as well as
+  `journal-core`; `npcd/src/engine/experience/`);
+- typed experience on journal lines (`journals/src/experience.rs`);
+- a journal read since a point (`journals/src/view/since.rs`);
+- a non-consuming durability query (`Substrate::snapshot_durable`,
+  `candle-conversation/src/projection/resolver/recurrent_state.rs`);
 - the rebuilt phone (§11);
 - accounts carried through messages and authority;
 - the speech gate (§12).
@@ -665,7 +691,7 @@ measured in the live check (§13).
   `Sequence`, which frees the slot (`conversation/mod.rs:5352-5361`).
   - **The new query.** The wait is a new non-consuming per-timeline query,
     `Substrate::snapshot_durable(timeline, turn)`, built from the snapshot's
-    location and `sealed.is_durable` (`candle-conversation/src/projection/resolver/mod.rs:5062-5069`).
+    location and `sealed.is_durable` (`candle-conversation/src/projection/resolver/recurrent_state.rs`).
   - **Why not the existing call.** `drain_durable_snapshots` is a global
     read-once queue whose only consumer is the scheduler's own idle parking
     (`candle-conversation/src/scheduler/recurrent_park.rs:24-28`). Draining it
@@ -1023,8 +1049,8 @@ phone is `npcd/src/sim/phone/`, one concern per file.
 - **One thread per pair, forever.** A direct thread's id is derived from the
   sorted pair of member ids, so reaching someone again finds the same thread.
   - Its seq never restarts.
-  - It is never evicted; `KEEP_THREADS` (`phone/mod.rs:399`) does not apply to
-    direct threads.
+  - It is never evicted; `KEEP_GROUPS` (`sim/phone/channel.rs`, 64) bounds
+    group threads only.
 - **`sign_off` does not leave.** It marks the conversation ENDED (§4.3) and
   leaves membership alone. A direct thread is never closed by its members.
 - **Read is bounded.** `read_through(who, thread, seq)` marks read up to a seq,
@@ -1117,7 +1143,7 @@ Everything that reads or writes `Threads` today moves to the new API:
 - **Engine:** `npcd/src/engine/{on_you, channels, survey, pulse, mod}.rs`.
 - **Other sim users:** `npcd/src/sim/{posting, item, seed}.rs`. `seed::issue_handset`
   (`seed.rs:355-359`) gives each NPC its handset.
-- **Zen tasks:** `npcd/src/authority/zen_task.rs:213`, which already reaches by
+- **Zen tasks:** `npcd/src/authority/zen_task.rs`, which already reaches by
   body id.
 
 ---
@@ -1290,13 +1316,13 @@ New, one concern per file:
 | `npcd/src/engine/agenda/ordered.rs` | the ordered-body mission specs and the order each call makes | the specs' names and params; each order read off exact arguments |
 | `npcd/src/engine/experience/days.rs` | the world's day rolling over, once | a roll told once, a first sight told nothing |
 | `npcd/src/engine/experience/{line,buffer,concern,store}.rs` | lines, per-bot buffer and flush, `concern`, npcd's `journals::live::Live` per world | rendered lines and experience fields; flush order and caps; the exact journal paths per change; a flush lands under `groups/<g>/bots/<bot>` as `Actor::Npcd{group}` |
-| `npcd/src/sim/phone/{thread,direct,channel,read,line,roster}.rs` | the rebuilt phone (§11) | stable pair ids; seq continuity; `read_through` bounds; no eviction of direct threads; `invite` refused on direct threads |
+| `npcd/src/sim/phone/{thread,direct,channel,read,line}.rs` (the roster is in `npcd/src/sim/mod.rs`) | the rebuilt phone (§11) | stable pair ids; seq continuity; `read_through` bounds; no eviction of direct threads; `invite` refused on direct threads |
 | `journals/src/live.rs` | the live store moved from zend (`zend/src/mcp/memory/mod.rs:121-290`) | as zend's existing memory tests |
 | `journals/src/view/since.rs` | lines and folds after a point, with overlap and seen ids | exact lines for fixture trees around folded periods |
 | `journals/src/ops/episodes.rs` | `Op::Episodes`: one commit, per-line `at` and id, per-line trailers | exact tree and commit message; replay renames each colliding id; refusal outside `bots/` |
 | `journals/src/experience.rs` | the `Experience` line field | raw rendered bytes; fold conflict on change |
-| `candle-conversation/src/conversation/publish.rs` | `Sequence::publish_sections` | an ask after publish sees a section sealed before it |
-| `candle-conversation/src/substrate/durable.rs` | `snapshot_durable(timeline, turn)` | false before, true after a turn's snapshot is durable; the scheduler's drain is unaffected |
+| `candle-conversation/src/conversation/submitted_sections.rs` | `Sequence::publish_sections` | an ask after publish sees a section sealed before it |
+| `candle-conversation/src/projection/resolver/recurrent_state.rs` | `snapshot_durable(timeline, turn)` | false before, true after a turn's snapshot is durable; the scheduler's drain is unaffected |
 
 Changed:
 

@@ -133,7 +133,8 @@ maintenance jobs at `GET /v1/cluster/command/jobs`.
 `service_deploy {service, host?}`:
 
 1. Refuse what keep would refuse: the service is one keep runs (`motherd`,
-   `web`, `mcp`), and the machine has an agent. With no `host`, the machine is
+   `web`, `mcp`, `yenbot`, `battlecities`; `SERVICES` in
+   `zend/src/mcp/tools/service/mod.rs`), and the machine has an agent. With no `host`, the machine is
    the one of those with an agent that the machine table most prefers to build
    on (`host/machines.yaml`'s `builds`: BlackWorld). That is where a `motherd`
    deploy belongs: the other members take it through certification and never
@@ -278,8 +279,8 @@ A conversation of Zen's — a task, a chat, a person's dialogue — gets the fiv
 laid onto it — the overlay its last tool round saved, each file's chain sent by
 name and carried only when the agent lacks it, as `run_command`'s is — on a
 machine it names; the answer says how many files it carries,
-`docs/archived/zen_coding_challenge_fixes.md` Cause 5, `docs/replicated_substrate.md`
-§11.4), `service_deploy`, `service_status`, `cluster_status`, `cluster_logs`,
+`docs/replicated_substrate.md` §11.4; the archived original of the rule is
+Cause 5 of `docs/archived/zen_coding_challenge_fixes.md`), `service_deploy`, `service_status`, `cluster_status`, `cluster_logs`,
 `cluster_audit`, `member_status`, `timeline_read` (another run's turns, calls,
 projections and prompt, for diagnosing it), `layer_read`, the acting tools of
 `docs/zen_tool_reach.md` §6.1, `guide_list` and `guide_read`, each defined in

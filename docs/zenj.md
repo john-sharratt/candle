@@ -95,19 +95,19 @@ one route table, a capacity, `INFO serving` printed once admitted.
 It joins as **its own app, `zenj`**, never as `agent`, so the gateway never routes it a build job.
 Apps are a fixed list in the `cluster` crate, and that is where the change is:
 
-- `zenj` is added to `APPS` (`cluster/src/gateway/hub/constants.rs:109`); `web` takes the list from there
+- `zenj` is added to `APPS` (`cluster/src/gateway/hub/constants.rs`, as `ZENJ`); `web` takes the list from there
   (`web/src/cluster/endpoint.rs:60-66`) and needs no change of its own for the socket.
-- `zenj` is added to `SERVICES` (`hub/constants.rs:122`). An app outside `SERVICES` and not `agent` is
+- `zenj` is added to `SERVICES` (`hub/constants.rs`). An app outside `SERVICES` and not `agent` is
   *locked* and must name a model, so a `zenj` with `model: None` would be closed at the handshake
-  (`cluster/src/gateway/admission.rs:26-28`, `:148-152`). As a service it has no floor, no model
+  (`cluster/src/gateway/admission.rs`, `locked`). As a service it has no floor, no model
   lock and no rollout: each machine's is released on its own — which is exactly right for a process
   motherd deploys must never touch.
 
 Requests reach it only on routes it declares (`Registry::declaring`,
-`cluster/src/gateway/registry/pick.rs:205-217`; MCP invariant 5, `AGENTS.md`).
+`cluster/src/gateway/registry/pick.rs`; MCP invariant 5, `AGENTS.md`).
 
 **The reservation.** `MemberState` has no "live" and `Capacity` no field to carry one
-(`cluster/src/frame/types.rs:77-91`, `cluster/src/frame/membership.rs:30-100`). `zenj` says so on
+(`MemberState`, `cluster/src/frame/types.rs`; `Capacity`, `cluster/src/frame/membership.rs`). `zenj` says so on
 its listener's `/v1/status` instead, with `refuse: "<why>"` **while rekordbox is open** — playing
 or between tracks, since a build begun in a pause is still running when the music starts again
 (`zenj/src/http.rs`). keep and motherd read it as one of the machine's **guards** (`guards:` in

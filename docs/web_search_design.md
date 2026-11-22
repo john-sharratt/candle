@@ -1,5 +1,13 @@
 # Gemini-Powered Web Tooling: the `web_*` family
 
+**Status: designed, not built as written.** `zend-tools` has `web_search`
+(`zend-tools/src/tools/web_search.rs`, backed by the Tavily API with its key
+from the daemon's secrets document) and `web_fetch`
+(`zend-tools/src/tools/web_fetch.rs`, which fetches one URL locally from the
+public internet only, through `zend-tools/src/public_fetch/`); neither calls
+Gemini. `web_extract`, `web_compare`, `web_deep_research` and the shared
+`gemini` helper do not exist.
+
 A build guide for a family of web tools that run on the Gemini API. Gemini
 handles search, curation, fetching, conversion, extraction, comparison, and
 synthesis; each tool shapes one request and parses one structured JSON response

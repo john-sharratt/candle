@@ -7,7 +7,7 @@
 
 ## 1. Summary
 
-Every repository in the workspace is already a git working tree on disk. The git layer drives the installed `git` binary against it, using plumbing commands whose output formats are stable and machine-readable, and parses that output into Rust types. Nothing outside the crate spawns `git`, formats a git argument, or parses git output.
+A repository in the workspace is either a git working tree on disk or one read from the substrate (`docs/substrate_git.md`). The git layer answers what it can in process: libgit2 holds a repository it can open (`zend-vfs/src/library/`) and answers the lookups that need no `git` program — refs, ancestry, trees, history, blame, grep, diffs, merges — in microseconds rather than a process start, and a repository read from the substrate has no folder, so libgit2 over its object database (`zend-vfs/src/odb/`) answers every question and writes every object. What stays with the installed `git` binary for a working tree is the network (fetch, push, clone with the user's credentials), the working tree (checkout, the index), using plumbing commands whose output formats are stable and machine-readable, parsed into Rust types. Nothing outside the crate spawns `git`, formats a git argument, or parses git output. The command-line sections below (§4–§8) describe that half; each operation returns the same typed value whichever way it is answered.
 
 Three rules shape the whole interface:
 
@@ -33,7 +33,7 @@ Three rules shape the whole interface:
 - **Operations that change the user's checkout**: `checkout`, `switch`, `reset`, `stash`, `merge` into a working tree, `rebase` of the user's branch. The user owns their checkout.
 - **Porcelain output.** Anything whose output depends on the user's pager, colour or locale settings.
 - **Pull requests and other GitHub API calls.** A separate `github` client, authenticated with `github_token` from the secrets file (`zend-tools/src/state/secrets.rs`), consumes the branches this layer pushes.
-- **A pure-Rust git implementation.** `git2` lacks partial fetch and `gix` lacks HTTPS push; the command line has everything, and the machine already has it.
+- **A pure-Rust git implementation of the network and the working tree.** `git2` lacks partial fetch and `gix` lacks HTTPS push; the command line has everything, and the machine already has it. libgit2 is used only for what runs on a repository's own files (`zend-vfs/src/library/`) and over the substrate's object database.
 
 ---
 
@@ -53,6 +53,11 @@ zend-vfs/src/
   changeset.rs        ChangeSet, Change
   worktrees.rs        worktrees, add_worktree, remove_worktree
   testing.rs          (tests only) TestRepo: nested repos under scratch/
+  library/            the repository held in process by libgit2: refs, history, blame, grep, diffs, merges
+  odb/                the object database a repository read from the substrate is held in
+  origin/             pull, publish, follow_record (§7.8)
+  work/               a conversation's commits and merges (§7.9)
+  checkout/, sandbox/ the execution checkout and the command sandbox (§7.7)
   types/
     oid.rs            Oid, ObjectFormat
     ref_name.rs       RefName, BranchName, RemoteName
@@ -84,14 +89,18 @@ zend-vfs/src/
     ref_txn.rs        update_refs, create/move/delete_branch
     upstream.rs       set_upstream, unset_upstream
     merge_tree.rs     merge_trees, commit_tree
+    merge_text.rs     merge_text (merge-file with labelled markers)
+    scratch.rs        private indexes and scratch files in the git folder
     pick.rs           cherry_pick, revert
     tags.rs           create_tag, delete_tag
     apply.rs          apply_patch (private index)
   remote/
     ls_remote.rs
     fetch.rs
-    probe/            pkt_line, ls_refs, url: the origin watcher's v2 ls-refs
+    probe/            pkt_line, ls_refs, url: the v2 ls-refs request and response
+    fetch_bundle.rs, fetcher.rs, bundle.rs, packs.rs   a fetch through an agent, as a bundle of packs
     push.rs           branches and tags, updates and deletes
+    pusher.rs         what makes a repository's pushes: its checkout or an agent
     manage.rs         add_remote, remove_remote, set_remote_url
   setup/
     init.rs           Repo::init
@@ -312,7 +321,7 @@ Every network operation first requires `remote` to be configured (`UnknownRemote
 
 **Timeouts.** A call that only asks a remote something (`ls_remote`) has two minutes. One that moves objects — `clone`, `fetch`, `push` — takes as long as the repository is large, so it has an hour, and an HTTP transfer that stalls (under 1,000 bytes a second for 60 seconds, `http.lowSpeedLimit`/`lowSpeedTime`) is abandoned by git well before that. A clone cut off by a timeout cannot clean up after itself, so `clone` removes what it wrote — the folder it created, or the contents of the empty folder it was given — and a retry finds the target as the first attempt did.
 
-**The probe.** `remote::probe` speaks the one exchange the origin watcher makes without the git binary: protocol v2's `ls-refs` over HTTPS, as pkt-lines (`pkt_line.rs`), its request body and response (`ls_refs.rs`), and an origin's HTTPS form (`url.rs`). Only the bytes are built and read here; the daemon carries them (`docs/zend_branch_ingest.md` §4.1).
+**The probe.** `remote::probe` speaks one exchange without the git binary: protocol v2's `ls-refs` over HTTPS, as pkt-lines (`pkt_line.rs`), its request body and response (`ls_refs.rs`), and an origin's HTTPS form (`url.rs`). Only the bytes are built and read here; no daemon calls it now that origin is imported by one member through an agent (`docs/zend_branch_ingest.md` §4).
 
 A `PushSpec` is `{ action, target, lease }`. `PushTarget` is `Branch(BranchName)` or `Tag(TagName)`; `PushAction` is `Update(Oid)` or `Delete`; `Lease` is `Expect(Oid)` (the remote must hold this) or `Absent` (the ref must not exist). Constructors cover the common cases: `PushSpec::branch`, `PushSpec::tag` (always `Absent` — a tag is published once; it takes the tag's own object, from `resolve_object`, so an annotated tag arrives with its message and tagger rather than as a lightweight tag on its commit), `PushSpec::delete_branch` and `PushSpec::delete_tag` (always `Expect`). A delete with `Absent` is refused before any push. There is no unconditional force; a matching lease does allow a non-fast-forward, which is how a branch zen owns is rebuilt. `--atomic` makes a multi-ref push all-or-nothing. Each result is `Created`, `FastForward`, `Forced`, `Deleted`, `UpToDate`, or `Rejected(Stale | AtomicAborted | Remote(reason) | Other(summary))`, parsed from `--porcelain` output.
 
@@ -381,7 +390,7 @@ A run that crashed, or whose restore failed, leaves its journal, and the next `p
 
 `publish_branch(pulled, new)` moves a branch anywhere on purpose — a new branch, a rewind — under the same lease, and `unpublish_branch` deletes on origin under the lease, then locally. Neither retries: origin moving in between is a refusal, never an overwrite. With no `origin` remote the local branch is the record: the pull reads it and a publish moves it.
 
-Reads never touch the network: they read the local refs. The origin watcher keeps the tracking refs within seconds of origin (`docs/zend_branch_ingest.md` §4), and `Repo::record_branches` reads the record through them — every `refs/remotes/origin/*` branch, or with no origin every local branch. **A tool's branch revision reads the record, never the local branch** (`zend-tools/src/tools/git/mod.rs`'s `on_record`, through `Repo::record_tip`): a local branch is only a cache of origin's, which a checkout that never wrote to a branch does not have and which can lag it, so `{"kind": "branch", "name": "main"}` is origin's `main`, and `git_refs`' `branches` lists the record's branches.
+Reads never touch the network: they read the local refs. The importer keeps the tracking refs within seconds of origin (`docs/zend_branch_ingest.md` §4, `docs/substrate_git.md` §5), and `Repo::record_branches` reads the record through them — every `refs/remotes/origin/*` branch, or with no origin every local branch. **A tool's branch revision reads the record, never the local branch** (`zend-tools/src/tools/git/mod.rs`'s `on_record`, through `Repo::record_tip`): a local branch is only a cache of origin's, which a checkout that never wrote to a branch does not have and which can lag it, so `{"kind": "branch", "name": "main"}` is origin's `main`, and `git_refs`' `branches` lists the record's branches.
 
 ### 7.9 A conversation's work
 

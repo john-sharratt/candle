@@ -11,7 +11,7 @@ candidates from the next turn after it seals.
 
 | Call | Effect |
 |---|---|
-| `submit_section(collection, name, content, priority) -> SectionRef` | Allocate an id, claim it for this timeline, seal in the background. |
+| `submit_section(collection, name, content, priority, after, sharing) -> Result<SectionRef>` | Allocate an id, claim it for this timeline, seal in the background. `after` names the submitted sections this one continues (empty for a section that stands alone); `sharing` says whether the text is this conversation's own or shared (`docs/shared_journal_sections.md`). |
 | `SectionRef::wait()` / `state()` | Block until sealed (`Ready{blocks}`), or observe `Pending` / `Failed` / `Removed`. |
 | `remove_section(&SectionRef)` / `remove_section_named(name)` | Drop the member, its K/V and its stream. |
 | `submitted_sections()` | Handles for the sections this conversation holds. |
@@ -32,10 +32,14 @@ takes the id the substrate already chose.
 
 The prefix a member seals against is the walk `prefix_before_collection` makes over
 the system prompt: bare sections, non-template members of earlier collections, and a
-section tree's default-present ids, up to the target collection. The address is
+section tree's default-present ids, up to the target collection, followed by the
+`after` sections it continues. The address is
 `ContentAddress { prefix_hash: owned_section_prefix(timeline, name, prefix_hash), section_hash }`.
 The salt keeps two conversations that submit identical content from sharing a
-stream, which matters because removal tombstones the stream.
+stream, which matters because removal tombstones the stream. A section submitted
+with `Sharing::Shared` is addressed by content alone (`shared_section_prefix`)
+instead, so every conversation that would seal exactly that text restores one
+stream.
 
 The sealed K/V goes through the normal persisted path: declare stream, cold persist,
 `RestoreSection` after a restart when the same content is submitted under the same

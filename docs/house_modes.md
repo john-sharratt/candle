@@ -36,7 +36,7 @@ rekordbox; every other mode closes it (`npcd/src/house/mode.rs`).
 **One act, `house_mode {mode}`** (`npcd/src/house/acts.rs`). It is offered to a body that takes no
 orders — Zen — standing (its attention) in the room the house's devices stand in, with `mode`
 bound to the six modes; anywhere else, and to anybody else, it is not in the grammar
-(`Choices::HouseModes`, `engine/build/within.rs`). Zen sets it when the family ask for it or
+(`Choices::HouseModes` in `engine/tools/choices.rs`, filled by `engine/build/within.rs`). Zen sets it when the family ask for it or
 plainly want it.
 
 A switch (`npcd/src/house/switch.rs`), in order:
@@ -132,7 +132,7 @@ all. So nothing is held down; each part steps aside as far as the group can abso
 
 | Part | While reserved |
 |---|---|
-| keep (`keep/src/main.rs`) | every switch, accept, restart, stop and trial is refused unless forced (`X-Keep-Force`), the cluster's own trials included. A start is not refused: it takes nothing down. |
+| keep (`keep/src/guard.rs`, `keep/src/main.rs`) | every switch, accept, restart, stop and trial is refused unless forced (`X-Keep-Force`), the cluster's own trials included. A start is not refused: it takes nothing down. |
 | the member (`host/src/cluster/reserve.rs`, `cluster::reserve::step_aside`) | **drains while another member is ready for every app it serves**: the gateways route it nothing new and its claims and leases go to the others. It stays connected, so it keeps seeing who else is ready, and **undrains the moment an app has nobody else** — serving it, reservation or not. Only the reservation's own drain is undone; one a person asked for stays. |
 | the agent (`agent/src/jobs.rs`, `member.rs`) | **no builds or tests** (`JobError::Reserved`, answered as `no_agent`, so a caller goes to another agent), and no free slot in its `CAPACITY`, so a gateway places them elsewhere. Pushes, fetches and the house's **bridge calls go on**: the party switches the devices through them. |
 | the tenants (`zend/src/ingest_lease.rs`) | **read, calibrate and seal nothing**: every unit, calibration and face is left as one another member holds is, for a member elsewhere or the first pass after release. A worker's turns go on: they are Zen doing what someone asked. |

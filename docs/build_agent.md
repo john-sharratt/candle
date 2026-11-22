@@ -13,8 +13,7 @@ alongside them.
 dying while it holds a queue (§6) fails the build that was running and loses
 the runs queued behind it. Nothing here tries to survive that.
 
-`docs/jobs.md` §2 and §6 describe the path as it is built today. Each
-changes as the step that touches it lands.
+`docs/jobs.md` §2 and §6 describe the same path from the job tools' side.
 
 ## 1. What went wrong
 

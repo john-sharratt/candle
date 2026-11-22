@@ -1,6 +1,6 @@
 # Private mode and diaries
 
-**Status: building** (branch `aw/private-mode`, from 2026-11-11). Owner: John.
+**Status: built** (on `main`; designed from 2026-11-11). Owner: John.
 Components: the `mcp` aggregator, `mcp-server`, zend's MCP tools and memory,
 the `journals` crate and repository, the guides. Extends `docs/mcp_app.md`,
 `docs/mcp_user_context.md` and `docs/memory_backbone.md`; where they disagree

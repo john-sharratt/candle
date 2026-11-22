@@ -175,7 +175,7 @@ person's worker conversations to them and to Admins
   chat opens a second chat, apart from the first; a send naming another
   person's chat, or one closing, is refused as not open; a read without `after`
   gives Zen's messages since Claude's last; a read writes no record; every
-  answer names its chat; a send opening a seventeenth chat is refused, and the
+  answer names its chat; a send opening a hundred and twenty-ninth chat is refused, and the
   count is each person's own.
 - `tools/zen_chat_send.rs`: a `chat` that is not a chat id — a number, `null`,
   empty — is refused, never taken for none.

@@ -4,7 +4,7 @@ Design of `candle-kernels/src/paged-latent/latent_prefill_kernel.cuh` — the pa
 latent-attention prefill for the DeepSeek single-latent geometry (HEAD_DIM=512, K≡V,
 MQA `n_kv_head=1`, 64 query heads, nope‖rope 448+64). Measured on RTX PRO 5000
 Blackwell (sm_120, 100 KB smem/SM, 65536 regs/SM): **~65 ms / 4096 queries @ 200K
-depth, topk 512** (harness `latent_prefill_bench`, gate `max_rel_err = 0.0088`)
+depth, topk 512** (harness `latent_prefill_bench`, `candle-transformers/examples/`, gate `max_rel_err = 0.0088`)
 — 2.7× the scalar-PV flash baseline this design replaced (178 ms). StoryRewrite
 n=1/4/8 all 100%.
 
@@ -64,10 +64,11 @@ over keys at full per-dim granularity. Measured **precision-neutral** (gate
 exactly 0.0088): dims are the sensitive axis, keys are not (pooling dims —
 per-band scales — fails the gate at 0.10). The PV epilogue scale for comp
 tiles is therefore a kernel constant, loaded into `s_vscale` at the first comp
-tile of each split. Canonical `comp` stays f32/pre-RoPE/position-free (§C of
-the batched-attention plan); all of this is throwaway per-prefill scratch.
+tile of each split. The canonical corpus stays the position-free pre-RoPE two-region cache
+(`deepseek_int8_hot_corpus.md`; §C of the batched-attention plan); all of
+this is throwaway per-prefill scratch.
 
-## Adaptive per-band window formats
+## Per-band window format dispatch
 
 The window walk dispatches on the KvHead's per-band format tag
 (`load_band_elem` in `latent_common.cuh`, shared with the decode kernel):
@@ -76,9 +77,12 @@ dtypes, and all arena quant formats via `dequant_element_inline`. Quant bands
 are token-oriented GGML blocks — with CHUNK=32, block `d` holds dim `d`'s 32
 tokens (`base + d·BLOCK_BYTES`, element `within & 31`) — composed with the
 per-band outer scale. Each lane's 16 dims sit in one band, so {ptr, fmt,
-outer} resolve once per lane. The write paths (fused/glue scatter) stay FP8:
-sealed chunks gain quant tags only through the compression policy. Gated
-bit-exact by `mirror_bit_exact_mixed_band_formats` (decode) and within the
+outer} resolve once per lane. The write paths (fused/glue scatter) write FP8,
+and single-latent KV is never adaptively compressed
+(`quantize_sealed_in_place` refuses a single-latent backing), so in production
+every window chunk carries the F8E4M3 tag; the quant-band read path is exercised
+by the synthetic slots and the host codecs (`latent_moe/paged/band_codec.rs`).
+Gated bit-exact by `mirror_bit_exact_mixed_band_formats` (decode) and within the
 int8-PV envelope by `prefill_mixed_rows_equal_decode_steps` (prefill).
 
 ## Measured design boundaries (do not relitigate without new hardware)
@@ -102,5 +106,6 @@ int8-PV envelope by `prefill_mixed_rows_equal_decode_steps` (prefill).
 int8 P·V is a different PV than the decode kernel's scalar path, so
 prefill↔decode gates are tolerance-based (`d < 0.03·scale`); the harness
 float-reference gate (0.05, measured 0.0088), the mirror bit-exact suite
-(including mixed band formats), `prefill_chunked`, and wave_paris /
+(including mixed band formats), `prefill_chunked_rows_match_decode`, and the wave gates
+(`wave_prefill_state_matches_decode_steps`, `wave_prefill_then_decode_end_to_end`) /
 StoryRewrite argmax are the guards.

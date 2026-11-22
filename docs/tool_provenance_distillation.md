@@ -5,8 +5,8 @@ KV chunks, **and** the per-turn wide-Q signature (`WideQSig`). But only the
 signature is ever read at runtime: tool selection scores the `tools` collection's
 belief gallery (`Resolver::belief_gallery`), which reads each in-scope turn's
 `wide_q_sigs` and never touches its tokens or KV. And the trajectories are
-redundant on disk anyway — the exported `zend-tools/examples/*.md` files are the
-source of truth the prefill-calibration path reads.
+redundant on disk anyway — the tool definitions (`zend/src/prompts/tools/*.yaml`,
+npcd's act catalog) are the source of truth the prefill-calibration path reads.
 
 So once a calibration turn's sig is captured, its content is dead weight.
 **Distillation** reclaims it: keep the `StreamDecl` (its tags + gallery scope) and
@@ -19,10 +19,13 @@ A **per-timeline `Distilled` marker**, mirroring the `Tombstone` pattern: a
 substrate set + a `RecordType::Distilled` redo-log record, reached by compaction.
 `Tombstone` = "drop everything"; `Distilled` = "keep sig + decl, drop content".
 
-1. **The marker.** `Conversation::distill_timeline(timeline)` (and the
-   `ConversationEngine::distill_timeline` wrapper) writes a `Distilled` record and
-   sets the in-RAM `Substrate::distilled_timelines` bit. `is_timeline_distilled`
-   queries it. Idempotent — duplicate markers replay identically.
+1. **The marker.** `ConversationEngine::distill_timeline(timeline, mode)`
+   (`candle-conversation/src/engine/tiering.rs`) writes a `Distilled` record and
+   sets the in-RAM `Substrate::distilled_timelines` entry. `mode` is a
+   `DistillMode`: `ProvenanceOnly` (what calibration uses: keep the sig, drop
+   tokens and KV) or `TextOnly` (archived conversations: keep tokens, drop KV and
+   the sig). `is_timeline_distilled` queries it. Idempotent — duplicate markers
+   replay identically.
 
 2. **Marking calibration material.** The calibration loop
    (`host/src/calibration/phase.rs`) marks a conversation for distillation in **both**
@@ -36,7 +39,7 @@ substrate set + a `RecordType::Distilled` redo-log record, reached by compaction
    material already in the substrate from a prior run would never be distilled.
 
 3. **A compaction branch.** `collect_live_records`
-   (`persistence/compaction/collect.rs`) already emits each record type of a turn
+   (`candle-conversation/src/persistence/compaction/collect.rs`) already emits each record type of a turn
    independently. For a turn whose `timeline_id` is in the distilled set, it emits
    the `StreamDecl` + `WideQSig` (and `ProjectionEvents`) but **skips the KV
    chunks and the `Tokens` record**. Tombstoned timelines still drop entirely.
@@ -111,4 +114,4 @@ Reaches a steady sig-only state after one reclaim pass; never loops.
 - **Reclaimed:** `Tokens`, KV `Chunk` records.
 - **Consequence:** `calib-check` (which decodes turn tokens to audit tool-calls)
   cannot run against a distilled corpus — it must run before distillation or on a
-  fresh rebuild. The prefill trajectories remain available in the `.md` files.
+  fresh rebuild. The prefill trajectories remain available in the tool definitions.

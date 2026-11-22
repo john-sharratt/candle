@@ -1,6 +1,11 @@
 # DeepSeek-V4-Flash — DSpark Speculative Decode
 
-**Status:** in progress. Branch `speculative-decode` (forked from `deepseek-flash`).
+**Status:** built end to end. The DSpark drafter, the batched verify wave, the accept loop
+and the corpus rollback are in `latent_moe/`, and the generic driver
+(`ManagedBatchedModel::speculative_decode_step`, `batched_inference/managed_model.rs`) runs
+them. Gates: `wave_speculative_step_is_lossless`, `wave_speculative_step_with_drafter_is_lossless`,
+`wave_speculative_speedup_with_drafter`, `wave_speculative_realtext_acceptance`
+(`latent_moe/wave/tests_speculative.rs`).
 **Goal:** draft a block of up to 5 tokens per decode cycle with the DSpark `dflash` drafter —
 **as far as the drafter's own confidence justifies** (0 drafts ⇒ a normal decode) — verify
 them in one main-model forward, and commit the prefix that converges. Turns our launch-bound
@@ -15,10 +20,11 @@ decode floor into ~2.4+ tokens per forward with no change to the output distribu
 `output_hc` head-reduce → `output_norm`); the **semi-autoregressive sampler** `sample_block`
 (Eq. 4 + Alg. 1); and `DsparkDrafter::draft` tying it all together. 10 tests (6 CPU bit-exact,
 4 download) + an on-GPU real-weight test that loads the drafter and runs the 3 injected blocks
-→ finite hidden `[5,4096]`. **Remaining = engine plumbing only** (§4.3-4.5): capture the
-target's hidden states at layers [41,42,43] to feed `draft()`, hand it the target's shared
-`token_embd`+`output.weight`, and run the verify/accept/rollback loop against the running 284 B
-target — that's where real acceptance (and the residency go/no-go, §7) is measured. The drafter
+→ finite hidden `[5,4096]`. The engine plumbing (§4.3-4.5) is in place: the wave stashes the
+target's hidden states at `dflash.target_layers` per sequence (`target_feat`) to feed `draft()`,
+`draft()` takes the target's shared `token_embd`+`output.weight`, and `begin_verify` /
+`end_verify` / `truncate_sequence` (`latent_moe/wave/managed.rs`) run the verify/accept/rollback
+loop against the target — where real acceptance (and the residency go/no-go, §7) is measured. The drafter
 is DSpark verified against the real GGUF — **not** the V3-MTP `eh_proj` recurrence an earlier
 draft of this doc assumed.
 
@@ -117,22 +123,23 @@ There are three decode implementations; only the batched wave is production and 
 matters here (the reference `IncrementalTransformer::step` and single-seq engine paths stay
 as correctness oracles):
 
-- **Production:** `BatchedEngine::forward_wave` (`latent_moe/wave/managed.rs:470`) — one call = one wave =
+- **Production:** `BatchedEngine::forward_wave` (`latent_moe/wave/managed.rs`, which calls
+  `drive_wave`; the layer loop is `latent_moe/wave/sweep_wave.rs`) — one call = one wave =
   one forward step for every session in the batch.
 - Per-wave the head block already gathers scored rows and runs **one batched `lm_head` GEMM**
-  over `[1, R, dim]` (`wave.rs:1494-1516`), returning per-row logits. Sampling (argmax) is
-  the caller's host responsibility (`wave.rs:1695,1726,1830`) — there is no sampler in the
-  module.
-- **The verify shape already exists.** `paged_latent_prefill_raw` (`latent_moe/paged/prefill.rs:548`,
-  driven at `wave.rs:1344-1363`) feeds K new tokens for one sequence through **one** kernel
+  over `[1, R, dim]` (`sweep_wave.rs`, `e.lm_head().forward(&scored_hidden)`), returning per-row logits. Sampling (argmax) is
+  the caller's host responsibility — there is no sampler in the module.
+- **A K-token prefill launch exists** — `paged_latent_prefill_raw`
+  (`latent_moe/paged/prefill.rs`) feeds K new tokens for a sequence through **one** kernel
   launch: packed `kv_new`, a `seq_of` query→slot map, per-token `q_pos`, and per-seq diagonal
-  metadata `new_meta[n_seq,4] = {rows, base, start, -}`. Each query attends its arena slot +
-  its own new-token diagonal slice with causal masking, and is **argmax-equal to per-token
-  decode** (guaranteed by the bf16 diagonal staging, `wave.rs:650-664`). This is exactly a
-  speculative verify of K proposed tokens — we reach it today only through `prefill_seqs`.
+  metadata `new_meta[n_seq,4] = {rows, base, start, -}`, and it is gated by
+  `prefill_rows_equal_decode_steps`. The built verify does not use it: a verify block rides the
+  wave as a multi-token member of the prefill slot and the sweep expands it into one
+  **virtual decode slot per position** that runs the decode kernel (§4.3), so verify rows have
+  decode numerics by construction.
 
-So verify is "run the drafts as a K-token prefill row-group". Drafting is the genuinely new
-compute; rollback plumbing is the genuinely new bookkeeping.
+So verify is "run the block as per-position decode rows in one wave". Drafting is the genuinely
+new compute; rollback plumbing is the genuinely new bookkeeping.
 
 ---
 
@@ -201,9 +208,16 @@ draft fewer — at zero, do a normal decode."
     the cycle always runs; τ and the drafter's confidence decide its depth.)
   - `d = k_max` in confident, low-entropy regions (boilerplate, repeated structure) ⇒ full
     4-token draft, most of it accepted.
-- **τ selection:** default range **0.4–0.6** (vLLM DSL); model- and workload-dependent, so we
-  calibrate it on our fixtures against effective ms/token (§6, measurement 5). A single scalar,
-  read from deployment config like a model path — **not** a per-path feature flag.
+- **τ selection:** vLLM DSL's default range is **0.4–0.6**; model- and workload-dependent, so we
+  calibrate it on our fixtures against effective ms/token (§6, measurement 5). The calibrated
+  value is the constant `DSPARK_TAU = 0.3` in `latent_moe/wave/speculative.rs::draft_one`. It is a
+  single scalar, **not** a per-path feature flag.
+- **Cost control around τ (built):** `draft_one` also gates on a per-sequence rolling
+  acceptance EMA (`SpecStats`, `SPEC_EMA_ALPHA = 0.25`): below `SPEC_MIN_ACCEPT = 2.3`
+  accepted tokens per drafted step (plus 0.45 per extra session in the cohort) the drafter is
+  skipped and the step is a 1-token verify, with a drafted probe every `SPEC_PROBE_INTERVAL =
+  32` skipped steps; and it caps the block at `ceil(EMA + 1)` minus a shave when the verify
+  wave's expert miss rate passes 50 %. All of these shape cost and acceptance, never the output.
 - **Why it compounds on WDDM specifically:** each avoided draft step is a full avoided set of
   kernel launches (the §7 overhead). Confidence-gating removes draft
   launches exactly where they have negative expected value (low accept probability), so the
@@ -216,55 +230,47 @@ draft fewer — at zero, do a normal decode."
   further step but needs a tree-causal-mask verify kernel we don't have — out of scope; the
   linear chain here is the "keep 1–4 that converge" shape.
 
-### 4.3 The verify step: K-token prefill row-group + hidden readout
+### 4.3 The verify step: decode-shaped block rows + hidden readout
 
-Extend the wave with a fourth row-group, `verify_seqs`/`verify_inputs`, that reuses the
-existing multi-slot prefill machinery rather than adding a kernel:
+A verify block rides the wave as a multi-token member of the **prefill** slot
+(`begin_verify` in `latent_moe/wave/managed.rs` builds the `VerifyPlan`: the plain cohort's
+committed tokens as decode rows, each verifying sequence's block as a `verify_inputs` row),
+and inside the sweep (`latent_moe/wave/sweep_wave.rs`) the block is expanded back to **one
+virtual decode slot per position**, so verify runs the **decode kernel** — decode numerics by
+construction (FP PV, read-time rope, decode softmax structure) — rather than the prefill
+kernel's int8-PV envelope, which flips narrow-margin argmaxes:
 
 1. **Input row:** for a verifying session, the `d+1` tokens `[t_{p+1}, d_1, …, d_d]` (`d` =
-   this cycle's adaptive draft count, `∈ [0, k_max]`) at positions `p+1 … p+1+d`, fed through
-   the same `new_meta`/`seq_of`/`q_pos` path prefill uses (`wave.rs:1344-1363`). Causal masking
-   makes draft position i attend to corpus + arena window + drafts `< i` — exactly verify
-   semantics. When `d = 0` this is a single-row decode — the normal path (§4.2).
-2. **Corpus / provenance selection:** select **once** using the base query at position `p`
-   and **share** that corpus set across all `d+1` verify rows. The drafts are ≤`k_max` positions
-   in the future and share locality; per-draft reselection would cost `d` extra BDP scans for
-   negligible accept-rate change. This is an explicit approximation — it affects *which
-   corpus is visible during verify*, never correctness of the accept test (that compares the
-   main model's own argmax to the drafts). Flagged for measurement (§6).
-3. **Logits:** add all `d+1` rows to `sel_rows` (`wave.rs:1503`) so the existing single
-   batched `lm_head` GEMM scores them together — no new head path.
-4. **Hidden readout (new):** also surface the post-`head_reduce`, post-final-norm residual
-   hidden for each verify row (the tensor already computed at `wave.rs:1494-1511` just before
-   `lm_head`). The accepted position's hidden seeds the next cycle's draft. Return it in
-   `WaveStep` alongside `logits`.
+   this cycle's adaptive draft count, `∈ [0, k_max]`) at positions `p+1 … p+1+d`. All of a
+   block's virtual slots share identical slot headers serialized with the write length committed
+   over the whole block (the rows are host-written before each layer's launch, and
+   `mark_decode_writer_stale` makes the header build re-serialise the writer region); per-slot
+   causal visibility comes from the kernel's `key_pos <= q_pos` bound alone, so draft position i
+   attends to corpus + arena window + drafts `< i`. When `d = 0` this is a single-row decode — the
+   normal path (§4.2).
+2. **Corpus / provenance selection:** per row. Each row captures its selection intent against
+   its OWN corpus size and the selection batches over every row of every session (pass 1c of
+   the decode block in `sweep_wave.rs`), exactly as for plain decode rows. The earlier
+   plan to select once at the base position and share the set across the block is not built:
+   per-row selection is what makes verify equal per-token decode.
+3. **Logits:** all `d+1` rows of a verifying sequence are scored (`verify_all_rows` marks the
+   sequences for full-row head scoring) so the existing single batched `lm_head` GEMM scores
+   them together — no new head path. `end_verify` splits the scored rows back per cohort.
+4. **Hidden readout:** the post-`head_reduce`, post-final-norm residual hidden at
+   `dflash.target_layers` is stashed per sequence and position (`target_feat`) as the wave
+   scores each row; `draft_one` gathers the longest consecutive run of stashed positions ending at
+   the block's start (up to `window_size`) as the drafter's `Hctx` source.
 
-`verify_seqs` is guarded like prefill (skip when empty) so pure-decode waves are unchanged.
+`verify_seqs` is empty for pure-decode waves, so they are unchanged.
 
-**Kernel choice — reuse prefill now, extend decode later.** The prefill kernel is *correct*
-for verify (gate test `prefill_rows_equal_decode_steps`, `latent_moe/paged/tests_prefill.rs:2861`, proves prefill row i
-== decode step i) but it is **not** flash-style query-tiled: it launches **one thread block per
-query token** (`latent_prefill_kernel.cuh:986`, `grid(total_q,1,num_splits)`; the MMA M
-dimension is *heads*, not tokens), so the `d+1` verify tokens **each re-stream the whole
-window+corpus KV** — ~`(d+1)×` the attention memory traffic of one decode query — and it runs a
-**per-layer baked-RoPE corpus pre-pass** each forward (`latent_prefill_kernel.cuh:962-973`;
-~2 launches × 43 layers) that decode avoids via its **position-free persistent corpus cache**
-(`latent_decode_kernel.cuh:327-357`). At `d ≤ 4` with `num_splits=1` that is also only ~5
-thread blocks — badly under-occupied on a ~100-SM Blackwell part.
-
-- **Phases 2–3 reuse the prefill kernel as-is.** Even paying `~5×` attention + the pre-pass
-  launches, the verify forward stays well under the `~2.4× decode-forward` budget that makes
-  speculation win (attention is a fraction of a 43-layer forward; the win survives an
-  unoptimized verify). This lets us prove correctness and *measure* before spending kernel
-  effort — measurement 5 breaks out verify:kernel vs verify:prepass launch time.
-- **The optimized verify kernel is a small extension of the *decode* kernel, not a tuned
-  prefill** (§7, its own phase in §8). Pack the `d+1` verify tokens into the MMA so **one
-  KV-tile load serves all `d+1` queries** (true ~1× amortization), keep decode's position-free
-  corpus cache so verify **reuses** the base position's already-cached corpus and **skips the
-  per-forward RoPE pre-pass** (the dominant WDDM cost here — ~86 fewer launches/forward), and
-  add the cheap `(d+1)²` causal diagonal. Clean because verify shares the base corpus selection
-  (step 2) and the cache is position-free; real work because decode's M dimension is currently
-  heads, not tokens.
+**Kernel choice — the decode kernel over virtual slots.** The prefill kernel is correct for a
+K-token verify (`prefill_rows_equal_decode_steps`) but launches **one thread block per query
+token** and runs a **per-layer baked-RoPE corpus pre-pass**, while decode reads its position-free
+corpus cache. Verify therefore uses the decode kernel; the one remaining cost is that each
+virtual slot re-streams the window and corpus (the MMA M dimension is *heads*, not tokens), a
+`~(d+1)×` attention memory traffic that stays well under the `~2.4× decode-forward` budget that
+makes speculation win. Packing the `d+1` tokens into one MMA so a single KV-tile load serves all
+of them is the open kernel optimisation (§7, §8 Phase 5).
 
 ### 4.4 Accept / reject
 
@@ -303,31 +309,33 @@ Four pieces of state, three already truncatable:
    cached decode slot buffer with `mark_decode_writer_stale`, so the header build's sync
    re-serialises it — a commit made outside the decode kernel must, see
    `../archived/deepseek/deepseek_perf_optimization_report.md` ("the live buffer's one invariant"). On accept length `m ≤ d+1`, roll back with
-   `truncate_sequence_to_tokens(seq, p+m)` (`candle-nn/src/kv_cache/chunked/sequence_ops/tail.rs:2071`) + `set_sequence_offset`
-   (`batched_inference.rs:2455`). **Present.** Needs a session-level token-granular wrapper
-   (only a block-granular `truncate_sequence_to_blocks` wrapper exists at
-   `batched_inference.rs:1216`).
-2. **Drafter SWA KV** — same truncate for `MtpKvState`, plus the drafter writes `d`
-   speculative positions; trim to the accepted count. New but small (single layer).
+   `truncate_sequence_to_tokens(seq, p+m)` (`candle-nn/src/kv_cache/chunked/sequence_ops/tail.rs`, with the session-level
+   token-granular wrapper in `batched_inference/block_tail.rs`) + `set_sequence_offset`
+   (`batched_inference/stats.rs`). **Present.**
+2. **Drafter SWA KV** — the drafter attends over the injected `Hctx` window rebuilt per block from
+   the stashed target features (`draft_one`), so it carries no KV that needs trimming.
 3. **Compressed corpus (`FloatGallery`) + streaming compressor** — **snapshot → absorb →
    restore + replay** (implemented; an earlier draft of this section proposed deferring
    absorption until after the accept decision, which is WRONG: corpus selection explicitly
    includes groups completed inside the current block — `kernel_attn_prefill_assemble`'s
    `n_visible[t] = base + (l0+t+1)/ratio` — mirroring decode's push-then-select, so deferral
    would diverge verify from decode at every group-boundary token). The implemented design:
-   - `verify_block` takes a per-layer pre-verify snapshot (`VerifySnapshot` in `latent_moe/wave/speculative.rs`):
+   - `begin_verify` takes a per-layer pre-verify snapshot (`VerifySnapshot`/`LayerVerifySnap` in
+     `latent_moe/wave/speculative.rs`, `snapshot_verify_state` in `wave/mod.rs`):
      each `IncrementalCompressor`'s streaming state (`CompressorState` — partial-group
      buffers, overlap prev-group, `group_idx`; `Arc`-clone cheap) + the gallery length.
-     During the verify forward, prefill pass 1 stashes the block's projected compressor
-     rows (comp + icomp per layer) into the snapshot — the replay source.
+     During the verify forward, the sweep stashes the streaming state after absorbing each
+     block row (`row_states`: comp, icomp and gallery length per row).
    - The generic driver routes its truncation through a `ManagedBatchedModel::
      truncate_sequence` hook (default = session KV truncate); DeepSeek's override adds
      `rollback_verify_state`: full accept discards the snapshot (the absorbed block IS the
-     accepted text); partial accept restores the compressors, truncates the gallery
+     accepted text); partial accept **installs** the stashed state after the last accepted row
+     (the pre-block state when none is accepted) and truncates the gallery to the recorded length
      (`FloatGallery::truncate` — every reader narrows to `len`, appends overwrite `len..`,
-     so a length rollback suffices), and replays exactly the `m` accepted rows via
-     `emit_groups_projected` — bit-identical to having absorbed only those tokens
-     (`snapshot_restore_replay_matches_clean_absorb`, `latent_moe/compressor/tests_incremental.rs`).
+     so a length rollback suffices). No replay and no per-layer launches: the per-row states
+     are the wave's own decode-shaped capture, bit-identical to having absorbed only those tokens.
+     (`snapshot_restore_replay_matches_clean_absorb`, `latent_moe/compressor/tests_incremental.rs`,
+     gates the compressor state round trip.)
    - Without this, a partial accept leaves rejected draft rows in the partial-group buffer,
      a group pooled over draft content in the gallery, and `group_idx` advanced — the
      re-decoded positions get absorbed AGAIN as duplicate, shifted groups, and the model
@@ -336,7 +344,7 @@ Four pieces of state, three already truncatable:
    from the arena/corpus, which we already truncated. The only cross-wave carried state is
    per-`(layer,seq)` compressor buffers, handled by (3).
 
-**No `window_ring_snapshot`/`corpus_snapshot` full checkpoints** (`latent_moe/wave/mod.rs:168-299`) on the
+**No `window_ring_snapshot`/`corpus_snapshot` full checkpoints** (`latent_moe/wave/mod.rs`) on the
 hot path — they copy full corpus/window state and are far heavier than truncate. They remain
 for cold resume only.
 
@@ -349,14 +357,15 @@ Phasing:
   normally in the same wave (they're just decode rows). Proves correctness and measures the
   single-session win, which is the stated target ("decode speedup"). This is the regime where
   the WDDM floor hurts most and the win is largest.
-- **v2 — batched spec.** All sessions draft and verify together; the verify row-group packs
-  `Σ (d_s+1)` rows across sessions (the multi-slot kernel already handles arbitrary per-seq row
-  counts via `new_meta`/`seq_of`). Per-session `d_s` and accept lengths differ → per-session
-  truncate. The wave-batching machinery (`decode|prefill|glue` layout, `wave.rs:632-649`)
-  extends to a fourth `verify` group cleanly. **Adaptive draft length across a batch:** either
-  keep it per-session (fully ragged, what the packed kernel already supports) or, like vLLM
-  DSL, gate on the **batch-mean** confidence to keep `d` uniform across the batch (rectangular,
-  simpler bookkeeping) — decide from the v2 measurement. Defer until v1 is measured.
+- **v2 — batched spec (built).** All sessions draft and verify together: `begin_verify` packs
+  every verifying sequence's block into one wave (`Σ (d_s+1)` virtual decode rows) beside the
+  plain cohort's decode rows. Per-session `d_s` and accept lengths differ → per-session
+  truncate. **Adaptive draft length across a batch** is per-session (fully ragged): each
+  sequence's `draft_one` runs on its own stashed features and acceptance EMA, with the gate's
+  threshold widened by 0.45 accepted tokens per extra session in the cohort (§4.2), so a wide
+  cohort rides the plain batched wave unless the text is very predictable. Drafting itself is
+  one drafter forward per session (`speculative_draft` maps over the cohort); batching the
+  drafters is not built.
 
 ---
 
@@ -379,10 +388,9 @@ machines, where the gated tests look): no daemon runs DeepSeek, so the hosts' mo
   (Eq. 5) against a hand-computed reference, orientation-robust to either GGUF storage layout;
   `ConfidenceHead::confidence` = `σ(wᵀ[h; W₁[prev]])` (Eq. 7).
 
-**Remaining (GPU-coupled, needs a device to validate):** the backbone `draft()` forward with
-target-feature extraction + KV injection (§4.1), and the verify/rollback/accept wiring in the
-wave (§4.3-4.5). These are specified above; they are integration + kernel work, not open
-research — the architecture is pinned by §2 and the loaded weights.
+The backbone `draft()` forward with target-feature extraction + KV injection (§4.1), and the
+verify/rollback/accept wiring in the wave (§4.3-4.5), are built on top of this load
+(`latent_moe/wave/speculative.rs`, `latent_moe/wave/managed.rs`).
 
 ---
 
@@ -398,11 +406,13 @@ pieces, not tolerances.
    `target_layers`; `DsparkDrafter::load` loads 3 blocks + `markov_w1/w2` + `output_norm`.
 2. **Verify == per-token decode**: a K-token verify row-group over `[t, d_1, d_2]` must be
    argmax-equal, row-for-row, to running those three tokens as three separate decode steps
-   (inherits the existing prefill mirror gate `wave.rs:650-664`). Raw-token equality.
+   (the verify rows run the decode kernel, so this is decode-step equality; the prefill-kernel
+   analogue is `prefill_rows_equal_decode_steps`). Raw-token equality.
 3. **Rollback exactness**: append `d+1` tokens, truncate to `m`, and assert the arena +
    position + compressor state are **byte-identical** to having only ever decoded `m` tokens
    (this is the property that makes speculation invisible to the model). Covers
-   `truncate_sequence_to_tokens`, the drafter KV truncate, and `absorb_accepted`.
+   `truncate_sequence_to_tokens` and `rollback_verify_state`
+   (`snapshot_restore_replay_matches_clean_absorb`).
 4. **End-to-end determinism**: greedy generation with speculation on must produce the **exact
    same token stream** as greedy decode with speculation off, on the StoryRewrite fixture, all
    configs. This is the headline gate — spec is a no-op on output by construction.
@@ -436,10 +446,9 @@ pieces, not tolerances.
   causal paged-latent kernel. Getting it bit-faithful to the trained drafter is the crux of
   acceptance; it's the piece that must be GPU-validated (the CPU reference pins the Markov +
   confidence math, but not the injected-KV attention).
-- **Verify-kernel efficiency (prefill reuse).** The reused prefill kernel re-streams KV per
-  verify token and re-bakes the corpus RoPE per layer (§4.3) — fine for the first cut; if test 5
-  shows verify:kernel/prepass launch time material, build the extended-decode verify kernel
-  (Phase 5). On WDDM the per-layer pre-pass launches dominate the `~5×` L2-hot KV re-stream.
+- **Verify-kernel efficiency.** Each virtual verify slot runs the decode kernel and re-streams
+  the window and corpus KV (§4.3); if test 5 shows the verify kernel's launch time material,
+  build the token-packed extended-decode verify kernel (Phase 5).
 - **Confidence calibration.** DSpark's confidence head is trained to predict acceptance
   directly (§2 Eq. 8), so it should be well-calibrated — confirm on our model (test 5); if not,
   τ still bounds *wasted* drafts, or fall back to the max-softmax proxy.
@@ -449,22 +458,17 @@ pieces, not tolerances.
 ## 8. Phasing
 
 1. **Phase 1 — loader + math. ✅ DONE.** `dflash` config + `DsparkDrafter::load`, and the bit-exact
-   Markov/confidence math with gate test 1 (§5, §6.1). Nothing wired into decode yet.
-2. **Phase 2 — verify path.** Fourth `verify` row-group reusing the prefill kernel, hidden
-   readout (incl. the `target_layers` capture for `Hctx`), batched logits over `d+1` rows;
-   gate test 2. No drafter yet — feed *known* tokens to prove verify+accept+rollback (tests 2, 3).
-3. **Phase 3 — drafter forward + single-session spec.** `DsparkDrafter::draft` (semi-AR
-   backbone with target-KV injection + Markov bias + confidence scheduling, §4.1–4.2), wire the
-   full cycle for one session (§4.6 v1); calibrate `τ`; gates 3, 4; measurement 5 — **including
-   the residency go/no-go (§7).** This is the milestone that delivers (or refutes) the speedup.
-4. **Phase 4 — batched spec + sampling.** Ragged multi-session verify (§4.6 v2) and the
-   modified-rejection sampling arm (§4.4).
-5. **Phase 5 — extended-decode verify kernel (optimization, measurement-gated).** Only if
-   Phase 3's measurement shows the reused prefill kernel's per-token KV re-stream or per-layer
-   RoPE pre-pass is material: a decode-derived kernel that packs the `d+1` verify tokens (one
-   KV-tile load for all), reuses the position-free corpus cache (no per-forward pre-pass), and
-   adds the `(d+1)²` causal diagonal (§4.3, §7). Gated by the same `prefill_rows_equal_decode_steps`
-   equality it replaces. Do **not** build speculatively — the Phase 3 numbers decide whether it
-   pays.
-
-Commit boundaries follow the phases; each lands with its gates green and no half-wired path.
+   Markov/confidence math with gate test 1 (§5, §6.1).
+2. **Phase 2 — verify path. ✅ DONE.** The verify block as decode-shaped rows in one wave (§4.3),
+   hidden readout (incl. the `target_layers` capture for `Hctx`), batched logits over `d+1` rows;
+   `wave_speculative_step_is_lossless` proves verify+accept+rollback with known tokens.
+3. **Phase 3 — drafter forward + speculation. ✅ DONE.** `DsparkDrafter::draft` (semi-AR
+   backbone with target-KV injection + Markov bias + confidence scheduling, §4.1–4.2) wired into
+   the full cycle; `wave_speculative_step_with_drafter_is_lossless` is the end-to-end gate,
+   `wave_speculative_speedup_with_drafter` and `wave_speculative_realtext_acceptance` the measurement.
+4. **Phase 4 — batched spec + sampling.** Ragged multi-session verify (§4.6 v2) is built; the
+   modified-rejection sampling arm (§4.4) is not (greedy only).
+5. **Phase 5 — extended-decode verify kernel (optimization, measurement-gated; not built).** Only if
+   the measurement shows the per-virtual-slot KV re-stream is material: a decode-derived kernel
+   that packs the `d+1` verify tokens (one KV-tile load for all) and adds the `(d+1)²` causal
+   diagonal (§4.3, §7). Do **not** build speculatively — the measurement decides whether it pays.

@@ -2,8 +2,10 @@
 
 Qwen3.8-Flash-Next selects, per query, the `top_k + ratio − 1 = 2051` cells
 (513 blocks of 4) whose indexer score `Σ_h ReLU(⟨q_h, k̄_b⟩)` is highest, plus
-the query's own partial block. Nothing else is guaranteed a seat: there is no
-sliding window and no sink.
+the query's own partial block. Nothing else is guaranteed a seat — there is no
+sliding window and no sink — except the sequence's pinned ranges, which are
+attended whole beside the budget (`StrataTokens::pinned`,
+`docs/hit_driven_projection.md` §5).
 
 ## The problem
 
@@ -38,7 +40,7 @@ plus the query's tail. A block chosen by several windows (a prompt block, or a
 recent candidate) is attended once, at its widest cut.
 
 Each window asks the checkpoint the question it was trained on — the best 2051
-cells among ~128K positions — instead of the best 2051 among 294K. The
+cells among a window of positions — instead of the best 2051 among 294K. The
 prompt is ranked in every window, so it competes everywhere. In Candidate mode
 the recent span gets as many chances as there are windows, and is still chosen
 only on score. In Forced mode it is always attended.
@@ -49,11 +51,14 @@ oracle, the kernel and the gates all take that path unchanged.
 
 ## The default
 
-Every engine runs `StrataTokens::DEFAULT` unless told otherwise: 128K-position
-windows and an 8K recent span, in Candidate mode. It is the setting measured to
-recall at a 294–394K production prompt, at about +15% decode
-(`docs/results/qsa_stratified_selection_2026-10-06.md`). Forced mode recalled
-too, but confused its reasoning after a tool call, at +93% decode.
+Every engine runs `StrataTokens::DEFAULT` unless told otherwise: windows of
+262,144 positions — the trained window, the length the checkpoint's indexer was
+trained to rank — and an 8K recent span, in Candidate mode. A context inside the
+trained window is one window, so it selects exactly what `WHOLE` does there; a
+deeper one is ranked a trained window at a time. The setting was measured with
+128K-position windows to recall at a 294–394K production prompt, at about +15%
+decode (`docs/results/qsa_stratified_selection_2026-10-06.md`). Forced mode
+recalled too, but confused its reasoning after a tool call, at +93% decode.
 
 The setting belongs to the engine, not to one architecture.
 `StrataTokens` lives in `candle-transformers/src/models/selection_strata.rs`.
@@ -63,17 +68,19 @@ blocks at its own ratio and checks it against its kernel. A model whose
 attention reads every position has no candidates to divide, and takes it as
 nothing.
 
-Below one window's depth the default selects exactly what `WHOLE` does, because
-the prompt and the recent span are then inside the only window. The model
+Below one window's depth (262,144 positions) the default selects exactly what
+`WHOLE` does, because the prompt and the recent span are then inside the only
+window. The model
 itself still loads at `WHOLE`, so the forward gates, which drive the model
 without an engine, measure the checkpoint's own selection.
 
 `--qsa-window 0 --qsa-recent 0` runs the checkpoint's selection under zend.
 
-Cost: `windows × 513` blocks attended instead of 513. At 294K with 128K windows
-that is 3 × 513, plus 2,048 forced blocks in Forced mode. That is about 6.2K
-cells in Candidate mode and 14.4K cells in Forced mode, against a dense read of
-294K.
+Cost: `windows × 513` blocks attended instead of 513. At 294K with the 128K
+windows measured below that is 3 × 513, plus 2,048 forced blocks in Forced mode.
+That is about 6.2K cells in Candidate mode and 14.4K cells in Forced mode,
+against a dense read of 294K. At the default 262,144-position windows a 294K
+context is two windows.
 
 ## Where it lives
 

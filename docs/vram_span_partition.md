@@ -167,12 +167,13 @@ count**:
 
 ```rust
 fn live_watermark(&self) -> usize {
-    let free: HashSet<usize> = self.free.iter().map(|Reverse(i)| *i).collect();
-    (0..self.next).rev().find(|i| !free.contains(i)).map_or(0, |i| i + 1)
+    watermark_of(self.next, self.free.iter().map(|Reverse(i)| *i))
 }
 ```
 
-It scans downward from the top for the highest **non-free** index. A region is not
+`watermark_of` (`region_pool/occupancy.rs`) starts at `next` and walks the free
+indices downward from the top for as long as they are contiguous, so it lands on
+one past the highest **non-free** index. A region is not
 preemptible — an arena keeps its address for as long as it lives — so this is a
 hard floor, not a preference. **One live arena at a high index holds the tier up,
 no matter how much free ground lies beneath it.**
@@ -293,9 +294,9 @@ The result is a ratchet:
 Nothing lowers the watermark again, so step 5 is one-way.
 
 **The same ratchet runs across requests, and settling is what breaks it.** A finished
-turn's KV leaves the device only when the persistence thread has quantized it and
-landed its warm copy, and it needs the gaps between forwards to create the arenas that
-takes. A request arriving on the same instant fills those gaps with its own prefill,
+turn's KV leaves the device only when the gap has quantized it and the persistence
+thread has landed its warm copy (`docs/kv_quantize_in_the_gap.md`), and that needs the
+gaps between forwards to create the arenas the quantize leases. A request arriving on the same instant fills those gaps with its own prefill,
 so the last turn stood under it — measured on Flash-Next's Strata runs, 5 GB of the
 previous 128K turn's float KV under each of the next two, the zone 24,914 → 23,430 →
 21,953 slots and prefill 4,426 → 3,547 → 2,092 t/s. Two things close it:
@@ -348,7 +349,7 @@ low, and `weight_floor` can sit as far left as possible — **making the weight 
 and so expert residency, as large as it can be.**
 
 The code is `candle-nn/src/kv_cache/chunked/compact_plan.rs` (what to move),
-`compact_map.rs` (who holds the old identities), `compact/pass.rs` (the pass), and
+`compact_map/` (who holds the old identities), `compact/pass.rs` (the pass), and
 `scheduler/prefill/pack_pools.rs::compact_kv_if_fragmented` (when). The harness that specified
 it, and still gates it, is `candle-conversation/examples/kv_fragmentation.rs`.
 
@@ -456,8 +457,8 @@ it, and still gates it, is `candle-conversation/examples/kv_fragmentation.rs`.
   conceded expert residency with the pools a third air: 193, 240 and 290 MiB in two
   seconds on the 30B while 287 arenas held what 185 would. Relief runs between
   forwards, at the same seam as the wave loop's pass, and **no rung of it quantizes a
-  turn**: a finished turn's float→quant rewrite is the persistence thread's hot→warm
-  migrate. Run from relief it landed inside whatever wave called it — 0.65–2.4 s
+  turn**: a finished turn's float→quant rewrite is the gap's quantize
+  (`docs/kv_quantize_in_the_gap.md`). Run from relief it landed inside whatever wave called it — 0.65–2.4 s
   inside a 128K decode — and freed nothing for a turn the decode still attended,
   whose block table keeps the float chunks alive until the slot goes.
 - **Lowering the watermark is followed by lowering the floor.** A non-empty pass
@@ -795,6 +796,7 @@ set is a bitmap, so an arena of thousands of slots is as cheap as one of five.
 | `RecurrentState` | one DeltaNet layer state (`s` + conv tail + 8-row timeline), or the prefill scratch beside it (`docs/deltanet_timeline.md`) | `RecurrentStateStore` |
 | `Gallery` | one 6 KiB provenance gallery page (32 tokens × 24 words) | `GalleryArena`'s page runs |
 | `QsaIndex` | one live-tail key page (256 block keys), an open block, or a rewind copy of one | `IndexCache` (`qwen4exp::index_keys`) |
+| `CreepResidual` | one block of whole rows of a creep's residual, held between the steps of its sweep (`docs/wave_step.md` §3) | `CreepResidual` (`models/residual_rows`) |
 
 Common to all of them:
 

@@ -26,8 +26,8 @@ private-thread DMs and the channels its people make there — with the reconcile
 carry-over of its cursors, and typing (§4.4, §5.3–5.4, `world/`, `discord/dm/typing.rs`); and
 how a character knows its channels and chooses where to speak (§3.5,
 `engine/channels.rs`). §8 records the order it was built in. It sits on npcd's
-messaging (`npcd/src/sim/phone/mod.rs`, `npcd/src/engine/runtime/messages.rs` `message_npc` /
-`say_on_channel`, `npcd/src/engine/enact/mod.rs` the `message` family of acts) and on the
+messaging (`npcd/src/sim/phone/`, `npcd/src/engine/runtime/messages.rs` `message_npc` /
+`say_on_channel`, `npcd/src/engine/enact/messaging.rs` the `message` family of acts) and on the
 world authority (`npcd/src/authority/`, `docs/replicated_substrate.md` §9).
 
 ---
@@ -35,30 +35,30 @@ world authority (`npcd/src/authority/`, `docs/replicated_substrate.md` §9).
 ## 1. What exists, and what it lacks
 
 npcd already has three kinds of conversation, all held in one store, the world's
-`Sim.threads` (`sim/phone/mod.rs:100-170`):
+`Sim.threads` (`sim/phone/`):
 
 | npcd | What it is | Who writes it |
 |---|---|---|
-| **The channel** (`CHANNEL = "the channel"`, `sim/phone/channel.rs:83`) | one per world, permanent; every enrolled person and character is a member | a person with the Creator role (`POST /v1/world/:wid/channel`), a character's `message` act to `"the channel"` |
+| **The channel** (`CHANNEL = "the channel"`, `sim/phone/channel.rs`) | one per world, permanent; every enrolled person and character is a member | a person with the Creator role (`POST /v1/world/:wid/channel`), a character's `message` act to `"the channel"` |
 | **A group** (`Kind::Group`: `named`, or more than two members) | opened by a character's `open_group`, or a DM that gained a third member by `invite` | characters' `message` / `invite` / `open_group` acts |
 | **A DM** (`Kind::Direct`) | a person and a character, or two characters | `POST /v1/npc/:nid/message` (`bot_message_send`), a character's `message` act |
 
-A message is delivered to a character by `deliver_messages` (`engine/environment.rs:389-449`)
-as an `EventKind::Message`, urgent for a DM; the character answers with the same
-`message` act; every write is a `WorldOp` applied on the world's **authority**
-(`authority/perform.rs:43-64`), the one member holding the world's lease, and reaches
-every other member as substrate records.
+A message is delivered to a character by `deliver_messages` (`engine/environment.rs`)
+as an `EventKind::Message` (or, for a conversation thread, `EventKind::Talk`; see
+`docs/npc_conversations.md` §9), urgent for a DM; every write is a `WorldOp`
+(`authority/ops.rs`) applied on the world's **authority** (`authority/perform.rs`), the
+one member holding the world's lease, and reaches every other member as substrate
+records.
 
-What a mirror needs and the store does not have:
+What a mirror needs and the store did not have before §4 added it:
 
-- **No message identity.** A message is `{from, intent, seen_by}`
-  (`sim/phone/line.rs:193-203`): no id, no time, no author account — `from` is a display name
-  (`engine/mod.rs:1134-1166`), and positions shift as the window is trimmed
-  (`sim/phone/thread.rs:251-268`). A mirror cannot say "this one I have posted" or "this one came
-  from Discord".
+- **No message identity.** A message was `{from, intent, seen_by}`: no id, no time, no
+  author account, and positions shifted as the window was trimmed. A mirror could not say
+  "this one I have posted" or "this one came from Discord". A line now carries `seq`,
+  `at_ms`, `origin` and `account` (`sim/phone/line.rs`), and `from` is a member id.
 - **No hook when a message is created.** Every message passes through
-  `Threads::send` (`sim/phone/mod.rs:541`); nothing observes it, and the codebase chose
-  polling over a broadcast deliberately (`engine/mod.rs:1440-1448`).
+  `Threads::send` (`sim/phone/mod.rs`); nothing observes it, and the codebase chose
+  polling over a broadcast deliberately.
 - **No external identity** on an account or a character.
 - **No outbound HTTP** in npcd (`host` carries `reqwest` and `tokio-tungstenite`).
 
@@ -244,12 +244,12 @@ in memory; a restart tells them once more.
 
 A linked person is then the same author in both places: their Discord messages arrive
 as `WorldOp::Message { from: <their speaking name> }`, the name `speaking_as`
-(`engine/mod.rs:1153-1166`) gives their account, exactly as `post_message`
-(`engine/mod.rs:1179-1234`) builds it — so a conversation started in the console goes
+(`engine/voices.rs`) gives their account, exactly as `post_message`
+(`engine/messages.rs`) builds it — so a conversation started in the console goes
 on in Discord, one thread. The person's identity is the one their account was made
 for, read back from the account record (`Accounts::identity`), so the name and the
 role are what their own requests would get. **Who may DM a character** is who may see
-it: the `visible_to` check `owned_by` makes (`engine/mod.rs:672-692`), at the `User`
+it: the `visible_to` check `owned_by` makes (`engine/character_state.rs`), at the `User`
 bar `post_message` is registered at. A linked person DMing a character they may not
 see is answered once, "I can't talk with you", and nothing enters the world. A channel
 post from Discord still needs the Creator role.
@@ -307,7 +307,7 @@ handset, and the character uses it as it uses any group.
 - **A channel is a group thread** in the character's world, named `<server> #<channel>`
   (`zenworld #general`), with `named` and `permanent` set — permanent so a server of
   forty quiet channels cannot evict the character's own conversations under
-  `KEEP_THREADS`; the server count bounds it instead. Its members are the character and
+  `KEEP_GROUPS`; the server count bounds it instead. Its members are the character and
   everyone who has written in it, each added (as `invite` adds, at the thread's end) on
   their first message. The thread is opened when the bot learns of the channel: every
   text channel (types 0 and 5) in a server's `GUILD_CREATE`, and each `CHANNEL_CREATE`.
@@ -408,13 +408,13 @@ none.
 
 ### 4.1 A message has an identity
 
-`Message` gains:
+A `Message` (`sim/phone/line.rs`) carries, besides the words:
 
 ```rust
 pub struct Message {
-    pub from: String,
-    pub intent: String,
-    pub seen_by: Vec<String>,
+    pub from: String,             // a member id: a body id or an account handle
+    pub text: String,             // the words as said; what Discord posts
+    pub intent: Option<String>,   // what the character meant, for diagnostics
     /// Per-thread, strictly increasing, never reused — survives trimming.
     pub seq: u64,
     /// When it was written, in real milliseconds.
@@ -422,17 +422,18 @@ pub struct Message {
     /// Where it came from, when not from the world: the Discord message it
     /// mirrors, so the bridge never posts it back.
     pub origin: Option<Origin>,
+    pub to: Option<String>,
+    pub requests: Option<String>,
+    pub account: Option<String>,
 }
 ```
 
-`Thread` gains `next_seq: u64`, the seq its next message takes, from 1. Every message
-is said through `Threads::send_from` (`Threads::send` is it with no origin), which
-stamps `at_ms`, and `Thread::say` gives it the thread's `seq`; the trimming in
-`Thread::say` no longer changes what a message is called. `Origin` is
-`Discord { message: u64, channel: u64 }`. A world saved before these fields loads its
-messages at seq 0, which names no message, and its threads at `next_seq` 1. A person's
-message reaches the thread as `WorldOp::Message { npc, from, text, origin }` →
-`Runtime::message_npc` → `Threads::send_from`; the console's carries no origin.
+Every message is said through `Threads::send` / `send_on` (`sim/phone/mod.rs`), which
+stamps `at_ms`; `Thread::say` (`sim/phone/thread.rs`) gives it the thread's `seq`, and
+the trimming in `Thread::say` does not change what a message is called. `Origin` is
+`Discord { message: u64, channel: u64 }`. A person's message reaches the thread as a
+`WorldOp::Message` carrying its account and origin → `Runtime::message_npc` →
+`Threads::send`; the console's carries no origin.
 
 ### 4.2 The bridge's own store
 
@@ -548,8 +549,8 @@ world's beat waits on nothing; what the world's beat writes is what the bots' ne
 reads, and the cursors the bots move are written with the world's records on its next
 beat (§4.2).
 
-1. **The text is the message's own.** A message holds what was said, `intent`
-   (`sim/phone/line.rs:193-203`), and the console shows exactly that: `get_messages` reads it
+1. **The text is the message's own.** A message holds what was said, `text`
+   (`sim/phone/line.rs`), and the console shows exactly that: `get_messages` reads it
    off the thread (`engine/runtime/messages.rs` `messages_with`) with no model call. Discord is sent the
    same text, so the two never disagree and a post costs nothing to render.
 2. Posted by the right sender (§3.1), split at 2,000 characters on a sentence boundary.

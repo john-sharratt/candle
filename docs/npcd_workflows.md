@@ -196,12 +196,16 @@ any other.
 | `reopen(workflow, run, step)` | puts a settled run back on a step in a new round, with its send-backs counted afresh |
 | `run.last_findings()` | the latest step's notes, for `{findings}` |
 
-## Today's pipeline in this form
+## The earlier hardcoded pipeline in this form
 
-The hardcoded pipeline (`sim/operations.rs`, `engine/mission_gen/run.rs`) maps
-onto `story`, `life-event` and `correction`:
+The story pipeline was once a fixed set of phases in code. The workflow engine
+replaced it: `sim/operations.rs` now holds only each operation's record (its
+`Run`, who holds it, its retry), and `engine/mission_gen/run.rs` proposes the
+work. The phases of the old pipeline map onto `story`, `life-event` and
+`correction` as follows (none of the names in the left column is in the code any
+more):
 
-| Today | Workflow |
+| Earlier | Workflow |
 |---|---|
 | the generator's proposal, `no_mission` | a `generators:` entry. A declined proposal opens nothing. |
 | `Phase::Drafting` | `write`, `by: maker`, `edits: new`, `next: read` |

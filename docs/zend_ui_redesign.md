@@ -10,8 +10,8 @@
 
 ## 1. Goal & scope
 
-Replace the current Zend web UI (`zend/web/index.html`, ~1,516 lines, vanilla
-single-file) with the redesigned interface that was specified in the imported
+Replace the original Zend web UI (a vanilla single-file `zend/web/index.html`; the
+rebuilt one is ~5,100 lines) with the redesigned interface that was specified in the imported
 design bundle (`Zend.dc.html`, `zend-api.js`, `README.md`; since consumed into
 `zend/web/` and removed). The redesign is a **superset** of today's UI — it
 keeps the chat/sidebar/logs and
@@ -183,10 +183,9 @@ getStatus() -> Promise<{state, started_at_ms, build, tenants:{zend:{state:"loadi
                                                     // files on disk and the binary's version) drives the hot-reload check;
                                                     // `ingest_backlog: {processed,total,last_item,calibrating}|null` drives the under-chat background-ingest bar; `calibrating` is the calibration sweep's units still to go, named "Calibrating" when they are all that is left
 getToolSchemas() -> Promise<{[tool]: JSONSchema|null}>  // GET /v1/tools (zend's entries); tool-call cards list every parameter from it, defaults included
-archiveConversation(id) / unarchiveConversation(id) -> Promise<void>
+archiveConversation(id) -> Promise<void>            // one-way: the daemon has no unarchive route
 streamChatCompletion(conv, text, opts, handlers) -> { cancel() }
 mkProjEvent(conv, region) -> ProjectionSpan         // mock-only synthesis helper; live ignores
-getWindowedSubstrate(conv, node) -> Promise<Section[]>
 uploadFiles(convId, descriptors, handlers) -> { cancel() }   // progressive: carve + prefill in parts
 getFileContent(convId, fileId) -> Promise<string>   // live: GET …/files/:fileId (mock: returns inline content)
 deleteFile(convId, fileId) -> Promise<void>
@@ -301,7 +300,7 @@ Steps:
    parity — **but** per "no dual path", we do this on the branch and the old
    file is replaced, not kept alongside. During Phase 1 the branch's
    `index.html` is the new UI; the daemon on `main` is unaffected.
-4. Stand up Playwright: `zend/web/tests/` with a static file server fixture
+4. Stand up Playwright: `zend/web-tests/` with a static file server fixture
    (serve `zend/web/` over http, open `index.html?mock=1`). Config runs
    headless Chromium.
 5. **Positive test 0.1:** page loads with `?mock=1`; the layout root renders;
@@ -629,7 +628,12 @@ numerics (no `barLeft`/`winK`); region flips across a `<think>` boundary and
 back; hydrate `spans` are per assistant turn with monotonic `seq`. **Gate:** spec
 1.6 passes on live (dots seed from hydrate + accumulate from the stream).
 
-### 2.4 Windowed-substrate endpoint
+### 2.4 Windowed-substrate endpoint (replaced)
+The panel is served by `GET /v1/conversations/:id/projections/:turn/:event` and
+`POST /v1/conversations/:id/projection-context` (`zend/src/api/projections.rs`,
+§4.1); the `…/substrate?at=` route specified below was not kept, and neither is
+`getWindowedSubstrate` in either adapter. The design as first specified:
+
 `GET /v1/conversations/:id/substrate?at={step}` → `Section[]`. Materialize the
 projected context at the given projection step from
 `candle_conversation::projection` + persistence: system prompt, KV/retrieval
@@ -792,7 +796,7 @@ The composer placeholder, for reference, should read:
 
 ### Tooling note (Playwright)
 Playwright is a dev/test-only dependency (not embedded, not shipped, not a build
-step for the UI). It lives under `zend/web/tests/` with its own
+step for the UI). It lives under `zend/web-tests/` with its own
 `package.json`/lockfile scoped to tests, kept out of the daemon build. CI runs
 it as a separate job. This does **not** reintroduce a frontend build step — the
 shipped artifact is still the hand-written `index.html`.
@@ -876,9 +880,10 @@ These were settled during planning and are now binding for the sections above:
     the user turn — already understood by the model and already stripped on
     hydrate by the splitter (decision 9). No new inference plumbing. (This refines
     decision 3's "inference hook" to the concrete existing mechanism.)
-11. **Unarchive UI** — *Add a restore affordance.* Archived rows (shown under
-    "Show archived") get a restore action calling
-    `POST /v1/conversations/:id/unarchive`. Symmetric with archive.
+11. **Unarchive UI** — *Not built.* The design adds a restore affordance to
+    archived rows (shown under "Show archived") calling
+    `POST /v1/conversations/:id/unarchive`; the daemon serves no such route and
+    the adapter's `archiveConversation` is one-way (§2.1).
 
 ### Residual design points (detail when the phase lands)
 - The named-section-collection ↔ projection/reprojection integration (decision 3)
@@ -947,11 +952,10 @@ decisions; 12 is a perf guard.
   user turn on `effort:0`/`think:false`, in the chat path. ✅ 5 tests.
 - `ConvEntry.updated_ms` (decision 4), the most-recently-used rank from
   `ConvState.active`. ✅ tested (`conv_order`, substrate touch + replay).
-- **Windowed-substrate endpoint** `GET /v1/conversations/:id/substrate` (§2.4):
-  real engine-backed materialization (`system_prompt` + recovered turns →
-  ordered sections) via the pure `substrate_view::build`, **dummy-substrate
-  tested** with no model (3 tests); model-less → 503 (harness). Read-only — does
-  not touch the decode hot path. ✅
+- **Windowed-substrate view (§2.4) — replaced.** The panel reads a recorded
+  point through `GET /v1/conversations/:id/projections/:turn/:event` and
+  `POST /v1/conversations/:id/projection-context` (`zend/src/api/projections.rs`);
+  there is no `…/substrate?at=` route and the adapter has no `getWindowedSubstrate`.
 - **Daemon harness** `zend/tests/gui_api_harness.rs` — boots the real model-less
   router over HTTP/WS (decision 7) + the substrate 503 contract. ✅ 3/3.
 - `zend-api.live.js` adapter for every endpoint that exists today (conversations,
@@ -995,14 +999,14 @@ decisions; 12 is a perf guard.
 > encode/decode + span-core derivation) and §2.5 (files store + reconstruction)
 > get built and tested next — no GPU needed for the logic.
 
-**Remaining — deep model/substrate integration (do on the model box, with care:
-these touch the perf-sensitive decode/projection hot path and the substrate
-persistence internals; should be validated against a running model, not authored
-blind):**
-- effort/verbosity → **named-section directives** in the projection (decision 3,
-  the rest of §2.2) — needs projection-schema + Builder work.
-- **Projection-selection records** + `projection` SSE events + hydrate `spans[]`
-  (§2.3) — hooks the decode loop / scheduler.
-- **Windowed-substrate endpoint** (§2.4) — materializes projected context.
-- **Conversation-files layer** + upload-prefill SSE + file routes (§2.5) —
-  mirrors `code_read`; new substrate record kind.
+**As built, where the code departs from §2.2–§2.5:**
+- effort and verbosity reach the projection as **options of the schema's
+  selection**, not as a replacement for the provenance scan: `dial_selection`
+  (`zend/src/api/chat.rs`) maps `effort` to the `thinking_effort` option and
+  `verbosity` 0..4 to the `response_length` option (terse … comprehensive).
+- The projection timeline is carried by the engine's projection events
+  (`zend/src/projection_event.rs`), streamed on the chat SSE and served light on
+  hydrate; the panel fetches a point in full (§4.2 notes).
+- **Conversation files (§2.5)** are files of the conversation's `uploads` store,
+  saved as its file events and named by the conversation's upload records
+  (`zend/src/api/files.rs`), not a content-keyed layer of token-string ranges.

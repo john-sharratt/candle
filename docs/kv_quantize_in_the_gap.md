@@ -1,6 +1,10 @@
 # Quantize in the gap: K/V is compressed where it is made, and persistence only copies
 
-**Status:** design, not built. Where this document and the code disagree, the
+**Status:** the gap quantize, the lease, the claim, the catch-up and the
+copy-only persistence pass are built (`candle-nn/src/kv_cache/chunked/gap/`,
+`scheduler/run/scheduler_loop.rs`, `persistence/thread/warm_copy.rs`). Of the
+deletions in §6, `MigrateFlight` and the selection's `run_palette4` readback
+remain in the code. Where this document and the code disagree, the
 code is to be brought to this document. It supersedes the hot→warm quantize of
 `docs/kv_drain_under_pressure.md` §2a–§2c and §3, and restores the write path of
 `docs/archived/kv_tier_migration.md` §3 and §11, which the build departed from.
@@ -645,7 +649,7 @@ scale whichever gap quantizes them.
 
 ## 6. What is deleted
 
-- From `persistence/thread/mod.rs`: the hot→warm quantize and convert phases
+- From `persistence/thread/` (`mod.rs`, `pass.rs`, now `warm_copy.rs`): the hot→warm quantize and convert phases
   (the `quantize_layers_deferred` and `convert_deferred_descs` calls), the
   install of a quantized hot copy (`Substrate::install_migrated`, replaced by
   `install_copied`, which installs warm over the content it read), the fence
@@ -759,13 +763,14 @@ The gates in §7 decide whether it is done. §9 gives each step its code.
 
 ## 9. Tasks, with the code they touch
 
-Line numbers are as of commit `dc04b62ac`.
+Paths and line numbers are as of the current tree.
 
 **1. Measure the core (§8 step 1).**
-- `candle-transformers/src/models/batch_test/utils.rs:2056` and `:2195`: the two
-  boundary calls. Time them, and report device time per MiB of native K/V.
-- `candle-transformers/src/models/batched_inference.rs`,
-  `quantize_and_seal_sequences`. Its convert was issued inside a loop over every
+- `candle-transformers/src/models/batch_test/utils.rs`: the two boundary calls
+  (now replaced by the gap calls in `batch_test/gap_tally.rs`). They were timed to
+  report device time per MiB of native K/V.
+- `candle-transformers/src/models/batched_inference/` (the file that held
+  `quantize_and_seal_sequences`, since deleted). Its convert was issued inside a loop over every
   backing with the whole descriptor list each time, where
   `convert_deferred_descs` says any one backing serves: it ran the convert once
   per KV layer. It now runs once, and the call answers its `SealTiming`
@@ -777,30 +782,32 @@ Line numbers are as of commit `dc04b62ac`.
 - New `candle-nn/src/kv_cache/chunked/gap/table.rs`: the row type and the
   builder. One concern, tested alone.
 - `candle-nn/src/kv_cache/chunked/sequence_ops/tail.rs`: the per-sequence cursor
-  beside `writer_start_idx`; `truncate_sequence_to_tokens` (`:2134`) keeps the
+  beside `writer_start_idx`; `truncate_sequence_to_tokens` (`:305`) keeps the
   cursor at or below the committed block.
-- `candle-nn/src/kv_cache/chunked/types/live_chunk.rs:216`: `ChunkWindow` (`gids`, `meta`),
+- `candle-nn/src/kv_cache/chunked/types/live_chunk.rs:89`: `ChunkWindow` (`gids`, `meta`),
   the source of a row's pointers.
-- `batched_inference/seal_guard.rs:2172`, `assert_sealed_layers_aligned`: the every-layer
+- `batched_inference/seal_guard.rs:59`, `assert_sealed_layers_aligned`: the every-layer
   rule the builder applies per block.
-- `batched_inference/mod.rs:645`, `layer_seal_cap`: the per-layer level that puts a
+- `batched_inference/mod.rs:127`, the `layer_seal_cap` field (read through
+  `layer_seal_policies` in `batched_inference/construction.rs`): the per-layer level that puts a
   row in its policy group.
-- `candle-nn/src/kv_cache/chunked/selection_batches.rs:69`, `SELECTION_BUDGET_BYTES`: the
+- `candle-nn/src/kv_cache/chunked/selection_batches.rs:25`, `SELECTION_BUDGET_BYTES`: the
   cut.
 
 **3. The lease (§3.2).**
 - New `candle-nn/src/kv_cache/chunked/gap/lease.rs`: the one-gap lease, its
   demand (retried blocks exactly, new blocks by peak share), its device stack,
   the take at the catch-up and the return of the rest.
-- `candle-nn/src/kv_cache/chunked/gid_pool/pool.rs:1428`, `ChunkGidPool`: the lease
+- `candle-nn/src/kv_cache/chunked/gid_pool/pool.rs:79`, `ChunkGidPool`: the lease
   allocates through `allocate_n_for`, which already takes the lowest-placed
   arena with a free slot (a find-first-set over the capacity bitmap); each
   slot's address is computed as it is allocated, so building the stack is a
   copy. `set_reserve_target` is gone: a reserve class keeps one arena.
-- `candle-nn/src/kv_cache/chunked/alloc.rs`, `owe_reserves`, and
-  `reserve_target.rs`, `reserve_targets`: replaced by the lease's demand, with
-  `reserves_short` restoring the one-arena guard.
-- `alloc/arena_window.rs:664`, `create_deferred_arenas`, and the compaction: run with the
+- `candle-nn/src/kv_cache/chunked/alloc/`, `owe_reserves`, and
+  `reserve_target.rs`, `reserve_targets` (both gone): replaced by the lease's demand, with
+  `reserves_short` (`alloc/arena_window.rs`) restoring the one-arena guard
+  (`keep_reserves`, `alloc/reserves.rs`).
+- `alloc/arena_window.rs:290`, `create_deferred_arenas`, and the compaction: run with the
   gap's demand per class set aside as ground, and make the arenas a lease is
   short of, in the gap.
 
@@ -838,13 +845,13 @@ Line numbers are as of commit `dc04b62ac`.
   exactly the jobs past it. It also refuses a bad window and a gap over no
   layers before launching, drops the device state mid-gap cleanly, and does
   not see the gap after a sequence wrap complete early.
-- `candle-nn/src/kv_cache/chunked/sampled_selection/gpu/paged_inputs.rs:741`, `run_palette4`,
-  and the readback at `:1497–1538`: removed.
+- `candle-nn/src/kv_cache/chunked/sampled_selection/gpu/paged_inputs.rs:49`, `run_palette4`,
+  and its readback: to be removed; still present, called at `:624` and `:816`.
 
 **5. The summary and the catch-up (§3.4, §3.5).**
 - New `candle-nn/src/kv_cache/chunked/gap/summary.rs`: the mapped buffer, its
   row layout and the completion word. Pattern:
-  `candle-transformers/src/models/expert_lre/dispatch/ring.rs:156`, `SummaryRing`.
+  `candle-transformers/src/models/expert_lre/dispatch/ring.rs:15`, `SummaryRing`.
 - New `candle-nn/src/kv_cache/chunked/gap/install.rs`: the catch-up over live
   sequences — the summary read only once `GapDevice::finished` hands it out,
   each block found by identity, its slots taken block by block, every record
@@ -857,17 +864,17 @@ Line numbers are as of commit `dc04b62ac`.
   to today's seal band for band, and covers a truncate under the gap, the
   natives' return, the lease's surplus and a deferred block installed by the
   next gap. `gap/ownership_tests.rs` is the randomised model test of §7.
-- `candle-nn/src/kv_cache/chunked/backing/record_pool.rs:1307`, `fill_records_on_device`,
+- `candle-nn/src/kv_cache/chunked/backing/record_pool.rs:414`, `fill_records_on_device`,
   and `meta_pool.rs:146`, `serialize_kv_heads`: the record, unchanged.
-- `candle-nn/src/kv_cache/chunked/gpu_chunks/guard.rs:692`, `update_chunk`, and
-  `types/gpu_sync.rs:1458` / `:1507`: the header re-serialisation and its upload.
+- `candle-nn/src/kv_cache/chunked/gpu_chunks/guard.rs:91`, `update_chunk`, and
+  `types/gpu_sync.rs`: the header re-serialisation and its upload.
 
 **6. The gap call (§3, §3.7).**
-- `candle-conversation/src/scheduler/run/scheduler_loop.rs:1363`: the gap. Catch-up before
+- `candle-conversation/src/scheduler/run/scheduler_loop.rs:680`: the gap. Catch-up before
   `create_deferred_arenas`; the quantize after `compact_kv_if_fragmented`
-  (`scheduler/prefill/pack_pools.rs:1249`).
-- `candle-conversation/src/scheduler/decode/decode_step.rs` (the rollback, around `:860`
-  and `:1051`): the table is built after it.
+  (`scheduler/prefill/pack_pools.rs:245`).
+- `candle-conversation/src/scheduler/decode/decode_step.rs` (the rollback):
+  the table is built after it.
 - `candle-nn/src/kv_cache/chunked/gap/cycle.rs`, `GapCycle`: the gap's state
   from one gap to the next and its two calls, `catch_up` and `quantize`
   (`gap_take` cuts each sequence's take to the gap's room).
@@ -896,14 +903,15 @@ Line numbers are as of commit `dc04b62ac`.
   scheduler's (`scheduler/gap_residence.rs`). The copy keeps its retry at the
   next gap (`await_owed_arenas`, `MAX_GAP_RETRIES`) and the pass its opening
   and closing syncs (§5). `BacklogGauge` stays, stamped with the copy backlog.
-- `candle-nn/src/kv_cache/chunked/chunk_ops/tier_migration.rs:1297`,
+- `candle-nn/src/kv_cache/chunked/chunk_ops/tier_migration.rs:403`,
   `migrate_sealed_to_cpu_batch_async`: the copy, on the thread's own stream,
   through its pinned staging into the warm arenas.
 - `candle-conversation/src/persistence/`: `PersistenceTrigger::warm_turns`, a
   cold-to-warm read on the persistence thread. `persistence/warm_ledger.rs`
   gives each thread its share of the warm budget, as today.
 - `candle-nn/src/kv_cache/chunked/migrate_flight.rs:131` (`MigrateFlight`,
-  deleted) and `:212` (`HeldChunks`, kept).
+  to be deleted; the warm copy in `persistence/thread/warm_copy.rs` and `pass.rs` still
+  takes it) and `:212` (`HeldChunks`, kept).
 - `candle-conversation/src/persistence/group_cap.rs` and `reserve_log.rs`:
   deleted.
 

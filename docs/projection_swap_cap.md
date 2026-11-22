@@ -16,12 +16,11 @@ time. The decode it interrupted also read a context that never settled.
 
 ## The rule
 
-A mid-decode reprojection (decode position > 0) applies two caps:
+A mid-decode reprojection (decode position > 0) applies one cap:
 
 | Where | Setting | Default | Unit |
 |---|---|---|---|
 | Belief-driven turn groups (`repo_map`, `code_reading`, memory tiers) | group `max_swaps` | 2 | conversations (a file, a folder) |
-| The dialogue's working set | `working_set.max_admits` | 2 | provenance members |
 
 For a **belief-driven group** (`projection/swap_cap.rs`):
 
@@ -37,10 +36,11 @@ A held-back newcomer keeps its fresh score. Unselected turns are not carried
 and enters within the cap. New content therefore still arrives, a couple of
 conversations per reprojection, without the selection churning.
 
-For the **working set** (`WorkingSet::observe`), at most `max_admits` newcomers
-enter per reprojection. The rest keep their momentum and enter later.
+The **working set** is not capped. `WorkingSet::observe` chooses its pool again
+at every observation and a piece that ranks in enters at once
+(`docs/zend_working_set.md` §4.3); its size is the card's (`working_set::PoolSize`).
 
-**A cap is never zero.** Both are `NonZeroUsize`, and the YAML loader refuses a
+**A cap is never zero.** `max_swaps` is a `NonZeroUsize`, and the YAML loader refuses a
 `0`: a cap of zero admits nothing, ever, and the selection freezes on what the
 turn opened with. The smallest cap still brings one conversation in, whole.
 
@@ -59,8 +59,8 @@ of the same selection still brings it.
   freely.
 - **Section collections** (the tool catalog). Their selection is small and is
   held across a tool call by the scheduler.
-- **Working-set locks and seeds.** A lock answers a call the model just made; a
-  seed is placed when the dialogue opens.
+- **The dialogue's working set and its seeds.** A seed is placed when the
+  dialogue opens.
 - **Ingest conversations reading themselves.** They select every own turn.
 
 ## Configuration
@@ -69,6 +69,4 @@ of the same selection still brings it.
 groups:
   - id: structure
     max_swaps: 2        # per mid-decode reprojection
-working_set:
-  max_admits: 2
 ```

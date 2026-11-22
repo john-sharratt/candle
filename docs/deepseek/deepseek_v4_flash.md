@@ -17,7 +17,25 @@ inference engine, ported test-first from the `quantized_qwen3_moe` implementatio
 
 ---
 
-## 0. Implementation status (updated 2026-08-05)
+## 0. Implementation status
+
+**Current state.** DeepSeek-V4-Flash runs through the batched engine. The model is
+`candle-transformers/src/models/deepseek4.rs` (`impl Arch for DeepSeekV4`: config defaults, GGUF
+metadata keys, tensor names, latent geometry, and the `dflash` drafter arch), the engine family is
+`latent_moe/` (layers, paged-latent kernel path, provenance gallery, wave engine; AGENTS.md "Sparse-Latent
+MoE Engine"). `latent_moe::Engine::load` builds the resident engine from the offline-prepared
+`MXFP4_KO` GGUF (the routed experts as the exact 4-bit int8 twin, §3.2; non-expert weights resident
+as int8-KO), and `latent_moe::BatchedEngine` (`latent_moe/wave/`) wraps it as a `ManagedBatchedModel`
+that the scheduler binds for `ModelArch::DeepSeekV4`
+(`candle-conversation/src/models/builder/load_arch.rs`). Attention runs on the paged-latent kernels
+(`candle-kernels/src/paged-latent/`) over arena KV; the compressed corpus lives in a `FloatGallery`;
+the MoE runs through the live dispatch (`docs/moe_live_dispatch_design.md`); DSpark speculative decode
+is built (`deepseek_v4_speculative_decode.md`). The end-to-end gate is
+`candle-conversation/tests/deepseek_rung4.rs` (Paris through the conversation engine, persist → reboot).
+The remaining sections keep their first-pass structure; §5-§7 carry status lines where the build
+departed from the plan. The first-pass status follows as a record.
+
+### First pass (2026-08-05): the block-streaming reference forward
 
 > **THE FULL MODEL RUNS ON REAL WEIGHTS (2026-08-05).** The complete 43-layer, 284B
 > DeepSeek-V4-Flash-0731 executes end-to-end on the real merged GGUF and produces sane logits
@@ -64,7 +82,7 @@ Built and tested (branch `deepseek-flash`), bottom-up and TDD:
   inverse), `hyper` (mHC + Sinkhorn), `compressor` (gated overlap pooling), `indexer`
   (CSA scoring + top-k), `attention` (latent single-KV + sink softmax over
   window‖compressed keys), `moe` (sqrtsoftplus/noaux_tc + hash routing + clamped SwiGLU),
-  `transformer` (mHC-wrapped blocks + generate). Tiny-config end-to-end forward+generate
+  `transformer` (mHC-wrapped blocks + generate), `streaming` (`StreamingModel`, the block-streaming forward). Tiny-config end-to-end forward+generate
   runs deterministically. The reference recomputes over the full prefix each step
   (prefill path) — exact for complete compressed groups, no incremental KV state.
 - **Metadata loader + real-weight validation** — `config_from_gguf` reads the real
@@ -80,10 +98,12 @@ Built and tested (branch `deepseek-flash`), bottom-up and TDD:
   GEMM** (repack for MMA layout, 4-bit preserved) — faster and keeps the RAM footprint at
   147 GB instead of ballooning (§3.3, §6.1).
 
-**Remaining work (the integration + perf phase):** merge to a single GGUF; build the FP4
-tensor-core GEMM as isolated kernel work; refactor three hard-coded engine seams into
-defaulted trait methods and override them for DeepSeek; add the four MoE kernel deltas; copy
-`test_parallel_batched_forwarding` and drive it to green on the real weights. See §6–§7.
+**What the first pass left, and where it landed:** the single merged GGUF (`merge_split_ggufs`,
+`candle-core/src/quantized/gguf_file.rs`, then the offline `prepare_ko_gguf`,
+`candle-core/src/quantized/prepare.rs`); the expert GEMM (no FP4 tensor-core GEMM — the experts run
+as the `MXFP4_KO` int8 twin on the int8 grouped GEMM, §6.1); the engine seams (a `ManagedBatchedModel`
+implemented directly, not the defaulted trait methods of §6.4); the MoE kernel deltas (§6.3); the
+batched-forwarding gate (the rung-4 and wave gates above). See §6–§7.
 
 ---
 
@@ -334,10 +354,12 @@ they also re-quantize the QAT FP4 experts, sacrificing the "trained format" prop
 
 ### 3.2 Runtime memory budget (dev machine: 72 GB VRAM, 189 GB RAM, NVMe)
 
-The engine's `ExpertCache` is a **two-tier** pool (see §5.1): a fixed VRAM slot pool (the hot
-active set) plus a **pinned host-RAM** overflow pool. On the CUDA path the NVMe mmap is only
-the *startup* source (experts are repacked from it into VRAM slots or pinned RAM); at
-inference the cold tier is pinned host RAM, not NVMe. So the sizing constraint is **experts
+_Status: the sizing below is the first-pass (two-tier) arithmetic. The engine's `ExpertCache` is now
+three-tier (VRAM hot pool → pinned host RAM → the NVMe pack, `docs/expert_cache_design.md`), and the
+routed experts are served as the `MXFP4_KO` int8 twin — the exact 4-bit byte-reorder of the MXFP4 expert
+(`latent_moe/engine.rs`, `candle-core/src/quantized/ko_quant/mxfp4_ko.rs`), so the 147 GB does not
+grow._ The engine's `ExpertCache` was, in the first pass, a **two-tier** pool (see §5.1): a fixed VRAM slot pool (the hot
+active set) plus a **pinned host-RAM** overflow pool. So the sizing constraint is **experts
 fit in VRAM + host RAM**, which they do with margin:
 
 | What | Size | Placement |
@@ -348,11 +370,19 @@ fit in VRAM + host RAM**, which they do with margin:
 | KV state @ 1M ctx (per session) | ≈ 3.5 GB | VRAM: window 43×128×512 ≈ 3 MB; CSA compressed 21 × T/4 × (448 FP8 + 7 scale + 64 BF16 ≈ 583 B) ≈ 3.1 GB; HCA 20 × T/128 ≈ 90 MB; indexer FP4 21 × T/4 × 68 B ≈ 360 MB |
 | Activations/workspaces | governed by existing VRAM reserve | VRAM |
 
+_KV row, as built:_ the window is the two-region latent (nope `[0,448)` FP8 E4M3 at unit scale, the 64 rope
+dims BF16: 576 B/token/layer); the compressed corpus is the position-free int8+BF16 two-region cache
+(448 B int8 + 14 f32 band scales + 128 B BF16 per entry, `deepseek_int8_hot_corpus.md`), not 583 B of
+FP8 per-64 blocks; the Indexer keys are f32 `[G,128]` (not FP4 nibbles), spilling with the corpus cache to
+host RAM past `HOT_ENTRY_CAP` while the sign index stays on the GPU. The 3.5 GB figure is the first-pass
+FP8/FP4 target, not the built footprint.
+
 **Fits:** 147 GB experts + ~9 GB dense ≈ 156 GB total ≤ 72 GB VRAM + 189 GB RAM = **261 GB**.
 Hot set (~40–50 GB) in VRAM, ~100 GB in pinned RAM. Crucially, keeping experts **4-bit**
-(native MXFP4, repacked only for tensor-core *layout*, not width — §3.3/§6.1) is what makes
-this fit: repacking to the Qwen3 int8 KO twins (8-bit) would balloon 147 GB → ~280 GB and
-overflow RAM, so DeepSeek uses the FP4 path, not the KO-int8 path.
+(MXFP4 payload, repacked only for tensor-core *layout*, not width — §3.3/§6.1) is what makes
+this fit: requantizing to the Qwen3 int8 KO twins (8-bit, `Q6_KO`/`Q8_KO`) would balloon 147 GB → ~280 GB and
+overflow RAM. DeepSeek uses `MXFP4_KO`, the exponent-collapse int8 twin that is an exact 4-bit
+byte-reorder of the MXFP4 expert (no requant), read directly by the int8 grouped GEMM.
 
 Streaming ceiling: 6 experts × 43 layers × 13.4 MB (MXFP4 expert) ≈ 3.4 GB/token if every
 expert missed and had to stream pinned→VRAM — PCIe 5 x16 (~63 GB/s) caps that at ~18 t/s.
@@ -463,31 +493,26 @@ tests at first green.
 
 ## 5. Current engine survey (what we build on)
 
-The batched engine (`quantized_qwen3_moe/model.rs` as the reference model, `batched_model/mod.rs` /
-`batched_layer/mod.rs` / `batched_inference/mod.rs` / `expert_lre/` as the engine) is what DeepSeek
-plugs into. The load + run seam is three lines (`quantized_qwen3_moe.rs:2340`):
-
-```rust
-let model = ModelWeights::from_gguf_by_path_with_int8(&model_path, &device, None, int8mode)?;
-let schedule = RopeSchedule::stated(model.rope_inv_freq()..., context_length)?;
-BatchedInference::new_with_schedule(model, &schedule, 4096, &device)   // engine wraps the model
-```
+The batched engine (`quantized_qwen3_moe/` as the reference model, `batched_model/` /
+`batched_layer/` / `batched_inference/` / `expert_lre/` as the engine) is what DeepSeek
+plugs into. The Qwen3 load + run seam is `ModelWeights::from_pack` (`quantized_qwen3_moe/loader.rs`) wrapped by
+`BatchedInference::new_with_schedule` (`batched_model/inference_wrapper.rs`); DeepSeek's is
+`Engine::load(path, &DEEPSEEK_V4, device)` + `BatchedEngine::new(engine)` (`load_arch.rs`).
 
 ### 5.1 The engine already streams a MoE larger than VRAM
 
-This is the crux the first pass missed. `from_gguf_by_path_with_int8`
-(`quantized_qwen3_moe.rs:1409`) `mmap`s the (single) GGUF, page-locks it with
-`register_mmap_cuda` (`cuMemHostRegister ... DEVICEMAP|READ_ONLY`), and builds a **two-tier**
+This is the crux the first pass missed. The Qwen3 loader `mmap`s the (single) GGUF, page-locks it with
+`register_mmap_cuda` (`candle-core/src/quantized/cuda/host_memory.rs`, `cuMemHostRegister ... DEVICEMAP|READ_ONLY`), and builds a **two-tier**
 `ExpertCache` (`expert_lre/`):
 
-- **Startup** (`startup_two_tier`, `pipeline.rs:136`): every `(layer, expert)` is GPU-repacked
+- **Startup** (`expert_lre/startup.rs`): every `(layer, expert)` is GPU-repacked
   from the GGUF bytes into its target format; it lands in a **VRAM slot** if one is free, else
   a **pinned host-RAM slot** (`cuMemAllocHost`). After startup the mmap is unused for experts.
-- **Per layer** (`classify_and_load`, `pipeline.rs:598`): resident experts hit; misses
-  `allocate_slot` (score-based LRU, `PINNED_LAYERS=3` never evicted), evict the victim
+- **Per layer** (the first-pass `classify_and_load`; replaced by the live dispatch below): resident experts hit; misses
+  `allocate_slot` (score-based LRU, the first `PINNED_LAYERS` = 2 MoE layers never evicted, `expert_lre/cache/policy.rs`), evict the victim
   VRAM→pinned, and stream the miss **pinned→VRAM** on a copy stream — one fence per batch.
-  Markov `TransitionMatrix` prefetch fills free slots with predicted next-layer experts.
-- **VRAM governor** (`:1522`): a balloon measures real capacity, `expert_budget()` leaves the
+  Markov `TransitionMatrix` (`expert_lre/transition.rs`) prefetch fills free slots with predicted next-layer experts.
+- **VRAM governor**: a balloon measures real capacity, `expert_budget()` leaves the
   KV floor free, and `num_slots = expert_budget / max_expert_size` is the hot active set; the
   rest lives in pinned RAM.
 - **Cross-session wave** (`forward_wave` / `forward_wave_contexts`): co-batches decode + prefill
@@ -510,37 +535,46 @@ GEMM → silu_mul → scatter`, all on the GPU, with zero routing readback.
 
 ### 5.2 The seam map — what plugs in vs. what is model-owned
 
-Two traits define the model↔engine contract: `BatchedModelCore` (`batched_model/model_core.rs:98` — leaf
+Two traits define the Qwen-lineage model↔engine contract: `BatchedModelCore` (`batched_model/model_core.rs` — leaf
 accessors: layers, embed, `final_norm`, `output_proj`) and `BatchedAttentionLayer`
-(`batched_layer/mod.rs:232`). Verified pluggability:
+(`batched_layer/mod.rs`); above them sits `ManagedBatchedModel` (`batched_inference/managed_model.rs`),
+the trait the scheduler binds. Verified pluggability (first-pass survey):
 
 | Concern | Hook today | DeepSeek needs |
 |---|---|---|
-| Q/K/V projection | `project_qkv` (`:264`) | override (low-rank Q, single latent KV) |
-| ln1 / ln2 | `attention_norm`/`ffn_norm` (`:245`,`:249`) | override |
-| o_proj | `output_projection`/`o_proj` (`:283`,`:269`) | fold DSv4's grouped 8-way de-rotated o-proj here |
+| Q/K/V projection | `project_qkv` | override (low-rank Q, single latent KV) |
+| ln1 / ln2 | `attention_norm`/`ffn_norm` | override |
+| o_proj | `output_projection`/`o_proj` | fold DSv4's grouped 8-way de-rotated o-proj here |
 | MoE / FFN | `ffn_residual` → `SparseMoeBlock` + `ExpertCache` | **reuse**; new `SparseMoeBlock`-analog, 4 kernel deltas (§6.3) |
 | **Attention kernel** | *hard-coded* to paged-GQA in `forward_attn_batched_single/_multi` | **new seam** — the wrongly-hardcoded bit (§6.4) |
 | **Residual / layer body** | *hard-coded* `[tokens,hidden]` add in `forward_layer_batched_mixed` | **new seam** — mHC 4-copy stream (§6.4) |
 | **Session KV creation** | *hard-coded* GQA `ChunkedKvBacking` | **new seam** — session-owned window/compressed/indexer KV (§6.2) |
 
-The three "hard-coded" rows are the ones to fix — see §6.4 for the *minimally-invasive*
+The three "hard-coded" rows are the ones the plan fixed — see §6.4 for the *minimally-invasive*
 strategy (extract each into a defaulted trait method; existing models keep the default;
-DeepSeek overrides). The expert-streaming / scheduler / wave machinery is reused untouched.
+DeepSeek overrides). _Built differently:_ DeepSeek implements `ManagedBatchedModel` directly
+(`BatchedEngine`, `latent_moe/wave/`), so its attention kernel, mHC layer body and session KV
+creation (`create_batched_session`) are owned by the wave and no seam in the Qwen layer
+traits was extracted. The expert-streaming / scheduler machinery is reused.
 
-**Quant infra status** (post first-pass): MXFP4 codec (CPU+GPU dequant) is **done** (§0). The
-grouped expert GEMM float path `grouped_matmul_gemx` (`candle-core/src/quantized/cuda/grouped_matmul.rs:4151`) dequants on the fly via
-`gemx_dequant.cuh` per-format `block_type_traits`; MXFP4 needs (a) a `block_c_mxfp4` traits +
-dequant there for the correctness baseline, then (b) the native FP4 tensor-core path (§6.1).
-`moe_bucketize` is compiled `MAX_EXPERTS 128` (`moe_bucketize.cu:44`) → raise to 256. Paged
+**Quant infra status:** MXFP4 codec (CPU+GPU dequant) is **done** (§0). The
+grouped expert GEMM float path `grouped_matmul_gemx` (`candle-core/src/quantized/cuda/grouped_matmul.rs`) dequants on the fly via
+`gemx_dequant.cuh` per-format `block_type_traits`, and MXFP4 is in it (`candle-kernels/src/quantized/loader/mxfp4.cuh`);
+the production expert path is the `MXFP4_KO` int8 twin on the int8 grouped GEMM (§6.1). `moe_bucketize` is
+compiled `MAX_EXPERTS 512` (`candle-kernels/src/simple/moe_bucketize_common.cuh`), above the 256 routed experts. Paged
 attention (`paged-decode/`, `paged-prefill/`) is GQA head_dim ∈ {64,128}, kernel-internal
-RoPE — unsuited to DSv4's 512-dim single-KV gather, hence the new attention seam + kernel.
+RoPE — unsuited to DSv4's 512-dim single-KV gather, hence the new attention kernel family `paged-latent/`.
 
 ---
 
 ## 6. Gap analysis → what we build
 
 ### 6.1 MXFP4 weight format + FP4 tensor-core GEMM
+
+_Status: the production expert path is `MXFP4_KO` — the MXFP4 expert repacked offline
+(`prepare_ko_gguf`) into the exponent-collapse int8 twin, an exact 4-bit byte-reorder, read by the int8
+grouped GEMM (`grouped_matmul_gemx_q8a128`) with q8a128 activations. The MXFP4 dequant-to-FP16 path
+below is also in `gemx_dequant.cuh` and is the reference/standard-quant route; the sm_120 finding stands._
 
 **Codec — DONE (§0).** `GgmlDType::MXFP4` + `BlockMXFP4 {e:u8, qs:[u8;16]}`, GGUF code 39,
 CPU quantize/dequantize with raw-byte tests, standalone CUDA dequant kernel bit-exact vs CPU,
@@ -572,7 +606,14 @@ native path becomes the optimization; on sm_120 it is unavailable, so it is out 
 
 ### 6.2 Attention pipeline (new kernel family + cache layout)
 
-New candle-kernels subdir `sparse-attn/`:
+_Status: built as `candle-kernels/src/paged-latent/` (not `sparse-attn/`): `latent_decode_kernel.cuh`,
+`latent_prefill_kernel.cuh`, `latent_common.cuh`, with the Rust wrappers in `latent_moe/paged/`
+(`deepseek_batched_paged_attention_plan.md` Part III). The session KV is `ChunkedKvBacking` (single-latent
+mode), not flat session-owned tensors, and the window format is the two-region latent (nope FP8 at unit scale,
+rope BF16). Hadamard, the Indexer and the compressor are `latent_moe/indexer.rs` and
+`latent_moe/compressor/`; the Indexer cache is f32 keys, not FP4 nibbles._
+
+New candle-kernels subdir `sparse-attn/` (as planned):
 - `sparse_gather_attn`: q `[heads=64, d=512]` × gathered KV rows (`topk_idxs`,
   `-1` = skip), online softmax with per-head sink, BF16 in/out, one query block per
   CTA (decode: 1 token; prefill: tiled over positions). Mirrors the reference
@@ -595,6 +636,9 @@ chunks later.
 
 ### 6.3 MoE deltas
 
+_Status: all four are in (the router in `latent_moe/moe.rs`, `Gate::route`; `moe_bucketize` now compiles
+`MAX_EXPERTS 512`)._
+
 - `moe_bucketize.cu`: `MAX_EXPERTS 128 → 256` (+ Rust re-export consumers).
 - Router: `sqrtsoftplus` scoring, noaux_tc bias-for-selection-only, sum-normalize,
   ×1.5 scale — extend the routing kernel (`moe_route` currently fuses softmax+topk;
@@ -607,6 +651,11 @@ chunks later.
 - Shared expert: reuse dense-MLP machinery (Q8_0 weights).
 
 ### 6.4 Engine integration — minimally invasive (defaults + overrides, no duplication)
+
+_Status: not followed. DeepSeek is a `ManagedBatchedModel` implemented directly (`BatchedEngine`,
+`latent_moe/wave/`), with its own wave sweep, so the three defaulted trait methods below were not
+extracted (`deepseek_batched_paged_attention_plan.md` §K step 5 records the choice). The plan text is
+kept as the design of record._
 
 **Do not** fork the forward loop or implement a parallel `ManagedBatchedModel` (that
 duplicates the engine). Instead: find the spots that *wrongly hard-code*, turn each into a
@@ -642,7 +691,9 @@ page-locks a single mapping; expert byte-offsets index into it). So **merge the 
 splits into one `DeepSeek-V4-Flash-0731-MXFP4.gguf`** (llama.cpp `gguf-split --merge`, or a
 byte-merger) and load it through the same single-mmap path as every other model. The
 first-pass multi-split `GgufModel` is superseded — only its `config_from_gguf` metadata logic
-(§4.1) ports over.
+(§4.1) ports over. _Built: the engine loads the offline-prepared `DeepSeek-V4-Flash-0731-MXFP4_KO.gguf`
+(`prepare_ko_gguf` over the merged file) through `latent_moe/loader.rs`, naming every tensor through the
+`Arch` trait (`models/deepseek4.rs`)._
 
 `ModelWeights::from_gguf_by_path_with_int8` analog: read the `deepseek4.*` keys, per-layer
 kind from `compress_ratios`, and build attention weights, compressor(s), indexer, hc params
@@ -662,7 +713,13 @@ pre-rotated q and cached pre-rotated kv, matching the reference).
 3. **Later — adaptive compression**: our C0–C9 policy over *compressed* entries is
    compression-on-compression; revisit only with perplexity evidence, sink-block
    protection concepts do not transfer 1:1 (each entry already summarizes 4–128
-   tokens).
+   tokens). Single-latent KV is not adaptively compressed in the code
+   (`quantize_sealed_in_place` refuses a single-latent backing).
+
+_Status (as built):_ the window is stored as the two-region latent (nope FP8 E4M3 at unit scale — a
+per-64 ue8m0 scale is not representable in the per-chunk scalar record the window ring writes — and rope BF16);
+the compressed corpus is the position-free int8+BF16 two-region cache (`deepseek_int8_hot_corpus.md`); the Indexer
+keys stay f32. The 583 B/entry FP8+scale layout and the FP4 Indexer cache (68 B/entry) are not built.
 
 ---
 
@@ -678,7 +735,13 @@ Each phase lands with its tests; no phase leaves stubs behind. **DONE** marks fi
 - **DONE — real config + real MXFP4 decode.** `config_from_gguf` verified against the file;
   a real expert tensor decodes correctly on the GPU.
 
-Remaining, test-first against the engine:
+Remaining, test-first against the engine _(first-pass list; status as built: P-A done —
+`merge_split_ggufs` + `prepare_ko_gguf`; P-C done, with the production expert path being the
+`MXFP4_KO` int8 twin (§6.1); P-D not followed (§6.4); P-E done as `latent_moe/` + `models/deepseek4.rs`;
+P-F done — `candle-conversation/tests/deepseek_rung4.rs` and the `latent_moe/wave/tests_*.rs` gates;
+P-G partly — the live MoE dispatch and the paged-latent kernels, FP4 MMA is out of scope on sm_120;
+P-H partly — see §6.6; P-I — the scheduler binds DeepSeek and DSpark speculative decode is built, the
+turn-seal wiring is specified but not built (`deepseek_turn_seal_persistence.md`))_:
 
 - **P-A — Merge to a single GGUF.** No `gguf-split`/`gguf-py`/llama.cpp on the box (verified),
   so write a small Rust merger: read the 4 splits, emit one `DeepSeek-V4-Flash-0731-MXFP4.gguf`
@@ -730,14 +793,15 @@ Remaining, test-first against the engine:
 5. **Indexer top-k cost** — 64×128 q against T/4 keys dominates long context; a BF16 matmul+topk
    baseline is slow at ≥ 256K. Acceptable for bring-up; P-G owns the FP4-tensor-core scan (the
    VNNI provenance-scan experience applies).
-6. **256-expert dispatch** — beyond `MAX_EXPERTS 128`, audit every shared-memory / occupancy
+6. **256-expert dispatch** (`MAX_EXPERTS` is 512 now) — audit every shared-memory / occupancy
    assumption in `moe_bucketize`/gather/scatter at 256, and `expert_base`/device-table sizing
    across 43 layers (11,008 experts total).
 7. **Harness assumptions** — batch_test/`TestParams` `InferenceMode` K/V sweeps are GQA-era and
    don't map 1:1 onto DSv4 caches; the copied test starts with BF16/FP8 modes only.
 8. **Iteration cost** — every e2e touches the merged ~156 GB mmap; the tiny-config reference
    oracle carries the fast TDD loop, real-weight runs are the gate, not the inner loop.
-9. **`num_speculative_tokens` 7 vs `dspark_block_size` 5** — resolve when DSpark lands (P-I).
+9. **`num_speculative_tokens` 7 vs `dspark_block_size` 5** — the built drafter uses the trained
+   block size from the GGUF (`dflash.block_size`, 5); see `deepseek_v4_speculative_decode.md`.
 
 ---
 

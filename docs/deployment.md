@@ -69,16 +69,17 @@ not identities.
 
 | Address | Hostname | Runs | Repo |
 |---|---|---|---|
-| `192.168.1.2` | BlackWorld | web, motherd, keep, cf-ddns | `D:\prog\candle` |
+| `192.168.1.2` | BlackWorld | web, keep, and under it motherd (`D:/prog/motherd-local.yaml`), mcp, yenbot and battlecities (`keep/keep.yaml`), cf-ddns | `D:\prog\candle` |
 | `192.168.1.3` | WhiteWorld | keep, and under it motherd and mcp, from `C:\prog\keep-local.yaml` and `C:\prog\motherd-local.yaml` | `C:\prog\candle`; its substrate on `D:\prog` |
 | `192.168.0.237` | AlienWorld (the laptop) | keep, and under it `tokera-agent`: the cluster's standby agent. No motherd since 2026-10-25 | `C:\Users\johna\prog\candle`; the agent's own checkouts under `C:\Users\johna\prog\agent` |
 
 ### AlienWorld's standby agent
 
 The laptop runs `tokera-agent` alone, under keep (`C:\Users\johna\prog\keep-local.yaml`),
-on `motherd/agent.laptop.yaml`. That config names 2 slots and the agent's own checkouts,
-`candle`, `battle-cities`, `battle-mind` and `journals`, cloned under
-`C:\Users\johna\prog\agent`, named as blackworld's agent names them. A job fetches and
+on `motherd/agent.laptop.yaml`. That config names the agent's own checkouts,
+`candle`, `battle-cities`, `battle-mind`, `journals`, `journals-npcd` and `yenbot`, cloned under
+`C:\Users\johna\prog\agent`, named as blackworld's agent names them. An agent runs one build at a time
+(`docs/build_agent.md` §2); the file names no slot count. A job fetches and
 resets its checkout, so they are never the working trees under `C:\Users\johna\prog`.
 It joins as `AlienWorld` (`--host`), written as the other machines are. The gateway's
 `standby_agents: ["AlienWorld"]` (`web/web.yaml`, matched in any case) makes it a spare:
@@ -99,7 +100,7 @@ as its working directory. cf-ddns is the exception — see below.
 | Service | Machine | Listens | Build | Stop by default in `/down` |
 |---|---|---|---|---|
 | web | .5 | `0.0.0.0:80` (from `web/web.yaml`); `0.0.0.0:443` tcp + udp, HTTPS with Let's Encrypt certificates (from `web/secrets/tls.yaml`); UDP 4300 and 4123, the game's datagrams it forwards (`docs/battlecities_app.md` §5) | `cargo build --release -p web` | **no** — only `/down web` or `/down all` |
-| motherd | .5 | `192.168.0.5:8081`; `192.168.0.5:8444` tcp + udp, HTTPS self-signed at startup — the zend route's upstream in dumb mode; outbound to the gateway's cluster on `:443` | `cargo build --release -p motherd` | yes |
+| motherd | .5 | `192.168.1.2:8081`; `192.168.1.2:8444` tcp + udp, HTTPS self-signed at startup — the zend route's upstream in dumb mode; outbound to the gateway's cluster on `:443` | `cargo build --release -p motherd` | yes |
 | keep | .5 | — (watches web on `:80` and motherd on `:8081`) | `cargo build --release -p keep` | **never** |
 | yenbot | .5 | `127.0.0.1:8096` (from `D:\yenbot\live\yenbot.yaml`) — loopback only; the gateway's `yenbot` site forwards yenbot.com.au to it | `cargo build --release` in `D:\prog\yenbot` (its own repository, `docs/yenbot_app_host.md` §5.5); released with `service_deploy {host: BlackWorld, service: yenbot}` | yes |
 | npcd | .6 | `0.0.0.0:8081` (`--host 0.0.0.0 --port 8081`) | `cargo build --release -p npcd` | yes |
@@ -114,7 +115,7 @@ Paths are relative to the repo root.
 | Machine | Service | Command line | Recorded |
 |---|---|---|---|
 | .5 | web | `keep\stable\web.exe --config web/web.yaml` | 2026-10-14, keep restarts a proven trial from this path |
-| .5 | motherd | `keep\stable\motherd.exe --config motherd\motherd.yaml` | 2026-10-14, keep restarts a proven trial from this path — every setting is in `motherd/motherd.yaml` |
+| .5 | motherd | `keep\stable\motherd.exe --config D:/prog/motherd-local.yaml` | keep restarts a proven trial from this path (`keep/keep.yaml`); every setting is in the config file, whose shape is `motherd/motherd.yaml`'s |
 | .5 | yenbot | `keep\stable\yenbot.exe --config D:/yenbot/live/yenbot.yaml`, working directory `D:\yenbot` | 2026-11-07, keep restarts a proven trial from this path. Its store, files, backups and library cache are under `D:\yenbot\data\`, its bus key at `D:\yenbot\secrets\gateway.key`, and the live checkout it serves at `D:\yenbot\live` (yenbot's `docs/running.md`) |
 | .5 | keep | `target\release\keep.exe keep/keep.yaml` | 2026-10-14. Supervisor `C:\Users\johna\AppData\Local\keep\supervise.ps1` (restart 10 s after exit), run by the scheduled task `\keep` at boot since 2026-10-15. keep is not swapped by a rollout |
 | .6 | npcd | `target\release\npcd.exe --host 0.0.0.0 --port 8081 --gateway 192.168.0.5 --mind D:/prog/mind --forget-conversations` | 2026-09-29, from /up — mind moved to `D:\prog\mind`, which also holds its `.substrate\` and `accounts\` (`--data` defaults to `--mind`). Rewritten 2026-10-10 for the host's flags (not yet run): `--bind` became `--host`/`--port`, `--content` is gone, and `--gateway 192.168.0.5` is new — without it every signed-in visitor is anonymous. Its store was written by the AntiLoop + StyleTune fine-tune; since 2026-10-11 the host prescribes Flash-Next, so that store is refused at open, before anything in it is rewritten, and npcd's first run on this build needs a new `--data` |
@@ -166,7 +167,7 @@ Notes on the arguments:
 `motherd/motherd.yaml`, holds the process's settings under `host:` and each daemon's
 under its name, in the same shape as that daemon's own flags:
 
-- **`host:`** — `192.168.0.5`, ports `8081` and `8444` (zend's, unchanged), and the
+- **`host:`** — `192.168.1.2`, ports `8081` and `8444` (zend's, unchanged), and the
   cluster: `clusters: ["https://gateway.tokera.local https://gateway.tokera.com"]`, verified as `cluster_name:
   tokera.com`, with `group_key: web/secrets/group.key` and `agent: motherd/agent.yaml`.
 - **`zend:`** — `working_dir: ..`, so the workspace is `D:\prog` and the substrate
@@ -178,9 +179,11 @@ under its name, in the same shape as that daemon's own flags:
   fetched and pushed through an agent, never from GitHub directly. A start with no
   mirror runs with no mind, fetches it once joined, and relaunches onto it.
 
-**The agent** runs in process (`motherd/agent.yaml`): `D:\agent\jobs` for jobs, 4
-slots, and its own checkouts, cloned over SSH — `D:\agent\candle`,
-`D:\agent\battle-cities`, `D:\agent\battle-mind` — each allowed to push. They are
+**The agent** runs in process (`motherd/agent.yaml`): `D:\agent\jobs` for jobs, one
+build at a time (`docs/build_agent.md` §2), `D:\prog\candle\keep\stage` as the stage
+folder, and its own checkouts, cloned over SSH — `D:\agent\candle`,
+`D:\agent\battle-cities`, `D:\agent\battle-mind`, `D:\agent\journals`,
+`D:\agent\journals-npcd`, `D:\agent\yenbot` — each allowed to push. They are
 apart from the working trees zend reads in `D:\prog`.
 
 Its log is `motherd.log` beside zend's substrate, `D:\prog\substrate\motherd.log`; `/up`'s
@@ -260,7 +263,8 @@ rollback has stdout and stderr detached. A set-aside file exists only while a tr
 is unproven, so a `keep` that starts and finds one stops whatever runs and puts it
 back. It does not certify, roll out, or store binary bytes, and
 it does no canary math. It also joins the gateway as the app `keep`, so `/gateway` lists
-it beside zend and npcd; that socket declares no routes and takes no rollout. Its state
+it beside zend and npcd; that socket takes no rollout, and declares the routes the
+operations tools reach keep by (`docs/claude_zend_gateway.md` §8.4). Its state
 is `keep/state/`.
 
 Its supervisor is `C:\Users\johna\AppData\Local\keep\supervise.ps1`, the same loop shape
@@ -368,7 +372,7 @@ Expected results, as measured 2026-09-13:
 
 | Check | How | Healthy |
 |---|---|---|
-| motherd on the LAN | `curl http://192.168.0.5:8081/v1/status` | `"tenants":{"zend":{"state":"ready",…},"npcd":{"state":"ready",…}}` and `"cluster":{…"apps":{"zend":{"link":"joined",…},"npcd":{"link":"joined",…}}}` — it answers `200` with `"loading"` throughout startup, and npcd's first start on a fresh substrate ingests its mind for a while after zend is ready |
+| motherd on the LAN | `curl http://192.168.1.2:8081/v1/status` | `"tenants":{"zend":{"state":"ready",…},"npcd":{"state":"ready",…}}` and `"cluster":{…"apps":{"zend":{"link":"joined",…},"npcd":{"link":"joined",…}}}` — it answers `200` with `"loading"` throughout startup, and npcd's first start on a fresh substrate ingests its mind for a while after zend is ready |
 | npcd on the LAN | `curl http://192.168.0.6:8081/v1/status` | `200`; a host-built npcd answers with `"tenants":{"npcd":…}` |
 | yenbot on loopback | `curl http://127.0.0.1:8096/v1/status` | `{"state":"ready","build":"<count>-<hash>","store":{"schema":…}}` |
 | gateway config | `target\release\web.exe --config web/web.yaml --check` | exit 0 |

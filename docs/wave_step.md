@@ -100,7 +100,8 @@ A creep's residual crosses steps, so it cannot be on the tier: the tier is
 re-placed every step and moves with the weight floor. It is held the way every
 other per-sequence tenant of the span is — the recurrent state, the QSA index
 pages, the provenance gallery — in **fixed-stride slot arenas**
-(`tenant_arena`, `SlotTenant::CreepResidual`), claimed between forwards when the
+(`tenant_arena`, `SlotTenant::CreepResidual`, held by `CreepResidual` in
+`models/residual_rows/`), claimed between forwards when the
 creep forms and given back slot by slot when the creep reaches the head, fails,
 or is dropped. The claim comes first in its step, after the previous forward's
 tier is handed back (`end_wave_transient`) — that tier stands past its guards
@@ -147,7 +148,8 @@ which then becomes the committed one.
 
 A sweep paused between forwards with nothing beside it — a single prompt run a
 layer range at a time — holds its residual the same way: an arena of two
-halves, read and written by the standalone forward (`ResidualIo`).
+halves (`CreepResidual`, `models/residual_rows/creep.rs`), read and written by the
+standalone forward, which takes it as an `Option<&mut CreepResidual>`.
 
 ## 4. Row order
 

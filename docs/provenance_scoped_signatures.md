@@ -191,8 +191,10 @@ measured against again.
 
 ### 2.4 Analysis units
 
-An analysis unit — `dependency_analysis`, `code_review`, `security_review`,
-each `after: code_reading` — forks from the file's reading, so its own
+The analysis layers — `dependency_analysis`, `code_review`,
+`security_review`, each `after: code_reading` — have left the schema, and their
+units are retired at every boot (`zend/src/layers/removed.rs`); the rule below
+is what a layer of that shape is scored by. An analysis unit forks from the file's reading, so its own
 conversation inherits the whole file. Its gallery is its **own** turns — the
 question asked of it, its tool rounds, and its answer — cut by §2.1 and §2.2,
 never the inherited reading. A `security_review` unit's web searches are tool
@@ -338,7 +340,11 @@ questions joined them as exemplars Top-1 rose 74.5% → 87.9%
   file-scored cases, the unit's. Each competition sums its fold groups by its
   own weights: the content by `layer_weights`, the calibration by
   `calibration_layer_weights`, applied per segment in the one launch's tally.
-  `code_reading` and the analysis layers weigh content `[0, 1, 1]`, the
+  `code_reading`'s `scopes` group weighs content `[1, 1, 1]` and calibration
+  `[1, 1, 1]` at `calibration_weight: 1.0` (each token votes for its best 8
+  files, `vote_top_k: 8`, each kept vote square-rooted, `vote_power: 0.5`; a
+  file reads as a z-score among files of its own extension, `normalize:
+  kind_z`); the `guidance` and `journals` groups weigh content `[0, 1, 1]`,
   calibration `[0, 0, 1]`, at `calibration_weight: 0.25`. A calibration is
   never itself a candidate, a working-set member, or a dialogue probe.
 - **Resumed like the tools' corpus.** Ahead of each ingest pass, a layer's
@@ -365,8 +371,9 @@ token's next-best agreement; down-weighting them only shrinks the vote and
 loses (`docs/results/provenance_gates_2026-10-26.md`).
 
 - **Learned from the questions, never from the gallery alone.** A layer's
-  calibration questions — `EXCLUSION_QUESTIONS_PER_FILE` (2) of each file —
-  are scanned raw against the group's content alone: no calibration in the
+  calibration questions — a fixed sample of 4,000 chosen by hash
+  (`provenance::chunk_exclusion::sample::SAMPLE`) — are scanned raw against the
+  group's content alone: no calibration in the
   gallery, nothing cut, so the exclusion never learns from a gallery it already
   shaped. Each kept vote for a file not the question's own is credited to the
   32-token chunk holding the token that won it: the best agreement in the
@@ -476,7 +483,7 @@ replay of the conversation remains the end-to-end check after the gate passes.
 
 | Piece | Where |
 |---|---|
-| The boundary rule | `candle-conversation/src/provenance/boundaries.rs` (new), called by `scheduler/decode/` |
+| The boundary rule | `candle-conversation/src/provenance/boundaries.rs`, stepped by the decode loop (`scheduler/decode_state.rs`, `scheduler/reprojection.rs`) |
 | Windows from a stored turn | `candle-conversation/src/projection/belief_files.rs`, replacing `subwindow_bounds` over seams |
 | Per-file aggregation | `candle-conversation/src/projection/belief_files.rs` / the scan wrappers |
 | Probe construction | `scheduler/mod.rs` (the reproject probe) — the shape the windows mirror |
@@ -487,9 +494,9 @@ replay of the conversation remains the end-to-end check after the gate passes.
 ## 7. Open
 
 - The expected injections, per projection (§3.4).
-- Gate 4 on the shipped weighting (content `[0, 1, 1]`, calibration
-  `[0, 0, 1]` at 0.25). The paper conversation measured on 2026-10-25
+- Gate 4 on the shipped weighting (`scopes`: content and calibration
+  `[1, 1, 1]` at 1.0, top-8 square-rooted votes, kind z). The paper conversation measured on 2026-10-25
   (`e7bca43c…`) now holds its dialogue turns' tokens but no signatures, so the
   gate has no probe; it needs a fresh replay, run off the serving cluster.
-- The analysis layers carry `code_reading`'s weighting unmeasured; sweep them
-  (`provenance_gates layers`) once their units are read again and calibrated.
+- The `guidance` and `journals` groups' weightings (§2.5) differ from `scopes`';
+  sweep them against it (`provenance_gates layers`).

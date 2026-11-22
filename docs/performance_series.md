@@ -57,7 +57,7 @@ Each answer declares how it adds up across members, in a `fuse` block:
 
 ```json
 "fuse": { "series": { "waves": ["ws", "fwd", "wave_ms", "quanta_ms"],
-                      "migrate": ["migrate", "quant", "copy", "total"],
+                      "migrate": ["migrate", "copy", "total"],
                       "mix": [] },
           "sum": ["host"],
           "union": ["mix_formats"] }

@@ -3,11 +3,20 @@
 *How work reaches the wave engine without a thread blocked on every in-flight turn,
 and how npcd is rebuilt on top of that so one slow mind never stalls the cast.*
 
-Companion to [`unified_wave_inference_engine.md`](archived/unified_wave_inference_engine.md),
-which specifies the scheduler this document feeds, and to
-[`wave_blocking_optimizations.md`](wave_blocking_optimizations.md), which covers
-blocking *inside* the scheduler thread. This document is about blocking *in front of*
-it: the callers.
+**Status: built.** All seven steps of §4 have landed: the caller-facing channels are
+`flume` (`candle-conversation/Cargo.toml`), `TurnHandle` has `wait_async` /
+`stream_async` (`handle.rs`), `GuestReceipt` has `wait_async` (`guest/queue.rs`), the
+ingest-cancel latch has `wait_cancellable_async` (`cancel.rs`), npcd's characters are
+supervised tasks (`npcd/src/engine/runtime/supervise.rs`, `engine/mind/think.rs`), the
+world metronome is an interval task (`engine/driver.rs`), and zend streams a turn with
+`stream_async` (`zend/src/session/inference_stream/stream_turn.rs`). §1 records the
+starting point the design replaced, so its tables and "today" wording describe the code
+as it was before those steps.
+
+Companion to [`continuous_fair_waves.md`](continuous_fair_waves.md), which specifies
+the scheduler this document feeds (the original wave design is archived at
+[`unified_wave_inference_engine.md`](archived/unified_wave_inference_engine.md)). This
+document is about blocking *in front of* the scheduler thread: the callers.
 
 ---
 
@@ -18,9 +27,9 @@ through the model together, and a wave is only as wide as the work that is waiti
 it forms. The engine can serve a hundred concurrent minds; it is fed by callers that
 submit one at a time.
 
-### 1.1 Where the engine stands
+### 1.1 Where the engine stood
 
-| Piece | Where | Shape today |
+| Piece | Where | Shape before |
 |---|---|---|
 | Request queue into the scheduler | `candle-conversation/src/scheduler/mod.rs` (`SchedulerRequest`) | `crossbeam::channel` — `Sender<SchedulerRequest>` held by every caller, drained by the scheduler thread, mid-wave included (`scheduler/run/prefill_cohort.rs`, `mid_wave_admission`) |
 | Per-turn event stream | `candle-conversation/src/handle.rs` (`TurnHandle`) | wraps a `crossbeam::channel::Receiver<TurnEvent>`; `wait`, `wait_cancellable`, `stream` and `try_recv` are all blocking or polling |
@@ -35,9 +44,9 @@ guest progress (`guest/progress.rs`), which reports through a caller-supplied ca
 precisely so the engine never has to pick a channel — or a runtime — on the caller's
 behalf.
 
-### 1.2 Where npcd stands
+### 1.2 Where npcd stood
 
-| Piece | Where | Shape today |
+| Piece | Where | Shape before |
 |---|---|---|
 | Tick driver | `npcd/src/engine/runtime.rs` — `drive` | **one OS thread**, walking due characters in turn on a 100 ms sleep loop |
 | Character scheduling | `npcd/src/engine/tick/mod.rs` | a due-heap plus per-character `due_at`, pace-floored heartbeats, `hold`/`release`, preempt flags — a hand-rolled scheduler quantised by the driver's sleep |
@@ -336,7 +345,7 @@ daemon is synchronous, the common code is written twice or bridged everywhere.
 The engine-facing shape is identical: submit under short locks, await handles, drop to
 cancel. What that lands on, concretely — zend's blocking machinery as audited:
 
-| Piece | Where | Shape today → after |
+| Piece | Where (before) | Shape before → after |
 |---|---|---|
 | The submit path | `session/inference_stream/stream_turn.rs` — `run_inference_stream` | one `spawn_blocking` per request, streaming through a `tokio::sync::mpsc` bridge → an async task streaming `stream_async` directly |
 | Titler | `session/titler.rs` — dedicated worker thread fed by a `std::sync::mpsc::sync_channel(256)` | an async task fed by a bounded channel; same drop-on-backlog, same drain-on-shutdown |

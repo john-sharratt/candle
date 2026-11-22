@@ -1,7 +1,6 @@
 # One process, two daemons: a shared model host for zend and npcd
 
-**Status:** phases 1–6 built (§6); phase 7, `motherd` deployed on `.5`, not yet
-done. **Scope:** a single binary that serves zend and npcd together — one loaded
+**Status:** phases 1–7 built (§6.1). **Scope:** a single binary that serves zend and npcd together — one loaded
 model, one conversation engine, a separate substrate each. The model is prescribed:
 one fine-tune, named in one place, for every tenant. A substrate is bound to the model
 that wrote it: a daemon whose substrate was written by a different model refuses to
@@ -157,8 +156,7 @@ zend's `tool_def::DEFS`, `SCAN_*`, `ingest_backlog`, `ingest_report`; npcd's
    load, naming both models. Nothing is regenerated, injected or tombstoned. Moving a
    daemon to a new model means a new substrate (or the old model).
 7. **One prescribed model for the process.** The host names a single model —
-   `Qwen36_35B_A3B_AntiLoop_StyleTune`, the fine-tune npcd already runs — and every
-   tenant runs it. No candidate lists, no VRAM ladder, no per-daemon choice: zend's
+   `Qwen38_FlashNext` (§5.1) — and every tenant runs it. No candidate lists, no VRAM ladder, no per-daemon choice: zend's
    `model_choice` ladder and `--model` flag go. A tenant only declares what it needs
    *of* a model, which is checked against the prescribed one at start.
 8. **One HTTP server; where the daemons overlap, one implementation.** A path both
@@ -205,17 +203,22 @@ pub struct TenantContext {
     pub log: Arc<LogBus>,             // the host's one bus
     pub roles: Roles,                 // the estate's role table (§3.5)
     pub telemetry: Arc<Telemetry>,    // for a tenant's own columns (`add_source`)
+    pub cluster: Option<Join>,        // its app in the cluster the process joins
+    pub stopping: Arc<Stopping>,      // the process's stop, to restart onto what it read at start
+    pub agent: Option<Arc<Jobs>>,     // the agent in this process
+    pub starting: Arc<StartLine>,     // what it says it is doing until `start` returns (§3.4)
 }
 
 pub struct Running {
     pub routes: Routes,               // its own routes and their table (`host::guard`)
     pub reports: Arc<dyn Reports>,    // what the shared endpoints report about it (§3.5)
-    pub stop: Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>, // drain
+    pub leave: Leave,                 // hand its work on as the member leaves its clusters
+    pub stop: Stop,                   // drain: Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>
 }
 
 pub struct TenantUi {
     pub hosts: Vec<String>,           // "code.tokera.com", "zend.localhost"
-    pub content: PathBuf,             // its UI directory on disk, read per request
+    pub content: &'static Dir<'static>, // its pages, compiled into the tenant's crate
     pub default: bool,                // serves a request whose Host names no tenant
 }
 
@@ -358,11 +361,11 @@ differently today:
 
 | Setting | zend | npcd | Rule |
 |---|---|---|---|
-| `prefill_pass_tokens` | sized from the card (`prefill_width`: VRAM × link) | 8192 (`runtime.rs:163`) | max, then clamped to the card's width |
-| `qsa_selection_budget`, `qsa_strata` | CLI (`session.rs:1249-1250`), the pinned bound from the schema's `pin_tokens` | unset | zend's; npcd sets none |
-| `hit_layers` | the schema's `hits.layers` | unset | zend's; npcd sets none |
-| `max_response_tokens` | 65,536 (`session.rs:349`) | 16,384 (the builder default) | max |
-| guests (`<data>/guests.yaml`) | none | npcd's, when the file exists (`runtime.rs:3757`) | union |
+| `prefill_pass_tokens` | sized from the card (`prefill_width`: VRAM × link) | 8192 (`PREFILL_PASS_TOKENS`, `npcd/src/engine/runtime/load.rs`) | max, then clamped to the card's width |
+| `qsa_selection_budget`, `qsa_strata` | CLI, the pinned bound from the schema's system-prompt `pins.tokens` (`zend/src/engine_asks.rs`) | unset | zend's; npcd sets none |
+| `hit_layers` | the schema's `hits.layers` (`engine_asks.rs`) | unset | zend's; npcd sets none |
+| `max_response_tokens` | 65,536 (`MAX_TURN_TOKENS`, `zend/src/session/turn_types.rs`) | 16,384 (the builder default) | max |
+| guests (`<data>/guests.yaml`) | none | npcd's, when the file exists (`npcd/src/engine/runtime/loader.rs`) | union |
 | `max_concurrent` | the builder's | the builder's | sum — each tenant's sessions count against one scheduler |
 | `thinking` | `true` | unset | `true` if any tenant asks |
 
@@ -382,12 +385,13 @@ bought from the expert zone and decode pays for it after the window — on the R
 5000 npcd's 8,192 over the card's 3,072 conceded ~8 GB of experts every window.
 
 Settings that already agree need no rule: `compression_level` is 5 for both (zend sets
-it, `session.rs:1258`; npcd gets the builder default, `builder.rs:205`), and a
-conversation's own level overrides it either way (`SequenceConfig::kv_compression_level`);
-the expert pack sits beside the GGUF for both (zend sets it, `session.rs:1274-1276`;
-npcd gets the builder's default for a `Qwen35Hybrid`, `builder.rs:1190-1193`).
-`thinking` needs none either: the core enables it, as zend does (`session.rs:1262`),
-and npcd already sets the mode on every turn (`engine/mind.rs:909`, `:916`) — that
+it, `zend/src/session/load/startup.rs`; npcd gets the builder default,
+`models/builder/mod.rs`), and a conversation's own level overrides it either way
+(`SequenceConfig::kv_compression_level`); the model resolves to one model pack in the
+cache root for both (`docs/self_contained_model_packs.md`), so no tenant sets a pack
+location. `thinking` needs none either: the core enables it, as zend does
+(`zend/src/engine_asks.rs`), and npcd already sets the mode on every turn
+(`with_think_mode`, `npcd/src/engine/mind/mind_schema.rs`) — that
 the per-turn mode wins over the core flag is checked in phase 3. Per-sequence
 settings — sampling, dialect templates, stencils, projection schemas, think steering
 — are already per conversation and need nothing.
@@ -624,7 +628,7 @@ other needs:
 | `api/substrate.rs` and the substrate views in `session.rs` | `substrate.rs` | the overview is `host::endpoints::catalog`; the views — overview, layer, system prompt, timeline — are `host::substrate_views`, each tenant serving them over its own substrate and schema (§3.5). npcd's per-character views (`engine/layers.rs`) stay its own |
 | `web/perf.html`'s script, `web/substrate.html`'s script | `pages/system.js`, `pages/substrate.js` | `web/content/common/lib/perf.js` (+ `perf.css`) and `web/content/common/lib/substrate.js`, each console mounting them in its own look (§3.5) |
 | the tools-catalog view | the `/v1/tools` view in `engine/pulse.rs` | `host::endpoints::catalog` (each catalog stays in its daemon) |
-| `main.rs` process setup: panic hook, tracing init, `ctrl_c.rs` (the Ctrl-C flag reset), `self_heal.rs`, `log_file.rs` | `main.rs` process setup: tracing init, Ctrl-C | `host::process`, `host::ctrl_c`, `host::self_heal`, `host::log_file`, `host::run` |
+| `main.rs` process setup: panic hook, tracing init, `ctrl_c.rs` (the Ctrl-C flag reset), `self_heal.rs`, `log_file.rs` | `main.rs` process setup: tracing init, Ctrl-C | `host::process`, `host::ctrl_c`, `host::self_heal`, `web::log_file` (the gateway writes it too), `host::run` |
 | `download.rs` (less the DeepSeek fetch, which ran a model no tenant runs), `model_choice.rs` (deleted, §5) | `model.rs`'s `model()` | `host::model` (`MODEL`), `host::download` |
 | `web/common/`, `web/brand/` (copies of the shared front-end) | — (served `web/content/common/` at its root) | `web/content/common/`, once — zend's copies and the two sync tests deleted, both UIs load it from `/common/` and `/brand/` |
 | the `include_dir!` UI embed and its build hash (`api/mod.rs:43-83`) | the embedded roots, `--content` (`main.rs:48-49`, `:252-266`), the constant `build` (`ops.rs:163`) | the host's disk-served UI layer and its on-disk `build` hash (`host::ui`, `host::server`, §3.4) |
@@ -804,7 +808,7 @@ identity it would need.
 pub const MODEL: Model = Model::Qwen38_FlashNext;
 ```
 
-It is Qwen3.8-Flash-Next (`models/qwen38_flash_next.rs`), arch `Qwen4Exp`: a `Q8_0`
+It is Qwen3.8-Flash-Next (`candle-conversation/src/models/qwen38_flash_next.rs`), arch `Qwen4Exp`: a `Q8_0`
 trunk prepared on each machine, with the routed experts at the card's rung — `Q3_KO`
 under 64 GiB, `Q4_KO` above. It runs on every machine in the fleet — the expert cache
 streams what VRAM cannot hold.

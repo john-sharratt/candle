@@ -1105,8 +1105,8 @@ The target shapes everything: **the whole suite in about a minute.**
 
 ### One binary, not fourteen
 
-`candle-conversation/tests/` currently holds 14 separate `*.rs` files. Cargo compiles each into
-its **own binary and runs it as its own process**, so a shared model would be loaded fourteen
+`candle-conversation/tests/` currently holds 24 separate `*.rs` files. Cargo compiles each into
+its **own binary and runs it as its own process**, so a shared model would be loaded twenty-four
 times. Any design that shares one load must therefore start here:
 
 > The NPC suite is **one integration-test binary** — `tests/harness.rs` — with the suite's

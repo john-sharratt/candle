@@ -30,10 +30,15 @@ deploying it behind the gateway are the same build.
    tokera.com     ──────▶│                              │
    battlecities.net      │   web  (DMZ)                 │
                          │   • tokera.com, rendered     │
-   bot.tokera.com ──────▶│   • sign-in for the estate   │──▶ 192.168.0.6:8081  npcd
-   code.tokera.com ─────▶│   • everything else: proxy   │──▶ 192.168.0.5:8081  zend
+   bot.tokera.com ──────▶│   • sign-in for the estate   │──▶ cluster members: npcd
+   code.tokera.com ─────▶│   • everything else: proxy   │──▶ cluster members: zend
                          └──────────────────────────────┘
 ```
+
+A route names a cluster app (`cluster: zend`, `cluster: npcd`) and the gateway
+forwards to a ready member of it over the member's socket; a route's `upstream`
+(motherd's address, `192.168.1.2:8081`) serves only while the app has no member
+(`docs/deployment.md`, "The cluster").
 
 The gateway renders tokera.com and owns `/auth/*` for every hostname. It serves
 files for **tokera.com only** — `npcd` and `zend` are proxied whole, console
@@ -216,7 +221,7 @@ credential that doubles as a minting one, so a single compromised daemon became
 every hostname. Trusting a header from a peer that cannot be anyone else is the
 smaller claim, and it distributes no secret at all.
 
-This supersedes `npc_api_gui_design.md` §8.1's per-daemon OAuth: `npcd` does not
+This supersedes `docs/archived/npc_api_gui_design.md` §8.1's per-daemon OAuth: `npcd` does not
 run its own dance, and its `/v1/me` reports the identity it was handed.
 
 **One bearer path: `/mcp`.** A remote MCP client (Claude Code, claude.ai) holds
@@ -318,13 +323,19 @@ web/
     errors.rs               one failure, rendered as a page or as JSON
     content.rs              layered roots, disk or embedded; path safety
     markdown/               render, maths, front matter, heading slugs, cache
-    auth/                   session, OIDC exchange, cookies
+    auth/                   session, OIDC exchange, cookies; mcp/, the /mcp authorization server
     site/tokera/            home, blog, papers, page shell
     mock/npcd/              the console's fixture daemon
+    cluster/                the gateway's cluster (`docs/replicated_substrate.md` §3–§5, §12): members' sockets, routing, jobs, keeps, status
+    bus/                    the gateway's pub/sub bus (`docs/mcp_file_tools.md` §5)
+    acme/, tls/             certificates and the HTTPS entrance
+    hooks/                  what other services tell the gateway happened (`docs/battlecities_app.md` §4)
+    udp_forward/            the game's datagrams
   content/
     common/                 framework + base.css, shared by every site
     tokera/                 site.css, papers.yaml, blog/*.md
     npcd/                   the NPC console
+    battlecities/           the game's site
 ```
 
 ## 8. Open

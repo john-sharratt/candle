@@ -155,6 +155,12 @@ refused rather than double-scaled.
 
 ## 3. What the audits found
 
+§3 records the tree as it was audited, before the build: the findings are why
+§4–§8 exist, and the `file:line` references here are to the audited tree. Each
+fault below has since been fixed — Hermes' Llama3 scaling is read from
+`rope_freqs.weight`, the linear factor `infer_rope_scaling_factor` computed is
+gone, and the index is stored un-rotated (§7).
+
 ### 3.1 The fixed-scaling models: one already scaled, one silently not
 
 **DeepSeek-V4 already applies its static YaRN, and correctly.**
@@ -283,6 +289,7 @@ computes a RoPE frequency.
 | File | Holds |
 |---|---|
 | `schedule.rs` | `RopeSchedule { rope_dim, theta, scaling, supported_max }` with `Scaling { Plain, Linear{factor}, Stated{inv_freq}, Yarn{l0, beta_fast, beta_slow, rungs, temperature} }`; `Rung { ceiling, factor }`; `RungFreqs { inv_freq: Vec<f32>, q_rot_scale: f32 }`. Llama3 is `Stated`: the frequencies the file's `rope_freqs.weight` gives |
+| `angle.rs` | `AngleArithmetic`: how a low-band angle product is rounded (the reference's f32 product, or exact) |
 | `yarn.rs` | The YaRN transform and `mscale`, moved from `latent_moe/rope.rs` |
 | `llama3.rs` | `rope_freqs.weight` → frequencies, and the published-parameter formula (moved from `llama_rope.rs`) that the tests check the tensor against |
 | `declared.rs` | `DeclaredScaling`: what a GQA file's metadata declares, its frequencies and its schedule (§2) |
@@ -629,6 +636,12 @@ kernel forgets.
 
 ## 7. The QSA index stores un-rotated keys, rotated on load
 
+Read §7.2–§7.7 with `docs/qsa_index_q8.md` beside them: the rotate-on-load
+scorer was built and measured on F32 key rows, and every completed key has
+since moved to Q8_0 (`AUX_VERSION` 4), with the scorer dequantizing on load and
+its wide arm on the INT8 tensor cores. The measurements below are the F32
+scorer's; that document carries the Q8_0 ones.
+
 ### 7.1 The rule
 
 > **Every stored index row — live tail, page, turn record, snapshot — is the
@@ -693,7 +706,7 @@ placement staging.
 | `IndexPage` | rows rotated relative to the page start; `roped_base`; `at_frame` | **un-rotated rows**, row-major. `roped_base` and `at_frame` are deleted |
 | `seal_page`, `rotate_rows(±frame)` | rotate out of or into a frame | a seal copies stored rows. `rotate_rows` survives only as the GEMM tail's scratch rotation and the query rotation |
 | `Placement`, `place_kernel` | rotate each page into a channel-blocked staging | **a pure transpose** into the channel-blocked staging the scorer's coalesced read wants. Job words `{src, dst, rows}` |
-| Record format | row-major `[rows, D]` F32, rotated relative to the page start | row-major `[rows, D]` F32, **un-rotated**. `AUX_VERSION = 3` |
+| Record format | row-major `[rows, D]` F32, rotated relative to the page start | row-major `[rows, D]` F32, **un-rotated**, at `AUX_VERSION = 3`; the keys were then moved to Q8_0, `AUX_VERSION = 4` (`docs/qsa_index_q8.md`) |
 | Scorer page descriptor | `{keys}` + `page_first` | `{keys, cstride, rstride, delta}` (i64, strides in `float4`s) + `page_first`; a row `g` sits at `delta + g·ratio` |
 | `export_aux_state` / `restore_aux_state` | normalise the tail by `−tail_base`; restore at `tail_base = 0` | export stored rows as they are; restore at `tail_base = 0`, which is where a branch checkpoint's rows sit (§3.4) |
 | Index frequencies | `RopeTables`, f32 angles | `FactoredRope` (`rope_schedule/factored.rs`): the attention's own `RopeRungs`, shared (`FactoredRope::over`), plus each rung's step table per ratio. Rung 1's frequencies are `plain_inv_freq(rope_dim, θ)` — f32-identical to the frequencies `RopeTables` used, so rung 1 selects as before. `RopeTables` remains only as the CPU oracle in tests |
@@ -902,7 +915,7 @@ Each round:
   within run-to-run variance. At this width (b)'s tail is cuBLAS, so this is the
   gate the wide-row arm answers to.
 - **Every correctness test green,** and `device_selection_matches_the_cpu_oracle`
-  (`indexer/tests_device.rs:2779`) unchanged.
+  (`indexer/tests_device.rs`) unchanged.
 
 **If the rounds do not reach the gates,** the fallback runs in this order. Each
 step is taken only on the evidence that the previous one fell short:
@@ -949,15 +962,17 @@ marked.
 
 ### 7.7 Records already on disk
 
-The turn-record and snapshot blobs (`paged_index.rs:503-628`, `AUX_VERSION = 2`)
-hold row-major rows rotated by `j·ratio` relative to each page's start.
-`decode_page` always gives `roped_base = 0`.
+The turn-record and snapshot blobs (`qwen4exp/paged_index.rs`, `AUX_VERSION = 2`
+at the time) held row-major rows rotated by `j·ratio` relative to each page's
+start. `decode_page` always gave `roped_base = 0`.
 
-- **`AUX_VERSION` goes to 3:** un-rotated, row-major (§7.3).
-- **No migration: the substrate is wiped** (`zend --wipe-substrate`). This is a
+- **`AUX_VERSION` went to 3:** un-rotated, row-major (§7.3). It is now 4, the
+  Q8_0 keys of `docs/qsa_index_q8.md`.
+- **No migration: the substrate was wiped** (`zend --wipe-substrate`). This is a
   pre-publication codebase, and a v2 record — turns, layer conversations,
-  section pages, resume blobs — is not worth a conversion pass or a dual
-  reader. `decode_aux` accepts only v3 and bails on anything else.
+  section pages, resume blobs — was not worth a conversion pass or a dual
+  reader. `decode_aux` accepts only the current version and bails on anything
+  else, naming `substrate_inspect migrate-index-q8` for the F32 one.
 - **Section pages are persisted too,** beside the section's chunks
   (`enqueue_index_page` at the section seal), and restored with the section at
   boot. A prefix section whose page is refused or missing during an ingest is
@@ -1065,7 +1080,7 @@ paths refuse any row past rung 0 (§6.3), and the oracles are tests.
   test reads.
 
 **Llama3 frequencies.** The source is decided once, at load
-(`quantized_llama::stated_inv_freq`), in this order:
+(`quantized_llama::stated_inv_freq`, `quantized_llama/mod.rs`), in this order:
 
 1. **`rope_freqs.weight`**, when the file has it (one divisor per pair,
    llama.cpp's form). It is the file's own statement of its scaling.
@@ -1103,7 +1118,7 @@ the code.
 | One `m²`, on Q's rotary dims | `tests/rope_rung_tests.rs` | `q_scale_applies_to_q_rotary_pairs_only`: the decode output against a host reference that scales Q's rotary pairs by `m²`, within a derived band that rejects no scale, `m`, `m⁴` and `m²` on every pair; temperature on and off agree exactly on a pass-through-only query and at rung 1 |
 | Rung bounds | kernels | A header rung ≥ `n_rungs` traps |
 | Selection | `rope_schedule/select.rs` | reach → rung at each ceiling and one past it; refusal past `supported_max` for every schedule |
-| QSA stored rows | `qwen4exp/indexer/` | Rows after append equal the reference's pooled normed un-rotated key; a seal is a byte copy of stored rows; `device_selection_matches_the_cpu_oracle` (`indexer/tests_device.rs:2779`) passes unchanged, since the oracle already ropes at read time |
+| QSA stored rows | `qwen4exp/indexer/` | Rows after append equal the reference's pooled normed un-rotated key; a seal is a byte copy of stored rows; `device_selection_matches_the_cpu_oracle` (`indexer/tests_device.rs`) passes unchanged, since the oracle already ropes at read time |
 | QSA rotate-on-load scorer | `tests/qsa_score_rot_harness.rs` | The full §7.5 correctness set |
 
 **GPU gates.** These run one `cargo` process per model, with the daemon

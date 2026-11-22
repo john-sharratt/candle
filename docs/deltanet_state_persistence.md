@@ -49,10 +49,13 @@ projection was planned around it.
 pass, so the defect that silently ran the model on a quarter of its stack is
 fixed and pinned in both directions.
 
-**The feasibility gate is not.** A projection still emits glue, so the wave will
-still bail on `n_glue > 0`. Nothing in phases 5a–5c has landed.
+**The feasibility gate is met.** The live schema's only glue producer
+(`is_template` sections) is sealed, a sealed turn owns its boundaries, and the live
+opener is tail prefill, so a projection reserves no gap chunk on this lineage
+(§11a.2, §11a.2b). `TreeGlue` and `member_glue` have no production caller; on a
+model that cannot gap-fill they refuse through `reserve_glue_island`.
 
-Three things were found during implementation that the design got wrong, all in
+Three were found during implementation that the design got wrong, all in
 §11a: the rewind cannot be deleted the way §5.2 said, phase 5a is **not**
 independently landable, and the hybrid was never wired into the model registry
 at all — a prerequisite for the switch that appears nowhere in the 142-item list.
@@ -97,7 +100,7 @@ rather than a test list: **every one of these is fluent, shape-correct, and
 error-free.** A model with a zeroed recurrent state reads perfectly and has
 simply forgotten; a mis-folded signature returns a confident number. This is the
 same signature as the three defects that cost the hybrid its original bring-up
-(`qwen35_qwen38_models.md` §7.8), none of which was visible as a crash.
+(`docs/archived/qwen35_qwen38_models.md` §7.8), none of which was visible as a crash.
 
 It reaches the instruments too, which is the part worth bracing for. The replay
 probe that exists to separate harness drift from model non-determinism rolls back
@@ -138,7 +141,7 @@ about the tree as it stands, not plan.
 
 - **GPU**: RTX PRO 5000 Blackwell, 73,415 MiB, ~71 GiB free. `nvidia-smi` works.
 - **The 35B checkpoint is already on disk**, at the exact revision
-  `models/qwen36_moe.rs` pins:
+  the `Model::Qwen36_35B_A3B_Q4` preset (`candle-conversation/src/models/`) pins:
   `~/.cache/huggingface/hub/models--unsloth--Qwen3.6-35B-A3B-GGUF/snapshots/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`
   (22,134,528,992 bytes).
 
@@ -189,8 +192,9 @@ measurement, and it is measurement of the research kind.
 3. **P10.6** — re-opened by measurement: **three** state forks per turn, not
    one, so ~188 MiB/turn moves device-to-device. Find the other two carves.
 4. **P6.2, P8, P10.3, T5b.5** — closed, each with a reason: no cross-product to
-   accelerate (§11a.11), 4 % of wall (§11a.12), the capability refusal already
-   makes the hybrid safe (§11a.3c), and not implementable as written (§11a.10).
+   accelerate (§11a.11), 4 % of wall (§11a.12), the hybrid rewinds a verified
+   block by folding its timeline instead (§5.4, §11a.3c), and not implementable
+   as written (§11a.10).
 
 ### 0a.4 Decisions already taken — do not re-litigate
 
@@ -212,8 +216,8 @@ re-opened by mistake:
 
 `AGENTS.md` governs: no back-compat shims, no env flags, no TODOs or stubs, one
 concern per file, imports not fully-qualified paths, **only Edit/Write may
-modify files**, and **never commit without explicit permission**. The whole run
-so far is uncommitted on branch `fused-kernels`.
+modify files**, and finished work is committed and pushed without asking. The
+work described here is committed on `main`.
 
 ## 0. Pre-reading — what to load before starting
 
@@ -221,165 +225,159 @@ Read this **after** finishing the document for the first time, and **again after
 any session compaction**. The design below is a set of claims about code; the
 claims are not actionable until the code they describe is in context.
 
-Two tiers. **Tier A is mandatory every time** — ~3,700 lines, all of it small
-files read whole. **Tier B is per-phase** — large files where only named ranges
-matter, loaded when you start that phase and not before. Reading all of Tier B
-up front is ~23,000 lines and will not survive a compaction anyway.
+Two tiers. **Tier A is mandatory every time** — small files read whole. **Tier B
+is per-phase** — large files where only named symbols matter, loaded when you
+start that phase and not before.
 
-A note on ranges: line numbers throughout this document come from a survey and
-**drift**. Every range below is paired with the symbol it brackets. If a range
-does not contain its symbol, trust the symbol and re-locate — do not read the
-range and assume.
+A note on locations: the big files this survey was taken from have since been
+split into module folders, so Tier B names each symbol and the file that holds it
+rather than a line range. Line numbers elsewhere in this document come from the
+original survey and **drift**; trust the symbol and re-locate.
 
 ### 0.1 Tier A — always, whole files
 
 | file | lines | why |
 |---|---|---|
-| `AGENTS.md` (repo root) | — | the standing rules this work is bound by: no back-compat shims, no env flags, no TODOs/stubs, one concern per file, TDD, **only Edit/Write may modify files**, never commit without permission |
-| `candle-transformers/src/models/delta_net/state_store/mod.rs` | 615 | `RecurrentStateStore` — the thing being persisted, forked and restored. `export`/`import`, and the **ping-pong** wave discipline (two `s` buffers per layer; commit is a `mem::swap`, rollback is nothing). **P1, P2, P4, P7 all edit this.** |
-| `candle-transformers/src/models/delta_net/types.rs` | 58 | `DeltaNetDims`, `LayerKind` — the geometry every size calculation uses |
+| `AGENTS.md` (repo root) | — | the standing rules this work is bound by: no back-compat shims, no env flags, no TODOs/stubs, one concern per file, TDD, **only Edit/Write may modify files** |
+| `candle-transformers/src/models/delta_net/state_store/mod.rs` and its siblings (`layers.rs`, `store_access.rs`, `store_waves.rs`, `folding.rs`, `store_steps.rs`, `store_io.rs`, `snapshots.rs`) | 117 (`mod.rs`) | `RecurrentStateStore` — the thing being persisted, forked and restored. `export`/`import` (`store_io.rs`), `fork_from` and the `seeded` flag (`store_steps.rs`), and the wave discipline (`store_waves.rs`): one live state per layer, a short timeline of rows not yet applied, and a scratch held only while the sequence prefills (`docs/deltanet_timeline.md`). **P1, P2, P4, P7 all edit this.** |
+| `candle-transformers/src/models/delta_net/types.rs` | 71 | `DeltaNetDims`, `LayerKind` — the geometry every size calculation uses |
 | `candle-transformers/src/models/delta_net/kv_layout.rs` | 220 | `KvLayerMap` — why `session.num_layers()` is 10 and `model.num_layers()` is 40; `snap_to_attention` |
-| `candle-transformers/src/models/qwen35/batched/recurrent_state.rs` | 511 | the recurrent map, `ensure_recurrent` (the `offset == 0` reset, `:175`), `take/put_recurrent`, `release_recurrent` (`:214`), the wave begin/commit/rollback |
-| `candle-transformers/src/models/qwen35/engine.rs` | 303 | `provenance_layer_indices` (already hybrid-correct), `create_session` |
-| `candle-conversation/src/turn_layout/mod.rs` | 873 | `TurnSegment` / `GlueKind` / `KvSpan` / `from_flat_grid` — **the whole of §4.7 lives here**, including the already-tested `user_content_start > 0` path |
-| `candle-conversation/src/provenance/mod.rs` | 50 | the pipeline in one page: index side at seal, query side in decode |
-| `candle-conversation/src/persistence/streams.rs` | 293 | `TurnDecl` — a turn IS a stream; `segments` is the persisted layout |
+| `candle-transformers/src/models/qwen35/batched/recurrent_state.rs` | 482 | the recurrent map, `ensure_recurrent` (the `offset == 0` reset), `take/put_recurrent`, `release_recurrent`, `fork_recurrent`, `export_recurrent`, `restore_recurrent`, the wave begin/commit/rollback |
+| `candle-transformers/src/models/qwen35/engine.rs` | 530 | `provenance_layer_indices` (already hybrid-correct), `create_session` |
+| `candle-conversation/src/turn_layout/` (`segment.rs`, `kv_span.rs`, `layout.rs`) | 39 (`mod.rs`) | `TurnSegment` / `GlueKind` / `KvSpan` / `from_flat_grid` — **the whole of §4.7 lives here**, including the `user_content_start > 0` path |
+| `candle-conversation/src/provenance/mod.rs` | 65 | the pipeline in one page: index side at seal, query side in decode |
+| `candle-conversation/src/persistence/streams.rs` | 444 | `TurnDecl` — a turn IS a stream; `segments` is the persisted layout |
 
-Also read, from `mix/mod.rs` (do **not** read all 1,873 lines):
+Also read, from `delta_net/mix/` (do **not** read all of it):
 
-- **`mix/mod.rs:1-40`** — the recurrence in three lines, and the layer around it.
-- **`mix/state.rs:45-110`** — `DeltaNetState`, `snapshot()`, `copy_from()`, and the
-  comment explaining why it is deliberately not `Clone`. P1's `fork_from` is
-  built directly on `snapshot()`. Read both doc comments carefully: since the
-  ping-pong landed, **neither is on the wave path any more** — `snapshot` serves
-  the reference model's bookkeeping and `copy_from` is explicitly labelled "the
-  wave path does not use this." A fork is now their only hot caller.
-- **`mix/recurrence.rs:165-345`** — `delta_chunked`, for the `v_new = u − w·Sᵀ` line that
+- **`mix/mod.rs`** — the recurrence in three lines, and the layer around it.
+- **`mix/state.rs`** — `DeltaNetState`, `snapshot()`, `copy_from()`, and the
+  comment explaining why it is deliberately not `Clone`. `fork_from` falls back
+  to `snapshot()` where the state arenas are not in use. Read both doc comments
+  carefully: **neither is on the wave path** — `copy_from` is explicitly labelled
+  "the wave path does not use this." A fork is now their only hot caller.
+- **`mix/recurrence.rs`** — `delta_chunked`, for the `v_new = u − w·Sᵀ` line that
   §4.6 uses to prove state does not compose.
 
 **Companion design docs** (skim, do not read whole):
-`docs/qwen35_qwen38_models.md` — **§5** (the original snapshot design), **§7.8**
+`docs/archived/qwen35_qwen38_models.md` — **§5** (the original snapshot design), **§7.8**
 (the three invisible defects — the standing warning behind §6's test strategy),
 **§7.16** (F32 accumulation is mandatory), **§8 risk 1 and risk 5**.
 
-### 0.2 Tier B — per phase, named ranges only
+### 0.2 Tier B — per phase, named symbols only
 
 Load these when you start the phase, not before.
 
 **Before P0 / P2 / P7 (the hooks and the scheduler wiring)**
-- `candle-transformers/src/models/batched_inference/mod.rs`
-  — `:1533-1560` `create_view_sequence` (a view is a new `create_sequence()`)
-  — `:2852-2900` `ProvenanceLayerIndices`, `ModelCoreProperties`
-  — `:2995-3160` the `ManagedBatchedModel` trait head + `model_core_properties`
-  — `:3240-3270` `truncate_sequence` (the shape every new hook copies)
-  — `:3460-3500` the spec-decode accept path — `truncate_sequence`'s only caller
-- `candle-conversation/src/scheduler/mod.rs`
-  — `:1940-1960` the `Scheduler` struct (confirms `model` is reachable)
-  — `:2470-2530` `handle_request` — `NewSequence` / `NewEphemeralSequence` /
-    `ResumeSequence` all funnelling to `create_sequence`
-  — `:2960-3040` view registration (`turn_views.insert`) and the
-    `FreeSequence` handler
-  — `:5320-5375` `finalize_view` at seal
-  — `:6690-6745` `create_view`
-  — `:7500-7560` the reprojection path: free the view, rebuild the parent,
-    carve a fresh one
-  — `:7790-8110` the test harness: `DummyModel`, `make_test_session`,
-    `make_test_scheduler` — **P-INFRA extends exactly this**
-- `candle-conversation/src/conversation/sequence_fork.rs` — `:2455-2545` `fork`,
+- `candle-transformers/src/models/batched_inference/`
+  — `views.rs` `create_view_sequence`, `finalize_view` (a view is a new `create_sequence()`)
+  — `model_core.rs` `ProvenanceLayerIndices`, `ModelCoreProperties`
+  — `managed_model.rs` the `ManagedBatchedModel` trait head + `model_core_properties`
+  — `managed_model.rs` `truncate_sequence` / `truncate_sequences` (the shape every new hook copies)
+  — `managed_model.rs` `speculative_decode_step_batch` — the spec-decode accept path
+- `candle-conversation/src/scheduler/`
+  — `mod.rs` the `Scheduler` struct (confirms `model` is reachable)
+  — `requests.rs` `handle_request` — `NewSequence` / `NewEphemeralSequence` /
+    `ResumeSequence` all funnelling to `create_sequence` (`slots.rs`)
+  — view registration (`turn_views.insert`: `submit_admit.rs`, `turn_group.rs`,
+    `reprojection.rs`) and the `FreeSequence` handler (`requests.rs`, `slots.rs`)
+  — `cleanup.rs` `finalize_view` at seal
+  — `projection_turns.rs` `create_view`, `carve_view`
+  — `reproject_prepare.rs`, `reprojection.rs` the reprojection path: free the
+    view, rebuild the parent, carve a fresh one
+  — `tests_fixtures.rs` the test harness: `DummyModel`, `make_test_session`,
+    `make_test_scheduler`; `tests_toy_model.rs` `DummyRecurrentModel`
+- `candle-conversation/src/conversation/sequence_fork.rs` — `fork`,
   `fork_resuming`, `fork_onto`
 
 **Before P3 (truncation removal)** — §5.1's table is 14 rows across two
 primitives; read the non-zero ones, not just the scheduler's.
-- `candle-conversation/src/scheduler/mod.rs` — `:4640-4660`, `:5478-5500` (the
-  `<think>` partial truncate — the scheduler's only non-zero target),
-  `:5610-5640`, `:5720-5760`, `:7540-7560`
-- `candle-conversation/src/scheduler/projection_assembler/apply_build.rs` — `:605-640`
-  (`apply_segments_build`)
-- `candle-conversation/src/scheduler/prefill.rs` — `:2440-2490`
+- `candle-conversation/src/scheduler/` — `seal_turn.rs`, `turn_group.rs`,
+  `sections.rs` (`prepare_section_ingest`), `reproject_prepare.rs` and
+  `projection_assembler/apply.rs`, the `truncate_sequence_to_blocks` callers
 - `candle-nn/src/kv_cache/chunked/sequence_ops/tail.rs` —
-  `truncate_sequence_to_blocks` / `_to_tokens` (~:1900-2100)
-- `candle-transformers/src/models/batched_inference.rs` — `:1180-1245`
-  (`reserve_glue_gap`'s rollback, site 9), `:1251-1290` (both session wrappers),
-  `:1385-1410` (the seal quantize clear, site 7)
-- `candle-nn/src/kv_cache/chunked/alloc/ensure_layout.rs` — `:1670-1735`
-  (`heal_tail_divergence`, site 11) and `candle-nn/src/kv_cache/cache/mod.rs`
-  — `:695-725` (`truncate_chunked_to_tokens`, site 12)
-- `candle-transformers/src/models/batch_test/utils/reproducibility.rs` — `:505-600`
-  (`decode_replay_probe`, site 13) and `:1165-1200` (the repeat loop, site 14).
+  `truncate_sequence_to_blocks` / `_to_tokens`
+- `candle-transformers/src/models/batched_inference/block_tail.rs` —
+  `reserve_glue_gap` (its rollback, site 9), and both session wrappers
+  `truncate_sequence_to_blocks` / `truncate_sequence_to_tokens`
+- `candle-nn/src/kv_cache/chunked/alloc/ensure_layout.rs` —
+  `heal_tail_divergence` (site 11) and `candle-nn/src/kv_cache/cache/mod.rs`
+  `truncate_chunked_to_tokens` (site 12)
+- `candle-transformers/src/models/batch_test/utils/reproducibility.rs` —
+  `decode_replay_probe` (site 13) and `batch_test/utils/run_batched.rs` (the
+  repeat loop, site 14).
   **Read the doc comments, not only the code** — both state the invariant they
   no longer hold on a hybrid, which is what makes them §3 defect 8.
 
 **Before P4 (snapshot writer + strip)**
-- `candle-conversation/src/persistence/record/mod.rs` — `:100-200` (`RecordType`,
-  esp. `Snapshot = 20` and `Distilled = 16`), `:1008-1130` (`SnapshotPayload`)
-- `candle-conversation/src/persistence/compaction.rs` — `:120-250`
-  (`collect_live_records`: the snapshot loop and the `distilled` map below it)
-- `candle-conversation/src/persistence/maintenance.rs` — `:610-660`
-  (the `live_snapshots` supersede filter), `:1010-1360` (its four tests)
-- `candle-conversation/src/persistence/mod.rs` — `:210-250`
-  (`record_snapshot_loc`), `:650-720` (`track_snapshot_loc`,
-  `append_recurrent_snapshot`)
-- `candle-conversation/src/projection/resolver.rs` — `:2670-2710`
-  (`enqueue_recurrent_snapshot`, `recurrent_snapshot_loc`)
-- `candle-conversation/src/scheduler/mod.rs` — `:6250-6300` (the seal: sig
-  gather, then `record_turn`), `:6380-6410` (the `WideQSig` + `Tokens`
-  enqueues — where P4.4 inserts)
+- `candle-conversation/src/persistence/record/mod.rs` — `RecordType`, esp.
+  `Snapshot = 20`, `BranchCheckpoint = 21` and `Distilled = 16`; `record/snapshot.rs`
+  `SnapshotPayload`
+- `candle-conversation/src/persistence/compaction/collect.rs` —
+  `collect_live_records`: the snapshot loop and the `distilled` map above it
+- `candle-conversation/src/persistence/maintenance/` — `worklist.rs`,
+  `relocate.rs` (the live-tail filter that skips a superseded snapshot),
+  `tests_tails.rs` (its tests)
+- `candle-conversation/src/persistence/` — `replication.rs`
+  (`record_snapshot_loc`), `tracking.rs` (`track_snapshot_loc`), `writer.rs`
+  (`append_snapshot`)
+- `candle-conversation/src/projection/resolver/recurrent_state.rs` —
+  `enqueue_recurrent_snapshot`, `recurrent_snapshot_loc`
+- `candle-conversation/src/scheduler/perform_seal.rs` — the seal: sig gather,
+  `export_recurrent`, then the `WideQSig` and snapshot enqueues, then `Tokens`
 
 **Before P5a / P5b (turn boundaries)**
-- `candle-conversation/src/scheduler/projection_assembler/assembly.rs` — `:150-220`
-  (`BoundaryMarkers`, incl. the "intra-turn markers stay baked" note),
-  `:255-335` (`assemble_pieces` — the wrapping being removed),
-  `:1700-1918` (its tests, incl. the stream this must reproduce)
-- `candle-conversation/src/scheduler/mod.rs` — `:2765-2860` (the live turn's
-  opener + `no_think`), `:4180-4210` (the compression-turn builder — **P5b.7**),
-  `:4390-4480` (`tool_exchange_segments`, the baked-marker precedent)
-- `candle-conversation/src/substrate.rs` — `:735-790` (the persisted-turn
-  contract, and the reason boundary markers were never baked)
-- `candle-conversation/src/projection/project.rs` — `:220-270`
-  (`ProjectionSegment`, `SealedKind`)
+- `candle-conversation/src/scheduler/projection_assembler/assembly.rs` —
+  `BoundaryMarkers`, `assemble_pieces`; tests in `tests_assembly.rs`, incl. the
+  stream this must reproduce
+- `candle-conversation/src/scheduler/` — `compression_turn.rs` (the
+  compression-turn builder — **P5b.7**), `seal_turn.rs`
+  (`tool_exchange_segments`, the baked-marker precedent)
+- `candle-conversation/src/substrate/entries.rs` — the persisted-turn contract
+  (a turn owns its boundaries at both ends)
+- `candle-conversation/src/projection/project/mod.rs` — `ProjectionSegment`,
+  `SealedKind`
 
 **Before P5c (system-prompt glue)**
-- `candle-conversation/src/projection/schema.rs` — `:125-165`
-  (`is_collection_member` — the collection approximation precedent),
-  `:180-330` (`SectionTree`, `TreeDim`, `TreeNode`, `TreeGlue`),
-  `:356-500` (`TreeCollection`, `TreeVariant`, `SectionCollection`,
-  `member_glue`)
-- `candle-conversation/src/projection/project.rs` — `:1890-1920` (`TreeGlue`
-  emission), `:1970-2000` (`is_template`), `:2080-2100` (`push_member_glue`)
-- `candle-conversation/src/scheduler/projection_assembler.rs` — `:640-800`
-  (the island walk + prefix hash), `:980-1030` (`reserve_glue_island` — what a
-  gap chunk actually is)
+- `candle-conversation/src/projection/schema/system_prompt.rs` —
+  `is_collection_member` (the collection approximation precedent),
+  `SectionTree`, `TreeGlue`, and the other tree and collection types;
+  `member_glue` is a field of the section collection
+- `candle-conversation/src/projection/project/emit.rs` — `push_section_segment`,
+  `push_member_glue`; the `is_template` emission is in the same file
+- `candle-conversation/src/scheduler/projection_assembler/walk.rs` — the island
+  walk, `reserve_glue_island` (what a gap chunk actually is)
 
 **Before P5d / P5e (provenance)**
-- `candle-conversation/src/provenance/wide_sig.rs` (447, whole) — the fold
-- `candle-conversation/src/provenance/scan.rs` — `:30-130`
-  (`HEADS_PER_GROUP`, `score_provenance_late_fusion_weighted`)
-- `candle-conversation/src/provenance/gpu.rs` — `:120-180`,
-  `candle-conversation/src/provenance/packed.rs` — `:30-130`
-  (the other two `HEADS_PER_GROUP` consumers)
-- `candle-conversation/src/scheduler/mod.rs` — `:620-700`
-  (`assemble_folded_prov_sigs`, the GPU fold), `:6580-6700`
-  (`gather_wide_sigs` — **both** paths, incl. the CPU fallback fold at ~:6682)
-- `candle-transformers/src/models/batched_inference/provenance.rs` — `:1915-1960`
-  (`prov_sub_head_dim` and the `> 32` guard that silently disables the fast path,
-  **plus** the `ProvSignPacked` literal above it that stamps the global
-  `N_PALETTE` beside the derived `sub_head_dim` — P5d.1a)
-- `zend/examples/provenance_layers.rs` — `:30-72` (the fourth, un-aliased
-  `HEADS_PER_GROUP` and the `project_groups` stride it feeds — P5e.5a)
-- `candle-nn/src/kv_cache/mod.rs` — `:110-260` (`active_kv_formats`, `R16` and
-  its Q-capture space, `QuantFormat`)
-- `candle-nn/src/kv_cache/chunked/backing.rs` — `:215-235` (`n_palette()`,
-  the per-backing mechanism P5d.2 extends)
+- `candle-conversation/src/provenance/wide_sig.rs` — the fold
+- `candle-conversation/src/provenance/scan.rs` —
+  `score_provenance_late_fusion_weighted`
+- `candle-conversation/src/provenance/gpu.rs`,
+  `candle-conversation/src/provenance/packed.rs` — the other two consumers of
+  the heads-per-group derivation
+- `candle-conversation/src/scheduler/provenance_capture.rs` —
+  `assemble_folded_prov_sigs` (the GPU fold) and `gather_wide_sigs` (**both**
+  paths, incl. the CPU fallback fold)
+- `candle-transformers/src/models/batched_inference/provenance.rs` —
+  `prov_sub_head_dim`, `prov_n_palette` and the `ProvSignPacked` literal in
+  `pack_provenance_signs`
+- `zend/examples/provenance_layers.rs` — `project_groups` and its stride
+- `candle-nn/src/kv_cache/mod.rs` — `active_kv_formats` (`R16` and its Q-capture
+  space, `QuantFormat`)
+- `candle-nn/src/kv_cache/chunked/backing/` — `n_palette()`
+  (`backing_inner.rs`, `constructors.rs`)
 
 **Before P6 (branch checkpoints)**
-- `candle-conversation/src/conversation.rs` — `:670-760`
-  (`insert_section_collection` and friends — where variants are sealed)
-- plus the P5c schema ranges above
+- `candle-conversation/src/conversation/sequence_sections.rs` —
+  `insert_section_collection` and friends — where variants are sealed;
+  `conversation/prefix_state.rs`
+- plus the P5c schema symbols above
 
 **Before P9 (zend)**
-- `zend/tests/infinite_conversation_smoke.rs` and `..._deep.rs` — the tiered
-  `#[ignore]` convention and the conversation-growth harness to copy
-- `zend/src/session/restore.rs` — `:2140-2175` (`fork_resuming` at daemon resume)
+- `zend/tests/infinite_conversation_smoke.rs` and `infinite_conversation_deep.rs` — the tiered
+  `#[ignore]` convention and the conversation-growth harness to copy;
+  `zend/tests/hybrid_recurrent_state.rs`, the hybrid gates
+- `zend/src/session/restore.rs` — `fork_resuming` at daemon resume
 
 ### 0.3 Read-order for a first session
 
@@ -399,15 +397,20 @@ single grep, and each has been wrong at some point during drafting:
 
 ```
 grep -rn "\.truncate_sequence(" --include=*.rs .         # 1  — spec-decode accept, the only caller
-grep -rn "enqueue_recurrent_snapshot" --include=*.rs .   # 1  — its own definition; nothing writes
-grep -rn "release_recurrent" --include=*.rs .            # 2  — definition + one unreachable caller
+grep -rn "enqueue_recurrent_snapshot" --include=*.rs .   # before the writer: 1 — its own definition; nothing writes
+grep -rn "release_recurrent" --include=*.rs .            # before P0: 2 — definition + one unreachable caller
 grep -rn "fn create_view_sequence" -A 6 --include=*.rs . # 2  — session-level + backing-level; the
                                                          #      session one must call create_sequence()
 grep -rn "truncate_sequence_to_tokens" --include=*.rs .  # the OTHER truncation family — §5.1
 ```
 
-Counts verified against the tree at the time of writing. If one differs, the
-phasing that rests on it needs re-deriving before you start:
+Counts verified against the tree before the work began. At HEAD
+`enqueue_recurrent_snapshot` has two hits (its definition and the seal's call in
+`scheduler/perform_seal.rs`) and `release_recurrent` has three (its definition in
+`qwen35/batched/recurrent_state.rs` and the two uses in
+`qwen35/forward/managed_model.rs`: `release_sequence` and the reset to zero in
+`truncate_sequences`); the other counts are unchanged. If one differs from what
+the phasing rests on, re-derive the phasing before you start:
 
 - **`truncate_sequence` > 1** ⇒ §5.1's survey is stale and P3 is bigger than
   stated.
@@ -434,7 +437,7 @@ re-deriving before you start.
 Three quarters of a hybrid stack's layers mix tokens through a **recurrent
 state** rather than a KV cache. Per sequence, per DeltaNet layer, that state is
 a delta-rule matrix `S [n_v_heads, d_v, d_k]` plus a causal-conv tail
-`[conv_dim, K−1]`, both F32 ([mix/state.rs:55-61](../candle-transformers/src/models/delta_net/mix/state.rs#L55-L61)).
+`[conv_dim, K−1]`, both F32 ([mix/state.rs](../candle-transformers/src/models/delta_net/mix/state.rs)).
 
 The substrate's whole design is that a conversation's history lives on disk and
 is **spliced back as sealed KV chunks** rather than re-prefilled. The projection
@@ -448,7 +451,7 @@ The result is a conversation that resumes with attention KV covering its full
 history on ¼ of its layers and `S = 0` on the other ¾. Nothing errors, every
 shape matches, and the model reads fluently — it has simply forgotten
 everything the recurrent layers were carrying. This is §7.8 defect 2 of
-`qwen35_qwen38_models.md` wearing the opposite mask: that one was *state without
+`docs/archived/qwen35_qwen38_models.md` wearing the opposite mask: that one was *state without
 KV*, this is *KV without state*.
 
 Affected paths:
@@ -480,13 +483,17 @@ state moves to the parent with the decoded blocks.
 
 ## 2. What already exists
 
+§1–§3 describe the tree as it stood when the work began; every gap in §3 has
+since been closed (§11a). They are kept as the statement of the problem, and the
+locations below are where each piece lives at HEAD.
+
 More of this is built than the gap suggests. The following all exist, are
 tested, and need no new design — only callers.
 
 **Record format.** `RecordType::Snapshot = 20`, with `SnapshotPayload`
 {`timeline_id`, `turn_index`, `schedule_hash`, `Vec<SnapshotLayer>`} and a
 versioned binary codec that validates every blob length against its declared
-dims ([record.rs:1008-1129](../candle-conversation/src/persistence/record.rs#L1008-L1129)).
+dims ([record/snapshot.rs](../candle-conversation/src/persistence/record/snapshot.rs)).
 Round-trip tested. The per-layer encoding already carries a **dtype tag byte**,
 currently pinned to `0 = F32` — the designed-in extension point for §7.
 
@@ -506,26 +513,26 @@ the superseded copy as dead bytes.
 a newer tail for a planned stream between plan and execute. Maintenance filters
 the relocation plan against the live-tail map under the persistence lock, so a
 planned-but-now-stale snapshot is skipped entirely rather than relocated after
-the newer record ([maintenance.rs:619-641](../candle-conversation/src/persistence/maintenance.rs#L619-L641)).
+the newer record ([maintenance/relocate.rs](../candle-conversation/src/persistence/maintenance/relocate.rs)).
 Relocating it would have installed rolled-back state as the tail on the next
 reload. That hazard is closed, with tests.
 
 **Reload installs the location.** The load walk records each `Snapshot`'s
 location per stream, and a timeline-scoped `Tombstone` removes the entry, so a
 snapshot replayed before its timeline's tombstone never reads as live
-([mod.rs:221-244](../candle-conversation/src/persistence/mod.rs#L221-L244)).
+([replication.rs](../candle-conversation/src/persistence/replication.rs) `record_snapshot_loc`).
 Both the pre-substrate walk and the runtime append path keep the map current.
 
 **Compaction carries the live tail forward.** `collect_live_records` stages one
 snapshot per conversation verbatim as a `Raw` item — the payload is a multi-MB
-blob nothing holds in RAM ([compaction.rs:149-169](../candle-conversation/src/persistence/compaction.rs#L149-L169)).
+blob nothing holds in RAM ([compaction/collect.rs](../candle-conversation/src/persistence/compaction/collect.rs)).
 
 **Export / import.** `RecurrentStateStore::export()` produces
 `ExportedLayerState` rows field-for-field matching `SnapshotLayer`;
 `import(hash, layers)` validates `schedule_hash`, layer count, and every
 layer's geometry **before touching any tensor**, then writes into the slots'
 existing buffers rather than replacing them
-([state_store.rs:231-322](../candle-transformers/src/models/delta_net/state_store.rs#L231-L322)).
+([state_store/store_io.rs](../candle-transformers/src/models/delta_net/state_store/store_io.rs)).
 Export refuses mid-wave; import refuses mid-wave and on hash mismatch.
 
 **The device-copy primitive.** `DeltaNetState::snapshot()` is
@@ -534,27 +541,29 @@ a device-to-device copy that never touches the host. This is already exactly
 the fast VRAM fork the brief asks for, and it survives; what changed under it is
 that it now has **no caller at all** on the hot path.
 
-> **The ping-pong commit moved this ground.** The wave used to preserve its entry
+> **The wave stopped copying the state.** The wave used to preserve its entry
 > state by copying every layer aside, so a fork's copy was the same operation the
-> engine already ran every wave. It no longer is: each slot holds two `s` buffers,
-> a wave reads one and writes the other, commit is a host `mem::swap` and rollback
-> is nothing. `copy_from`'s own doc comment now says "the wave path does not use
-> this." The primitive is intact and correct, but §4.4's cost argument has to be
-> re-derived rather than inherited — see there.
+> engine already ran every wave. It no longer is: a short span writes only a
+> timeline row per token, a long span writes a scratch held while the sequence
+> prefills, and a failed wave is undone by dropping that bookkeeping
+> (`docs/deltanet_timeline.md`). `copy_from`'s own doc comment says "the wave path
+> does not use this." The primitive is intact and correct, but §4.4's cost
+> argument has to be derived rather than inherited — see there.
 
-**The seal site.** The turn seal writes `WideQSig` then `Tokens` then fires the
-persistence trigger ([scheduler/mod.rs:6388-6407](../candle-conversation/src/scheduler/mod.rs#L6388-L6407)).
-The snapshot write belongs immediately beside the `WideQSig` write, before the
+**The seal site.** The turn seal writes `WideQSig`, the recurrent snapshot, then
+`Tokens`, then fires the persistence trigger
+([scheduler/perform_seal.rs](../candle-conversation/src/scheduler/perform_seal.rs)).
+The snapshot write sits immediately beside the `WideQSig` write, before the
 `Tokens` enqueue.
 
 **The sequence-creation funnel.** `NewSequence`, `NewEphemeralSequence`, and
 `ResumeSequence` all route through `Scheduler::create_sequence`
-([scheduler/mod.rs:2476-2526](../candle-conversation/src/scheduler/mod.rs#L2476-L2526)).
+([scheduler/slots.rs](../candle-conversation/src/scheduler/slots.rs)).
 One hook point serves both fork-copy and resume-restore.
 
 **The per-sequence model hook precedent.** `ManagedBatchedModel::truncate_sequence`
 is a per-sequence lifecycle method the hybrid overrides to *also* act on
-recurrent state ([forward.rs:176-193](../candle-transformers/src/models/qwen35/forward.rs#L176-L193)).
+recurrent state ([qwen35/forward/managed_model.rs](../candle-transformers/src/models/qwen35/forward/managed_model.rs)).
 Every new hook below (`export_recurrent`, `restore_recurrent`,
 `release_sequence`) follows that *shape* — a trait method with a no-op default
 that the hybrid overrides. The method itself does not survive: §5 shows its only
@@ -562,9 +571,11 @@ caller is speculative decode and its rewind capability is being deleted.
 
 ## 3. What is missing
 
-Six gaps and three pre-existing defects. Gap 0 gates the model switch; gaps
-1–5 are the feature work; defects 6–8 are live bugs on today's code,
-independent of any of it.
+Six gaps and three pre-existing defects, as found before the work began (all nine
+are closed — §11, §11a). Gap 0 gated the model switch; gaps 1–5 were the feature
+work; defects 6–8 were live bugs on the then-current code, independent of any of
+it. The counting claims below ("one hit", "one caller") are the pre-work counts;
+§0.4 gives HEAD's.
 
 0. **Views do not carry the state — so nothing carries it across a turn.**
    The turn loop carves a child slot (a *view*) at turn start and decodes on
@@ -666,7 +677,7 @@ the tail, the accounting already credits the old copy as dead, and the
 plan/execute race is already filtered. Compaction drops every superseded copy
 and carries exactly the tail forward. The brief's "when we compact we'll
 basically remove all the previous DeltaNet's" is the existing behaviour, and the
-race it worries about is the one `live_snapshots` was written to close.
+race it worries about is the one the maintenance relocation's live-tail filter closes (`persistence/maintenance/`).
 
 *Strip* is the gap. Two triggers must remove a conversation's snapshot:
 
@@ -758,20 +769,21 @@ RecurrentStateStore::fork_from(&parent) -> Self
 No host round trip, no encode, no disk. On the 35B this is ~63 MiB of device
 copy per fork — sub-millisecond at PCIe-free device bandwidth.
 
-**This cost is no longer amortised, and that is a change since the ping-pong
-landed.** The original argument here was that a fork costs the same operation the
-wave already ran every wave, so it was free in the sense of adding no new *kind*
-of work. The wave stopped copying: it preserves the entering state by not writing
-it, commit is a `mem::swap`, and the ~60 MiB per wave the store used to move is
-gone. A fork's copy is now genuinely new device traffic, and §5.3a puts one on
-**every dialogue turn** rather than only on an explicit `fork()`.
+**This cost is not amortised against anything the wave does.** The original
+argument here was that a fork costs the same operation the wave already ran every
+wave, so it was free in the sense of adding no new *kind* of work. The wave no
+longer copies the state: a short span writes timeline rows and a failed wave is
+undone by dropping them (`docs/deltanet_timeline.md`), so the ~60 MiB per wave the
+store used to move is gone. A fork's copy is genuinely new device traffic, and
+§5.3a puts one on **every dialogue turn** rather than only on an explicit
+`fork()`.
 
 Two consequences to carry into P1 and P2:
 
-- A forked slot needs **both** halves of the ping-pong: `live` is a real
-  `snapshot()` of the parent's live buffer, while the write buffer can be
-  allocated without initialising (the kernels fully overwrite it), so the copy is
-  ~63 MiB against ~123 MiB of allocation. `advanced` starts `false`.
+- A forked slot copies only the live state: `fork_from` copies each layer's live
+  `s` and conv tail device-to-device into the child's own state-arena slot, and
+  the child holds no scratch and nothing pending (`advanced` starts `false`). The
+  scratch is claimed only if the child later prefills a long span.
 - Per-turn fork traffic is a number to measure, not to assume, and it is the
   first thing to look at if turn latency regresses after P2. It is also the
   reason to check whether a view's fork can be deferred to the first layer that
@@ -781,10 +793,13 @@ Two consequences to carry into P1 and P2:
 **Parent not resident** (daemon restart, or the parent was freed). Fall back to
 §4.3's snapshot read.
 
-Plumbing: `fork_onto` must pass the parent's sequence id through
-`SchedulerRequest::NewSequence` so `create_sequence` can reach the parent's
-store. Today the request carries `conversation`/`target`/`response_tx` only.
-Add `parent: Option<SequenceId>`.
+*Layout note:* §4.4 and §4.7 onward are written as the design that was then
+implemented; where they say "today" or "currently", they describe the code before
+the work landed, and §11a records what the code does now.
+
+Plumbing: `fork_onto` passes the parent's sequence id through
+`SchedulerRequest::NewSequence` (its `parent: Option<SequenceId>` field) so
+`create_sequence` can reach the parent's store.
 
 **The boundary constraint.** A fork's spliced KV covers the parent's history *as
 sealed*. The recurrent state must correspond to the same token stream, so the
@@ -955,7 +970,9 @@ documented as unexercised. What is missing is a caller that reserves the room.
 
 #### The reason they were never baked
 
-The persisted-turn contract states it directly (`substrate.rs:738-756`):
+The persisted-turn contract stated it directly (the doc comment on the turn entry,
+now in `substrate/entries.rs`, which since P5b says the opposite — a turn owns its
+boundaries at both ends):
 
 > *"the inter-turn `user_start` head and `assistant_end` tail are **not**
 > persisted: the projection assembler re-emits them as live `Generated` runs at
@@ -1084,7 +1101,7 @@ unexplained empty block the model learns to mimic."* It is keyed to that turn's
 own persisted flag, which is fixed once the turn is sealed. **Safe to bake**,
 and it must be, or a non-glue model cannot reproduce it.
 
-**The live turn's switch** (`scheduler/mod.rs:2833`) is explicitly the
+**The live turn's switch** (in the scheduler's turn submission) is explicitly the
 opposite: *"re-decided from the current dial every projection, never sealed
 into a turn — keeps it out of the substrate and prevents a past suppressed turn
 from leaking a stale switch onto a later thinking-on turn."* Baking that would
@@ -1169,10 +1186,10 @@ Five producers of `ProjectionSegment::Generated` exist:
 
 | producer | after these changes |
 |---|---|
-| `TreeGlue` dialect markers (`project.rs:1905`) | sealed — §4.6(1) |
+| `TreeGlue` dialect markers (`projection/project/emit.rs`) | sealed — §4.6(1) (designed; no production caller, refused by `reserve_glue_island` on a lineage that cannot gap-fill — §11a.2b) |
 | turn boundary markers (the spine) | sealed — this section |
-| `is_template` sections (`project.rs:1988`) | sealed against a canonical prefix — §4.7d |
-| `SectionCollection::member_glue` (`project.rs:2095`) | sealed as a leading separator — §4.7d |
+| `is_template` sections (`projection/project/emit.rs`) | sealed against a canonical prefix — §4.7d |
+| `SectionCollection::member_glue` (`push_member_glue`, `projection/project/emit.rs`) | sealed as a leading separator — §4.7d (designed; no production caller — §11a.2b) |
 | the live turn's opener (`user_start_current`) | folded into `NewUserMessage` — §4.7c |
 
 With all five resolved, a projection of system prompt + sealed turns + a live
@@ -1216,23 +1233,27 @@ itself passes every KV layer.)
 | 1 | `PROV_HEADS_PER_LAYER` (= `HEADS_PER_GROUP`) | `4` | the 35B has **2** KV heads, so `n_layers = n_heads / 4` reads 10 layers × 2 heads as 5 × 4 — structure scrambled, not merely mis-sized |
 | 2 | `PROV_FOLD_SIZES` | `[46, 1, 1]` | a 48-layer shape; at ≤10 layers group 0 absorbs everything and **groups 1 and 2 are empty** — ⅔ zeros, and the identity-bearing top layers vanish |
 | 3 | `PROV_FOLD_SHIFT` / `rotate_head` | `32`, gated on `wph == 2` | head_dim 256 ⇒ `wph == 4` ⇒ the decorrelation stagger **silently no-ops**, so correlated layers cancel dim-aligned |
-| 4 | `n_palette` | `4` | `prov_sub_head_dim()` returns 0 when `head_dim/4 > 32`, so at 256 the GPU sign-pack path is **skipped** and every seal pulls the whole R16 dump D2H |
+| 4 | `n_palette` | `4` | `prov_sub_head_dim()` returned 0 when `head_dim/4 > 32`, so at 256 the GPU sign-pack path was **skipped** and every seal pulled the whole R16 dump D2H |
 
 Item 4 is a prerequisite rather than part of the fold, and it is the dangerous
 one: it is not a correctness bug, so it presents as "provenance got slow on the
-new model" rather than as a disabled fast path. It plugs into the same
-per-backing `n_palette()` mechanism §4.2 of `qwen35_qwen38_models.md` already
-scopes for the decode kernels.
+new model" rather than as a disabled fast path. The design scoped it as the
+per-backing `n_palette()` mechanism that §4.2 of
+`docs/archived/qwen35_qwen38_models.md` describes for the decode kernels. What
+the code does instead (§11a.14, item 2): the band count is a property of the R16
+arena and stays `N_PALETTE` (`prov_n_palette`); what declined at 256 was the
+sign-pack kernel's word width, and it now packs a `u64`, so `prov_sub_head_dim`
+admits a sub-band up to `MAX_SUB_HEAD_DIM = 64` and a 256-wide head takes the GPU
+path with its physical banding intact.
 
-It also cannot be fixed in `prov_sub_head_dim` alone. Three lines below that
-call, the same function stamps `n_palette: candle_nn::kv_cache::N_PALETTE` — the
-**global constant** — into the `ProvSignPacked` it returns, beside the
-`sub_head_dim` it just derived
-([batched_inference/provenance.rs:1924-1936](../candle-transformers/src/models/batched_inference/provenance.rs#L1924-L1936)).
-Deriving one and not the other does not leave the old behaviour in place; it puts
-two mutually contradictory numbers in one struct, so a consumer reconstructing
-`head_dim = n_palette × sub_head_dim` reads 128 for a 256-dim head. Both move
-together or neither does.
+It also could not be fixed in `prov_sub_head_dim` alone. `pack_provenance_signs`
+stamps `n_palette` into the `ProvSignPacked` it returns beside the
+`sub_head_dim` it derived
+([batched_inference/provenance.rs](../candle-transformers/src/models/batched_inference/provenance.rs)).
+Deriving one and not the other puts two mutually contradictory numbers in one
+struct, so a consumer reconstructing `head_dim = n_palette × sub_head_dim` reads
+the wrong width. Both come from the same two methods, `prov_n_palette` and
+`prov_sub_head_dim`.
 
 #### The generalisation
 
@@ -1244,36 +1265,37 @@ an identity on Qwen3-30B**:
 | heads per group | the model's `n_kv_head` | 4 ✓ |
 | fold sizes | `[n − 2, 1, 1]` over capture layers | `[46,1,1]` ✓ |
 | fold shift | `head_dim / 4` | 32 ✓ |
-| `n_palette` | smallest `p` with `head_dim / p ≤ 32` | 4 ✓ |
+| `n_palette` | designed as the smallest `p` with `head_dim / p ≤ 32`; shipped as the arena's `N_PALETTE` with a 64-bit pack word (§11a.14) | 4 ✓ |
 
 `[46,1,1]` turning out to be exactly `[n−2,1,1]` is the useful one: the existing
 constant already *is* the general rule, written out longhand.
 
 Two need real code rather than parameterisation:
 
-- **`rotate_head`** does a `u128::rotate_left` and bails unless `wph == 2`.
-  Generalise to a word-wise rotate over `wph` words, with a bit-identity test at
-  `wph == 2`.
+- **`rotate_head`** did a `u128::rotate_left` and bailed unless `wph == 2`.
+  It is now a word-wise rotate over `wph` words (`rotate_head_into` in
+  `wide_sig.rs`), with a bit-identity test at `wph == 2`.
 
   > **Generalising `rotate_head` alone is a no-op, and a silent one.** Two things
-  > block it, and neither is inside the function. Its signature returns
+  > blocked it, and neither was inside the function. Its signature returned
   > `(u64, u64)` — a shape that cannot carry a `wph == 4` result at all — and
-  > `fold_provenance` guards the *use* of that result with a second
+  > `fold_provenance` guarded the *use* of that result with a second
   > `if wph == 2 { xor rotated } else { xor raw }`
-  > ([wide_sig.rs:124-131](../candle-conversation/src/provenance/wide_sig.rs#L124-L131)),
-  > so at head_dim 256 the caller XORs the unrotated words no matter what the
-  > rotate does. A change that fixes only the function compiles, passes a test
+  > (in `wide_sig.rs`),
+  > so at head_dim 256 the caller XORed the unrotated words no matter what the
+  > rotate did. A change that fixes only the function compiles, passes a test
   > written against the function, and leaves production folding without a
-  > stagger. Both the return type and the caller branch are part of the change
+  > stagger. Both the return type and the caller branch were part of the change
   > (P5e.4, P5e.4a).
-- **`HEADS_PER_GROUP`** is aliased into `scan.rs`, `gpu.rs` and `packed.rs`. The
+- **`HEADS_PER_GROUP`** was aliased into `scan.rs`, `gpu.rs` and `packed.rs`. The
   scorer must use the value the signature was **folded with**, not a
-  compile-time constant — which is why it has to ride on the record (below).
+  compile-time constant; each now derives it from the signature's own shape
+  (`heads_per_group(n_heads)`, §11a.5).
 
-  There is a **fourth** copy, and it is not an alias:
-  [zend/examples/provenance_layers.rs:34](../zend/examples/provenance_layers.rs#L34)
-  declares its own `const HEADS_PER_GROUP: usize = 4`, so a grep for
-  `PROV_HEADS_PER_LAYER` does not find it. Its `project_groups` slices the
+  There was a **fourth** copy, and it was not an alias:
+  `zend/examples/provenance_layers.rs` declared its own
+  `const HEADS_PER_GROUP: usize = 4`, so a grep for
+  `PROV_HEADS_PER_LAYER` did not find it. Its `project_groups` slices the
   signature at `g × HEADS_PER_GROUP × wph` word strides; on the hybrid's folded
   shape (6 heads × 4 words) that stride is twice the real group width, the
   bounds check `e <= words.len()` fails, and the function returns an **empty**
@@ -1353,36 +1375,43 @@ makes a rewind look easier to delete than it is:
   both `ChunkedKvBacking` and `BatchedInferenceSession`.
 - `truncate_sequence_to_tokens(slot, n_tokens)` — the token-granular form. **This
   is the one that expresses a rewind.** `ManagedBatchedModel::truncate_sequence`
-  bottoms out here ([batched_inference/managed_model.rs:3258](../candle-transformers/src/models/batched_inference/managed_model.rs#L3258)),
+  bottoms out here ([batched_inference/managed_model.rs](../candle-transformers/src/models/batched_inference/managed_model.rs)),
   and so do both of its overrides — the hybrid's
-  ([qwen35/forward/managed_model.rs:190](../candle-transformers/src/models/qwen35/forward/managed_model.rs#L190))
+  ([qwen35/forward/managed_model.rs](../candle-transformers/src/models/qwen35/forward/managed_model.rs))
   and deepseek4's
-  ([latent_moe/wave/managed.rs:916](../candle-transformers/src/models/latent_moe/wave/managed.rs#L916)).
+  ([latent_moe/wave/managed.rs](../candle-transformers/src/models/latent_moe/wave/managed.rs)).
 
 The `_to_blocks` sites, sorted by *target* rather than by caller, separate
 cleanly:
 
 | # | site | target | what it is actually for |
 |---|---|---|---|
-| 1 | [mod.rs:4646](../candle-conversation/src/scheduler/mod.rs#L4646) | `0` | post clean-seal: drop the slot's `Arc<ChunkGid>` refs, residence owns them |
-| 2 | [mod.rs:5622](../candle-conversation/src/scheduler/mod.rs#L5622) | `0` | post-`Done` seal: identical housekeeping |
-| 3 | [mod.rs:5731](../candle-conversation/src/scheduler/mod.rs#L5731) | `0` | `prepare_section_ingest` — "defensive truncate" before injecting a prefix |
-| 4 | [mod.rs:7551](../candle-conversation/src/scheduler/mod.rs#L7551) | `0` | free a view, clear the parent so `apply_projection`'s populated-slot guard lets the rebuild through |
-| 5 | [projection_assembler/apply_build.rs:625](../candle-conversation/src/scheduler/projection_assembler/apply_build.rs#L625) | `0` | `apply_segments_build` — snapshot tail, clear, rebuild in logical order |
-| 6 | [prefill.rs:2475](../candle-conversation/src/scheduler/prefill.rs#L2475) | `0` | error path: reprefill failed, drop the slot's chunks |
-| 7 | [batched_inference.rs:1399](../candle-transformers/src/models/batched_inference.rs#L1399) | `0` | seal quantize: drop the float chunks, `inject_sealed_at_tail` the quantized ones |
-| 8 | [mod.rs:5490](../candle-conversation/src/scheduler/mod.rs#L5490) | **`seal_block_from`** | `<think>` clean-reprefill: rewind to the turn boundary |
-| 9 | [batched_inference/block_tail.rs:1211](../candle-transformers/src/models/batched_inference/block_tail.rs#L1211) | **`pre_counts[li]`** | `reserve_glue_gap` rollback: undo a partially-reserved gap chunk |
+| 1 | `scheduler/seal_turn.rs` | `0` | post clean-seal: drop the slot's `Arc<ChunkGid>` refs, residence owns them |
+| 2 | `scheduler/turn_group.rs` | `0` | post-`Done` seal: identical housekeeping |
+| 3 | `scheduler/sections.rs` | `0` | `prepare_section_ingest` — "defensive truncate" before injecting a prefix |
+| 4 | `scheduler/projection_assembler/apply.rs`, `scheduler/reproject_prepare.rs` | `0` | free a view, clear the parent so `apply_projection`'s populated-slot guard lets the rebuild through |
+| 5 | `scheduler/projection_assembler/apply_build.rs` (`apply_segments_build`) | `0` | snapshot tail, clear, rebuild in logical order |
+| 6 | `scheduler/prefill/` | `0` | error path: reprefill failed, drop the slot's chunks |
+| 7 | `batched_inference/` (session seal quantize) | `0` | seal quantize: drop the float chunks, `inject_sealed_at_tail` the quantized ones |
+| 8 | `scheduler/` (the `<think>` clean re-prefill) | **`seal_block_from`** | `<think>` clean-reprefill: rewind to the turn boundary |
+| 9 | [batched_inference/block_tail.rs](../candle-transformers/src/models/batched_inference/block_tail.rs) | **`pre_counts[li]`** | `reserve_glue_gap` rollback: undo a partially-reserved gap chunk |
+
+(The first column names the file that held each site in the survey. At HEAD the
+non-test `truncate_sequence_to_blocks` callers in `candle-conversation` are
+`scheduler/seal_turn.rs`, `turn_group.rs`, `sections.rs`, `reproject_prepare.rs`
+(target `turn_start_parent_blocks`) and `projection_assembler/apply.rs`
+(targets `0` and `last.blocks_after`); `block_tail.rs` and `injection.rs` call it
+in `candle-transformers`. §11a.1 says what became of the non-zero targets.)
 
 Plus the `_to_tokens` sites, which the block-count view does not see at all:
 
 | # | site | target | what it is actually for |
 |---|---|---|---|
-| 10 | [batched_inference/managed_model.rs:3482](../candle-transformers/src/models/batched_inference/managed_model.rs#L3482) → `:3258` | **`poss[i] + kept`** | speculative-decode accept: rewind to the accepted prefix |
-| 11 | [alloc/ensure_layout.rs:1722](../candle-nn/src/kv_cache/chunked/alloc/ensure_layout.rs#L1722) | **`target_tokens`** | `heal_tail_divergence`: trim a failed wave's surplus token off every layer |
-| 12 | [cache/mod.rs:714](../candle-nn/src/kv_cache/cache/mod.rs#L714) | any | `truncate_chunked_to_tokens` — the `KvCache` passthrough |
-| 13 | [batch_test/utils/reproducibility.rs:580](../candle-transformers/src/models/batch_test/utils/reproducibility.rs#L580) | **`prompt_len`** | `decode_replay_probe`: roll back between replays |
-| 14 | [batch_test/utils.rs:1182](../candle-transformers/src/models/batch_test/utils.rs#L1182) | **`base`** | the gate harness's repeat loop: re-prefill "from identical state" |
+| 10 | [batched_inference/managed_model.rs](../candle-transformers/src/models/batched_inference/managed_model.rs) (`speculative_decode_step_batch` → `truncate_sequences`) | **`poss[i] + kept`** | speculative-decode accept: rewind to the accepted prefix |
+| 11 | [alloc/ensure_layout.rs](../candle-nn/src/kv_cache/chunked/alloc/ensure_layout.rs) | **`target_tokens`** | `heal_tail_divergence`: trim a failed wave's surplus token off every layer |
+| 12 | [cache/mod.rs](../candle-nn/src/kv_cache/cache/mod.rs) | any | `truncate_chunked_to_tokens` — the `KvCache` passthrough |
+| 13 | [batch_test/utils/reproducibility.rs](../candle-transformers/src/models/batch_test/utils/reproducibility.rs) | **`prompt_len`** | `decode_replay_probe`: roll back between replays |
+| 14 | [batch_test/utils/run_batched.rs](../candle-transformers/src/models/batch_test/utils/run_batched.rs) | **`base`** | the gate harness's repeat loop: re-prefill "from identical state" |
 
 **Sites 1–7 are not rewinds.** Every one targets zero, and every one is either
 immediately followed by a repopulation in the same operation or is the last
@@ -1486,15 +1515,15 @@ a child slot at turn start and decodes on it:
 
 ```
 submit turn  → create_view(parent, ranges) → a NEW sequence id borrowing the
-               parent's KV blocks zero-copy      (mod.rs:6699-6724, 2988)
+               parent's KV blocks zero-copy      (projection_turns.rs `create_view`)
 decode       → runs on the view
-reproject    → free the view, rebuild the parent, carve a FRESH view   (7551)
+reproject    → free the view, rebuild the parent, carve a FRESH view   (reproject_prepare.rs)
 seal         → cleanup_finished seals parent[turn_start_parent_blocks..end]
 finalize     → the view's decoded blocks transfer to the parent
 ```
 
 `create_view_sequence` calls `create_sequence()`, so a view is a genuinely
-distinct sequence id, not an alias ([batched_inference.rs:1533-1551](../candle-transformers/src/models/batched_inference.rs#L1533-L1551)).
+distinct sequence id, not an alias ([batched_inference/views.rs](../candle-transformers/src/models/batched_inference/views.rs)).
 The parent/child split option (a) describes is the existing turn machinery.
 Nothing new needs building — the slot budget already accommodates parent +
 view per turn, and the "discard the child" path is already exercised on every
@@ -1561,10 +1590,16 @@ forward **because it finalizes**, not because reprojection is special.
 
 ### 5.4 Site 10 — speculative decode
 
-Today this is not a skew but a hard stop: the hybrid's bail makes the first
-accept with `kept > 0` fail, so **speculative decode is structurally
-unavailable on the whole hybrid lineage**. The bail reads like a defensive
-check; it is actually a capability block.
+When this was surveyed it was not a skew but a hard stop: the hybrid's bail made
+the first accept with `kept > 0` fail, so speculative decode was structurally
+unavailable on the whole hybrid lineage. The bail read like a defensive check; it
+was actually a capability block. At HEAD the hybrid *can* rewind a verified
+block, by a different route than the fork described below: a verify block writes
+a per-layer timeline instead of the state, and `truncate_sequences` folds the
+accepted prefix of it (`qwen35::spec`, `docs/deltanet_timeline.md`), which is
+exact. The capability is `ManagedBatchedModel::can_rewind_speculative_block`,
+which the hybrid overrides to `true`; a model carrying recurrent state that does
+not override it is refused at the entry of `speculative_decode_step_batch`.
 
 Forks give it a defined answer for the first time. Fork before the verify
 block; decode the block on the child; on accepting `k` of `n`, discard the
@@ -1591,7 +1626,7 @@ to discard the child, which is strictly better than today.
 ## 6. Test strategy
 
 Three tiers, because the failure modes here are the kind that pass every
-structural check. §7.8 of `qwen35_qwen38_models.md` is the standing warning: all
+structural check. §7.8 of `docs/archived/qwen35_qwen38_models.md` is the standing warning: all
 three defects that cost the hybrid its bring-up left the model fluent, shape-
 correct and error-free. Nothing in this document can be validated by "it ran."
 
@@ -1612,34 +1647,36 @@ More than expected. These are harnesses to extend, not to build:
 
 | area | existing tests | file |
 |---|---|---|
-| recurrent store | export/import round-trip, hash + geometry refusal, wave rollback/commit, **`a_wave_leaves_the_entering_buffer_untouched`** (the ping-pong contract — this replaced the old write-back-into-the-live-buffer test, which pinned the inverse), wave sequencing, `schedule_hash` pins layout | `delta_net/state_store/mod.rs` (6) |
-| snapshot codec | round-trip, exact header bytes, unknown-version rejection | `persistence/record/snapshot.rs` |
-| snapshot lifecycle | single tail survives reload + relocation, exact dead-byte credit, superseded not relocated, tombstoned not relocated | `persistence/maintenance.rs` (4) |
-| turn layout | tiling + realisation, ethereal segments add no K/V, **`leading_boundary_offsets_user_body`**, thinking split, tool-exchange split, tiling rejects gaps | `turn_layout/mod.rs` (10) |
-| assembler | `assemble_pieces_wraps_turns_merges_glue_and_defers_user`, no-think re-injection, consecutive-generated coalescing, glue bridge windows | `scheduler/projection_assembler/assembly.rs` (6) |
-| provenance | fold groups layers with stagger, `from_band` packs signs, history round-trip, exact header bytes, late-fusion vote, per-group isolation | `provenance/wide_sig.rs` + `scan.rs` (9) |
-| mixer | chunked ≡ sequential at every chunk width, segmented ≡ one-shot, GQA tiling, strong-decay finiteness | `delta_net/mix/mod.rs` (12) |
+| recurrent store | export/import round-trip, hash + geometry refusal, wave rollback/commit, **`a_wave_leaves_the_entering_buffer_untouched`** (a wave writes its scratch or timeline, never the live buffer — this replaced the old write-back-into-the-live-buffer test, which pinned the inverse), wave sequencing, `schedule_hash` pins layout | `delta_net/state_store/tests_layers.rs`, `tests_snapshots.rs`, `tests_steps.rs`, `tests_memory.rs` |
+| snapshot codec | round-trip, exact header bytes, unknown-version rejection | `persistence/record/tests_snapshot.rs` |
+| snapshot lifecycle | single tail survives reload + relocation, exact dead-byte credit, superseded not relocated, tombstoned not relocated | `persistence/maintenance/tests_tails.rs` |
+| turn layout | tiling + realisation, ethereal segments add no K/V, **`leading_boundary_offsets_user_body`**, thinking split, tool-exchange split, tiling rejects gaps | `turn_layout/tests_grid.rs`, `tests_sealed.rs`, `tests_thinking.rs` |
+| assembler | `assemble_pieces_emits_sealed_turns_alone_and_defers_user`, no-think re-injection, consecutive-generated coalescing, glue bridge windows | `scheduler/projection_assembler/tests_assembly.rs` |
+| provenance | fold groups layers with stagger, `from_band` packs signs, history round-trip, exact header bytes, late-fusion vote, per-group isolation | `provenance/wide_sig.rs` + `scan.rs` |
+| mixer | chunked ≡ sequential at every chunk width, segmented ≡ one-shot, GQA tiling, strong-decay finiteness | `delta_net/mix/tests_*.rs` |
 
 Two of these are load-bearing for the new work and worth naming:
 
 - **`leading_boundary_offsets_user_body`** already covers §4.7's change 1 — a
   real leading `UserStart` with `user_content_start > 0`. The mechanism is
   tested; only the caller is missing.
-- **`assemble_pieces_wraps_turns_merges_glue_and_defers_user`** is the exact
-  test §4.7a's stream-equivalence assertion has to preserve. It encodes today's
-  `AE ++ US` island shape, so it is both the thing to keep green and the source
-  of the expected stream.
+- **`assemble_pieces_wraps_turns_merges_glue_and_defers_user`** (renamed
+  `assemble_pieces_emits_sealed_turns_alone_and_defers_user` once turns owned their
+  boundaries) was the exact test §4.7a's stream-equivalence assertion had to
+  preserve. It encoded the `AE ++ US` island shape, so it was both the thing to
+  keep green and the source of the expected stream; the equivalence is now pinned
+  by `baked_boundaries_reproduce_the_spine_emitted_stream_exactly` (§11a.5).
 
 ### 6.2 Tier 1 — fast, CPU, no model
 
-**The enabler already exists.** `scheduler/mod.rs` has a `DummyModel`
+**The enabler already exists.** `scheduler/tests_fixtures.rs` has a `DummyModel`
 implementing `ManagedBatchedModel` over CPU tensors, plus `make_test_scheduler()`
 which stands up a real `Scheduler` on `Device::Cpu` with a dummy tokenizer and
 tiny arenas. Scheduler-level behaviour is testable with no GPU and no
 checkpoint.
 
-**The one piece to build is a `DummyRecurrentModel`** — `DummyModel` plus the
-three new hooks (`export_recurrent`, `restore_recurrent`, `release_sequence`)
+**The one piece built on top is `DummyRecurrentModel`** (`scheduler/tests_toy_model.rs`)
+— `DummyModel` plus the three new hooks (`export_recurrent`, `restore_recurrent`, `release_sequence`)
 over a toy state (say 2 layers × 2×2, F32). That is the whole tier-1
 infrastructure cost, and it buys something better than a real model would: with
 a state that small, every assertion is an **exact integer comparison**, not a
@@ -1733,7 +1770,7 @@ round of hybrid defects and they are cheap:
   a seal/drop/resume (or a fork, or a reprojection) in the middle, and compare.
   Needs no reference implementation, which is what makes it decisive when the
   reference is itself suspect. `wave_one_shot_equals_segmented` already exists
-  in `qwen35/forward.rs`; the state-persistence analogue is the same shape.
+  in `qwen35/forward/tests_wave.rs`; the state-persistence analogue is the same shape.
 - **paired disposition** (§5.3a) — move-on-reproject and discard-on-reprefill
   must be asserted *together*; either alone passes under a naive "always move"
   or "always discard" implementation.
@@ -1761,7 +1798,7 @@ Unmarked entries are **tier 1** (fast, CPU); tier 2 and tier 3 are called out.
 - A tombstoned timeline's snapshot is dropped.
 - Plan/execute race: a snapshot appended between plan and execute is the one
   that survives, and the planned copy is not relocated. (Extends the existing
-  `live_snapshots` tests to the new writer.)
+  tests in `maintenance/tests_tails.rs` to the new writer.)
 
 **Resume (the decisive one).** Tier 1 against `DummyRecurrentModel`; the
 real-checkpoint repeat is tier 2.
@@ -1875,8 +1912,8 @@ synthetic geometry); the two checkpoint-geometry rows are tier 2.
 - Fold mismatch is **refused, not scored** — a gallery folded under one
   parameter set and probed under another returns no score and one warning,
   rather than a plausible number.
-- `prov_sub_head_dim()` is non-zero at head_dim 256 once `n_palette` is derived,
-  so the GPU sign-pack path is taken. Assert the path, not the timing: the
+- `prov_sub_head_dim()` is non-zero at head_dim 256 (the pack word is 64 bits
+  wide), so the GPU sign-pack path is taken. Assert the path, not the timing: the
   fallback is correct, so only a path assertion catches the silent demotion.
 
 **End-to-end (the one that would have caught the original bug).** Tier 2 on a
@@ -1908,18 +1945,19 @@ per layer                                 ≈ 2.09 MiB
 × 30 recurrent layers                     ≈ 62.8 MiB per snapshot
 ```
 
-That is the **snapshot** size and it is unchanged by the ping-pong: `export`
-reads each slot's `live` buffer only. The *resident* figure is not the same
-number — since the ping-pong landed, every slot holds two `s` buffers, so a live
-sequence carries ≈123 MiB (2 × 2.00 MiB + 0.09 MiB per layer × 30) rather than
-63. Size VRAM from the resident number and the log from the snapshot one.
+That is the **snapshot** size: `export` reads each slot's `live` buffer only. The
+*resident* figure is not the same number — each slot also reserves a timeline of
+`R` rows at the end of its state block (`docs/deltanet_timeline.md` §5 has the
+resident figures per model), and a sequence that is prefilling holds a scratch
+state too. Size VRAM from the resident number and the log from the snapshot one.
 
 **~63 MiB per turn seal per conversation**, in a log whose other per-turn
 records are kilobytes. Compaction reclaims all but the tail, so steady-state
 *storage* is ~63 MiB per live conversation — acceptable. The cost is **write
 bandwidth and log growth between compactions**: ten turns is 630 MiB of redo
-log, and the export path as written also pays a 63 MiB device→host copy per
-seal (`export` does `to_vec1` per layer).
+log, and the export path also pays a 63 MiB device→host copy per seal
+(`export` reads every layer back with `read_back`, through the pinned buffers of
+`state_store/host_buffers.rs`).
 
 **§4.6 adds a second, differently-shaped multiplier.** Turn snapshots scale
 with *live conversations*; branch checkpoints scale with the **selector
@@ -2091,13 +2129,15 @@ symbol name is authoritative.
 
 ### P-INFRA — test harness (do first; everything else asserts through it)
 
-- [ ] **I1.** Add `DummyRecurrentModel` to `candle-conversation/src/scheduler/mod.rs`
-      tests, beside `DummyModel` (~:7935). Wraps `DummyModel`, adds a toy state:
+- [ ] **I1.** Add `DummyRecurrentModel` to the scheduler tests
+      (`scheduler/tests_toy_model.rs`), beside `DummyModel` (`tests_fixtures.rs`).
+      Wraps `DummyModel`, adds a toy state:
       2 layers × 2×2 F32 per sequence, in a `HashMap<usize, [[f32;4];2]>`.
       Implements the three hooks added in P0/P2/P4/P7 as they land.
-- [ ] **I2.** Add `make_test_scheduler_recurrent()` mirroring
-      `make_test_scheduler()` (~:8057) but with `DummyRecurrentModel`.
-- [ ] **I3.** Helper `assert_state_eq(scheduler, seq, expected: [[f32;4];2])` —
+- [ ] **I2.** Add `make_test_scheduler_recurrent()` (`tests_fixtures.rs`) mirroring
+      `make_test_scheduler()` but with `DummyRecurrentModel`.
+- [ ] **I3.** Helper `assert_state_eq(scheduler, seq, expected: [[f32;4];2])`
+      (`tests_recurrent_slots.rs`) —
       exact equality, no tolerance. Every tier-1 state assertion goes through it.
 
 ---
@@ -2108,13 +2148,13 @@ symbol name is authoritative.
 - [ ] **P0.1.** `candle-transformers/src/models/batched_inference/managed_model.rs`: add to
       `ManagedBatchedModel`
       `fn release_sequence(&self, _seq: usize) -> Result<()> { Ok(()) }`
-      (default no-op), beside `truncate_sequence` (~:3252).
+      (default no-op), beside `truncate_sequence`.
 - [ ] **P0.2.** `candle-transformers/src/models/qwen35/forward/managed_model.rs`: override it
       on `HybridBatched` → `self.release_recurrent(seq)`.
-- [ ] **P0.3.** `candle-conversation/src/scheduler/mod.rs`: call
+- [ ] **P0.3.** `candle-conversation/src/scheduler/`: call
       `model.release_sequence(idx)` at **both** `session.free_sequence` sites —
-      `:3028` (`FreeSequence` handler) and `:4970` — and at `:7544`
-      (`free_sequence(view_id.0)` on reprojection).
+      the `FreeSequence` handler and the other free path (`cleanup.rs`) — and at
+      the reprojection's `free_sequence(view_id.0)` (`reproject_prepare.rs`).
 
 **Tests** (tier 1)
 - [ ] **T0.1.** Free a slot, allocate a new sequence that lands on the same slot
@@ -2128,39 +2168,37 @@ symbol name is authoritative.
 ### P1 — `fork_from`  *(the primitive P2/P7 need)*
 
 **Changes**
-- [ ] **P1.1.** `candle-transformers/src/models/delta_net/state_store/mod.rs`
-      (`RecurrentStateStore`, `:129`): add
+- [ ] **P1.1.** `candle-transformers/src/models/delta_net/state_store/store_steps.rs`
+      (`RecurrentStateStore`): add
       `pub fn fork_from(&self) -> Result<Self>` — new slots, same `dims`/`hash`/
-      `layer_index` order, `open: false`. Per slot: `live` is a
-      `DeltaNetState::snapshot()` of the parent's `live` (device-to-device);
-      `backup` is a fresh allocation the kernels fully overwrite, so it needs no
-      copy; `advanced: false`.
+      `layer_index` order, `open: false`. Per slot: `live` is a device-to-device
+      copy of the parent's `live` (into the child's own state-arena slot, or a
+      `DeltaNetState::snapshot()` where the arenas are not in use); the child
+      holds no scratch and nothing pending; `advanced: false`.
 - [ ] **P1.2.** Refuse `fork_from` while `self.open` (mid-wave) — same rule as
-      `export`. Sharper than it was before the ping-pong: mid-wave, the parent's
-      *advanced* state lives in `backup` and its `live` is one wave stale, so a
-      mid-wave fork would silently copy the wrong buffer rather than merely
-      copying a moving one.
-- [ ] **P1.3.** Build the fork through `layer_state` / the slot fields directly,
-      **never** `layer_state_pair_mut` — that accessor sets `advanced`, and a
-      fork that trips it makes the parent's next `commit_wave` swap in a buffer
-      no wave wrote.
+      `export` — and while a layer has timeline rows pending: either way the
+      state the store will stand at is not yet the one in its live buffers, so
+      the fork would silently come up stale.
+- [ ] **P1.3.** Build the fork through the slot fields directly and never set
+      `advanced` on the parent — a fork that trips it makes the parent's next
+      `commit_wave` install a scratch no wave wrote.
 
 **Tests** (tier 1 for shape, tier 2 for device)
 - [ ] **T1.1.** Child's `s` and `conv_tail` are bit-identical to the parent's.
 - [ ] **T1.2.** Buffers are **distinct allocations**: mutate the child, re-read
       the parent, assert unchanged. This is the test that catches a `Clone`
       sharing storage — the hazard `DeltaNetState`'s missing `Clone` prevents.
-      Assert it on **both** halves of the ping-pong: `layer_state_pair` hands out
-      a `Tensor` clone of the write buffer, so a fork that shares that one looks
-      correct until the child's first commit swaps it into the parent's view.
+      Assert it on the live state **and** on any scratch or timeline the store
+      hands out as a `Tensor` clone: a fork that shares one looks correct until the
+      child's first commit installs it into the parent's view.
 - [ ] **T1.3.** `fork_from` mid-wave errors.
 - [ ] **T1.4.** Forking does not disturb the parent's wave bookkeeping: fork a
       parent whose slots are all `advanced: false`, then commit a wave on the
       parent and assert the state it installs is the one its own wave wrote
       (P1.3's hazard).
 - [ ] **T1.5.** A child forked from a parent mid-*turn but between waves* carries
-      the parent's committed state, not its write buffer — i.e. the fork reads
-      `live` after the swap, never `backup`.
+      the parent's committed state, not its scratch — i.e. the fork reads
+      `live` after the commit, never a scratch.
 - [x] **T1.6.** *(tier 2)* On CUDA, the copy never touches host memory —
       assert via device pointers differing and no H2D/D2H in the span.
 
@@ -2177,19 +2215,20 @@ symbol name is authoritative.
       `fork_recurrent` inserts `parent.fork_from()` under `child`;
       `move_recurrent` removes `child`'s store and inserts it under `parent`.
 - [ ] **P2.3.** `candle-transformers/src/models/delta_net/state_store/mod.rs`
-      (`RecurrentStateStore`, `:129` — **not** `qwen35/batched/`, which holds only the
-      map): add `seeded: bool` with `mark_seeded()` / `take_seeded()`. It is a
+      (`RecurrentStateStore` — **not** `qwen35/batched/`, which holds only the
+      map): add `seeded: bool` with `mark_seeded()` / `take_seeded()`
+      (`store_steps.rs`). It is a
       store-level flag like `open`, not a per-slot one like `advanced`. Set by
       `fork_recurrent` and by restore; `ensure_recurrent`
-      (`qwen35/batched/recurrent_state.rs:175`) **skips the `offset == 0` reset exactly once**
+      (`qwen35/batched/recurrent_state.rs`) **skips the `offset == 0` reset exactly once**
       when it is set, then clears it. (§10 decision 2.)
-- [ ] **P2.4.** `scheduler/mod.rs::create_view` (~:6699): after
+- [ ] **P2.4.** `scheduler/projection_turns.rs::create_view`: after
       `create_view_sequence` returns the view id, call
       `model.fork_recurrent(parent_id.0, view_id.0)`.
-- [ ] **P2.5.** `scheduler/mod.rs` `:5358` (`finalize_view` at seal): call
+- [ ] **P2.5.** `scheduler/cleanup.rs` (`finalize_view` at seal): call
       `model.move_recurrent(view_id.0, parent_id.0)` **before**
       `free_sequence(view)`.
-- [ ] **P2.6.** `scheduler/mod.rs` `:7544` (reprojection): this path finalizes —
+- [ ] **P2.6.** `scheduler/reproject_prepare.rs` (reprojection): this path finalizes —
       call `move_recurrent` before the free. **Do not** discard here (§5.3a
       disposition rule).
 
@@ -2214,54 +2253,56 @@ symbol name is authoritative.
 
 **Changes**
 - [ ] **P3.1.** `batched_inference/managed_model.rs`: rework the spec-decode accept path
-      (~:3482) per §5.4 — fork before the verify block, discard on partial
+      (`speculative_decode_step_batch`) per §5.4 — fork before the verify block, discard on partial
       accept, advance a fresh fork over the `k` accepted tokens. If spec-decode
       is out of scope for the switch, instead **assert** it is disabled for
       recurrent models and remove the call.
 - [ ] **P3.2.** `batched_inference/managed_model.rs`: **delete** `ManagedBatchedModel::truncate_sequence`
-      (`:3252-3259`) and both overrides — `qwen35/forward/managed_model.rs:190` and
-      `latent_moe/wave/managed.rs:910` (deepseek4's, which also drops
+      and both overrides — `qwen35/forward/managed_model.rs` and
+      `latent_moe/wave/managed.rs` (deepseek4's, which also drops
       `rollback_verify_state`'s caller; fold that into P3.1's fork rework).
-- [ ] **P3.3.** `qwen35/forward.rs`: delete the `tokens != 0` bail (~:182) — the
-      API can no longer express it.
+- [ ] **P3.3.** `qwen35/forward/managed_model.rs`: delete the `tokens != 0` bail —
+      the API can no longer express it.
 - [ ] **P3.4.** `candle-nn/src/kv_cache/chunked/sequence_ops/tail.rs`: rename
       `truncate_sequence_to_blocks` → `clear_slot_chunks` and **remove the
       block-count parameter**. This is only possible once P3.4b rewrites site 9,
       which passes a non-zero count today — the parameter is *not* already
       0-only.
 - [ ] **P3.4a.** **Delete `truncate_sequence_to_tokens` outright** — the backing
-      method (`sequence_ops.rs`) and the session wrapper
-      (`batched_inference.rs:1275`). This is the primitive that actually
+      method (`sequence_ops/tail.rs`) and the session wrapper
+      (`batched_inference/block_tail.rs`). This is the primitive that actually
       expresses a rewind; P3.4's block-count rename does not touch it, and
       leaving it means phase 3's gate is false. Its callers are P3.4b–P3.4e.
-- [ ] **P3.4b.** `batched_inference/block_tail.rs:1211` (site 9, `reserve_glue_gap`
+- [ ] **P3.4b.** `batched_inference/block_tail.rs` (site 9, `reserve_glue_gap`
       rollback): the non-zero `_to_blocks` target. Replace with an explicit
       release of the chunks this call reserved, so the rollback stops being
       spelled as a truncation.
-- [ ] **P3.4c.** `candle-nn/src/kv_cache/chunked/alloc/ensure_layout.rs:1722` (site 11,
+- [ ] **P3.4c.** `candle-nn/src/kv_cache/chunked/alloc/ensure_layout.rs` (site 11,
       `heal_tail_divergence`): the heal trims a failed wave's surplus token.
       Decide against §5.3a's disposition rule — the wave rolled back, so `S` is
       already at the entry value and the trim is consistent — and **state that
       in the code**, gated by T3.7 rather than left as a reading.
-- [ ] **P3.4d.** `candle-nn/src/kv_cache/cache/mod.rs:711`
+- [ ] **P3.4d.** `candle-nn/src/kv_cache/cache/mod.rs`
       (`truncate_chunked_to_tokens`, site 12): remove with its only caller.
-- [ ] **P3.4e.** `batch_test/utils/reproducibility.rs` sites 13 (`:580`,
-      `decode_replay_probe`) and 14 (`:1182`, the repeat loop). **These are live
+- [ ] **P3.4e.** `batch_test/utils/reproducibility.rs` site 13
+      (`decode_replay_probe`) and site 14 (the repeat loop, now in
+      `batch_test/utils/run_batched.rs`). **These are live
       defects on the gate harness, not just renames** — both claim to restore
       identical state and neither touches the recurrent store, so on a hybrid
       the control drifts and reports its own drift as model non-determinism.
       Replace each with a fresh sequence per replay/repeat (`create_sequence` +
       re-prefill), which restores identical state on every model rather than
       only on models with no state to restore.
-- [ ] **P3.5.** `scheduler/mod.rs` `:5490` (site 8, `<think>` clean-reprefill):
+- [ ] **P3.5.** the scheduler's `<think>` clean-reprefill (site 8):
       replace the partial truncate with **discard the view** — do not
       `move_recurrent`, free the view, re-prefill clean onto the untouched
       parent.
-- [ ] **P3.6.** Update the seven zero-target call sites to the renamed API:
-      `mod.rs:4646`, `:5622`, `:5731`, `:7551`;
-      `projection_assembler/apply_build.rs:625`; `prefill.rs:2475`;
-      `batched_inference.rs:1399` (the seal quantize path — session-level, and
-      the one the scheduler-scoped survey missed). Add a one-line comment
+- [ ] **P3.6.** Update the seven zero-target call sites to the renamed API (the
+      §5.1 sites 1–7: the scheduler's `seal_turn.rs`, `turn_group.rs`,
+      `sections.rs`, `projection_assembler/apply.rs` and `apply_build.rs`,
+      `scheduler/prefill/`, and the session's seal quantize path in
+      `batched_inference/` — session-level, and the one the scheduler-scoped
+      survey missed). Add a one-line comment
       at each stating the slot is repopulated before the next wave, which is
       *why* the recurrent state is untouched.
 
@@ -2300,7 +2341,8 @@ symbol name is authoritative.
 **Changes**
 - [ ] **P4.1.** `batched_inference/managed_model.rs`: add
       `fn export_recurrent(&self, _seq: usize) -> Result<Option<SnapshotPayload>> { Ok(None) }`.
-      (Payload type moves to a shared crate or is mirrored — see P4.2.)
+      (Payload type moves to a shared crate or is mirrored — see P4.2; shipped as
+      `Result<Option<(u64, Vec<ExportedLayerState>)>>`.)
 - [ ] **P4.2.** Decide the type boundary: `candle-conversation` depends on
       `candle-transformers`, not the reverse, so the hook returns
       `Option<Vec<ExportedLayerState>>` + `schedule_hash` and the scheduler
@@ -2308,12 +2350,12 @@ symbol name is authoritative.
 - [ ] **P4.3.** `qwen35/forward/managed_model.rs`: implement via `RecurrentStateStore::export()`;
       assert `!store.open` (the seal runs outside the wave — make it an
       assertion, not an assumption).
-- [ ] **P4.4.** `scheduler/mod.rs` (~:6390, beside the `WideQSig` write, **before**
+- [ ] **P4.4.** `scheduler/perform_seal.rs` (beside the `WideQSig` write, **before**
       the `Tokens` enqueue): build the payload, stamp `turn_index` from the
       sealing turn, call `conversation.enqueue_recurrent_snapshot(timeline, payload.encode())`.
-- [ ] **P4.5.** `candle-conversation/src/persistence/compaction.rs` (~:154): gate
-      the `recurrent_snapshot_entries()` loop on the `distilled` map built ~25
-      lines below, so a distilled timeline's snapshot is dropped.
+- [ ] **P4.5.** `candle-conversation/src/persistence/compaction/collect.rs`: gate
+      the `recurrent_snapshot_entries()` loop on the `distilled` map, so a
+      distilled timeline's snapshot is dropped.
 - [ ] **P4.6.** Verify the timeline-tombstone removal still fires for a
       tombstoned-**and**-distilled timeline (which deliberately escapes the
       wholesale drop).
@@ -2336,9 +2378,9 @@ symbol name is authoritative.
 ### P5a — fold the live opener into `NewUserMessage`
 
 **Changes**
-- [ ] **P5a.1.** `scheduler/mod.rs` (~:2802): delete the
+- [ ] **P5a.1.** the scheduler's turn submission: delete the
       `Generated { user_start_current }` segment push.
-- [ ] **P5a.2.** `scheduler/mod.rs` (~:2840): delete the live `no_think`
+- [ ] **P5a.2.** the same place: delete the live `no_think`
       `Generated` push.
 - [ ] **P5a.3.** Prepend `user_start` (+ `no_think` when the dial suppresses) to
       the `ProjectionSegment::NewUserMessage { tokens }` payload instead. The
@@ -2368,29 +2410,29 @@ symbol name is authoritative.
 - [ ] **P5b.4.** Move the seal anchor: `turn_start_parent_blocks` must anchor
       **before** the leading marker, or the baked boundary is outside the sealed
       range.
-- [ ] **P5b.5.** `projection_assembler/assembly.rs::assemble_pieces` (~:290): stop
+- [ ] **P5b.5.** `projection_assembler/assembly.rs::assemble_pieces`: stop
       wrapping `Sealed::Turn` — no `run += user_start`, no `run += assistant_end`.
       A sealed turn emits alone.
-- [ ] **P5b.6.** `batched_inference.rs`: add `can_gap_fill: bool` to
+- [ ] **P5b.6.** `batched_inference/model_core.rs`: add `can_gap_fill: bool` to
       `ModelCoreProperties`; `false` for the hybrid. The assembler reads it
       before planning rather than discovering it via `forward_wave`'s bail.
 - [ ] **P5b.7.** **The compression turn must bake its own head/tail.**
-      `scheduler/mod.rs` ~:4192 builds a summary/compression turn as
+      `scheduler/compression_turn.rs` builds a summary/compression turn as
       `[user][user_end][assistant_start][assistant]` with the comment *"No
       leading `no_think` / `user_start` head: those are live `Generated`
       segments the assembler re-emits around the sealed turn."* P5b.5 stops the
       assembler re-emitting, so without this the compression turn silently
       loses its opener. Give it the same baked head + tail as a normal turn.
 - [ ] **P5b.8.** **Check the `TurnHalf` injection for double framing.**
-      `projection_assembler/inject.rs` ~:311 injects a turn-half with no wrapping
+      `projection_assembler/inject.rs` injects a turn-half with no wrapping
       because *"the compression pass supplies its own framing glue."* With the
       turn's markers baked, verify the injection windows on `user_span()`
       (which excludes the leading marker by construction, since
       `user_content_start` is the `User` segment's offset) and not on the whole
       turn grid. If it windows the whole grid, the marker and the compression
       pass's own framing both land.
-- [ ] **P5b.9.** Update the persisted-turn contract doc at `substrate.rs`
-      ~:738-756, which currently states the head and tail are *"**not**
+- [ ] **P5b.9.** Update the persisted-turn contract doc (now at
+      `substrate/entries.rs`), which stated the head and tail are *"**not**
       persisted."* That comment is the contract; leaving it stale makes the next
       reader trust the wrong thing.
 
@@ -2421,14 +2463,14 @@ symbol name is authoritative.
 ### P5c — `TreeGlue`, `member_glue`, templates
 
 **Changes**
-- [ ] **P5c.1.** `candle-conversation/src/projection/schema.rs`: give `TreeGlue`
+- [ ] **P5c.1.** `candle-conversation/src/projection/schema/system_prompt.rs`: give `TreeGlue`
       nodes sealed variants per branch they are active in
       (`TreeGlue::active_keys` already records which). They stop being
       prefix-transparent, so everything below them re-seals.
 - [ ] **P5c.2.** `SectionCollection::member_glue`: bake as a **leading**
       separator on every member's seal. Accept the spurious copy on the first
       selected member.
-- [ ] **P5c.3.** `is_template` sections (`project.rs` ~:1988): seal against a
+- [ ] **P5c.3.** `is_template` sections (`projection/project/emit.rs`): seal against a
       canonical prefix rather than emitting `Generated`.
 - [ ] **P5c.4.** Mark `SlotState.glue_islands` dead for `can_gap_fill: false`
       models — do not leave an apparently-live cache that never fills.
@@ -2448,24 +2490,28 @@ symbol name is authoritative.
 ### P5d — `n_palette` for head_dim 256
 
 **Changes**
-- [ ] **P5d.1.** `batched_inference/provenance.rs::prov_sub_head_dim` (~:1942): replace the
+- [ ] **P5d.1.** `batched_inference/provenance.rs::prov_sub_head_dim`: replace the
       `head_dim / N_PALETTE, must be ≤ 32` rule with a derived
-      `n_palette = smallest p such that head_dim / p ≤ 32`.
-- [ ] **P5d.1a.** `batched_inference/provenance.rs:1934`: the same function stamps
-      `n_palette: candle_nn::kv_cache::N_PALETTE` into `ProvSignPacked`, three
-      lines below the `sub_head_dim` P5d.1 just derived. Derive it from the same
-      rule. **Landing P5d.1 without this is worse than landing neither** — the
-      struct then carries two contradictory numbers and a consumer computing
-      `n_palette × sub_head_dim` reads 128 for a 256-dim head.
+      `n_palette = smallest p such that head_dim / p ≤ 32`. *(Shipped
+      differently — §11a.14: the band count stays the arena's `N_PALETTE` and the
+      bound became `MAX_SUB_HEAD_DIM = 64`, the sign-pack kernel's word width.)*
+- [ ] **P5d.1a.** `batched_inference/provenance.rs`: `pack_provenance_signs` stamps
+      `n_palette` into `ProvSignPacked` beside the `sub_head_dim` P5d.1 derives.
+      Derive it from the same rule. **Landing P5d.1 without this is worse than
+      landing neither** — the struct then carries two contradictory numbers and a
+      consumer computing `n_palette × sub_head_dim` reads 128 for a 256-dim head.
+      *(Both come from `prov_n_palette` / `prov_sub_head_dim`.)*
 - [ ] **P5d.2.** Thread a per-backing `n_palette()` through the arena/table path
-      (the 16-band latent precedent in `arena_table.rs` and `backing.rs` shows
-      the shape). 128 → 4, 256 → 8.
-- [ ] **P5d.3.** Verify `assemble_folded_prov_sigs` (`scheduler/mod.rs` ~:630)
+      (the 16-band latent precedent in `arena_table.rs` and `chunked/backing/`
+      shows the shape). 128 → 4, 256 → 8. *(Not done: the R16 arena bands every
+      head into `N_PALETTE = 4`, and 256 → 4 bands of 64 dims — §11a.14.)*
+- [ ] **P5d.3.** Verify `assemble_folded_prov_sigs` (`scheduler/provenance_capture.rs`)
       reads `n_palette` from the packed struct rather than the constant.
 
 **Tests**
 - [ ] **T5d.1.** *(tier 1)* `prov_sub_head_dim()` is 32 at head_dim 128 (4
-      bands) and 32 at head_dim 256 (8 bands) — never 0.
+      bands) and non-zero at head_dim 256 — never 0. *(At HEAD it is 64: 4 bands
+      of 64.)*
 - [x] **T5d.2.** *(tier 2)* At head_dim 256 the **GPU sign-pack path is taken**.
       Assert the path, not the timing: the fallback is correct, so only a path
       assertion catches the silent demotion.
@@ -2482,19 +2528,20 @@ symbol name is authoritative.
 - [ ] **P5e.1a.** Thread it through **both** gather paths — they are separate
       code and either can be missed:
       the GPU fast path `assemble_folded_prov_sigs`
-      (`scheduler/mod.rs` ~:686, `fold_provenance(&WideQSig { n_heads, words })`)
+      (`scheduler/provenance_capture.rs`, `fold_provenance(&WideQSig { n_heads, words })`)
       **and** the CPU fallback in `gather_wide_sigs`
-      (~:6682, `fold_provenance(&WideQSig::from_band(&band, head_dim))`).
-      The two are asserted bit-identical today; keep that true.
+      (same file, `fold_provenance(&WideQSig::from_band(&band, head_dim))`).
+      The two are asserted bit-identical; keep that true.
 - [ ] **P5e.2.** Replace `PROV_FOLD_SIZES` with a derivation `[n − 2, 1, 1]` over
       the capture-layer count. Refuse to emit an all-zero group (return an
       error rather than a signature that cannot be filled).
 - [ ] **P5e.3.** Replace `PROV_FOLD_SHIFT` with `head_dim / 4`.
 - [ ] **P5e.4.** Generalise `rotate_head` to a word-wise rotate over `wph` words
-      (currently bails unless `wph == 2`). Its return type must change too — the
-      current `(u64, u64)` cannot carry a `wph == 4` result at all.
+      (it bailed unless `wph == 2`; it is now `rotate_head_into`). Its return type
+      had to change too — the former `(u64, u64)` could not carry a `wph == 4`
+      result at all.
 - [ ] **P5e.4a.** **Delete `fold_provenance`'s own `if wph == 2` branch**
-      (`wide_sig.rs:124-131`), which XORs the *unrotated* `raw.words` on the
+      (in `wide_sig.rs`), which XORed the *unrotated* `raw.words` on the
       `else` arm. Without this P5e.4 is invisible: the generalised rotate runs,
       its output is dropped, and the fold still has no stagger at head_dim 256.
       A test written against `rotate_head` (T5e.1) passes either way, so the
@@ -2502,7 +2549,7 @@ symbol name is authoritative.
 - [ ] **P5e.5.** `provenance/scan.rs`, `gpu.rs`, `packed.rs`: replace the
       `HEADS_PER_GROUP` alias with the value **the signature was folded with**,
       read from the record.
-- [ ] **P5e.5a.** `zend/examples/provenance_layers.rs:34` holds a **fourth**
+- [ ] **P5e.5a.** `zend/examples/provenance_layers.rs` held a **fourth**
       copy — a bare `const HEADS_PER_GROUP: usize = 4`, not an alias, so it does
       not turn up in a `PROV_HEADS_PER_LAYER` grep. Derive it from the probed
       signature's own shape. Left alone, `project_groups` strides past the end
@@ -2548,7 +2595,7 @@ symbol name is authoritative.
 > because there is no cross-product left to accelerate.
 
 - [x] **P6.1.** Generator — the section-seal path,
-      `conversation/sequence_sections.rs::insert_section_collection` (~:731) and its
+      `conversation/sequence_sections.rs::insert_section_collection` and its
       `_with_progress` variant, which is what pre-seals the tree's variants.
       For each `SectionTree` leaf (full selector assignment), compute the
       recurrent state over the branch's ordered in-tree prefix, with collection
@@ -2579,13 +2626,13 @@ symbol name is authoritative.
 
 **Changes**
 - [ ] **P7.1.** `batched_inference/managed_model.rs`: add
-      `fn restore_recurrent(&self, _seq: usize, _layers: &[ExportedLayerState], _hash: u64) -> Result<bool> { Ok(false) }`.
+      `fn restore_recurrent(&self, _seq: usize, _schedule_hash: u64, _layers: &[ExportedLayerState]) -> Result<bool> { Ok(false) }`.
 - [ ] **P7.2.** `qwen35/forward/managed_model.rs`: implement via `RecurrentStateStore::import`;
       set `seeded` on success.
-- [ ] **P7.3.** `scheduler/mod.rs::create_sequence` (~:2476–2526): for a slot
+- [ ] **P7.3.** `scheduler/slots.rs::create_sequence`: for a slot
       binding to a timeline with a snapshot, read the payload via
       `recurrent_snapshot_loc` + the persistence handle, decode, restore.
-- [ ] **P7.4.** `conversation/sequence_fork.rs::fork_onto` (~:2501): add
+- [ ] **P7.4.** `conversation/sequence_fork.rs::fork_onto`: add
       `parent: Option<SequenceId>` to `SchedulerRequest::NewSequence`; prefer
       `fork_recurrent` from a live parent **only when the fork's target timeline
       is the parent's own** — that is the one case where the parent's live state
@@ -2662,7 +2709,7 @@ symbol name is authoritative.
       Both are defensible by argument; neither has been measured.
 - [ ] **P10.5.** bf16 quality gate for turn snapshots (§7 option 2) if the F32
       write rate measures badly.
-- [ ] **P10.6.** **Measure per-turn fork traffic** (§4.4). The ping-pong store
+- [ ] **P10.6.** **Measure per-turn fork traffic** (§4.4). The timeline store
       removed the per-wave copy this cost used to be amortised against, and P2
       puts a ~63 MiB device copy on every dialogue turn. If turn latency
       regresses after P2, this is the first place to look — and the question it
@@ -2699,13 +2746,13 @@ above and would produce it again.
 caller is a rewind". Two of them are not, and a third cannot be rewritten
 tonight or safely:
 
-- **`heal_tail_divergence`** (`alloc/ensure_layout.rs:1722`) trims a failed wave's surplus
+- **`heal_tail_divergence`** (`alloc/ensure_layout.rs`) trims a failed wave's surplus
   token so the layers agree with the offset the session already delivered. That
   is a repair toward the committed state, not a rewind away from it.
-- **`KvCache::truncate_to_offset`** (`cache/kv_cache_pair.rs:1280`) is public API on the simple
+- **`KvCache::truncate_to_offset`** (`cache/kv_cache_pair.rs`) is public API on the simple
   contiguous/chunked cache, unrelated to the batched paged path.
 - **deepseek4's speculative verify** carries a compressor + gallery rollback
-  attached to the same hook (`latent_moe/wave/managed.rs:910`). Rewriting it to the
+  attached to the same hook (`latent_moe/wave/managed.rs`). Rewriting it to the
   fork-based shape §5.4 describes is real work in a GPU-only, performance-
   critical path with no CPU-runnable gate.
 
@@ -2715,19 +2762,30 @@ and starts being inexpressible") reached by a different route:
 
 - `ManagedBatchedModel::carries_recurrent_state()` — a real model property, like
   `head_dim`. `true` for `HybridBatched`.
-- `speculative_decode_step_batch` refuses at its **entry point** when that holds,
-  naming §5.4 and P10.3. Not inside the rewind: by the time the driver has
-  drafted and verified, refusing is an error against work already done.
-- `truncate_sequence` → renamed `rewind_after_verify`, so the hook names its one
-  purpose instead of reading like a general lifecycle method.
+- `speculative_decode_step_batch` refuses at its **entry point** a model that
+  carries recurrent state and does not declare
+  `can_rewind_speculative_block()`, naming it. Not inside the rewind: by the time
+  the driver has drafted and verified, refusing is an error against work already
+  done. (As first landed the entry refusal keyed on `carries_recurrent_state`
+  itself, which made speculative decode unavailable on the hybrid. The two
+  questions are separate now: the hybrid carries state and also declares
+  `can_rewind_speculative_block`, because a verify block writes a timeline that
+  `truncate_sequences` folds to the accepted prefix — `docs/deltanet_timeline.md`.
+  A recurrent block deeper than the `TIMELINE_ROWS`-row timeline is refused too.)
+- `truncate_sequence` keeps its name; the hook is documented as reached only by the
+  speculative verify path, with `truncate_sequences` as the batched form the
+  driver calls.
 - The hybrid's `tokens != 0` bail is **deleted** — it fired after the fact, and
-  site 8 bypassed it entirely by reaching the session directly.
+  site 8 bypassed it entirely by reaching the session directly. The hybrid's
+  `truncate_sequences` now folds a block's accepted prefix, resets at `0`, and
+  refuses any other target by name.
 
 **P3.4's premise was also wrong.** "Remove the block-count parameter (it only
 ever takes 0)" is false: the clean-turn re-prefill passes `seal_block_from` and
 the glue-gap rollback passes the pre-reservation index. Both are legitimate —
 neither leaves state describing tokens the K/V no longer holds — so the parameter
-stays, documented at `batched_inference/block_tail.rs`'s `truncate_sequence_to_blocks`.
+stays, documented at `batched_inference/block_tail.rs`'s `truncate_sequence_to_blocks`
+(its doc comment points at `ManagedBatchedModel::carries_recurrent_state`).
 
 ### 11a.2 Phase 5a is NOT independently landable — 5a and 5b landed together
 
@@ -2802,10 +2860,10 @@ This is a prerequisite for the switch that appears nowhere in §11, and §0's
 survey missed it by never asking whether `Model::` had an entry.
 
 **Landed** (it blocks P9 and the switch itself): `ModelArch::Qwen35Hybrid`, the
-`Model::Qwen36_35B_A3B_Q4` preset (`models/qwen36_moe.rs`), the builder arm, and
-the `qwen35moe` GGUF arch-string mapping. Compile-checked only — loading it needs
-the 22 GB checkpoint, so **the first person to run P9 is also the first to
-exercise this loader**.
+`Model::Qwen36_35B_A3B_Q4` preset (`candle-conversation/src/models/mod.rs`), the
+builder arm (`models/builder/load_arch.rs`), and the `qwen35moe` GGUF arch-string
+mapping (`models/builder/builder_config.rs`). It was compile-checked only when
+first landed — loading needs the 22 GB checkpoint — and has since run (P9, §11a.7).
 
 ### 11a.3b P6.1's premise is false — the generator never prefills a branch prefix
 
@@ -2814,7 +2872,7 @@ generator already runs — do not add a second pass." It is not, and the reason 
 this document's own subject appearing one level up.
 
 The section ingest **Arc-injects** the prefix and prefills only the section's own
-content (`conversation.rs:441`, `:706` — *"every section in `prefix_section_ids`
+content (`conversation/sequence_sections.rs` — *"every section in `prefix_section_ids`
 is Arc-injected onto the scratch slot before this section's prefill"*). That is
 the right design for K/V: the prefix's K/V already exists, so copying it is free
 and the forward attends to real preceding context.
@@ -2832,9 +2890,10 @@ work with a new cost, not a by-product. P6.2's "build-time accelerator" (resume
 the walk from the deepest shared ancestor) stops being an optimisation and
 becomes the thing that makes the pass affordable at all.
 
-**Not implemented**: it needs the model both to run and to validate, and getting
-it wrong produces a conversation that starts with a *plausible* prompt state
-rather than an obviously-empty one — the failure mode that reads fine.
+This was not implemented when it was first written: it needs the model both to
+run and to validate, and getting it wrong produces a conversation that starts
+with a *plausible* prompt state rather than an obviously-empty one — the failure
+mode that reads fine. It is implemented now (`BranchCheckpointPass`, §11a.11).
 
 #### 11a.3b-i Collection members seal from the state at the collection
 
@@ -2879,9 +2938,9 @@ so, and running either needs the checkpoint.
   CPU and would surface as intermittently wrong resumed state.
 - **P10.3** (spec-decode on forks) means reworking deepseek4's verify path,
   which carries its own compressor and gallery rollback. It is a working,
-  GPU-only, performance-critical feature with no CPU-runnable gate. The capability
-  refusal (§11a.1) already makes the hybrid safe there; the rework buys deepseek4
-  nothing it does not already have.
+  GPU-only, performance-critical feature with no CPU-runnable gate. The hybrid
+  does not need it: it rewinds a verified block by folding its timeline (§5.4,
+  §11a.1), and the rework buys deepseek4 nothing it does not already have.
 
 Recorded because "not done" and "not done *yet*, deliberately" are different
 states, and the second one should not be re-litigated from scratch.
@@ -3017,7 +3076,9 @@ records — so a cache hit needs no confirmation, and asking anyway makes every
 load depend on the network. The same shape was in the test helper
 `hf_get_repo`, where every caller pins an explicit revision.
 
-Both now check the cache first and go to the network only on a miss. This is a
+Both were changed to check the cache first and go to the network only on a miss
+(neither name exists at HEAD; checkpoint fetching goes through
+`models/pack_source.rs` and `candle-transformers/src/models/hub_download.rs`). This is a
 daemon startup property, not a test convenience: a workstation with the
 checkpoint on disk should not fail to start because the hub is unreachable.
 
@@ -3317,9 +3378,13 @@ place where two derivations of the same fact were allowed to disagree.**
    stores 4 and the kernel's contract is `head_dim / N_PALETTE`; the fast path
    re-activated and captured half of every signature, dim-permuted, no longer
    bit-identical to the CPU fold it is documented to match. The band count is a
-   property of the R16 arena, not a free choice: it reports `N_PALETTE`, and a
-   256-wide head correctly declines to the (slow, correct) CPU path until the
-   arena and kernel genuinely band that wide.
+   property of the R16 arena, not a free choice: it reports `N_PALETTE`. What
+   declined the fast path at 256 was the sign-pack kernel's `u32` word, not the
+   band count: the kernel packs a `u64` now and `prov_sub_head_dim` admits a
+   band up to `MAX_SUB_HEAD_DIM = 64`, so a 256-wide head (4 bands of 64) takes
+   the GPU path bit-identically to the CPU fold
+   (`hybrid_capture_takes_the_gpu_sign_pack_path`). A band wider than 64 still
+   declines to the CPU path.
 3. **The fold-group divisor was swept everywhere but the scorer.**
    `resolver.rs` still divided by the locked `PROV_HEADS_PER_LAYER`, reading 1
    group for the hybrid's 6-head signatures — collapsing three-group late
@@ -3358,7 +3423,10 @@ the same rule.
 
 ## 12. References
 
-- `docs/qwen35_qwen38_models.md` §5 (turn-seal snapshots, the original design),
-  §7.8 (the three invisible defects), §7.16 (F32 accumulation), §8 risk 1.
+- `docs/archived/qwen35_qwen38_models.md` §5 (turn-seal snapshots, the original
+  design), §7.8 (the three invisible defects), §7.16 (F32 accumulation), §8 risk 1.
 - `docs/tool_provenance_distillation.md` — the strip-KV-keep-sigs precedent.
-- `docs/archived/kv_tier_migration.md` §5.6-5.7, §16.12 — resume and the redo log.
+- `docs/deltanet_timeline.md` — the state store's current wave discipline
+  (timeline rows, one live state per layer) and the speculative-decode rewind.
+- `docs/archived/kv_tier_migration.md` §5.6-5.7, §16.12 — resume and the redo log
+  (the archived original).

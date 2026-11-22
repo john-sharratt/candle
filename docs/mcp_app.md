@@ -4,15 +4,18 @@ The remote MCP endpoint Claude reaches at `https://code.tokera.com/mcp` is an
 **aggregator**. It holds no tools of its own. zend and npcd each serve their
 own tools as an ordinary MCP server — zend at `/v1/mcp`, npcd at
 `/v1/npc/mcp`, apart because one motherd may host both tenants and their
-routes must not meet. The aggregator lists all of
+routes must not meet. A third backend, the DJ's (`zenj`, `/v1/zenj/mcp`,
+`docs/zenj.md`), is served alike. The aggregator lists all of
 those tools as one server and passes each call to the backend that lists its
 tool, as the signed-in caller.
 
-- **zend** serves the engineering tools: `thread_*`, `task_*`, `journal_*`,
-  `layer_*`, `timeline_*`, and the operations tools (`cluster_*`,
-  `gateway_command`, `agent_*`, `service_*`). They are zend's own. A task's
-  turn streams in zend's process, a task's `repo_task_start` calls back into
-  the worker lifecycle, and the operations tools ride zend's cluster socket (§3).
+- **zend** serves the engineering tools: `thread_*`, `repo_task_*`,
+  `repo_job_start`, `job_*`, `journal_*`, `layer_*`, `timeline_*`, `zen_chat_*`,
+  `file_*`, `log_*`, `group_*`, `diary_*`, and the operations tools
+  (`cluster_*`, `gateway_command`, `member_*`, `service_*`). They are zend's
+  own. A task's turn streams in zend's process, a task's `repo_task_start`
+  calls back into the worker lifecycle, and the operations tools ride zend's
+  cluster socket (§3).
 - **npcd** serves the `bot_*` tools (§4). A **bot** is what Claude is shown
   of an npcd character: an autonomous agent, living in a world, to be
   managed. Each tool lists bots, gives or manages a mission, messages a bot,
@@ -47,6 +50,7 @@ aggregator (BlackWorld or WhiteWorld), over the socket it dialled        │
    │                                                                      │
    │  POST http://<gateway>/v1/mcp      Host: code.tokera.com
    │  POST http://<gateway>/v1/npc/mcp  Host: bot.tokera.com
+   │  POST http://<gateway>/v1/zenj/mcp Host: code.tokera.com
    │       Authorization: Bearer <the same token>                         │
    ▼                                                                      │
 web gateway  ── the token names the caller, from a trusted backend (§2) ──┘
@@ -74,8 +78,8 @@ nothing about access.
   nobody is calling, and the client is sent to sign in.
 - **aggregator → gateway.** The gateway's `server.trusted_backends` lists
   each aggregator's address: `127.0.0.1` for BlackWorld's, which calls back
-  over loopback, and `192.168.0.6` for WhiteWorld's, which calls back across
-  the LAN. From a listed backend, a request that carries a person's MCP
+  over loopback, and `192.168.1.3` for WhiteWorld's, which calls back across
+  the LAN (`web/web.yaml`). From a listed backend, a request that carries a person's MCP
   access token is read as that person, on any path (`Auth::mcp_delegated`). A
   backend's own `X-Tokera-*` headers are still stripped on ingress. The
   address alone names nobody, so a process on a listed machine can act only
@@ -97,8 +101,10 @@ named in `Host`.
 instructions and icon a client shows. The backends' own cards are never shown.
 
 **`tools/list`** asks every backend for its tools, in parallel and as the
-caller, and lists them in backend order. It also keeps a note of which backend
-lists which tool. A name an earlier backend already listed is left out. A
+caller, and lists them in backend order. It also learns which backend
+lists which tool (`mcp/src/routes.rs`): each listing adds to the routes, and
+they are kept in a file beside the node's, so a restart routes at once what it
+routed before. A name an earlier backend already listed is left out. A
 backend that cannot be listed — restarting, still loading its model — is
 listed as it last was for that caller, and a call to one of its tools
 meanwhile answers that it is down and to try again. claude.ai does not list
@@ -123,8 +129,13 @@ passes on a Grok client as `grok`.
 **Every listing and call is logged**: one line each, naming the backend, the
 tool and how long it took, at `WARN` with the reason when it failed.
 
-**`tools/call`** goes to the backend that listed the tool. If no backend has
-listed it yet, as after a restart, the tools are listed again first. The call
+**`tools/call`** goes to the backend that listed the tool. If the routes hold
+no such name, the tools are listed again first. A call goes to the backend's
+own path, except that a diary call goes to its `diaries` path, a call that
+reads or writes the memory to its `memory` path, and a call that starts a model
+turn (`zen_chat_send`, `repo_task_start`, `repo_task_reply`;
+`context::starts_model_turn`) to its `model` path, which the gateway places by
+the machine table (`Backend::path_for`). The call
 asks the backend for progress. Each `notifications/progress` the backend
 streams becomes a step of the aggregator's own call, which the client sees as
 a progress notification. The backend's result is the answer.
@@ -145,8 +156,8 @@ another member opened, a restart loses none, and nothing sticks a caller to
 one member.
 
 **Every member is the same.** Beside the sessions, an aggregator keeps only
-what it relearns: which backend lists each tool (listed again on a miss) and
-each caller's last listing of a backend that is down. So the gateway deals
+what it relearns: which backend lists each tool (kept in a file across
+restarts, listed again on a miss) and each caller's last listing of a backend that is down. So the gateway deals
 `/mcp` to its members in turn (`Dispatch::Any`), and one member leaving costs
 the calls it was running and nothing else.
 
@@ -205,7 +216,8 @@ sessions are records in its substrate (`zend/src/mcp/state.rs`,
 conversation to is a record of its own, `mcp/attached/<owner>/<conversation>`
 (`zend/src/mcp/attached.rs`), which is what `"self"` names; it goes when the
 conversation's ref has been idle four hours. The route is
-`Dispatch::Any`.
+`Dispatch::Any`. The route a call that starts a model turn goes to, `/v1/mcp/model`
+(the same server), is `Dispatch::Best` (`docs/claude_zend_gateway.md` §6.3).
 
 ### npcd (`/v1/npc/mcp` on bot.tokera.com)
 
@@ -308,7 +320,7 @@ carrying.
 |---|---|
 | `bind` | Where it listens (`127.0.0.1:8095`) |
 | `trusted_gateways` | The peers on that listener whose `X-Tokera-*` it believes (`127.0.0.1`) |
-| `gateway` | The gateway entrance every backend is reached through (`http://127.0.0.1` on BlackWorld, `http://192.168.0.4` — BlackWorld's wired address — on WhiteWorld) |
+| `gateway` | The gateway entrance every backend is reached through (`http://127.0.0.1` on BlackWorld, `http://192.168.1.2` — BlackWorld's address on the 10 GbE LAN — on WhiteWorld) |
 | `cluster` | The gateway it joins as `mcp`: `urls` (space-separated, best first), `name` (the certificate's), `group_key`, and `host`, its name on the status page |
 | `state` | The folder its node is kept in |
 
@@ -323,7 +335,7 @@ instead. It holds:
 | Key | Meaning |
 |---|---|
 | `server` | Its card: `name`, `title`, `description`, `instructions`, `icon` |
-| `backends` | The servers whose tools it serves, in list order: `{name, host, path, memory?, diaries?}` each — the path is the app's own MCP route on that site; `memory` the route only the members holding the journals declare; `diaries` the route sticky on a conversation's diary key (`docs/private_mode.md` §5.4). The name is what a failed listing tells the client — `coding` (zend) and `bot` (npcd), never the app's own name |
+| `backends` | The servers whose tools it serves, in list order: `{name, host, path, memory?, diaries?, model?}` each — the path is the app's own MCP route on that site; `memory` the route only the members holding the journals declare; `diaries` the route sticky on a conversation's diary key (`docs/private_mode.md` §5.4); `model` the route a call that starts a model turn goes to, placed by the machine table. The name is what a failed listing tells the client — `coding` (zend), `bot` (npcd) and `dj` (zenj), never the app's own name |
 
 | Module | What |
 |---|---|
@@ -335,6 +347,14 @@ instead. It holds:
 | `presence` | The cluster socket: joining as `mcp`, declaring `/mcp`, serving the gateway's streams |
 | `config` | Each machine's file, and the `served` card and backends built in |
 | `guides` | The guide library: the embedded `.md` files, `guide_list` / `guide_read`, the "Guides:" lines |
+| `context` | The user's context: the client's guide in front of `get_user_context`, episodes, which calls start a model turn |
+| `conversation` | A call's `ref`: taken from its arguments, required by every tool's schema |
+| `liveness` | Each conversation ref's last use as this process saw it |
+| `counters` | How much private mode and diaries are used, as counts alone |
+| `routes` | Which backend runs each tool, learned from every listing and kept across restarts |
+| `last_listed` | What each backend last listed for each caller |
+| `listing` | Whether this process has listed, and the record a call leaves behind it |
+| `served` | Which listing each session was served (§3.1) |
 
 ## 6. Deployment
 
@@ -381,7 +401,9 @@ the leg ran at 4–11 KB/s, while the gateway itself answered over the internet
 at ~650 KB/s. An image edit that finished in npcd in 12 ms reached claude.ai
 28 s later, because its ~127 KB of base64 crossed the slow leg twice. A member
 belongs only on a machine whose link to the gateway is fast: BlackWorld's is
-loopback, and WhiteWorld's is wired, to BlackWorld's wired address. The same
+loopback, and WhiteWorld's is wired, to BlackWorld's wired address (the
+addresses named below are those of the 2026-10-28 measurement; the wired
+link is now `192.168.1.2`, §5). The same
 109 KB file took 4–18 ms from `192.168.0.4` to WhiteWorld, and 9.7 s
 (11 KB/s) from `192.168.0.5`, BlackWorld's Wi-Fi, which answers its first
 byte at once and then sends at that rate to every machine on the LAN

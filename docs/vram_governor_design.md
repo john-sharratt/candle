@@ -1,6 +1,18 @@
 # VRAM Governor — Design Document
 
-**Status:** Draft for review (rev 2 — measurement-driven)
+**Status:** The startup half is built (`candle-core/src/vram/`): the
+measurement probes (§6), the balloon-and-measure bootstrap that fixes capacity
+`C` (§5), the `AllocClass` tags with their loose per-class tallies and the
+`BudgetTable` diagnostics (§10), and the capacity arithmetic the span is sized
+from (`VramGovernor::usable`). **The runtime half is removed.** The criticality
+ladder with its registered relief closures (`Criticality`, `register_relief`,
+`relief.rs`, §4 and §8), the variable KV band and `kv_floor` (§7), the managed
+`reserve`/`allocate` retry and `forecast_units` (§9), and `expert_budget()` (§11)
+went when KV moved onto a static reservation: the memory is claimed once and the
+scheduler reads an exact free-region count (`docs/vram_span_partition.md`;
+`docs/archived/arena_unification.md` §3.8, §5). Those sections are kept as the
+design record of the removed machinery. §8.1 (idle demote) and §8.2 (splice
+sources) describe code that stands, now driven by the scheduler.
 **Scope:** A single, cross-platform module that owns GPU VRAM residency for the
 `zend` inference engine. It **measures real free VRAM** and lets the budget
 **evolve as allocations happen**, classifying each allocation by type so it knows
@@ -173,21 +185,24 @@ pub enum Criticality {
 band and the KV floor. `C` is not `cuMemGetInfo total`.
 
 **Algorithm:**
-1. Grow a chain of large chunks (1–2 GiB `cuMemAlloc`), touching each with a
-   **strided** `cuMemsetD8` (one write per WDDM segment granule is enough to force
-   residency and evict others — we don't memset every byte). Stop when **either**
-   reserved reaches `BALLOON_TARGET_FRAC` (default 0.90) of total, **or** the probe
-   headroom hits `BALLOON_FLOOR`, **or** an allocation fails.
+1. Grow a chain of chunks (`balloon_chunk`, 256 MiB, `cuMemAlloc`), touching each
+   with a memset (`memset_d8_async`) so residency is forced and others' cold pages
+   are evicted. Stop when **any** of these holds: reserved reaches
+   `capacity_target = total − capacity_reserve` (`capacity_reserve`, 256 MiB, the one
+   number the card holds back); the probe's live headroom falls to the **wobble
+   margin** (on a DXGI reading, a `WOBBLE_DIVISOR`th (32) of the headroom, capped at
+   `MAX_WOBBLE_MARGIN` (512 MiB) and floored at `capacity_reserve`; under TCC and
+   Linux just `capacity_reserve`); or the driver refuses a chunk already as small as
+   `balloon_min_chunk` (2 MiB). A refusal halves the chunk and asks again.
 2. `C = reserved_high_water`.
 3. **Free the balloon.**
-4. On Windows, **now that `C` is known**, `SetVideoMemoryReservation` to the floor
-   we intend to defend (§6) so the OS trims *others* first if contended.
 
-**Fast in the general case (requirement):** strided touch makes this bandwidth-
-trivial (a handful of writes per GiB), so even 0.9 × 73 GB is well under model-load
-time. No DXGI-specific fast path; the same balloon runs everywhere (on Linux the
-touch simply forces allocation, there's nothing to evict). `BALLOON_TARGET_FRAC`,
-`BALLOON_FLOOR`, `BALLOON_TOUCH_STRIDE`, chunk size are tunables.
+The post-balloon `SetVideoMemoryReservation` of the first design is not built.
+
+**Fast in the general case (requirement):** the same balloon runs everywhere (on
+Linux the touch simply forces allocation, there's nothing to evict). The
+tunables are `GovernorConfig`'s `capacity_reserve`, `balloon_chunk`,
+`balloon_min_chunk` and `scratch_margin`.
 
 **Runs before model load**, on the emptiest card. **Circuit breaker:** if it can't
 reach a sane floor, log loudly and fall back to `C = cuMemGetInfo total − margin`
@@ -233,6 +248,12 @@ sequence of `VramReading`s.
 
 ## 7. The evolving budget & the variable band
 
+*Removed: `kv_floor` and the variable band (the `kv_floor_abs`/`kv_floor_pct`
+fields are gone from `GovernorConfig`), and with them the external-theft
+relief below. The span is sized once from `C`, and the boundary between the KV
+and weight sides moves by concession (`docs/vram_span_partition.md`). The
+per-class tallies remain, for the budget table only.*
+
 No partition is computed up front. Instead:
 
 - Each managed allocation is tagged `AllocClass`. The governor keeps a **loose
@@ -263,6 +284,12 @@ never below `kv_floor`. On Windows the post-balloon `SetVideoMemoryReservation`
 ---
 
 ## 8. The relief ladder — thresholds, gentle-early, async, sync-only-high
+
+*Removed: the ladder, its thresholds and `register_relief` are gone
+(`candle-core/src/vram/mod.rs` module doc). The scheduler's pressure gate and
+relief cascade (`vram_under_pressure`, `relieve_vram_pressure`,
+`scheduler/prefill/`) read the KV side's exact free-region count, and relief is the
+scheduler's, not a registered closure set. §8.1 and §8.2 below stand.*
 
 Relief is triggered by **where `measure().headroom` sits** relative to a ladder of
 thresholds, so **cheap relief starts early** and **KV eviction is withheld until
@@ -414,15 +441,13 @@ minute would permanently condemn ordinary KV to be dropped rather than persisted
 Dropping `hot` directly says exactly what is meant, is undone by the next
 `elevate_to_hot`, and leaves the flag to mean the one thing it means.
 
-**The clock is one persistence pass**, ticked at the scan. Getting this unit
-right is the whole of the calibration: the pass wakes on every seal/flush trigger
-and otherwise on its own 5 s tick, so an epoch tracks real work with a wall-clock
-floor — a dormant conversation retires even with zero traffic, and the window
-shortens under load, which is when the VRAM is wanted back. The alternatives are
-both wrong: a projection *publish* is far too coarse (a whole session may do only
-a handful, which makes any usable grace unreachable and the demote silently
-inert — measured), and a per-*wave* tick would need a hook the scheduler does not
-expose to the substrate.
+**The clock is one scan**, ticked by `Substrate::demote_idle_hot`, which the
+scheduler calls each gap between forwards (`Scheduler::demote_idle_hot`,
+`scheduler/gap_residence.rs`). Getting this unit right is the whole of the
+calibration: an epoch tracks real work, and the window shortens under load, which
+is when the VRAM is wanted back. A projection *publish* is far too coarse (a
+whole session may do only a handful, which makes any usable grace unreachable and
+the demote silently inert — measured).
 
 The counter is **per-`Substrate`, not a global**: a process-wide clock lets one
 engine's activity age out another's residences, which showed up immediately as
@@ -455,11 +480,11 @@ epoch predicate excludes the current forward by construction; (2) the working-se
 pins are checked as well, so a residence the current wave attends is skipped even
 if its stamp were somehow stale; (3) the stamp is written by the consumer, so
 "inactive" cannot go stale between decision and action; (4) the scan runs only on
-the persistence thread's between-forward seam — the same one
-`create_deferred_arenas` depends on, past `device.synchronize()`, with no wave in
-flight; (5) it only ever drops a **redundant** copy — `warm.is_some()` is part of
-the predicate, and a residence still owed a quantize (`pending_quantize`, whose
-`hot` is the interim native form the drain is about to replace) is excluded too.
+the scheduler's between-forward seam — after the gap's quantize, where every free
+is ordered behind the forward that last read the block, with no wave in
+flight; (5) it only ever drops a **redundant** copy — `has_warm()` is part of
+the predicate, and a residence still flagged `PENDING_QUANTIZE` (whose
+`hot` is the interim native form the scheduler still owes a quantize) is excluded too.
 
 ### 8.2 Splice sources are exempt from every hot-drop
 
@@ -493,6 +518,11 @@ card through a calibration.
 ---
 
 ## 9. Managed allocation, retry, and the forecast
+
+*Removed: `reserve`, `allocate`, `forecast_units` and `evictable_estimate` are gone
+(`candle-core/src/vram/managed.rs` keeps `is_oom` and `usable` only). Nothing
+called the managed path once KV stopped allocating from the pool. Admission width
+is the scheduler's own (`scheduler/admit/`).*
 
 ### 9.1 Managed allocation (progressive, measurement-gated)
 ```rust
@@ -582,6 +612,11 @@ impl VramGovernor {
 
 ## 11. Expert budget — a point-in-time computation at expert-load
 
+*Removed: `expert_budget()` went with `kv_floor`. The resident-expert count is the
+weight zone's capacity, `(span − MIN_ELASTIC_RESERVE) / slot_bytes`, computed once
+against the span (`candle-core/src/vram/managed.rs` module doc;
+`docs/vram_span_partition.md` §4).*
+
 The expert module needs a concrete resident count (`num_slots`) **up front** to
 drive its two-tier GGUF→VRAM/pinned repack. So the governor exposes a **single
 computation, evaluated at the instant experts are about to be allocated** — after
@@ -637,22 +672,31 @@ device; reachable by both consumers):
 
 ```
 candle-core/src/vram/
-  mod.rs        VramGovernor, per-GPU global registry, AllocClass, Criticality
+  mod.rs        VramGovernor, per-GPU global registry, AllocClass
   reading.rs    VramReading, VramProbe trait, ProbeKind
   probe_dxgi.rs #[cfg(windows)] DXGI backend + LUID match + budget-change event
   probe_cuda.rs cuMemGetInfo backend (TCC and Linux)
   driver_model.rs WDDM / TCC / Linux, read from the device
-  balloon.rs    strided balloon-and-measure
-  budget.rs     evolving budget, variable band, kv_floor (abs+pct), per-class tally
-  relief.rs     criticality ladder, thresholds, relief loop, evictable_estimate
-  managed.rs    reserve()/allocate()/forecast_units(), pressure-retry
+  balloon.rs    balloon-and-measure, wobble margin
+  budget.rs     GovernorConfig, per-class tally
+  managed.rs    capacity arithmetic (usable), is_oom
   diag.rs       BudgetTable, log_budget, event targets
-  tests/        (see §14)
+  gpu_addressable.rs  the DXGI NON_LOCAL host budget (docs/driver_model.md §3)
+  host_probe.rs, process_ram/, process_paging/  host RAM and paging probes
+  tests.rs
 ```
+(`relief.rs` and the `Criticality` ladder it held no longer exist.)
 Deps: `cudarc` (existing); `windows` crate (`#[cfg(windows)]`, minimal features) or
 `windows-sys` hand-roll. **No NVML.**
 
 ### 12.1 Integration points (what changes, where)
+
+*These were the planned changes for the removed runtime half; the file and line
+citations below are those of the code as it was when the design was written and
+no longer resolve. Of them, the balloon at session construction
+(`ensure_vram_governor`, `batched_model/model_core.rs`) and `device_init_free`
+as the circuit-breaker fallback (`BALLOON_FALLBACK_MARGIN`, `vram/mod.rs`) stand.*
+
 - **Replace** `vram_has_room`/`vram_budget_available` (`alloc/budget.rs:140/210`) with
   governor queries; `ensure_vram_budget` (`alloc.rs:234`) → `governor.allocate(Kv,…)`.
 - **KV registers relief** wrapping §3.3; `relieve_vram_pressure` (`scheduler/prefill/relief.rs:74`)
@@ -745,10 +789,11 @@ Resolved in review:
    the ramp. ✔ (§9.2)
 
 Open / defaulted (flag if you disagree):
-5. **`SCRATCH_MARGIN`.** The cushion left above `kv_floor` when computing
-   `expert_budget()` so the first forward's scratch lands before any KV eviction.
-   **Defaulting to 1 GiB** (tunable, `CANDLE_VRAM_SCRATCH_MARGIN_MB`) — sized to
-   clear a wide prefill's transient activations + the grow-once scratch pools. (§9.1, §11)
+5. **`SCRATCH_MARGIN`.** Now `GovernorConfig::scratch_margin`: the cushion left
+   outside the KV reservation for allocations that still come from the CUDA pool
+   (the gallery arena's slabs, the grow-only scratches, a streamed model's layer
+   pack). **Defaults to 512 MiB** (`CANDLE_VRAM_SCRATCH_MARGIN_MB`; a forward's
+   activations come from the reservation's transient tier, not from it). (§9.1, §11)
 6. **`ABS_i`/`PCT_i` ladder constants.** The specific `{2.0/4%, 1.5/3%, 1.0/1.5%,
    0.5/0.5%}` values are a starting shape to validate against real runs and
    re-derive per card class (AGENTS.md: measure, don't guess). (§8)

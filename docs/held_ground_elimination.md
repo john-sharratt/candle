@@ -71,7 +71,8 @@ between forwards is re-captured with its new address (`docs/decode_graphs.md` §
 
 The held ground's *mechanism* — first-fit extents, release fenced on the stream it was
 given back on, a per-site ledger — is kept. What changes is the ground under it: a set
-of **span regions** claimed as a tenant (`SlotTenant::Held`) instead of a fixed block.
+of **span regions** claimed as a tenant (`SpanRegion`s taken through `SpanClaims`, held
+by `SpanHeldGround` in `held_ground.rs`) instead of a fixed block.
 
 - **Claimed between forwards, lowest index first**, through the arena window like every
   span tenant. Lowest *at the moment of the claim*, which mid-prefill is high in the
@@ -79,8 +80,8 @@ of **span regions** claimed as a tenant (`SlotTenant::Held`) instead of a fixed 
 - **Contiguous runs** for a block wider than a region: the pool hands out `k`
   consecutive free regions (`claim_region_run`) — the provenance scan's accumulators are
   up to 96 MiB.
-- **Provisioned ahead of demand.** Between forwards (`wave_driver::provision_held`, at
-  the head of every forward and step), the held arenas keep a *headroom* of free bytes:
+- **Provisioned ahead of demand.** Between forwards (`provision_held_ground`, called from
+  `wave_driver/wave_sweep.rs` at the head of every forward and step), the held arenas keep a *headroom* of free bytes:
   the most any of the last 16 windows took, plus one region. A take inside a forward — a
   slot-state promotion at a 32-token boundary, a sampler pack growing — finds ground
   already there.

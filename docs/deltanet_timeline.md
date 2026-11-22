@@ -92,29 +92,30 @@ The row quantities of row `t` — `G[t]`, `k[t]`, `v_new[t]` — depend only on 
 
 - **`G`:** the Hillis–Steele scan adds slot `t − off` into slot `t` at each
   doubling; lanes at or past `len` start at zero and only feed higher lanes; at
-  `off = 32` every lane adds `+0` (`short_span:230-247`; the three-kernel scan,
-  `delta_net_prefill_kernel.cuh:476-482`, does the same).
+  `off = 32` every lane adds `+0` (`delta_net_short_span_kernel.cuh`, the `G` scan;
+  the three-kernel scan in `delta_net_prefill_kernel.cuh` does the same).
 - **Conv and norm:** each row's window is a fixed `j`-ascending chain over its own
-  inputs, and the l2-norm tree is per row (`short_span:152-159, 206-273`).
+  inputs, and the l2-norm tree is per row (`delta_net_short_span_kernel.cuh`).
 - **`A` and `kq`:** entry `(i, j ≤ i)` is one d-ascending FMA chain over rows `i`
-  and `j`, times `e^{G[i] − G[j]}` (`short_span:304-326`).
+  and `j`, times `e^{G[i] − G[j]}` (`delta_net_short_span_kernel.cuh`).
 - **The solve:** `x[i] = b[i] − Σ_{j<i} A[i][j] · x[j]`, reading only rows `j < i`;
-  `len` only stops the loop (`short_span:343-351`).
-- **`v_new[t]`:** `u[t] − w[t] · S_0ᵀ` — `len` is only a guard (`short_span:366-374`).
+  `len` only stops the loop (`delta_net_short_span_kernel.cuh`).
+- **`v_new[t]`:** `u[t] − w[t] · S_0ᵀ` — `len` is only a guard (`delta_net_short_span_kernel.cuh`).
 
 Only the state phase's final factors depend on `len` — `e^{G[len−1]}` and
-`e^{G[len−1] − G[t]}` (`short_span:287-293`) — and both are computed from the
+`e^{G[len−1] − G[t]}` — and both are computed from the
 stored `G`. So **the state for the first `m` rows is the state phase with
 `len = m` applied to the stored rows.** The conv tail follows the same way: after
 `m` rows it is the last `K − 1` raw conv inputs of `[tail_0 | x[0] .. x[m−1]]`,
-exactly what the kernel's tail writer computes for `len = m` (`short_span:190-201`).
+exactly what the fold's tail writer computes for `len = m`
+(`delta_net_fold_kernel.cuh`).
 
 ### 3.2 The reference this is exact against
 
 Today's replay launches the **three-kernel prefill path** (conv, intra, state;
-`replay_stack.rs:280-330`), not the short-span kernel. The two are equal bit for
+`replay_stack.rs`, since removed), not the short-span kernel. The two are equal bit for
 bit by test, not by construction:
-`a_stacked_replay_is_each_layers_wave_launch_bit_for_bit` (`replay_stack.rs:411-581`)
+`a_stacked_replay_is_each_layers_wave_launch_bit_for_bit` (in `replay_stack.rs`)
 asserts the short-span state and tail against the stack. The fold is therefore held
 to the three-kernel state pass over `m` rows, which keeps its state-out (it runs
 long spans, §7) and is the arithmetic today's replay is locked to. That is the
@@ -122,8 +123,8 @@ oracle of §10, test 1.
 
 ### 3.3 Rounding is pinned with intrinsics
 
-The DeltaNet kernels compile with `--use_fast_math` (`candle-kernels/build_utils.rs:261`,
-the `delta_net` group at `:586-594`): FMA contraction is free (`-fmad=true`),
+The DeltaNet kernels compile with `--use_fast_math` (`candle-kernels/build_utils.rs`,
+base args and the `delta_net` group): FMA contraction is free (`-fmad=true`),
 denormals flush, and `expf` is `__expf`. The state phase's bits today depend on
 contraction the compiler chose (`acc += vv·kg` → `fma(vv, kg, acc)`,
 `s·dec + acc` → `fma(s, dec, acc)`), which a shared helper does not guarantee
@@ -147,11 +148,12 @@ A layer's slot holds, in order, each on a `SLOT_ALIGN` boundary:
 | conv tail | `[conv_dim, K − 1]`, channel-major | always |
 | timeline | `R` rows | always; meaningful only between a span's forward and its fold |
 
-`R = DNS_ROWS = DELTA_NET_SHORT_SPAN_ROWS = 8` (`api.rs:33`): the longest span the
+`R = DNS_ROWS = DELTA_NET_SHORT_SPAN_ROWS = TIMELINE_ROWS = 8`
+(`candle-kernels/src/delta-net/api.rs`, `delta_net/timeline.rs`): the longest span the
 short-span kernel runs. Every span that kernel takes keeps a timeline and every
 longer span is a long span (§7), so the short-span kernel loses its state-out and
 tail-out entirely. Production verify blocks are at most 5 rows (a draft ceiling of
-4 in every shipped ladder, `draft_ladder.rs:222, 268, 331, 420`; a ceiling of 5
+4 in every shipped ladder, `draft_ladder.rs`; a ceiling of 5
 measured slower, `docs/archived/possible-performance-boost.md`). The other rows serve short
 prompts and leave room for a ceiling up to 7. Draft depth is bounded at `R − 1 = 7`
 everywhere a block can be formed, and a deeper block is refused (§6.2, §12 D1).
@@ -160,10 +162,10 @@ One timeline row, at row `t`:
 
 | Field | Shape | Written by | Read by the fold for |
 |---|---|---|---|
-| `G[t]` | `[h_v]` | short-span: block of V head `h`, tile 0 (every block holds `sg`, `short_span:243-246`); decode: the decode-step kernel | the decays |
-| `k[t]` | `[h_k, d_k]`, normed, unscaled | short-span: block of V head `h = kh < h_k`, tile 0 (every block holds its K head's 128 channels, `:282-284`); decode: the decode-step kernel | the rank-1 terms |
-| `v_new[t]` | `[h_v, d_v]` | short-span: each (V head, d_v tile) block, its own 32 `d_v` rows (`vnew`, `:372`); decode: `err` from the decode-step kernel | the rank-1 terms |
-| `x[t]` | `[conv_dim]`, raw conv input | short-span: spread over the span's blocks, one writer per element (the tail writer's pattern, `:190-201`); decode: the conv-decode kernel, which is the only decode kernel that reads raw `x` (`delta_net_decode_kernel.cuh:203`) | the conv tail |
+| `G[t]` | `[h_v]` | short-span: block of V head `h`, tile 0 (every block holds `sg`); decode: the decode-step kernel | the decays |
+| `k[t]` | `[h_k, d_k]`, normed, unscaled | short-span: block of V head `h = kh < h_k`, tile 0 (every block holds its K head's 128 channels); decode: the decode-step kernel | the rank-1 terms |
+| `v_new[t]` | `[h_v, d_v]` | short-span: each (V head, d_v tile) block, its own 32 `d_v` rows (`vnew`); decode: `err` from the decode-step kernel | the rank-1 terms |
+| `x[t]` | `[conv_dim]`, raw conv input | short-span: spread over the span's blocks, one writer per element (the tail writer's pattern); decode: the conv-decode kernel, which is the only decode kernel that reads raw `x` (`delta_net_decode_kernel.cuh`) | the conv tail |
 
 `k` is stored once per K head and `x` once per row — the two dedupes the structure
 allows. `x` is the widest field (10,240 of 18,480 floats per row on Flash-Next); it
@@ -173,7 +175,7 @@ by then (§11.1, item 17).
 
 The slot is one `SlotTenant::RecurrentState` claim per layer, as today; only its
 stride grows. Compaction, fork, export, eviction and reset move or read the slot
-whole. `relocate` (`state_store/store_steps.rs:977`) copies only `S` and the tail: nothing is
+whole. `relocate` (`state_store/store_steps.rs`) copies only `S` and the tail: nothing is
 pending between steps (§6.4), so the timeline region holds nothing to keep.
 
 ## 5. Size
@@ -189,11 +191,11 @@ row      = h_v + h_k·D + h_v·D + conv_dim
 **Today** a sequence holds `2 · (S + tail)` per layer, and each verifying **cohort**
 — not each sequence — holds one rewind stash of
 `(Σ cohort verify rows) · (conv_dim + h_v·D + 2·h_v)` per layer, grow-only and reused
-across steps (`qwen4exp/spec.rs:169-195`, `qwen35/spec.rs:194-215`). **With the
+across steps (`qwen4exp/spec.rs`, `qwen35/spec.rs`, before the stash was removed). **With the
 timeline** a decoding sequence holds `S + tail + R · row` per layer and there is no
 stash.
 
-Flash-Next's geometry (`qwen4exp/config.rs:410, 441-445, 482`): `D = 128`, `h_k = 16`,
+Flash-Next's geometry (`qwen4exp/config.rs`): `D = 128`, `h_k = 16`,
 `h_v = 48`, `K = 4`, 36 DeltaNet layers of 48. Per layer: `S` = 3,145,728 B, tail =
 122,880 B, one row = 73,920 B, so today's block is 3,268,608 B and the timeline
 block 3,859,968 B.
@@ -209,7 +211,7 @@ unused). The float saving is 44%; the region saving is 41%:
 | `state` band ×4 | 1,072 MiB (67) | 640 MiB (40) | 40% |
 | `state` band ×8 | 2,048 MiB (128) | **1,216 MiB (76)** | **40.6%** |
 
-The `state` band is every slot tenant (`vram_bands.rs:75`, `region_pool.rs:3206`):
+The `state` band is every slot tenant (`candle-nn/src/kv_cache/chunked/vram_bands.rs`, `region_pool/`):
 at ×8 it is 1,856 MiB of recurrent state (91%), 128 MiB of rewind stash (6%) and
 64 MiB of PLE histories, draft seeds, QSA pages and gallery (3%). Each step the
 band takes in the CSV — 304 → 352 MiB at ×1, 1,920 → 2,048 at ×8 — is the stash
@@ -234,22 +236,22 @@ output rows and its timeline rows.
 
 - **The kernel is chosen per span.** Today it is chosen per wave: the short-span
   kernel runs only when *every* multi-row span of the wave fits it
-  (`mix.rs:1723-1726`), and a creep segment routinely packs verify blocks beside long
-  creep spans (`wave_driver.rs:1213-1224`). The span table is split per layer into a
+  (`delta_net/mix/fused.rs`), and a creep segment routinely packs verify blocks beside long
+  creep spans (`models/wave_driver/`). The span table is split per layer into a
   short table (short-span kernel, timeline out) and a long table (conv + prefill
   scan, state out to the scratch, §7): one more launch on a layer whose wave carries
   both.
 - **The short-span kernel** writes `G`, `k`, `v_new` and `x` per row (§4), computes
   the state phase's reads (`inter`, `v_new` → `o`), and stores no state and no tail.
 - **The decode path is two kernels, and both change.** The conv-decode kernel
-  writes `x[0]` into the timeline in place of its tail shift (`delta_net_decode_kernel.cuh:213-219`).
+  writes `x[0]` into the timeline in place of its tail shift (`delta_net_decode_kernel.cuh`).
   The decode-step kernel writes `G[0] = g`, `k`, `v_new[0] = err`, and computes its
   in-register update in the fold's exact operations at `m = 1` — `kg = k · __expf(g − g)`,
   `acc = __fmaf_rn(err, kg, 0)`, `S' = __fmaf_rn(S, decay, acc)` — so the state `o` is
   read from is the state the fold stores (§11.1, items 6 and 10). `g` already
-  matches `dn_decay_gate` bit for bit (`delta_net_decode_kernel.cuh:95`, `delta_net_common.cuh:45-47`).
+  matches `dn_decay_gate` bit for bit (`delta_net_decode_kernel.cuh`, `delta_net_common.cuh`).
   Every `len == 1` span takes this path, a one-token prefill included
-  (`mix.rs:1705-1709`).
+  (`delta_net/mix/`).
 - **Tables.** A decode row's and a short span's rows are `[tail, state, timeline]`;
   a long span's keep four rows, `[tail in, tail out, state in, state out]`, the outs
   pointing at the scratch. The short and long tables of one layer are views of **one
@@ -259,27 +261,27 @@ output rows and its timeline rows.
   would be four carves whose alignment overruns that price. The refusal of a shared
   entering/advanced tail applies to long spans only. Tables are rebuilt every
   forward and decode graphs are re-recorded and updated in place each wave
-  (`docs/decode_graphs.md:153-163`), so no slot address has to outlive a forward.
+  (`docs/decode_graphs.md`), so no slot address has to outlive a forward.
 
 ### 6.2 Kept length
 
 A short span's kept length `m` is `len` unless the span is a verify block of the
 **armed verify cohort** — the sequences `begin_verify` captured this step. For those,
 `m` is decided on the host after the device-side sampling: the accept walk
-(`candle-conversation/src/scheduler/decode.rs:1045-1124`, standalone
-`batched_inference.rs:5649-5679`), cut shorter by the commit loop for EOS, stencil
-exit or a page cut (`decode.rs:1205-1283`), handed over as `truncate_sequences`
-targets (`decode.rs:1310-1325`).
+(`candle-conversation/src/scheduler/decode/decode_step.rs`, standalone
+`batched_inference/managed_model.rs`, `speculative_decode_step_batch`), cut shorter
+by the commit loop for EOS, stencil exit or a page cut (`decode_step.rs`), handed
+over as `truncate_sequences` targets (`decode_step.rs`, `rollback_targets`).
 
 Every path that forms a verify block bounds it at `R` rows: the scheduler's ladder
-(ceilings ≤ 4 today, `decode.rs:762-774`), qwen35's `MTP_MAX_DRAFT` (`mtp.rs:116`,
-applied at `qwen35/forward.rs:242`), and — new — qwen4exp's `begin_verify` /
-`mtp_draft` (`qwen4exp/wave.rs:2462`, `qwen4exp/draft.rs:627-640`) and
-`speculative_decode_step_batch` (`batched_inference.rs:5449, 5507`), which take any
+(ceilings ≤ 4 today, `decode_step.rs`), qwen35's `MTP_MAX_DRAFT` (`qwen35/mtp.rs`,
+applied in `qwen35/forward/managed_model.rs`), and — new — qwen4exp's `begin_verify` /
+`mtp_draft` (`qwen4exp/wave/delegates.rs`, `qwen4exp/draft.rs`) and
+`speculative_decode_step_batch` (`batched_inference/managed_model.rs`), which take any
 depth today. A block longer than `R` rows — more than 7 drafts — is refused where it
 is formed; it is never silently run as a long span, which could not partially
 accept. The Flash-Next profiling ladders at depths 8, 12 and 16
-(`draft_ladder.rs:388-405`) go with it.
+(`draft_ladder.rs`) go with it.
 
 ### 6.3 Fold
 
@@ -309,22 +311,22 @@ tail    ← last K − 1 of [tail | x[0] .. x[m−1]]
     beside a block, short prompts, short creep spans, heal prefills, stencil
     injection, `verify_block`'s default loop, every batch-test forward;
   - **at the reconcile**, for the armed cohort, with the walk's `m`: qwen4exp's
-    `rewind_cohort` → `rewind_recorded` (`qwen4exp/spec.rs:262-428`), inside its
+    `rewind_cohort` → `rewind_recorded` (`qwen4exp/spec.rs`), inside its
     recorded capture beside the PLE and QSA rewinds; qwen35's `truncate_sequences`
-    → `replay_recurrent` (`qwen35/forward.rs:443-559`, `qwen35/batched.rs:1249-1317`),
-    which is eager today and is recorded as one wave capture the same way (§12 D4).
+    → `fold_armed` (`qwen35/forward/managed_model.rs`,
+    `qwen35/batched/verify_and_draft.rs`), which issues the fold eagerly (§13).
 
-  Today a full accept and a plain row skip the replay (`qwen4exp/spec.rs:367-371`);
+  A full accept and a plain row once skipped the replay (`qwen4exp/spec.rs`);
   every one of them now folds.
 
 ### 6.4 Pending, per layer
 
 A layer is **pending** from the moment a forward hands it a timeline until its fold
 or its discard. Pending is tracked per layer, beside today's per-layer `advanced`
-flag (`state_store.rs:705-721`), because a step opens and commits the store's wave
-once **per segment**, not once per step (`qwen35/forward.rs:896-916`,
-`qwen4exp/wave.rs:3327-3382`): a verify row rides every segment
-(`wave_driver.rs:1220-1227`), each segment writes a disjoint layer range, and the
+flag (`state_store/layers.rs`), because a step opens and commits the store's wave
+once **per segment**, not once per step (`qwen35/forward/layer_sweep.rs`,
+`qwen4exp/wave/`): a verify row rides every segment
+(`models/wave_driver/`), each segment writes a disjoint layer range, and the
 armed cohort's layers stay pending across the segments' commits until the reconcile.
 
 The store's rules:
@@ -344,33 +346,32 @@ The store's rules:
 - `fold_stores` with `Some(m)` and `discard_pending` end pending; a discard writes
   nothing — `S` and the tail are as the step entered.
 - `export`, `import`, `fork_from`, `relocate` and `compact_stores` refuse a store
-  with a pending layer, as they refuse an open wave today (`state_store.rs:1123, 1304,
-  967, 350, 917`).
+  with a pending layer, as they refuse an open wave today (`state_store/`).
 
 **Every exit from an armed step ends pending**, by `truncate_sequences` (fold) or
 `abort_verify` (discard). Paths that skip both today, and must not:
 
 - rows that committed nothing are failed and never truncated (`rollback_targets`,
-  `decode.rs:2362-2377`, `:1310-1318`) → discard;
-- a truncate failure fails every decode (`decode.rs:1325-1328`) → discard;
+  `decode_step.rs`) → discard;
+- a truncate failure fails every decode (`decode_step.rs`) → discard;
 - the standalone walk's `?` exits on `chooser.choose` / `walk.commit`
-  (`batched_inference.rs:5641-5677`) → `abort_verify`;
+  (`batched_inference/managed_model.rs`) → `abort_verify`;
 - `describe_recurrent_state` exports mid-step, between the commit and the truncate
-  (`decode.rs:1152`) → moves after the truncate.
+  (`decode/failure.rs`) → moves after the truncate.
 
 **What a failed step leaves.** An armed sequence's `S` is untouched until its fold,
 so a verify step that fails anywhere — any segment, the readback, the walk — leaves
 its DeltaNet state exactly as it entered, which today it does not. A non-armed span
 folds at its own segment's commit, so a later segment's failure leaves the earlier
 segments' layers advanced, as it does today; those turns are failed
-(`fail_all_decodes`, `decode.rs:2350-2356`), and the K/V of the earlier segments is
+(`fail_all_decodes`, `decode/failure.rs`), and the K/V of the earlier segments is
 not truncated, also as today. A fault inside the fold itself leaves `S` unrecoverable;
 a device fault ends the process, so this is accepted.
 
 ### 6.5 Creep windows
 
-A creep commits its window mid-step, before the head (`wave_driver.rs:1339-1347`), and
-can advance while the head fails (`:1314-1320`). A short creep span is never armed,
+A creep commits its window mid-step, before the head (`models/wave_driver/`), and
+can advance while the head fails. A short creep span is never armed,
 so it folds at its own segment's commit like any non-armed span; a long creep span
 commits through the scratch (§7). The per-layer `advanced` and pending flags keep
 layers outside `[cursor, win_end)` untouched, as today.
@@ -379,15 +380,15 @@ layers outside `[cursor, win_end)` untouched, as today.
 
 qwen4exp's three other rewound states keep their mechanisms and their failure
 bracket (snapshot at every forward's entry, restore on failure,
-`qwen4exp/wave.rs:3277-3326, 3383-3420`); GDN needs no snapshot. What they lose is
-the row layout they borrow from the stash: `SpecCapture::new` takes each sequence's
-row from `delta.span_of` (`qwen4exp/spec.rs:99-119`), `CaptureRows` is "laid out like
-the rewind stash" (`capture_rows.rs:8-9`), `head_wave_pass` writes seed rows at
-`stash.row` (`qwen4exp/draft.rs:326-343`), and the `verify_stash` mutex holds
-`(VerifyStash, CaptureRows)` together (`qwen4exp/wave.rs:186`). The cohort's row map
-— sequence → `(row, len)` — moves into `CaptureRows`, which keeps every buffer it has
-today; only the GDN operand buffers go. The `spec.rs` header table and its
-"snapshotted anyway" paragraph (`qwen4exp/spec.rs:10-23`) are rewritten to match.
+`qwen4exp/wave/`); GDN needs no snapshot. What they lost is
+the row layout they borrowed from the stash: `SpecCapture::new` took each sequence's
+row from `delta.span_of` (`qwen4exp/spec.rs`), `CaptureRows` was "laid out like
+the rewind stash" (`capture_rows.rs`), `head_wave_pass` wrote seed rows at
+`stash.row` (`qwen4exp/draft.rs`), and the `verify_stash` mutex held
+`(VerifyStash, CaptureRows)` together. The cohort's row map
+— sequence → `(row, len)` — is in `CaptureRows`, which keeps every buffer it had
+before; only the GDN operand buffers went. The `spec.rs` header table
+is written to match.
 
 ## 7. Long spans: the prefill scratch
 
@@ -396,8 +397,8 @@ and writes a final state, and for that alone the sequence holds a **scratch slot
 
 - **Claimed** in the prologue that already claims recurrent state before the tier
   stands and runs in the prepare pass of a step: qwen35's `ensure_recurrent`
-  (`qwen35/forward.rs:888-895, 924-956`), which gains the span lengths it does not
-  receive today, and qwen4exp's `ensure_seq_state` (`qwen4exp/wave.rs:3107-3111`),
+  (`qwen35/batched/recurrent_state.rs`), which gains the span lengths it does not
+  receive today, and qwen4exp's `ensure_seq_state` (`qwen4exp/wave/model_core.rs`),
   which already has `off + q`.
 - **Used** as today's ping-pong, per layer: the scan reads the live slot and writes
   the scratch; `commit_wave` exchanges them for every layer that advanced; a failed
@@ -408,15 +409,15 @@ and writes a final state, and for that alone the sequence holds a **scratch slot
   end a sequence's prefill without another commit. The store records whether a
   layer's last commit carried a long span; nothing records it today.
 - **Priced** separately: admission charges one figure per sequence today
-  (`reserved_bytes_for`, `state_store/store_steps.rs:1084`; `recurrent_store_bytes`,
-  `qwen35/batched/recurrent_state.rs:588`). A prefilling sequence and a decoding one are priced
+  (`reserved_bytes_for`, `state_store/store_steps.rs`; `recurrent_store_bytes`,
+  `qwen35/batched/recurrent_state.rs`). A prefilling sequence and a decoding one are priced
   apart.
 
 Length decides: a span of at most `R` rows takes the timeline, whatever its kind;
 a longer one takes the scratch. No sequence carries a short and a long span in one
-forward — the driver refuses a sequence in two groups (`wave_driver.rs:724-742`) —
+forward — the driver refuses a sequence in two groups (`models/wave_driver/`) —
 and glue never reaches a DeltaNet layer: both hybrid stacks refuse glue rows
-(`qwen35/forward.rs:1003-1009`, `qwen4exp/wave.rs:3020-3024`).
+(`qwen35/forward/`, `qwen4exp/wave/`).
 
 **A prefilling sequence costs more than today, and that is accepted (§12 D2).** The
 scratch has the home slot's stride, so commit is an exchange and never a copy: two
@@ -430,7 +431,7 @@ them, carry the saving.
 Every store user takes the same contract whatever kernel runs it (§12 D3). The
 non-fused path — `mix_spans_by_ops` and the tensor-op reference it calls, used on
 CPU devices, for non-F32 state, `head_dim ≠ 128` and `conv_kernel ≠ 4`
-(`mix.rs:1678-1694, 1723-1726`) — gains the timeline and the fold in tensor ops:
+(`delta_net/mix/fused.rs`) — gains the timeline and the fold in tensor ops:
 
 - **A short span** computes its rows' `G`, `k`, `v_new` and `x` with the reference
   chunk algebra (`delta_chunked` over one chunk) and writes them to the slot's
@@ -440,7 +441,7 @@ CPU devices, for non-F32 state, `head_dim ≠ 128` and `conv_kernel ≠ 4`
   matmul of `v_new[0..m]ᵀ` against `k[0..m] · e^{G[m−1] − G[0..m]}`, and the tail
   slice. The store calls whichever fold its device and geometry run.
 - **A long span** writes the scratch, as on the fused path, and stops advancing the
-  live `S` in place: the mirror into the write half (`mix.rs:1860-1883`) goes.
+  live `S` in place: the mirror into the write half goes.
 
 The non-fused path is held to the fused one by the same parity tolerance the
 reference is held to today, not bit for bit. What it gains is the atomicity it lacks
@@ -462,24 +463,23 @@ Deleted:
 - `qwen35/spec.rs`: `VerifyStash`, `StashSpan`, `stash_in_slots`,
   `compact_verify_stash`, `replay_accepted_prefixes`, `replay_stacked`.
 - `qwen35/batched/mod.rs`: `begin_verify_stash`, `verify_stash_width`,
-  `take/put/drop_verify_stashes` (`:278-380`); `replay_recurrent`'s replay body
+  `take/put/drop_verify_stashes`; `replay_recurrent`'s replay body
   becomes the fold.
 - `qwen35/forward/layer_sweep.rs`: the sweep's stash take, `StashSlot`, `filled`, the put-back
-  (`:1344-1361, 1502-1573, 1645-1656`) and the replay pricing (`:1107-1158`).
-- `qwen4exp`: `verify_stash_for`, `park_verify_stash` (`spec.rs:169-210`), the stash
-  capture in the sweep (`wave.rs:3963-3993, 4033`), its pricing (`wave.rs:3151-3191`),
-  its compaction accounting (`wave.rs:1541-1573`) and release (`wave.rs:2730-2736`).
-- `delta_net/mix.rs`: `SpanOperands` (`:1074`), `StashSlot` (`:983`),
-  `DeltaNetSeq.stash` (`:971`), `delta_net_advance_spans` (`:1932-2028`).
+  and the replay pricing.
+- `qwen4exp`: `verify_stash_for`, `park_verify_stash` (`spec.rs`), the stash
+  capture in the sweep, its pricing, its compaction accounting and its release.
+- `delta_net/mix/`: `SpanOperands`, `StashSlot`,
+  `DeltaNetSeq.stash`, `delta_net_advance_spans`.
 - `delta_net/replay_stack.rs`, after its bit-for-bit test is carried over as the
   fold's oracle test (§10, test 1).
-- candle-nn `wave_plan.rs`: `WaveWidth::{staged_rows, staged_spans, replay}`,
-  `DeltaNetWidths::{replay_stack, replay_layer_bytes}` (`:192-287, 390-402, 2049-2078`),
-  and the reference at `batched_model.rs:950`.
+- candle-nn `wave_plan/`: `WaveWidth::{staged_rows, staged_spans, replay}`,
+  `DeltaNetWidths::{replay_stack, replay_layer_bytes}`,
+  and the reference in `batched_model/`.
 - `SlotTenant::RewindStash`: its label, compaction, `arena_reserved_bytes` term
-  (`state_store.rs:1039-1041`) and region accounting.
-- Both `affordable_draft_budget`s (`qwen35/batched.rs:879-939`,
-  `qwen4exp/spec.rs:229-253`), which price draft depth from stash rows: the timeline
+  and region accounting.
+- Both `affordable_draft_budget`s (`qwen35/batched/`,
+  `qwen4exp/spec.rs`), which price draft depth from stash rows: the timeline
   is fixed per slot, so depth is bounded by `R − 1` and by K/V alone.
 
 Changed:
@@ -490,24 +490,24 @@ Changed:
 - `decode_table_addresses` and both table builders (§6.1).
 - The wave contract of `RecurrentStateStore`: per-layer pending, `fold`, `discard`,
   the scratch (§6.4, §7). Store tests that bake in two halves are rewritten:
-  `fork_buffers_are_distinct_allocations_on_both_halves`,
-  `fork_reads_the_committed_buffer_not_the_write_buffer`,
-  `decode_addresses_are_the_halves_and_follow_a_commit`,
+  `fork_buffers_are_distinct_allocations`,
+  `fork_reads_the_committed_state`,
+  `decode_addresses_are_the_live_halfs_and_follow_an_exchange`,
   `a_store_is_priced_from_geometry_not_from_what_is_resident`.
 - The non-fused path: `mix_spans_by_ops` writes a timeline for short spans and the
-  scratch for long ones, its in-place advance and mirror (`mix.rs:1860-1883`) go, and
+  scratch for long ones, its in-place advance and mirror go, and
   a tensor-op fold sits beside the CUDA one (§7.1).
 - The draft-depth bound at every block-forming path, and the Flash-Next profiling
-  ladders at depths 8, 12 and 16 removed (`draft_ladder.rs:388-405`) (§6.2).
-- qwen35's reconcile recorded as one wave capture (§6.3).
-- Comments that state today's sizes or stash: `tenant_arena.rs:33-34` ("five
-  recurrent states on Flash-Next"), `vram_bands.rs:32` (the `state` band omits the
-  stash), `draft_ladder.rs:317-331, 355-379` (stash OOM as the width limit).
+  ladders at depths 8, 12 and 16 removed (`draft_ladder.rs`) (§6.2).
+- qwen35's reconcile folds through `fold_armed`, issued eagerly (§6.3, §13).
+- Comments that state today's sizes or stash: `tenant_arena.rs` ("five
+  recurrent states on Flash-Next"), `vram_bands.rs` (the `state` band omits the
+  stash), `draft_ladder.rs` (stash OOM as the width limit).
 
 Unchanged: the PLE, QSA and seed rewinds (§6.6); compaction's timing (between
-forwards, skipped while any store is open, `state_store.rs:329-352`); drafting, which
+forwards, skipped while any store is open, `state_store/compaction.rs`); drafting, which
 never touches DeltaNet state (qwen35's MTP head and qwen4exp's draft head are
-attention blocks, `qwen35/mtp.rs:16-18`, `qwen4exp/draft.rs:208-219`).
+attention blocks, `qwen35/mtp.rs`, `qwen4exp/draft.rs`).
 
 ## 9. Cost
 
@@ -525,13 +525,13 @@ attention blocks, `qwen35/mtp.rs:16-18`, `qwen4exp/draft.rs:208-219`).
 The fold adds one read of `S` on a full accept and saves one write on a partial
 accept. The batched gate accepts almost every block whole (4.90 of 5 at Flash-Next's
 ceiling of 4); free continuation accepts about 2.1 and the essay task 1.68–2.22
-(`draft_ladder.rs:342-407`). The decode rate is measured both ways (§10).
+(`draft_ladder.rs`). The decode rate is measured both ways (§10).
 
 ## 10. Tests and measurements
 
 Codec-style, raw bytes, written with the code. The fused path requires `D = 128`
-(`mix.rs:1682`); the small geometry is `h_k = 2`, `h_v = 4`, `D = 128`, as
-`replay_stack.rs`' tests use, beside Flash-Next's 16 K / 48 V. (`test_arch` is a
+(`delta_net/mix/fused.rs`); the small geometry is `h_k = 2`, `h_v = 4`, `D = 128`, as
+the fold tests (`delta_net/cuda/tests_fold.rs`) use, beside Flash-Next's 16 K / 48 V. (`test_arch` is a
 latent-MoE architecture and has no DeltaNet.)
 
 1. **The fold is the three-kernel state pass at every prefix.** From one entering
@@ -542,7 +542,7 @@ latent-MoE architecture and has no DeltaNet.)
    fold at `m = 1`: the folded `S` equals the decode kernel's in-register update,
    written out through a test-only state-out in the test build. A decode row and the
    same token at `len = 1` through the short-span kernel are not compared: their
-   conv chains differ (`delta_net_decode_kernel.cuh:206-209`), by design.
+   conv chains differ (`delta_net_decode_kernel.cuh`), by design.
 3. **A failed armed step leaves no trace.** A verify forward over several segments
    that fails in the last leaves the armed sequence's `S` and tail bytes as they
    entered; a discard does the same after a successful forward. Run on the fused
@@ -594,9 +594,9 @@ changed, with the section that now carries it:
   DeltaNet layer (§7).
 - Graphs and tables are rebuilt or updated per forward, so slot addresses need not
   be stable across forwards; compaction cannot meet a captured graph (§6.1).
-- Persistence readers run between steps: seal export (`scheduler/mod.rs:9692`),
-  checkpoints, forks (`mod.rs:4099, 10234, 10634`), restores, moves, and compaction
-  (`prefill.rs:400-431`) — except one diagnostic export (§6.4).
+- Persistence readers run between steps: seal export (`scheduler/`),
+  checkpoints, forks, restores, moves, and compaction
+  (`scheduler/prefill/`) — except one diagnostic export (§6.4).
 - The CSV's `state` band, region for region (§5).
 
 ### 11.2 Corrected in this revision
@@ -624,14 +624,14 @@ changed, with the section that now carries it:
 ### 11.3 Already broken today, and fixed by this design or kept out of it
 
 - **The non-fused path has no rollback for `S`.** `mix_spans_by_ops` advances the
-  live `S` in place and mirrors it into the write half (`mix.rs:1860-1883`); only the
+  live `S` in place and mirrors it into the write half; only the
   tail ping-pongs. Every non-fused caller — CPU devices, non-F32, `head_dim ≠ 128`,
-  `conv_kernel ≠ 4` (`mix.rs:1678-1694, 1723-1726`), the single-state entry points
+  `conv_kernel ≠ 4` (`delta_net/mix/fused.rs`), the single-state entry points
   (`delta_net_mix`, `absorb_solo`, `quantized_delta_net_layer_forward`) and the
   reference models — already lacks wave atomicity. The design fixes it for every
   store user (§7.1, §12 D3); the oracles that own a plain state keep it.
-- **The store's `seeded` flag** is read only by qwen35 (`qwen35/batched/recurrent_state.rs:513`);
-  qwen4exp keeps its own (`qwen4exp/wave.rs:1667, 1791`). Untouched by this design.
+- **The store's `seeded` flag** is read only by qwen35 (`qwen35/batched/recurrent_state.rs`);
+  qwen4exp keeps its own (`qwen4exp/wave/`). Untouched by this design.
 
 ## 12. Decisions
 
@@ -643,7 +643,7 @@ forms a block refuses more than 7 drafts (§6.2); the Flash-Next profiling ladde
 depths 8, 12 and 16 are removed. Not chosen: `R = 12` — free in regions on
 Flash-Next but one block a region fewer on the 35B-A3B (6 → 5) and the 0.8B (11 → 10),
 and a re-budget of the short-span kernel's registers and shared memory, which are
-sized by `DNS_ROWS` (`short_span:92-105, 135, 150, 206`); and a per-model `R`.
+sized by `DNS_ROWS` (`delta_net_short_span_kernel.cuh`); and a per-model `R`.
 
 **D2. The prefill scratch has the home slot's stride, and commit exchanges.** A
 prefilling sequence costs 288 MiB on Flash-Next against today's 240 (+20%), accepted:
@@ -657,13 +657,13 @@ atomicity they lack today. Not chosen: atomicity on the fused path only.
 
 **D4. qwen35's fold is recorded as one wave capture** at the reconcile, as qwen4exp's
 rewind is: eager issue measured ~3.6 ms of wall for ~0.8 ms of kernels
-(`qwen4exp/spec.rs:328-347`).
+(`qwen4exp/spec.rs`).
 
 ## 13. Implementation notes (2026-10-18)
 
 Where each part landed, and what building it settled.
 
-**The store** (`delta_net/state_store/mod.rs`). A layer is `{live: Half, scratch:
+**The store** (`delta_net/state_store/`: `layers.rs`, `store_waves.rs`, `folding.rs`). A layer is `{live: Half, scratch:
 Option<Half>, pending: Option<Pending>, advanced}`; a `Half` is a state, its conv
 tail and its timeline, views into one `SlotTenant::RecurrentState` slot laid out
 `S | tail | timeline`, each on a 256-byte boundary. `layer_span_mut(li, len)` hands

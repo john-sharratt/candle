@@ -7,7 +7,11 @@ slots. This document replaces how that copy is done. It is the warm half of the 
 design in `docs/archived/kv_tier_migration.md`, whose §10 assumed a pinned warm pool;
 that pool is not built and will not be (§2), so this is the design that stands.
 
-## 1. What it costs today
+**Status:** the warm lift is built (`candle-nn/src/kv_cache/chunked/warm_lift/`,
+`lift_warm_to_gpu`) and is the only path for the warm leg of `elevate_to_hot`; the
+per-layer path described in §1 is removed (§5).
+
+## 1. What the per-layer path cost
 
 BlackWorld (RTX PRO 5000 Blackwell, PCIe 5.0 ×16), one conversation, 08:42–08:48 UTC
 on 17 November 2026, from the `elevate_to_hot phases` log lines:
@@ -21,7 +25,7 @@ The reprojection census over the same conversation put the lift at 3,316 ms of 5
 rebuilds — 64 ms a rebuild, 21 % of all reprojection time and the largest part of it
 after the scan. The link carries more than twenty times the warm rate.
 
-The rate is not the link's. `elevate_to_hot` calls
+The rate was not the link's. `elevate_to_hot` called
 `ChunkedKvBacking::migrate_sealed_to_gpu_batch_async` (`candle-nn/src/kv_cache/chunked/chunk_ops/tier_migration.rs`)
 once per layer — 48 calls a lift — and each call:
 

@@ -8,7 +8,7 @@ sliding window plus an Indexer-selected top-k over a pooled compressed corpus �
 context depth. This plan ports that model from its working single-session prototype (host-tensor KV,
 green on the "Paris" golden, fully int8) onto the engine's production **batched/paged substrate**:
 the window moves into the arena KV cache, the compressed corpus into a tiered float gallery, and the
-attention into a thin `paged-deepseek` fork of the tuned INT8 paged kernels, batching ~64 sessions
+attention into a thin `paged-latent` fork of the tuned INT8 paged kernels, batching ~64 sessions
 with exactly one host readback per decoded token.
 
 Two ideas carry the design past the model's native 1M-token limit. First, **retrieval becomes
@@ -49,8 +49,8 @@ model would hold at the same depth.
 7. **Embed everything static; regenerate only what reordering invalidates.** Sealed interiors,
    intra-turn glue, and static tree glue are baked and Arc-cloned; only inter-turn seams and
    collection seams re-prefill — and the compression fold rides those same seams for free (§E, §F).
-8. **Reuse the substrate; fork only what attention control flow forces.** pal_map routing, INT8 MMU,
-   32-token paging, split-KV combine transfer verbatim; the fork exists only for K≡V single-latent,
+8. **Reuse the substrate; fork only what attention control flow forces.** The per-band dequant, int8 MMA wrappers,
+   32-token paging and split-KV combine transfer verbatim; the fork exists only for K≡V single-latent,
    the index-driven walk, and partial RoPE (§G, Part III).
 9. **Everything stays on the GPU; one readback per token.** The sampler sync is the only
    host round-trip decode is allowed. Weight preparation happens offline, never at load (§1, §2).
@@ -61,23 +61,29 @@ model would hold at the same depth.
 ---
 
 Synthesis of a code investigation across the paged attention kernels, the arena KV system, the
-wide-Q per-conversation state machinery, and the DeepSeek decode path. This is the plan for turning
-the current **single-session prototype** (`latent_moe/engine.rs`, host `Vec<Tensor>` KV) into a
-**batched/paged engine on the production substrate**, plus the smaller fixes.
+wide-Q per-conversation state machinery, and the DeepSeek decode path. This is the plan that
+turned the original **single-session prototype** (host `Vec<Tensor>` KV) into the
+**batched/paged engine on the production substrate** (`latent_moe/wave/`), plus the smaller fixes.
+Where a section below still reads as a plan, its status line (or §K's table) says what is built.
 
 ---
 
 ## 0. Where we are
 
-- `latent_moe/engine.rs` (`latent_moe::Engine`) is a **single-session reference** — one conversation, KV as
-  host `Vec<Tensor>`, dense attention in Rust tensor ops. Correct + green ("Paris"), fully int8.
-- The production batched path already exists for Qwen3-MoE: `quantized_qwen3_moe/model.rs` implements
+- The batched/paged engine is built. `latent_moe::Engine` (`latent_moe/engine.rs`) holds the
+  resident weights, the arena KV (`ChunkedKvBacking`) and the shared `ExpertCache`;
+  `latent_moe::BatchedEngine` (`latent_moe/wave/`) wraps it as a `ManagedBatchedModel` (§K step 5)
+  that the scheduler binds for `ModelArch::DeepSeekV4`
+  (`candle-conversation/src/models/builder/load_arch.rs`), driving the **paged-latent attention
+  kernels** (`candle-kernels/src/paged-latent/`) over the arena KV cache and a `FloatGallery`
+  per compression layer. The block-streaming reference (`latent_moe/streaming.rs`,
+  `latent_moe/transformer.rs`, host-tensor `attention.rs`) remains the correctness oracle.
+- The Qwen3-MoE production path that this plan reused: `quantized_qwen3_moe/model.rs` implements
   `BatchedModelCore` + `BatchedAttentionLayer`, drives the **paged INT8 attention kernels**
-  (`paged-decode/`, `paged-prefill/`) over an **arena KV cache** (`candle-nn/kv_cache/chunked/`),
-  batching ~64 sessions spatially across the grid. **DeepSeek must join this path.** The int8 weight
-  work done already carries over unchanged.
+  (`paged-decode/`, `paged-prefill/`) over the same **arena KV cache** (`candle-nn/kv_cache/chunked/`),
+  batching ~64 sessions spatially across the grid. The int8 weight work carries over unchanged.
 
-_Reuse audit (built components): int8-KO forward reused verbatim (`forward_via_int8` mod.rs:2361, `dense_qmatmul` candle-core/src/quantized/cuda/dense_matmul.rs:5255). `QLinear` (latent_moe/linear.rs:10) Quant/Int8 arms overlap the transformers `QMatMul` wrapper (quantized_matmul.rs:18) — only its `Dense` reference arm is additive (a fold-able cleanup). MXFP4_KO (ko_quant.rs:25), Sinkhorn (sinkhorn.cu:27), `prepare_ko_gguf` (reuses `repack_to_host` candle-core/src/quantized/cuda/repack_host.rs:3886), and the Compressor/Indexer/mHC math are NOVEL — no prior art._
+_Reuse audit (built components): the int8-KO forward is reused verbatim (`QMatMul::forward_via_int8` in `candle-core/src/quantized/qmatmul_forward.rs`, `dense_qmatmul` in `candle-core/src/quantized/cuda/dense_matmul.rs`). `QLinear` (`latent_moe/linear.rs`) Quant/Int8 arms overlap the transformers `QMatMul` wrapper (`quantized_matmul.rs`) — only its `Dense` reference arm is additive (a fold-able cleanup). MXFP4_KO (`candle-core/src/quantized/ko_quant/mxfp4_ko.rs`), Sinkhorn (`candle-kernels/src/simple/sinkhorn.cu`), `prepare_ko_gguf` (`candle-core/src/quantized/prepare.rs`, which reuses `repack_to_host` in `candle-core/src/quantized/cuda/repack_host.rs`), and the Compressor/Indexer/mHC math are NOVEL — no prior art._
 
 ---
 
@@ -173,6 +179,10 @@ a cut in the fold.**
 > Only the trailing partial `(m,l,acc)` is persisted; the finalized boundary entry is regenerated at
 > the seam, never stored baked. On a plain resume with no reorder this degenerates to the pure
 > arithmetic replay above.
+>
+> _Status: the persistence side of this is superseded by `deepseek_turn_seal_persistence.md`: the
+> partial group is closed at seal and persisted as an ordinary corpus entry, no open `(m,l,acc)` crosses a
+> turn boundary, and `GroupPartial` is reference-only algebra._
 
 ## D. Corpus selection — BDP recall (in Indexer space) → Indexer precision
 
@@ -205,10 +215,14 @@ now wrapping the model's native selector instead of a dense attention.
 **Cadence (what keeps the one-readback rule intact):** the two stages run on different clocks.
 **BDP recall is asynchronous shortlist maintenance** — per-turn / periodic, off the decode hot path
 (the paged GPU BDP scan, `candle-kernels/src/provenance/api.rs::run_batched_bdp_scan`), refreshing which corpus
-entries sit in the `FloatGalleryArena` hot tier. **Indexer precision is per-token and fully
+entries sit in the `FloatGallery` hot tier. **Indexer precision is per-token and fully
 on-device** — the float re-score runs over that resident shortlist and yields a device index tensor
-the decode kernel walks directly (§G.4). Neither stage reads back to the host; the current per-token
-`to_vec1` + host sort (indexer.rs:184) is exactly what this replaces (§2's −C syncs).
+the decode kernel walks directly (§G.4). Neither stage reads back to the host; the per-token
+`to_vec1` + host sort of the reference Indexer (`latent_moe/indexer.rs`) is exactly what this replaces
+(§2's −C syncs): the wave's selection is `two_stage_select_batched` (`latent_moe/gallery/select.rs`),
+whose recall is `bdp_recall_batched` (`latent_moe/gallery/recall.rs`).
+_Status: the recall launch runs inside each wave over every session's resident sign index (on-device,
+no readback), not as a separate per-turn maintenance pass._
 
 **Must be measured, not assumed:** BDP **recall** — does the sign-space top-M contain the Indexer's
 float top-k? Sweep M vs recovered-fraction, **per layer**, on real traces (the
@@ -230,10 +244,15 @@ per layer, two-stage ≡ full Indexer when the shortlist covers the corpus._
 **Storage:** the compressed corpus is unbounded + per-layer (tens of GB at 1M), so it lives in a
 tiered store. The provenance corpus's *tiering skeleton* (`StreamId` residency, fingerprint upload,
 free-list pool, LRU + rebuild-from-warm) transfers, but its leaf is sign-bits; the compressed entries
-are floats. So build a **`FloatGalleryArena`** — the same lifecycle skeleton, **float leaves**
+are floats. So build a **`FloatGallery`** — a lifecycle like that skeleton's, **float leaves**
 (`[G,512]` attended + `[G,128]` scoring) — with **BDP sign-signatures stored alongside** for the
-recall scan. We reuse the corpus's *tiering* + add a *sign-index for recall*; we do **not** reuse its
+recall scan. We reuse the corpus's *tiering* idea + add a *sign-index for recall*; we do **not** reuse its
 BDP *selector* verbatim (it returns case-votes, not per-entry top-k — see §"Decisions").
+_Built:_ `FloatGallery` (`latent_moe/gallery/mod.rs`) is a per-sequence store, not a sibling of
+`GalleryArena`: it does not use the `StreamId` residency / LRU machinery. Its attended latent is held
+as the int8+BF16 two-region cache (`deepseek_int8_hot_corpus.md`) rather than `[G,512]` floats; the
+`[G,128]` scoring keys stay f32. The two-region cache and the keys spill together to CPU RAM past
+`HOT_ENTRY_CAP` (8192 entries), and the sign/position index stays GPU-resident at any depth (§L).
 
 ## E. The glue phase — the seam, and where the compression merge lives
 
@@ -249,14 +268,17 @@ positions (`reserve_glue_gap_chunk`: `offset = 32 − n`, "full by construction"
 `rope_base == logical position`) and attends each marker **backward-unbounded + forward-windowed**
 (`cpos ≤ row_pos + fwd_ahead`, the bridge into the following section). Sealed content is preserved;
 only the reorder-dependent glue is recomputed. The codebase already calls the deferred version
-"**ingest / compression gap-fill**" (`scheduler/prefill.rs:1842`).
+"**ingest / compression gap-fill**" (`candle-conversation/src/scheduler/prefill/`).
 
 **DECISION — DeepSeek glue is causal-only; drop the forward bridge.** The `fwd_ahead > 0` forward
 window (a glue token peeking into the first `TURN_BRIDGE_FWD_AHEAD (16)` tokens of the turn it
 introduces) is an asymmetric, semantically fuzzy special case whose quality effect is unmeasured. For
 DeepSeek we set **`fwd_ahead ≡ 0`** — glue attends **backward-unbounded, strictly causal**. This is a
-single-parameter change (`glue_bridge_window` → `0`, `scheduler/projection_assembler/walk.rs:690`); the kernel
-already treats `fwd_ahead==0` as pure causal, so nothing else moves. Benefits: (a) removes the
+single-parameter change; the kernel
+already treats `fwd_ahead==0` as pure causal, so nothing else moves. _Built:_ `BoundaryMarkers::causal_only_glue`
+(`scheduler/projection_assembler/assembly.rs`), keyed on the dialect at construction, makes
+`apply_segments_build` (`apply_build.rs`) reserve every glue island with `fwd_ahead = 0` instead of the
+`glue_bridge_window` of `walk.rs`. Benefits: (a) removes the
 forward "unknown"; (b) removes the dependency on the *following* turn being resident-in-place for the
 bridge — glue needs only its backward (sealed-before + earlier-glue) context; (c) **cleaner
 compression seam** — the boundary group's tokens are then projected under standard causal attention,
@@ -285,7 +307,7 @@ causal-only. Implementation: add a DeepSeek `DialectType` (or reuse one) with `n
 `no_think_block=""`, `think_block="<think>…"`, and the model's own role markers — no change to the
 `no_think` node / glue machinery, which stays for Qwen3.
 
-_Prior art: EXTEND — add a `DialectType` variant + `Dialect::deepseek()` preset (dialect.rs:12); pure data (Llama2/3 already ship the empty no-think fields, dialect.rs:194-224)._
+_Built:_ `DialectType::DeepSeek` + `Dialect::deepseek()` (`candle-transformers/src/models/dialect.rs`); pure data (Llama2/3 already ship the empty no-think fields).
 
 **The identical problem exists for the compressed corpus — and it is *why* the merge belongs here.**
 A compressed entry is `Compressor(x_t…)` — a pool of the group's tokens' hidden states `x`, and `x`
@@ -349,8 +371,8 @@ invariant entries. The seam is never stored "baked" — it is always re-folded i
 current order, exactly as the boundary markers are.
 
 **Note:** the glue kernel must be **forked for DeepSeek** (single-latent K≡V + the compressor fold),
-same as the decode/prefill forks — a `paged-deepseek` glue variant sharing the fork's substrate.
-(Minor cleanup: `paged-glue/api.rs:22` has a stale `col_actual_pos` doc-comment; the live signature
+same as the decode/prefill forks — a `paged-latent` glue variant sharing the fork's substrate (built as the glue scatter only; see §G.6).
+(The stale `col_actual_pos` doc-comment in `paged-glue/api.rs` is gone; the live signature
 derives position from `slice_rope`.)
 
 ## F. Embed the static system-prompt glue too (same principle, applied to the prompt)
@@ -364,7 +386,7 @@ never re-prefills the nodes below.
 
 **But `TreeGlue` is the one part not baked.** Every structural marker in the tree is emitted
 `ProjectionSegment::Generated` (live-prefilled via a gap-fill forward) on **every** projection —
-even glue that sits between two purely-static sealed nodes (`project.rs:1816-1830`;
+even glue that sits between two purely-static sealed nodes (`candle-conversation/src/projection/project/emit.rs`;
 `assemble_pieces` routes it into a `Glue` island → `reserve_glue_island` → gap-fill). Only the
 `options`/collection-member variants are baked.
 
@@ -396,15 +418,16 @@ variance can't leak into the sealed nodes below.
 
 **Touch-points + caveat.** Add a build-time static-interior/seam flag on `TreeGlue`; seal
 static-interior glue per branch (the build-time cross-product sealing AND the runtime
-`add_section_to_collection` per-branch allocation, `candle-conversation/src/projection/builder/sections.rs:753-791`, must stay in lockstep); emit
-`Sealed` for it in the tree arm of `emit_system_prompt_items` (`candle-conversation/src/projection/project/emit.rs:1803-1879`); keep seam
+`add_section_to_collection` per-branch allocation, `candle-conversation/src/projection/builder/sections.rs`, must stay in lockstep); emit
+`Sealed` for it in the tree arm of `emit_system_prompt_items` (`candle-conversation/src/projection/project/emit.rs`); keep seam
 glue on the `Generated` path (`push_member_glue`). **Caveat:** the new sealed glue ids must be
 counted by the `pack`/`ancestors` accounting and the `all_section_ids`/`is_collection_member` walks,
 and nodes-below prefixes shift — so the two sealing sites move together. This is a **shared-engine**
 improvement (it helps Qwen too), gated behind the same dialect/config; it is not DeepSeek-specific,
 but DeepSeek benefits from it directly.
 
-_Prior art: EXTEND — reuse the per-branch seal + `TreeVariant` (projection/schema/system_prompt.rs:423, projection/builder/sections.rs:762, `TreeOption.variants` :409); give `TreeGlue` (:331) a `variants` vec routed through it. A sealed glue drops prefix-transparency (the intended static-interior semantic) — a new node mode over existing seal/inject primitives, not a rewrite._
+_Prior art: EXTEND — reuse the per-branch seal + `TreeVariant` (`projection/schema/system_prompt.rs`, `projection/builder/sections.rs`, `TreeOption.variants`); give `TreeGlue` a `variants` vec routed through it. A sealed glue drops prefix-transparency (the intended static-interior semantic) — a new node mode over existing seal/inject primitives, not a rewrite._
+_Status: not built. `TreeGlue` is still a live-prefilled marker that allocates no sealed variants and is prefix-transparent (`projection/schema/system_prompt.rs`); `variants` exists on `TreeOption` and collection members only._
 
 ---
 
@@ -412,10 +435,10 @@ _Prior art: EXTEND — reuse the per-branch seal + `TreeVariant` (projection/sch
 
 ## 1. `qtensor_from_ggml`: build the real GPU-repack path (not the byte-copy)
 
-**Finding.** The GPU repack primitive already exists: `QCudaStorage::repack_ko` (`candle-core/src/quantized/cuda/matmul_methods.rs:3713`)
-does dequantize-on-device → `run_quantize_ko`, and is used by `repack_to_host` (`candle-core/src/quantized/cuda/repack_host.rs:3916`, the
+**Finding.** The GPU repack primitive already exists: `QCudaStorage::repack_ko` (`candle-core/src/quantized/cuda/matmul_methods.rs`)
+does dequantize-on-device → `run_quantize_ko`, and is used by `repack_to_host` (`candle-core/src/quantized/cuda/repack_host.rs`, the
 expert-staging path) and by `QMatMul::repack_for_optimization` (the loader's int8 path). The
-`qtensor_from_ggml` KO arm I added only handles the case where the on-disk bytes are **already** KO
+`qtensor_from_ggml` (`candle-core/src/quantized/ggml_file.rs`) KO arm only handles the case where the on-disk bytes are **already** KO
 (offline-prepared, via `load_repacked` — a byte copy borrowed from the swap-file helpers). It cannot
 take a standard `Q8_0` weight and produce KO.
 
@@ -430,8 +453,9 @@ the GPU kernel becomes the single source of truth for the KO layout.
 **DECIDED — DeepSeek is offline-repack only; do NOT build the GPU-repack path for this model.**
 GPU-repack-at-load reintroduces the per-tensor F32 transient (dequant → requant) that we moved
 *offline* precisely because the CUDA pool retains freed transients and inflated resident to 11.2 GB.
-The offline-prepare (Q8_KO in the GGUF) + byte-copy `load_repacked` path stays as the sole path for
-DeepSeek. (The general GPU-repack capability could still be built for *other* models later, with a
+The offline-prepare (`prepare_ko_gguf` → the `MXFP4_KO` GGUF) + byte-copy `load_repacked` path stays as the sole path for
+the big weights of DeepSeek (`qlinear_int8` in `latent_moe/loader.rs` wraps an already-KO tensor directly; only the small
+float weights — BF16 head, compressor, indexer, router, mHC — are requantized at load). (The general GPU-repack capability could still be built for *other* models later, with a
 reusable scratch buffer to bound the transient — but it is out of scope here.)
 
 ---
@@ -444,8 +468,8 @@ Measured host readbacks per decode token ≈ **N + C + 1** (N = layers ≈ 43, C
 | Op | Now | Fix |
 |---|---|---|
 | **MoE route dispatch** (`engine.rs` `to_vec2` + host counting-sort, ×N) | GPU→CPU readback of route indices then host sort | **DONE — −N syncs.** The live MoE dispatch (`docs/moe_live_dispatch_design.md`): `ExpertCache::forward_routed` runs `moe_bucketize` over a live expert table and the grouped GEMMs at once; the routing summary reaches the host through a mapped ring nothing on the device waits for. |
-| **Indexer top-k** (`indexer.rs:183` `to_vec1` + host sort, ×C) | readback + host partial sort | Prefill's `build_mask` (`attention.rs:211`) **already does this top-k fully on-device** (`arg_sort_last_dim` + `narrow` + `scatter_add`). Reuse it in decode → return a **device index tensor** — **−C syncs**. |
-| **KV gather** (`attention.rs:362` `Vec<Tensor>` + `stack`, ×N) + window ring `remove(0)` | host-orchestrated per-step gather | Disappears entirely once KV lives in arenas + the attention kernel reads it (§3–5). |
+| **Indexer top-k** (reference `latent_moe/indexer.rs` `to_vec1` + host sort, ×C) | readback + host partial sort | **DONE — −C syncs.** The wave selects on-device (`two_stage_select_batched`, `latent_moe/gallery/select.rs`) and returns a **device index tensor**; the host `to_vec1` remains only in the reference Indexer and the out-of-regime prefill recall. Prefill's `build_mask` (`attention.rs`) does the same top-k on-device in the reference forward (`arg_sort_last_dim` + `narrow` + `scatter_add`). |
+| **KV gather** (reference `attention.rs` `Vec<Tensor>` + `stack`, ×N) + window ring `remove(0)` | host-orchestrated per-step gather | **DONE** — KV lives in arenas and the attention kernel reads it (§3–5). |
 | **Sinkhorn** | ✅ already fused (shipped) | one kernel launch |
 | **Sampler argmax→`to_scalar`** | 1/token | **UNAVOIDABLE** — the autoregressive sync point. |
 | Embedding host lookup | 1/token, tiny | intentional (embed in RAM); not a readback. |
@@ -462,18 +486,18 @@ DeepSeek decode keeps two buffers, both currently naive host `Vec<Tensor>` in `I
 
 1. **Linear sliding-window buffer** — the last `window_size` raw KV vectors (K≡V, one 512-d latent
    per token). Grows, then rings. **→ Arena KV cache**, exactly like the normal engine:
-   `ChunkedKvBacking` per layer (shared pool via `new_layer`), one **slot per conversation**
-   (`KvCache::set_chunked_backing(backing, batch_idx, policy)`), append per token, seal every 32
-   tokens in the fixed **FP8 E4M3** window format (§H — no adaptive C-level; the C0–C9 candidate
+   `ChunkedKvBacking` per layer (shared pool via `new_layer`, `set_single_latent(true)`), one **slot per
+   sequence**, append per token, seal every 32 tokens in the fixed two-region window format
+   (§H — the nope dims `[0,448)` FP8 E4M3, the 64 rope dims BF16; no adaptive C-level, since the C0–C9 candidate
    tables assume per-head separate K/V and do not apply to the single latent). DeepSeek is
    single-latent-KV → `n_kv_head
-   = 1`, `head_dim = 512`, which splits cleanly into the **4 palette sub-bands** (128-d each) the
-   arena/kernel already use. The sliding-window bound = a bounded slot (old chunks' `ChunkGid`s
-   `Drop` → recycle to the pool) or the `RotatingKvCache` variant.
+   = 1`, `head_dim = 512`, which splits into **16 bands of 32 dims** (`D512_R64_B16`, `latent_moe/geometry.rs`;
+   14 nope bands + 2 rope bands, one m16n8k32 tile per band). The sliding-window bound = a bounded slot
+   (`evict_window_front` frees chunks that left the window → recycle to the pool).
 
 2. **Stateful compressed-entry corpus** — the pair `[G,512]` attended + `[G,128]` scoring, growing
    one row per completed group, attended via a **top-k selected subset** (§D). **→ a
-   `FloatGalleryArena`** (Part I §D): the provenance corpus's tiering *skeleton*
+   `FloatGallery`** (Part I §D): the provenance corpus's tiering *skeleton*
    (`StreamId`-keyed residency, fingerprint-gated upload, free-list pool, LRU + rebuild-from-warm
    substrate blob backed by the redo log) with **float leaves**, plus **BDP sign-signatures stored
    alongside** for the recall scan. Selection is **two-stage**: BDP recall in the Indexer's sign
@@ -482,7 +506,7 @@ DeepSeek decode keeps two buffers, both currently naive host `Vec<Tensor>` in `I
    and the persisted unit is the position-free, monoid-mergeable form from §C. We reuse the corpus's
    *tiering* and *sign-scan*, NOT its case-vote *selector*.
 
-   _Prior art: EXTEND — reuse `GalleryArena`'s tiering skeleton (free-list pool, StreamId residency, LRU, fingerprint upload; gallery_arena/mod.rs:216-416) as a sibling `FloatGalleryArena`; only the leaves are sign-bit (storage.rs, scan.rs) and a float warm/cold tier is new. Two-stage recall→rescore = NOVEL composition of existing halves (BDP scan.rs:82 + Indexer top-k indexer.rs:62); no pluggable selector interface exists today._
+   _Prior art: the provenance `GalleryArena` tiering skeleton (free-list pool, StreamId residency, LRU, fingerprint upload; `candle-conversation/src/provenance/gallery_arena/`) is the model for the float store; only its leaves are sign-bit, and the float warm tier is new (`FloatGallery`, `latent_moe/gallery/`). Two-stage recall→rescore = NOVEL composition of existing halves (the BDP scan, `candle-conversation/src/provenance/gallery_arena/scan_plan.rs` + `candle-kernels/src/provenance/`, and the Indexer top-k, `latent_moe/indexer.rs`); no pluggable selector interface exists._
 
 ### The attention math, and how it splits (your point 9 — and it's the clean win)
 
@@ -508,11 +532,12 @@ with its own archive group). But it's a *thin* fork: the entire quantization/com
 **orthogonal to attention control flow and transfers verbatim**, which is what gets you "pal_map
 compression + int8-MMU compatible + already tuned" for free:
 
-- **Inherited unchanged:** `pal_map` per-head palette routing (`pal_iter.cuh`), `ArenaAccessor` +
-  the 22-format dequant-in-kernel + the **INT8 read-through MMU** (`convert_all.cuh` —
-  `is_int8_readthrough_format`, V read straight as int8, no FP round-trip), `mma_int8_m16n8k32`
+- **Inherited unchanged:** `ArenaAccessor` + the per-format dequant-in-kernel
+  (`dequant_element_inline`, reached through `load_band_elem`), `mma_int8_m16n8k32`
   wrappers, the `SlotHeader`/`TokenSlice` 32-token paging + on-device `len` commit, the split-KV
-  combine, and the launcher/grid scaffolding.
+  combine, and the launcher/grid scaffolding. (The `pal_map` per-head palette routing is not used: the
+  latent kernels read an identity band layout, dim `d` → band `d/SUB`; and the INT8 read-through MMU
+  is not used either, since K≡V is loaded once and re-quantized for QK.)
 - **Free flags (no SMEM cost):** per-head **sinks** (fold into the `(m,l)` init), **sliding-window**
   bound (clamp the tile range).
 - **What forces the fork (not flaggable):**
@@ -530,9 +555,11 @@ a clean fork is correct.
 
 The attention kernels are inherently batched (grid.x = active slots; each block reads its own
 `SlotHeader` from GPU memory, so ragged-depth sessions co-batch with no host raggedness). To use
-them, `deepseek4` must implement **`BatchedModelCore` + `BatchedAttentionLayer`** (as `quantized_qwen3_moe/model.rs`
-does for Qwen3) rather than the single-session `latent_moe::Engine`. The MoE side already has the batched,
-GPU-native dispatch (`ExpertCache` + `moe_bucketize` + `GpuDispatchTables`).
+them, DeepSeek joins the batched engine rather than the single-session reference. _Built as_
+`BatchedEngine` (`latent_moe/wave/`), a `ManagedBatchedModel` directly rather than a
+`BatchedModelCore` + `BatchedAttentionLayer` pair (see §K step 5): the scheduler binds it as
+`Box<dyn ManagedBatchedModel>`, so the mHC loop stays private to the wave. The MoE side uses the batched,
+GPU-native dispatch (`ExpertCache::forward_routed` + `moe_bucketize`, `docs/moe_live_dispatch_design.md`).
 
 ---
 
@@ -542,9 +569,10 @@ GPU-native dispatch (`ExpertCache` + `moe_bucketize` + `GpuDispatchTables`).
   GGUF load path for this model.
 - **Sequencing:** **Build toward the batched core directly.** Start with arena-KV integration + the
   forked decode kernel; the sync-elimination fixes land inside the batched core, not on the
-  throwaway single-session prototype. `engine.rs` (`latent_moe::Engine`) is kept only as the **numeric
-  golden reference** to validate the kernel against.
-- **Compressed-entry store + selection (§C, §D):** a **`FloatGalleryArena`** — reuse the provenance
+  throwaway single-session prototype. The reference forward (`latent_moe/streaming.rs`,
+  `transformer.rs`, `attention.rs`) is kept as the **numeric golden reference** to validate the
+  kernel against; `latent_moe::Engine` (`engine.rs`) is the resident-weight engine the batched wave wraps.
+- **Compressed-entry store + selection (§C, §D):** a **`FloatGallery`** — modelled on the provenance
   corpus's *tiering skeleton* (StreamId residency, fingerprint upload, free-list pool, LRU +
   rebuild-from-warm) with **float leaves** (`[G,512]`+`[G,128]`), plus **BDP sign-signatures for
   recall**. Selection is **two-stage: BDP recall in the Indexer's sign space → Indexer float
@@ -555,39 +583,48 @@ GPU-native dispatch (`ExpertCache` + `moe_bucketize` + `GpuDispatchTables`).
   RoPE + position live in the kernel. **To validate:** BDP recall (sign top-M ⊇ Indexer top-k),
   swept per layer.
 - **Latent KV:** confirmed — one **512-d latent used as both K and V** (K≡V, `n_kv_head=1`),
-  split into 4 palette sub-bands of **128-d** each (not the stock 32).
+  split into 16 bands of **32-d** each (`D512_R64_B16`: 14 nope bands + 2 rope bands), one m16n8k32 tile per
+  band — the stock band width, which is why none of the §G.2 widening blockers applied to the built fork.
 - **First kernel:** **full-hybrid decode in one shot** (window + compressed top-k + sink), developed
-  against a standalone correctness test vs `engine.rs::sink_attend` before wiring live data.
+  against a standalone correctness test vs `attention.rs::sink_attend` before wiring live data.
 
 ## Build order (revised)
-1. **`paged-deepseek/` decode kernel** (the long pole): fork `int8_decode_kernel.cuh`, single-latent
+1. **`paged-latent/` decode kernel** (the long pole; the plan called the directory `paged-deepseek/`):
+   fork `int8_decode_kernel.cuh`, single-latent
    K≡V `KvHead` variant, hybrid loop (sequential window + index-driven compressed top-k), per-head
    sink, windowed RoPE, reusing arena_table/convert/mma/slot_types + split-KV combine. Rust op
    wrapper mirrors `prefill_utils/mod.rs`. Develop against a **standalone test** with synthetic arena
-   KV + selection, checked vs the CPU reference.
-2. **Arena-KV window integration** — `ChunkedKvBacking` per layer, single-latent 512-d/4-palette
-   layout, slot per conversation.
-   _Prior art: REUSE (zero new cache code) — `KvCache::set_chunked_backing` (cache.rs:1077), `append` (:1139), `chunked_write_kv` (:1094) via `BatchedInferenceSession`._
-3. **`FloatGalleryArena` + two-stage selection (§C, §D)** — float-leaf tiering skeleton for the
+   KV + selection, checked vs the CPU reference. _Built:_ `candle-kernels/src/paged-latent/`
+   (`latent_decode_kernel.cuh`, `latent_common.cuh`), wrapper `latent_moe/paged/decode.rs`.
+2. **Arena-KV window integration** — `ChunkedKvBacking` per layer, single-latent 512-d/16-band
+   layout, slot per conversation. _Built_ (`BatchedEngine::create_batched_session`).
+   _Prior art: REUSE (zero new cache code) — `KvCache::set_chunked_backing`, `chunked_write_kv` (`candle-nn/src/kv_cache/cache/kv_cache_pair.rs`) via `BatchedInferenceSession`._
+3. **`FloatGallery` + two-stage selection (§C, §D)** — float-leaf tiering skeleton for the
    `[G,512]`+`[G,128]` corpus; BDP sign-index for recall; Indexer float re-score on the shortlist.
    Persist the position-free, monoid-mergeable unit (§C: pre-RoPE window + corpus pair + trailing
    `(m,l,acc)`; RoPE/position in the kernel; turn-boundary partials fold via LSE). Validate BDP
    recall (sign top-M ⊇ Indexer top-k) per layer before trusting it as the primary recall stage.
-4. **`paged-deepseek/` prefill kernel** — one shot.
-5. **`paged-deepseek/` GLUE kernel + compression-seam merge (§E)** — fork `paged_glue_kernel.cuh`
+4. **`paged-latent/` prefill kernel** — one shot. _Built:_ `latent_prefill_kernel.cuh`,
+   `latent_moe/paged/prefill.rs` (`deepseek_prefill_tensorcore_pv.md`).
+5. **`paged-latent/` GLUE kernel + compression-seam merge (§E)** — fork `paged_glue_kernel.cuh`
    for single-latent K≡V, **causal-only** (`fwd_ahead ≡ 0` via `glue_bridge_window → 0`, so the fork
    drops the forward-window path entirely), and add the boundary compressed-group fold: attach a
    compression-merge descriptor on the `GapFillPlan` (`scheduler/projection_assembler/apply.rs`), reserve the
    finalized entry's gap, thread it via `PendingGlue`/`GlueMeta`, and in the forked glue kernel run
    the compressor on the boundary tokens + LSE-fold with the persisted `(m,l,acc)` + scatter the
-   entry. Co-batched in the `[decode|prefill|glue]` wave. (Also: drop the stale `col_actual_pos`
-   doc-comment in `paged-glue/api.rs:22`.)
-6. **`BatchedModelCore` for DeepSeek** — assemble the batched engine.
-   _Prior art: REUSE — `BatchedModelCore` (batched_model/model_core.rs:98) + `BatchedAttentionLayer` (batched_layer/mod.rs:232); `quantized_qwen3_moe/model.rs:761` (Qwen3) is the template._
+   entry. Co-batched in the `[decode|prefill|glue]` wave. _Status:_ the causal-only glue (`causal_only_glue`)
+   and the glue scatter into reserved gaps (`latent_glue_scatter_kernel`, `paged_latent_glue_scatter` in
+   `latent_moe/paged/glue.rs`, driven from the `sweep_wave.rs` glue islands) are built; the compression-seam merge
+   (the compression-merge descriptor on `GapFillPlan`, the fold in the glue kernel) is not — the turn-seal design
+   closes the partial group at seal instead (`deepseek_turn_seal_persistence.md`, Artifact B), and `GroupPartial`
+   stays reference-only algebra. (The stale `col_actual_pos` doc-comment in `paged-glue/api.rs` is gone.)
+6. **DeepSeek in the batched engine** — assemble the batched engine. _Built as_ `BatchedEngine`
+   (`latent_moe/wave/`), a `ManagedBatchedModel` directly (§K step 5), not a `BatchedModelCore` pair.
+   _Prior art: `BatchedModelCore` (`batched_model/model_core.rs`) + `BatchedAttentionLayer` (`batched_layer/mod.rs`); `quantized_qwen3_moe/model.rs` (Qwen3) is the template for those traits._
 
 ---
 
-# Part III — `paged-deepseek` kernel design
+# Part III — `paged-latent` kernel design (the plan called it `paged-deepseek`)
 
 Grounded in the measured budgets of the stock INT8 kernels (48 KiB decode static cap; 25.6 KB
 prefill union arena at 4 blocks/SM; 64-reg `__launch_bounds__` → 67% occupancy on Ada; `-maxrregcount`
@@ -597,23 +634,27 @@ attended keys `K ≈ window_size + index_topk ≈ 640`** (bounded — the O(1) b
 
 ## G.1 Reused verbatim (the substrate — the reason a fork is cheap)
 `arena_table.cuh` (`ArenaFormat`, `ArenaAccessor`), `convert/convert_all.cuh`
-(`load_head_scaled`, `is_int8_readthrough_format`, `load_head_int8_readthrough`), `mma/mma_wrappers.cuh`
+(`dequant_element_inline`), `mma/mma_wrappers.cuh`
 (`mma_int8_m16n8k32`), `paged-decode/slot_types.cuh` (`SlotHeader`/`TokenSlice`/`KvHead`, on-device
 `len` commit), `fast_exp` (base-2 online softmax), the split-KV **combine** kernels, the persistent
-partial pool, and the launcher grid/split heuristics. This buys "pal_map compression + INT8-MMU +
-already-tuned" for free.
+partial pool, and the launcher grid/split heuristics. This buys the per-format dequant + int8 MMA +
+already-tuned scaffolding for free.
 
-_Prior art: int8-KO forward + MoE dispatch reused verbatim (`forward_via_int8` mod.rs:2361; ExpertCache/`moe_bucketize` batched.rs:397). Partial-range RoPE + per-head sinks exist HOST-side (attention.rs:152 `rope_last`, :229 `sink_attend`) but NOT as kernels — no paged kernel has a nope/rope window or a sink scalar (the `Q4_KS`/`Q8_KS` "attention-sink formats" are an unrelated block-quant naming collision); both are new kernel work here._
+_Prior art: int8-KO forward + MoE dispatch reused verbatim (`QMatMul::forward_via_int8`; `ExpertCache`/`moe_bucketize` in `candle-transformers/src/models/expert_lre/`). Partial-range RoPE + per-head sinks existed HOST-side (`attention.rs` `rope_last`, `sink_attend`) and are now kernel work in `paged-latent/` — no stock paged kernel has a nope/rope window or a sink scalar (the `Q4_KS`/`Q8_KS` "attention-sink formats" are an unrelated block-quant naming collision)._
 
-## G.2 The four structural blockers at HEAD_DIM=512 / SUB=128 (fork's new constants)
+## G.2 The four structural blockers at HEAD_DIM=512 / SUB=128 (the plan's constants; not met by the built fork)
+_Built geometry: 16 bands of SUB=32 (`D512_R64_B16`), so blockers 2-4 below do not arise (a band is one
+m16n8k32 step, the rank pack stays 6-bit, `PalIter` is not used). Blocker 1 was met by templating the
+kernels on `<HEAD_DIM, ROPE_DIM, NPAL>` (`geometry_ok` in `latent_common.cuh`). The analysis stays as the
+record of the SUB=128 design._
 Hard (compile-fail or overflow), not tuning:
-1. `static_assert(VEC <= 8, "HEAD_DIM <= 256")` (`int8_decode_kernel.cuh:62`) → VEC=16 at HD=512. The
+1. `static_assert(VEC <= 8, "HEAD_DIM <= 256")` (stock `paged-decode/int8_decode_kernel/`) → VEC=16 at HD=512. The
    fork templates `VEC` up to 16 (or head-dim-tiles), auditing every `float regs[VEC]`.
 2. `static_assert(SUB >= 16 && SUB <= 64)` prefill rank pack `(palette<<6)|rank` — SUB=128 rank
    reaches 127 → needs **7 bits**. Repack `(palette<<7)|rank` (u16 table) OR tile the palette to 32.
 3. `static_assert(SUB_HEAD_DIM == 32)` batched-M MMA — SUB=128 = **4× m16n8k32 K-steps** (K=32 each,
    accumulate the 4 into one C). The tensor-core math is unchanged; only the fragment loop grows ×4.
-4. `PalIter::scatter` is `uint8_t[VEC]` (`pal_iter.cuh:33`) — index `3*128+127=511` overflows. Widen
+4. `PalIter::scatter` is `uint8_t[VEC]` (stock `pal_iter.cuh`) — index `3*128+127=511` overflows. Widen
    to `uint16_t`.
 Plus: the 25.6 KB **prefill arena only closes at HD=128** (§G.5).
 
@@ -635,25 +676,24 @@ reuses the "~2 waves at 3 blocks/SM" factor; the stock LSE combine merges. (For 
 **SMEM (per block, single-stage; K≡V halves the need for double-buffer):**
 ```
 Q-tile int8   [16][512]      =  8192 B   (this M-tile's heads, quantized once)
-scaleQ        [16][4] f32    =   256 B
+scaleQ        [16][NPAL=16] f32 = 1024 B
 latent FP     [8][512] T     =  8192 B   (8-key tile; RoPE + PV reuse — the K=V share)
-latent int8   [8][512]       =  4096 B   (requant for QK)
-scaleK        [8][4] f32     =   128 B
-scores        [16][8] f32    =   512 B
+latent int8   [8][512+16]    =  4224 B   (requant for QK, padded for ldmatrix)
+scaleK        [8][NPAL] f32  =   512 B
+scores        [NPAL][16][8] f32 = 2048 B  (per-band partials, summed after the band loop)
                               ---------
-                    total  ~= 21.4 KB  -> fits 48 KiB; <=25.5 KB => 4 blocks/SM (67%)
+                    total  ~= 23.7 KB  -> fits 48 KiB; <=25.5 KB => 4 blocks/SM (67%)
 ```
 **out accumulator** `out_reg[16 heads × 512]` = 8192 floats / 256 threads = **32 F32/thread** —
 identical to the prefill dim-half `o_acc` budget that already closes at 64 regs. Target
 `__launch_bounds__(256, 4)` → 64 regs → **67% occupancy**, matching stock decode. (Optional
 double-buffer of the 8-key latent = +8 KB → 3 blocks/SM; skip it — occupancy hides the single load.)
 
-**QK:** M=16 heads, N=8 keys, K=512 = **4 palettes × 4 k-steps** of `mma_int8_m16n8k32`; scaled-acc
-`acc += c · scaleQ[h][p] · scaleK[key][p]`. **PV:** FP `fmaf` over the reused staged latent (or int8
-read-through when all palettes are read-through formats — one arena, so the gate is per-slot cheap).
+**QK:** M=16 heads, N=8 keys, K=512 = **16 bands × 1 k-step** of `mma_int8_m16n8k32`; scaled-acc
+`acc += c · scaleQ[h][p] · scaleK[key][p]`. **PV:** FP `fmaf` over the reused staged latent.
 **Sink:** fold per head at the end — `m'=max(m,sink[h]); l = l·e^{m−m'} + e^{sink−m'}`.
 **RoPE:** read from a **factored cos/sin table** (`rope_lookup`, `latent_common.cuh`) — neither the
-flat position-indexed `rope_cs` table (`int8_decode_kernel.cuh:56`; hundreds of MB growing with N,
+flat position-indexed `rope_cs` table (`rope_cs_at`, stock `paged-decode/decode_helpers.cuh`; hundreds of MB growing with N,
 §L) nor per-key in-kernel trig (f64 runs at 1/64 rate on consumer Blackwell, and every key needs
 `rope_head_dim/2` angles per tile). The position splits at bit 10 — `pos = hi·2¹⁰ + lo` — and the
 angle-addition identity `sin θ = s_hi c_lo + c_hi s_lo`, `cos θ = c_hi c_lo − s_hi s_lo` recombines
@@ -673,14 +713,24 @@ cannot contract them). The runtime combination is 2 float2 loads + 6 exact-round
   to the last `window_size` (a `tile_lo` clamp), strictly causal (§E: no forward bridge).
 - **Compressed pass** — an **index-driven walk** over the Indexer's top-k selected GIDs (device index
   tensor from the two-stage BDP-recall→Indexer-precision, §D), gathering each selected 512-d latent
-  from the `FloatGalleryArena`, into the *same* `(m_i, l_i, out_reg)`. The index tensor is produced
+  from the `FloatGallery`, into the *same* `(m_i, l_i, out_reg)`. The index tensor is produced
   **on-device each token** by the Indexer re-score over the resident shortlist; BDP recall refreshes
   that shortlist asynchronously (§D cadence) — never on the decode hot path.
 Both are key streams feeding one accumulator; the split-KV `num_splits` spans their union.
 
 ## G.5 Prefill kernel — per-query decode geometry over a settled slot
-_Revised at implementation (the palette-tiled-arena plan below it replaced assumed the stock
-adaptive-format staging; the fixed-FP8 direct-load fork obviates it)._ The implemented prefill is
+_Status: the wave absorbs prompts with the multi-query `paged_latent_prefill_raw` kernel (one launch per
+layer across the whole prompt fleet; `deepseek_prefill_tensorcore_pv.md`, `deepseek_hot_path_invariants.md`
+Inv 5). It attends each sequence's fresh new-token diagonal from a per-sequence `new_meta` slice,
+fake-quantised to the writer chunk's float format, and is gated tolerance-based against per-token decode
+(`prefill_rows_equal_decode_steps`, `wave_prefill_state_matches_decode_steps`: next-step argmax equality).
+Speculative-verify blocks, which need decode numerics, run the decode kernel over one virtual slot per
+position instead (`deepseek_v4_speculative_decode.md` §4.3). What follows is the analysis of why a
+settled-slot prefill and per-token decode differ; the per-token mechanism it describes
+(`build_decode_metadata_at` in `batched_inference/decode_metadata.rs`, `kernel_attn_decode_step` in
+`latent_moe/kernel_attention.rs`) is the original prompt-absorption path, and the palette-tiled-arena plan it
+replaced assumed the stock adaptive-format staging, which the fixed-format direct-load fork obviates._
+The original implemented prefill was
 the **decode step itself, run once per prompt token inside the wave**. The wave's real batching
 win is the MoE (one grouped call per layer per wave, amortized over every row, with no routing
 readback — `docs/moe_live_dispatch_design.md`); attention absorbs the prompt through `kernel_attn_decode_step` — the SAME launch the decode
@@ -689,7 +739,7 @@ Mechanism: `build_decode_metadata_at(seqs, generation, offset_overrides)` pre-bu
 snapshot per prompt token at wave entry (token `t` serialized at offset `base+t`, all layers;
 non-prefill slots are frozen for the wave, so snapshot 0 serves the decode and glue rows). This is
 **bit-identical to per-token stepping by construction** — same kernel, same launch geometry, same
-accumulation order. The multi-query `deepseek_prefill_kernel` remains the glue-row path (arbitrary per-query positions
+accumulation order. The multi-query prefill kernel (`latent_prefill_kernel`; the plan called it `deepseek_prefill_kernel`) was the glue-row path (arbitrary per-query positions
 over a settled slot) but it is **NOT the prompt-absorption path** — and the reason is a genuine
 semantic fork, not a reassociation. The decode kernel **bf16-stages the current token's PV** (the
 query's own key contributes to the value sum at bf16 precision), while a settled-slot prefill reads
@@ -706,9 +756,8 @@ and, when a window key's `key_pos == q_pos[qi]` (the diagonal), read it from `di
 bf16-staged (int8-from-roped-f32 for QK, matching decode) instead of the arena FP8 — window keys
 `[t-w, t-1]` still come from the arena. That reproduces the decode walk exactly and is gated by
 `prefill_rows_equal_decode_steps` extended to compare against a per-token decode reference on
-**real** (not fp8-exact synthetic) activations. Until that kernel lands, prompt absorption uses the
-per-token path above (correct, ~5 tok/s), which is sufficient for the step-6 recall gate at
-multi-thousand-token depth. **Residual batched-float variance** (independent of the above): the
+**real** (not fp8-exact synthetic) activations. The per-token path above was correct at ~5 tok/s, which
+sufficed for the step-6 recall gate at multi-thousand-token depth. **Residual batched-float variance** (independent of the above): the
 wave's row-parallel non-attention ops (mHC projections, MoE gate/experts) reduce in shape-dependent
 order, so a multi-row wave's hidden states carry a few-ulp drift vs strict per-token stepping — the
 same variance multi-session co-batched decode waves already carry by design. With attention
@@ -722,7 +771,10 @@ forward-window path), single-latent K≡V. Register-resident flash-state (glue i
 HD=512 the `q_reg`+`o_reg` per glue token is large, so **`GLUE_G_TILE=1–2`**, O distributed across
 threads (32 F32/thread), glue runs fanned across `gridDim.z`.
 
-**+ compression fold (§C/§E) — the LSE monoid operator is IMPLEMENTED host-side**
+**+ compression fold (§C/§E) — the LSE monoid operator is IMPLEMENTED host-side; the glue-kernel fold is NOT
+built.** The turn-seal design closes the partial group at seal instead of persisting an open `(m,l,acc)`
+(`deepseek_turn_seal_persistence.md`, Artifact B: `IncrementalCompressor::close`), so `GroupPartial` stays
+reference-only algebra and the glue kernel (`latent_glue_scatter_kernel`) only scatters recomputed KV.
 (`latent_moe/compressor/pool.rs::GroupPartial`: `identity` / `fold(scores,kvs)` / `merge` / `finalize`, proven by
 `group_partial_seam_fold_matches_whole` — a group's pooling rows cut at every interior seam and
 re-merged equal the single-shot softmax pool, and the identity law holds). The glue kernel transcribes
@@ -739,19 +791,19 @@ A per-channel reduction over `<2·ratio` boundary tokens + the partial — a han
 entry into its reserved gap (like the glue KV scatter). Descriptors ride `PendingGlue`/`GlueMeta`;
 co-batched in the `[decode|prefill|glue]` wave — one launch does both seams.
 
-_Prior art: the `(m,l,acc)` fold reuses the split-KV combine LSE monoid — `int8_decode_combine_kernel` (int8_decode_kernel.cuh:1522-1530), tile-fold at :663-671. No host-side LSE merge exists; transcribe :663-671 for the glue/host fold._
+_Prior art: the `(m,l,acc)` fold reuses the split-KV combine LSE monoid — `int8_decode_combine_kernel` (`paged-decode/int8_decode_kernel/split_kv_combine.cuh`), with the tile-fold in the decode kernel beside it. The host-side LSE merge is `GroupPartial::merge` (`latent_moe/compressor/pool.rs`)._
 
 ## G.7 Occupancy / budget summary
 | kernel | grid | block | SMEM | regs / launch_bounds | blocks/SM | occ |
 |---|---|---|---|---|---|---|
-| decode | (slots, head_tiles, splits) | 256 | ~21 KB single-stage | 64 / (256,4) | 4 | 67% |
-| prefill (A) | (q_tiles, batch·splits) palette-loop | 256 | ≤25.6 KB palette-tiled | 64 / (256,4) | 4 | 67% |
+| decode | (slots, head_tiles, splits) | 256 | ~24 KB single-stage | 64 / (256,4) | 4 | 67% |
+| prefill (built) | (total_q, splits), two head-passes of 32 | 512 | ~50 KB | 64 / (512,2) | 2 | — |
 | glue+fold | (slots, kv_head=1, glue_tiles) | 256 | ~12 KB + reg flash-state | 96 max, no LB | occ-bound | high |
 
 **Net:** the tensor-core math + the whole quant/paging substrate are reused; the fork's real work is
 (1) the 512/128 constant re-derivation (§G.2), (2) the K≡V single-load restructuring (§G.3), (3) the
 hybrid two-source loop (§G.4), (4) the palette-tiled prefill arena (§G.5), (5) the glue compression
-fold (§G.6). Decode first (validate vs `engine.rs::sink_attend` on synthetic KV+selection), then
+fold (§G.6). Decode first (validate vs `attention.rs::sink_attend` on synthetic KV+selection), then
 prefill, then glue — each one-shot to amortize the slow compiles.
 
 ---
@@ -765,46 +817,39 @@ longer matches this model), and gives each build-order step its concrete test + 
 
 ## H. The compression harness no longer matches this model (the C0–C10 mismatch)
 
-The Qwen harness measures KV compression with `InferenceMode` C0–C10 (batched_inference/inference_mode.rs:57) and
-`compression_ratio_by_sequences` → `16.0 / bpe` (batched_inference/stats.rs:2611). Both assume Qwen's KV
+The Qwen harness measures KV compression with `InferenceMode` C0–C10 (`batched_inference/inference_mode.rs`) and
+`compression_ratio_by_sequences` → `16.0 / bpe` (`batched_inference/stats.rs`). Both assume Qwen's KV
 shape: **per-head 128-d K and V, format-selected per 32-token block** against cosine thresholds. None
 of that is true for DeepSeek:
 
-- DeepSeek KV is **one 512-d latent, K≡V, MQA `n_kv_head=1`** (§A, §G.3), split into 4×128-d palette
-  sub-bands. There is no per-32 K/V format pair to select, so the C0–C10 candidate tables are
+- DeepSeek KV is **one 512-d latent, K≡V, MQA `n_kv_head=1`** (§A, §G.3), split into 16 bands of 32 dims.
+  There is no per-32 K/V format pair to select, so the C0–C10 candidate tables are
   meaningless here.
 - The *real* memory win is not per-block bit savings — it is that each query attends to a **bounded
   `window + top-k ≈ 640` keys** (§B, Part III) instead of the full O(N) history, plus a **pooled
   compressed corpus** (§C) instead of one KV entry per token.
 
-**Decision — window-KV format (REVISED): FP8 E4M3 writer + adaptive per-BAND compression on sealed
-chunks.** The WRITER chunk stores the latent as FP8 E4M3 (`F8E4M3 = 34`; the fused/glue scatters
-write FP8 only). At seal time, the **latent band compressor**
-(`candle-kernels/src/quantize/latent_band_quant.cuh` + `quantize_sealed_latent` in
-`kv_cache/chunked/compress.rs`) selects ONE format per (chunk, 128-dim band) from the level's K
-candidate ladder — whole-band round-trip rel-L2 against the level threshold, first passing wins,
-no-pass preserves FP8 — and re-encodes the band as token-oriented GGML blocks. The paged-latent
-kernels dispatch per band on the KvHead format tags (`load_band_elem`), so mixed FP8/quant chunks
-read directly. This SUPERSEDES the earlier "one fixed format, no adaptive C-level" decision: the
-original objection (the C0–C10 tables assume Qwen's per-head K/V shape) was answered by selecting at
-the latent's own granularity — the four per-band KvHead slots — rather than retrofitting the
-palette4 machinery (whose per-32-dim selection is structurally wrong for this shape, 16 sub-palette
-picks vs 4 band slots). Q8_KS's fine-scaled sub-block (elements 0–3) maps to the chunk's first four
-TOKENS in the token-oriented layout — the attention-sink protection carries over intact. Byte-wise,
-Q8 ≈ FP8 (quality rung, not size); the size wins start at Q4 (≈1.78×) and grow down-ladder, selected
-only where the threshold proves them. Gates: `latent_band_select_convert_matches_codec` (GPU/CPU
-codec byte contract), `mirror_bit_exact_mixed_band_formats` (decode dispatch, bit-exact),
-`prefill_mixed_rows_equal_decode_steps` (prefill dispatch), `latent_compressed_arena_roundtrip_decode`
-(the full production seal→compress→decode chain). Nothing in the session drives it: the gap
-quantize (`docs/kv_quantize_in_the_gap.md`) takes no single-latent backing, and the persistence
-thread's hot→warm drain moves single-latent chunks format-preserving (the latent path is
-immediate-only — no deferred-descs contract). The compressed-corpus entries stay **float** (`FloatGalleryArena` `[G,512]`+`[G,128]`,
-§C/§D) — their job is retrieval, not compression.
+**Decision — window-KV format: the fixed two-region latent, no adaptive compression.** The WRITER chunk
+stores the nope dims `[0,448)` as FP8 E4M3 at unit scale (`F8E4M3 = 34`) and the 64 rope dims `[448,512)` as
+BF16 (the rope tail must not lose precision); the fused/glue scatters write exactly that, and
+`BatchedEngine::create_batched_session` pins it. Single-latent KV is never adaptively compressed:
+`quantize_sealed_in_place` (`candle-nn/src/kv_cache/chunked/compress/quantize_impl.rs`) refuses a single-latent
+backing, the gap quantize (`docs/kv_quantize_in_the_gap.md`) takes none, and the persistence thread's hot→warm
+drain moves single-latent chunks format-preserving. An earlier revision of this plan added an adaptive
+per-band latent compressor (`latent_band_quant.cuh` + `quantize_sealed_latent`, one format per
+(chunk, 128-dim band) chosen by round-trip rel-L2); that direction was reversed and removed
+(`docs/archived/deepseek/deepseek_palquant_removal_plan.md`), and neither the kernel nor the function nor its
+gates (`latent_band_select_convert_matches_codec`, `latent_compressed_arena_roundtrip_decode`) exist. The
+paged-latent kernels still dispatch per band on the KvHead format tags (`load_band_elem`), so a chunk carrying
+quantized bands would read directly; the dispatch is gated bit-exact by `mirror_bit_exact_mixed_band_formats`
+(decode) and `prefill_mixed_rows_equal_decode_steps` (prefill) against synthetic slots. The compressed-corpus
+entries are the int8+BF16 two-region cache (`deepseek_int8_hot_corpus.md`) plus f32 scoring keys, held in
+`FloatGallery` (§C/§D) — their job is retrieval, not compression.
 
 **Decision — the ratio we report:** re-baseline against *traditional FP16 linear attention*, as
 requested. Add `fp16_linear_baseline_bytes(n_tokens) = n_tokens · head_dim · 2 (K and V) · 2 B
 (FP16) · n_layers` (what a traditional dense-attention FP16 model would hold — separate full-history
-K and V, every token, every layer) and `deepseek_kv_footprint()` = FP8 window + float corpus pair +
+K and V, every token, every layer; `latent_moe/footprint.rs`) and `deepseek_kv_footprint()` = FP8 window + float corpus pair +
 `(m,l,acc)` tails, summed **per layer kind** (SWA layers hold only the window; HCA/CSA add the
 corpus pair — a flat per-layer count over-states the footprint by the SWA fraction). Report
 `baseline / actual`. This is a
@@ -839,11 +884,12 @@ bounded window + a pooled corpus.
    latent — the mirror keeps both (zero-rope tests cannot catch this: fp8 ⊂ bf16). Device-vs-mirror
    bit probes for `ds_exp`/`ds_sincos` + a nullable kernel stage-dump are permanent regression
    infrastructure (`latent_moe/paged/mod.rs`)._
-3. **Engine vs CPU reference** — `engine_generate_paris_fast` (engine.rs:532) still answers Paris
-   after each kernel is swapped into `latent_moe::Engine`. The engine is kept solely as this rung's harness
-   (Decisions-locked: numeric golden, not a product path).
-4. **Conversation-engine vs engine** — same Paris after migration into `BatchedModelCore` + a
-   (temp-file) substrate, plus persist→reboot→resume exactness.
+3. **Engine vs CPU reference** — `engine_generate_paris_fast` and `engine_generate_paris_kernel`
+   (`latent_moe/engine.rs`, `#[ignore]`d, need the merged GGUF) answer Paris
+   with the kernels swapped into `latent_moe::Engine`.
+4. **Conversation-engine vs engine** — same Paris after migration into `BatchedEngine` (a
+   `ManagedBatchedModel`) + a (temp-file) substrate, plus persist→reboot→resume exactness
+   (`candle-conversation/tests/deepseek_rung4.rs`: `deepseek_rung4_part1_paris`, `_part2_reboot`, `_part3_live_seam`).
 
 **Standalone-first rule (your ask):** build every attention function against synthetic inputs at
 rung 2 *before* any live data. Substrate enters only at rung 4. This is why the temp-substrate helper
@@ -851,14 +897,14 @@ rung 2 *before* any live data. Substrate enters only at rung 4. This is why the 
 
 ## J. Substrate hosting for tests (temp-file, Zend-less)
 
-`ConversationBuilder::workspace_path(dir)` roots persistence at `dir/substrate/` (builder.rs:71).
+`ConversationBuilder::workspace_path(dir)` (`candle-conversation/src/models/builder/mod.rs`) roots persistence at `dir/substrate/`.
 For tests, point it at a `TempDir` under the scratchpad: a `deepseek_test_conversation(tmp)` helper
 builds a no-daemon `Conversation` with a real-or-tiny model (gated on file presence, like the existing
 `#[ignore]` goldens) and a throwaway substrate. Persistence stays mandatory (AGENTS.md) — it is simply
 rooted in a directory dropped at test end, so we get full persist/reboot/resume coverage without Zend.
 Only rung 4 uses it; rungs 1–3 never construct a `Conversation` at all (they are kernel/engine tests
 below candle-conversation). **Never pass `workspace_path = None` in a test:** `None` does not disable
-persistence — the engine falls back to the *current directory* (engine.rs:262-265) and would silently
+persistence — the engine falls back to the *current directory* (`latent_moe/engine.rs`) and would silently
 write `substrate/` into the repo checkout. Rung 4 always passes an explicit `TempDir`.
 
 ## K. Per-step plan — implement / test / gate
@@ -867,15 +913,15 @@ Each step keeps the prior rung green as its gate; that green rung is the **next 
 
 | # | Implement (build order) | Test (rung) | Gate |
 |---|---|---|---|
-| 0 | FP8 window wiring (`Float(F8E4M3)`, §H) + `fp16_linear_baseline` / `deepseek_kv_footprint`; one-line comment fixes (`arena_table.cuh:16` header says "3=F8E4M3" but the constant is 34; `paged-glue/api.rs:22` stale `col_actual_pos`) | raw-byte footprint units + ratio line | streaming Paris unaffected |
-| 1 | `paged-deepseek` **decode** kernel (BO §1) | rung 2, both §I oracles: arithmetic-mirror **bit-exact**; `sink_attend` at tolerance | rung 2 green **before any wiring** |
-| 2 | Arena-KV window: single-latent 512-d/4-palette `ChunkedKvBacking` (BO §2) | write→read round-trip **raw bytes**; kernel over arena == kernel over synthetic | rung 2 still green through the arena |
-| 3 | `FloatGalleryArena` + two-stage select (BO §3) | (a) **BDP recall ⊇ Indexer top-k**, swept per layer (§D validation); (b) corpus round-trip raw bytes; (c) two-stage == full Indexer top-k on synthetic gallery | rung 2 corpus path matches `sink_attend` (oracle b) over the same selection |
-| 4 | `paged-deepseek` **prefill** kernel (BO §4) | rung 2: prefill vs `streaming.rs::forward` on synthetic prompt → then **rung 3** | **`engine_generate_paris_fast` green on the real kernel path** (host attention gone) |
-| 5 | `BatchedModelCore` + temp-substrate migration (BO §6), incl. the §2 sync eliminations (`moe_bucketize` routing −N, on-device Indexer top-k −C) | **rung 4**: persist→reboot→resume == pre-reboot KV (monoid boundary-merge, §C); same Paris; instrumented **readbacks/token == 1** (the sampler) | rung 4 Paris + resume-exact + one-readback assert |
-|   | _Implemented as `ManagedBatchedModel` directly (`latent_moe/wave.rs` — the scheduler binds `Box<dyn ManagedBatchedModel>`, so the mHC loop stays private; zero scheduler changes). Readback accounting, measured and asserted (`wave_paris`): the Indexer top-k and prefill selections are fully on-device (−C ✓); MoE routing is read back nowhere — the live MoE dispatch (`docs/moe_live_dispatch_design.md`) serves the **streaming** `ExpertCache` without the host seeing expert ids first, so the wave readback budget (`latent_moe::readback`) is zero. Budget = 1 sampler readback/token, nothing else._ | | |
+| 0 | FP8 window wiring (`Float(F8E4M3)`, §H) + `fp16_linear_baseline` / `deepseek_kv_footprint`; one-line comment fixes (the `arena_table.cuh` header now reads `F8E4M3=34`; the stale `col_actual_pos` comment in `paged-glue/api.rs` is gone) | raw-byte footprint units + ratio line | streaming Paris unaffected |
+| 1 | `paged-latent` **decode** kernel (BO §1) | rung 2, both §I oracles: arithmetic-mirror **bit-exact**; `sink_attend` at tolerance | rung 2 green **before any wiring** |
+| 2 | Arena-KV window: single-latent 512-d/16-band `ChunkedKvBacking` (BO §2) | write→read round-trip **raw bytes**; kernel over arena == kernel over synthetic | rung 2 still green through the arena |
+| 3 | `FloatGallery` + two-stage select (BO §3) | (a) **BDP recall ⊇ Indexer top-k**, swept per layer (§D validation); (b) corpus round-trip raw bytes; (c) two-stage == full Indexer top-k on synthetic gallery | rung 2 corpus path matches `sink_attend` (oracle b) over the same selection |
+| 4 | `paged-latent` **prefill** kernel (BO §4) | rung 2: prefill vs `streaming.rs::forward` on synthetic prompt → then **rung 3** | **`engine_generate_paris_fast` green on the real kernel path** (host attention gone) |
+| 5 | `ManagedBatchedModel` (`BatchedEngine`) + temp-substrate migration (BO §6), incl. the §2 sync eliminations (`moe_bucketize` routing −N, on-device Indexer top-k −C) | **rung 4**: persist→reboot→resume == pre-reboot KV (monoid boundary-merge, §C); same Paris; instrumented **readbacks/token == 1** (the sampler) | rung 4 Paris + resume-exact + one-readback assert |
+|   | _Implemented as `ManagedBatchedModel` directly (`latent_moe/wave/` — the scheduler binds `Box<dyn ManagedBatchedModel>`, so the mHC loop stays private; zero scheduler changes). Readback accounting, measured and asserted at the time (the `wave_paris` gate; no test of that name remains, the wave gates are in `latent_moe/wave/tests_prefill.rs`): the Indexer top-k and prefill selections are fully on-device (−C ✓); MoE routing is read back nowhere — the live MoE dispatch (`docs/moe_live_dispatch_design.md`) serves the **streaming** `ExpertCache` without the host seeing expert ids first, so the wave readback budget (`latent_moe::readback`) is zero. Budget = 1 sampler readback/token, nothing else._ | | |
 | 6 | Dynamic corpus/RoPE budgets to 1M (§L) | NIAH needle recall via `ruler_gen` (generic over `ManagedBatchedModel` — needs the step-5 core) + footprint **flat** as N grows | Paris green; footprint-flat + needle recall hold |
-| 7 | `paged-deepseek` **glue** kernel + compression-seam merge (BO §5, §E) | rung 2: glue-recombine vs host LSE fold (raw `(m,l,acc)`) → two-turn seam-straddling group reconstructs == single-shot forward of the concatenation | rung 4 Paris across a 2-turn seam |
+| 7 | `paged-latent` **glue** kernel + compression-seam merge (BO §5, §E; the glue scatter and causal-only glue are built, the seam merge is not — see §G.6) | rung 2: glue-recombine vs host LSE fold (raw `(m,l,acc)`) → two-turn seam-straddling group reconstructs == single-shot forward of the concatenation | rung 4 Paris across a 2-turn seam |
 | 8 | **Intra-turn glue embedding (LAST)** (§E optimization) | equivalence: embedded-intra-glue reconstruction == fully-regenerated-glue reconstruction | no Paris/coherence regression |
 
 Three ordering notes: the **batched core (step 5) precedes the 1M work (step 6)** because the NIAH
@@ -889,12 +935,12 @@ zero host attention.**
 
 ## L. Window budget — dynamic sizing toward 1M
 
-Today `window_size = 128` (config.rs:82) and `max_seq = 512` (engine.rs:309, a prototype RoPE-cache
-constant). Scaling to 1M does **not** grow the per-query attended set — that stays bounded at
+`window_size = 128` (`Config::window_size`, from the GGUF's `sliding_window`; the prototype's `max_seq`
+RoPE-cache constant no longer exists). Scaling to 1M does **not** grow the per-query attended set — that stays bounded at
 `window + top-k ≈ 640` (the O(1) budget, and the entire premise). What must become dynamic:
 
 - **RoPE to 1M — a factored table with N-independent size (IMPLEMENTED).** The inherited kernels
-  index a position-sized `rope_cs` table (`int8_decode_kernel.cuh:56`); at 1M positions that table
+  index a position-sized `rope_cs` table (`rope_cs_at`, `paged-decode/decode_helpers.cuh`); at 1M positions that table
   is hundreds of MB of device memory growing with N — a quiet violation of the fixed-budget
   principle. The `paged-latent` fork splits the position at bit 10 and recombines two tiny cos/sin
   blocks via the angle-addition identity (`rope_lookup`, §G.4): ≈768 KB per frequency set covering
@@ -911,10 +957,10 @@ constant). Scaling to 1M does **not** grow the per-query attended set — that s
 - **Corpus tier budget (IMPLEMENTED).** The `FloatGallery` splits its storage by access pattern:
   the sign/pos **index** (`signs` [G, sign_words] u32 + `pos` [G] u32, `sign_words·4 + 4` B/entry)
   stays GPU-resident at any depth — the BDP recall scan reads all of it, and it is tiny (≈105 MB at
-  1M tokens across the compression layers). The **float pair** (`attn` [G, head_dim] + `keys` [G,
-  index_head_dim], the bulk) spills to CPU RAM past `HOT_ENTRY_CAP` entries; per query, only the
-  bounded shortlist (`gather_keys`, ≤`top_m`≤1024 rows) and the selection (`gather_selected`,
-  `top_k` rows) are gathered back to the GPU, and the kernel walks that compacted pair densely. The
+  1M tokens across the compression layers). The **hot pair** (the two-region latent cache `nope_i8`/`nope_scale`/`rope_bf` + `keys` [G,
+  index_head_dim], the bulk) spills to CPU RAM past `HOT_ENTRY_CAP` (8192) entries; per query, only the
+  bounded shortlist (`gather_keys`, ≤`top_m`≤1024 rows) and the selection (`gather_corpus_into`,
+  `top_k` rows) are gathered back to the GPU, and the kernel walks that compacted block densely. The
   resident GPU footprint is therefore the index alone — bounded — while the corpus grows in RAM;
   `spilled_corpus_selects_exactly` proves selection stays bit-exact vs the full-residency oracle
   across the spill boundary. Below the threshold a gallery is fully hot, so short conversations pay

@@ -31,9 +31,9 @@ waiting on the one thing that would have freed it:
    first.
 2. **An arena made for it could be swept away before it was used.**
    `create_deferred_arenas` stamps an owed arena and finishes its creation at
-   once (`alloc/arena_window.rs:473`). An empty, finished, unprotected arena is exactly
+   once (`alloc/arena_window.rs`, `create_deferred_arenas`). An empty, finished, unprotected arena is exactly
    what `release_empty_arenas` reclaims on the next sweep. The gap runs that
-   sweep through compaction (`scheduler/run/scheduler_loop.rs:1380`), relief, `claim_region` and
+   sweep through compaction (`scheduler/run/scheduler_loop.rs`, `compact_kv_if_fragmented`), relief, `claim_region` and
    `settle_device`.
 3. **Compaction and migration exclude each other through one process-global
    word** (`migrate_flight.rs`: `CHUNK_LOCATIONS` with a `FROZEN` bit, and
@@ -79,7 +79,7 @@ keeps one for each native hot class (F16/R16) that sealing writes into.
 - A class is reachable when some candidate of some level maps to it
   (`size_class` ladder, `arena_key_for`). Those are a subset of the 15 classes
   (320 … 16,384 B), not all 15.
-- It replaces `warm_protected_arenas` (`alloc.rs:149-192`), which protects one
+- It replaced `warm_protected_arenas` (gone), which protected one
   arena per key for a fixed list. There is one mechanism, not two.
 
 **How it is placed.**
@@ -106,11 +106,11 @@ then **owed a new reserve**. A migrate mid-wave therefore always has a
 destination. It never needs a new arena inside a wave, so "deferred: needs a
 new arena" cannot recur while the reserve stands.
 
-**When it is replenished** (`BackingInner::owe_reserves`, at the top of every
-`create_deferred_arenas`), at the moments arena creation is legal:
-- the wave-loop gap, which now creates arenas **ahead of** compaction, so a
-  sweep cannot see the new reserve before it is protected;
-- the persistence pass top.
+**When it is replenished** (`reserves_short`, read by `create_deferred_arenas`
+in `alloc/arena_window.rs`), at the moment arena creation is legal:
+- the wave-loop gap, which creates arenas **ahead of** compaction, so a
+  sweep cannot see the new reserve before it is protected. The persistence
+  pass no longer creates arenas.
 
 The gap runs on every loop iteration, so admission needs no third site.
 
@@ -315,9 +315,10 @@ holder the sweep rewrites to that copy reads unfinished bytes as its KV.
 
 **What was built.**
 1. **The hold spans only the writes.** `try_migrate_flight` is taken before the
-   group's snapshot, as before. After the quantize (claims, records) and the
-   convert, `migrate_group_hot_to_warm` synchronises `copy_stream` and calls
-   `MigrateFlight::settle`, which drops the location hold. The in-flight count
+   group's snapshot (`persistence/thread/pass.rs`). The pass no longer quantizes
+   or converts, so `copy_group_hot_to_warm` (`persistence/thread/warm_copy.rs`)
+   calls `MigrateFlight::settle`, which drops the location hold, before its
+   DtoH. The in-flight count
    (`migrate_in_flight`) stays until the marker drops.
 2. **The pass steps around what the group holds** (`HeldChunks`,
    `migrate_flight.rs`). The group's native chunks are registered before the

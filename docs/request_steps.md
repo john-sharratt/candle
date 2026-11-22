@@ -81,7 +81,7 @@ Journal history:
 Entry 6 — Reviewed the onboarding flow and listed its three demo-mode leaks.
 Entry 7 — Began making demo mode anonymous across the employee lifecycle.
 
-Current request:
+Current request — the notes you have made in the request you are working on, in order:
 Step 1 — The demo flag is read in three places; only session.rs gates on it.
 Step 2 — EmployeeCard renders the real name before the demo check runs.
 …
@@ -89,7 +89,7 @@ Step 2 — EmployeeCard renders the real name before the demo check runs.
 Still open: …
 ```
 
-- **`journal/history`** is the fixed heading line before the first entry. It
+- **`journal/history`** is the fixed heading line (`Journal history:`) before the first entry. It
   is part of the chain, so adding it reseals each conversation's journal once.
   After that it is sealed with the entries and costs nothing per round. A
   journal with no entry pins no section (`docs/zend_journal.md` §4), and its
@@ -198,10 +198,11 @@ the model loses what it is doing, whatever the steps say.
 
 - **No test pins it end to end.** The fill tests check the floors on
   hand-built units, and the selection tests check the recent window. Neither
-  checks the whole projection on a long loop. One test is built: a dialogue
-  whose request runs 64 tool rounds of ~6K-token tool outputs, projected under
-  a window that holds a fraction of them, still emits the request turn, the
-  newest tool turn and the newest turn, and emits every step of §2.
+  checks the whole projection on a long loop. The test that does is not yet
+  written: a dialogue whose request runs 64 tool rounds of ~6K-token tool
+  outputs, projected under a window that holds a fraction of them, must still
+  emit the request turn, the newest tool turn and the newest turn, and emit
+  every step of §2.
 - **The summary tree's path does not hold it.** When a summary tree exists,
   the §8 score-density pick replaces the rule-based selection and is only closed
   under exchange (`projection/project/pipeline/sink.rs`, `summary_tree_select`). Nothing in it keeps the
@@ -250,10 +251,11 @@ Made in writing this, to be confirmed or reversed before it is built:
 
 | Where | What |
 |---|---|
-| `zend/src/journal/steps.rs` | `Steps`: a request's first turn and its steps; grow from a sealed reply, reset on a new request, rebuild from the request's turns, the newest 64 |
-| `zend/src/journal/notes.rs` | reading a reply's note calls with their `journal`, so a memory-journal note is told apart |
-| `journal-core/src/section.rs` | the `journal/history` and `journal/current` headings and `journal/step/<n>` names; a step's rendered line; the closing section without `Still open:` when nothing is open |
-| `zend/src/journal/carry.rs` | the wanted sections in order: history heading, entries, current heading, steps, `journal/close` |
+| `zend/src/journal/steps.rs` | `RequestSteps`: a request's first turn and its steps; grow from a sealed reply, reset on a new request, rebuild from the request's turns, the newest 64 (`MAX_STEPS`) |
+| `zend/src/journal/notes.rs` | `own_notes`: reading a reply's note calls with their `journal`, so a memory-journal note is told apart |
+| `journal-core/src/section.rs` | the `journal/history` and `journal/current` headings and `journal/step/<n>` names; a step's rendered line (`STEP_CHARS` = 400); the closing section without `Still open:` when nothing is open; `JournalPrompt::with_steps` yields the wanted sections in order: history heading, entries, current heading, steps, `journal/close` |
+| `zend/src/journal/style.rs` | the heading, `Step` and end-line wording of each journal style |
+| `zend/src/journal/carry.rs` | scoping the `journal` collection to named members and pinning the sections that have sealed |
 | `zend/src/journal/state.rs` | `SessionJournal` holds the `Steps` |
 | `zend/src/prompts/projection.yaml` | the intro's sentence on steps |
 | `candle-conversation/src/projection/` tests | the end-to-end request-turn test (§3) |

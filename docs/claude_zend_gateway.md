@@ -1,6 +1,6 @@
 # Claude and zend: one orchestrator, one workhorse
 
-**Status: designed, not built.** This document is authoritative over the remote
+**Status: built.** This document is authoritative over the remote
 MCP endpoint (`/mcp` behind the `web` gateway), the gateway's OAuth
 authorization server for it, the global skills that drive it, and the routing
 rules a Claude session follows. Where it names machinery that already exists,
@@ -25,9 +25,8 @@ crate, which zend and the aggregator both serve on. Where this document places
 them in zend's `http.rs`, read `mcp_server::http`. zend's sessions are in
 `zend/src/mcp/state.rs`. What the tools do is unchanged, and stays zend's.
 
-Every statement below about existing code was checked against the tree on
-2026-10-25 and carries its source; everything that does not exist yet is
-marked **new**. The Claude-side facts (§12, §13) were checked against
+Every statement below about existing code carries its source; the sections
+describe what is built. The Claude-side facts (§12, §13) were checked against
 Anthropic's and the MCP specification's published documentation the same day.
 
 ## 1. Why
@@ -126,12 +125,13 @@ way a dialogue is:
 - its own branch per repository, its tool rounds' changes, its owner.
 
 The turn is submitted on `POST /v1/chat/completions` with `conv_id` naming the
-worker and zend's own model (`zend/src/api/mod.rs:69-78`). With any model but
+worker and zend's own model (`zend/src/api/mod.rs`). With any model but
 `passthrough` that route runs zend's projection through `session.submit`, and
-answers `400 missing_conv_id` without a `conv_id` (`zend/src/api/chat.rs:152-223`).
-**`passthrough` is refused by the endpoint**: it runs the client's own
-messages through `submit_passthrough` and never touches the substrate
-(`chat.rs:158-160`), which is exactly what delegation exists to avoid.
+answers `400 missing_conv_id` without a `conv_id` (`zend/src/api/chat.rs`,
+`missing_conv_id`). **`passthrough` is refused by the endpoint**: it runs the
+client's own messages through `submit_passthrough` and never touches the
+substrate (`zend/src/api/chat.rs`), which is exactly what delegation exists to
+avoid.
 
 ### 3.2 Tools
 
@@ -222,7 +222,8 @@ never held longer than `wait_s`:
   answer, answers the question) and waits again on the rest. A question from
   any worker surfaces on the next return, so no worker sits blocked behind
   another's long build.
-- **A short wait is the progress report.** `wait_s` defaults to 60 s, so a
+- **A short wait is the progress report.** `job_status`'s `wait_s` defaults to 60 s (`repo_task_start`'s and
+  `repo_task_reply`'s to 45 s), so a
   wait that finds every worker still running answers every 60 s with, for
   each, one sentence counted from its turn's stream — never summarised by a
   model (`zend/src/mcp/activity.rs`): `running 4m10s, 6 rounds: 1,934
@@ -247,7 +248,7 @@ never held longer than `wait_s`:
 - **`wait_s` is bounded per client** (§13.2), the client named by the MCP
   session's `clientInfo`:
 
-| Client | `wait_s` default | `wait_s` at most | How long waits are carried |
+| Client | `job_status` `wait_s` default | `wait_s` at most | How long waits are carried |
 |---|---|---|---|
 | claude.ai, Claude Desktop | 60 s | 200 s, inside the 240 s cap | Polling: each `job_status` holds up to `wait_s` and answers with what each worker has done; the model has no notification channel, so the answers are its progress report |
 | Claude Code | 60 s | 240 s, inside the claude.ai connector's ~300 s | Polling as above: a longer wait is another call |
@@ -268,10 +269,10 @@ it sits 24 hours untouched (`docs/mcp_guides.md` §3).
 
 ### 3.4 What a task turn runs as
 
-- **Tools by role** (`zend/src/access.rs:27-97`): an Admin's tasks run with
+- **Tools by role** (`zend/src/access.rs`): an Admin's tasks run with
   `tools: comprehensive` — the agents, the git tools, web search — within the
   guardrails of §11; anyone else's are served `restricted`, which grants no
-  commands, network or push (`access.rs:63-80`). A skill that needs
+  commands, network or push (`access.rs`). A skill that needs
   Comprehensive tells a non-admin it cannot run. Which operations, memory,
   bot and task tools each kind of conversation reaches — a task, a chat, a
   person's dialogue — is `docs/zen_tool_reach.md` §6.1's table.
@@ -298,7 +299,7 @@ it sits 24 hours untouched (`docs/mcp_guides.md` §3).
   the newest — one aloud, three written — in their next conversation from any
   client, marking nothing read.
 - **Decode priority `normal` by default.** Priority is a layer's, and a worker
-  is a dialogue-layer conversation, so it would decode at the dialogue's `high`
+  is a dialogue-layer conversation, so it would decode at the dialogue's `urgent`
   (`zend/src/prompts/projection.yaml`), level with a live user. A conversation
   may record a band of its own under `decode_band`
   (`DecodePriority::METADATA_KEY`), which the scheduler reads when it makes the
@@ -342,13 +343,13 @@ did, so it says exactly what Claude said, with no model between:
    `journal_note {journal: "self", text}`, one entry per note.
 
 The note's text is filed as the turn behind its entry, so `journal_read` and
-`journal_grep` reach it as they reach any entry's turns. **new:** the notes
-route appends a turn with no model reply — today every dialogue turn is
+`journal_grep` reach it as they reach any entry's turns. The notes
+route appends a turn with no model reply — every dialogue turn is otherwise
 decoded — and keeps the entry through the journal's own keep path
 (`journal.kept`, the section submit), so it seals, folds and replicates like
 any entry. Its claims are labelled by speaker: `Claude said:` for a note,
-`Claude started:` for a task, `Task ended:` for an outcome (**new** labels;
-`zend/src/journal/style.rs:154-170` holds today's).
+`Claude started:` for a task, `Task ended:` for an outcome (`zend/src/journal/style.rs`
+holds `Claude said:`; `zend/src/mcp/threads.rs` the thread's other two).
 
 Claude learns to keep the thread from the tools' own descriptions and the
 skills (§7.1). The thread's journal is the anchor Claude re-reads after its
@@ -369,10 +370,10 @@ earlier outcomes in its prompt, at no prefill, and its own task prompt states
 the task in full.
 
 Inheriting turns was considered and refused: inherited turns are pinned whole
-and unscored (`candle-conversation/src/projection/selection.rs:231-249`), up to
-`INHERITED_CHAIN_TOKEN_CAP` (100K tokens) across the chain, and an ancestor
+and unscored (`candle-conversation/src/projection/selection.rs`), up to
+`INHERITED_CHAIN_TOKEN_CAP` (64K tokens) across the chain, and an ancestor
 that does not fit is dropped together with everything above it — the priming
-chain included (`candle-conversation/src/substrate/mod.rs:3470, 3775-3791`). A long
+chain included (`candle-conversation/src/substrate/registry.rs`). A long
 thread would have cost every worker its priming.
 
 The worker runs the task's rounds — its reads, its builds, its tool output —
@@ -387,12 +388,13 @@ are workers too, started by it on the same thread (§6.1).
    it, and archived the same way when its thread is archived or after 24 hours
    untouched (`docs/mcp_guides.md` §3); when it failed, it is archived at once.
 
-**An archived worker keeps the turns behind its entries.** Today archiving a
-conversation keeps its entries and ceases the text filed under them
-(`archive_conversation` → `cease_journal_text`, `zend/src/session/conversations.rs:6992-7001,
-5252-5260`), because nothing reads an archived conversation's turns. A worker's
+**An archived worker keeps the turns behind its entries.** Archiving a
+dialogue keeps its entries and ceases the text filed under them
+(`archive_conversation` → `cease_journal_text`, `zend/src/session/conversations.rs`
+and `zend/src/session/journaling.rs`), because nothing reads an archived
+conversation's turns. A worker's
 are exactly what is read later — the evidence behind a task's outcome — so a
-conversation owned through `/mcp` keeps its filed turns when it is archived,
+worker is archived through `archive_worker`, which keeps its filed turns,
 and they go only when its thread is tombstoned (§16). An archived conversation
 is not open, so the calendar fold, which runs over the open conversations, never
 folds it (`docs/zend_journal.md` §4.2); its addresses stay exact.
@@ -414,10 +416,10 @@ The journal is the summary layer, and it already exists
 from, and the server derives its kind from what it cites. A coding journal
 carries no typed facts: its claims rest on the turns they cite.
 The kinds are `Observed` / `Heard` / `Did` / `Inferred`
-(`journal-core/src/entry.rs:18-28`), rendered `Saw:` / `User said:` / `Did:` /
-`Concluded, not seen:` (`zend/src/journal/style.rs:158-161`): a user turn is
+(`journal-core/src/entry.rs`, `Kind`), rendered `Saw:` / `User said:` / `Did:` /
+`Concluded, not seen:` (`zend/src/journal/style.rs`): a user turn is
 `Heard`, a user turn carrying a `<tool_response>` is `Observed`, an assistant
-turn is `Did` (`zend/src/journal/origin.rs:80-86`). In an `/mcp` worker every
+turn is `Did` (`zend/src/journal/origin.rs`). In an `/mcp` worker every
 user turn is Claude's — the task, an answer, a nudge — so `Heard` renders
 `Claude said:` there (`style_for`, `zend/src/journal/style.rs`).
 
@@ -431,8 +433,8 @@ result is every entry whose span overlaps the task's turns, the last of them
 first. Two things about the draft route shape this:
 
 - It only starts the draft: `202 {from_turn, to_turn, parts}`, the entry kept
-  later (`zend/src/session/journaling.rs:5171, 5270-5299, 7051-7063`). `GET …/journal`
-  already reports `drafting` and `covered_to` (`journal-core/src/record.rs:140-158`),
+  later (`ZendSession::journal_draft`, `zend/src/session/journaling.rs`). `GET …/journal`
+  reports `drafting` and `covered_to` (`journal-core/src/record.rs`),
   so the task waits for `drafting` to clear, then takes the entries whose ids
   are past the newest the worker's journal held before the task began
   (`zend/src/mcp/workers/mod.rs`).
@@ -442,7 +444,7 @@ first. Two things about the draft route shape this:
   when the conversation is not open on the member (`zend/src/api/journal.rs`).
   The task waits a running draft out and asks again (`finish_journal`).
 
-A draft that skips the final stretch (`journal_skip`, `style.rs:47-52`) still
+A draft that skips the final stretch (`journal_skip`, `zend/src/journal/style.rs`) still
 advances `covered_to`; the task's result is then its earlier entries, and
 `repo_task_start` says the final stretch added nothing.
 
@@ -631,7 +633,7 @@ no `entry` is given: `journal_read {journal, entry?, offset?, limit?}`,
 conversation's tools read from its shelf — its own journal and every journal
 above it — built at each round (`zend/src/journal/shelf.rs`). (The note tool
 is not `journal_write`: that name is already the drafter's answer grammar,
-`journal-core/src/tools.rs:47`, which never enters a dialogue's catalog.)
+`journal-core/src/tools.rs` `WRITE`, which never enters a dialogue's catalog.)
 
 `journal` is one of:
 
@@ -771,9 +773,9 @@ exactly as for a question.
 under the worker's conversation; the worker's next tool round takes it and
 adds it to that round's results as Claude's words, literal text under a line
 naming whose they are.
-A nudge never interrupts a decoding round. Today a second message on a busy
-conversation waits on its lock until the whole turn ends
-(`zend/src/session.rs:3848-3862`), which is too late to steer it.
+A nudge never interrupts a decoding round. A second message on a busy
+conversation waits on its lock until the whole turn ends, which is too late to
+steer it, so a nudge is a record the loop reads instead.
 
 **Claude can stop a worker going the wrong way.** `job_cancel {job:
 "task:..."}` queues a stop as a record under the worker's conversation
@@ -982,11 +984,11 @@ Admin-only, the read-only ones included (`host/src/commands/mod.rs`), so
 | Tool | Wraps | Returns |
 |---|---|---|
 | `cluster_status` | `GET /v1/status` (any caller; every zend member's answer, gathered by the gateway with a `group` block, `web/src/cluster/aggregate.rs`) and, for an Admin, `GET /gateway/status.json` (`web/src/cluster/page.rs`), which lists every app's members — zend, npcd, the agents and keep — with their nodes | Each member: machine, node, build, state, when it started, its tenants; for an Admin, each app's floor and ready members, upgrade candidates, faults |
-| `cluster_logs {grep?, level?, tenant?, since?, limit?, node?, exclude?, lines_before?, lines_after?}` | `GET /v1/logs` (`host/src/endpoints/log_grep.rs`; `Role::User`): every member's lines, oldest first, `limit` 200 by default and 5000 at most; `exclude` a pattern no match may match, `lines_before`/`lines_after` the context around each match (at most 20); `node` sets `x-tokera-node` for one member | Matching lines, newest last, each member saying how far back its log reaches (`held_from`) |
-| `cluster_audit {entries?}` | `GET /gateway/status.json?log=N`: the coordination log, which records each command and who ran it (`cluster/src/gateway/coord_log.rs:37-57`), held in memory for 24 hours | Who ran which command, and how it ended |
+| `cluster_logs {grep?, level?, tenant?, since?, limit?, node?, exclude?, lines_before?, lines_after?}` — a worker's tool; the connector offers Claude `log_list`, `log_read` and `log_grep` over the same cluster source and each site's (`zend/src/mcp/tools/logs/`, `docs/mcp_file_tools.md` §6) | `GET /v1/logs` (`host/src/endpoints/log_grep.rs`; `Role::User`): every member's lines, oldest first, `limit` 100 by default and 5000 at most; `exclude` a pattern no match may match, `lines_before`/`lines_after` the context around each match (at most 20); `node` sets `x-tokera-node` for one member | Matching lines, newest last, each member saying how far back its log reaches (`held_from`) |
+| `cluster_audit {entries?}` | `GET /gateway/status.json?log=N`: the coordination log, which records each command and who ran it (`cluster/src/gateway/coord_log.rs`), held in memory for 24 hours | Who ran which command, and how it ended |
 
 `cluster_logs` answers a page, never a stream; the gateway's `/ws/logs` takes
-no filters (`host/src/endpoints/logs.rs:28`) and is for the live page.
+no filters (`host/src/endpoints/logs.rs`) and is for the live page.
 
 **A machine's log is its daemon's, not one app's.** The gateway gathers
 `/v1/logs` from zend's members, and a machine's zend loads for ten minutes after
@@ -999,22 +1001,22 @@ maintenance commands); its lines come back under the machine, marked with the
 member that answered. A `node` may name a member of either app.
 `cluster_audit` is not the `audit` command, which walks the substrate checking
 what it holds against what maintenance counts as live
-(`host/src/commands/exec.rs:334-363`).
+(`host/src/commands/exec.rs`).
 
 ### 8.2 Maintenance commands
 
 `cluster_command {member, name, args?, confirm?}` runs one of the members'
 maintenance commands on one member — `member` is its app and 16-hex-digit node
 id, as `cluster_status` lists them, sent as `x-tokera-node`
-(`web/src/cluster/route.rs:91-159`) — and answers `202 {job, command, stream}`
-(`host/src/commands/mod.rs:174-182`) as the handle `cluster:<node>:<n>`.
+(`web/src/cluster/route.rs`) — and answers `202 {job, command, stream}`
+(`host/src/commands/mod.rs`) as the handle `cluster:<node>:<n>`.
 `job_status {jobs: ["cluster:<node>:<n>"], wait_s?}` and `job_read` read
 `GET /v1/cluster/command/job/:id`: NDJSON, a `started` line, `step`
-lines, and one terminal `done` or `error` (`host/src/commands/jobs.rs:76-108`),
+lines, and one terminal `done` or `error` (`host/src/commands/jobs.rs`),
 summarised to its last state and its errors. A job is readable only on the
-member that ran it (`mod.rs:226-235`), so the handle names the same member;
+member that ran it (`commands/mod.rs`), so the handle names the same member;
 one command runs per member at a time, and a second answers 409
-(`jobs.rs:134-141`), which the tool reports as busy rather than an error.
+(`commands/jobs.rs`), which the tool reports as busy rather than an error.
 
 The commands, all 25 registered at `host/src/commands/parse.rs`, in three
 classes, and a fourth for the two never run remotely
@@ -1034,26 +1036,26 @@ name before it is parsed):
   That gate is the endpoint's; the members' own checks stand behind it.
 - **The members' checks.** `shutdown`, `set-quorum` and `prune-builds` also
   need `confirm` to be the machine's OS host name, and `rollout` needs the
-  build's `count-hash` (`parse.rs:218, 254-263`); the tool takes those as
+  build's `count-hash` (`commands/parse.rs`); the tool takes those as
   `args`. The other Decide commands take none at the member.
 - **`rollout` goes through the gateway:** a member refuses one without the
-  gateway's plan (`parse.rs:209-224`), so the tool wraps
+  gateway's plan (`commands/parse.rs`), so the tool wraps
   `POST /gateway/upgrade/rollout` twice — once for the plan, once with its
-  confirm (`web/src/cluster/upgrades.rs:10-12`). A member's `rollback` refuses
+  confirm (`web/src/cluster/upgrades.rs`). A member's `rollback` refuses
   a build below the floor, so a cluster-wide rollback is a `rollout` of the
   older build.
 - **`offline` and `online` are not tools.** After `offline` a member serves
-  only loopback callers (`parse.rs:68-73`, `exec.rs:193-225`), so `online`
+  only loopback callers (`commands/parse.rs`, `commands/exec.rs`), so `online`
   could never reach it through the gateway; both are done on the member's
   machine. The other 23 commands are tools.
 - **The gateway's own commands** `raise-floor` and `cancel-floor`
-  (`upgrades.rs:132-139`) are Decide, through
+  (`web/src/cluster/upgrades.rs`) are Decide, through
   `gateway_command {name, args?, confirm?}`. **`drain-gateway` and
   `undrain-gateway` are not tools**, for `offline`'s reason: the tool reaches
   the gateway up the member's own socket, which a drain closes
   (`cluster/src/gateway/drain.rs`), and a drained gateway admits no socket for
   `undrain-gateway` to come back up. Both are done from the gateway's page or
-  its machine (`page.rs:49-50`).
+  its machine (`web/src/cluster/page.rs`).
 
 ### 8.3 Building and testing
 
@@ -1101,7 +1103,8 @@ lines are its steps (`mcp/steps.rs`). An answer to a brief of two or more
 steps ends with a `Steps:` section, a line per step saying `done` and what
 shows it, `not done` or `could not` and why; one that leaves a step out is
 sent back once to account for it, in the same send-back as a citation check
-(`docs/archived/zen_coding_challenge_fixes.md` Cause 3).
+(the archived original of the rule is Cause 3 of
+`docs/archived/zen_coding_challenge_fixes.md`).
 
 **A nudge says who sent it.** A message queued for a worker's next tool round
 is delivered under a line naming its sender — Claude, the agent that started
@@ -1132,7 +1135,7 @@ are Admin-only at the endpoint:
 
 | Tool | keep route | Class |
 |---|---|---|
-| `service_deploy {host, service}` | `GET /v1/keep/state` first: a keep whose state names no build of its own (`keep`) records no deploy on its trials, so the deploy is refused with how to update keep. Then the build on that machine's agent, then `POST /v1/keep/trial {service, artifact, deploy}` — the trial, run as a job and tagged with the deploy's handle, `deploy:<node>:<id>`, which it answers. `service` is `motherd`, `web`, `mcp` or `yenbot`; each answers `--build-info`, which keep checks the artifact by | Care |
+| `service_deploy {host, service}` | `GET /v1/keep/state` first: a keep whose state names no build of its own (`keep`) records no deploy on its trials, so the deploy is refused with how to update keep. Then the build on that machine's agent, then `POST /v1/keep/trial {service, artifact, deploy}` — the trial, run as a job and tagged with the deploy's handle, `deploy:<node>:<id>`, which it answers. `service` is `motherd`, `web`, `mcp`, `yenbot` or `battlecities` (`SERVICES`, `zend/src/mcp/tools/service/mod.rs`); each answers `--build-info`, which keep checks the artifact by | Care |
 | `service_status {host?}` | `GET /v1/keep/state` — keep's own build, and each service: its stable file's build and whether it runs | Look |
 | `job_read` / `job_grep` on a deploy | the build's log, a marker line, then `POST /v1/keep/trial/log` — the trial log, read on keep's machine | Look |
 | `job_status` / `job_cancel` on a deploy | the deploy's stage, waited on; or the build cancelled, or `POST /v1/keep/trial/cancel` — the trial rolled back and recorded cancelled | Look / Care |
@@ -1182,7 +1185,7 @@ job's view answers the staged path (`Staged`), which `job_status` reports.
 | `timeline_read {id}` | `GET /v1/substrate/zend/timeline/:tl` | Look |
 | `timeline_delete {id}` | `DELETE /v1/substrate/zend/timeline/:tl` | Decide |
 
-All four exist and are `Role::Admin` (`zend/src/api/mod.rs:105-128`). Wiping a
+All four exist and are `Role::Admin` (`zend/src/api/mod.rs`). Wiping a
 member's substrate is not a tool: it is the user's decision, carried out on
 that machine (§11).
 
@@ -1272,13 +1275,13 @@ endpoint and by zend, not asked of anyone in a prompt:
 ## 12. Identity and access
 
 The gateway owns sign-in (`docs/web_gateway_design.md` §5): Google OIDC with
-PKCE (`web/src/auth/oidc.rs`), a session cookie (`web/src/auth/mod.rs:119-134`),
+PKCE (`web/src/auth/oidc.rs`), a session cookie (`web/src/auth/mod.rs`),
 and identity stated to the members on `X-Tokera-User` / `-Provider` / `-Email`
-/ `-Name` / `-Picture`, `-Provider` required (`web/src/auth/forwarded.rs:20-67`),
+/ `-Name` / `-Picture`, `-Provider` required (`web/src/auth/forwarded.rs`),
 believed only from the trusted peers and stripped from anyone else
-(`web/src/auth/gateways.rs:15-37`, `web/src/server.rs:594-604`). `Role` is the
-gateway's (`web/src/auth/role.rs:63-70`); zend maps it to tool modes
-(`zend/src/access.rs:30, 44`). `/mcp` keeps all of that.
+(`web/src/auth/gateways.rs`, `web/src/server.rs`). `Role` is the
+gateway's (`web/src/auth/role.rs`); zend maps it to tool modes
+(`zend/src/access.rs`). `/mcp` keeps all of that.
 
 **The gateway is the OAuth 2.1 authorization server for `/mcp`**
 (`web/src/auth/mcp/`), beside the sign-in it already owns. Its routes are
@@ -1337,7 +1340,7 @@ other request, and never see what a token means. The site table forwards
   signed with the session key (`web/src/auth/mcp/grants.rs`), each with a
   `kind` its reader requires, so a code is never a token and a session cookie
   — which has no `kind` — is never either. Peered gateways share that key
-  (`web/src/cluster/peers.rs:83`), so each honours what any of them issued,
+  (`web/src/cluster/peers.rs`), so each honours what any of them issued,
   and nothing is stored. The cost: a code works for its five minutes and a
   refresh token until it expires, not once — neither is any use without what
   the client alone holds, the PKCE verifier or the token itself — and signing
@@ -1549,7 +1552,7 @@ and reached the way a real client reaches it:
 | A command's member is busy | `cluster_command` answers busy (409); the skill waits for the running job and retries |
 | A command's or an agent job fails | `job_status` / `job_read` answer its errors; the skill reports them and stops |
 | A trial fails | keep restores the previous binary; `job_status` on the deploy reports the rollback |
-| The motherd running a worker restarts mid-task | That member's boot scan carries the worker on from the round it was in (`workers::carry_on`). A member that does not come back loses it: it reads as lost once its beat stops (`BEAT_LOST_MS`), and after `RESUME_AFTER_MS` another member starts it again (`super::resuming`), told its task in full. Maintenance and agent jobs are held in that motherd's memory and are lost with it (`host/src/commands/jobs.rs:110-160`, `agent/src/jobs.rs:44-45`); only keep's trial runs outside motherd. The worker re-checks state — the build, `/v1/status` — rather than waiting on a lost job, and runs it again |
+| The motherd running a worker restarts mid-task | That member's boot scan carries the worker on from the round it was in (`workers::carry_on`). A member that does not come back loses it: it reads as lost once its beat stops (`BEAT_LOST_MS`), and after `RESUME_AFTER_MS` another member starts it again (`super::resuming`), told its task in full. Maintenance and agent jobs are held in that motherd's memory and are lost with it (`host/src/commands/jobs.rs`, `agent/src/jobs.rs`); only keep's trial runs outside motherd. The worker re-checks state — the build, `/v1/status` — rather than waiting on a lost job, and runs it again |
 | An OAuth token expires | The client refreshes it; a refused refresh signs the user in again |
 
 ## 16. Changes to other documents

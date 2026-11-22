@@ -34,8 +34,9 @@ window the model generates itself; runs on the sign/popcount path.
    position-independently isolating the signal from the diffuse haystack (§24.8).
 5. **Belief** — `RelLeak` (`acc[t] = max(0, acc[t] − β·max(acc)) + s[t]`, β = 0.40) carries and
    decays belief across a turn's reprojections (§24.5).
-6. **Selection** — `SectionSelector` under `committed_tool_scope`: β 0.40, **min 1000 / evict 750**,
-   **budget 1..3**, `fix_per_turn` (§24.6). Persisted per turn by `projection_event`, which scores
+6. **Selection** — `SectionSelector` under `committed_tool_scope`: β 0.40, **min 800 / evict 600**
+   (`PolicyPreset::CommittedToolScope`, `candle-conversation/src/projection/policy.rs`; a lowered
+   band of 250 / 187.5 holds for the first 64 decoded tokens), **budget 1..3**, `fix_per_turn` (§24.6). Persisted per turn by `projection_event`, which scores
    the just-sealed turn's stored signature so the record and the self-reinforcing gallery agree.
 
 **Numbers** (leave-one-out over 372 tagged tool turns, 93 tools; chance ≈ Top-1 1.1 %):
@@ -1895,7 +1896,10 @@ On that scale the §80.2 sweep derives **min 1000 / evict 750 / max 3 / fix** fo
 the true tool is always Top-3 at the 256-token width, `min 1000` sits ~0.7× the weakest true-tool
 score (a wide margin below the recall floor) so live probes noticeably weaker than the corpus
 worst-case still keep the truth, trimming the set to ~1 false positive (exact-1 ~50%), and
-`evict 750` sits below that floor so a correct pick is never evicted.
+`evict 750` sits below that floor so a correct pick is never evicted. (The preset as shipped
+runs a stricter band, **min 800 / evict 600** on the normalized 0–1000 scale, with an early-decode
+grace of min 250 / evict 187.5 for the first 64 generated tokens; a looser min 112 was measured
+live to admit weak tools into unrelated queries.)
 
 ### 24.7 The `z × margin` hybrid scorer (§80, §81)
 
@@ -1938,7 +1942,7 @@ The decisive comparison, same ~53-token budget: **top-25%-by-magnitude 97.0 / 10
 **last-64-by-recency 89.2 / 98.1** — magnitude *finds* the needle, recency *guesses* at it.
 
 The gated scores keep essentially the same scale (the kept needles dominate the magnitude sum), so
-the §80.2 thresholds (min 1000 / evict 750 / max 3) are unchanged — the gate is a strict-improvement
+the §80.2 thresholds (min 1000 / evict 750 / max 3 at the time; the shipped preset is now min 800 / evict 600, §24.6) are unchanged by it — the gate is a strict-improvement
 drop-in. Because it keys on signal quality, not domain, it is left **on for all collections**; for a
 content collection (code) the same gate keeps the sharp relevant reference and mutes the boilerplate.
 Validated only on tools so far — the content case awaits a labelled code-section corpus.
@@ -2168,7 +2172,8 @@ The definitive warm-level code-side verification belongs to the §11 selection-r
 captured at turn open live, the persisted user `KvSpan` at seal; collection normalization; the
 size-aware level prior; attention mass → flexbox/member budgets; locality; the file-head anchor;
 `SelectionOrigin::{Locality, Anchor}`; the full YAML surface; the migrated
-`committed_tool_scope` preset min 112 / evict 60 / budget 1..4 / early 35/26). Building it
+`committed_tool_scope` preset min 112 / evict 60 / budget 1..4 / early 35/26 — reverted after live
+testing to the strict min 800 / evict 600 / budget 1..3 of §24.6). Building it
 forced three measured corrections, swept via a production-chain config battery (R5: fusion ×
 level-source × floor-semantics on the headline targets):
 

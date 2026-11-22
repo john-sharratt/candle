@@ -1,6 +1,6 @@
 # Zen everywhere, drones at rest
 
-**Status:** design, agreed 2026-11-15. Built in the order of §8.
+**Status:** agreed 2026-11-15. Steps 1–7 of §8 are built.
 
 Zen stops being a body in a room and becomes the one mind that is always
 running: it keeps watch over real things through **terminals**, does the small
@@ -25,12 +25,12 @@ and a standing task restates an idle drone's summons every 90 s
 
 | Piece | Where | Bearing |
 |---|---|---|
-| Zen is `takes_orders: false` — an **unordered** body; drones take orders | `tenant.rs:980`, `Missions::is_unordered` | The one switch every Zen/drone branch reads. No code names Zen. |
-| Zen is `moves: attention` — no `move_to`, no lift, a `focus` teleport | `sim/mod.rs:139`, `engine/enact/movement.rs:676` | Half-way to no body already. |
-| A conversation can be unloaded and rejoined from the log | `Minds::let_go` (`engine/mind/conversation.rs:2097`) | Used by suspension; an idle drone uses the same path. |
+| Zen is `takes_orders: false` — an **unordered** body; drones take orders | `Runtime::takes_orders` (`engine/runtime/missions.rs`), `Missions::is_unordered` | The one switch every Zen/drone branch reads. No code names Zen. |
+| Zen is `moves: attention` — no `move_to`, no lift, a `focus` teleport | `sim/mod.rs`, `engine/enact/movement.rs` | Half-way to no body already. |
+| A conversation can be unloaded and rejoined from the log | `Minds::let_go` (`engine/mind/conversation.rs`) | Used by suspension; an idle drone uses the same path. |
 | A held character: parked, `begin_tick` refuses, inbox fills and is cut on resume, reflect/dream/journal refuse | `Scheduler::suspend`, `follow_suspended`, `held::PER_SOURCE` | Exactly what idle is. |
 | The table hands a free drone its work | `Runtime::assign_work` → `work::take_up` | Built (§8 step 1): no act of a drone's takes work. |
-| An unordered body takes nothing from the table | `Missions::collect` | Its missions come from the people who message it. |
+| An unordered body takes nothing from the table | `Runtime::assign_work` (`engine/runtime/moments.rs`) | Its missions come from the people who message it. |
 | A conversation with a person puts an item on Zen's agenda | `mission_add` on the thread, `agenda/acts.rs` | A request becomes work for Zen today. |
 | Real devices, worked through an agent on the home network | `effector-bridge`, `npcd/src/bridge/` | Sonos, eISCP receivers, Cast, LG webOS, Android TV, WiZ bulbs, wake-on-LAN; found by `survey_network`. |
 | Coding tasks through zend | `engine/zen_task/` → zend `repo_task_*` as `service:zen` | Offered only when a carried mission grants them; no moon content does. |
@@ -111,7 +111,7 @@ back reaches Zen as the report's notice, urgent. A person's request
 television on is connect, act, disconnect.
 
 **The terminals are stated, never looked for.** The view of the whole names
-each terminal that can be reached (`sim::terminals::reachable`, noted every
+each terminal that can be reached (`engine::body::reachable`, noted every
 five minutes and whenever they are listed). The acts a body finds its way
 about the world with — `scan`, `focus` (`tools::WAYFINDING`) — are never
 offered to a mind with no body: it is shown every room as it changes, and

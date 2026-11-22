@@ -186,6 +186,11 @@ Each stage is measured against the last before the next is built.
 5. **The prefill width table** (`candle-conversation/src/prefill_width.rs`)
    re-derived against the tier per row that results.
 
+Stage 1 is the only stage in the code. Stages 2 and 3 are not built: no `Placer`,
+`Sizing` or `PhasedBuffers` exists, and every family's chains are still priced by
+the `WaveBuffer` inventory (`wave_plan/wave_buffer.rs`) summed by
+`WavePlan::phase_bytes`.
+
 ## 5. Stage 1 in detail
 
 ```

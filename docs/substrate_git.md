@@ -5,9 +5,9 @@
 substrate is held in (`zend-vfs/src/odb/`), zend reading every repository from it, and
 npcd's mind read from the substrate with `--mind-repo`. No folder and no `git` program is
 involved on a member. Nothing has run end to end across members yet (§12).
-**Scope:** where a member's git objects and refs come from. Today every zend member reads
-each workspace repository from its own checkout, and every npcd member reads its mind
-from a mirror it keeps under `--data`. This design moves both into the substrate: git's
+**Scope:** where a member's git objects and refs come from. Every zend member once read
+each workspace repository from its own checkout, and every npcd member its mind
+from a mirror it kept under `--data`. This design moved both into the substrate: git's
 packs and refs become replicated records, and a member reads every repository from what
 its log holds. Agents remain the only machines that talk to `origin` (fetch, push) and the
 only ones with working trees for commands. zend and npcd use the same mechanism.
@@ -26,11 +26,11 @@ it removes and what it adds, §11 the build order, §12 the tests, §13 what is 
   (`docs/zend_workspace_execution.md` §3.1, `zend-vfs/src/workspace.rs`).
 - A conversation's files are a union mount: its edits (`VfsEvent`, replicated,
   `docs/zend_vfs_events.md`) over a lower layer, which for a repository is
-  `Lower::Branch { source: Arc<GitSource>, .. }` (`zend-vfs/src/vfs/mod.rs:427-441`).
-  `GitSource::open(dir)` opens the checkout's `.git` (`zend-vfs/src/vfs/git_source.rs:52`).
+  `Lower::Branch { source: Arc<GitSource>, .. }` (`zend-vfs/src/vfs/mod.rs`).
+  `GitSource::open(dir)` opened the checkout's `.git` (`zend-vfs/src/vfs/git_source.rs`).
 - `Repo` holds libgit2 for lookups, and sends everything else to the `git` program:
   "the network (fetch, push, clone…), the working tree (checkout, merge, the index) and
-  everything that writes" (`zend-vfs/src/library/mod.rs`, `zend-vfs/src/lib.rs:139`).
+  everything that writes" (`zend-vfs/src/library/mod.rs`, `zend-vfs/src/lib.rs`).
   Commits, merges, `git_log` and `git_grep` therefore need a repository on disk.
 - `git_commit` / `git_merge` build objects in the member's own `.git` under scratch refs
   and push them to `origin` under a lease (`zend-vfs/src/write/commit.rs`,
@@ -46,15 +46,14 @@ it removes and what it adds, §11 the build order, §12 the tests, §13 what is 
 ### 1.2 npcd reads the mind from a mirror
 
 - With `--cluster`, the mind is `--mind-repo <name>`, mirrored at
-  `<data>/mind/<name>` with `origin = agent:<name>` (`npcd/src/mind_repo.rs:26,42-64`).
-  `--mind <dir>` is refused beside `--cluster`, and `--mind-repo` without it
-  (`npcd/src/tenant.rs:326-336`).
+  `<data>/mind/<name>` with `origin = agent:<name>` (`npcd/src/mind_repo.rs`, removed by §8.3).
+  `--mind <dir>` is refused beside `--cluster`, and `--mind-repo` without it.
 - The mirror follows the record every 60 s and after a publish, through `AgentFetch`
   (`docs/replicated_substrate.md` §10.3). A member whose mirror is not ready starts with no
   mind, makes the mirror once joined, and restarts onto it (`MindRepo::bring_up`,
-  `mind_repo.rs:88`).
+  `mind_repo.rs`).
 - npcd reads the mind as files. The schema is `std::fs::read_to_string` of
-  `projection.yaml` at start (`npcd/src/engine/schema.rs:67-69`). About 25 modules read the
+  `projection.yaml` at start (`npcd/src/engine/schema.rs`). About 25 modules read the
   mind folder directly: the watcher, registry, corpus, console, API, mission generation
   and lifegen among them.
 - The watcher turns file changes into substrate writes: unchanged costs nothing, changed
@@ -72,8 +71,8 @@ it removes and what it adds, §11 the build order, §12 the tests, §13 what is 
 - **Leases.** Paxos leases among an app's members, used by `ingest/<content key>` so one
   member reads a unit, and by `calibrate/<marker>` so one member calibrates it
   (`zend/src/ingest_lease.rs`).
-- **Fetch and push behind traits.** `Fetch` and `Push` (`zend-vfs/src/remote/fetcher.rs:17`,
-  `pusher.rs:16`) have local and agent implementations (`AgentFetch`, `AgentPush`).
+- **Fetch and push behind traits.** `Fetch` and `Push` (`zend-vfs/src/remote/fetcher.rs`,
+  `pusher.rs`) have local and agent implementations (`AgentFetch`, `AgentPush`).
 - **Records that wait for their parents.** A record whose parent has not arrived waits for
   it (`docs/replicated_substrate.md` §6.5).
 
@@ -124,7 +123,7 @@ last writer wins by version stamp), held in RAM and replicated; a pack's bytes a
 | `git/slice/<repo>/<oid>` | A commit an unfinished sliced fetch has taken (§5.1), so the next lease holder resumes from it |
 
 - **Packs.** At most 64 MiB, so a pack fits a relocation stripe
-  (`persistence/stripes.rs:14`) and replicates as 64 `EVENT` fragments or fewer. A pack
+  (`MAX_STRIPE_BYTES`, `persistence/stripes.rs`) and replicates as 64 `EVENT` fragments or fewer. A pack
   comes from one of three places: the objects a member made, packed when it publishes
   (§4.4); a bundle an agent answers a fetch with, written as it is taken (§5.1); and a
   folder repository adopted into the log (`adopt`, the tests' fixture). Every pack is
@@ -248,8 +247,8 @@ every 2 s by zend's `substrate-git` thread (`zend/src/substrate_git.rs`). Each t
 
 1. **Publishes this member's pushes**: a record branch ahead of the log (§6.2).
 2. **Imports**, on the member holding the lease `git/<repo>` (Paxos, 120 s, renewed every
-   30 s): fetches every branch into `import` through `Fetch` (`AgentFetch` with
-   `--cluster`), and publishes every branch that moved ahead of the log. A fetch that
+   30 s): fetches every branch, at most every 15 s (`FETCH_EVERY`), into `import` through
+   `Fetch` (`AgentFetch` with `--cluster`), and publishes every branch that moved ahead of the log. A fetch that
    fails (no agent, origin down) is reported and the tick carries on.
 3. **Syncs** the store up to the log. A record that changed since the follower last
    reported it — a sync, or this member's own push landing — wakes zend's ingest worker

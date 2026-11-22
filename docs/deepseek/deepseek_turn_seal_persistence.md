@@ -2,8 +2,8 @@
 
 > **Status:** the **model-side seal/resume primitives are implemented and tested**
 > (Artifacts A/B/C/D, see §9); the **conversation-side record + scheduler seal
-> wiring is specified** (§9.2) and lands atomically with the scheduler path that
-> drives DeepSeek. Builds directly on the sliding-window KV ring (`base_pos` /
+> wiring is specified** (§9.2, not built) and lands atomically with the seal hook the
+> scheduler path calls. Builds directly on the sliding-window KV ring (`base_pos` /
 > `evict_window_front`, committed `67309fc0`). Authoritative for the DeepSeek
 > seal/resume path; where it disagrees with code, the code is wrong.
 
@@ -12,9 +12,12 @@
 The sliding-window ring bounds the *live* window to `O(window_size)`. What it does
 **not** yet do is persist a turn so a resumed conversation reconstructs (a) the raw
 ring buffer and (b) the turn's compressed KV, and so provenance can *select* the turn.
-DeepSeek currently has **no substrate seal wiring at all** — `BatchedEngine` is only a
-`ManagedBatchedModel` (`latent_moe/wave/mod.rs:132`), driven by tests; nothing calls `record_turn` /
-emits `WideQSig` / persists the gallery. This document specifies that seal, and the
+DeepSeek currently has **no seal wiring into the substrate** — `BatchedEngine`
+(`latent_moe/wave/mod.rs`) is a `ManagedBatchedModel` (`latent_moe/wave/managed.rs`) that the
+scheduler binds for `ModelArch::DeepSeekV4` (`candle-conversation/src/models/builder/load_arch.rs`),
+but nothing in the seal path calls its seal/snapshot primitives, emits an Indexer `WideQSig` or
+persists the gallery, and a single-latent backing refuses section restore-from-log
+(`scheduler/sections.rs`: re-ingest). This document specifies that seal, and the
 matching resume.
 
 The design rests on one structural fact established earlier: **`window_size ≥
@@ -54,7 +57,7 @@ prior one** for that timeline. Because it is decoupled from the turn's corpus/to
 records (which are permanent), it must be its **own record type**, not a field on
 `TurnDecl`.
 
-**New `RecordType::WindowRing = 20`** (next free after `TurnCoupling = 19`).
+**New `RecordType::WindowRing`** (the next free tag: 32 at HEAD — tags 20–31 are taken, 20 is `Snapshot`).
 Payload (versioned):
 - `timeline_id`, seal `turn_index` (keying + provenance/debug)
 - per layer: the dense resident-window KV bytes (K≡V single latent → one band set).
@@ -80,8 +83,8 @@ compaction/maintenance liveness pass re-emits only the current (latest) copy fro
 in-RAM state, so the superseded copy is absent from the resident set and reads as dead.
 There is **no per-record `Tombstone`**: `RecordType::Tombstone` (record 14) is
 timeline/turn-scoped death, not a metadata-supersession marker; the supersede-and-keep-
-latest is the positional LWW mechanism `ConvState` uses (`persistence/mod.rs`
-`is_tracked_metadata` / `metadata_locs`; `persistence/maintenance/resident.rs` `gather_resident_set`;
+latest is the positional LWW mechanism `ConvState` uses (`persistence/replication.rs`
+`is_tracked_metadata`, `persistence/appends.rs` `metadata_locs`; `persistence/maintenance/resident.rs` `gather_resident_set`;
 `persistence/compaction/collect.rs` `collect_live_records`). Distillation drops the ring like the KV chunks
 (it is transient window state, not the durable belief signature `WideQSig`).
 
@@ -158,9 +161,9 @@ provenance reordering safe.
 
 **What.** At seal, extract the **Indexer's** per-head roped query `sign(Q)` for the
 turn and store it in the existing `WideQSig` records. `Indexer::query_space`
-(`indexer.rs:60`) already yields the roped per-head `q [n_heads, head_dim=128]` — sign
+(`latent_moe/indexer.rs`) already yields the roped per-head `q [n_heads, head_dim=128]` — sign
 its 128 dims per head → pack via `WideQSig::from_band(band, head_dim=128)`
-(`provenance/wide_sig.rs`). "It might be multiple extracted from it": a turn yields
+(`candle-conversation/src/provenance/wide_sig.rs`). "It might be multiple extracted from it": a turn yields
 several rows (per captured token / per indexer head); store all via `encode_wide_sigs`
 and `enqueue_wide_q_sigs(turn_stream_id, blob)` — the same off-thread writer other
 models use.
@@ -168,7 +171,7 @@ models use.
 **Why this is the *right* source.** DeepSeek's Indexer **is** the learned significance /
 recall space ("BDP but learned/float/≤1M"). For every other model the wide-Q is a
 *heuristic* fold of R16 `sign(Q)` across all layers (`gather_wide_sigs`,
-`scheduler/mod.rs:6476`, `fold_provenance`). DeepSeek instead reads the model's **real**
+`scheduler/provenance_capture.rs`, `fold_provenance`). DeepSeek instead reads the model's **real**
 significance directly from the Indexer — no layer-fold heuristic. The output format is
 identical (`WideQSig`, 128-bit heads), so it **plugs straight into** the unchanged
 selection pipeline: `score_belief_*` / `gather_wide_sigs`-consumers read
@@ -216,15 +219,15 @@ On conversation open:
 - `latent_moe/compressor/incremental.rs`: `IncrementalCompressor::close()` (+ byte-exact test).
 - `kernel_attention.rs` / `latent_moe/gallery/snapshot.rs`: seal snapshot of the gallery's corpus entries
   (serialize) + inject (deserialize into `append_batch`/`gather_corpus` shape).
-- `indexer.rs`: `sign(Q)` extraction → `Vec<WideQSig>`.
+- `latent_moe/indexer.rs`: `sign(Q)` extraction → `Vec<WideQSig>`.
 - `latent_moe/wave/mod.rs` (`BatchedEngine`): seal hook exposing (window bytes, corpus entries,
   indexer wide-Q) to the scheduler.
 - Ring snapshot/restore reads/writes the `ChunkedKvBacking` window arena (the
   `base_pos`/resident chunks from the committed ring work).
 
 **candle-conversation**
-- `persistence/record/mod.rs`: `RecordType::WindowRing = 20` + payload codec.
-- Seal path (`scheduler/mod.rs::perform_seal_and_write` / `projection/resolver/mod.rs::
+- `persistence/record/mod.rs`: `RecordType::WindowRing` (next free tag) + payload codec.
+- Seal path (`scheduler/perform_seal.rs::perform_seal_and_write` / `projection/resolver/turn_log.rs::
   record_turn`): accept + persist DeepSeek's window/corpus/wide-Q; DeepSeek override of
   `gather_wide_sigs` (Indexer source).
 - `persistence/maintenance/mod.rs` / `persistence/compaction/mod.rs`: `WindowRing` = supersede-and-tombstone
@@ -240,7 +243,7 @@ On conversation open:
 
 1. **Close partials.** `IncrementalCompressor::close`; test the partial pool equals the
    softmax over the buffered rows (overlap prev-half included). Gallery gains the closed
-   entry; `wave_paris` / StoryRewrite still green.
+   entry; the wave gates (`wave_prefill_then_decode_end_to_end`) / StoryRewrite still green.
 2. **Corpus persist ↔ resume.** Serialize gallery entries at seal, inject on resume;
    byte-exact round-trip test (`seal → Chunk → load → inject == live gallery`).
 3. **WindowRing event.** New record type + payload + emit/tombstone/restore; a
@@ -302,22 +305,22 @@ integration composes them.
 - `FloatGallery::snapshot() -> CorpusSnapshot` / `from_snapshot(device, &snap, positions)`
   — native durable form (two-region + keys); `positions` are the RECONSTRUCTED
   group-starts the caller supplies (`base + i·ratio`), not from the snapshot; signs
-  repacked from keys; archival `attn` is a CPU zero placeholder (reference
-  `gather_selected` only, unused post-resume). GPU test
+  repacked from keys; no f32 `attn` archive exists (the two-region cache is the canonical
+  stored latent). GPU test
   `gallery_snapshot_restore_round_trip` restores at a fresh base (10 000) and asserts
   bit-exact `nope_i8`/`nope_scale`/`rope_bf`/`keys`/`signs` + the reconstructed `pos`.
 - `BatchedEngine::{seal_sequence, corpus_snapshot, corpus_restore}` — per-layer seal
   (B), snapshot (`Vec<Option<CorpusSnapshot>>`, `None` on SWA), and fresh-state restore
   that reconstructs each layer's positions as `corpus_base + i · compress_ratio(layer)`.
 
-**Artifact A — window ring snapshot/restore** (`kv_cache/chunked/sequence_ops/mod.rs`,
-`kv_cache/chunked/chunk_ops/mod.rs`; `latent_moe/wave/mod.rs`)
+**Artifact A — window ring snapshot/restore** (`kv_cache/chunked/sequence_ops/window.rs`,
+`kv_cache/chunked/io.rs`; `latent_moe/wave/mod.rs`)
 - `ChunkedKvBacking::{window_base_pos, resident_len, set_window_base_pos}` +
-  `SequenceState::{base_pos, set_base_pos}` — the resident-window + absolute-frame
+  `SequenceState::{base_pos, set_base_pos}` (`chunked/types/sequence_state.rs`) — the resident-window + absolute-frame
   accessors. Snapshot reads via `read_contiguous(seq, 0, resident_len)` (FP8/BF16 ⇄ F32 is
   lossless for the writer formats); restore writes via `ensure_for_offset` +
   `write_contiguous` + `set_len` + `set_window_base_pos`. Backing test
-  `window_ring_snapshot_restore_round_trip` proves content bit-exact AND each restored row
+  `window_ring_snapshot_restore_round_trip` (`chunked/chunk_ops/tests_cpu_migration.rs`) proves content bit-exact AND each restored row
   still equals its absolute position after a real front-chunk eviction.
 - `WindowRingSnapshot`/`WindowRingLayer { resident_len, kv }` — **no stored position**.
   `BatchedEngine::window_ring_snapshot` captures the dense resident tail;
@@ -343,8 +346,8 @@ integration composes them.
 
 ### 9.2 Conversation side — integration spec (lands atomically with the scheduler seal path)
 
-DeepSeek is **not yet driven by the `Scheduler`** (tests exercise `forward_wave`
-directly), and the scheduler's seal path is model-agnostic — `gather_wide_sigs` reads only
+The `Scheduler` binds DeepSeek (`BatchedEngine`, `ModelArch::DeepSeekV4`), but its seal path
+calls none of the primitives above, and the scheduler's seal path is model-agnostic — `gather_wide_sigs` reads only
 `self.session` (the KV backings), never `self.model`, and `ManagedBatchedModel` has no
 seal hook. So the conversation-side wiring below must land together with (a) a
 `ManagedBatchedModel` seal hook and (b) the scheduler actually running DeepSeek; landing
@@ -362,7 +365,7 @@ consumer. The seams are exact (mapped against the current tree):
    CSA layers), drained at seal. Always-on (no env flag), so it lands only with the
    scheduler consumer that pays for it.
 
-3. **`RecordType::WindowRing = 20`** (`persistence/record/mod.rs`): next free tag. Add the
+3. **`RecordType::WindowRing`** (`persistence/record/mod.rs`): next free tag (32). Add the
    enum variant, the `from_tag` arm, a binary `WindowRingRecordPayload {timeline_id,
    turn_index, ring: Vec<u8>}` (per-layer dense window-KV blob; the model's
    `WindowRingSnapshot` bytes). **No absolute position in the record** — the resume path
@@ -383,7 +386,7 @@ consumer. The seams are exact (mapped against the current tree):
    (one per compression layer, `chunk_index = flat_chunk_index(layer, 0, ...)`), injected
    on resume via `corpus_restore`.
 
-5. **DeepSeek `gather_wide_sigs` override** (`scheduler/mod.rs:6476`): when the model is
+5. **DeepSeek `gather_wide_sigs` override** (`scheduler/provenance_capture.rs`): when the model is
    DeepSeek, source the turn's wide-Q from the captured Indexer bands
    (`WideQSig::from_band(band, 128)` per token) instead of the R16 fold — same
    `WideQSig` record + `enqueue_wide_q_sigs` + selection scan, only the *source* changes.

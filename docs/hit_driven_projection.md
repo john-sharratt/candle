@@ -80,7 +80,7 @@ The findings this answers are in
 - **Boundary**: a point where the projection runs. A reply reaches one at a
   line feed past the content gate and once `reproject_every_n_tokens` (64)
   tokens have passed since the last boundary, and never inside a tool call
-  (`provenance::boundaries`, `scheduler/decode/mod.rs`); each chunk of a long
+  (`provenance::boundaries`, `scheduler/decode_state.rs`); each chunk of a long
   opening ends at one, the opening's last does not (§7.4).
 - **Stride**: the queries between two boundaries.
 
@@ -151,7 +151,7 @@ at every selecting layer, whatever its score.
   window), the index cache holds up to four `[start, end)` position ranges
   (`IndexCache::set_pins`, `qsa_select::MAX_PINS`), declared after each
   projection walk from the pinned sections' places (`pin_ranges_of` in
-  `candle-conversation/src/scheduler/projection_assembler/mod.rs`) through
+  `candle-conversation/src/scheduler/projection_assembler/slot_state.rs`) through
   `ManagedBatchedModel::set_selection_pins`. They move with every splice and
   cut, as the prompt span does, and reach the selection kernel as each row's
   block ranges (`PinRow`).
@@ -386,7 +386,7 @@ At each boundary:
      by its lifted strength a piece the question named.
    - **Size, per card: the larger of a token budget and a count per kind.**
      2,000,000 tokens on the 72 GB card, 1,000,000 on the 24 GB card, 512,000
-     on the 16 GB card (`scheduler::pool::pool_tokens_for`), and at least 6
+     on the 16 GB card (`working_set::PoolSize::for_card`), and at least 6
      pieces of each kind on the 72 GB card and 4 on the others — readings,
      folder summaries, guides and journal notes each filled to its count by
      its own strength before the token budget is spent by strength across
@@ -684,16 +684,16 @@ A code reading (`zend/src/code_read/`) is one piece. Its request asks for the
 file, its tool rounds each read one range of it, and its answer summarises it.
 The pool holds the whole reading; the slot holds its first and last turns and
 the pages the indexer asks for. Placing a 306K-token file in a dialogue does
-not cost 306K, only the pages the question reads, up to `max_file`.
+not cost 306K, only the pages the question reads, under the readings' cap.
 
 - **One read per reply.** The reading asks for one `file_read` per reply, one
   range of at most `PAGE_LINES` (200) lines each, so each tool round is one page
   and carves at that page's cost. A reply that batched `MAX_TOOL_CALLS_PER_TURN`
   (12) reads would make a round of twelve pages, placed or dropped together.
   Code-reading ingest bounds its own replies to one call
-  (`opening_prompt`, the reading's tool grammar), and its round limit is the
-  file's page count, not `MAX_FILE_READ_ROUNDS`, so a file of any length reads
-  to its end in rounds of one page.
+  (`opening_prompt`, `zend/src/code_read/reading.rs`, the reading's tool
+  grammar), and its round limit is the file's page count, so a file of any
+  length reads to its end in rounds of one page.
 - **Scored per turn, on the band.** Each page turn has its own hit counter
   and base. Its base is provenance's normalized score for that turn (§7.1),
   lifted by its hits, and a page with no base that the indexer reads is
@@ -835,9 +835,9 @@ had said it is read back as something it said
 
 ## 12. Built
 
-Items 1–17 are built; each names the section it answers to and where it
-lives. Items 18–26 are the pool-first revision (2026-11-18) of §7.1, §7.2,
-§7.5 and §8.5, and are what is left to build. A built item is not the same as
+Every item is built; each names the section it answers to and where it
+lives. Items 18–26 are the pool-first revision (2026-11-18, built 2026-11-19) of §7.1, §7.2,
+§7.5 and §8.5. A built item is not the same as
 a live one: the fill of item 12 was built and tested on the CPU and did not run
 on the daemon until 2026-11-18 (§8.2). An item is live when the daemon's own
 prompt dumps (`/v1/conversations/<id>/prompt-tokens`) and projection points
@@ -884,9 +884,9 @@ show it.
     (`qwen4exp/resident_page.rs`). A sequence's pool holds a piece's sampled
     layers only, shared per card with every slot that places the rest, and
     the pool's rows are addressed by descriptor table.
-11. **The pool (§7.2).** `pool_tokens` by card size (`scheduler/pool.rs`); a
+11. **The pool (§7.2).** `working_set::PoolSize` by card size (`scheduler/pool.rs`); a
     dialogue's pool is its floors, then provenance's candidates lifted by
-    their rounds' hits, up to the card's `pool_tokens`; each pooled
+    their rounds' hits, up to the card's token budget; each pooled
     conversation's pages are held at the sampled layers
     (`scheduler/pool_refresh.rs`). The hit map covers loaded rounds, then
     pooled ones (`PooledRound`). Item 21 removes the pool's warm asks.
@@ -916,8 +916,8 @@ show it.
     each query; a hit is in its window's top `keep` and above the cut, and is
     counted into the same counters with `shadow_queries` as its denominator.
 16. **Openings (§7.4).** An opening's rows are selected and counted like
-    decoded rows, and the turn's first reprojection fires at its first
-    decoded token (`wants_early_reprojection`). On a selecting engine an
+    decoded rows, and no boundary fires at an opening's end: the reply's
+    first boundary is the rule's (§7.4, item 28). On a selecting engine an
     opening longer than `reserve_tokens` is prefilled in strides of that
     length: each stride stops at its boundary and waits while a reprojection
     rechooses the slot from the hits its rows ran up, holding the turn as an

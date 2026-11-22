@@ -28,8 +28,9 @@ The other items are rewritten here as each lands.
 
 ## 1. The idea
 
-Every dialogue carries a **working set**: a voluntary token budget (64K) of
-already-ingested `code_reading` files and `repo_map` folders, projected ahead of
+Every dialogue carries a **working set**: a pool, sized by the card
+(`working_set::PoolSize`), of already-ingested `code_reading` files, `repo_map`
+folders, guides and journal notes, projected ahead of
 its own turns as **one sequence in the order its members entered**. The unit is
 always a **whole ingest conversation** — one file or one folder.
 
@@ -68,8 +69,9 @@ alias (`ConversationEngine::reseed_base_children`).
 
 Every member enters at the **end** of the sequence, beside the dialogue, so
 the newest provenance sits nearest the question. A member keeps its place until
-it leaves, and the gap closes at once. A newcomer that needs room dislodges the
-weakest provenance only when it is clearly stronger.
+it leaves, and the gap closes at once. The pool is chosen again at every
+observation, by strength: a piece that ranks in enters at once and one that
+ranks out leaves.
 
 **Ingestion is not changed.** The belief scan already scores every exchange of
 every ingested file; the working set only reads those scores.
@@ -132,7 +134,7 @@ emits (`projection/project/pipeline/sink.rs` Step 12):
 ```
 system prompt
 inherited chain         the dialogue group's lineage turns
-repo_map/structure      provenance folders       ┐ working set: provenance ≤ budget_tokens
+repo_map/structure      provenance folders       ┐ working set: the pool, by strength
 code_reading/scopes     provenance files         ┘
 dialogue                its own turns: recent 16 + historical 8, its own 180K window
 ```
@@ -165,7 +167,7 @@ the system prompt. Every change to the sequence is an append or a removal, so:
 - **Long-lived provenance is absolute-stable.** Nothing enters to its left, so it
   keeps its place beside the system prompt.
 - **The churn lands beside the dialogue.** Newcomers enter at the end and the
-  weakest — usually the youngest — are dislodged there. Retrieval falls off with
+  weakest — usually the youngest — leave there. Retrieval falls off with
   distance (measured 2026-09-30 on Flash-Next: a file at the start of a
   ~390K-token prompt could not be read back, the same file near the end was
   read correctly), so the newest provenance sits nearest the question.
@@ -182,14 +184,14 @@ The distance limit is not solved by ordering: as the dialogue grows, everything
 ahead of it moves further back. That remains open.
 
 **Budget.** The two groups are sized by the working set, not by the flexbox.
-On a selecting engine the shares below are caps on the slot fill
+On a selecting engine the `shares:` block (§4.2) gives caps on the slot fill
 (`projection/fill.rs`), which places the working set and the dialogue in one
 pass; on any other engine `projection/project/pipeline/sink.rs` takes the working set's selections off
 the top and distributes the dialogue's `window` over the rest. Their
 `budget:` shares in `projection.yaml` are deleted.
 
-- `repo_map` — provenance folders up to `folder_tokens`.
-- `code_reading` — provenance files up to what remains of `budget_tokens`.
+- `repo_map` — provenance folders, under the `folders` share.
+- `code_reading` — provenance files, under the `readings` share.
 
 **What fills the voluntary budget today (open, §4.3).** Measured on a
 conversation about the paper, 2026-10-24/25:
@@ -211,8 +213,9 @@ as the conversation's opening already; admitted on momentum it emitted twice —
 measured: `AGENTS.md`'s 46K characters in both the working set and the chain
 (`Substrate::working_set_candidate`).
 
-Two budgets because the two groups' scores are normalised separately and cannot
-be ranked against each other; folders are small, so a fixed slice is enough.
+Each kind keeps its own minimum in the pool (`PoolSize::per_kind`) because the
+groups' scores are normalised separately and cannot be ranked against each
+other.
 
 ### 4.2 Configuration
 
@@ -222,12 +225,10 @@ On the dialogue layer, replacing `fast_path_window` (deleted):
   - name: dialogue
     working_set:
       reserve_tokens: 16384      # what arrives between two projections; the slot is the engine's trained window less this
-      budget_tokens: 64000       # seeds + provenance, folders and files together
-      folder_tokens: 10000       # repo_map's share of budget_tokens
-      guidance_tokens: 16000     # the guidance pool, beside budget_tokens
-      beta: 0.2                  # per-file momentum leak (§4.3)
-      min_momentum: 100          # below this a file is not a provenance candidate
-      max_file_tokens: 48000     # the most of one reading the slot places (§4.4)
+      shares: { readings: 0.225, folders: 0.02, guides: 0.05, journals: 0.105, dialogue: 0.6 }
+      beta: 0.2                  # per-piece momentum leak (§4.3)
+      min_momentum: 100          # below this a piece is not a pool candidate
+      type_shares: …             # §4.10
       seeds:
         - candle/zend/
         - candle/zend/src/
@@ -256,31 +257,31 @@ On the dialogue layer, replacing `fast_path_window` (deleted):
 
 ### 4.3 State and momentum
 
-One reprojection admits at most `working_set.max_admits` provenance newcomers
-(default 2). The rest keep their momentum and enter on later reprojections. See
-`docs/projection_swap_cap.md`.
+Nothing throttles entry: the pool is chosen again at every observation, and the
+strongest pieces that fit enter at once. The swap cap of
+`docs/projection_swap_cap.md` binds belief-driven groups, not this pool.
 
 The substrate keeps one `WorkingSet` per dialogue,
-`HashMap<TimelineId, WorkingSet>`, in `candle-conversation/src/working_set/`:
+`HashMap<TimelineId, WorkingSet>`, in `candle-conversation/src/working_set/`.
+Its core state is the members in emission order (`{ timeline, tokens, share,
+kind }`) and the momentum of every member and candidate; it also carries the
+withheld set, each conversation's last fresh score, the hit momentum
+(`docs/hit_driven_projection.md` §7.1), and the slot's held turns.
 
-```rust
-pub struct WorkingSet {
-    members: Vec<Member>,                // emission order: { timeline, tokens, share }
-    momentum: HashMap<TimelineId, f32>,  // members and candidates
-}
-```
-
-The **budget is enforced on entry**, so membership is state, not a fresh pick
-each projection: an unchanged set projects identically. Each member draws on its
-group's share — folders up to `folder_tokens`, files on what `budget_tokens`
-leaves — which the substrate knows per group (`Substrate::set_working_set_share`,
-set at setup from each `working_set` rule's `share`). Every operation:
+Membership is chosen from momentum at each `observe`: each kind's strongest
+pieces up to `PoolSize::per_kind` whatever they cost, then the strongest of
+every kind while `PoolSize::tokens` has room, a typed piece only while its type
+is under its share (§4.10). A member chosen again keeps its place; a newcomer
+enters after every member already there, strongest first. The substrate knows
+each group's share per kind (`Substrate::set_working_set_share`, set at setup
+from each `working_set` rule's `share`). Every operation:
 
 | Operation | What happens |
 |---|---|
-| `observe` | Momentum decays for everything; a conversation under `min_momentum` leaves the map and, if a member, the sequence — the gap closes. A member its scope no longer offers leaves too. Then the strongest non-members try to enter at the end, each dislodging only provenance it beats by `DISLODGE_MARGIN` (×1.5) — without the margin two files near the floor trade places every reprojection and each trade rebuilds everything to its right. |
-| `seed` | At open, in list order: each seed gains `seed_momentum` (1000) and enters at the end while the budget has room — seeds dislodge nothing. One that misses for room stays a candidate. |
+| `observe` | Momentum decays for everything and each scanned conversation adds its fresh score; a conversation whose strength (momentum lifted by its hit momentum) is under `min_momentum` leaves the map. The pool is then chosen again, so a member that ranks out leaves and the gap closes. |
+| `seed` | At open, in list order: each seed gains `seed_momentum` (1000) and enters at the end while the pool has room (and its type its share). One that misses for room stays a candidate. |
 | `remove` | A tombstoned conversation leaves; the gap closes. |
+| `withhold` | See §4.5. |
 
 An unattended seed falls under the floor after
 `ln(1000 / min_momentum) / ln(1 / (1 − β))` reprojections — eleven at the
@@ -291,7 +292,7 @@ defaults.
 reprojection (the scan already produces per-exchange normalised scores; a max
 per timeline is one pass). A file hit steadily settles at `fresh/β`; one left
 alone decays geometrically. Below `min_momentum` (config, default 100 — the
-noise floor `code_reading/scopes` gates at today, `projection.yaml:821`) a file
+noise floor `code_reading/scopes` gates at in `projection.yaml`) a file
 is dropped from the map, and only files at or above it are provenance
 candidates, so an idle budget stays empty rather than filling with noise.
 
@@ -320,8 +321,8 @@ not belief-driven but is still scanned (`GroupSchema::is_scanned`). For the two
 working-set groups the max per timeline is taken and handed to the dialogue's
 `WorkingSet` under the substrate write lock. The turn's opening projection is
 not scanned (it reads zero scores), so it projects the momentum as it stood —
-which is what an opening should see. Momentum ranks only who enters and who is
-dislodged; it never places anyone.
+which is what an opening should see. Momentum ranks only who is in the pool and
+who is out; it never places anyone.
 
 **Momentum need not survive a restart.** It is a ranking, not a promise; it
 stays in-memory and rebuilds from the scan within a few reprojections.
@@ -337,17 +338,14 @@ A `working_set` selection rule, declared on `repo_map/structure` and
 the group's working-set members, whole, in the working set's order (§4.3) —
 nothing is chosen at projection time.
 
-**A reading longer than `max_file_tokens` is carved, not refused.** On an
-engine whose fill carves the slot (`docs/hit_driven_projection.md` §7.2),
-the fill places at most `max_file_tokens` of one reading: its first and last
-turns and the page turns that score highest, each whole (§8.1 there). So a
-reading longer than the cap is admitted as a seed or as provenance, and
-charged the cap against the budget, not its whole size
-(`Candidate::carved_to`, applied by `Substrate::provenance_charge`). On an
-engine that emits members whole, it is never a member.
+**A reading of any size is pooled whole.** There is no per-piece cap: the
+pool is charged the reading's recorded tokens, and the fill carves the slot
+(`docs/hit_driven_projection.md` §7.2) — a reading too large for its share is
+placed by its first and last turns and the page turns that score highest, each
+whole (§8.1 there).
 
-Measured 2026-11-18, the §9.12 battery's answers sit in five files past the
-cap: `scheduler/mod.rs` (306K tokens), `quantized/cuda.rs`,
+Measured 2026-11-18, under the 48K per-piece cap then in force, the §9.12
+battery's answers sat in five files past it: `scheduler/mod.rs` (306K tokens), `quantized/cuda.rs`,
 `conversation.rs`, `region_pool.rs` and `projection_assembler.rs`. Refused
 whole, they could never be placed, and two questions had no other answer
 file (`docs/results/dependency_battery_gap_analysis_2026-11-18.md`). The same day
@@ -367,15 +365,16 @@ scoped group, and leaves the set at the next observation.
 
 **Off the flexbox, by an existing precedent.** A `score_density` group already
 has its picks decided upstream and emitted verbatim, skipping the bounded pass
-(`projection/project/pipeline/sink.rs:1851-1864`). A `working_set` group takes the same path, and one more
+(`projection/project/pipeline/sink.rs`, the group emission after Step 11b). A `working_set` group takes the same path, and one more
 step: its natural consumption is left out of `layer_items`/`group_items`
-(`projection/project/pipeline/sink.rs:1768-1848`), so the flexbox distributes the dialogue's `window`
+(`projection/project/pipeline/sink.rs`), so the flexbox distributes the dialogue's `window`
 over the other groups as if the working set were not there. Its selection is
-sized by its own budget and never trimmed.
+sized by the pool and never trimmed.
 
-**Budget between the two groups.** Enforced when a member enters (§4.3): the
-folder members hold at most `folder_tokens` between them, and the files take
-what `budget_tokens` leaves.
+**Budget between the kinds.** Enforced when the pool is chosen (§4.3): each
+kind holds its `PoolSize::per_kind` minimum, the rest of `PoolSize::tokens` goes
+to the strongest of any kind, and on a selecting engine the fill's `shares:`
+cap what each kind places.
 
 `in_tool_rounds` becomes `true` on both layers — the working set must be present
 in the rounds that lean on it. `locality`, `anchor`, `budget_adaptive` and the
@@ -384,7 +383,7 @@ which no longer selects anything here. The scan's own settings
 (`fusion`, `layer_weights`, `question_pin`, `level_prior`) stay — they decide the
 fresh scores momentum is built from.
 
-The dialogue group loses its injection splice (`resolver.rs:4546-4551`): it holds
+The dialogue group loses its injection splice: it holds
 lineage and its own turns only, and its 96K window is its own again.
 
 ### 4.5 Reads — every one runs, and the loop withholds what it read
@@ -398,7 +397,7 @@ anchor before stating a fact: that rule sent it to re-read the seed it held
 a file's contents.
 
 **The loop withholds what it read** (`zend::session::withhold_read_files`,
-`zend::working_set::corpus::readings_of`, `WorkingSet::withhold`). After a
+`zend::working_set::corpus::readings_of_all`, `WorkingSet::withhold`). After a
 round, every successful `file_read`'s file, at the version the read returned,
 names its ingested readings, and those are kept from entering the working set
 for the rest of the turn's loop:
@@ -453,10 +452,10 @@ restart and `lock_tokens` / `release_on` were deleted
 Resolved per dialogue once, when it opens: a file through `CONTENT_KEY` at the
 blob the dialogue's branch holds, a folder through `folder_unit`. A miss
 (changed, not ingested, in the lineage) is skipped. Each resolved seed gains the
-seeding momentum and enters provenance in list order while the budget has room,
+seeding momentum and enters provenance in list order while the pool has room,
 dislodging nothing (§4.3) — so the seeds are the leftmost members, beside the
 system prompt and the priming chain. One that does not fit, has no recorded
-size, or, where members are emitted whole, is past `max_file_tokens` (§4.4) is
+size, or would take its type past its share (§4.10) is
 left out with a warning naming it; one
 that missed only for room stays a candidate and can enter later on its
 momentum.
@@ -568,7 +567,7 @@ question about the code it describes, so on momentum documents filled the
 voluntary budget and the code that ranked below them never entered.
 
 **What.** The dialogue's `working_set:` names types of document and the most of
-`budget_tokens` each may hold:
+`PoolSize::tokens` each may hold:
 
 ```yaml
       type_shares:
@@ -588,16 +587,13 @@ code, tests, kernels, scripts, and every folder — is unbounded. Shares are in
 `(0, 1]`, names unique, every pattern must compile; a declaration that breaks
 any of those is refused at load (`working_set::TypeShares::new`).
 
-**How it applies.** A share is a cap, not a reservation: it is checked where
-`folder_tokens` is, at admission (`WorkingSet::room_for`). A typed newcomer
-whose type would pass its share dislodges only weaker voluntary members of its
-own type — by the same `DISLODGE_MARGIN` — so a burst of strong documents can
-take each other's places but never the room the code would have. When it beats
-none of them it waits on its momentum, and the next-best candidate by score is
-considered. Seeds keep to the shares too. When the budget shrinks under a
-standing set, `observe` trims each type's weakest members back under its share
-(`WorkingSet::trim_types`). Guidance is its own pool and holds no type's
-share. Provenance orders everything inside the caps exactly as before.
+**How it applies.** A share is a cap, not a reservation: it is checked as the
+pool is chosen (`WorkingSet::choose`). A typed piece whose type would pass its
+share is skipped and the next-best candidate by strength is considered, so a
+burst of strong documents can never take the room the code would have. Seeds
+keep to the shares too. Because the pool is chosen again at each observation,
+a type back over its share loses its weakest members at the next one.
+Provenance orders everything inside the caps.
 
 The substrate types each candidate (`Substrate::working_set_candidate`) from the
 classifier zend installs at setup beside the groups' shares
@@ -610,15 +606,16 @@ and cap.
   dialogue's slot stays inside them (`docs/hit_driven_projection.md` §4): the
   slot is the engine's trained window less the 16K reserve, and one fill
   places everything in it after the system prompt — floors, then rounds by
-  score (`hit_driven_projection.md` §7.2). The 64K voluntary, 16K of guidance
-  and the dialogue's 180K window are caps on that fill, not reservations, so a
+  score (`hit_driven_projection.md` §7.2). The `shares:` of §4.2 (readings
+  22.5%, folders 2%, guides 5%, journals 10.5%, the dialogue 60%) are caps on that fill, not reservations, so a
   thin working set leaves its room to the dialogue and a short dialogue leaves
   it to the working set. A reserve that passes the trained window fills YaRN
   ×2 with one warning. A slot's rung follows its deepest
   position, so a dialogue inside the trained window runs the trained RoPE at
   every position. Progressive YaRN (`qwen4exp/rope.rs`) still carries a
-  sequence a caller drives deeper ×2 to 524,288. The only length checks are
-  against the RoPE reach (`scheduler/prefill/first_samples.rs:2052`); `max_seq_len` is ignored for this
+  sequence a caller drives deeper: ×2 to 524,288, then ×4 to 1,000,000
+  (`FLASH_NEXT_MAX`). The only length checks are
+  against the RoPE reach (`scheduler/prefill/wave_group.rs`, `first_samples.rs`); `max_seq_len` is ignored for this
   architecture.
 - **Sparse attention.** Flash-Next has 12 attention layers (every 4th of 48) and
   36 recurrent. Spliced content reaches the attention layers only, through QSA's
@@ -634,14 +631,13 @@ and cap.
   over in large units; momentum (rather than the fresh score) is what keeps that
   turnover slow.
 - **Speculative decoding.** Flash-Next's draft step builds plain `rope_cos_sin`
-  beside the rung set (`qwen4exp/draft.rs:627-634`). Speculation is off on this
+  beside the rung set (`qwen4exp/draft.rs`). Speculation is off on this
   model today (`draft_budget 0` at load), so it does not arise; before it is
   enabled, the draft head must be checked to rotate by the slot's rung past
   262K, or its drafts will be rejected at depth.
 
-Budget ships at 64K voluntary + 16K of guidance (D10), inside the
-trained window's slot with the reserve, the conversation fitted to what is left; the §7
-measurement watches these numbers.
+The pool is the card's (`PoolSize`) and the shares cap one fill of the trained
+window's slot less the reserve (D10); the §7 measurement watches these numbers.
 
 ## 6. Code map
 
@@ -651,8 +647,9 @@ measurement watches these numbers.
 | `WorkingSetConfig` (the `working_set:` block) | `candle-conversation/src/working_set/config.rs` |
 | `is_mark`, `is_dialogue` / `gather_tags` | `candle-conversation/src/working_set/marks.rs` |
 | Per-dialogue sets on the substrate; `tombstone_timeline` drops from every set | `candle-conversation/src/substrate/registry.rs` (`working_set_*`) |
-| `observe` after the scan | `scheduler/mod.rs` (`reproject_view_prepare`), `Conversation::observe_working_set`, `projection/working_set_observe.rs` |
-| `working_set` selection rule, `WorkingSetShare` | `projection/schema/mod.rs`, `projection/yaml/mod.rs` |
+| `observe` after the scan | `scheduler/reproject_prepare.rs` (`reproject_view_prepare`), `projection/resolver/belief_scoring.rs` (`Conversation::observe_working_set`), `projection/working_set_observe.rs` |
+| `working_set` selection rule, `WorkingSetShare` | `projection/schema/selection.rs`, `projection/yaml/parse_groups.rs` |
+| Pool size by card; per-kind fill shares; type shares | `candle-conversation/src/working_set/pool_size.rs`, `fill_shares.rs`, `type_shares.rs` |
 | Filling the groups; off the flexbox, emitted verbatim | `projection/project/pipeline/sink.rs` (Step 4b), `projection/working_set_pick.rs` |
 | The dialogue group holds lineage + its own turns; members per group | `projection/resolver/targeted_read.rs` (`TargetedRead::group_turns`, `working_set_members`) |
 | Withheld files: the set of files a turn's loop read for real, kept out of provenance's newcomers | `candle-conversation/src/working_set/state.rs` (`withhold`, `clear_withheld`), `substrate/registry.rs` / `engine/retrieval.rs` (`working_set_withhold`, `working_set_clear_withheld`) |
@@ -668,14 +665,14 @@ measurement watches these numbers.
 
 ## 7. Tests (CPU unless marked)
 
-- `WorkingSet`: a newcomer enters at the end and dislodges only provenance it
-  beats by the margin; a link of the dialogue's own chain is never seeded or
+- `WorkingSet`: the strongest candidates enter at once while the pool has room
+  and a newcomer enters at the end; a link of the dialogue's own chain is never seeded or
   admitted; `observe` settles a steady file at `fresh/β` and decays an idle
   one; a file below `min_momentum` leaves the map and is never a candidate; a
   withheld file keeps its momentum but does not enter; a tombstoned timeline
   leaves the set.
-- Selection: members emit whole, in the set's order, at their momentum;
-  `folder_tokens` bounds `repo_map` and `code_reading` gets the rest; the
+- Selection: members emit whole, in the set's order, at their momentum; each
+  kind holds its `per_kind` minimum in the pool; the
   flexbox distributes the dialogue's `window` exactly as it would with no
   working set (the dialogue group's selection is identical with and without a
   full working set); a focused projection carries no working set; an ingest
@@ -697,13 +694,13 @@ measurement watches these numbers.
 | D2–D4 | Locks: release, tie-break, which calls release | Withdrawn with the lock tier (§4.6). |
 | D5 | Where the working set sits | Its own layers' groups, which already emit ahead of the dialogue. |
 | D6 | Tool rounds | `in_tool_rounds: true`; ingestion unchanged. |
-| D7 | Provenance unit | Whole files and folders are what enters and leaves. Where the fill carves the slot, a reading past `max_file_tokens` is a member charged the cap, and the fill keeps its floor and best-scored page turns (§4.4). |
-| D8 | Seed list | §4.2 draft, to be edited. |
+| D7 | Provenance unit | Whole files and folders are what enters and leaves. A reading of any size is pooled whole, and the fill keeps the floor and best-scored page turns of one too large for its share (§4.4). |
+| D8 | Seed list | The `seeds:` list in `zend/src/prompts/projection.yaml`. |
 | D9 | Fade rate | Per-file momentum at β 0.2, leaking by its own value. |
-| D10 | Default budget | 64K voluntary, guidance 16K, caps on one fill of the trained window less the 16K reserve, beside the dialogue's 180K window (`docs/hit_driven_projection.md` §4, §7.2). Strength is momentum lifted by the model's own hits (§4.3, `hit_driven_projection.md` §7.1). |
+| D10 | Default budget | The pool is the card's (`PoolSize`); the `shares:` (readings 22.5%, folders 2%, guides 5%, journals 10.5%, dialogue 60%) cap one fill of the trained window less the 16K reserve (`docs/hit_driven_projection.md` §4, §7.2). Strength is momentum lifted by the model's own hits (§4.3, `hit_driven_projection.md` §7.1). |
 | D11 | Momentum store | In `WorkingSet`, not the belief carry; in-memory. |
 | D12 | Restart | Nothing is restored: seeds re-enter at open and momentum rebuilds from the scan. |
-| D13 | Folder vs file budget | `folder_tokens` slice for `repo_map`, the rest for `code_reading`. |
+| D13 | Folder vs file budget | Each kind holds its `per_kind` minimum in the pool, and its `shares:` entry caps what the fill places. |
 | D14 | A file decaying out under an `in_context` reply | No reply says `in_context`: every read runs (§4.5). |
 | D15 | "Complete read" without touching ingestion | Derived from the chain's own `file_read` pages and responses. |
 | D16 | A selected file that cannot be made hot | Dropped with a warning; nothing placed is a promise. |

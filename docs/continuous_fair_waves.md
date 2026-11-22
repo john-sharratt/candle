@@ -72,9 +72,13 @@ set — it fills the cold slots around it.
 
 New per-layer metadata in `projection.yaml`:
 
-- Each **layer** declares a `decode_priority`: `Low` | `Normal` | `High`.
+- Each **layer** declares a `decode_priority`: `Low` | `Normal` | `High` | `Urgent`
+  (`DecodePriority`, `projection/schema/layer.rs`). A conversation may carry its
+  own band in its `decode_band` metadata, which takes the layer's place.
 - A conversation inherits its layer's priority when it is created and attached.
-- **Default is `Low`** for every layer; the **dialogue** layer is `High`.
+- **Default is `Low`** for every layer; zend's **dialogue** layer is `Urgent`
+  (a person is waiting on each turn), above `High`, which is work somebody waits
+  on that is not a live conversation (npcd's `talk` layer, a Maker's table call).
 
 The priority is the **decode-to-prefill airtime ratio** `R` — how many decode
 tokens are produced for each prefill forward that completes:
@@ -83,7 +87,8 @@ tokens are produced for each prefill forward that completes:
 |---|---:|---|
 | Low    | 1  | prefill drains at full speed; least decode protection (bulk ingest) |
 | Normal | 16 | prefill stretched ~16× while 16 decode tokens land |
-| High   | 64 | prefill heavily throttled; decode latency maximally protected (dialogue) |
+| High   | 64 | prefill heavily throttled; decode latency maximally protected |
+| Urgent | 64 | the same ratio as `High`, and ranked above it (zend's dialogue) |
 
 Concretely, with `N` layers the prefill cursor is given a budget of `~N/R` layers
 of forward progress per wave (fractional, accumulated):
@@ -123,9 +128,10 @@ cohorts beside 1–3 `Low` decodes) held the creep to 43 ms of every ~190 and
 prefilled at 0.5–2.6k tok/s on a card measured at 6.7k. The arrival bound keeps
 what a higher band's prompt waits at the step's end where it was.
 
-**An outranking decode is protected, and a `High` one from `High` work too.**
-The creep yields to the decodes that outrank it — and, when it is `High`, to the
-`High` decodes — at the highest of their ratios; with none, `R = 1` and it clears
+**An outranking decode is protected, and a live one from live work of its band too.**
+The creep yields to the decodes that outrank it — and, when it is `High` or
+`Urgent`, to the decodes of its own band — at the highest of their ratios; with
+none, `R = 1` and it clears
 every layer in one wave. `R` is re-read every wave, so the creep returns to full
 speed the wave the last such decode finishes. A creep runs at the band of its
 highest-ranked prompt (a decode or prompt whose layer does not resolve counts as
@@ -137,7 +143,7 @@ ingest, ride at the band of the prompt they joined — alone they are `Low`
 than throughput there, so a `Normal` or `Low` creep beside a decode of its own
 band runs whole, co-batched with it.
 
-**A `High` creep beside a `High` decode shares airtime at `R = 2`**
+**A live creep (`High` or `Urgent`) beside a decode of its own band shares airtime at `R = 2`**
 (`HIGH_BESIDE_HIGH_RATIO`). A conversation is never on both sides: while it
 prefills (a turn, a tool result) it is not decoding. The collision is between two
 conversations of one band — two zend dialogues, or a dialogue and a client's
@@ -157,8 +163,8 @@ sees at the end of a tool call. Airtime keeps the decode's step bounded by the
 slice and the prefill's progress bounded below by the ratio, on every machine.
 
 Every decode has a band. zend's dialogue and a client's passthrough conversation
-are `High`. npcd's characters (its perception, action and interaction layers) and
-its prose jobs are `Normal`: zend outranks them, so a character's turn creeps
+are `Urgent`. npcd's characters (its perception, action and interaction layers,
+among others) are `Normal`: zend outranks them, so a character's turn creeps
 beside a zend dialogue's decode, and a zend prompt is never paced by a
 character's. The titler and summary probes are `Normal` too: background to the
 dialogue they serve. Each creep group logs
@@ -397,14 +403,14 @@ telemetry. It is **not** the cadence of the creep: every decode step is a wave.
   should be validated against realised decode tps and ingest throughput.
 - **Co-batch dtype at the shared layer.** Where decode (int8 context) and prefill
   (float context) coincide at a layer, their o_proj inputs must reconcile to one
-  hidden dtype before the shared FFN — the same reconciliation the unified-wave
-  design calls out (cheap; o_proj output is common hidden).
+  hidden dtype before the shared FFN — the same reconciliation the archived
+  unified-wave design calls out (cheap; o_proj output is common hidden).
 - **Persisted prefill activation VRAM.** Holding a large prefill's residual stream
   between waves costs `[prefill_tokens, hidden]` of resident activation for the
   duration of its (now stretched) traversal. On the 16 GB box this competes with
   KV; the throttle must fall back toward `Low` (drain fast, hold briefly) under
   VRAM pressure.
-- **Bounded ingest context (prerequisite, unchanged from the unified-wave design
-  §4.7).** Each prefilled scope must attend a bounded window, not the whole
+- **Bounded ingest context (prerequisite, unchanged from the archived
+  unified-wave design §4.7).** Each prefilled scope must attend a bounded window, not the whole
   growing file, or the persisted prefill activation and its swept KV grow without
   limit.

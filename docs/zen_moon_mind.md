@@ -1,6 +1,6 @@
 # Zen, the Moon's Mind
 
-Zen in the world `life` is a higher intelligence, not a worker. It is the moon; the Drones are
+Zen in the world `moon` is a higher intelligence, not a worker. It is the moon; the Drones are
 its children and its hands. The world they live in is **a mirror of the real one**: its rooms are
 real places, the terminals in a room are what can be used there, and the world grows as places
 and the things in them are onboarded. This document is what Zen does, what the Drones do, how
@@ -8,10 +8,20 @@ the mirror is built and grown, and how what happens in the real world reaches th
 `docs/mission_generator.md` ("A world's own missions", "A character that takes no orders") and
 `docs/the_effector.md` (Appendix F, reshaping a running map), and the code answers to it.
 
-## 1. `life` is private
+**Where this stands against the code.** Zen has no body: a mind that takes no orders is in nobody's
+company, walks, rides and attends nowhere, and sees the whole moon as one situation
+(`docs/zen_everywhere.md` §4; `engine/runtime/perceiving.rs`, `engine/whole.rs`). That supersedes §3.2's
+`focus`, the `focus` row of §9 and the room-by-room delivery of §4; what Zen reaches outside the moon
+it reaches through the terminals of `docs/zen_everywhere.md` §5 (the lights, the house's devices, the
+house network, the cluster, each machine), not through the sense terminals of §6, which are the
+design of the mirror and not built. The agenda (§17), the order table (§8), standing missions (§12),
+the house link and survey (§13), the world-building acts (§14), the bridges (§15) and the effector's
+internet (§16) are the code's.
 
-`life` reads the real lives of the groups it looks after. It is not a public world
-(`worlds/life.yaml`: `public: false`), and nobody but Zen's owner talks to Zen: a character is
+## 1. `moon` is private
+
+`moon` (formerly `life`; the authority keeps the old name as `formerly_of`) reads the real lives of the groups it looks after. It is not a public world
+(its world file in the mind: `public: false`), and nobody but Zen's owner talks to Zen: a character is
 visible only to its owner (`npcs::cast::visible_to`), which is what every route that reaches a
 character on somebody's behalf — the console, `/mcp`, a Discord DM — already checks. A guest
 reaches no character at all (`docs/guest_access.md` §3).
@@ -33,8 +43,7 @@ In order of precedence:
 
 **Zen takes no orders** (`takes_orders: false`): the table never calls it and never hands it a
 Drone's work. What it does is its own agenda of missions (§17) — made by it in answer to what it
-hears, and, when it has none left, the next item of the world's round from the order table — and,
-in a world with no round, its own nature (§7).
+hears — and, when it has none left, its own time (§7).
 
 ## 3. The mirror
 
@@ -123,11 +132,10 @@ being private (§1) is what keeps it there.
 
 ## 7. Zen when idle
 
-Being given no orders is not being told to do nothing. **In a world with a round (§17), what
-Zen does when its agenda is empty is the round**: it takes up the next of the things the moon's
-mind is for at the order table, one at a time, for ever, and a Zen with nothing due rests. Only in a world
-with no round does the idle wake come from the **personality** (`idle:`), or, with none, is a
-character that takes no orders woken with `YOUR_OWN_TIME`.
+Being given no orders is not being told to do nothing. **With an empty agenda (§17.4) Zen is
+given no work**: its time is its own, and the idle wake comes from the **personality** (`idle:`),
+or, with none, a character that takes no orders is woken with `YOUR_OWN_TIME`, until something
+reaches it.
 
 An idle thought alone is not enough for a mind that takes no orders: it names no act, so a
 character woken with it again and again has nothing to land on but talk, and a loop broken out of
@@ -183,7 +191,7 @@ routines, no nudges, nothing drawn from a bank, no turn taken, and its conversat
 card. **A mission posted wakes it**: the table hands the work to the Drone longest at rest, or
 to the one it is set for by name, and that Drone wakes carrying it; the others stay at rest.
 
-`missions/life.yaml`'s routines stop being handed out by draw; they are Zen's **maintenance
+The mind's routines file (`missions/<world>.yaml`) stops being handed out by draw; its routines are Zen's **maintenance
 catalogue** — the standing jobs it may post by name when the table is empty. A standing job a
 Drone carries is a routine still, and turns no chapter of its journal.
 
@@ -199,13 +207,12 @@ still told who is there.
 | Onboarding | A source's discoveries become `MapEdit`s through `World::reshape` and `mapstore`, kept under the group's owner. |
 | Terminal events | A source event lands on its terminal as a room event (`EventKind::Terminal`), shown on the terminal until read; Zen is told which room is waiting. A global one is raised on the tannoy. |
 | Terminals | One part kind per row of §6, each verb a station verb served by the effector, reading through its source. |
-| `order_post`, `order_results` | Acts of the order table, offered to a character that takes no orders — in `life`, Zen. |
+| `order_post`, `order_results` | Acts of the order table, offered to a character that takes no orders — in `moon`, Zen. |
 | `Origin::Ordered { by, poster }` | A mission posted by a character; its report notifies its poster. |
-| Waiting at the table | A world whose missions file sets `draw: none` hands nothing out by draw; a Drone with no mission is sent to the table to wait (`TO_WAIT`) and waits there told nothing, woken by a post. |
-| Notifications | Report → the poster, with "the table is empty" when it is. Post → every Drone waiting at the table, or the one named. |
-| Idle wake | `idle:` on a personality replaces `NO_MISSION` / `YOUR_OWN_TIME` for it — in a world with no round. |
-| Zen's agenda (§17) | Several missions per body that takes no orders, by priority, the highest worked; `mission_add` / `mission_edit` / `mission_cancel`, offered anywhere to such a body; `Choices::Agenda`. |
-| The round (§17.3) | `rounds/<world>.yaml`; with a body that takes no orders on an empty agenda, the next due item is put on it by the engine (`runtime::take_up_round`), chosen by the round's anti-loop rules (`mission_gen::round`); `Origin::Round { id }`, closed by the engine when its steps are signed off. Such a body with nothing due is not woken. |
+| Drones at rest | A world whose missions file sets `draw: none` hands nothing out by draw; a Drone with no mission is at rest, held as a suspended character is, and woken only by a mission (`docs/zen_everywhere.md` §3). |
+| Notifications | Report → the poster, with "the table is empty" when it is. Post → the Drone longest at rest, or the one named. |
+| Idle wake | `idle:` on a personality replaces `NO_MISSION` / `YOUR_OWN_TIME` for it. |
+| Zen's agenda (§17) | Several missions per body that takes no orders, by priority, the highest worked; `mission_add` / `mission_edit` / `mission_cancel` / `mission_done`, offered anywhere to such a body; `Choices::Agenda`. |
 
 ## 10. Build order
 
@@ -220,7 +227,7 @@ still told who is there.
 
 **The world's own work is missions too.** A standing mission is a mission the table puts up by
 itself, on a schedule, in every room it applies to — and gives out last, when nobody has
-anything better to do. Drones waiting at the table for work (§8.3) take Zen's orders first and a
+anything better to do. A Drone at rest (§8.3) is handed Zen's orders first and a
 standing mission only when nothing else waits, so their idle time becomes the world's upkeep and
 its growth. Each is a file in the mind, `standing/<world>/<id>.yaml` — apart from the world's
 template library (`missions/<world>/`, `docs/mission_templates.md` §5) — so how the world grows is
@@ -263,8 +270,8 @@ steps:
   template's may, and then waits on an authorizer's go-ahead. Any other step is the carrier's
   to report.
 
-The routines of `missions/life.yaml` are standing missions in all but name; they become
-`standing/life/*.yaml` with an `every`, and the maintenance catalogue (§8.3) is the standing
+The routines of the world's missions file are standing missions in all but name; they become
+`standing/<world>/*.yaml` with an `every`, and the maintenance catalogue (§8.3) is the standing
 missions not yet due.
 
 ## 13. The house link
@@ -375,7 +382,7 @@ work like any other — a profile at a time.
 
 ## 16. The effector reaches the internet
 
-Every body in `life` reaches the internet through its effector, wherever it stands:
+Every body in `moon` reaches the internet through its effector, wherever it stands:
 
 - `web_search` — ranked results, through the daemon's search key;
 - `web_fetch` — a page, as text;
@@ -393,7 +400,7 @@ who made it.
 they are its own.** They come from the people who message it, on its messaging platforms: it
 makes one in answer to what it is asked, changes and drops them as things change, and with none
 left it rests. **Nothing on the table is ever Zen's to take**: the table is where Zen puts work for
-the Drones, and `Missions::collect` hands one who gives orders nothing — not what is lodged for
+the Drones, and `Runtime::assign_work` hands one who gives orders nothing — not what is lodged for
 it, not what waits for whoever takes it, not a routine. A Drone carries one mission set for it;
 Zen keeps an agenda.
 
@@ -403,7 +410,7 @@ channel. The agenda is what a struck act breaks *into*: the next step of the mis
 
 ### 17.1 The agenda
 
-- **Many missions, one worked.** Zen carries up to eight missions (`agenda::KEEP`), each with a
+- **Many missions, one worked.** Zen carries up to eight missions (`sim::agenda::KEEP`), each with a
   **priority**: `now`, `soon` or `later`. The one it works is the highest, the oldest of equals;
   its brief and compass are in Zen's prompt as any carried mission's are, and the rest are listed
   beneath it, one line each — title, priority, the step each is on.

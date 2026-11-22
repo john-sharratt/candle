@@ -153,7 +153,7 @@ SAMPLING                                     scheduler/sample.rs
    fused single-launch kernel (temperature/top-k/top-p/DRY/…),
    candle-kernels/src/sampling/
    ↓
-TURN SEAL, on turn completion                scheduler/mod.rs (seal path)
+TURN SEAL, on turn completion                scheduler/seal_turn.rs, perform_seal.rs
    prefill refresh over the completed turn — re-quantizes from clean,
    non-decode-drifted activations; per-block format re-selected
    (candle-nn/src/kv_cache/chunked/compress/)
@@ -194,21 +194,25 @@ Every KV block is `CHUNK_SIZE = 32` tokens — a constant shared verbatim
 between Rust (`chunked/types/mod.rs`) and CUDA (`arena_table.cuh`), enforced by
 the build so a mismatch cannot silently compile.
 
-- **`Arena`** (`chunked/arena.rs`) — Float or Quantized backing, one of
-  several `StoragePolicy` layouts, allocated in `TARGET_ARENA_BYTES = 16 MiB`
-  slabs.
+- **`Arena`** (`chunked/arena.rs`) — one-dimensional byte slab of fixed-stride
+  slots per `SizeClass` (`ArenaKind::Band` for K/V payload, `ArenaKind::Record`
+  for the `KvHead` records the paged kernels dereference), `TARGET_ARENA_BYTES
+  = 16 MiB` per arena, carved from the device reservation on the GPU. An arena
+  carries no format of its own: a band's format comes from its chunk's tag.
 - **`ChunkGidPool` / `ChunkGid`** (`chunked/gid_pool/`) — a lock-free,
   refcounted slab allocator. `ChunkGid` is an RAII handle
-  (`id = arena_idx * stride + chunk_idx`); allocation is O(1) (pop a Treiber
-  free-list, else bump a high-water mark); the last `Drop` recycles the slot
-  lock-free. `ResolvedArenaInfo` (`arena_table.rs`) resolves a GID to an
+  (`id = arena_idx * stride + chunk_idx`); a claim takes the lowest-placed arena
+  with room, and within it is O(1) (pop a Treiber recycle stack, else bump a
+  high-water mark); the last `Drop` recycles the slot lock-free. `ResolvedArenaInfo` (`arena_table.rs`) resolves a GID to an
   absolute device pointer (`base_ptr + chunk_idx * chunk_byte_stride`) — the
   pattern every other paged subsystem in this codebase (paged-KV kernels,
   the gallery arena of §5.2) reuses.
 - **`HeadGids`** (`chunked/head_gids.rs`) — per-head/palette chunk-GID
   collection for one sequence.
-- **`ArenaTable` / `PerHeadTable`** (`arena_table.rs`) — the per-head format
-  and palette index the attention kernel reads once per tile.
+- **`PerHeadTable`** (`arena_table.rs`) — the persistent GPU tensor of
+  per-head metadata (base pointer, byte offset, chunk stride, format metadata
+  for each palette sub-band) the attention kernel reads once per tile; there
+  is no per-arena table.
 - **`SealedSequence` / `SealedChunk`** (`chunked/types/sealed.rs`) — the immutable,
   byte-stable representation of a completed sequence's KV; the unit
   persistence and tier migration operate on.
@@ -224,9 +228,10 @@ smallest format that passes. Levels 0–1 are the `"quality"` tier, 2–4 are
 `"sweet"`, 5–10 are `"compress"` (`PRODUCTION_LEVEL_TIER`). Thresholds are
 **asymmetric between K and V** — K is channel-sensitive, V is token-sensitive
 — tracked as separate `PRODUCTION_K_QREL_*` / `PRODUCTION_V_QREL_*` tables,
-and are **per-model** (`LLAMA_KV_FACTORS`, `QWEN3_8B_KV_FACTORS`,
-`QWEN3_MOE_KV_FACTORS`) because thresholds must be re-derived per model
-family. **Attention sink protection**: positions 0–3 use a dedicated fine
+and are **per-model** (one `*_KV_FACTORS` row per family: `LLAMA_KV_FACTORS`,
+`QWEN3_8B_KV_FACTORS`, `QWEN3_MOE_KV_FACTORS`, `QWEN35_MOE_KV_FACTORS`,
+`QWEN36_MOE_KV_FACTORS`, `QWEN38_KV_FACTORS`, …) because thresholds must be
+re-derived per model family. **Attention sink protection**: positions 0–3 use a dedicated fine
 scale (Q4_KS/Q8_KS) so attention-sink magnitude outliers cannot inflate the
 global scale for the rest of a block. Format is selected **per head, not per
 block** — one format per KV head, read once per attention tile and broadcast
@@ -262,7 +267,7 @@ where alignment allows) and orchestrated host-side by
 `candle-nn/src/kv_cache/chunked/migrate.rs` (`MigrationPlan`,
 `MigrationRecord`). The scheduler tick is one plan, one launch per direction
 — independent of how many sequences are involved — on a **dedicated copy
-CUDA stream** that overlaps with ongoing decode. Full design:
+CUDA stream** that overlaps with ongoing decode. Archived original design:
 [`docs/archived/kv_tier_migration.md`](docs/archived/kv_tier_migration.md).
 
 ---
@@ -291,16 +296,22 @@ substrate as the `wide_q_sigs` blob (`substrate/`).
 
 Re-uploading every candidate turn's signatures on every scan was the
 bottleneck; `provenance/gallery_arena/` fixes this by keeping folded records
-**resident in VRAM** between reprojections, modelled directly on the
-chunked-KV slab allocator (§4.1): fixed 6 KiB group-major pages (32 tokens
-each), a Treiber free-list pool (`pool.rs`), persistent 16 MiB storage slabs
-(`storage.rs`), and — like the paged-KV → CUDA interface — the scan kernel
-receives **pre-resolved absolute device pointers** plus a `pos_map`
-(logical token → `(page, offset)`), not an in-kernel block-index table. The
-warm/cold tiers already exist independently (the substrate's `wide_q_sigs`
-blob + its `decoded_wide_sig` `Arc` memo, and the redo log); the arena owns
-only hot-tier VRAM residency and rebuilds an evicted turn from the `Arc` on
-demand. Design: [`docs/archived/paged_gallery_arena.md`](docs/archived/paged_gallery_arena.md).
+**resident in VRAM** between reprojections. A turn occupies fixed-size
+group-major pages of `PAGE_TOKENS = 32` tokens (`gallery_arena/pages.rs`; 6 KiB
+for a page holding all three fold groups at the production 24 words a token),
+each page one slot of the device's own slot arenas carved from the reservation
+(`gallery_arena/setup.rs`), so an evicted or re-sealed turn releases only its
+slots and an empty arena hands its region back to the span. Like the paged-KV
+→ CUDA interface, a scan uploads only the **addressing** (the page's absolute
+device address for each group, the segment prefixes and the probe) and the
+paged BDP kernel reads the resident pages in place (`gallery_arena/scan/`).
+Residency is keyed by stream, so every conversation on the card shares one
+arena, and a group nothing weighs is left out of a page
+([`docs/gallery_residency.md`](docs/gallery_residency.md)). The warm/cold tiers
+already exist independently (the substrate's `wide_q_sigs` blob and the redo
+log); the arena owns only hot-tier VRAM residency and rebuilds an evicted turn
+from the substrate's encoded signatures on demand. Archived original design:
+[`docs/archived/paged_gallery_arena.md`](docs/archived/paged_gallery_arena.md).
 
 ### 5.3 The scan kernels (`candle-kernels/src/provenance/`)
 
@@ -334,7 +345,7 @@ exactly 8 same-level children. Nodes are immutable once created (no
 AVL-style rotation, no `dirty` bit); the BDP scan drills from a coarse
 "peak" node down into its immutable children to recover detail — the same
 provenance-selected attention, rooted at multiple resolutions instead of one
-global root. Design: [`docs/archived/immutable_summary_forest.md`](docs/archived/immutable_summary_forest.md).
+global root. Archived original design: [`docs/archived/immutable_summary_forest.md`](docs/archived/immutable_summary_forest.md).
 
 ---
 
@@ -342,25 +353,35 @@ global root. Design: [`docs/archived/immutable_summary_forest.md`](docs/archived
 
 MoE inference (Qwen3-30B-A3B: 30B total, 3B active) cannot hold every expert
 resident on a 16 GB card, so `candle-transformers/src/models/expert_lre/`
-runs a background pipeline thread (`handle/mod.rs`, `pipeline/mod.rs`) owning a
-fixed-size VRAM expert pool with `&mut self` (no lock on the hot path):
-callers submit routed-expert requests over a channel; the pipeline
-partitions them into cache hits (compute immediately) and misses (DMA-load
-from host mmap, then compute), overlapping DMA with hit compute. Eviction is
-a four-part policy (`mod.rs` doc comment) tuned to avoid eviction cascades.
+keeps every expert readable by the GPU at all times — from a VRAM slot, from
+pinned host memory, or, cold, from the NVMe pack once a stager thread has
+staged it — and names where in a live table (`live_table.rs`,
+`docs/moe_live_dispatch_design.md` §0). The forward thread (`dispatch/`) enqueues
+each MoE layer (bucketize, gather, gate/up/down, scatter) and never waits on
+the host; the expert kernels' worker blocks copy every non-VRAM expert's row
+tiles into VRAM scratch and compute them. The pipeline thread
+(`pipeline/mod.rs`, handle in `handle/mod.rs`) owns VRAM residency — scores,
+the Markov transition matrix, promotion, eviction — off the critical path,
+with `&mut self` on `ExpertCacheInner`. Eviction is a retarget (every expert has
+a copy in the pack, so it moves no bytes) ranked by `score × position`: an LFU
+score with recency decay, times a mild multiplier that falls with forward
+(wrapped) reuse distance, run first over the experts the warm tier holds and
+over pack-only experts only for the shortfall; the first `PINNED_LAYERS` MoE
+layers are never evicted.
 
 **Markov expert prediction** (`expert_lre/transition.rs`) — an online,
 self-learning transition matrix predicts a layer's expert routing from the
 prior layer's observed routing (no offline calibration), 69% hit rate on
-Qwen3-30B-A3B (`docs/archived/markov_expert_prediction_eval.md`). The production
-"Markov Wave" design runs two modes: a Bayesian prior + live per-session
-predictor below the PCIe-saturation batch (≈256), and deterministic
-prefetch-all-missing streaming above it, where prediction adds nothing once
-bandwidth-bound. Eviction inside a wave is one deterministic rule: **always
-evict the layer the wave just left** (`L-1`, wrapping) — the longest reuse
-distance until the next full sweep.
+Qwen3-30B-A3B (`docs/archived/markov_expert_prediction_eval.md`). It is one of
+three predictors: each row ahead's candidate list is the union of the router
+look-ahead's votes, the tables' candidates and recent decode routing, ranked by
+measured worth and cut at a cap (`expert_lre/blend.rs`). Prediction is worth
+nothing at prefill width, where the next layer routes to most of its experts;
+a prefill-width row promotes the next row's scored experts instead. Eviction
+inside a wave prefers **the layer the wave just left** (`L-1`, wrapping) — the
+longest reuse distance until the next full sweep (`cache::behind_protection`).
 
-**Wave-batched grouped GEMM** (`expert_lre/compute.rs`) steps every
+**Wave-batched grouped GEMM** (`expert_lre/dispatch/`) steps every
 in-flight session through a layer together, so an expert loaded over PCIe is
 shared by every token routed to it that wave — PCIe cost amortises across
 the batch instead of being paid per session. **Continuous fair waves**
@@ -368,27 +389,27 @@ the batch instead of being paid per session. **Continuous fair waves**
 *inference* wave: a decode cursor sweeps every layer every wave (its hot
 experts stay continuously re-touched, never aging out of the LRU) while a
 background prefill/glue cursor creeps through layers at a rate set by a
-per-layer `decode_priority` (`Low`/`Normal`/`High`, the decode-to-prefill
-airtime ratio). Where the two cursors coincide at a layer, their tokens
-co-batch through one grouped GEMM.
+per-layer `decode_priority` (`Low`/`Normal`/`High`/`Urgent`, the
+decode-to-prefill airtime ratio). Where the two cursors coincide at a layer,
+their tokens co-batch through one grouped GEMM.
 
 ---
 
 ## 7. The CUDA kernel layer (`candle-kernels/`)
 
 Kernels are compiled **ahead-of-time**, not JIT-loaded at runtime.
-`candle-kernels/build.rs` (shared logic in `build_utils.rs`) partitions
-`src/*.cu`/`*.cuh` into named **archive groups** (`simple`, `quantized`,
-`sampling`, `provenance`, `paged-decode`, `paged-prefill`, `paged-glue`, …),
-computes a **SHA-256 hash per kernel and per group**, and only re-invokes
-`nvcc` for groups whose hash changed — the rest come from cached `.a` static
-archives. Each kernel builds with `-gencode=arch=compute_89,code=sm_89`
-(native SASS, dev 4090) plus `-gencode=arch=compute_120,code=[sm_120,compute_120]`
-(native SASS for Blackwell **and** embedded PTX as a forward-compat
-fallback) — "PTX embedded at compile time" means embedded in each compiled
-object's fatbinary, not loaded separately at process start. Archives link
-statically (`cargo:rustc-link-lib=static=<group>`) into the final binary;
-there is no runtime kernel-loading step.
+`candle-kernels/build.rs` (shared logic in `candle-kernels/build_utils.rs`)
+partitions `src/*.cu`/`*.cuh` into named **archive groups** (`simple`,
+`quantized`, `sampling`, `provenance`, `paged-decode`, `paged-prefill`,
+`paged-glue`, …), computes a **SHA-256 hash per kernel and per group**, and only
+re-invokes `nvcc` for groups whose hash changed — the rest come from cached `.a`
+static archives. Every kernel builds for the whole fleet: one `-gencode` per
+entry of `KERNEL_ARCHES = [86, 89, 120]` (Ampere sm_86, Ada sm_89, Blackwell
+sm_120), **SASS only, with no embedded PTX** — a card outside the list has no
+image to load, so a new card is a new entry there, and
+`CudaDevice::validate_compute_capability` refuses an unlisted card at device
+creation. Archives link statically (`cargo:rustc-link-lib=static=<group>`) into
+the final binary; there is no runtime kernel-loading step.
 
 `CHUNK_SIZE = 32` is defined once in Rust (`kv_cache/chunked/types/mod.rs`) and
 once in CUDA (`arena_table.cuh`, mirrored as `candle-kernels::CHUNK_SIZE`) —
@@ -399,6 +420,8 @@ the build treats a mismatch as a correctness bug, not a tuning knob.
 | `paged-decode/` | Single-token-per-sequence attention over the paged KV cache; `SlotHeader`/`slot_types.cuh` absolute-pointer addressing |
 | `paged-prefill/` | Multi-token prefill attention, INT8 context path |
 | `paged-glue/` | Boundary gap-fill attention for reprojected context stitching |
+| `paged-latent/` | Latent (K≡V) attention for the sparse-latent MoE family (`latent_moe/`) |
+| `delta-net/` | DeltaNet decode-step, conv-step and fused prefill-scan kernels for the hybrid recurrent models |
 | `quantized/` | Native quantized matmul (GEMV/GEMM ladder, greedy decomposition), `impl/` and `loader/` subtrees |
 | `provenance/` | The BDP scan kernels — `bdp_scan.cu` (scalar), `bdp_bmma.cu` (1-bit tensor-core), `bdp_imma.cu` (INT8 tensor-core), shared `bdp_vote.cuh` |
 | `sampling/` | The fused all-modifier sampling kernel |
@@ -436,10 +459,12 @@ Schema
     │           └── Turns                          (append-only, opaque to this crate)
 ```
 
-Selection rules are a closed set — `always_visible`, `top_k(k)`, `single`,
-`conversation { recent, historical_top_k }` — evaluated by score, but turns
-always **emit in insertion order** (score decides who's in-window; sequence
-order decides how it reads). Design:
+Selection rules are a closed set (`SelectionRule`, `projection/schema/selection.rs`) —
+`always_visible`, `top_k(k)`, `single`, `conversation { recent,
+historical_top_k }` (`Sequence`), the collection-only `named` and `offered`,
+and `working_set` — evaluated by score (except the explicit `named` pick), but
+turns always **emit in insertion order** (score decides who's in-window;
+sequence order decides how it reads). Archived original design:
 [`docs/archived/conversation_builder.md`](docs/archived/conversation_builder.md).
 
 ### 8.2 Timelines, turns, sections, collections
@@ -472,7 +497,7 @@ skip-load header walk (`walker.rs`), the in-RAM last-writer-wins index
 (`inherit.rs`), the tier-migration orchestrator that drives `candle-nn`'s
 `kv_pack`/`kv_unpack` (`transfer.rs`), the background thread (`thread/mod.rs`),
 warm→hot promotion (`elevate.rs`), and the NVMe→VRAM bridge
-(`cold_load.rs`). Full design:
+(`cold_load.rs`). Archived original design:
 [`docs/archived/kv_tier_migration.md`](docs/archived/kv_tier_migration.md) §13.
 
 ---
@@ -533,8 +558,10 @@ they submit `SchedulerRequest`s over a channel and receive `TurnHandle`s.
 **Waves.** A wave is the unit of scheduling: a mixed forward whose rows are
 the union of in-flight decode (`q_len == 1`), prefill, and glue tokens for
 one step, built as one packed batch header spanning all three
-(`docs/archived/unified_wave_inference_engine.md`). Attention runs per-type (three
-kernel launches, each into its disjoint row range of one output buffer);
+(the archived original is `docs/archived/unified_wave_inference_engine.md`;
+the scheduler as it runs is `docs/continuous_fair_waves.md`). Attention runs
+per-type (three kernel launches, each into its disjoint row range of one output
+buffer);
 everything after attention — `o_proj`, FFN norm, the MoE grouped GEMM — runs
 **once** over all rows, which is where the PCIe-amortisation gain comes
 from. Continuous fair waves (§6) decouple the decode cursor's per-wave full
@@ -542,19 +569,19 @@ sweep from prefill/glue's throttled creep so a large ingest never evicts the
 live decode session's hot experts.
 
 **Admission and the VRAM governor.** `candle-core/src/vram/` owns a
-process-global `VramGovernor` per GPU: a "balloon and measure" boot step
-establishes the true resident capacity `C` (not raw `cuMemGetInfo` total);
-allocations are tagged by `AllocClass` (`Weights`, `Expert`, `Scratch`,
-`Kv`) purely for accounting/forecasting, never as an availability gate —
-`measure()` (DXGI on Windows, `cuMemGetInfo` on Linux) is the sole source of
-truth. The KV budget is **observed, not predicted**: whatever headroom
-remains once weights and experts are resident *is* the KV variable band,
-floored by `kv_floor = KV_FLOOR_ABS + KV_FLOOR_PCT × (C − Weights)`. A
-five-rung **relief ladder** (`Trivial → Cheap → Moderate → Costly →
-Critical`) runs low-to-high as headroom tightens; only the top rung takes a
-GPU sync. KV eviction to the warm tier registers at `Costly`; the
-provenance gallery arena (§5.2) registers at the *cheapest* rungs so it is
-reclaimed before KV is ever touched. Design:
+process-global `VramGovernor` per GPU, and its role is startup: a "balloon and
+measure" boot step establishes the true resident capacity `C` (not raw
+`cuMemGetInfo` total); allocations are tagged by `AllocClass` (`Weights`,
+`Expert`, `Scratch`, `Kv`) purely for accounting, never as an availability
+gate — the live measurement (DXGI on Windows, `cuMemGetInfo` on Linux) is the
+sole source of truth, and the expert cache and the KV reservation are sized
+from `C` once. The reservation is one contiguous device span shared by persist
+staging, KV regions, the per-forward transient tier and the expert weight
+zone, with the elastic `weight_floor` between the last two
+([`docs/vram_span_partition.md`](docs/vram_span_partition.md)); because the memory
+is claimed once there is no runtime relief ladder, and the scheduler reads an
+exact free-region count when it admits work. KV is moved to the warm tier by
+the persistence thread's drain (§4.3). Startup measurement design:
 [`docs/vram_governor_design.md`](docs/vram_governor_design.md).
 
 ---

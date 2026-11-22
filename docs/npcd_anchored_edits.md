@@ -398,7 +398,7 @@ to keep the old one alive.
    caller, prompt and example is moved to anchors in the same change.
 3. **zend's `code_reading` units are re-read.** Their turns were read with line
    numbers and cite them, so they describe a read format that no longer exists.
-   `KEY_VERSION` 3 (`zend/src/branch_ingest/keys.rs`) re-keys every unit, so the
+   Raising `KEY_VERSION` (`zend/src/branch_ingest/keys.rs`; 3 at this change, 6 now) re-keys every unit, so the
    next ingest pass reads each one again with anchored pages and tombstones the
    old reading once the new one commits. A unit now records the pages it read
    (`pages`, counted from the content) where it recorded a line count, which is

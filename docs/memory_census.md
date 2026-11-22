@@ -91,6 +91,7 @@ card. One concern per file:
 | `counting.rs` | `Counting`, the `GlobalAlloc` wrapper, and the process's `CENSUS` |
 | `os.rs` | The OS's figures (§4) |
 | `reading.rs`, `history.rs` | One reading, and an hour of them |
+| `scope.rs`, `thread_state.rs` | The `Scope` enum (§10), and a thread's shard and scope in one thread-local word |
 | `verdict.rs` | The §2 verdict over a window |
 | `report.rs` | The census as `/v1/memory` carries it |
 

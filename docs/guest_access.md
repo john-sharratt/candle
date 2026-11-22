@@ -66,7 +66,7 @@ below opens with the queue (step 2).
 - **Their own account:** `/v1/me/profile` and its history, `/v1/me/unique-name`.
 - **Nothing else.** In particular:
   - no characters. A character keeps ticking in the background once created
-    (`npcd/src/api.rs:1318-1330`), which is load no queue gates;
+    (`npcd/src/api/`), which is load no queue gates;
   - no `/mcp` (consent requires `User`, §6);
   - nothing from the operational and corpus reads: host `/v1/telemetry`,
     `/v1/memory`, `/v1/phases`, `/v1/projections`, `/v1/layers`, `/v1/logs`,
@@ -195,6 +195,15 @@ refused for depth, and timed out, with the queue depth and wait.
    `Guest`, zend chat at `Guest` through it, the `people_busy` placement, MCP
    tools taking their route's role and cost, and the clients of §5
    presenting an identity.
+
+**Where it stands.** Step 1 is built: `host/roles.yaml` is the `people` list
+(`host::access::ROLES`), `Role::Guest` sits between `Unauthenticated` and `User`
+(`web/src/auth/role.rs`), `/mcp` consent requires `User` (`web/src/auth/mcp/authorize.rs`),
+and zend's chat, repo map and conversation routes are at `User`
+(`zend/src/api/mod.rs`). Step 2 is not built: the tree has no
+`host/src/guest_gate/`, no `Cost` beside a route's minimum role in
+`host/src/guard.rs`, and no `people_busy` in a member's status, so §3's inference
+routes and §4's queue describe the design, not the code.
 
 ## 9. Tests
 

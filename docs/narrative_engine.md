@@ -1,17 +1,17 @@
 # Roleplay Engine (RPE) — Design Document
 **Status:** Draft v0.7  
 **Model Target:** Qwen3-30B-MoE (non-thinking mode, narrative turns)  
-**Crate:** Internal Candle crate — not a standalone binary
+**Crate:** Internal Candle crate — not a standalone binary (the `narrator` module of `candle-conversation`, `candle-conversation/src/narrator/`)
 
 ---
 
 ## 1. Overview
 
-The Roleplay Engine (RPE) is an internal Candle crate that translates structured player inputs into narrated story turns. Input arrives from a chat application as multi-line text strings. Clap parses each line via `Command::try_parse_from()` on a whitespace-split iterator — full flag and subcommand semantics without a binary entrypoint.
+The Roleplay Engine (RPE) is an internal Candle crate that translates structured player inputs into narrated story turns. Input arrives from a chat application as multi-line text strings. Clap parses each line via `RpeCommand::try_parse_from()` on a whitespace-split iterator — full flag and subcommand semantics without a binary entrypoint.
 
 The narrator is a **conversation** — the full message history is maintained in the KV cache. The model remembers everything that has happened because it is all in prior turns. There is no state block injected per turn, and no state delta expected in the output. The model's output is narrative prose only.
 
-Each turn, the caller serialises `Vec<Input>` as a JSON array and appends it as the next user message in the conversation. The model responds with narrative. The crate exposes three things: `parse_turn(input: &str, config: &SessionConfig) -> Result<Vec<Input>, ParseError>`, `text_to_inputs(text: &str, author: Option<&str>, max_attempts: usize) -> Result<Vec<Input>, ConvertError>`, and `SessionConfig` for initialisation.
+Each turn, the caller serialises `Vec<NarratorInput>` as a JSON array and appends it as the next user message in the conversation. The model responds with narrative. The crate exposes three things: `parse_turn(input: &str, config: &SessionConfig) -> Result<Vec<NarratorInput>, ParseError>`, `text_to_inputs(text: &str, mode: ConverterMode<'_>, max_attempts: usize, engine: &ConversationEngine, config: SequenceConfig) -> Result<Vec<NarratorInput>, ConvertError>`, and `SessionConfig` for initialisation.
 
 ---
 
@@ -25,9 +25,9 @@ Player Input (chat app)          NPC Character LLM (prose output)
         ▼                             ▼
 ┌─────────────────┐         ┌───────────────────────┐
 │  parse_turn()   │         │  text_to_inputs()      │  waypoint mode,
-│  + SessionConfig│         │  author: None          │  NPC prose → Vec<Input>
+│  + SessionConfig│         │  author: None          │  NPC prose → Vec<NarratorInput>
 └────────┬────────┘         └──────────┬────────────┘
-         │ Vec<Input>                  │ Vec<Input>
+         │ Vec<NarratorInput>                  │ Vec<NarratorInput>
          │                            │ + NPC prose verbatim
          ▼                            ▼
 ┌─────────────────────────────────────────────────────────────────┐
@@ -35,7 +35,7 @@ Player Input (chat app)          NPC Character LLM (prose output)
 │  [system]                                                        │
 │  [user]      turn 1 player inputs JSON          ┐ real turns    │
 │  [assistant] narrative 1                        ┘               │
-│  [user]      NPC LLM output as Vec<Input> JSON  ┐ synthetic     │
+│  [user]      NPC LLM output as Vec<NarratorInput> JSON  ┐ synthetic     │
 │  [assistant] NPC LLM prose verbatim             ┘ exchange      │
 │  [user]      turn 2 player inputs JSON          ┐ real turns    │
 │  [assistant] narrative 2                        ┘               │
@@ -57,11 +57,11 @@ Player Input (chat app)          NPC Character LLM (prose output)
 
 ### 3.1 Design Principle
 
-`parse_turn(input: &str, config: &SessionConfig) -> Result<Vec<Input>, ParseError>` is the crate's entry point. The host chat application passes the raw multi-line string from the user's input box. `parse_turn` splits on newlines, calls `Command::try_parse_from(line.split_whitespace())` for each non-empty line, and immediately resolves default characters using `config`. By the time `Vec<Input>` is produced, every `character` field is a concrete name — `null` never appears in the output.
+`parse_turn(input: &str, config: &SessionConfig) -> Result<Vec<NarratorInput>, ParseError>` is the crate's entry point. The host chat application passes the raw multi-line string from the user's input box. `parse_turn` splits on newlines, calls `RpeCommand::try_parse_from(line.split_whitespace())` for each non-empty line, and immediately resolves default characters using `config`. By the time `Vec<NarratorInput>` is produced, every `character` field is a concrete name — `null` never appears in the output.
 
 `no_binary_name = true` is set on the root command so no dummy argv[0] is required.
 
-The narrator engine's input contract is `Vec<Input>` serialised as a JSON array, appended as a user message in the conversation. Test inputs can be authored as raw JSON and fed directly, bypassing `parse_turn` entirely.
+The narrator engine's input contract is `Vec<NarratorInput>` serialised as a JSON array, appended as a user message in the conversation. Test inputs can be authored as raw JSON and fed directly, bypassing `parse_turn` entirely.
 
 ### 3.2 Command Set
 
@@ -100,11 +100,11 @@ use serde::{Deserialize, Serialize};
 #[command(no_binary_name = true)]
 struct RpeCommand {
     #[command(subcommand)]
-    command: Command,
+    command: RpeSubcommand,
 }
 
 #[derive(Subcommand, Debug)]
-enum Command {
+enum RpeSubcommand {
     /// Speak dialogue as a character (defaults to session PC)
     Say {
         #[arg(short, long)]
@@ -146,12 +146,12 @@ enum Command {
 
 ### 3.5 Serialisation Layer
 
-`Command` is not serialised directly. `Input` is the crate's wire format. All `character` fields are `String` — never `Option`. Default resolution happens during conversion, using the `SessionConfig` passed into `parse_turn`. `null` is not a valid value in the `Input` JSON schema.
+`RpeSubcommand` is not serialised directly. `NarratorInput` (`candle-conversation/src/narrator/types.rs`) is the crate's wire format. All `character` fields are `String` — never `Option`. Default resolution happens during conversion, using the `SessionConfig` passed into `parse_turn`. `null` is not a valid value in the `Input` JSON schema.
 
 ```rust
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Input {
+pub enum NarratorInput {
     Say   { character: String, text: String },
     Act   { character: String, action: String },
     Scene { description: String },
@@ -161,27 +161,27 @@ pub enum Input {
 
 /// Internal conversion — requires session config to resolve defaults.
 /// Not exposed publicly; called only from parse_turn.
-fn command_to_input(cmd: Command, config: &SessionConfig) -> Input {
+fn command_to_input(cmd: RpeSubcommand, config: &SessionConfig) -> NarratorInput {
     match cmd {
-        Command::Say { character, text } =>
-            Input::Say {
+        RpeSubcommand::Say { character, text } =>
+            NarratorInput::Say {
                 character: character.unwrap_or_else(|| config.protagonist.clone()),
                 text: text.join(" "),
             },
-        Command::Act { character, action } =>
-            Input::Act {
+        RpeSubcommand::Act { character, action } =>
+            NarratorInput::Act {
                 character: character.unwrap_or_else(|| config.protagonist.clone()),
                 action: action.join(" "),
             },
-        Command::Scene { description } =>
-            Input::Scene { description: description.join(" ") },
-        Command::Cue { character, action } =>
-            Input::Cue {
+        RpeSubcommand::Scene { description } =>
+            NarratorInput::Scene { description: description.join(" ") },
+        RpeSubcommand::Cue { character, action } =>
+            NarratorInput::Cue {
                 character: character.unwrap_or_else(|| config.persona.clone()),
                 action: action.join(" "),
             },
-        Command::Beat { description } =>
-            Input::Beat { description: description.join(" ") },
+        RpeSubcommand::Beat { description } =>
+            NarratorInput::Beat { description: description.join(" ") },
     }
 }
 ```
@@ -193,12 +193,14 @@ fn command_to_input(cmd: Command, config: &SessionConfig) -> Input {
 pub enum ParseError {
     InvalidCommand { line: String, error: clap::Error },
     EmptyInput,
+    /// A valid command whose content field is empty.
+    EmptyContent { line: String, field: &'static str },
 }
 
 pub fn parse_turn(
     input: &str,
     config: &SessionConfig,
-) -> Result<Vec<Input>, ParseError> {
+) -> Result<Vec<NarratorInput>, ParseError> {
     let lines: Vec<&str> = input.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -208,14 +210,20 @@ pub fn parse_turn(
         return Err(ParseError::EmptyInput);
     }
 
+    // `shell_split` is a whitespace split that keeps a quoted span as one
+    // token, so `--character "Old Man"` works without a shell.
     lines.iter()
         .map(|line| {
-            RpeCommand::try_parse_from(line.split_whitespace())
+            let input = RpeCommand::try_parse_from(shell_split(line))
                 .map(|parsed| command_to_input(parsed.command, config))
                 .map_err(|e| ParseError::InvalidCommand {
                     line: line.to_string(),
                     error: e,
-                })
+                })?;
+            if let Some(field) = empty_content_field(&input) {
+                return Err(ParseError::EmptyContent { line: line.to_string(), field });
+            }
+            Ok(input)
         })
         .collect()
 }
@@ -298,7 +306,7 @@ The narrator does not directly observe or interact with the NPC character LLM. I
 When the NPC LLM produces a prose response, the engine:
 
 1. Passes the prose to `text_to_inputs(prose, None, max_attempts)` — waypoint mode, no author.
-2. Serialises the resulting `Vec<Input>` as a JSON array → the **synthetic user message**.
+2. Serialises the resulting `Vec<NarratorInput>` as a JSON array → the **synthetic user message**.
 3. Takes the NPC LLM's original prose verbatim → the **synthetic assistant message**.
 4. Appends both to the narrator conversation in order before the next real player turn.
 
@@ -319,13 +327,13 @@ Player inputs, NPC LLM outputs, and engine `cue` overrides are all serialised in
 2. Engine converts NPC prose → synthetic exchange, appends to conversation  
 3. Engine collects player's next input from chat app
 4. Engine applies any cue overrides
-5. All player inputs serialised as Vec<Input> JSON → real user turn appended
+5. All player inputs serialised as Vec<NarratorInput> JSON → real user turn appended
 6. Narrator inference runs
 ```
 
 ### 4.3 Why This Works
 
-The narrator never double-narrates. NPC actions are injected as already-narrated history. The narrator's next generation picks up from that established context and continues forward. The conversation history is always consistent — every assistant turn is either genuine narrator output or verbatim NPC LLM prose, and the corresponding user turn is always the structured `Vec<Input>` that describes what happened.
+The narrator never double-narrates. NPC actions are injected as already-narrated history. The narrator's next generation picks up from that established context and continues forward. The conversation history is always consistent — every assistant turn is either genuine narrator output or verbatim NPC LLM prose, and the corresponding user turn is always the structured `Vec<NarratorInput>` that describes what happened.
 
 The `text_to_inputs` converter is doing real structural work here — it extracts what mechanically occurred from the NPC's prose so the narrator has a clean JSON description of events, while the NPC's own prose becomes the canonical narration of those events.
 
@@ -337,7 +345,7 @@ The Turn Assembler is the only component between `parse_turn` and the conversati
 
 **Sliding window management** — before appending the new user turn, checks the conversation length against `SessionConfig.max_turns`. If the cap is exceeded, the oldest turn pair (user + assistant) is dropped. The system prompt and the world/scene initialisation message are never dropped.
 
-**Serialisation** — `serde_json::to_string(&inputs)` produces the user message content. No prose construction, no merging, no templates, no character resolution. By the time `Vec<Input>` reaches the Turn Assembler, all fields are already concrete.
+**Serialisation** — `serde_json::to_string(&inputs)` produces the user message content. No prose construction, no merging, no templates, no character resolution. By the time `Vec<NarratorInput>` reaches the Turn Assembler, all fields are already concrete.
 
 ---
 
@@ -393,7 +401,7 @@ Characters present:
 The scene opens: [opening narration or situation]
 ```
 
-The model's first assistant message acknowledges the setup and opens the scene. All subsequent turns are `Vec<Input>` JSON.
+The model's first assistant message acknowledges the setup and opens the scene. All subsequent turns are `Vec<NarratorInput>` JSON.
 
 ---
 
@@ -413,16 +421,13 @@ pub struct SessionConfig {
     pub max_turns: usize,
 }
 
-impl Default for SessionConfig {
-    fn default() -> Self {
-        Self {
-            protagonist: String::new(),
-            persona: String::new(),
-            max_turns: 7,
-        }
-    }
-}
+/// Sensible default for `SessionConfig::max_turns`.
+pub const DEFAULT_MAX_TURNS: usize = 7;
 ```
+
+`SessionConfig` (`candle-conversation/src/narrator/types.rs`) has no `Default`
+impl; a caller names `protagonist` and `persona` and takes `DEFAULT_MAX_TURNS`
+for `max_turns` if it has no preference.
 
 `SessionConfig` is intentionally minimal. World and scene data live in the conversation's first message, not in the config.
 
@@ -438,7 +443,7 @@ If the caller needs to extract mechanical information (disposition changes, item
 
 ## 9. Text-to-Input Converter
 
-The Text-to-Input Converter transforms free-form prose or stage directions into a valid `Vec<Input>` JSON array. It is a separate single-shot call — not part of the narrator conversation — and uses its own system prompt and correction loop.
+The Text-to-Input Converter transforms free-form prose or stage directions into a valid `Vec<NarratorInput>` JSON array. It is a separate single-shot call — not part of the narrator conversation — and uses its own system prompt and correction loop.
 
 The converter operates in two modes selected by the `author` parameter:
 
@@ -459,21 +464,26 @@ pub enum ConvertError {
     InferenceError(String),
 }
 
-/// Convert free-form text into a Vec<Input>.
+/// Convert free-form text into a Vec<NarratorInput>.
 ///
-/// `author` — controls the conversion mode:
-///   None        → waypoint mode: third-person narrative, no perspective assumed
-///   Some(name)  → author mode: first-person text written as the named character.
-///                 Pass `session_config.protagonist` for live player input.
+/// `mode` — controls the conversion:
+///   ConverterMode::Waypoint     → third-person narrative, no perspective assumed
+///   ConverterMode::Author(name) → first-person text written as the named character.
+///                                 Pass `session_config.protagonist` for live player input.
+///   ConverterMode::Response(c)  → a character's response text reduced to a compact
+///                                 summary (say and act only, one to three entries),
+///                                 before it is fed back to the narrator.
 ///
 /// Retries up to `max_attempts` times, feeding parse errors back
 /// to the model for self-correction on each failure.
-/// Default max_attempts: 3
-pub async fn text_to_inputs(
+/// Default max_attempts: 3 (a `max_attempts` of 0 means 3)
+pub fn text_to_inputs(
     text: &str,
-    author: Option<&str>,
+    mode: ConverterMode<'_>,
     max_attempts: usize,
-) -> Result<Vec<Input>, ConvertError>
+    engine: &ConversationEngine,
+    config: SequenceConfig,
+) -> Result<Vec<NarratorInput>, ConvertError>
 ```
 
 ### 9.2 System Prompts
@@ -565,7 +575,7 @@ On each attempt, the converter runs a short conversation:
 
 - **Message 1 (user):** the raw input text
 - **Message 2 (assistant):** the model's JSON output
-- Parse with `serde_json::from_str::<Vec<Input>>()`
+- Parse with `serde_json::from_str::<Vec<NarratorInput>>()`
 - If parse succeeds → return `Ok(inputs)`
 - If parse fails → append a correction message and retry
 
@@ -583,52 +593,18 @@ Your output was:
 
 The correction appends to the same conversation so the model sees exactly what it wrote and what went wrong — more reliable than restarting fresh.
 
-```rust
-pub async fn text_to_inputs(
-    text: &str,
-    author: Option<&str>,
-    max_attempts: usize,
-) -> Result<Vec<Input>, ConvertError> {
-    let max_attempts = if max_attempts == 0 { 3 } else { max_attempts };
-    let system = match author {
-        Some(name) => build_author_system_prompt(name),
-        None       => WAYPOINT_SYSTEM_PROMPT.to_string(),
-    };
-    let mut messages: Vec<Message> = vec![
-        Message::system(&system),
-        Message::user(text),
-    ];
-
-    for attempt in 0..max_attempts {
-        let output = infer(&messages).await
-            .map_err(|e| ConvertError::InferenceError(e.to_string()))?;
-
-        messages.push(Message::assistant(&output));
-
-        match serde_json::from_str::<Vec<Input>>(&output) {
-            Ok(inputs) => return Ok(inputs),
-            Err(e) if attempt + 1 < max_attempts => {
-                let correction = format!(
-                    "The JSON you produced failed to parse. Fix it and                      return only the corrected JSON array — no explanation.                     \n\nParse error: {e}\n\nYour output was:\n{output}"
-                );
-                messages.push(Message::user(&correction));
-            }
-            Err(e) => {
-                return Err(ConvertError::MaxAttemptsExceeded {
-                    last_error: e.to_string(),
-                    last_output: output,
-                });
-            }
-        }
-    }
-    unreachable!()
-}
-
-fn build_author_system_prompt(author: &str) -> String {
-    AUTHOR_SYSTEM_PROMPT_TEMPLATE
-        .replace("{author}", author)
-}
-```
+The loop is `text_to_inputs` in `candle-conversation/src/narrator/converter.rs`.
+It opens one single-use conversation on the engine under
+`converter_system_prompt(&mode)` and sends the raw text as its first turn. Each
+reply is cleaned of code fences (`sanitize_json_output`) and parsed with
+`serde_json::from_str::<Vec<NarratorInput>>`; on a failure the exact error and
+prior output are sent back as the next turn (`correction_message`), up to
+`max_attempts` times, and the last failure is returned as
+`ConvertError::MaxAttemptsExceeded`. `text_to_inputs_streaming` is the same loop
+streaming each attempt to stderr. The system prompts are the files
+`candle-conversation/src/prompts/narrator_waypoint.md`, `narrator_author.md`
+(`{author}` substituted by `build_author_system_prompt`) and
+`narrator_response.md`.
 
 ### 9.4 Conversion Examples
 

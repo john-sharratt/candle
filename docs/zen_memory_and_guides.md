@@ -1,12 +1,14 @@
 # Zen's memory, guides and task driving: the build
 
-**Design and build plan, in progress.** The work that follows from three audits
+**Design and build plan; the branch is merged to `main`** (`c55ec530c`, `zen/memory-and-guides`).
+The work that follows from three audits
 of 2026-11-08 — the MCP guides against the tool set, how a task is driven from
 each client, and the journals (how they are structured, written, searched and
 read, and how they reach conversations through provenance and projection) —
 carried out as **one build by AlienWorld and BlackWorld together**: one branch,
 the phases below, each closed by its gate, one review, one merge, one joint
-release.
+release. §1 records what the audits found in the tree as it stood on
+2026-11-08; the phases of §4 are built.
 
 The design documents each phase names (`memory_backbone.md`, `guidance_layer.md`,
 `mcp_user_context.md`, `mission_templates.md`, `mcp_file_tools.md`) are revised
@@ -325,7 +327,7 @@ quoted in Phase 8's report.
   the brief, the design documents and the repository's rules, and record each
   decision in the answer; commit and push the result; run the brief's verify
   step; state anything only the user may approve as pending, and stop there.
-- **Outcomes.** The settle notes `workers/settle.rs:1573-1628` writes gain `kind:
+- **Outcomes.** The settle notes `workers/settle.rs` writes gain `kind:
   outcome` on `Note` for an alone task, with where it landed and what waits on
   approval; `mcp::tending` writes the same note for an alone task it finds lost.
   Each outcome is indexed at `mcp/outcome/<owner>/<at>-<task digest>` — so two
@@ -374,13 +376,13 @@ quoted in Phase 8's report.
    - `health` and `incident` use `member_status`.
 4. **Tests:** the guides library's tests; a test that every tool a guide's
    `tools:` names is in the aggregator's served list and every guide named in a
-   guide's text exists (`Library::unserved`, `guides/src/library.rs:137`, is the
+   guide's text exists (`Library::unserved`, `guides/src/library.rs`, is the
    runtime half of the same check).
 
 ### Phase 6 — Drone ↔ zend task bridge (`mission_templates.md` §7, D4, D8)
 
 Templates, parameters, `work.checks` and the `critical` gate are built
-(`npcd/src/engine/mission_gen/world.rs`, `authorize.rs`). **Built:** the bridge
+(`npcd/src/engine/mission_gen/world.rs`, `npcd/src/engine/authorize.rs`). **Built:** the bridge
 is `npcd/src/engine/zen_task/` (acts, zend calls, the task step) and
 `npcd/src/authority/zen_task.rs` (the calls as Zen, the tending).
 

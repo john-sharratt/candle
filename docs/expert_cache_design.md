@@ -364,8 +364,7 @@ there cost the gate **more than half its throughput** — 723 → 299 t/s on the
 narrowest config — to insure ~850 records per config.
 
 What the trailer defends is the *medium* — bit rot, a bad sector, a truncating
-filesystem — on a file that lives beside the checkpoint for as long as the
-checkpoint does. It is not defending against a half-written pack (the writer
+filesystem — on a file that lives in the model cache for as long as the model does. It is not defending against a half-written pack (the writer
 publishes by rename, so an incomplete one is never visible) or against two
 writers colliding (§12.7). The residual exposure is one unverified expert of
 6,144 in a layer that sums eight of them, against a checkpoint that carries no
@@ -468,7 +467,7 @@ bounded by min(what the machine is big enough for, what it has free now − head
 backed by cuMemAllocHost halving on refusal
 ```
 
-with the headroom (4 GiB, `WARM_TIER_HEADROOM`) reserved for everything the process allocates *after*
+with the headroom (3 GiB, `WARM_TIER_HEADROOM`) reserved for everything the process allocates *after*
 the warm tier — the mapped live table, routing-summary ring and promotion
 ring of the live dispatch, the substrate's pinned
 cold-load scratch, the `PinnedStager` arenas, and the warm KV tier. Pinned pages
@@ -491,9 +490,12 @@ they hold cold reads to 4 % of loads at 81 % coverage.
 Lowering the headroom to 1 GiB was measured. The tier grew to 5,090 slots and
 cold loads halved (986 → 435) — and **throughput did not improve**: flat to 1–2 %
 down, single-stream falling further. On Flash-Next at 16 GB, 3 GiB against 4 GiB
-was measured too and was slower (decode 13.8 / 67.6 / 26.8 → 13.5 / 64.7 /
-22.8 t/s, BF16×1 / BF16×8 / C5×2), free RAM bottoming at 2.05 GiB against
-3.57 GiB — which is why the constant is 4 GiB. Past the knee, pinned pages come out of the
+was measured too, on an earlier build, and was slower (decode 13.8 / 67.6 / 26.8 →
+13.5 / 64.7 / 22.8 t/s, BF16×1 / BF16×8 / C5×2), free RAM bottoming at 2.05 GiB
+against 3.57 GiB — which then made the constant 4 GiB. With the wave's transients
+since moved onto the span's bump tiers, Flash-Next's own transient after pinning is
+~1.06 GiB, and 3 GiB took its Q3_KO tier to 8,932 experts and BF16×8 prefill to
+570.5 t/s (528.4 at 4 GiB) — which is why the constant is now 3 GiB. Past the knee, pinned pages come out of the
 page cache and the warm KV tier, and the reads they save are no longer on the
 critical path. The tier's job is to cover the miss stream, not to mirror the
 model.
@@ -688,7 +690,7 @@ sizing decision — which is exactly what this table is for.
 
 | machine | link | NVMe | PCIe to GPU | warm tier value |
 |---|---|---|---|---|
-| dev — 4090 Mobile 16 GB | **PCIe 4.0 ×8** (live width, read 2026-10-16) | single, ~3–7 GB/s | **~12 GB/s** (copy engine, `dispatch.rs:112`) | 2–4× — earns its keep |
+| dev — 4090 Mobile 16 GB | **PCIe 4.0 ×8** (live width, read 2026-10-16) | single, ~3–7 GB/s | **~12 GB/s** (copy engine, `expert_lre/link_rate.rs`) | 2–4× — earns its keep |
 | dev — RTX 3090 24 GB (i7-10700K) | **PCIe 3.0 ×16** | single | **~12 GB/s** (gen-3 cap, 15.75 theoretical) | 2–4× — earns its keep, more so |
 | dev — RTX PRO 5000 72 GB | PCIe 5.0 ×16 | single | ~25 GB/s+ | large VRAM makes it mostly moot |
 | production (`AGENTS.md`) | PCIe 5.0 ×16 | 16 TB PCIe 5.0 RAID 0 **@ 45 GB/s** | ~25 GB/s | disk is *faster than the bus* — buys ≈ nothing |
@@ -775,9 +777,9 @@ the answer may well be to size it to zero, which §11 already allowed.
 A consequence §5.4 predicted and the build confirms in shape: with a persistent
 pack, startup reads only the experts it is going to place — the VRAM fill and the
 warm membership — and touches the GGUF's expert regions not at all. The ~42 s
-repack becomes a read. `zend` passes the GGUF's own directory, so its packs
-persist; the batched-forwarding gate does the same, because it reloads the model
-once per invocation while iterating.
+repack becomes a read. The pack persists in the model cache root
+(`self_contained_model_packs.md` §5.1) for zend and for the batched-forwarding gate
+alike, because the gate reloads the model once per invocation while iterating.
 
 ### 12.3 The warm tier is sized from the machine, and that is where the RAM went
 
@@ -973,13 +975,13 @@ per-miss cold read: with it there the gate lost more than half its throughput,
 which is the wrong price for insuring a derived cache against a failure the
 checkpoint it derives from is not insured against.
 
-**A shared pack needs a private temp file.** §5.2 puts the pack beside the
-checkpoint precisely so several workspaces share one, and the pack's name is a
-pure function of that checkpoint — so the fixed `.partial` sibling was the same
-path for every process that decided to build it. Two daemons starting together
+**A shared pack needs a private temp file.** §5.2 keeps one pack per model so
+several workspaces share it, and the pack's name is a pure function of that
+model — so a fixed `.partial` sibling would be the same path for every process
+that decided to build it. Two daemons starting together
 interleave their writes into one file and both rename it into place; the header
 is written first and is identical, so the result validates. The temp name now
-carries the pid and a nanosecond stamp.
+carries the pid and a nanosecond stamp (`model_pack/build.rs`).
 
 **An all-resident cache wants no warm tier.** When VRAM holds every expert
 nothing is ever evicted — the pipeline thread's routed-message handling skips
@@ -1005,7 +1007,11 @@ hands some pinned misses to a host pool, per layer.
 
 ### 12.8 Ephemeral packs are unlinked while open, not deleted on drop
 
-§5.2 asks for "a temp file unlinked at exit". The build takes the older and more
+*History: there is no ephemeral pack any more — a caller-supplied checkpoint is
+packed into the model cache (`self_contained_model_packs.md` §5.4). This records
+how the temp-file pack was handled while it existed.*
+
+The original §5.2 asked for "a temp file unlinked at exit". The build took the older and more
 robust reading: the pack is unlinked **immediately after it is opened for
 reading**, and stays fully readable through the open handles until the process
 ends. Unix has always allowed this; Windows does too, because `std::fs` opens

@@ -1,6 +1,6 @@
 # Turn handover: a member that leaves hands its turns on
 
-**Status:** design, 2026-11-18. Replaces "Moving off a card needs nothing new"
+**Status:** built (2026-11-18). Replaces "Moving off a card needs nothing new"
 (`docs/claude_zend_gateway.md` §6.3), which this measured wrong.
 
 ## 1. What failed
@@ -15,7 +15,7 @@ all run on after their request ends. The stop cut them mid-round:
   running; the cluster sockets closed, the scheduler failed every wave naming
   their sequences, and nothing was handed on. Another member would have revived
   the chats only once their beat had been silent for `RESUME_AFTER_MS`, ten
-  minutes (`mcp/resuming.rs`); the client waited on them as on a hung call.
+  minutes (`zend/src/mcp/resuming.rs`); the client waited on them as on a hung call.
 - 11:51 the same day, the same on the install of `1f5ad2746`.
 
 A dialogue turn cut off in its first round could never resume at all: its

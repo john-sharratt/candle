@@ -1,8 +1,15 @@
 # Yen Bots: an app host for Yen
 
-**Status: design, not built.** This document is authoritative for the yenbot
+**Status: the changes this repository needs for it are built (§22); the
+yenbot binary lives in its own repository.** This document is authoritative for the yenbot
 service (the site **Yen Bots**), its repository, its place behind the gateway
-and the changes the gateway, zend, npcd and tokera.com need for it.
+and the changes the gateway, zend, npcd and tokera.com need for it. In this
+repository the `yenbot` site and its bus topics are in `web/web.yaml`, the
+service is in `keep/keep.yaml`, the checkout is in `motherd/agent.yaml`,
+`service:yenbot` is in `host/roles.yaml`, `yenbot` is a service of
+`service_deploy` (`zend/src/mcp/tools/service/mod.rs`), the estate entry is in
+`web/src/site/tokera/page.rs`, and the `yen-apps` guide is in
+`mcp/src/guides/yen-apps.md`.
 
 ## 1. What it is
 
@@ -26,7 +33,7 @@ by rule — before it goes live.
 
 | Principle | Decision |
 |---|---|
-| HTML changes go live quickly | Apps are files the binary serves from disk and reloads on change (§5.3), and the platform's own web files — framework, design system, landing page — are built into the binary and released with it (§5.2). An edit is one `file_edit_and_commit` from claude.ai, live within a second (§5.4). Only Rust changes rebuild the binary, through the existing `service_deploy` (§5.5). |
+| HTML changes go live quickly | Apps are files the binary serves from disk and reloads on change (§5.3), and the platform's own web files — framework, design system, landing page — are built into the binary and released with it (§5.2). An edit is one `file_edit_and_commit` from claude.ai, live within a second (§5.4). Only changes to the binary — its Rust and its embedded web files — rebuild it, through the existing `service_deploy` (§5.5). |
 | Many apps, like tokera.com | One site, many apps under `/a/<app>/`, each a folder with a manifest (§5). |
 | One common framework | Every app is built on the platform's frontend framework, design system and SDK, served from `/_/` (§8). |
 | An advanced frontend framework that stays simple | Components, signals and a router, with fixed conventions and no build step (§8.2–§8.4). |
@@ -112,8 +119,8 @@ yenbot/
   src/                        the platform, one concern per file
     main.rs  config.rs  serve/  api/  store/  accounts/  jobs/  workflows/
     push/  ai/  apps/  library/  check/
-  web/                        the platform's web files: served from disk by the gateway,
-                              and embedded into the binary at build time (§5.2)
+  web/                        the platform's web files: embedded into the binary at build
+                              time and served by it (§5.2)
     index.html  _admin/       the landing page and the admin page
     _/yen.js  _/framework/    the framework: one import, one module per concern (§8)
     _/yen.css  _/ui/          design system: the page's look; tokens.css, fonts.css, components/
@@ -137,10 +144,10 @@ yenbot/
 ```
 
 `web/` is embedded with `include_dir!`, so the binary is whole on its own and
-serves the site with no checkout beside it; the gateway serves the same
-directory from the live checkout (§5.2), so a change to it is live as an
-app's is. `apps/` and `library/` are read from the live directory at runtime.
-Only a change under `src/` is a rebuild.
+serves the site with no checkout beside it (§5.2), so a change to it is a
+release of the binary. `apps/` and `library/` are read from the live directory
+at runtime, and change as soon as they are published. Only a change under
+`src/` or `web/` is a rebuild.
 
 ## 5. Apps
 
@@ -277,11 +284,12 @@ release motherd, web and mcp (`zend/src/mcp/tools/service/deploy.rs`):
 `service_control` restarts, stops and starts it through keep, as it does the
 others, for a site that is wedged rather than broken.
 
-The services keep runs are one list, `SERVICES = [motherd, web, mcp, yenbot]`
-(`zend/src/mcp/tools/service/mod.rs`), shared by `service_deploy`,
+The services keep runs are one list, `SERVICES = [motherd, web, mcp, yenbot,
+battlecities]` (`zend/src/mcp/tools/service/mod.rs`), shared by `service_deploy`,
 `service_control` and the workers' tools (`zend-tools`'s `Service`); each is
-built from the package of its name, in the repository `repo_of` names —
-`yenbot` for yenbot, `candle` for the rest (§22). The yenbot binary
+built from the package `package_of` names, in the repository `repo_of` names —
+`yenbot` for yenbot, `battle-cities` for the game (`docs/battlecities_app.md`),
+`candle` for the rest (§22). The yenbot binary
 answers `--build-info` from the cluster crate's version module and prints
 `INFO serving` once listening, as mcp does.
 
@@ -1598,14 +1606,14 @@ with its tile under `web/content/common/brand/`, and in the footer.
 | `web/web.yaml` | A `yenbot` site: `hosts: [yenbot.com.au]`, `api: [{prefix: /, upstream: "http://127.0.0.1:8096"}]`; `www.yenbot.com.au` as a redirect site. |
 | `web/src/auth/` | Sign-in per cookie domain (§12.1); the Google connect flow, the encrypted refresh-token store and `/gateway/google/token` (§19.3). |
 | `zend-tools`, `zend/src/mcp/archiving.rs` | A worker's tool sessions closed when its conversation is archived (`docs/mcp_file_tools.md` §4.2). |
-| `web/web.yaml` roots | `D:/yenbot/live/web` as the yenbot site's disk root (§5.2). |
+| `web/web.yaml` roots | None: the yenbot site has no disk root, because the platform's web files are embedded in the binary (§5.2). |
 | `web/src/`, `web.yaml`, zend | Service keys, the gateway's bus, `repo/<name>` on every push, and the connector's file tools — `docs/mcp_file_tools.md`. |
 | `host/roles.yaml` | `service:yenbot` as a user. |
 | Google Cloud console | `https://yenbot.com.au/auth/callback` as a redirect URI on the existing client; the scopes apps may ask for on the consent screen, and the family as test users (§19.3). John does this. |
 | Zen credentials | `yenbot`, an API token for an admin's account, under `http_bearer` in each member's `~/.zend/secrets.yaml`, which `http_session_open` falls back to (§6.3). |
-| `keep/keep.yaml` | The `yenbot` service: `stable: keep/stable/yenbot.exe`, `args: [--config, D:/yenbot/yenbot.yaml]`. |
+| `keep/keep.yaml` | The `yenbot` service: `stable: keep/stable/yenbot.exe`, `args: [--config, D:/yenbot/live/yenbot.yaml]`, `cwd: D:/yenbot`. |
 | `motherd/agent.yaml`, `D:\prog\workspace.yaml` | The `yenbot` repository, for Zen and the agent, with `author: {name: Yen, email: <Yen's address>}`. |
-| `service_deploy`, `service_control`, `service_status` | Learn `yenbot`: its repository and its package (§5.5). |
+| `service_deploy`, `service_control`, `service_status` | Learn `yenbot`: its repository and its package (§5.5); built. |
 | Zen connector | Every workspace repository is offered to the existing connectors (`docs/mcp_file_tools.md` §3.4); `log_list`, `log_read`, `log_grep` in place of `cluster_logs` (`docs/mcp_file_tools.md` §6); yenbot as the yenbot repository's gate (`docs/mcp_file_tools.md` §3.2). |
 | Zen's memory | The `yenbot` journal (§17.6). |
 | Zen grants | No approval on any step of the iteration (§17.7). |
@@ -1644,8 +1652,8 @@ Taken 2026-11-06:
 - **Everything has an API**, the admin page's actions included, documented in
   `docs/api/` and served as OpenAPI.
 - **The binary is released with the existing `service_deploy`**; the
-  platform's web files are served from disk by the gateway, so only Rust
-  changes need it.
+  platform's web files are embedded in it (§5.2), so a change to them or to
+  the Rust needs it, and an app's own files do not.
 - **Apps may override a fixed set of named tokens**, contrast-checked.
 - **Google services go through the gateway's existing client**, which keeps
   the refresh tokens; yenbot only ever holds a short-lived access token.

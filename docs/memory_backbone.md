@@ -1,12 +1,12 @@
 # The memory backbone: one master journal per group, in git
 
-**Status: redesigned, for review** (2026-10-31). This revision roots the tree
+**Status: built** (redesigned 2026-10-31). The tree is rooted
 at a group's **master journal** instead of at each person. People,
 conversations and topics are journals beneath it, and a conversation works
 out, as it goes, who is speaking and what it is about (the user's decisions,
 §15). The `journals` crate, zend's tools, its writer and the HTTP routes
-build the person-rooted tree of the previous revision, which this file's
-history keeps. §14 is the order they change in.
+build this tree; the person-rooted tree of the previous revision is kept in
+this file's history. §14 is the order they changed in.
 
 This document generalises `docs/mcp_user_context.md` (the flat `U:` journal,
 `get_user_context`, the first-call context) and the `/mcp` journals of

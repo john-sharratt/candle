@@ -44,7 +44,7 @@ against is the safety net it already is.
   constrained to the real names. This is what ended the invented-device looping,
   and it holds **whatever a mission's prose says** — which is why template
   parameters need no validation machinery of their own (§4).
-- **The handset threads** (`npcd/src/sim/phone/mod.rs`) — the Discord messaging the
+- **The handset threads** (`npcd/src/sim/phone/`) — the Discord messaging the
   drones already do, over which a coding mission drives zend (§7).
 
 ---
@@ -124,10 +124,10 @@ Templates are stored per world, in that world's repo, foldered for browsing, one
 template to a file:
 
 ```
-<world-repo>/missions/<group>/<template-id>.yaml
-            /missions/devices/play-a-film.yaml
-            /missions/coding/add-a-feature-to-zend.yaml
-            /missions/ops/patch-our-machines.yaml
+<world-repo>/missions/<world>/<group>/<template-id>.yaml
+            /missions/<world>/devices/play-a-film.yaml
+            /missions/<world>/coding/add-a-feature-to-zend.yaml
+            /missions/<world>/ops/patch-our-machines.yaml
             /missions/README.md
 ```
 
@@ -209,7 +209,7 @@ release), the task's news arrives on its handset, and the drone answers its
 questions and nudges it across as many ticks as it takes, until it reports done.
 The mission's terminal step is gated on that — the engine signs it off when the
 task completes, not on the drone's word, the same shape as the doc-commit and
-publish gates in `mission.rs`.
+publish gates in `npcd/src/engine/mission/`.
 
 **The acts.** A template grants any of `task_start { title, prompt, role? }` (the task's name; `name` is the act
 line's own field — made the kebab-case slug of at most 40 characters zend names a task with, cut on a word,

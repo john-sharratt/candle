@@ -61,15 +61,17 @@ tools: [repo_task_start, job_status, repo_task_reply, journal_grep, timeline_rea
 
 ### 2.2 Compiled in
 
-The folder is embedded with `include_dir!` (as zend embeds its prompts) and
-parsed once at startup into `Guide { name, description, tools, body }`
-(`mcp/src/guides/mod.rs`). A new `.md` dropped in the folder is picked up by the
-next build with no list to edit.
+The folder is embedded with `include_dir!` by the `guides` crate
+(`guides/src/lib.rs`, which Zen's own guide tools read too) and parsed once at
+startup into `Guide { name, description, tools, clients, body }`
+(`guides/src/guide.rs`); the aggregator re-exports them and answers the two
+tools (`mcp/src/guides/mod.rs`, `tools.rs`). A new `.md` dropped in the folder
+is picked up by the next build with no list to edit.
 
 - The guides ship in the same binary as the aggregator, so a guide and the
   version it describes are released together.
 - Editing a guide is a commit, a rebuild of `mcp` and a restart — about a
-  minute on AlienWorld, touching neither zend nor npcd.
+  minute, touching neither zend nor npcd.
 - **Tests** parse every embedded guide: frontmatter present, `name` equals the
   file stem, names unique, a non-empty `description` and `tools`, a body.
   A broken guide fails `cargo test`, never a session.
@@ -102,16 +104,15 @@ Only names and one-liners; the method arrives on demand. A tool more than four
 guides list (`NAMES_ONLY_PAST`) gets the names alone, so the line never
 outgrows the tool's own description. The backends know
 nothing of guides. A guide may span backends — a bot guide can list `bot_*`
-and `task_*` tools alike.
+and `repo_task_*` tools alike.
 
 ### 2.5 What moves
 
-`skills/` becomes the first guides: `zend-thread` (as the base guide every
-other refers to), `zend-research`, `zend-implement`, `zend-review`,
-`zend-test`, `zend-deploy`, `zend-release`, `zend-rollback`, `zend-watch`,
-`cluster-care`, plus a new `bots` guide for npcd's tools. Each repo skill
-shrinks to a pointer — "call `guide_read {name: research}`" — kept only for
-Claude Code's automatic loading, or is removed.
+`skills/` became the first guides: `thread` (the base guide every other
+refers to), `research`, `implement`, `review`, `test`, `deploy`, `release`,
+`rollback`, `watch`, `cluster-care`, plus `bots` for npcd's tools; the library
+has grown since (`mcp/src/guides/`). The repo's `skills/zend-*` and
+`cluster-care` remain for Claude Code's automatic loading in this repository.
 
 ### 2.6 Later: `guide_edit`
 
@@ -220,7 +221,7 @@ The first guide written against §3 and §4:
 3. Citation audit and the correction round (§4).
 4. The research and verify guides rewritten against 2 and 3 (§5).
 
-Releases: 1 is the aggregator alone (AlienWorld); 2 and 3 are zend (BlackWorld,
+Releases: 1 is the aggregator alone (BlackWorld and WhiteWorld); 2 and 3 are zend (BlackWorld,
 rolling to the cluster).
 
 ## 7. Decisions
@@ -255,5 +256,5 @@ rolling to the cluster).
   descriptions, errors, instructions and guides speak of workers, the model and
   hardware the user owns. The app's name appears only where it is a value Claude
   passes or reads back — `app` and `tenant` in the operations tools. The
-  aggregator's backends are named `coding` and `bot`, the names its failures
+  aggregator's backends are named `coding`, `bot` and `dj`, the names its failures
   give.

@@ -52,7 +52,7 @@ Rules, enforced when the workspace is built (`zend-vfs/src/workspace.rs`):
 
 - At least one repository.
 - A name is one plain folder name: no separators, no `.`/`..`, nothing Windows would open as another name (a `:`, a trailing dot or space, an 8.3 `~N` tail), not `secrets`, and not `jobs` in any case — the folder the command sandboxes write their job logs to (§7.4). Names are unique, so no two repositories share a folder and none nests in another.
-- Each folder must exist. A manifest key the schema does not know (a misspelt `name`, a `path:` field) is an error, not ignored.
+- Each folder must exist (`Workspace::load`), unless the repository is read from the substrate: the manifest is read without requiring folders (`Workspace::manifest`) and such a repository is marked `Workspace::in_substrate` — it has no folder (`docs/substrate_git.md` §7). A manifest key the schema does not know (a misspelt `name`, a `path:` field) is an error, not ignored.
 - A missing manifest fails the launch immediately — before the model loads.
 
 ### 3.2 The uploads repository
@@ -76,7 +76,7 @@ Anything else in the folder — other checkouts, stray files — is outside ever
 
 | Form | Example | Used by |
 |---|---|---|
-| Workspace-relative key | `candle/zend/src/main.rs` | The walk, `repo_map` / `code_reading` metadata and resume hashes, uploads, the fast path. |
+| Workspace-relative key | `candle/zend/src/main.rs` | The walk, `repo_map` / `code_reading` metadata and resume hashes, uploads, the working set's reading lookups. |
 | `(repo, path)` | `repo: candle`, `path: zend/src/main.rs` | Every tool call and tool response. |
 
 A repository's folder is its name, so the key's first segment *is* the repository, and `zend/src/repo_path.rs::split` converts one form to the other. There is no second mapping to keep consistent.
@@ -146,7 +146,7 @@ Because the enum is part of each tool's rendered definition, it is part of its c
 
 ## 5. Ingest
 
-The `repo_map` and `code_reading` layers are ingested from every branch origin holds, never from a repository's folder — the folder is whoever's working copy it is, borrowed by the sandbox. `docs/zend_branch_ingest.md` is the design: a watcher notices a moved branch within seconds and fetches, and the pass ingests each unit of content once, keyed by what it shows rather than by the commit it was found on. Uploads are ingested by their endpoint.
+The `repo_map` and `code_reading` layers are ingested from every branch origin holds, never from a repository's folder — the folder is whoever's working copy it is, borrowed by the sandbox. `docs/zend_branch_ingest.md` is the design: one member per repository imports origin through an agent and a moved branch wakes the ingest worker on every member, and the pass ingests each unit of content once, keyed by what it shows rather than by the commit it was found on. Uploads are ingested by their endpoint.
 
 ### 5.1 The walk
 
@@ -163,15 +163,13 @@ One unit per directory holding walked files (`candle/`, `candle/zend/src/`, …)
 
 A file's hidden conversation opens with ``Read the entire contents of `zend/src/main.rs` in the `candle` repository …``; the model decodes its own `file_read` calls, constrained to the repository enum, against the commit the file was found on. Its key is the workspace-relative path and the blob id (`docs/zend_branch_ingest.md` §6.1).
 
-**The first turn opens with the call.** Its assistant half is prefilled with the `<tool_call>` marker and begins inside the same call loop the trigger enters, compiled over `file_read` alone (`RefreshContext::read_opening`, `TurnOptions::turn_grammar`): the model writes the call's name and `lines` itself, and may add calls or end the turn after each, but cannot end the turn before it has read. Left to choose, a reading ended on its first token with `<|im_end|>` (2026-11-11, three files, every pass). Only the first turn opens so; the turns after it carry the reads' results and end in the model's own summary. A reading whose `file_read` comes back `not_found` fails at that round — it reads the one file its prompt names, so a call that found nothing read something else, and a reading left to go on searched until its round cap and was committed as an answer about the search (about 115 on 2026-11-11, `candle-conversation/src/turn_layout.rs` read as `src/turn_layout.rs`). A reading already committed that way is broken too: the pass and the fast path judge a reading finished only when its chain finished and its opening reads' results (the turn after the opening) hold no `file_read` `not_found` (`code_read::reading_break`), so such a file is queued and read again, its broken generation tombstoned once the new one commits. A reading that still answers nothing fails the same way — the attempt is tombstoned, the generation before it is kept — and is never committed: committed, it superseded the reading that did read the file.
+**The first turn opens with the call.** Its assistant half is prefilled with the `<tool_call>` marker and begins inside the same call loop the trigger enters, compiled over `file_read` alone (`code_read::reading::read_opening`, `TurnOptions::turn_grammar`): the model writes the call's name and `lines` itself, and may add calls or end the turn after each, but cannot end the turn before it has read. Left to choose, a reading ended on its first token with `<|im_end|>` (2026-11-11, three files, every pass). Only the first turn opens so; the turns after it carry the reads' results and end in the model's own summary. A reading whose `file_read` comes back `not_found` fails at that round — it reads the one file its prompt names, so a call that found nothing read something else, and a reading left to go on searched until its round cap and was committed as an answer about the search (about 115 on 2026-11-11, `candle-conversation/src/turn_layout.rs` read as `src/turn_layout.rs`). A reading already committed that way is broken too: the pass and the working set's coverage check judge a reading finished only when its chain finished and its opening reads' results (the turn after the opening) hold no `file_read` `not_found` (`code_read::reading_break`), so such a file is queued and read again, its broken generation tombstoned once the new one commits. A reading that still answers nothing fails the same way — the attempt is tombstoned, the generation before it is kept — and is never committed: committed, it superseded the reading that did read the file.
 
-### 5.4 Fast path
+### 5.4 Reads run for real
 
-The fast path, which serves a `file_read` from a `code_reading` conversation that already read the same bytes, joins the call's `repo` and `path` into the workspace-relative key the ingest used, with the blob id the conversation's base holds for that path. A file the conversation has changed is never served: its own copy is what it must read. A `repo` the workspace does not list is never joined onto the workspace; the call runs for real and the tool refuses it.
+Every `file_read` and `file_list` runs and its answer is prefilled; nothing answers a call from an ingested unit (`docs/zend_branch_ingest.md` §8.1). The working set joins a call's `repo` and `path` into the workspace-relative key the ingest used, with the blob id the conversation's base holds for that path, to find the readings of the version the call returned and withhold them for the rest of the turn (`docs/zend_working_set.md` §4.5). A file the conversation has changed withholds nothing: its own copy is what it read. A `repo` the workspace does not list is never joined onto the workspace.
 
-A `file_list` of a folder's first page is served from the folder's `repo_map` conversation by the same rules, the folder addressed as its repository and the path inside it (`""` for the root) — see `docs/zend_branch_ingest.md` §8.1.
-
-There is no file watcher: nothing reads a repository's folder for ingest. Origin is watched instead (`docs/zend_branch_ingest.md` §4).
+There is no file watcher: nothing reads a repository's folder for ingest. Origin is imported by one member through an agent instead (`docs/zend_branch_ingest.md` §4).
 
 ---
 
@@ -240,7 +238,7 @@ A conversation whose base is not the commit its branch holds is refused before a
 
 A program named without a path is looked up the way a shell looks it up: on Windows through `PATHEXT` as well as `PATH` (`sandbox/resolve.rs`), so `npm` starts the `npm.cmd` Node installs beside `node.exe`, which the system alone would not find.
 
-**In the daemon.** `ToolHost::new` builds one `SandboxServer` per git repository of the workspace (`zend_tools::sandboxes::Sandboxes`; a folder that is not a git repository — `uploads` — gets none), first putting back whatever a job a crash cut short left set aside in its checkout (`Sandbox::recover`; one that cannot be is logged and left, named, for its owner), logging to the workspace folder's `jobs/`, and shares them with every tool context; only a context granted `Exec` reaches them (`ToolContext::sandboxes`). The programs a job may start are the deployment's allow-list, `zend-vfs/src/sandbox/programs.rs`: the build, test and packaging toolchains (`node`, `npm`, `npx`, `cargo`, `python`, `pytest`, `go`, `dotnet`, `make`, …) and no shell. The list decides which programs start, not what they do — an interpreter or a package manager on it runs whatever it is handed, with the daemon's rights — so it is not the security boundary; the tools mode is.
+**In the daemon.** `ToolHost::new` builds one `SandboxServer` per git repository of the workspace (`zend_tools::sandboxes::Sandboxes`; a folder that is not a git repository — `uploads` — gets none, and neither does a repository read from the substrate, which has no folder: its commands run on agents, `docs/substrate_git.md` §7), first putting back whatever a job a crash cut short left set aside in its checkout (`Sandbox::recover`; one that cannot be is logged and left, named, for its owner), logging to the workspace folder's `jobs/`, and shares them with every tool context; only a context granted `Exec` reaches them (`ToolContext::sandboxes`). The programs a job may start are the deployment's allow-list, `zend-vfs/src/sandbox/programs.rs`: the build, test and packaging toolchains (`node`, `npm`, `npx`, `cargo`, `python`, `pytest`, `go`, `dotnet`, `make`, …) and no shell. The list decides which programs start, not what they do — an interpreter or a package manager on it runs whatever it is handed, with the daemon's rights — so it is not the security boundary; the tools mode is.
 
 Two tools drive it, Comprehensive only (`Network` + `Exec` + `DiskWrite`, high-risk):
 
@@ -310,6 +308,6 @@ Agents are long-lived VMs, added or removed on queue depth and wait time, and re
 
 - The walk visits exactly the listed repositories, keys workspace-relatively, respects scope and depth, never walks uploads.
 - Every folder unit is inside a repository and no prefilled call names `*`; prefilled calls split `repo` and `path`.
-- The fast path refuses a repository the workspace does not list, and never offers a file the conversation has changed.
+- The working set's corpus lookup refuses a repository the workspace does not list, and withholds nothing for a file the conversation has changed.
 
 **End to end** (GPU, `#[ignore]`d): a daemon over a multi-repository workspace answers a question whose answer lives in the second repository's files.

@@ -73,7 +73,7 @@ later:
 
 ### 1.1 Why a rolled-back member sits there for good
 
-The path as built:
+The path before the attempts record replaced `refused.json`:
 
 1. The new process does not prove itself. keep kills it, puts the stable file
    back and starts it with its usual flags.
@@ -111,7 +111,7 @@ cluster, saying why. It never sits connected and idle.**
 
 ### 2.1 The failure is recorded with its cause and counted
 
-`refused.json` becomes `<data>/upgrade/failed.json`: for each build an install
+`refused.json` became `<data>/upgrade/attempts.json`: for each build an install
 of which failed here, the attempts, and for each attempt when it ended and how:
 
 | Kind | From keep's trial end | Meaning |
@@ -126,7 +126,7 @@ trial log's last lines included.
 
 ### 2.2 Retry, bounded
 
-A failed build is tried again **three times**, `RETRY_AFTER` = 10, 30 and 90
+A failed build is tried again **three times**, `RETRY_AFTER_MS` = 10, 30 and 90
 minutes after each failure. After that it is refused.
 
 - `slow` retries. The same build on the same machine at a quieter moment is the
@@ -138,7 +138,7 @@ minutes after each failure. After that it is refused.
 - A retry is an ordinary install, under the same lease and the same proof
   window, so it is still one member at a time.
 - A build named by a forced rollout (§3.11 there) is tried as the rollout says,
-  as today. A build the member runs is forgiven, as today (`refused::forgive`).
+  as today. A build the member runs is forgiven, as today (`Attempts::forgive`).
 - Each attempt's end is in the member's upgrade report, so the status can show
   the history (§4).
 
@@ -211,8 +211,9 @@ gateway, and its machine's other parts follow it:
 ## 3. Gateway state words
 
 - **`upgrading` means an install is under way.** A member admitted below the
-  floor and not installing is reported as **`behind`**: a new `MemberState`
-  the gateway gives a below-floor admission in place of `Upgrading`. The
+  floor and not installing is reported as **`behind`**: the status's word for a
+  member the gateway holds `Upgrading` that is not installing
+  (`zend/src/mcp/tools/cluster_status.rs`; `MemberState` has no `Behind`). The
   member's own `Upgrading`, sent while `install_tick` runs, keeps the word.
 - **An older member serving between attempts** (§2.3) is `ready` with a note,
   `on <build>, install of <floor> pending (attempt <n> of 3 at <time>)`.
@@ -229,7 +230,7 @@ knows something about it. It reads oldest first, then the present:
 |---|---|
 | keep's board | what keep runs and since when; the trial in progress; each trial's build, end, proven or rolled back, and keep's detail |
 | the gateway's status | each member on the machine: app, build, when admitted, below which floor, its state (§3), `silent`, `lagging`, `syncing`; the connector's routing (§2.5) |
-| the member's upgrade report | an install under way and its step; a fetch's progress; `failed.json`'s attempts with their kinds and the next attempt's time; `stranded` and why |
+| the member's upgrade report | an install under way and its step; a fetch's progress; `attempts.json`'s attempts with their kinds and the next attempt's time; `stranded` and why |
 | the app's floor | which build, and since when |
 
 ```
@@ -252,7 +253,7 @@ knows something about it. It reads oldest first, then the present:
 
 **Member** (`cluster/src/upgrade/runtime/`, raw expected values):
 
-- A restored process records the failed build in `failed.json` with its kind
+- A restored process records the failed build in `attempts.json` with its kind
   from keep's trial end: `slow`, `died` or `cancelled`. Cancelled counts no
   attempt.
 - `decide::target` takes a failed build again at 10, 30 and 90 minutes after
@@ -268,8 +269,8 @@ knows something about it. It reads oldest first, then the present:
 
 - A restored member below the floor is admitted serving while older builds may
   serve, and upgrading once they may not.
-- A below-floor admission that is not installing is `MemberState::Behind`. A
-  member's own `Upgrading` passes through.
+- A below-floor admission that is not installing is read as `behind` by the
+  status (`cluster_status.rs`). A member's own `Upgrading` passes through.
 - A stranded member is closed 4410 with its reason.
 - `/mcp` is routed to no connector whose machine's daemon is behind or closed,
   unless it is of the floor's build.

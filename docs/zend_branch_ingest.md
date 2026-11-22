@@ -9,7 +9,7 @@ It replaces the folder walk of `docs/zend_workspace_execution.md` §5.1 and refi
 
 ## 1. Summary
 
-Every repository in the workspace whose record is on `origin` (`docs/zend_git.md` §7.8) is ingested **from its branches as origin holds them**: each `refs/remotes/origin/*` ref the ingest's whitelist names (§3.1), read in place, with no local branch made for any of them and nothing written to the checkout. A watcher asks origin every couple of seconds whether any branch moved — one small authenticated request per repository, on git's own wire protocol, which no API quota counts — and fetches only when something did. The fetch wakes the ingest worker.
+Every repository in the workspace whose record is on `origin` (`docs/zend_git.md` §7.8) is ingested **from its branches as origin holds them**: each `refs/remotes/origin/*` ref the ingest's whitelist names (§3.1), read in place, with no local branch made for any of them and nothing written to the checkout. Origin is imported by one member per repository, the holder of the lease `git/<repo>`, which fetches through an agent every 15 s and publishes what moved to the substrate's log; every member learns the new tips by replication, and a record branch that moves wakes the ingest worker (§4, `docs/substrate_git.md` §5). No member probes origin of its own.
 
 The ingest lists each branch tip's tree (one `ls-tree` per distinct tree, no file contents read), filters it by the same rules the folder walk used, and derives the units the two layers ingest. **A unit is keyed by what it shows, never by the commit it was found on.** A file's key is its repository, its path and its **blob id** — git's own hash of exactly the bytes `file_read` returns. A folder's key is a hash of its listing — the entries on its first page and how many it holds — and the blob ids of the files whose content its turns show. A commit only says where to read a unit's bytes from. So a branch moving forward re-ingests only the paths whose blob changed there; a file untouched since an older commit is never read again; and the same file on twenty branches is one conversation.
 
@@ -22,7 +22,7 @@ Whatever is ingested but no longer found on any whitelisted branch is tombstoned
 ### Goals
 
 - Every whitelisted branch on origin ingested (§3.1), within `--max-depth` and the `--ingest-dir` scope, whatever is checked out.
-- A change on origin noticed within seconds, on GitHub, GitLab, Gitea or any smart-HTTP host, without spending REST or GraphQL quota.
+- A change on origin noticed within seconds (the importer's fetch is every 15 s, §4.1), by one member for the whole group, without spending REST or GraphQL quota.
 - One ingest per distinct unit of content, however many branches or commits carry it.
 - A conversation's retrieval and fast path agree with the files it actually reads.
 - Nothing ingested outlives the branches that hold it.
@@ -39,9 +39,9 @@ Whatever is ingested but no longer found on any whitelisted branch is tombstoned
 
 ### 3.1 The record
 
-A repository's branches are its **record branches**: with an `origin` remote, every `refs/remotes/origin/<b>` except the symbolic `HEAD`; with none, every local branch. `Repo::record_branches()` returns them as `(BranchName, Oid)`, in name order. They are read locally and never touch the network — the watcher (§4) is what keeps them current.
+A repository's branches are its **record branches**: with an `origin` remote, every `refs/remotes/origin/<b>` except the symbolic `HEAD`; with none, every local branch. `Repo::record_branches()` returns them as `(BranchName, Oid)`, in name order. They are read locally and never touch the network — the importer (§4) is what keeps them current.
 
-**The ingest reads only the record branches its whitelist names.** `zend/src/prompts/ingest_branches.yaml` lists branch names, matched whole and applied to every repository; `branch_ingest::record_branches` drops every other branch before a tree is walked (`branch_ingest/monitored.rs`). A branch off the list contributes no unit, so every reading only such a branch held is planned as gone and tombstoned on the next pass (§1), and maintenance reclaims its bytes; a version a listed branch shares keeps its reading. The list ships as `main` and `master`. Reading every branch cost a reading per distinct file version on each of them: on BlackWorld (2026-11-09) ~127 branches of `candle` held 3,562 `code_reading` conversations for the ~1,177 files of `main`, and the substrate reached 694 GB.
+**The ingest reads only the record branches its whitelist names.** `zend/src/prompts/ingest_branches.yaml` lists branch names, matched whole and applied to every repository; `branch_ingest::record_branches` drops every other branch before a tree is walked (`keep_monitored`, `branch_ingest/monitored.rs`). A branch off the list contributes no unit, so every reading only such a branch held is planned as gone and tombstoned on the next pass (§1), and maintenance reclaims its bytes; a version a listed branch shares keeps its reading. The list ships as `main` and `master`. Reading every branch cost a reading per distinct file version on each of them: on BlackWorld (2026-11-09) ~127 branches of `candle` held 3,562 `code_reading` conversations for the ~1,177 files of `main`, and the substrate reached 694 GB.
 
 No local branch is created for any of them. The ingest reads trees and blobs by id, which needs no branch at all, and a conversation that switches to one gets a local branch the ordinary way (`git_switch` pulls it, `docs/zend_git.md` §7.8).
 
@@ -49,48 +49,29 @@ No local branch is created for any of them. The ingest reads trees and blobs by 
 
 A conversation's store pins its branch's **record** on first read (`GitSource::base_at`): `refs/remotes/origin/<b>` when origin has the branch, else `refs/heads/<b>`. That is the copy the ingest covered, the copy `git_status` already compares against, and the copy a commit must descend from to publish. A commit the developer made locally and never pushed is not on the record and is not what a new conversation starts from.
 
-A conversation's base can therefore be ahead of its local branch — origin moved, the watcher fetched, the local branch was left where it was. The sandbox, which checks the conversation's branch out, brings the local branch up first (`Repo::follow_record`): when the base is in origin's copy's history and the local branch is in the base's, the local branch is fast-forwarded to the base (created there if it does not exist), under a compare-and-swap. It does so only once it holds the checkout's lock and has set the owner's state aside, so no other job's checkout moves under it, and the owner's checkout comes back as a branch that moved on rather than as uncommitted work reverting what origin gained: the owner's own changes — staged, unstaged, untracked — are laid onto the branch as it now stands, against the commit they were made on (`checkout/preserve/snapshot.rs`). When the owner's checkout is on that branch with uncommitted changes to a file the followed commits change too, nothing moves and the job is refused, as `git merge --ff-only` refuses (`CheckoutError::OwnWorkInTheWay`). Any other disagreement is refused as before (`docs/zend_git.md` §7.7).
+A conversation's base can therefore be ahead of its local branch — origin moved, the importer fetched, the local branch was left where it was. (A repository read from the substrate has no local branch and no sandbox, its commands run on agents — `docs/substrate_git.md` §7; what follows is for a repository with a checkout.) The sandbox, which checks the conversation's branch out, brings the local branch up first (`Repo::follow_record`): when the base is in origin's copy's history and the local branch is in the base's, the local branch is fast-forwarded to the base (created there if it does not exist), under a compare-and-swap. It does so only once it holds the checkout's lock and has set the owner's state aside, so no other job's checkout moves under it, and the owner's checkout comes back as a branch that moved on rather than as uncommitted work reverting what origin gained: the owner's own changes — staged, unstaged, untracked — are laid onto the branch as it now stands, against the commit they were made on (`checkout/preserve/snapshot.rs`). When the owner's checkout is on that branch with uncommitted changes to a file the followed commits change too, nothing moves and the job is refused, as `git merge --ff-only` refuses (`CheckoutError::OwnWorkInTheWay`). Any other disagreement is refused as before (`docs/zend_git.md` §7.7).
 
 A local branch holding commits origin's copy lacks — the developer's own, never pushed, whether origin has moved on as well or not — is **set aside** for the job instead (`Preserved::set_branch_aside`). The job is judged against the part of the branch origin holds (`Repo::local_branch`: the tip, or where the unpushed commits leave origin's copy), so a conversation made on that commit, or on a later one of origin's, runs, and one origin has since moved past is refused as behind. Under the checkout's lock the branch's tip is held by a ref of the preservation's own (`refs/zend/preserved/<id>/branch`) and journalled, then the branch is moved onto the conversation's base with a compare-and-swap; the job runs on exactly what the conversation reads, without the unpushed commits; and the restore puts the branch back at its own commit — unless it only moved on from there since — before `HEAD` and the owner's changes come back over it. A job that fails or is abandoned puts it back the same way, and a crash leaves the journal, which zend finishes when it starts (`Sandbox::recover`, as it builds each repository's sandbox) and the next job would finish otherwise. The unpushed commits are never built on, published or lost.
 
 ---
 
-## 4. Watching origin
+## 4. Following origin
 
-`zend/src/origin_watch/`. One task per repository with an `origin`, started when the daemon is ready.
+zend reads every repository from the substrate (`zend/src/substrate_git.rs`, `docs/substrate_git.md` §7): a repository's tracking refs are records in the replicated log, and nothing on a member fetches origin for itself. The per-repository origin watcher that once probed origin every couple of seconds (`zend/src/origin_watch/`) is gone.
 
-### 4.1 The probe
+### 4.1 The importer
 
-Every **2 s** (±20 % jitter, so repositories do not synchronise), the watcher asks origin for its branch tips and compares them with the repository's tracking refs. Only a difference costs a fetch.
+A `substrate-git` thread ticks every **2 s** (`TICK`, `substrate-git/src/member.rs`). Each tick, the member holding the lease `git/<repo>` (120 s, renewed every 30 s) imports: it fetches every branch of origin through an agent, the only machine that talks to origin, and publishes each branch that moved ahead of the log as packs and refs. The fetch is made at most every **15 s** (`FETCH_EVERY`). Every member also publishes its own pushes and syncs its store up to the log; a record that changed since the follower last reported it — a sync, or this member's own push landing — wakes the ingest worker (`repositories.on_change`, `zend/src/session/lifecycle.rs`), and registering the callback wakes it once.
 
-The probe is **git protocol v2 `ls-refs`** over HTTPS: one `POST <url>/git-upload-pack` with `Git-Protocol: version=2` and the body
+A repository the log already names is not fetched at startup; it is whole from the log and origin's newer commits are the importer's. A branch origin deletes or rewrites is published as forced only once two consecutive ticks agree (`docs/substrate_git.md` §5.3).
 
-```
-0014command=ls-refs\n
-0001
-001bref-prefix refs/heads/\n
-0000
-```
+### 4.2 A tool round
 
-answered by one pkt-line per branch, `<oid> refs/heads/<b>\n`, then a flush. About 1 KB each way, one request, answered from git's refs directly — no API cache in front of it, and no REST or GraphQL quota spent. GitHub's documented guidance for git reads is at most 15 per second per repository; this is one every two seconds. A `GET <url>/info/refs?service=git-upload-pack` is made once when the watcher starts, to confirm the server speaks v2 and offers `ls-refs`; a server that does not is probed with git instead (§4.3).
+A commit zend itself publishes moves the store's tracking ref as the push lands, so no import is needed to see it. A `git_*` tool round that can write a branch or fetch one (`git_commit`, `git_merge`, `git_ref`, `git_switch`, `git_reset`, `git_push`, `git_fetch`; `BRANCH_MOVERS`, `branch_ingest/mod.rs`) wakes the ingest worker itself.
 
-The probe is the one place zend reaches origin without the git binary. Spawning `git ls-remote` on Windows every two seconds, per repository, with an SSH handshake each time, is both expensive locally and the connection pattern hosts throttle; one kept-alive HTTPS connection per host is neither. The protocol half — pkt-line framing, the request body, parsing the response, deriving the URL — lives in `zend-vfs/src/remote/probe/`, beside the rest of the code that speaks git; zend's watcher only moves the bytes (`reqwest`, HTTP/2 where the host offers it).
+### 4.3 The ls-refs probe
 
-**The URL.** An `https://` origin is probed as it is. An SSH origin — `git@host:owner/repo.git`, `ssh://git@host/owner/repo.git` — is probed at `https://host/owner/repo.git`, which GitHub, GitLab and Gitea all serve. A `file://` or local-path origin has no HTTPS form (§4.3).
-
-**Authentication.** Unauthenticated git reads are throttled on GitHub, so a probe to `github.com` carries the daemon's `github_token` (`~/.zend/secrets.yaml`, `docs/zend_workspace_execution.md` §3.5) as HTTP Basic, user `x-access-token`. Another host is probed without credentials, which serves public repositories.
-
-### 4.2 Fetch
-
-A probe that differs from the tracking refs runs `fetch(origin, AllBranches)` over the remote's configured transport (SSH on this machine). It writes only `refs/remotes/origin/*`, prunes branches origin deleted, never moves a local branch, and fetches no tags. A fetch that changed anything wakes the ingest worker.
-
-A commit zend itself publishes needs no probe at all: a push moves the tracking refs as it lands, so a probe afterwards would find origin and the tracking refs level and fetch nothing. A `git_*` tool round that can write a branch or fetch one (`git_commit`, `git_merge`, `git_ref`, `git_switch`, `git_reset`, `git_push`, `git_fetch`) wakes the ingest worker itself.
-
-### 4.3 When the probe cannot run
-
-A repository whose origin has no HTTPS form, or whose HTTPS probe is refused with 401, 403 or 404 (a private repository on a host zend holds no token for), is probed with `git ls-remote origin` instead (`Repo::ls_remote`, its `refs/heads/*` compared) — the transport the fetch uses, so it authenticates the same way. Over SSH that is every **30 s**; over a local path, where nothing is throttled, every 2 s.
-
-A probe that fails for any other reason — a network error, 429, a 5xx — backs off, doubling from 4 s to at most 5 minutes, and resets on the next success. A shutdown stops every watcher before the ingest worker.
+`zend-vfs/src/remote/probe/` still holds the protocol half of a git v2 `ls-refs` probe over HTTPS — pkt-line framing (`pkt_line.rs`), the request body and the response parsed to branch tips (`ls_refs.rs`), an origin's HTTPS form (`url.rs`) — with its tests. No daemon calls it: nothing on a member probes origin.
 
 ---
 
@@ -105,7 +86,7 @@ A probe that fails for any other reason — a network error, 429, a 5xx — back
 - **The size cap**, `MAX_FILE_BYTES` (1 MiB), from the listing's size — above the largest hand-written source in the workspace (~710 KB), below the dumps that are text only by extension (SASS listings at 2.3–2.8 MB, a 13 MB JSON data file), each of which would be 600K+ tokens that no reading chain finishes. A file already ingested and now over the cap is retired, since the kept list passes the same gate.
 - **The scope**, `--ingest-dir <layer>=<repo>/<folder>`: only paths under that folder.
 - **The depth bound**, `--max-depth N`: path components below the walk's start — the repository's root, or the scope folder — so `1` is its own files. It bounds what is ingested, not what is kept (§7.2).
-- **Nothing ignored**, `--ignore <pattern>` (repeatable; `motherd.yaml`'s `zend: ignore:`): a workspace key `<repo>/<path>` in which `*` matches any run of characters, `/` included (`zend/src/branch_ingest/ignore.rs`). Unlike the depth bound, it bounds what is kept as well: the scope at full depth refuses an ignored path too, so a unit of one is in neither the ingest nor the retain list, and the pass tombstones the reading the substrate held of it (§7.2) — it is ejected, not merely left unread. A `…/*/*` pattern covers only what lies below a folder's own files.
+- **Nothing ignored**, `--ignore <pattern>` (repeatable; `motherd.yaml`'s `zend: ignore:`): a workspace key `<repo>/<path>` in which `*` matches any run of characters, `/` included (`zend/src/branch_ingest/ignore.rs`). Unlike the depth bound, it bounds what is kept as well: the scope at full depth refuses an ignored path too, so a unit of one is in neither the ingest nor the retain list, and the pass tombstones the reading the substrate held of it (§7.2) — it is ejected, not merely left unread. A `…/*/*` pattern covers only what lies below a folder's own files. `motherd.yaml` ships the patterns that keep out the records of past states — every measured result (`candle/docs/results/*`) and every archived document (`candle/docs/archived/*`), whose paths and names no longer exist in the code and which read as current would answer with them — beside the dependency battery's questions and the gates' expected files (`candle/zend/examples/dependency_battery/*`, `candle/docs/provenance_expectations/*`), upstream examples (`candle/candle-examples/examples/*/*`) and the NPC map data (`candle/npc-map/maps/*/*`).
 
 Binary content cannot be told from a listing. It is sniffed when a file is about to be ingested (§7.3).
 
@@ -177,7 +158,7 @@ On the unit's conversation, as metadata: `content_key` (the key), plus `path`, `
 ### 7.1 Live, committed, queued
 
 1. **Live** — the corpus's keys (§5), in two lists: **ingest**, within the scope and the depth bound — what the layer reads — and **retain**, the same scope at full depth — what the layer keeps. Every ingest key is a retain key: a unit's key does not depend on the bound (a folder's listing and hint are the same whatever depth it is walked to), so the full-depth walk finds exactly the keys a deeper pass ingested.
-2. **Committed** — every live conversation of the layer carrying a `content_key`; for `code_reading`, only one whose chain **finished** (`candle_conversation::chain_health`). A file's key is written once its conversation stops calling tools, which is not the same as answering: a read cut off mid-deliberation, with no tool call and no summary, carries the key all the same. Such a chain is not committed, so its key is queued again; its conversation is deferred like a dead key's (§7.2) and retired once the rebuild commits. The resume snapshot and the `file_read` fast path read the same predicate.
+2. **Committed** — every live conversation of the layer carrying a `content_key`; for `code_reading`, only one whose chain **finished** (`candle_conversation::chain_health`). A file's key is written once its conversation stops calling tools, which is not the same as answering: a read cut off mid-deliberation, with no tool call and no summary, carries the key all the same. Such a chain is not committed, so its key is queued again; its conversation is deferred like a dead key's (§7.2) and retired once the rebuild commits. The resume snapshot and the working set's coverage check read the same predicate (`zend/src/code_read/chains.rs`).
 3. **Queued** — ingest keys not committed, in corpus order.
 4. **Dead** — committed keys not retained.
 
@@ -201,21 +182,17 @@ On success the conversation's `content_key` is written, which commits it and mar
 
 ## 8. Retrieval
 
-### 8.1 The fast path
+### 8.1 No served reads
 
-A `file_read` of a file the conversation has not changed is looked up by the file's key from the conversation's base: the blob id its base tree holds for that path (`VfsStore::content_id`), no read and no hash. A hit is locked into the conversation's working set (`zend/src/fast_path.rs`), and its answer reports the line count the ingest recorded (`lines`, §6.3) — the file is not read to count it. A conversation that recorded no count is not served from: an answer that cannot say how much the model already has is not given.
-
-**A `file_list` is never served; it runs and its listing is prefilled.** A listing is short, so serving it saved little, and what stood in for it was the folder's `repo_map` unit — a placed `file_list` round trip whose request the model is told came from the indexer. Handed that as the answer to its own listing, the model lost track of whether it had listed the folder at all. `repo_map` units still reach a dialogue as seeds and through the gather (§8.2); they are only no longer an answer to a call.
-
-A finished chain (`chain_health`) gates a served read, and a file is served only when its chain's reads covered every line. How a hit is then held in context — the budget, locks, release, restart, and the provenance tier beside them — is the working set, `docs/zend_working_set.md`.
+**A `file_read` and a `file_list` always run, and their answers are prefilled.** There is no screen that answers a call from an ingested unit (`zend/src/fast_path.rs` is gone): a listing is short, so serving it saved little, and handed the folder's `repo_map` unit as the answer to its own listing the model lost track of whether it had listed the folder at all. Ingested units reach a dialogue as seeds and through the gather (§8.2). A file's key is still looked up from the conversation's base — the blob id its base tree holds for that path (`VfsStore::content_id`), no read and no hash — to find which finished reading holds the version a `file_read` returned, so the loop can withhold those readings for the rest of the turn (`zend/src/working_set/corpus.rs`), and the working set checks the chain's reads covered the file's line count (`lines`, §6.3) before it serves the reading (`zend/src/working_set/coverage.rs`). A finished chain (`chain_health`) gates a reading. How a reading is held in context — the pool, seeds, the withheld set, the provenance tier beside them — is the working set, `docs/zend_working_set.md`.
 
 ### 8.2 The gather
 
-`repo_map` and `code_reading` are in the provenance gather, **scoped to each conversation's base**. The engine marks their groups as scoped (`ConversationEngine::set_group_scoped`), and a scoped group's candidates for a target are exactly the timelines the target's scope names (`set_retrieval_scope`) — none when it names none. Both the belief scan (`score_belief_groups`) and projection assembly (`TargetedRead::group_turns`) apply it, so an out-of-scope conversation is neither scored nor selected. An ingest conversation's own self-local projection is unaffected.
+`repo_map` and `code_reading` are in the provenance gather, **scoped to each conversation's base**. The engine marks their groups as scoped (`ConversationEngine::mark_group_scoped`), and a scoped group's candidates for a target are exactly the timelines the target's scope names (`set_retrieval_scope`) — none when it names none. Both the belief scan (`score_belief_groups`) and projection assembly (`TargetedRead::group_turns`) apply it, so an out-of-scope conversation is neither scored nor selected. An ingest conversation's own self-local projection is unaffected.
 
 Before each dialogue turn zend computes the target's scope (`zend/src/retrieval_scope.rs`): for each repository, the keys of every file and folder in the conversation's base tree, derived by the same filters and unit rules as the walk — at full depth, like the retain list (§7.2) — looked up in an index of committed keys to timelines. A path the conversation has changed contributes no file key, and the folder holding it no folder key. Every upload is in scope.
 
-**A file version not yet read stands at its path's latest reading.** A commit gives a file a new blob, and the pass reads the new version while the old one stays (§7.2); looked up by the new key alone, the file was out of every scope on the branch until the read committed — and for as long as it kept failing. On BlackWorld (2026-11-19) `candle-conversation/src/conversation.rs`, three lines of imports changed, was out of every conversation while its re-reads failed, and a question whose answer was a call on its fifteenth page was declined. So a file key with no committed reading is looked up by its path instead, and the path's latest committed reading — of whichever version, the one begun last as its timeline id orders it — stands in until the version's own reading commits and replaces it (`IngestIndex::latest_of`). This is the gather only: a `file_read` is served by its exact key (§8.1) and always returns the base's bytes, and so are the working set's seeds. A folder's key already covers only its listing and hint (§6.2), so an edit inside a file moves no folder.
+**A file version not yet read stands at its path's latest reading.** A commit gives a file a new blob, and the pass reads the new version while the old one stays (§7.2); looked up by the new key alone, the file was out of every scope on the branch until the read committed — and for as long as it kept failing. On BlackWorld (2026-11-19) `candle-conversation/src/conversation.rs`, three lines of imports changed, was out of every conversation while its re-reads failed, and a question whose answer was a call on its fifteenth page was declined. So a file key with no committed reading is looked up by its path instead, and the path's latest committed reading — of whichever version, the one begun last as its timeline id orders it — stands in until the version's own reading commits and replaces it (`IngestIndex::latest_of`). This is the gather only: a `file_read` always returns the base's bytes (§8.1), and the working set's seeds are looked up by the exact key. A folder's key already covers only its listing and hint (§6.2), so an edit inside a file moves no folder.
 
 Working the scope out reads no file and **takes no base**. A repository the conversation has not read yet is scoped at the base its first read would take (`VfsStore::peek_base`), and is left unpinned. A tree's units are kept per (repository, tree, index generation), and listing the tree is the only git work: a tree some conversation was already scoped on under this index costs nothing. The whole scope of a conversation that has changed nothing is kept per set of base trees and **shared**: every such conversation on the same bases holds the same two sets. Both caches keep the sixteen most recently used entries.
 
@@ -243,13 +220,13 @@ zend-vfs/src/
   origin/follow.rs    Repo::follow_record
   types/oid.rs        ObjectFormat::blob_id
   vfs/git_source.rs   base_at pins the record
-  vfs/mod.rs          VfsStore::content_id, peek_base, tree_at
+  vfs/store.rs        VfsStore::content_id, peek_base, tree_at
   files.rs            RepoFiles::fresh_at
+substrate-git/src/
+  member.rs           the tick, the lease, FETCH_EVERY
+  import.rs           the importer
 zend/src/
-  origin_watch/
-    mod.rs            one task per repository; the check and fetch
-    probe.rs          the HTTPS transport; git ls-remote when it cannot run
-    cadence.rs        interval, jitter, backoff
+  substrate_git.rs    the repositories read from the substrate; the thread that ticks
   branch_ingest/
     mod.rs            the pass (§7)
     walk.rs           tree listings → corpus (§5)
@@ -264,9 +241,10 @@ zend/src/
     index.rs          committed keys to timelines
     tree_scope.rs     one tree's ingested units
     kept.rs           the bounded caches
+    reader.rs         whose conversation a scope is worked out for (memory files, `docs/zen_memory_and_guides.md`)
 candle-conversation/src/
-  substrate/mod.rs    scoped groups and per-target scopes; archiving drops a scope
-  projection/resolver/mod.rs   both readers honour them
+  substrate/registry.rs        scoped groups and per-target scopes; archiving drops a scope
+  projection/resolver/         both readers honour them (belief_groups.rs, targeted_read.rs)
 ```
 
 ---
@@ -279,7 +257,7 @@ candle-conversation/src/
 - **Keys** asserted as exact strings and exact SHA-256 hex.
 - **The pass's plan** (live, queued, dead, deferred) as a pure function of a corpus and a committed set.
 - **The record**: a conversation pins origin's copy when it is ahead of the local branch; `follow_record` fast-forwards, creates, and refuses a diverged branch. A branch with unpushed commits — ahead of origin's copy or diverged from it, checked out or not, with the owner's staged, unstaged and untracked work over it, an untracked file where origin's copy tracks one — runs its job on origin's copy and comes back at its own commit with nothing published; a failed job and a crash put it back too; a conversation origin has moved past is still refused as behind.
-- **The probe loop** against a local bare origin: a push is seen, fetched and wakes the worker; an unchanged origin costs no fetch.
+- **The importer** (`docs/substrate_git.md` §12): the importer follows origin; a record that moved wakes the worker.
 - **The scope**: a scoped group returns only the target's timelines, and nothing for a target with no scope; archiving or tombstoning a target drops its scope. A conversation's scope is what its base holds; a changed path leaves it with its folder; conversations that changed nothing share one scope; working a scope out pins no base.
 - **The lazy rebuild**: nothing committed, no rebuild; a stale index is rebuilt at most once a second, each rebuild under the next generation; a commit during a rebuild leaves the index stale; a rebuild lets go of what was worked out against the old index.
 - **Partial repositories**: a repository that fails part-way through the walk, or whose `.git` will not open, sits the pass out whole.

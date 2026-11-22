@@ -101,9 +101,9 @@ So a guidance unit is calibrated **from use**:
    - A round that wrote no reasoning ahead of its calls teaches nothing, and
      neither does a read that failed.
 2. **The draft seeds a unit no one has read yet.** The layer's `calibrate:`
-   block declares a `guidance_prompt`. A unit under any drawing group's `paths`
-   is drafted with it instead of the layer's `prompt` (`CalibrateSpec::
-   template_for`). It asks for the questions a worker asks itself mid-task at
+   block declares a `guidance:` prompt (`questions` and `prompt`). A unit under any drawing group's `paths`
+   is drafted with it instead of its profile's prompts (`CalibrateSpec::
+   asks_for`). It asks for the questions a worker asks itself mid-task at
    the moment it needs the unit, in its own words, never naming the file.
    - The parser keeps questions only, so the draft writes questions.
    - Each question is asked again with thinking on, as every drafted question
@@ -194,10 +194,11 @@ with two differences:
 2. **Built.** Use calibration: a read in a tool round becomes an exemplar of its
    unit, kept per unit up to `MAX_EXEMPLARS`. Tests for the read's file, the
    exemplar text and which exemplars are retired.
-3. **Built.** Seeding for units no one has read: the `guidance_prompt`.
+3. **Built.** Seeding for units no one has read: the `calibrate.guidance` prompt.
 4. **Built.** The per-turn counts, logged per turn.
 5. **Built.** The counts split as §3 gives them — missed, read anyway,
    relevant, idle — from each placed unit's peak fresh score
    (`WorkingSet::fresh_of`).
 6. **Built.** Journals' recency term (§4: `Recency`, applied in
-   `working_set_fresh`), and the pool at 16K beside a 64K files budget (§1).
+   `working_set_fresh`), and the `guides` and `journals` kinds of the pool,
+   each with its own share of the slot (§1).

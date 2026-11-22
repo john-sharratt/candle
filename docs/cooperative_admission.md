@@ -276,7 +276,7 @@ now is the machine table (rule 2).
 
 **A card is a process.** Each process draws a random `card` id once
 (`cluster::card::this`) and every member it runs sends it in its `HELLO`
-(protocol 7). zend's member and npcd's member in one motherd share it, so the
+(`frame::handshake`). zend's member and npcd's member in one motherd share it, so the
 gateway counts them as one card. A member that names none (zero) — a peer
 gateway — is a card of its own.
 
@@ -304,7 +304,8 @@ gateway:
   arrives, the gateway takes each waiting unit out in order and places it. One
   that still does not fit is put back, and does not hold back those behind it
   that fit elsewhere.
-- **Bound.** A conversation and a draw wait as long as their client does. Any
+- **Bound.** A client's conversation turn (`POST /v1/chat/completions`) and a
+  client's draw wait as long as their client does. Any
   other unit that has waited 30 s — the catch-up hold of §5.4 — is answered
   `503` with `Retry-After`. A client that goes away is dropped from the queue;
   a unit placed for a client already gone is uncounted at once.
@@ -324,7 +325,7 @@ shared engine from the load. It serves, keeps its quorum place and takes its own
 leases as ready; the cast runs on the members that have loaded.
 
 The gateway sends the weights to every npcd member as `PLAN { epoch, weights }`
-(protocol 7) whenever they change, and to a member as it is admitted. npcd's
+(`frame::membership::Plan`) whenever they change, and to a member as it is admitted. npcd's
 authority lends by the plan's weight for each member (`replicated_substrate.md`
 §9.5), so rendezvous moves only the characters whose holder changed, at their
 next turn boundary (§9.3). A member keeps the last plan it was sent; with none,
@@ -354,8 +355,9 @@ dispatch, so the lines of one request join on `req`:
 | Line | When | Says |
 |---|---|---|
 | `routing standing` | the first pick for an app, and each pick after its members' standing changed | every member, `routable` or `passed over` with each reason — loading, upgrading, fault, draining, disabled, lagging, syncing, closing, silent |
-| `placed` | a `Best` or draw pick | how (`fill`, `round`, `full`, `draw`), and every candidate's machine, rank, `min`, `max`, units, drawing and reserved |
+| `placed` | a `Best` or draw pick | how (`fill`, `round`, `full`, `unplaced`, `draw`), and every candidate's machine, rank, `min`, `max`, units, drawing and reserved |
 | `routed` | a request placed by something other than the policy: a key's holder (`holder`), a canary's share (`canary`), an `Any` request or an errand dealt in turn (`turn`) | the member and why |
+| `placed among the members declaring the route` | a `Best` request on a route only some members declare (a call that starts a model turn, while a rollout has reached only some) | the route, the members declaring it, and the pick by the machine table |
 | `routed among the members declaring the route` | an `Any` request whose route not every ready member declares | the route, the members declaring it, and the pick |
 | `queued` | a unit fits nowhere | its class and the queue's depth |
 | `released` | a queued unit is placed | the member and how long it waited |

@@ -22,7 +22,14 @@ JSON schema.
   idempotent `with_trigger` / `without_trigger`, used to swap the per-turn think
   tree onto the tool-call base.
 - The `§15` module layout and the `§13` public-API sketch predate `driver/mod.rs`,
-  `think.rs`, and `trigger.rs` and are illustrative, not exhaustive.
+  `think.rs`, and `trigger.rs` and are illustrative, not exhaustive. Signatures
+  as built: `compile(&TreeSpec, &dyn Vocab)` takes a `Vocab`, not a tokenizer;
+  `compile_tool_call_tree(&[ToolSpec], &ToolCallEnvelope)` returns a `TreeSpec`
+  (the dialect is the envelope); `TreeSpec::from_yaml(yaml)` is the YAML front-end;
+  the builder's `build()` returns a `TreeSpec`; the simulator is `simulate` with
+  `Oracle` and `SimRun` (`sim.rs`), not a `StencilSimulator` type; and
+  `StencilAction::FreeDecode` carries `{ close_boost, opens_value }`.
+  `Terminator` also has `JsonStringValue`, `JsonValue`, `Never` and `Until`.
 - **Value sub-trees as shipped** (§8.3). Scalars (`integer`/`number`) and any
   container the grammar does not guide are one `FreeText{JsonValue}` span —
   any structurally-valid JSON value, lookahead-terminated at the enclosing
@@ -673,7 +680,7 @@ nodes:
     end: true
 ```
 
-`StencilTree::from_yaml(yaml, tok)` parses to `TreeSpec` and compiles. Parser
+`TreeSpec::from_yaml(yaml)` parses to a `TreeSpec`, which `compile` lowers. Parser
 errors (unknown node id in `next`, unreachable node, no `End`, bad terminator
 tag) are `BuildError`s, not panics.
 
@@ -712,7 +719,7 @@ turn given fewer — a layer unit with two tools, a file's reading with
   given name. It decodes only branches with as many arms as the catalog.
 - `TriggerRegistry::holding(token, held)` returns the turn's registry with that
   table on the trigger's binding; `ConversationEngine::holding_tools(triggers,
-  names)` does both, and errors when no given name is in the catalog.
+  names, first_call)` does both, and errors when no given name is in the catalog.
 - The driver `driver_for` starts carries the table. At each masked step it keys
   on the branch the cursor is in (`StencilSession::in_branch`): entering a held
   branch at its first token starts a hold, each step is masked to the tokens a
@@ -860,7 +867,7 @@ call that was just refused for one.
   conversation answers its listing in a tool loop, and each decode runs under
   the restricted catalog's call grammar held to the chain's tools (`file_list`,
   `file_read`), with each folder's paths held to its commit-pinned stores
-  (`zend/src/repo_scan/mod.rs`, `IngestPlan`). The pass refuses steering with
+  (`zend/src/repo_scan/ingest_plan.rs`, `IngestPlan`). The pass refuses steering with
   no grammar on `<tool_call>` rather than run on it: holding passes such a
   registry through unchanged, and the repo map ran on one — the `<think>`
   trigger alone — until 2026-11-14, decoding its calls free. Live, a folder
@@ -960,9 +967,10 @@ the scheduler in the `TriggerRegistry`. Only two scheduler changes:
 1. **Sample-stage mask + EOS bias hook** in `batched_sampler/`: a per-row
    `Option<AllowedSet>` mask and a per-row close-token boost (§6.3), applied
    after penalties.
-2. **Pre-wave prefill drain** in `scheduler/decode/`: a sequence owing a
-   `Prefill` runs it on its slot (`run_prefill`) before rejoining the
-   next decode wave; the §3 inner loop drains chained actions.
+2. **Static-run drain** in `scheduler/decode/` (`play_stencil_runs`,
+   `decode/stencil.rs`): a sequence owing a `Prefill` plays it as a row that
+   rides the decode step's own wave (`scheduler/stencil_wave.rs`, §3) rather
+   than a forward of its own; the §3 inner loop drains chained actions.
 
 KV cache, projection, and persistence are untouched. The rare healing rewind
 (§7.3) uses the existing `truncate_sequence_to_tokens`. **Decode-health guards**

@@ -391,8 +391,8 @@ splitting into six tools.
 
 ### Seven new live sets
 
-`Carried` · `Hostile` · `Operable` · `Extractable` · `Makeable` · `TowerAction` ·
-`Modes(of)` — the dependent one.
+`Carried` · `Hostiles` · `Operable` · `Extractable` · `Makeable` · `TowerActions` ·
+`DeviceModes` — the dependent one.
 
 Each is a question the world already knows the answer to, which is the test a live
 set has to pass.

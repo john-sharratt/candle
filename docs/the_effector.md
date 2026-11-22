@@ -7,7 +7,7 @@ that router hands back is the same schema that constrains the model's call; and 
 whole world layer is attachable, so an embedder can bring their own.*
 
 This is the fourth surface in the NPC estate. The other three are named in
-[`npc_api_gui_design.md`](npc_api_gui_design.md): what an NPC *is*
+[`npc_api_gui_design.md`](archived/npc_api_gui_design.md) (archived): what an NPC *is*
 ([`npc_mind_design.md`](npc_mind_design.md)), what we *build*
 ([`npc_engine_design.md`](npc_engine_design.md)), and what it *looks like from
 outside* over the operator wire (`npc_api_gui_design.md` itself). This document is
@@ -34,7 +34,7 @@ document specifies.
 
 ## 1. The tool surface does not scale, and cannot be made to
 
-[`tool_surface_audit.md`](archived/tool_surface_audit.md) counted it exactly. Nine body
+The archived audit, [`tool_surface_audit.md`](archived/tool_surface_audit.md), counted it exactly. Nine body
 tools are implemented and armed. **One hundred and fifteen** more are authored into
 the vault with no parameters, no handlers, no plane, and no presence in the
 grammar. The audit's own conclusion: *"Building the foundation is building all 79,
@@ -49,17 +49,17 @@ what fails to scale, whether or not a handler already exists behind each verb.)*
 Each of those tools, to become real, is the same five-part cost, paid once per
 verb, forever:
 
-1. A `Tool` static (`engine/tools/mod.rs:186`) with an `Availability` variant and `params`.
+1. A `Tool` static (`Tool` in `engine/tools/mod.rs`; the acts are in `engine/tools/act_tools.rs`, `engine/acts/`) with an `Availability` variant and `params`.
 2. A `Choices` variant and a `LIVE` row for every world-enumerated argument
-   (`engine/tools/choices.rs:1196`, `1443`).
+   (`Choices` and `LIVE` in `engine/tools/choices.rs`).
 3. A field on `Within` — the per-turn world snapshot that is *also the grammar
-   cache key* (`engine/tools/within_tools.rs:1509`) — so the new fact is hashable and gate-visible.
+   cache key* (`engine/tools/within_tools.rs`) — so the new fact is hashable and gate-visible.
 4. A handler in `engine/enact/`.
 5. Its share of the compiled turn grammar.
 
 The fifth cost is the wall. The turn grammar is the reachable catalogue expanded to
-`ACTS_PER_TURN = 2` (`engine/tools/compile.rs:1162`), budgeted against `MAX_TURN_PATHS = 2_000_000`
-(`engine/tools/compile.rs:1955`). Because the tree is the catalogue *squared*, and an unbounded
+`ACTS_PER_TURN = 2`, budgeted against `MAX_TURN_PATHS = 2_000_000` (both in
+`engine/tools/compile.rs`). Because the tree is the catalogue *squared*, and an unbounded
 value type makes it non-terminating, **every parameter is restricted to `string` or
 `boolean`** — an `integer` is "any JSON number," measured running away at 390 MB/s.
 A world that wants a machine with a numeric dial, a list argument, or a nested
@@ -73,7 +73,7 @@ door has to change.
 
 The NPC does not stop being embodied. It still thinks it is real, and everything
 that makes it act alive stays where it is: the body catalogue — `tell`, `whisper`,
-`shout`, `ask`, `gesture`, `move_to`, `follow`, `reflect` (`engine/tools/mod.rs:876`) — is
+`shout`, `ask`, `gesture`, `move_to`, `follow`, `reflect` (`engine/tools/act_tools.rs`) — is
 fixed, always present, and unchanged. Speech is a body act. Walking is a body act.
 Those are hands, and hands do not need a URL.
 
@@ -133,16 +133,16 @@ effector device.
 
 | Stays a body act | Becomes a device route |
 |---|---|
-| `tell` `whisper` `shout` `ask` `gesture` | every `STATION_ACTS` verb (~53, `station.rs:996`) |
-| `move_to` `follow` | `lift_call` `lift_use` (`engine/acts/combat_and_machines.rs:682`, `705`) |
-| `reflect` | the world-state half of `WORLD_ACTS` (`engine/acts/mod.rs:1311`) |
+| `tell` `whisper` `shout` `ask` `gesture` | every `STATION_ACTS` verb (~53, `engine/station.rs`) |
+| `move_to` `follow` | `lift_call` `lift_use` (`LIFT_CALL`, `LIFT_USE` in `engine/acts/combat_and_machines.rs`) |
+| `reflect` | the world-state half of `WORLD_ACTS` (`engine/acts/mod.rs`) |
 | `act` `sleep` `promise` `remind` (human interactions) | the phone acts (`message` `invite` `open_group` `send_image` `reach_out`) → `http://local/phone` |
 | — | `bench_*` (11), reused `file_*` (5), all 115 audited part tools |
 
 Speech does not go behind the device, and not from sentiment: if `tell` were `POST
 http://local/say`, a character could only speak where a `/say` route was mounted —
 asserting a body can talk near a terminal and not in a corridor, the exact falsehood
-the audit found when `room.talk` was hung on furniture (`archived/tool_surface_audit.md`
+the archived audit found when `room.talk` was hung on furniture (`archived/tool_surface_audit.md`
 §3.1). Speaking is `Availability::Always`. The device is for what a body does *not*
 always have — which is everything the world supplies.
 
@@ -352,7 +352,7 @@ a survey the character asks for; *what I did about it* is the conversation.
 
 The character is told, once, in the system prompt, what the effector device is and
 how to use it — the same place the body's acts and the world are explained
-(`prompt.rs:614`, the `WHAT YOU CAN DO` frame). The copy establishes, in the
+(`engine/prompt.rs`, the `WHAT YOU CAN DO` frame). The copy establishes, in the
 character's own register:
 
 - **What it is** — a handheld effector: it senses what is around you and lets you
@@ -419,8 +419,8 @@ A route's availability is a product of three independent facts, and simulating t
 world means answering all three from state:
 
 1. **Reachability** — is the thing within reach of where the body stands? This is
-   the map: `within_reach` (`perceive.rs:280`) over the node's placed parts,
-   `at_landing` (`npc-map/src/world/lifts.rs:545`) for the lift. Frozen topology, live standpoint.
+   the map: `within_reach` (`npc-map/src/perceive.rs`) over the node's placed parts,
+   `at_landing` (`npc-map/src/world/lifts.rs`) for the lift. Frozen topology, live standpoint.
 2. **Condition** — is the thing in a state that affords the call? A powered-down
    command table affords `OPTIONS` and `POST {powered:true}` but none of its
    working verbs; a claimed station affords reading but not a second body's write; a
@@ -432,10 +432,10 @@ Reachability and standing exist in the map and world today. **Condition is the
 gap.** Per-item mutable state — the command table's on/off, a terminal's mode, which
 body holds a claim — is the same "dynamic half" the world already keeps for
 actors/holds/lift, but *per placed item* it does not exist yet: a `Part` is a shared
-catalogue entry placed by reference, with no per-instance state (`part.rs:133`). So
+catalogue entry placed by reference, with no per-instance state (`npc-map/src/part.rs`). So
 the world-map design this document depends on adds one thing — a **per-item state
 record**, keyed by the item id of §7, living in the world's mutable half beside
-`actors`/`riders`/`lift` (`npc-map/src/state.rs:458`), that route handlers read and write. This
+`actors`/`riders`/`lift` (`npc-map/src/state.rs`), that route handlers read and write. This
 is the smallest addition that makes "turn the command table off" real, and it is
 what the simulation tests of Part F drive.
 
@@ -472,11 +472,11 @@ Everything else under `local` is situated (§7.1) and supplied by the active wor
 The world stands up a genuine `axum` router for host `local`, built beside the three
 that already exist and **nested into the npcd router at `/v1/local`** (`main.rs`) —
 *not* a second `web` `local_api` site. (As-built: `web` dispatches sites by the `Host`
-header, `server.rs:311`, so a `local` *host* would need its own hostname, whereas a
+header (`web/src/server.rs`), so a `local` *host* would need its own hostname, whereas a
 `/v1/local` *path* already resolves to the npcd site — the nest is the clean
 equivalent, no `sites:` change.) The router runs behind its **own** device-auth
 middleware (§8.3), *not* `guard::Api`: that wrapper hardcodes the operator `X-Tokera`
-role check with no escape hatch (`guard.rs:91`), which is the whole reason the device
+role check with no escape hatch (`host::guard::Api`), which is the whole reason the device
 carries its own.
 
 ### 8.1 The fast path skips TCP, never the API
@@ -487,9 +487,9 @@ router with two entry paths:**
 
 - **In-fiction (fast).** The engine builds a real `http::Request`, stamps the auth
   header (§8.3), and invokes the router *in-process* — the `tower::ServiceExt::
-  oneshot` path the existing routers are already tested through (`api.rs:448`). No
+  oneshot` path the existing routers are already tested through (`npcd/src/api/`). No
   TCP, no serialize-to-socket, no syscall. This is the path every `invoke`
-  takes, at the world's cadence (`EVERY = 500ms`, `driver.rs:44`) times the cast.
+  takes, at the world's cadence (`EVERY = 500ms`, `npcd/src/engine/driver.rs`) times the cast.
 - **External (real socket).** The identical routes answer on the bound port
   (§8.2), for an external client.
 
@@ -502,21 +502,20 @@ for rather than discovered:
 
 - **The sync/async seam.** `within` and the act path (`record_act` → `act_on_world`
   → `body::perform`) are synchronous and run inside the async `character_loop`
-  (`runtime.rs:1038`, `1481`, `3564`). A `tower` router call is a `Future`, and
+  (`engine/runtime/turn.rs`, `engine/runtime/acting.rs`). A `tower` router call is a `Future`, and
   `block_on` from a worker thread panics — so the fast path either makes that slice
   `async` (viral through a deep sync tree) or hops through `spawn_blocking` / a
   scoped current-thread runtime. Cheap in bytes, not free in plumbing; this seam is
   the real cost, chosen deliberately.
 - **No re-entry while holding the world lock.** `Hosted.state` is a non-reentrant
-  `std::sync::Mutex` (`world/mod.rs:41`). A handler that holds `hosted.with(...)` and
+  `std::sync::Mutex` (`npcd/src/world/mod.rs`). A handler that holds `hosted.with(...)` and
   then invokes the router again in-process (a sub-resource, an `OPTIONS`, the near-you
   index) deadlocks silently. **Invariant: never invoke the router while holding the
   world lock** — handlers acquire, act, release, as the lift handlers already do
-  (`engine/enact/movement.rs:535`) — and it is tested.
-- **The production Router handle.** Today the merged router is handed to `web` and no
-  handle is kept; the `oneshot` path is `#[cfg(test)]` (`api.rs:448`, `main.rs:636`).
-  **As-built (Step 1):** `Runtime` retains the router (`set_effector_router`) and
-  drives it via `effector_invoke`, an `async` method — the sync/async seam above is
+  (`engine/enact/movement.rs`) — and it is tested.
+- **The production Router handle.** The merged router is handed to `web`, and
+  `Runtime` also retains it (`set_effector_router`) and
+  drives it via `effector_invoke` (`engine/runtime/device.rs`), an `async` method — the sync/async seam above is
   handled by making the effector call at the async layer, never `block_on`.
 
 ### 8.2 The external mount
@@ -545,7 +544,10 @@ point:
 
 The operator API resolves a `Human`; the effector API resolves an `Npc`; "an
 external client acting as NPC X" is then a first-class `Npc(token)`, not a special
-case. This is where "who is acting" is decided, once.
+case. This is where "who is acting" is decided, once. (As built, the two shapes are
+two middlewares rather than one enum: `host::guard::Api` resolves the human, and
+`device_auth` in `npcd/src/effector/auth.rs` resolves the token into a `DeviceCaller
+{ npc_id, scope }`.)
 
 Every NPC is seeded at startup with an opaque token, carried as an auth header on
 every effector call and **invisible to the LLM** — the model never sees it, never
@@ -556,12 +558,12 @@ types it, cannot leak it into prose. The engine stamps it on the in-process requ
   quick-lookup table token → body. It must **not** be derived from the deterministic
   `body_id` (that would be guessable) — it is a real secret. Whether it is persisted
   so an external token survives a restart is **Q6** (recommended: persisted, since
-  the world otherwise is not — `runtime.rs:794`).
+  the world otherwise is not — `engine/runtime/`).
 - **The v1 check, whole.** Authorized iff the request carries the header, the header
   names a token, and the token is in the table (one lookup). No roles, no ownership
   on this surface — the token *is* the identity, resolving to a body whose standpoint
-  the handlers read from world state (`body_of`; `at_landing`, `npc-map/src/world/lifts.rs:545`;
-  `within_reach`, `perceive.rs:280`).
+  the handlers read from world state (`body_of`; `at_landing`, `npc-map/src/world/lifts.rs`;
+  `within_reach`, `npc-map/src/perceive.rs`).
 - **Scope decides proximity.** A token carries a scope. An **as-NPC** token — the
   character's own — is proximity-gated: it reaches only what is within the body's
   standpoint, so an id not near the body 404s, in the fiction or from outside. A
@@ -572,14 +574,14 @@ types it, cannot leak it into prose. The engine stamps it on the in-process requ
 
 **The device surface needs its own middleware — it cannot reuse `guard::Api`.** The
 one route-registration primitive, `Api::route`, hardcodes `require(headers, roles,
-min)` reading `X-Tokera-*`, with no escape hatch by design (`guard.rs:91`). The
+min)` reading `X-Tokera-*`, with no escape hatch by design (`host::guard::Api`). The
 effector routes register through a *parallel* wrapper (or a `Principal::Npc` path in
 `require`) that **ignores `X-Tokera-*` entirely** and resolves the token. This is a
 build blocker for Step 1, not a detail, and two hazards make it sharp:
 
 - **The fast path** builds an `http::Request` and stamps the token (§8.1). Because
   npcd *believes* inbound `X-Tokera-*` from the peers it trusts
-  (`web::Builder::trust`, `identity.rs:1`), that request must never carry one, or the
+  (`web::Builder::trust`), that request must never carry one, or the
   operator middleware would authenticate a character as a human — pinned by a test,
   both directions.
 - **The external mount** (§8.2) is on the same gateway-fronted domain, so a client
@@ -603,7 +605,7 @@ the wager of §3 depend on them:
 - **Prescriptive.** A malformed or invalid body returns a structured error with a
   `field` naming the offending key — `400 missing_field {field:"powered"}`, `400
   bad_range {field:"count", detail:"1..10"}`. Two honest costs the review named: the
-  estate's `err()` helper emits `{error, detail}` only today (`npcd/src/api/errors.rs:1637`), so
+  estate's `err()` helper emits `{error, detail}` only (`npcd/src/api/errors.rs`), so
   `field` is *added* — either by widening that shared helper (which touches the
   operator surface) or a device-only helper; and mapping a deserialize failure to a
   precise `field` is real work (serde's error path is clean for a missing scalar but
@@ -622,7 +624,7 @@ declaration.
 
 The map already has the right shape. A `Part` in `npc-map` is a catalogue entry —
 terminal, board, chair — placed into rooms by reference, and it deliberately does
-*not* name the acts it offers (`part.rs:75`): that vocabulary lives in npcd's
+*not* name the acts it offers (`npc-map/src/part.rs`; the act names its stations, `Tool::at`): that vocabulary lives in npcd's
 engine. Under this design it becomes *routes addressed by the part instance's id*,
 mounted wherever that instance is within reach. The chronicle terminal's `binds`,
 `modes`, and the audit's verbs become `http://local/chronicle/<id>/...` routes. One
@@ -631,13 +633,13 @@ fall out of the map — *once placed instances have ids, which today they do not
 
 **Minting the ids is the biggest hidden cost, and it must come from the map.** Today
 a `Placement` is anonymous and count-based (`Bare` or `Counted{part,count}`,
-`part.rs:131`); `part_ids_at` de-duplicates by catalogue `part.id` within a node
-(`load.rs:268`), so two world-history terminals in one room collapse to a single
+`npc-map/src/part.rs`); `part_ids_at` de-duplicates by catalogue `part.id` within a node
+(`npc-map/src/load.rs`), so two world-history terminals in one room collapse to a single
 entry — `chronicle/ct-command-1` versus `-2` in the same room is *not expressible*
 today; and world state keys on `place` (`area/node`) plus display name, never an
-instance (`sim/mod.rs`; `within_reach` returns catalogue ids, `perceive.rs:280`).
-Because the world is not persisted (bodies re-enter deterministically,
-`runtime.rs:788`), an id must be a **pure function of the map** to stay stable across
+instance (`sim/mod.rs`; `within_reach` returns catalogue ids, `npc-map/src/perceive.rs`).
+Because the world's map is not persisted (bodies re-enter deterministically,
+`engine/runtime/`), an id must be a **pure function of the map** to stay stable across
 restart and be shareable by console and test. **As-built:** the id is
 `<part-id>~<ordinal>` (tilde is URL-unreserved and appears in no kebab-case part id, so
 the split on the last tilde is reversible; ordinal is **0-based and world-wide**,
@@ -659,7 +661,7 @@ by this instance id (`sim/seed.rs`, `Sim::station`), while record *custody* stay
 **The url is a stencil, not free text (the anti-hallucination cut).** `invoke`'s `url`
 is a grammar-forced enum, not a free string: it is bound to each reachable resource's
 verb-paths (`Choices::InvokeUrl` ← `Within::invokable`, `<resource-url>/<verb>` from
-`station::verbs_at`). So the decoder is forced through a real address the device
+`effector::station::verbs_at`). So the decoder is forced through a real address the device
 actually lists — a character can never `invoke` a hallucinated guess that 404s
 (`http://local/command-table`) nor a bare resource (a 405); it acts on exactly what
 stands within reach. The `scan` survey renders each station with the whole verb-path
@@ -678,11 +680,11 @@ place in the vault and reads the resource behind every offered address. A part t
 moment its act names it, with no change here.
 
 Handlers reach the world through the one lock: `Hosted`, a single mutex over
-`{ world, attention, sim, rooms }` (`world/mod.rs:41`), with `with` the sole write
-path, `read` for queries, `with_both` for world+sim (`world/mod.rs:117`). A device
+`{ world, attention, sim, rooms }` (`npcd/src/world/mod.rs`), with `with` the sole write
+path, `read` for queries, `with_both` for world+sim. A device
 handler is an `engine/enact/` handler with an HTTP envelope; the lift handlers
-(`engine/enact/movement.rs:519`, `535`) are the template, and their typed refusals (`Refused`,
-`npc-map/src/world/events.rs:351`) become the route's error bodies (§12).
+(`engine/enact/movement.rs`) are the template, and their typed refusals (`Refused`,
+`npc-map/src/world/events.rs`) become the route's error bodies (§12).
 
 ### 9.1 Two worlds: the simulated world and the attachable world API
 
@@ -712,7 +714,7 @@ addressing.
 
 **One constraint on the seam, from the one-lock invariant.** `Hosted` unifies
 `{world, attention, sim, rooms}` under a single mutex precisely so no situation
-computation crosses two locks (`world/mod.rs:13`). An attachable world must not
+computation crosses two locks (`npcd/src/world/mod.rs`). An attachable world must not
 reintroduce that hazard: the extension point is a provider of **route handlers that
 run inside `Hosted`'s lock** (a `dyn WorldRoutes` invoked under `with`/`with_both`),
 with the embedder's state living behind that same mutex exactly as `Sim` does today —
@@ -801,7 +803,7 @@ from an event feed.
 So a route handler's write target is one of two stores, and the route declares
 which:
 
-- **World state** — `Hosted`'s `world`/`sim`/`rooms` (`world/mod.rs:41`); the
+- **World state** — `Hosted`'s `world`/`sim`/`rooms` (`npcd/src/world/mod.rs`); the
   effect is perceived over ticks (§10). The lift, the command table, a posted
   notice.
 - **Projected state** — the character's agency/belief/memory layers in the
@@ -839,7 +841,7 @@ against:
 
 1. **The npc-map `World` (RAM)** — who is where, what each body holds, the lift,
    witnessed events. Not persisted; bodies re-enter deterministically on restart
-   (`runtime.rs:776`). Written by the world acts (lift, claim/release/operate/…,
+   (`engine/runtime/`). Written by the world acts (lift, claim/release/operate/…,
    `engine/enact/`). Claim = proximity + `Actor.hold`.
 2. **`Sim` (RAM)** — everything about the world that is not its map: the `record`
    authored-content state machine (`sim/record.rs`), the `bench` per-body working
@@ -871,7 +873,7 @@ real store; D.6 lists the durability and projection gaps a full migration must c
 through perception, not the return value. `invoke("http://local/lift/command-shaft",
 {level:"command"})` returns `{ ok:true, detail:"The lift is on its way." }` that
 turn. The car then travels on the world clock — `step_lift` inside `tick`
-(`world.rs:928`, `world/mod.rs:172`) voices each `Moment` as a `Stirred` event on
+(`npc-map/src/world/`, `npcd/src/world/mod.rs`) voices each `Moment` as a `Stirred` event on
 the right landing — and the character learns it arrived the way it learns anything
 that happened while it was not looking: through `witness`/`stir` →
 `perceived::digest` → the narrated perception at the head of its next input
@@ -971,8 +973,8 @@ stencil.
 
 A wrong `invoke` comes back as a real API error (§8.4): a status and `{ error,
 detail, field }`. The character reads it next turn as a `<tool_response>` — the
-channel act outcomes already ride back on (`record_act`, `npcd/src/engine/runtime/acting.rs:1481`;
-`compose_narrated`, `npcd/src/engine/mind/perception.rs:1473`) — and corrects, because correcting a JSON API
+channel act outcomes already ride back on (`record_act`, `npcd/src/engine/runtime/acting.rs`;
+`compose_narrated`, `npcd/src/engine/mind/perception.rs`) — and corrects, because correcting a JSON API
 against its error body is a thing the model has done a million times. The rule: **a
 device error is what a well-behaved REST API would return, and nothing more
 clever** — an invented format would forfeit the whole prior the wager rests on.
@@ -984,8 +986,8 @@ path, body)`. No session, no handshake, no cursor inside it. The engine calls it
 three reasons and none may leave residue: to fill the **near-you index** (`GET
 http://local/`), to read a resource's **schema** (`OPTIONS`), and to render a **world event** referring to a capability. Because the
 answer is a function of world state, asking repeatedly and from more than one place
-is safe — two callers get the same answer, the property `perceive.rs` guarantees for
-percepts (`perceive.rs:9`). Any caching is the *engine's*, keyed on
+is safe — two callers get the same answer, the property `npc-map/src/perceive.rs` guarantees for
+percepts. Any caching is the *engine's*, keyed on
 `(id, schema fingerprint, standpoint)`, never the API's.
 
 ---
@@ -1029,7 +1031,7 @@ is the inventory, **Appendix C** the route map, **Appendix D** the store map.
 - **Choices becomes handler-computed schema.** `Company`, `Floors`, `Reachable`,
   `Claimable` (`engine/tools/choices.rs:1196`) are enums a handler fills from world state at
   `OPTIONS` time — `http://local/lift/<id>/call`'s `level` enum *is*
-  `world.floor_names()` (`npc-map/src/world/lifts.rs:613`) at that moment. The world enumerates; the
+  `world.floor_names()` (`npc-map/src/world/lifts.rs`) at that moment. The world enumerates; the
   schema carries; the stencil enforces.
 
 `Within` does not vanish — the body acts still gate through it and it is still the
@@ -1171,7 +1173,7 @@ Step 1–2; "sharp" = scoped but real; "minor" = watch.
 |---|---|---|---|
 | 1 | blocker | Focus must not enter the `(Deliberation, Within)` grammar-cache key, or the hit rate collapses and a whole-turn tree recompiles on the tick path | §11 (separate `invoke` sub-stencil cached by `(resource-id, schema-fingerprint)`) + §15 (shrink `Within`) |
 | 2 | blocker | The device surface cannot reuse `guard::Api` — it hardcodes the `X-Tokera-*` role check; and the fast path sits behind a header-trusting gateway | §8.3 (device-only middleware; `X-Tokera-*` never read; token both-ways test) |
-| 3 | blocker | Stable per-instance ids do not exist: `Placement` is anonymous, `part_ids_at` de-dups by catalogue id, world state keys on place+name | §7, §9 (id = `(place, part-id, ordinal)`; remove de-dup at `load.rs:271`; widen sim key) — Step 2 |
+| 3 | blocker | Stable per-instance ids do not exist: `Placement` is anonymous, `part_ids_at` de-dups by catalogue id, world state keys on place+name | §7, §9 (id = `(place, part-id, ordinal)`; remove de-dup in `load.rs`; widen sim key) — Step 2 |
 | 4 | sharp | Sync/async seam: `within`/act path are sync inside an async loop; a router call is a `Future`, `block_on` panics | §8.1 (async slice or `spawn_blocking`) |
 | 5 | sharp | Re-entering the non-reentrant world mutex from a handler that calls the router deadlocks silently | §8.1 (no-reentry-under-lock invariant, tested) |
 | 6 | sharp | "Strong typing" only truly binds string enums and booleans; `integer`/`array`/`object` are shaped, not enforced | §11 (world validation is load-bearing, not a backstop) |
@@ -1263,11 +1265,11 @@ changes. Ordered by how load-bearing the contradiction is.
 
 | Doc | What is now stale | What survives |
 |---|---|---|
-| [`tool_surface_audit.md`](archived/tool_surface_audit.md) | the whole "build all 115 as compiled tools" plan (§1, §6, §6.4); the `namespace_verb` naming/tokenisation analysis (§5A) is moot for URL path segments; the counts (§6.3); and its "Implemented: 0" claim is itself stale — the handlers ship in `engine/work/` (Appendix D) | §2 (what exists), §3 (removals), §4 (the 8 missing clusters), the craft-word naming rule for verbs |
+| [`tool_surface_audit.md`](archived/tool_surface_audit.md) (archived) | the whole "build all 115 as compiled tools" plan (§1, §6, §6.4); the `namespace_verb` naming/tokenisation analysis (§5A) is moot for URL path segments; the counts (§6.3); and its "Implemented: 0" claim is itself stale — the handlers ship in `engine/work/` (Appendix D) | §2 (what exists), §3 (removals), §4 (the 8 missing clusters), the craft-word naming rule for verbs |
 | [`tool_world_acts.md`](tool_world_acts.md) | world-acting verbs as compiled body tools; the string/boolean workaround (§0) — lifted by per-resource schema (§11); the "seven new live sets" (§4) become handler-computed `OPTIONS` schema | the intent-vs-typed field rule; §6 "to simulate this in the vault" |
-| [`tool_decisions.md`](tool_decisions.md) | "vocabulary moved onto the argument axis" — it moves onto the **route axis**; `read`/`claim`/`release` as body tools (§2, §3) reopen (read → `scan` and the internal `GET`) | §1 belief-write prohibition (reinforced, §9.2); tool-shape/argument-binding sections |
-| [`tool_interaction_reconciliation.md`](tool_interaction_reconciliation.md) | "25 `*_read_*` tools vs one `observe`" (§4.2) — reads are now `scan` and the internal `GET`; the 25-reads open question dissolves | interaction modes (§1, §3), interlocutor resolution; note phone acts' placement is Q5 |
-| [`tool_world_state.md`](archived/tool_world_state.md) | the "129 tools" framing; `bench_`/`file_` as tools | most of it — the four stores and the namespace→store table become the **route-handler** spec (§9) |
+| `tool_decisions.md` (no longer in `docs/`) | "vocabulary moved onto the argument axis" — it moves onto the **route axis**; `read`/`claim`/`release` as body tools (§2, §3) reopen (read → `scan` and the internal `GET`) | §1 belief-write prohibition (reinforced, §9.2); tool-shape/argument-binding sections |
+| `tool_interaction_reconciliation.md` (no longer in `docs/`) | "25 `*_read_*` tools vs one `observe`" (§4.2) — reads are now `scan` and the internal `GET`; the 25-reads open question dissolves | interaction modes (§1, §3), interlocutor resolution; note phone acts' placement is Q5 |
+| [`tool_world_state.md`](archived/tool_world_state.md) (archived) | the "129 tools" framing; `bench_`/`file_` as tools | most of it — the four stores and the namespace→store table become the **route-handler** spec (§9) |
 
 **Tier 2 — engine & wire contract (section rewrites + additions).**
 
@@ -1276,7 +1278,7 @@ changes. Ordered by how load-bearing the contradiction is.
   mechanism becomes routing (§15); the `trait NpcTool` / `ToolRegistry::register`
   extension story is re-scoped to the attachable world-routes provider (§9.1).
   "Tools carry intent, not output" stays.
-- [`npc_api_gui_design.md`](npc_api_gui_design.md) — `/v1/tools` and `ToolInfo`
+- [`npc_api_gui_design.md`](archived/npc_api_gui_design.md) (archived) — `/v1/tools` and `ToolInfo`
   (§9, §10) now describe only the compiled frame (body + `invoke`); add a
   new operator route exposing the `local` route map for console inspection; document
   the external effector mount `/v1/local/...` and its **token auth** (§8.2–8.3) as a
@@ -1292,7 +1294,7 @@ changes. Ordered by how load-bearing the contradiction is.
   you index replaces `tools_at`; `binds`/`modes` become mounting + methods; the
   "appear in reach and refuse" line is stale. Grows the stable-instance-id the
   design needs (Q2). The building/graph/memory design is untouched.
-- [`maker_repertoire.md`](maker_repertoire.md) — invariant 8's "reach and refuse"
+- [`maker_repertoire.md`](archived/maker_repertoire.md) (archived) — invariant 8's "reach and refuse"
   gloss and the dotted identifiers are stale; the 480 tasks, the currencies-as-types,
   and the invariants remain the spec for what routes must afford.
 - [`asynchronous_mind_hierarchy.md`](asynchronous_mind_hierarchy.md) — "tools fixed
@@ -1302,8 +1304,8 @@ changes. Ordered by how load-bearing the contradiction is.
 
 **Tier 4 — index & cross-reference.**
 
-- `docs/README.md` — add `local_api.md` (the fourth NPC surface) and the `tool_*`
-  series, which it does not currently list.
+- `docs/README.md` — list this document (the fourth NPC surface; there is no
+  `local_api.md`) and the `tool_*` series.
 - [`web_gateway_design.md`](web_gateway_design.md) — cross-reference note that npcd
   now registers a `local` effector router plus the `/v1/local/...` external mount.
 
@@ -1317,7 +1319,7 @@ belief-write protection is reinforced (§9.2), not contradicted.
 
 One decision touches several docs: `act`, `sleep`, `promise`, and `remind` stay body
 acts (human interactions), while the phone/messaging acts become `http://local/phone`
-routes (§4). `tool_world_acts.md`, `tool_interaction_reconciliation.md`, and Appendix
+routes (§4). `tool_world_acts.md` and Appendix
 A must be made to agree with that split.
 
 ---
@@ -1328,7 +1330,7 @@ A must be made to agree with that split.
 vault"). It turns Appendix A's checklist into an executable specification: every part that
 becomes routes, the routes each affords, what gates them, the body schema each `invoke`
 takes, and the store the handler reads or writes. It is grounded in the shipped vault
-(`npc-map/maps/*.yaml`), the shipped act tables (`npcd/src/engine/{acts,station}.rs`), the
+(`npc-map/maps/*.yaml`), the shipped act tables (`npcd/src/engine/acts/`, `npcd/src/engine/station.rs`), the
 availability/choices machinery (`npcd/src/engine/tools/`), and the current handlers
 (`npcd/src/engine/enact/`). Where a namespace is authored in the audit but has no handler
 yet (the audit's 0-of-79 finding, `archived/tool_surface_audit.md` §1), the row cites the audit and
@@ -1336,6 +1338,10 @@ is flagged **[no handler yet]** — that route is the work Step 6 lands, per Par
 
 Conventions used in every table below:
 
+- **Source anchors** — a `file.rs:NNN` beside an act in these tables names the constant that
+  declares it (`LIFT_CALL`, `CHRONICLE_ADD_ENTRY`, …); the number was the line when the table
+  was written, and these files have since been split and edited, so find the act by its constant
+  name in the file named (`engine/acts/`, `engine/station.rs`, `engine/enact/`, `engine/work/`).
 - **Method** — `GET` = read (internal to the router: no model-facing tool issues it; `OPTIONS` is implicit on every route and
   returns the schema, §5.1). `POST` = effect (issued by `invoke`; the model never picks the
   method, §5). RPC-flavoured one-path-per-verb, per the settled decision (§16 "Route paths").
@@ -1344,7 +1350,7 @@ Conventions used in every table below:
   `paired` (a settling table: needs the other holder present, the `Nearby`-class two-body
   gate), `affordable` (the `OPTIONS` enum is non-empty — the economy is enforced in the schema).
 - **Body schema** field tags: `enum(src)` = grammar-enforced closed set filled from the named
-  live-set at `OPTIONS` time (§15, `engine/tools/choices.rs:1443` LIVE / `1421` FIXED); `typed(kind)` =
+  live-set at `OPTIONS` time (§15, `LIVE` / `FIXED` in `engine/tools/choices.rs`); `typed(kind)` =
   integer/number/array/object — **shaped, not enforced**, so the handler validates (§11);
   `free` = open string. `req`/`opt` = required/optional.
 - **Store** — the column below records the *intended* target and is **superseded by
@@ -1368,7 +1374,7 @@ Conventions used in every table below:
 
 From the six vault level maps and `creators-vault.yaml`. "Ordinal?" = does any node place
 more than one, so a route id must carry the ordinal to be unique (§9, the removed
-`load.rs:271` de-dup). Parts marked **(war world)** carry world-acts but are placed only in
+`load.rs` de-dup). Parts marked **(war world)** carry world-acts but are placed only in
 `tower-redoubt.yaml`, never in the vault — listed because Appendix A routes their verbs.
 
 *(As-built, Step 2: the "id pattern" column below is shorthand. A route's full address
@@ -1432,7 +1438,7 @@ from every level (audit §3.4), the planning board sits where planning happens, 
 shelf where experiments are kept. Ordinal `1` until a map places more than one.
 
 **Standpoint → mount.** A route's routes are mounted wherever its part is within reach
-(`within_reach`, `perceive.rs:280`); a not-mounted route 404s (§15). Because the vault is one
+(`within_reach`, `npc-map/src/perceive.rs`); a not-mounted route 404s (§15). Because the vault is one
 building with a single lift shaft (`creators-vault.yaml` portals, all `kind: a lift`), the lift
 routes (C.1) mount at every level's `core` node.
 
@@ -1446,9 +1452,9 @@ level.
 
 | Route | Method | Condition | Body schema | Store | From |
 |---|---|---|---|---|---|
-| `GET .../lift/<id>` | GET | at a landing (`at_landing`, `npc-map/src/world/lifts.rs:545`) | — (returns `{here, level, moving}`) | World | new (status), design §5.1/§14 |
+| `GET .../lift/<id>` | GET | at a landing (`at_landing`, `npc-map/src/world/lifts.rs`) | — (returns `{here, level, moving}`) | World | new (status), design §5.1/§14 |
 | `POST .../lift/<id>/call` | POST | at landing **and car elsewhere** (`AtLift`, `engine/tools/types.rs:1750`) | — | World | `LIFT_CALL` engine/acts/combat_and_machines.rs:682; enact `lift_call` engine/enact/movement.rs:85 |
-| `POST .../lift/<id>/use` | POST | at landing **and car here** (`InLift`, `tools.rs:1751`) | `floor` enum(`world.floor_names()`, `npc-map/src/world/lifts.rs:613`) req | World | `LIFT_USE` engine/acts/combat_and_machines.rs:705; enact `lift_use` engine/enact/movement.rs:86 |
+| `POST .../lift/<id>/use` | POST | at landing **and car here** (`InLift`, `tools.rs:1751`) | `floor` enum(`world.floor_names()`, `npc-map/src/world/lifts.rs`) req | World | `LIFT_USE` engine/acts/combat_and_machines.rs:705; enact `lift_use` engine/enact/movement.rs:86 |
 
 ---
 
@@ -1968,6 +1974,12 @@ handlers truly absent are the short list (`plan_*`, `roster_*`, `room_sit`,
 
 # Appendix D — Handlers and the mind folder
 
+*Source anchors: the `file.rs:NNN` figures in this appendix were the lines when it was
+written; the files have since been edited and split. Find each item by its name in the
+file cited (`engine/work/dispatch.rs::perform`, `engine/work/bench_acts.rs::write_into`,
+`sim/record.rs::settle_path` / `index_canon`, `sim/bench.rs::commit`,
+`npcs/methods.rs::put_strategy`, `mind/doc.rs`, `mind/address.rs`).*
+
 *Companion to §9/§9.2/§9.3 and Appendix C. The main text once divided a route handler's
 write target into two stores — **world state** and **projected state**. That was a
 simplification: the writing handlers (`chronicle_`, `character_`, `story_`, `place_`,
@@ -2020,8 +2032,8 @@ first and last and folds the middle two away.
 
 **1. The in-RAM npc-map `World`** — *who is where, holding what, and what happened.* Owns
 placement/standpoint, `Actor.hold` claims, the lift, witnessed events. No persistence;
-deterministic re-entry (`runtime.rs:776`); reached under the one lock (`Hosted::with`/`read`,
-`world/mod.rs:41`). Claim = proximity (`perceive.rs:280`) + `Actor.hold`. Handlers: the
+deterministic re-entry (`engine/runtime/`); reached under the one lock (`Hosted::with`/`read`,
+`npcd/src/world/mod.rs`). Claim = proximity (`npc-map/src/perceive.rs`) + `Actor.hold`. Handlers: the
 world-state half of `WORLD_ACTS` (`engine/enact/mod.rs:71–98`; C.1–C.2).
 
 **2. The in-RAM `Sim`** (`sim/mod.rs:61`) — *everything about the world that is not its map.*
@@ -2282,10 +2294,10 @@ build follows Part F's order; this is the decision record it is built against.*
   `parent_id`) into the `agency` layer, which projects automatically (`projection.yaml:437`,
   `persona::intent` `persona.rs:98`) — no extra projection wiring.
 - **The bridge.** Wrap the cast as `Arc<tokio::RwLock<Npcs>>` and install it on `Runtime` (the
-  installed-after-construction pattern, `runtime.rs:291-319`), reusing the *existing* `Npcs`/
+  installed-after-construction pattern, `engine/runtime/`), reusing the *existing* `Npcs`/
   substrate handle — never a second (the one-writable-handle guard, `npcs.rs:16-23`). Projected
   writes (`plan_*`/`orders_*`) run at the **async turn-loop layer**, split out of the sync
-  `&Hosted`-only `work::perform`; `npc_id` parses from `body` (`"npc-{id}"`, `runtime.rs:763`); a
+  `&Hosted`-only `work::perform`; `npc_id` parses from `body` (`"npc-{id}"`, `engine/runtime/`); a
   new **owner-blind self-write** method resolves `owner` from `Npcs::payload(npc_id).owner`.
 
   *As-built: **built.** `Authored.npcs` is `Arc<Npcs>` — no lock: a read loads the published
@@ -2346,14 +2358,14 @@ impl World {
 }
 ```
 
-Each returns the same typed `Done`/`Refused` (`npc-map/src/world/events.rs:351`) the movement and claim
+Each returns the same typed `Done`/`Refused` (`npc-map/src/world/events.rs`) the movement and claim
 surface uses — a mutation that would break the map is refused, in second person, not
 half-applied.
 
 ## F.2 Every mutation re-runs the derived passes, transactionally
 
 The map has derived state that is never authored — `Node::exits` and `Node::visible`
-(woven from one-ended doors and sightlines, `load.rs:302/348`), the portal graph
+(woven from one-ended doors and sightlines, `npc-map/src/load.rs`), the portal graph
 `MapSet.ways`, and the lift's `shaft` (one `Core` per `Level`, ordered by `ordinal`,
 `world.rs:512`). A mutation is therefore **apply-to-a-copy, re-derive, validate, swap**:
 

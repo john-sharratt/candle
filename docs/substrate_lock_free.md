@@ -60,12 +60,12 @@ replaced; §3 onward describes what replaced it.
 | Lock | Where | Guards | Taken by | Worst holds |
 |---|---|---|---|---|
 | `SubstrateLock` (`RwLock<Substrate>` + mutation queue) | `substrate/lock.rs`, `Conversation::inner` | all 49 fields of `Substrate` (§2.2) | every thread: scheduler, persistence, writer, applier, replication, zend handlers and ingest, summariser, maintenance | maintenance reads 0.5–1.0 s every ~15 s; replication batches 0.25–1.16 s; projection reads |
-| `PersistenceLock` (`Mutex<SubstratePersistence>` + waiter count) | `persistence/priority_lock.rs` | the log (segments, staging, handles), manifest, accounting, header index, location maps, relocation watch, replica/rebase, minter handle | writer thread (one hold per job), maintenance batches, cold reads, elevate, replication, custom objects, model binding | relocation batches ~150 ms; compaction 16–31 s; I/O and fsync under it |
+| `PersistenceLock` (`Mutex<SubstratePersistence>` + waiter count; replaced by the owner thread, §9.1) | `persistence/priority_lock.rs` | the log (segments, staging, handles), manifest, accounting, header index, location maps, relocation watch, replica/rebase, minter handle | writer thread (one hold per job), maintenance batches, cold reads, elevate, replication, custom objects, model binding | relocation batches ~150 ms; compaction 16–31 s; I/O and fsync under it |
 | `Mutex<ConversationEngine>` | zend `state.engine`, ~155 sites | **nothing of its own** — every engine method takes `&self`, and npcd shared the same type without a mutex | every zend path | held across scheduler round-trips, prefills, git lookups, VFS restores, full metadata scans (15.6 s measured before a fork, 2026-10-29) |
-| `conversations` map (`Mutex<HashMap<String, Arc<ConvLock>>>`) | `zend/src/session/mod.rs` | which conversations are resident | turn path, sweep, deletes, file changes | held across `fork_resuming` — a scheduler round-trip |
+| `conversations` map (`Mutex<HashMap<String, Arc<ConvLock>>>`; replaced by `zend/src/resident.rs`, §8.2) | `zend/src/session/mod.rs` | which conversations are resident | turn path, sweep, deletes, file changes | held across `fork_resuming` — a scheduler round-trip |
 | `base_conv: Mutex<Sequence>`, ingest bases | `session/mod.rs` | the dialogue base, each ingest layer's base | forks, history reads | across `fork_resuming` |
 | `ConvLock<ConvState>` (tokio mutex) | per conversation | one turn in flight per conversation | turn path | the whole turn — **by design** (§8.4) |
-| `events_cache: Mutex` (inside the substrate) | `substrate.rs` | decoded events memo | belief scans under the substrate read | decode under the inner lock |
+| `events_cache: Mutex` (inside the substrate) | `substrate/mod.rs` | decoded events memo | belief scans under the substrate read | decode under the inner lock |
 | `Conversation` side locks | `projection/resolver/mod.rs` | `normalization`, `maintenance` (status), `branch_checkpoint`, `gallery_cache`, `held_index_pages`, `conv_state_writes` | scheduler, persistence, API | `gallery_cache` taken inside a substrate read |
 | GalleryArena `residency`, `index_cache`, `zero_page`, dedup `book`/`masks` | `provenance/gallery_arena/` | resident pages, indices, codebook, masks | scheduler | `residency` across device uploads |
 | Writer `Backpressure` / `Progress` / handle | `persistence/writer.rs` | queue depth, write tickets | producers, the writer | flow control |
@@ -200,7 +200,7 @@ step that acts:
 |---|---|---|
 | install hot (seal, lift) | refuse a `DEAD` residence; store; re-read `DEAD` and take the payload back if a kill landed between | R2 |
 | lift | `install_hot_if_absent`: compare-and-swap from empty, so two lifts never stack and a lift never lands on a hot residence | R2 |
-| migrate / quantize swap | `replace_hot(expected)`: compare-and-swap from the exact copy the migrate read; a residence killed or re-lifted since takes nothing (`install_migrated`, `replace_section_hot`) | R6 |
+| migrate / quantize swap | `replace_hot(expected)`: compare-and-swap from the exact copy the migrate read; a residence killed or re-lifted since takes nothing (`install_copied`, which compares the copy's `HotKv::lineage` so a KV compaction that relocated the copy still lands it, and `replace_section_hot`) | R6 |
 | evict hot | taken only from a residence no publisher pins and no splice holds, with a warm or cold copy behind it | R3, R4, R13 |
 | cold land | `install_cold` stores the references and clears `COLD_PENDING`; turn content is immutable per residence, so the references describe what the residence holds | R7 |
 | kill (tombstone, distill, retire) | set `DEAD`, then take hot (and warm when no cold copy will come) | R3 |
@@ -273,7 +273,7 @@ demote takes their hot copy.
 
 A KV compaction moves chunks between slots of a live arena, so a migrate that
 captured chunk addresses must not run across one. `CHUNK_LOCATIONS`
-(`candle-nn/.../migrate_flight.rs`) is one atomic word — a holder count and a
+(`candle-nn/src/kv_cache/chunked/migrate_flight.rs`) is one atomic word — a holder count and a
 frozen bit — and every step on it is one compare-and-swap that refuses rather
 than waits: a migrate or an off-thread snapshot holds it shared, a compaction
 freezes it, and whichever is refused comes back on its next pass.
@@ -559,7 +559,7 @@ the owner the appends and the edit.
 |---|---|
 | a reader keeps its version; concurrent edits all land; a lost attempt's residences are discarded; a panicking edit publishes nothing | `substrate/lock.rs` |
 | a dead residence keeps no payload; lifts never stack; a replace expects its copy; membership follows the cells; pins count per publisher; a lift is a use | `substrate/residence.rs` |
-| a migrate over a residence that moved on installs nothing | `substrate.rs` |
+| a migrate over a residence that moved on installs nothing | `substrate/` (`tests_copies_and_distill.rs`) |
 | calls return and borrow; a call's panic unwinds into its caller; writes land in order; calls from many threads are each served; calls go ahead of background work; shutdown drains, including behind a burst; a call queued beside a shutdown is answered | `persistence/owner.rs` |
 | concurrent mints are unique and ordered | `persistence/identity/minter.rs` |
 | every permutation of a record set yields the same substrate | `substrate::order_independence_tests` |

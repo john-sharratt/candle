@@ -13,8 +13,8 @@ A turn's signatures are worth holding only while a scan can read them, and
 the schema already says who can read what:
 
 - **Shared turns** — read across conversations. Every turn of a layer whose
-  `gather_scope` is `shared` (zend's `code_reading`, `repo_map`, the review
-  layers; npcd's `world`), and every turn a section collection gathers (zend's
+  `gather_scope` is `shared` (zend's `code_reading` and `repo_map`; npcd's
+  `world`), and every turn a section collection gathers (zend's
   `tools` calibration turns; npcd's `response` and `mood` votes, which are
   drawn from every character's turns). Any conversation's next projection may
   scan them, so they are preloaded at start and stay until the keep trade
@@ -91,10 +91,11 @@ actually open.
 ## 4. Only the weighted fold groups are resident
 
 A signature carries three fold groups (layer regions of the model, 8 words a
-token each), and every scan weighs them by its policy: `code_reading`'s and the
-review layers' content by `layer_weights: [0, 1, 1]`, their calibration
-questions by `calibration_layer_weights: [0, 0, 1]`, `repo_map` by
-`[0.1, 1, 0.1]`, the tool catalog and dialogue by all three. A group weighed
+token each), and every scan weighs them by its policy: `code_reading`'s
+`scopes` content by `layer_weights: [1, 1, 1]` and its calibration questions by
+`calibration_layer_weights: [1, 1, 1]`, its `guidance` and `journals` groups by
+`[0, 1, 1]` and `[0, 0, 1]`, `repo_map` by `[0.1, 1, 0.1]`, the tool catalog
+and dialogue by all three. A group weighed
 zero adds exactly nothing — the needle gate and the tally are both linear in
 the weights (`needle_tally_segments`) — so its words are neither uploaded nor
 scanned.
@@ -211,8 +212,9 @@ turn group's files are assembled from the substrate, and what the launches
 return is normalized and folded into the backgrounds. The seal scan — every
 sealed turn's, the once-per-turn learning point — held the wave thread ~575 ms
 a turn on BlackWorld (2026-11-16), all but ~50 ms of it that host work. So a
-scan that runs elsewhere reaches the arena through `BeliefArena`, the four
-calls a belief scan makes: the arena implements it in place, and
+scan that runs elsewhere reaches the arena through `BeliefArena`, the five
+launches a belief scan makes (`scan_weighted`, `scan_segment_weighted`,
+`scan_keyed`, `scan_votes`, `scan_stats`): the arena implements it in place, and
 `scheduler::RemoteArena` implements it by sending each launch to the wave
 thread as an owned `HeldScan` (`SchedulerRequest::ArenaScan`) and waiting for
 its answer. A held launch is the segments' turns as shared signature blobs — a

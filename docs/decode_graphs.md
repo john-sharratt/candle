@@ -456,7 +456,7 @@ engine (12,700 copy-engine promotions, 16 GiB). In order of discovery:
    pairing the enqueued key had, on the invocation the GPU is actually inside. Reuse also
    follows the device's latest started ticket rather than only the summaries a host thread has
    read (an in-order stream makes them equivalent bounds).
-2. **Copy-engine promotions issued off the pipeline thread** (`copier.rs`). The real cause of
+2. **Copy-engine promotions issued off the pipeline thread** (a copier thread, since removed). The real cause of
    the dry ring: on WDDM, issuing a `cuMemcpyHtoDAsync` from pinned memory stalled the pipeline
    thread for 157–189 ms once per step — the rest of the forward the GPU was running — and the
    ring it restocks every layer ran dry behind it. A copier thread then issued those copies and
@@ -472,7 +472,7 @@ engine (12,700 copy-engine promotions, 16 GiB). In order of discovery:
    rows are now a set of token ranges passed by value to bucketize: the decode rows, every
    verify segment, and each prompt's last row (the token its decode continues from). This one
    change took ×4 decode from 95 to 223 t/s at the time.
-4. **Rows about to run held back as victims** (`take_slots`). The started-word key made every
+4. **Rows about to run held back as victims** (`lazy_victims`, `pipeline/ring.rs`). The started-word key made every
    row ahead of the GPU quiet, so a wide prefill evicted the experts of the rows it was about
    to read; on Qwen3.6 that doubled a prompt's misses and cost up to 24% of prefill. Rows with
    an invocation enqueued and not begun (`ReclaimClock::upcoming`) give up victims only for a
@@ -622,10 +622,10 @@ per segment, in-place updates, instantiations — and is unit-tested on its text
    hits more of the zone when the zone holds old residents rather than decode's recent
    experts; a prompt-side long memory (prompt hits earning reuse) did not move it and cost
    Qwen3.6's prefill 3–5%.
-2. **Qwen3.6's verify rows.** `DecodeRows` now reaches its hybrid sweep through
-   `BatchedAttentionLayer::ffn_residual`, but it passes the decode prefix only: scoring its
-   verify segments and prompts' last rows as decode, as Flash-Next does, measured lower
-   prefill on its one-sequence rows.
+2. **Qwen3.6's verify rows.** `DecodeRows` reaches its hybrid sweep through
+   `BatchedAttentionLayer::ffn_residual`, and the sweep builds the set as Flash-Next's does
+   (`residency_decode_rows`: the decode rows, the verify segments and each prompt's last
+   row).
 3. **Fewer segments — done for the MoE flushes.** The dispatch's host readers poll the
    summary word bucketize writes *when it executes*, so launching each MoE invocation's
    segment at once bought nothing past the start of a wave, where the GPU must not idle

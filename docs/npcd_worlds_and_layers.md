@@ -3,7 +3,7 @@
 How `npcd` turns one written corpus into many worlds, and why it does it with
 tags rather than directories.
 
-Companion to `npc_api_gui_design.md` (§20 worlds, §38 world editor) and
+Companion to `docs/archived/npc_api_gui_design.md` (§20 worlds, §38 world editor) and
 `theory_of_the_mind.md`. Where this document and the code disagree, the code
 wins and this document is wrong — every mechanical claim below was checked
 against the implementation, and the checks are named so they can be re-run.
@@ -89,7 +89,7 @@ list means all projections in scope"*. It was wrong, and not harmlessly: under
 that reading every tagged turn would be visible from every unfiltered node,
 silently, because nothing about the output would look wrong. The comment is
 fixed and the behaviour is pinned by
-`substrate::tests::an_empty_tag_filter_admits_only_untagged_turns`.
+`substrate::tests_listing::an_empty_tag_filter_admits_only_untagged_turns`.
 
 ---
 
@@ -192,9 +192,9 @@ every world.
 
 ## 7. Selecting a scope needs an index, not `turn_with_tag`
 
-`Substrate::turn_with_tag` resolves **one** member — a group's declared default
-— and is unsuitable for bulk selection on two counts, both pinned by
-`substrate::tests::turn_with_tag_finds_one_arbitrary_member_by_scanning`:
+`Substrate::turn_with_tag` resolved **one** member — a group's declared default
+— and was unsuitable for bulk selection on two counts (the function and the test
+that pinned them are no longer in the tree):
 
 1. It is a linear scan over every stream decl. Selecting a scope's whole corpus
    through it is a scan per turn: quadratic in the corpus.
@@ -315,15 +315,14 @@ story-desk in 2950 — eras 1 (best 2349 eras/the-tower-age), …`).
 
 | Claim | Check |
 |---|---|
-| empty filter = untagged only | `substrate::tests::an_empty_tag_filter_admits_only_untagged_turns` |
-| `turn_with_tag` scans, and is arbitrary on multiple matches | `substrate::tests::turn_with_tag_finds_one_arbitrary_member_by_scanning` |
-| collections filter by tag | `resolver.rs` `belief_gallery`, `score_belief_collections` |
-| layer groups do **not** | `score_belief_groups` — no `tags` reference; candidates from `group_turns` |
-| `group_turns` masks by timeline only | `resolver.rs` impl |
-| sections are content-addressed | `content_hash.rs` `section_stream_id(ContentAddress)` |
-| turns are identity-addressed | `content_hash.rs` `turn_stream_id(timeline, index)` |
-| ingest carries per-turn tags | `TurnSink::insert_prefill_turn(.., tags)` |
-| a path already becomes a tag | `repo_scan::dir_tags` |
+| empty filter = untagged only | `substrate::tests_listing::an_empty_tag_filter_admits_only_untagged_turns` |
+| collections filter by tag | `projection/resolver/belief_gallery.rs` `belief_gallery`, `belief_collections.rs` `score_belief_collections` |
+| layer groups filter by tag only where `Builder::set_group_tags` set them | `projection/resolver/belief_groups.rs` `score_belief_groups`; candidates from `group_turns` |
+| `group_turns` masks by timeline only | `projection/resolver/targeted_read.rs` impl |
+| sections are content-addressed | `persistence/content_hash.rs` `section_stream_id(ContentAddress)` |
+| turns are identity-addressed | `persistence/content_hash.rs` `turn_stream_id(timeline, index)` |
+| ingest carries per-turn tags | `TurnSink::insert_prefill_turn(.., tags)` (`zend/src/raw_read/mod.rs`) |
+| a path already becomes a tag | `dir_tags` (`zend/src/repo_scan/ingest_plan.rs`) |
 | layer content folder = layer name | `ingest.rs` — `default_folder = other` |
 
 ---

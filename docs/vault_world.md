@@ -1,11 +1,12 @@
 # The Vault
 
-The Makers work in a building. Seven levels, joined by one lift. A Maker comes up
+The Makers work in a building. Eight levels, joined by one lift. A Maker comes up
 to the command level for orders, rides the lift down to the level that holds the
 job, walks to a console, and works. Sixteen of them, at once, and every working level can
 hold all sixteen. Work on the past starts on the seventh, the time level: a time
 machine sets the year the Maker works in, and nothing after it reaches its recall
-until the work is reported.
+until the work is reported. Finished work enters the record on the eighth, the
+archive floor, at a merge table.
 
 **The building is data, not prose.** It lives as YAML in `npc-map/maps/`,
 deployed to `<mind>/map/`. The description an NPC carries is generated from it,
@@ -238,7 +239,7 @@ correctly offered.
 **The same goes for the room itself.** The decision also records where the body
 stood (`World::decided_at`), and the acts that name something in the room —
 `read`, `post_notice`, `claim`, `gather`, `engage`, `operate` — look it up there
-(`Hosted::standpoint_of`) rather than wherever the metronome has since carried a
+(`Hosted::standpoint_of`, `npcd/src/world/mod.rs`) rather than wherever the metronome has since carried a
 moving body. A character offered "the wall turret" on the rampart and a leg
 later on is not refused "nothing here called the wall turret". Once the decision
 ends, the room it stands in is the room it acts in.
@@ -275,12 +276,13 @@ placed by reference. So *world history terminal* means the same thing on every
 level of every building that has one, and gains a tool everywhere at once when
 it gains one there.
 
-**The tools hang on the part, not on the NPC.** Standing at a chronicle
-terminal is what makes rewriting an era possible; walking away is what makes it
-impossible. `MapSet::tools_at(node)` reads the tool surface off the map, so
-what a Maker can do is computed from where its body is — a tool it is not
-standing next to is never offered and cannot be reasoned about wrongly. A
-corridor comes back empty, which is the point.
+**The tools are reached from the part, not carried by the NPC.** Standing at a
+chronicle terminal is what makes rewriting an era possible; walking away is what
+makes it impossible. The act names the stations it works at (`Tool::at` in
+`npcd/src/engine/tools/mod.rs`), so a building says only what it *contains* and
+the engine says what you can *do* with it. What a Maker can do is computed from
+where its body is — a tool it is not standing next to is never offered and
+cannot be reasoned about wrongly. A corridor offers nothing, which is the point.
 
 Each part carries **two descriptions for two readers**:
 
@@ -365,10 +367,13 @@ NPC's mental map.
 | 4 | the cartography level | one place, at sixteen — and the whole geography, at one |
 | 5 | the casting level | one character, at sixteen |
 | 6 | the portrait level | one character, at sixteen |
+| 7 | the time level | the year a Maker works in, at sixteen time machines |
+| 8 | the archive floor | finished work, published at a merge table |
 
-Every level is the same shape: a ring corridor braced across by two cross runs,
+Levels one to six are the same shape: a ring corridor braced across by two cross runs,
 so circulation is a loop with rungs rather than a spine with dead ends and no
-doorway the whole crew funnels through. The lift lands at the same
+doorway the whole crew funnels through. The time level and the archive floor are
+short two-walk spines (`loop: false`) with the lift at one end. The lift lands at the same
 place on every level.
 
 ## The rooms the repertoire needed

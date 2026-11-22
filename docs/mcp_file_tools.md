@@ -1,6 +1,9 @@
 # File, log and site tools in the Zen MCP, and the gateway's pub/sub
 
-**Status: design, not built.** This document is authoritative for the file,
+**Status: built.** The tools are in `zend/src/mcp/tools/` (`files.rs`,
+`file_edit_and_commit.rs`, `file_download_and_commit.rs`,
+`file_upload_and_commit.rs`, `logs/`), the bus in `web/src/bus/`, the service
+keys in `web/src/cluster/service_key.rs`. This document is authoritative for the file,
 log and site tools the Zen connector offers, the gateway's publish/subscribe
 bus and the gates it carries, and the service keys they rest on. Its first consumer is Yen Bots
 (`docs/yenbot_app_host.md`), which goes live a second after a commit lands.
@@ -31,8 +34,8 @@ every push it makes.
 
 ## 2. The reads
 
-`file_read {repo, path, page?, line?}`, `file_list {repo, path, page?}` and
-`file_search {repo, pattern, path?}` answer exactly as zend's worker tools of
+`file_read {repo, path, part | lines | list}`, `file_list {repo, path, page}` and
+`file_search {repo, query, prefix?, page}` answer exactly as zend's worker tools of
 the same names do (`zend-tools/src/tools/file/`), against the repository's
 default branch as origin holds it — the branches zend already watches and
 fetches within seconds of a move (`docs/zend_branch_ingest.md` §4), and that
@@ -40,9 +43,10 @@ fetches within seconds of a move (`docs/zend_branch_ingest.md` §4), and that
 enum, run no model, and answer within the MCP request-path budget (30 ms at
 p95, `AGENTS.md`).
 
-`file_read` also takes `paths` in place of `path`: up to 64 files in one call,
+`file_read` also takes `paths` in place of `path` and `part`/`lines`/`list`: up to 64 files in one call,
 each answered in full, in order, under its path, with a total of 4 MiB. A file
-that is not UTF-8 is answered as `{path, base64, bytes}`, never refused, so a
+that is not UTF-8 is answered as `{path, base64, bytes}`, never refused (a
+missing one as `{path, missing: true}`), so a
 reader can take a picture as well as a page. This is what an app preview loads
 itself from (`docs/yenbot_preview.md` §3): the framework and an app's files in
 one call rather than one call each.
@@ -249,8 +253,7 @@ cluster:
   service_keys:
     - name: yenbot                       # its identity is the subject service:yenbot
       key_file: secrets/yenbot.key       # 64 hex digits, as `web --new-ops-key` writes
-      routes: [/v1/chat/completions, /v1/models, /v1/image/generate, /v1/image/edit,
-               /gateway/google/token]
+      routes: [/v1/chat/completions, /v1/models, /v1/image/generate, /v1/image/edit]
       topics:
         subscribe: ["repo/yenbot", "gate/yenbot"]
         publish: ["gate/yenbot/result/*", "service/yenbot/*"]
@@ -511,7 +514,7 @@ request-path budget.
 | `zend/src/mcp/tools/` | `file_read`, `file_list`, `file_search` (the workers' implementations, offered to the connector) and `file_edit_and_commit`. |
 | `zend/src/mcp/tools/` | `file_download_and_commit`, `file_upload_and_commit`; `file_read` with `paths`. |
 | `zend-tools/src/tools/file/` | `file_download`, `file_upload` (§3.6). |
-| `zend-tools/src/net/` | The address guard (§3.7), its own module, used by every transfer. |
+| `zend-tools/src/public_fetch/` | The address guard (§3.7), its own module, used by every transfer. |
 | `zend/src/file_commit/` | A change carrying bytes, for the transfers (§3.8). |
 | `zend-vfs/src/workspace.rs` | `author:` in the manifest, the default and per repository. |
 | zend's push paths | Publish `repo/<name>` after each push. |

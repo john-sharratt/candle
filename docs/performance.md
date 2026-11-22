@@ -391,7 +391,7 @@ forty copies of the same text, and **two of the numbers in these tables are
 compression ratios**. A cache holding forty copies of one passage compresses
 like nothing real ever will.
 
-So the filler (`batch_test/long_context.rs`) is assembled instead: paragraphs
+So the filler (`candle-transformers/src/models/batch_test/long_context.rs`) is assembled instead: paragraphs
 from eight unrelated domains, walked in a rotating order so no two consecutive
 paragraphs come from the same template, and *perturbed every cycle* — the names,
 places and numbers differ each time a template comes round, so no two cycles
@@ -1020,7 +1020,7 @@ every build since.
 
 At `Int8Mode::auto`, Precision on this card. The gate decodes 256 tokens a row
 (C9/C10 at 64) — the 2026-10-05 sweep decoded 64 — and drafts to depth 4 up to
-eight sessions (`models/draft_ladder.rs`), at 4.90 accepted tokens a step.
+eight sessions (`candle-transformers/src/models/draft_ladder.rs`), at 4.90 accepted tokens a step.
 
 | KvMode | int8 | Batched | Ctx | Valid | prefill t/s | decode t/s | %Quant | Compress | Peak tok |
 |---|---|:-:|--:|:-:|--:|--:|--:|--:|--:|
@@ -1607,8 +1607,9 @@ every run validated:
 | DeepSeek-V4-Flash | 1,083.9 / 1,120.6 | +0.9 % | +1.6 % |
 
 Decode is within noise everywhere but one row: Qwen3.6-35B-A3B C10×16, 769.5 →
-690.9 t/s (−10.2 %), both runs of each build agreeing — open item #11 in
-`docs/archived/open_items.md`.
+690.9 t/s (−10.2 %), both runs of each build agreeing — recorded as open
+item #11 in the archived list (`docs/archived/open_items.md`), which is a
+historical record, not a live tracker.
 
 ### Qwen2-0.5B reports 0% quantized
 
@@ -1666,7 +1667,7 @@ whether they account for the shortfall, is not yet established.
 
 **Cause and fix (2026-10-11).** Read pass by pass, the shortfall is a retirement
 burst that the wave loop's compaction settle stopped clearing part-way. Each pass
-plans at most `PLANNED_MOVES_PER_POOL` moves a pool (`compact/plan.rs`), which here is
+plans at most `PLANNED_MOVES_PER_POOL` moves a pool (`candle-nn/src/kv_cache/chunked/compact/plan.rs`), which here is
 ~75,000 moves and 12–16 arenas a pass, every pass reporting `plan_capped` and none
 clipped by its 80 ms clock. The settle ran a fixed four passes (~52 regions)
 against bursts of 75–120 regions of air, so the remainder stood through the next
@@ -1688,7 +1689,7 @@ Two more defects came out of reading the same runs.
   frontier's arenas are drained, so ~115,000 moves touched ~8,000 chunks against
   a reservation for ~3,600; the rest were declined, and the frontier held at 400
   regions for a dozen passes in a row. The reservation is now one record per
-  move, its true upper bound (`compact/pass.rs`). Every pass since reads
+  move, its true upper bound (`candle-nn/src/kv_cache/chunked/compact/pass.rs`). Every pass since reads
   `records_declined=0`.
 - **VRAM relief stalled the scheduler for 5–8 s at a time.** Relief waits for
   the persistence thread to move turns warm before it can evict them, and that
