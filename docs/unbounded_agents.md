@@ -656,7 +656,7 @@ The same card, one context, 32K → 128K, BF16. Share of the 32K rate kept at 12
 | Qwen3.5-35B-A3B | 26% | 47% |
 | Qwen3.5-0.8B | 25% | 86% |
 
-Flash-Next is the one model whose cost per token does not depend on how much history there is, and the reason is in its checkpoint, not in this engine's provenance: its full-attention layers carry a trained sparse-attention indexer (QSA, `{layer}.indexer.*` weights) that caps each token's attended set at 2,051 positions, where the hybrids read the whole prefix. Profiled per call, the attention kernel costs the same at shallow depth on both (0.382 ms at 32K on Flash-Next, 0.394 ms at 8K on Qwen3.5-35B), then stays within 6% to 128K on Flash-Next and grows 3.71× for 4× depth on the 35B. The other models in this table are not a failure of the engine; they cannot acquire the indexer without training, and their retention is also confounded by size — Qwen3.5-0.8B keeps 86% of decode because its step is dominated by depth-independent work (`docs/performance.md` §3.3). Across the full depth sweep on the rewrite task its speculative head accepts exactly **4.85 tokens a step at every depth from 8K to 128K**, and the story is reproduced correctly from behind 128,897 tokens of padding. On the coherence task its prefill runs 1,098.8 / 1,368.9 / 1,342.8 / 1,291.8 / 1,257.5 t/s and its decode 24.7 / 28.3 / 24.6 / 26.3 / 26.4 t/s at 8K / 16K / 32K / 64K / 128K. The published llama.cpp run of the same model on an RTX 4090 24GB keeps 64% of its prefill and 65% of its decode between 6K and 110K [33], so the engine contributes something too: its paged attention and compression add no depth-dependent cost of their own on top of the indexer's. What this row shows is the principle §11.2 rests on — a working set bounded independently of depth costs the same at any depth — demonstrated by a model-native mechanism inside one context. It is not a measurement of provenance-selected attention, which a single-context depth gate does not exercise.
+Flash-Next is the one model whose cost per token does not depend on how much history there is, and the reason is in its checkpoint, not in this engine's provenance: its full-attention layers carry a trained sparse-attention indexer (QSA, `{layer}.indexer.*` weights) that caps each token's attended set at 2,051 positions, where the hybrids read the whole prefix. Profiled per call, the attention kernel costs the same at shallow depth on both (0.382 ms at 32K on Flash-Next, 0.394 ms at 8K on Qwen3.5-35B), then stays within 6% to 128K on Flash-Next and grows 3.71× for 4× depth on the 35B. The other models in this table are not a failure of the engine; they cannot acquire the indexer without training, and their retention is also confounded by size — Qwen3.5-0.8B keeps 86% of decode because its step is dominated by depth-independent work (`docs/performance.md` §3.3). Across the full depth sweep on the rewrite task its speculative head accepts exactly **4.85 tokens a step at every depth from 8K to 128K**, and the story is reproduced correctly from behind 128,897 tokens of padding. On the coherence task its prefill runs 1,098.8 / 1,368.9 / 1,342.8 / 1,291.8 / 1,257.5 t/s and its decode 24.7 / 28.3 / 24.6 / 26.3 / 26.4 t/s at 8K / 16K / 32K / 64K / 128K. The published llama.cpp run of the same model on an RTX 4090 24GB keeps 64% of its prefill and 65% of its decode between 6K and 110K [31], so the engine contributes something too: its paged attention and compression add no depth-dependent cost of their own on top of the indexer's. What this row shows is the principle §11.2 rests on — a working set bounded independently of depth costs the same at any depth — demonstrated by a model-native mechanism inside one context. It is not a measurement of provenance-selected attention, which a single-context depth gate does not exercise.
 
 #### 9.6.3 Compression: the top level, inline, validated
 
@@ -669,7 +669,7 @@ Each 32-token block is compressed in the forward that produced it; there is no s
 | Llama-2-7B (4K) | 3,684.7 / 3,851.1 | 47.1 / 44.1 | 4.81× |
 | Llama-3.2-3B | 6,195.9 / 5,936.8 | 69.9 / 66.1 | 4.62× |
 
-At 8K the top level costs **0–8% of decode for 3.3×–6.3×** across the models measured there. At 32K the largest hybrids pay 27–31% of decode for 6.3×–7.5×; at 128K the cache compresses 4.63×–7.63×, 100% of blocks quantized, with Flash-Next paying 19% for 6.97×. Prefill with C10 runs within 5% of BF16 at every depth measured, and at 128K it is marginally *faster* than BF16 on all six models, because there are fewer bytes to read back. For comparison, llama.cpp's q8_0 KV cache gives ~1.9× and costs 35% of decode at 32K and 45% at 64K; its q4_0 gives ~3.56× and costs 39% and 50% [37]; vLLM's FP8 cache gives 2× [38], and TurboQuant 2.4–3.4× for 20–27% of throughput [39]. At 32K the top level holds **nearly 4× the compression of q8_0 while slowing decode less**.
+At 8K the top level costs **0–8% of decode for 3.3×–6.3×** across the models measured there. At 32K the largest hybrids pay 27–31% of decode for 6.3×–7.5×; at 128K the cache compresses 4.63×–7.63×, 100% of blocks quantized, with Flash-Next paying 19% for 6.97×. Prefill with C10 runs within 5% of BF16 at every depth measured, and at 128K it is marginally *faster* than BF16 on all six models, because there are fewer bytes to read back. For comparison, llama.cpp's q8_0 KV cache gives ~1.9× and costs 35% of decode at 32K and 45% at 64K; its q4_0 gives ~3.56× and costs 39% and 50% [35]; vLLM's FP8 cache gives 2× [36], and TurboQuant 2.4–3.4× for 20–27% of throughput [37]. At 32K the top level holds **nearly 4× the compression of q8_0 while slowing decode less**.
 
 #### 9.6.4 Against the published record
 
@@ -677,22 +677,22 @@ For each model, our aggregate decode serving concurrent sessions against the bes
 
 | Card class | Model | Ours, aggregate (t/s) | llama.cpp best, single-stream (t/s) | Multiple |
 |---|---|---:|---:|---:|
-| RTX 3090 | Qwen3.5-35B-A3B, C10 ×16 | 1,228.8 | 111.2 [30] | 11.1× |
-| RTX 3090 | Qwen3.6-35B-A3B, C10 ×16 | 1,346.3 | 157.66 [35] | 8.5× |
-| RTX 3090 | Llama-2-7B, BF16 ×48 | 934.9 | 161.89 [29] | 5.8× |
-| RTX 3090 | Qwen3-8B, C8 ×10 | 383.8 | 115.3 [30] | 3.3× |
-| RTX 3090 | Qwen3.8-27B, C8 ×20 | 358.7 | 65.28, with MTP [32] | 5.5× |
-| RTX 3090 | Qwen3-30B-A3B, BF16 ×10 | 400.5 | 153.6 [30] | 2.6× |
-| RTX 3090 | Qwen3.8-Flash-Next, BF16 ×16 | 543.8 | 15 [34] | 36.3× |
-| 16 GB | Qwen3.6-35B-A3B, C10 ×16 | 336.7 | 183.29 / 249.33 MTP, IQ3_S resident [40] | 1.3–1.8× |
-| 16 GB | Qwen3-8B, C8 ×10 | 308.4 | 102.7 (RTX 4080) [31] | 3.0× |
-| 16 GB | Qwen3.8-Flash-Next, BF16 ×8 | 108.5 | 27.5–29 (RTX 5080) [34] | 3.7× |
-| Blackwell | Qwen3.5-35B-A3B, C10 ×64 | 2,869.9 | 194.0 [36] | 14.8× |
-| Blackwell | Qwen3.6-35B-A3B, C10 ×64 | 2,761.0 | 333.55, with MTP [40] | 8.3× |
-| Blackwell | Qwen3.8-Flash-Next, BF16 ×16 (TCC build, §9.6.7) | 1,819.3 | 48.02 [44] | 37.9× |
-| Blackwell | Llama-2-7B, BF16 ×48 | 1,675.0 | 300.40 [29] | 5.6× |
-| Blackwell | Qwen3-30B-A3B, BF16 ×10 | 997.4 | 226.1 [41] | 4.4× |
-| Blackwell | Qwen3-8B, C8 ×10 | 632.9 | 200.4 [41] | 3.2× |
+| RTX 3090 | Qwen3.5-35B-A3B, C10 ×16 | 1,228.8 | 111.2 [28] | 11.1× |
+| RTX 3090 | Qwen3.6-35B-A3B, C10 ×16 | 1,346.3 | 157.66 [33] | 8.5× |
+| RTX 3090 | Llama-2-7B, BF16 ×48 | 934.9 | 161.89 [27] | 5.8× |
+| RTX 3090 | Qwen3-8B, C8 ×10 | 383.8 | 115.3 [28] | 3.3× |
+| RTX 3090 | Qwen3.8-27B, C8 ×20 | 358.7 | 65.28, with MTP [30] | 5.5× |
+| RTX 3090 | Qwen3-30B-A3B, BF16 ×10 | 400.5 | 153.6 [28] | 2.6× |
+| RTX 3090 | Qwen3.8-Flash-Next, BF16 ×16 | 543.8 | 15 [32] | 36.3× |
+| 16 GB | Qwen3.6-35B-A3B, C10 ×16 | 336.7 | 183.29 / 249.33 MTP, IQ3_S resident [38] | 1.3–1.8× |
+| 16 GB | Qwen3-8B, C8 ×10 | 308.4 | 102.7 (RTX 4080) [29] | 3.0× |
+| 16 GB | Qwen3.8-Flash-Next, BF16 ×8 | 108.5 | 27.5–29 (RTX 5080) [32] | 3.7× |
+| Blackwell | Qwen3.5-35B-A3B, C10 ×64 | 2,869.9 | 194.0 [34] | 14.8× |
+| Blackwell | Qwen3.6-35B-A3B, C10 ×64 | 2,761.0 | 333.55, with MTP [38] | 8.3× |
+| Blackwell | Qwen3.8-Flash-Next, BF16 ×16 (TCC build, §9.6.7) | 1,819.3 | 48.02 [42] | 37.9× |
+| Blackwell | Llama-2-7B, BF16 ×48 | 1,675.0 | 300.40 [27] | 5.6× |
+| Blackwell | Qwen3-30B-A3B, BF16 ×10 | 997.4 | 226.1 [39] | 4.4× |
+| Blackwell | Qwen3-8B, C8 ×10 | 632.9 | 200.4 [39] | 3.2× |
 
 Every row clears the published single-stream rate, by 1.3× to 37.9×. Aggregate against single-stream is the comparison the published record allows — llama.cpp can serve parallel requests, but no aggregate for these models on these cards has been published — and it is the comparison that answers how much work one card does. The published single-card serving runs of the 35B models on a larger RTX PRO 6000 report 5–10 concurrent requests [42, 43]; this engine runs them at 64 on a 72GB card and Qwen3.5-0.8B at 256.
 
@@ -702,19 +702,19 @@ Two rows in the table are not like-for-like and are marked here rather than left
 
 The RTX 4090 Laptop GPU with 32GB of host RAM is the constraint the architecture was designed under, and where its results are least expected.
 
-- **A 180B model.** Qwen3.8-Flash-Next (180B total: a 125B trunk with 512 experts, a 51B n-gram table and a 4B MTP head; 6B active) runs from a Q2_KO-expert artifact of ~88GB, streaming its experts VRAM → pinned RAM → NVMe. Every rung of its ladder validates 8/8. On the 2026-10-10 sweep one warm session prefills at 269.1 t/s and decodes at 34.9; eight prefill at 1,127.5 and decode at **108.5 t/s aggregate**, with C10 at 5.79–5.82× and costing only 6.6% of that decode (1,128.7 / 101.3). Every published single-GPU run of the model that states its host uses 64–128GB of RAM; the fastest, an RTX 5090 with 128GB, decodes one stream at 48.02 t/s [44], and the only published 16GB-class run, an RTX 5080 with 64GB, at 27.5–29 [34].
+- **A 180B model.** Qwen3.8-Flash-Next (180B total: a 125B trunk with 512 experts, a 51B n-gram table and a 4B MTP head; 6B active) runs from a Q2_KO-expert artifact of ~88GB, streaming its experts VRAM → pinned RAM → NVMe. Every rung of its ladder validates 8/8. On the 2026-10-10 sweep one warm session prefills at 269.1 t/s and decodes at 34.9; eight prefill at 1,127.5 and decode at **108.5 t/s aggregate**, with C10 at 5.79–5.82× and costing only 6.6% of that decode (1,128.7 / 101.3). Every published single-GPU run of the model that states its host uses 64–128GB of RAM; the fastest, an RTX 5090 with 128GB, decodes one stream at 48.02 t/s [42], and the only published 16GB-class run, an RTX 5080 with 64GB, at 27.5–29 [32].
 - **A 30B MoE streaming its experts.** Qwen3-30B-A3B at Q8_0 ×20 prefills at **6,139.1 t/s** on the laptop with its experts streaming through the three-tier cache.
-- **A 35B MoE serving sixteen users.** Qwen3.5-35B-A3B and Qwen3.6-35B-A3B at Q6_K — ~28GB of weights on a 16GB card — serve ×16 at **330.8 and 336.7 t/s aggregate** with C10 at 7.01× and 6.42×, every session validated. The published 16GB runs of these models are single-stream, at smaller quants that fit resident [40].
+- **A 35B MoE serving sixteen users.** Qwen3.5-35B-A3B and Qwen3.6-35B-A3B at Q6_K — ~28GB of weights on a 16GB card — serve ×16 at **330.8 and 336.7 t/s aggregate** with C10 at 7.01× and 6.42×, every session validated. The published 16GB runs of these models are single-stream, at smaller quants that fit resident [38].
 - **A small model at workstation rate.** Qwen3.5-0.8B at C8 ×32 prefills at **46,056.8 t/s** and decodes at **3,810.7 t/s aggregate** — above the 24GB RTX 3090's 42,982.2 t/s on the same rung, on a card with half the memory and the same ~12 GB/s host link.
 
 C10 compresses the 35B to 7.01× on the laptop and 7.03× on the RTX 3090, and Qwen3.6-35B to 6.42× and 6.45×; the same selector, the same thresholds, making the same decisions on two different GPUs and two different PCIe links. The selector's per-model thresholds are the only thing that varies between the cards, and they vary by model family, not by silicon.
 
 #### 9.6.6 A 284B model on one GPU
 
-DeepSeek-V4-Flash (284B total, 13B active) on one RTX PRO 5000 72GB, sixteen concurrent sessions: **1,177.1 t/s prefill and 114.4 t/s aggregate decode**, build `21c36efbd`. The best published single-GPU prefill for the model is 748.4 t/s (RTX PRO 6000 Max-Q, all experts on the CPU, 8K) [45], and the best published single-GPU decode is 28 t/s (RTX 5090, KTransformers + SGLang, INT4 experts on the CPU) [46] — every published run holding the routed experts in host RAM, as this one does. The aggregate is 4.1× that decode, and the prefill is above every published single-GPU figure for the model.
+DeepSeek-V4-Flash (284B total, 13B active) on one RTX PRO 5000 72GB, sixteen concurrent sessions: **1,177.1 t/s prefill and 114.4 t/s aggregate decode**, build `21c36efbd`. The best published single-GPU prefill for the model is 748.4 t/s (RTX PRO 6000 Max-Q, all experts on the CPU, 8K) [43], and the best published single-GPU decode is 28 t/s (RTX 5090, KTransformers + SGLang, INT4 experts on the CPU) [44] — every published run holding the routed experts in host RAM, as this one does. The aggregate is 4.1× that decode, and the prefill is above every published single-GPU figure for the model.
 #### 9.6.7 Where published engines lead
 
-Single-stream decode on a model that fits wholly in VRAM is llama.cpp's strength: on a 16GB card, a 3-bit Qwen3.6-35B-A3B that fits resident decodes one stream at 183.29 t/s (249.33 with MTP) [40], where this engine's sixteen-session aggregate with Q6_K experts streamed is 336.7 — more work in total, less per stream. vLLM prefills Qwen3.6-35B-A3B at 41,105 t/s on an RTX PRO 6000 [43], against ~7,200 here at one session.
+Single-stream decode on a model that fits wholly in VRAM is llama.cpp's strength: on a 16GB card, a 3-bit Qwen3.6-35B-A3B that fits resident decodes one stream at 183.29 t/s (249.33 with MTP) [38], where this engine's sixteen-session aggregate with Q6_K experts streamed is 336.7 — more work in total, less per stream. vLLM prefills Qwen3.6-35B-A3B at 41,105 t/s on an RTX PRO 6000 [41], against ~7,200 here at one session.
 
 The closest published head-to-head is Strata's RTX 5090 single-session benchmark, replayed on this engine through the conversation engine at C5 as a daemon runs it (`kv_fragmentation::qwen38_flash_next_strata`, median of three runs, warm-up excluded). Ours leads prefill at 4K — 6,064.3 t/s against Strata's 4,269.8 — and trails on decode: 168.4 / 159.1 / 125.3 t/s against Strata's 179.4 / 175.7 / 165.0 at 4K / 32K / 128K, i.e. 82–95% of Strata at 4K and 32K and 69–76% at 128K, with a fastest single run of 181.9 t/s at 4K above Strata's median there. Strata runs on a PCIe 5.0 RTX 5090 with a dedicated CUDA graph path; this engine runs on a workstation card, where one segment submission per MoE layer is the floor. Both mark directions for the next version of the kernels; neither changes the architecture's claim, which is about how much one card can serve, from how large a model, at how much context — and Strata's published run is single-session.
 #### 9.6.8 Output fidelity against depth
@@ -729,7 +729,7 @@ The throughput rows say compression is cheap; they do not say how much it moves 
 | Flash-Next, QSA-selected | C10 mean KL | 5.9e-2 | 3.0e-2 | 1.08e-1 | 1.16e-1 |
 | Flash-Next | C5 mean KL | 9.8e-3 | 1.1e-2 | 2.1e-2 | 7.6e-3 |
 
-Top-1 agreement with BF16 is 95.8–100% in every cell; the run-to-run spread is 0 on the 8B and 9B and at most 4.3e-5 on Flash-Next. On the models whose attention reads the whole prefix, the divergence does not grow with depth across a 30× range — the exposure §11.2 bounds grows, the output error does not (§11.1). The one growth measured is C10 on Flash-Next, about 2× from 4K to 124K while its C5 and C0 rows stay flat: the selecting model, at the top level only, plausibly because its indexer selects over stored keys and a compressed key can move a selection. That attribution is not instrumented.
+Top-1 agreement with BF16 is 95.8–100% in every cell; the run-to-run spread is 0 on the 8B and 9B and at most 4.3e-5 on Flash-Next. On the models whose attention reads the whole prefix, the divergence does not grow with depth across a 30× range — the exposure §11.2 bounds grows, the output error does not (§11.1). On Flash-Next at C5, the level production seals everything at (§9.6.9), the divergence stays flat from 4K to 124K, as at near-lossless C0; the top level, C10, is the one cell that grows — about 2× over the same range — and is the price of its extra compression on a model whose attention selects.
 
 #### 9.6.9 Memory: what keeps a large context on one card
 
@@ -1272,87 +1272,81 @@ The deeper lesson is methodological: constraints accepted as first-class design 
 
 [13] Liu, D., et al. (2024). **RetrievalAttention: Accelerating Long-Context LLM Inference via Vector Retrieval.** NeurIPS 2025. https://arxiv.org/abs/2409.10516
 
-[14] Zhang, J., et al. (2025). **Decoding Emotion in the Deep.** arXiv:2510.04064.
+[14] Kamahori, K., et al. (2024). **Fiddler: CPU-GPU Orchestration for Fast Inference of Mixture-of-Experts Models.**
 
-[15] Tak, A.N., et al. (2025). **Mechanistic Interpretability of Emotion Inference in Large Language Models.** Findings of ACL 2025.
+[15] DAOP: Data-Aware Offloading and Predictive Pre-Calculation for Efficient MoE Inference. DATE 2025. https://arxiv.org/html/2501.10375
 
-[16] Kamahori, K., et al. (2024). **Fiddler: CPU-GPU Orchestration for Fast Inference of Mixture-of-Experts Models.**
+[16] KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models. SOSP 2025.
 
-[17] DAOP: Data-Aware Offloading and Predictive Pre-Calculation for Efficient MoE Inference. DATE 2025. https://arxiv.org/html/2501.10375
+[17] NVIDIA Technical Blog. (2025). **Optimizing Inference for Long Context and Large Batch Sizes with NVFP4 KV Cache.** https://developer.nvidia.com/blog/optimizing-inference-for-long-context-and-large-batch-sizes-with-nvfp4-kv-cache/
 
-[18] KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models. SOSP 2025.
+[18] KVSink: Sink-Aware KV Cache Quantization for Attention Sinks. COLM 2025. https://arxiv.org/abs/2508.04257
 
-[19] NVIDIA Technical Blog. (2025). **Optimizing Inference for Long Context and Large Batch Sizes with NVFP4 KV Cache.** https://developer.nvidia.com/blog/optimizing-inference-for-long-context-and-large-batch-sizes-with-nvfp4-kv-cache/
+[19] Quantization Error Propagation in Large Language Models. arXiv:2504.09629, 2025.
 
-[20] KVSink: Sink-Aware KV Cache Quantization for Attention Sinks. COLM 2025. https://arxiv.org/abs/2508.04257
+[20] Kamradt, G. (2023). **LLM Test: Needle In A Haystack.** https://github.com/gkamradt/LLMTest_NeedleInAHaystack
 
-[21] Quantization Error Propagation in Large Language Models. arXiv:2504.09629, 2025.
+[21] Kuratov, Y., et al. (2024). **BABILong: Testing the Limits of LLMs with Long Context Reasoning-in-a-Haystack.** NeurIPS 2024. https://arxiv.org/abs/2406.10149
 
-[22] Kamradt, G. (2023). **LLM Test: Needle In A Haystack.** https://github.com/gkamradt/LLMTest_NeedleInAHaystack
+[22] hardware-corner.net. (2025). **The Definitive GPU Ranking for LLMs: Token Generation & Prompt Processing Performance.** https://www.hardware-corner.net/gpu-ranking-local-llm/
 
-[23] Kuratov, Y., et al. (2024). **BABILong: Testing the Limits of LLMs with Long Context Reasoning-in-a-Haystack.** NeurIPS 2024. https://arxiv.org/abs/2406.10149
+[23] ToolHalla. (2026). **Best Local LLMs for RTX 4090 in 2026: 7 Models That Maximize 24GB.** https://toolhalla.ai/blog/best-local-llms-rtx-4090-2026
 
-[24] hardware-corner.net. (2025). **The Definitive GPU Ranking for LLMs: Token Generation & Prompt Processing Performance.** https://www.hardware-corner.net/gpu-ranking-local-llm/
+[24] Herz, M., et al. (2025). **Viability and Performance of a Private LLM Server for SMBs: A Benchmark Analysis of Qwen3-30B on Consumer-Grade Hardware.** arXiv:2512.23029.
 
-[25] ToolHalla. (2026). **Best Local LLMs for RTX 4090 in 2026: 7 Models That Maximize 24GB.** https://toolhalla.ai/blog/best-local-llms-rtx-4090-2026
+[25] Jiang, Z., et al. (2023). **FLARE: Active Retrieval Augmented Generation.** EMNLP 2023. https://arxiv.org/abs/2305.06983
 
-[26] Herz, M., et al. (2025). **Viability and Performance of a Private LLM Server for SMBs: A Benchmark Analysis of Qwen3-30B on Consumer-Grade Hardware.** arXiv:2512.23029.
-
-[27] Jiang, Z., et al. (2023). **FLARE: Active Retrieval Augmented Generation.** EMNLP 2023. https://arxiv.org/abs/2305.06983
-
-[28] Asai, A., et al. (2024). **Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection.** ICLR 2024. https://arxiv.org/abs/2310.11511
+[26] Asai, A., et al. (2024). **Self-RAG: Learning to Retrieve, Generate, and Critique through Self-Reflection.** ICLR 2024. https://arxiv.org/abs/2310.11511
 
 *Published throughput figures compared against in §9.6. Each is recorded with its card, quantization, context length and engine in `docs/performance.md` §6.*
 
-[29] llama.cpp Discussion #15013. **Performance of llama.cpp on Nvidia CUDA** (Llama-2-7B Q4_0). https://github.com/ggml-org/llama.cpp/discussions/15013
+[27] llama.cpp Discussion #15013. **Performance of llama.cpp on Nvidia CUDA** (Llama-2-7B Q4_0). https://github.com/ggml-org/llama.cpp/discussions/15013
 
-[30] Hardware Corner. (2026). **RTX 3090 LLM benchmarks.** https://www.hardware-corner.net/gpu-llm-benchmarks/rtx-3090/
+[28] Hardware Corner. (2026). **RTX 3090 LLM benchmarks.** https://www.hardware-corner.net/gpu-llm-benchmarks/rtx-3090/
 
-[31] Hardware Corner. (2026). **RTX 4080 LLM benchmarks.** https://www.hardware-corner.net/gpu-llm-benchmarks/rtx-4080/
+[29] Hardware Corner. (2026). **RTX 4080 LLM benchmarks.** https://www.hardware-corner.net/gpu-llm-benchmarks/rtx-4080/
 
-[32] jonidimo. (2026). **Qwen3.8-27B on One RTX 3090: 14h Measured Benchmark.** https://jonidimo.github.io/qwen38-3090-benchmark/benchmark.html
+[30] jonidimo. (2026). **Qwen3.8-27B on One RTX 3090: 14h Measured Benchmark.** https://jonidimo.github.io/qwen38-3090-benchmark/benchmark.html
 
-[33] ryan4yin. (2026). **Best llama.cpp config for Qwen3.8-Flash-Next (RTX 4090 24GB).** https://gist.github.com/ryan4yin/48617bbddacc7067f10799770b7cc33f
+[31] ryan4yin. (2026). **Best llama.cpp config for Qwen3.8-Flash-Next (RTX 4090 24GB).** https://gist.github.com/ryan4yin/48617bbddacc7067f10799770b7cc33f
 
-[34] unsloth/Qwen3.8-Flash-Next-GGUF discussion #3. (2026). **Share your model speed here.** https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/discussions/3
+[32] unsloth/Qwen3.8-Flash-Next-GGUF discussion #3. (2026). **Share your model speed here.** https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/discussions/3
 
-[35] InsiderLLM. (2026). **Best Way to Run Qwen 3.6 35B MoE Locally.** https://insiderllm.com/guides/best-way-run-qwen-3-6-35b-moe-locally/
+[33] InsiderLLM. (2026). **Best Way to Run Qwen 3.6 35B MoE Locally.** https://insiderllm.com/guides/best-way-run-qwen-3-6-35b-moe-locally/
 
-[36] llama.cpp Discussion #19890. (2026). **RTX 5090 (CUDA) vs Radeon AI PRO R9700 (Vulkan) — Qwen3.5-35B-A3B.** https://github.com/ggml-org/llama.cpp/discussions/19890
+[34] llama.cpp Discussion #19890. (2026). **RTX 5090 (CUDA) vs Radeon AI PRO R9700 (Vulkan) — Qwen3.5-35B-A3B.** https://github.com/ggml-org/llama.cpp/discussions/19890
 
-[37] SOTAAZ. (2026). **llama.cpp KV Cache Quantization, Measured on One A100.** https://sotaaz.com/post/llamacpp-kv-cache-quantization-bench-en
+[35] SOTAAZ. (2026). **llama.cpp KV Cache Quantization, Measured on One A100.** https://sotaaz.com/post/llamacpp-kv-cache-quantization-bench-en
 
-[38] vLLM Blog. (2026). **The State of FP8 KV-Cache and Attention Quantization in vLLM.** https://vllm.ai/blog/2026-04-22-fp8-kvcache
+[36] vLLM Blog. (2026). **The State of FP8 KV-Cache and Attention Quantization in vLLM.** https://vllm.ai/blog/2026-04-22-fp8-kvcache
 
-[39] vLLM Blog. (2026). **A First Comprehensive Study of TurboQuant: Accuracy and Performance.** https://vllm.ai/blog/2026-05-11-turboquant
+[37] vLLM Blog. (2026). **A First Comprehensive Study of TurboQuant: Accuracy and Performance.** https://vllm.ai/blog/2026-05-11-turboquant
 
-[40] ByteShape. (2026). **If It Fits, It Sits: Qwen 3.6 35B.** https://byteshape.com/blogs/Qwen3.6-35B-A3B/
+[38] ByteShape. (2026). **If It Fits, It Sits: Qwen 3.6 35B.** https://byteshape.com/blogs/Qwen3.6-35B-A3B/
 
-[41] Hardware Corner. (2026). **RTX 5090 LLM benchmarks.** https://www.hardware-corner.net/gpu-llm-benchmarks/rtx-5090/
+[39] Hardware Corner. (2026). **RTX 5090 LLM benchmarks.** https://www.hardware-corner.net/gpu-llm-benchmarks/rtx-5090/
 
-[42] Millstone AI. (2026). **Qwen3.5-35B-A3B FP8 on 1× RTX Pro 6000.** https://www.millstoneai.com/inference-benchmark/qwen3-5-35b-a3b-fp8-1x-rtx-pro-6000-blackwell
+[40] Millstone AI. (2026). **Qwen3.5-35B-A3B FP8 on 1× RTX Pro 6000.** https://www.millstoneai.com/inference-benchmark/qwen3-5-35b-a3b-fp8-1x-rtx-pro-6000-blackwell
 
-[43] Millstone AI. (2026). **Qwen3.6-35B-A3B FP8 on 1× RTX Pro 6000.** https://www.millstoneai.com/inference-benchmark/qwen3-6-35b-a3b-fp8-1x-rtx-pro-6000-blackwell
+[41] Millstone AI. (2026). **Qwen3.6-35B-A3B FP8 on 1× RTX Pro 6000.** https://www.millstoneai.com/inference-benchmark/qwen3-6-35b-a3b-fp8-1x-rtx-pro-6000-blackwell
 
-[44] holy_fox. (2026). **Running Qwen3.8-Flash-Next on an RTX 5090 with 128GB RAM using llama.cpp.** https://zenn.dev/holy_fox/articles/04887ff8177b87?locale=en
+[42] holy_fox. (2026). **Running Qwen3.8-Flash-Next on an RTX 5090 with 128GB RAM using llama.cpp.** https://zenn.dev/holy_fox/articles/04887ff8177b87?locale=en
 
-[45] llama.cpp PR #24162. (2026). **DeepSeek V4.** https://github.com/ggml-org/llama.cpp/pull/24162
+[43] llama.cpp PR #24162. (2026). **DeepSeek V4.** https://github.com/ggml-org/llama.cpp/pull/24162
 
-[46] RockmSockmJesus. (2026). **DeepSeek-V4-Flash (284B MoE) at ~28 tok/s on 1x RTX 5090.** https://gist.github.com/RockmSockmJesus/30a195ccd9b62e981ec2676a99a57b7e
+[44] RockmSockmJesus. (2026). **DeepSeek-V4-Flash (284B MoE) at ~28 tok/s on 1x RTX 5090.** https://gist.github.com/RockmSockmJesus/30a195ccd9b62e981ec2676a99a57b7e
 
 *Further works cited in the text by author and year.*
 
-[47] Liu, N.F., Lin, K., Hewitt, J., et al. (2024). **Lost in the Middle: How Language Models Use Long Contexts.** TACL 2024. https://arxiv.org/abs/2307.03172
+[45] Staniszewski, K., Łańcucki, A. (2026). **KV Cache Transform Coding for Compact Storage in LLM Inference.** ICLR 2026. https://arxiv.org/abs/2511.01815
 
-[48] Staniszewski, K., Łańcucki, A. (2026). **KV Cache Transform Coding for Compact Storage in LLM Inference.** ICLR 2026. https://arxiv.org/abs/2511.01815
+[46] Zhong, S., Sun, Y., Liang, L., et al. (2025). **HybriMoE: Hybrid CPU-GPU Scheduling and Cache Management for Efficient MoE Inference.** DAC 2025. https://arxiv.org/abs/2504.05897
 
-[49] Zhong, S., Sun, Y., Liang, L., et al. (2025). **HybriMoE: Hybrid CPU-GPU Scheduling and Cache Management for Efficient MoE Inference.** DAC 2025. https://arxiv.org/abs/2504.05897
+[47] OpenRouter. (2026). **Cache is Crucial.** *Inferred*, no. 3. https://openrouter.ai/data/newsletter/cache-is-crucial
 
-[50] OpenRouter. (2026). **Cache is Crucial.** *Inferred*, no. 3. https://openrouter.ai/data/newsletter/cache-is-crucial
+[48] Bai, L., Huang, Z., Wang, X., et al. (2026). **How Do AI Agents Spend Your Money? Analyzing and Predicting Token Consumption in Agentic Coding Tasks.** arXiv:2604.22750. https://arxiv.org/abs/2604.22750
 
-[51] Bai, L., Huang, Z., Wang, X., et al. (2026). **How Do AI Agents Spend Your Money? Analyzing and Predicting Token Consumption in Agentic Coding Tasks.** arXiv:2604.22750. https://arxiv.org/abs/2604.22750
-
-[19], [21], [24] and [25] are background reading and are not cited in the text.
+[17], [19], [22] and [23] are background reading and are not cited in the text.
 
 ---
 
