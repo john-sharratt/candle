@@ -246,41 +246,4 @@ impl SealedSequence {
             self.chunks.pop();
         }
     }
-
-    /// Drop the last `tokens` tokens — the span a re-feed forwards again over
-    /// a rebuilt context (`docs/reprojection_refeed.md` §2.2). The chunk the
-    /// cut lands in keeps its first tokens; chunks wholly past it go. Every
-    /// chunk the cut reaches must still take writes: the re-feed writes those
-    /// positions again, and the gap leaves them native for it. A cut longer
-    /// than the sequence, or into a quantized chunk, is refused.
-    pub fn trim_tail(&mut self, tokens: usize) -> candle::Result<()> {
-        if tokens > self.token_count {
-            candle::bail!(
-                "re-feed: a cut of {tokens} token(s) is longer than the {} the tail holds",
-                self.token_count
-            );
-        }
-        let mut left = tokens;
-        while left > 0 {
-            let Some(last) = self.chunks.last_mut() else {
-                candle::bail!("re-feed: the tail's chunks hold fewer tokens than it counts");
-            };
-            let held = last.token_count as usize;
-            if held > 0 && !last.is_native() {
-                candle::bail!(
-                    "re-feed: the cut reaches a quantized chunk — the gap must leave the tail's \
-                     last tokens native"
-                );
-            }
-            if held > left {
-                last.token_count -= left as u16;
-                left = 0;
-            } else {
-                left -= held;
-                self.chunks.pop();
-            }
-        }
-        self.token_count -= tokens;
-        Ok(())
-    }
 }

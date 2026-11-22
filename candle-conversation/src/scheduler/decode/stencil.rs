@@ -290,9 +290,6 @@ impl Scheduler {
             self.stencil_rows
                 .push(StencilRow::played(id, input, ends_turn));
         }
-        // A rebuilt turn's re-feed rides the same wave, ahead of any run played
-        // above (`refeed`).
-        self.play_refeeds();
     }
 
     /// Each listed sequence's sampling config for this token, with its stencil's

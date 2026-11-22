@@ -778,20 +778,6 @@ impl Scheduler {
                 .snapshot_sequence_tail(view_id.0, view_state.turn_start_parent_blocks)
                 .map_err(ConversationError::Model)?
         };
-        // **The re-feed** (`refeed`, `docs/reprojection_refeed.md`): the turn's
-        // last tokens are left out of the rebuild — trimmed off the captured
-        // K/V first, which touches nothing, then their index rows dropped — and
-        // forwarded again over the rebuilt slot once the turn is back on it.
-        let refeed_tokens = self.choose_refeed(view_id)?;
-        let mut tail_per_layer = tail_per_layer;
-        for layer in tail_per_layer.iter_mut() {
-            layer
-                .trim_tail(refeed_tokens)
-                .map_err(ConversationError::Model)?;
-        }
-        self.model
-            .rewind_positional_tail(view_id.0, refeed_tokens)
-            .map_err(ConversationError::Model)?;
         // Pull the turn and its sampling state off the old view id before
         // freeing the slot, then re-bind to the new view id after the
         // rebuild. Failing to find the turn is an internal invariant
@@ -1022,7 +1008,6 @@ impl Scheduler {
             parent_id,
             tail_per_layer,
             tail_index_page,
-            refeed_tokens,
             turn,
             sampling_state,
             sections_len: projected_sections.len(),

@@ -61,29 +61,6 @@ impl IndexCache {
             .map_or(pos, |p| p.base)
     }
 
-    /// The live tail's last tokens a re-feed may forward again
-    /// (`docs/reprojection_refeed.md` §2): [`refeed_cut`] over this cache's
-    /// completed blocks and open rows.
-    pub fn refeed_cut(&self, ratio: usize, max: usize) -> RefeedCut {
-        refeed_cut(self.n_blocks, self.n_open, ratio, max)
-    }
-
-    /// Drop the live tail back to its first `keep_blocks` completed blocks — the
-    /// rows a re-feed writes again ([`Self::refeed_cut`]). The keys above are
-    /// dead rows and the open block's are overwritten by the next append, so
-    /// nothing is erased. Never reaches a page: a page is closed and stays.
-    pub fn rewind_live(&mut self, keep_blocks: usize) -> Result<()> {
-        if keep_blocks > self.n_blocks {
-            candle::bail!(
-                "qsa index: a rewind to {keep_blocks} live block(s) of {} would grow the tail",
-                self.n_blocks
-            );
-        }
-        self.n_blocks = keep_blocks;
-        self.n_open = 0;
-        Ok(())
-    }
-
     /// Cut the cache back to position `pos`: keep the injected pages that end at
     /// or below it, drop the rest and the live tail, and resume the tail at
     /// `pos`. Returns the pages dropped.

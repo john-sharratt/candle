@@ -558,10 +558,9 @@ struct PendingShadow {
     rows: Arc<ShadowRows>,
     counters: u64,
     n_pieces: u32,
-    /// The rung covering the context's seats.
+    /// The sequence's rung, which its kept queries and its windows' keys
+    /// rotate on.
     tab: Tensor,
-    /// The rung the queries were kept on.
-    q_tab: Tensor,
 }
 
 /// What the scan needs of the engine at a sampled layer: the kernel's
@@ -652,15 +651,8 @@ pub fn count_hits(
             let mask = h.stride.kept[layer];
             if h.stride.due {
                 if let Some(rows) = h.counts.shadow.get(layer).filter(|_| mask != 0) {
-                    // The queries were kept on the sequence's rung; the
-                    // context seats the pool behind each one, so its keys
-                    // rotate on the rung covering the pool or the query's own
-                    // depth, whichever is further, and the query's block
-                    // (`docs/reprojection_refeed.md` §2.3).
-                    let reach = offsets[i] + span.len;
-                    let q_tab = scan.rope.table(scan.rope.rung_for(reach)?)?;
-                    let seats = reach.max(rows.n_rows() * scan.geom.ratio) + scan.geom.ratio;
-                    let tab = scan.rope.table(scan.rope.rung_for(seats)?)?;
+                    let rung = scan.rope.rung_for(offsets[i] + span.len)?;
+                    let tab = scan.rope.table(rung)?;
                     jobs.push(PendingShadow {
                         keep: h.stride.layer_ptr(layer)?,
                         mask,
@@ -668,7 +660,6 @@ pub fn count_hits(
                         counters: cnt_ptr,
                         n_pieces: h.counts.n_pieces as u32,
                         tab,
-                        q_tab,
                     });
                 }
                 h.stride.kept[layer] = 0;
@@ -715,7 +706,6 @@ pub fn count_hits(
                     counters: j.counters,
                     n_pieces: j.n_pieces,
                     tab: tensor_ptr(&j.tab)?,
-                    q_tab: tensor_ptr(&j.q_tab)?,
                 })
             })
             .collect::<Result<_>>()?;

@@ -1,8 +1,7 @@
-//! Tests re-feed cuts, snapshots and the prompt end across rewinds.
+//! Tests snapshots and the prompt end across rewinds.
 //!
-//! A re-feed rewinds to the newest block boundary within eight tokens, so only
-//! whole blocks and open rows are dropped. A snapshot restores the open rows it
-//! copied. A fork or a truncate carries the prompt end with the cache.
+//! A snapshot restores the open rows it copied. A fork or a truncate carries
+//! the prompt end with the cache.
 
 use super::*;
 
@@ -11,60 +10,6 @@ use super::*;
 #[allow(clippy::single_range_in_vec_init)]
 pub(super) mod tests {
     use super::*;
-
-    /// **A re-feed rewinds back to the newest block boundary within 8 tokens**:
-    /// 10 blocks and 2 open rows (42 tokens) keep 9 blocks and re-feed 6; 10
-    /// whole blocks keep 8 and re-feed 8; a tail of 5 tokens re-feeds all 5.
-    #[test]
-    fn a_refeed_rewinds_to_the_newest_block_boundary_within_its_reach() {
-        let cut = |blocks, open| refeed_cut(blocks, open, 4, 8);
-        assert_eq!(
-            cut(10, 2),
-            RefeedCut {
-                keep_blocks: 9,
-                tokens: 6
-            }
-        );
-        assert_eq!(
-            cut(10, 0),
-            RefeedCut {
-                keep_blocks: 8,
-                tokens: 8
-            }
-        );
-        assert_eq!(
-            cut(1, 1),
-            RefeedCut {
-                keep_blocks: 0,
-                tokens: 5
-            }
-        );
-        assert_eq!(
-            cut(0, 0),
-            RefeedCut {
-                keep_blocks: 0,
-                tokens: 0
-            }
-        );
-        // Every cut of a long tail re-feeds 5..=8 tokens: whole blocks only.
-        for open in 0..4 {
-            let c = cut(20, open);
-            assert!((5..=8).contains(&c.tokens), "{open} open: {c:?}");
-            assert_eq!(c.keep_blocks * 4 + c.tokens, 80 + open);
-        }
-    }
-
-    /// **A rewound tail keeps its first blocks and no open rows**, and refuses
-    /// to grow.
-    #[test]
-    fn a_rewound_tail_keeps_its_first_blocks() {
-        let mut c = IndexCache::new(8, &Device::Cpu).unwrap();
-        c.n_blocks = 5;
-        c.n_open = 3;
-        c.rewind_live(3).unwrap();
-        assert_eq!((c.n_blocks, c.n_open, c.len(4)), (3, 0, 12));
-        assert!(c.rewind_live(4).is_err());
-    }
 
     /// A snapshot keeps a COPY of the open rows: the wave after it writes the open
     /// block in place, and restoring — twice, as a partial accept can — puts back

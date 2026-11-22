@@ -95,10 +95,6 @@ pub(super) struct ReprojectInFlight {
     /// travel rather than being discarded, so this list and a stored one are the
     /// same shape.
     pub(super) tail_index_page: Vec<(usize, Vec<u8>)>,
-    /// The turn's last tokens left out of the rebuild — off `tail_per_layer`
-    /// and its index rows — which it forwards again once it is back on the
-    /// slot (`refeed`).
-    pub(super) refeed_tokens: usize,
     /// The turn being swapped: a decode, or an opening stopped at a boundary
     /// (`held_turn`).
     pub(super) turn: HeldTurn,
@@ -178,7 +174,6 @@ impl Scheduler {
             parent_id,
             tail_per_layer,
             tail_index_page,
-            refeed_tokens,
             mut turn,
             sampling_state,
             sections_len,
@@ -390,7 +385,6 @@ impl Scheduler {
             // also wiped above). Reconstruct from the turn's own record of
             // what it forwarded: the opening, then what it decoded.
             let (opening, decoded) = turn.slot_tokens();
-            let (opening, decoded) = without_last(opening, decoded, refeed_tokens);
             Self::record_slot_tokens(&mut self.slot_tokens, parent_id, opening);
             Self::record_slot_tokens(&mut self.slot_tokens, parent_id, decoded);
         }
@@ -463,7 +457,6 @@ impl Scheduler {
         // goes back to the loop; an opening to the prefill group, its next
         // stride against the rebuilt slot.
         self.rebind_turn(view_id, new_view_id, turn);
-        self.hold_refeed(new_view_id, refeed_tokens);
         if let Some(state) = sampling_state {
             self.sampling_states.insert(new_view_id, state);
         }

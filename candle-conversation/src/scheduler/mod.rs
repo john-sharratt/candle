@@ -136,7 +136,6 @@ pub(crate) mod projection_assembler;
 mod projection_identity;
 mod rates_store;
 mod recurrent_park;
-mod refeed;
 mod relief_pacing;
 pub mod relief_trace;
 mod remote_arena;
@@ -178,7 +177,6 @@ use frame::{framed_segments, frames};
 use graph_window::graph_window;
 use held_turn::HeldTurn;
 use phase_split::cobatched_step_shares;
-use refeed::without_last;
 use reproject_abandon::or_abandon;
 use section_pages::SectionPages;
 use section_timing::SectionTiming;
@@ -565,10 +563,6 @@ pub(crate) struct Scheduler {
     /// `view_id`s whose decoded count crossed an `every_n_tokens` boundary
     /// this batch.
     pending_reprojections: Vec<SequenceId>,
-
-    /// Each rebuilt decode's re-fed tokens, by its new view, until its next
-    /// wave carries them (`refeed`).
-    refeeds: HashMap<SequenceId, Vec<u32>>,
 
     /// A request's first-reading scores, by the parent slot its turn is
     /// submitted again on (`first_reading`): the second reading's opening

@@ -9,36 +9,32 @@
 // counters as a real hit.
 //
 // Each sequence keeps, per sampled layer, up to KEEP_SLOTS queries of its
-// stride — rotated at their own positions on the sequence's rung, with their
-// cut records (`../qsa_select.cuh`) — written by the hit count
-// (`qsa_hits.cu`). At the boundary each kept query `q` at position `p`, with
-// `C` candidate blocks, `tail` cells of its own block and cut `c`, is scored
-// against the sequence's `L` unloaded rows as ONE context
-// (`docs/reprojection_refeed.md` §2.3):
+// stride — rotated at their own positions, with their cut records
+// (`../qsa_select.cuh`) — written by the hit count (`qsa_hits.cu`). At the
+// boundary each kept query `q` at position `p`, with `C` candidate blocks and
+// cut `c`, is scored against the sequence's unloaded rows:
 //
-//   - The rows are seated directly behind the query, in pool order, over
-//     `S = max(C, L)` blocks: row `j` rotates at `(S − L + j) · ratio`, the
-//     query at `S · ratio + tail − 1`. The query is rotated back from `p` on
-//     the rung it was kept on (`q_tab`) and forward to its seat on the rung
-//     that covers the seat (`tab`) — the pool's rung, ×8 at 2M — so query and
-//     keys share one rotation. A pool that fits the query's own context seats
-//     the query where it is.
-//   - The context is ranked as the real selection ranks the slot: the query's
-//     budget, `(top_k + ratio − 1 − tail)` cells, buys `keep` blocks.
-//   - A row is one hit for its round when it is in the context's top `keep`
-//     AND scores above the cut — the second keeps a pool of nothing relevant
-//     from handing out a full budget of hits.
+//   - The rows are cut into windows of `C` rows in pool order. A window of `L`
+//     rows is seated directly behind the query: its row `j` rotates at
+//     `(C − L + j) · ratio`, so a full window sits at the positions the query's
+//     own context does, and the query is the one the real selection used.
+//   - Each window ranks its rows as the real selection ranks the slot: the
+//     query's budget, `(top_k + ratio − 1 − tail)` cells, buys `keep` blocks.
+//   - A row is one hit for its round when it is in its window's top `keep`
+//     AND scores above the cut — the first keeps it to what the indexer would
+//     choose from a context that size, the second keeps a window of nothing
+//     relevant from handing out a full budget of hits.
 //
-// So a query's hits are the top `min(keep, n_above)` of the rows scoring above
-// the cut, ranked `(score desc, row asc)`: the streaming survivors of
+// So a window's hits are the top `min(keep, n_above)` of the rows scoring
+// above the cut, ranked `(score desc, row asc)`: the streaming survivors of
 // `../qsa_survivors.cuh` over the keys of the rows above the cut. Each kept
 // query adds one to the counters' shadow-query word, the denominator an
 // unloaded round's hits are divided by (§6.4).
 //
 // One launch over the wave's due sequences: a SPAN table names each one's kept
 // queries, its unloaded rows (a page descriptor table read in place, hot-path
-// invariant 2b), their rows' counters and the two rungs. Nothing is attended
-// and nothing is read back.
+// invariant 2b), their rows' counters and the rung its keys rotate on.
+// Nothing is attended and nothing is read back.
 //
 // The page descriptors and their row prefixes travel in the same upload as the
 // spans, after them, and a span names its own by WORD OFFSETS from the table's
@@ -73,8 +69,7 @@ struct ShadowSpan {
     const uint32_t* keep;       // [KEEP_SLOTS, keep_words]: q as f32 bits, then the cut record
     const uint32_t* row_map;    // [n_rows] row → counter
     uint32_t* counters;         // [n_pieces + tail]: hits, queries, shadow queries, …
-    const float* tab;           // the factored RoPE table of the rung covering the seats
-    const float* q_tab;         // the factored RoPE table the queries were kept rotated on
+    const float* tab;           // the factored RoPE table of the sequence's rung
     uint32_t pages_off;         // words from the table's start to [n_pages * PAGE_WORDS] i64
     uint32_t first_off;         // words to [n_pages + 1] u32, the exclusive prefix over rows
     uint32_t n_rows;
@@ -99,8 +94,8 @@ __device__ __forceinline__ int page_of(const uint32_t* __restrict__ first, int P
     return lo;
 }
 
-// Grid: (KEEP_SLOTS, 1, spans). Block (x, 0, z) scores kept query `x` of span
-// `z` against every unloaded row of the span.
+// Grid: (KEEP_SLOTS, window groups, spans). Block (x, y, z) scores kept query
+// `x` of span `z` against windows `y, y + gridDim.y, …` of its unloaded rows.
 __global__ void __launch_bounds__(THREADS) qsa_shadow_kernel(
     const ShadowSpan* __restrict__ spans,
     int heads,
@@ -122,7 +117,6 @@ __global__ void __launch_bounds__(THREADS) qsa_shadow_kernel(
     const float cut = __uint_as_float(cut_rec[0]);
     // A dense row, or one that ranked nothing, keeps no query.
     if (isnan(cut)) return;
-    const int qpos = (int)cut_rec[1];
     const int cand = (int)cut_rec[2];
     const int tail = (int)cut_rec[3];
     if (cand <= 0) return;
@@ -131,7 +125,7 @@ __global__ void __launch_bounds__(THREADS) qsa_shadow_kernel(
     if (keep > MAX_KEEP) keep = MAX_KEEP;
     if (keep <= 0) return;
     const int tid = (int)threadIdx.x;
-    if (tid == 0) atomicAdd(&s.counters[s.n_pieces + 1], 1u);
+    if (blockIdx.y == 0 && tid == 0) atomicAdd(&s.counters[s.n_pieces + 1], 1u);
 
     __shared__ float sq[QSA_SHADOW_MAX_HEADS * 256];
     __shared__ unsigned long long buf[CAP];
@@ -144,30 +138,12 @@ __global__ void __launch_bounds__(THREADS) qsa_shadow_kernel(
     __syncthreads();
 
     const float2* tab = reinterpret_cast<const float2*>(s.tab);
-    const float2* q_tab = reinterpret_cast<const float2*>(s.q_tab);
     const int n_rows = (int)s.n_rows;
-    // The context: every row, seated behind the query over `span` blocks.
-    const int span = cand > n_rows ? cand : n_rows;
-    const int qseat = span * ratio + tail - 1;
-    // The query to its seat: back from `qpos` on the rung it was kept on, then
-    // forward to `qseat` on the rung the keys rotate on.
-    for (int i = tid; i < heads * pairs; i += THREADS) {
-        const int h = i / pairs;
-        const int c = i - h * pairs;
-        float* qh = sq + h * head_dim;
-        float lo = qh[c], hi = qh[c + pairs];
-        const float2 back = rope_f_lookup(q_tab, pairs, qpos, c);
-        rope_f_rotate(lo, hi, make_float2(-back.x, back.y));
-        rope_f_rotate(lo, hi, rope_f_lookup(tab, pairs, qseat, c));
-        qh[c] = lo;
-        qh[c + pairs] = hi;
-    }
-    __syncthreads();
-
-    {
-        const int lo = 0;
-        const int hi = n_rows;
-        const int seat = span - n_rows;
+    const int n_win = (n_rows + cand - 1) / cand;
+    for (int w = (int)blockIdx.y; w < n_win; w += (int)gridDim.y) {
+        const int lo = w * cand;
+        const int hi = lo + cand < n_rows ? lo + cand : n_rows;
+        const int seat = cand - (hi - lo);
         survivors_reset(sv, tid);
         int n = 0;
         for (int base = lo; base < hi; base += THREADS) {
@@ -214,7 +190,7 @@ __global__ void __launch_bounds__(THREADS) qsa_shadow_kernel(
             }
             survivors_offer(sv, key, keep, n, tid);
         }
-        if (n == 0) return;
+        if (n == 0) continue;
         survivors_finish(sv, keep, n, tid);
         const int kept = *sv.count;
         for (int r = tid; r < kept; r += THREADS) {
@@ -222,16 +198,19 @@ __global__ void __launch_bounds__(THREADS) qsa_shadow_kernel(
             const uint32_t piece = __ldg(s.row_map + g);
             if (piece < s.n_pieces) atomicAdd(&s.counters[piece], 1u);
         }
+        __syncthreads();
     }
 }
 
 } // namespace qsa_shadow
 
 // `spans` is device memory holding `n_spans` ShadowSpan followed by the page
-// descriptors and row prefixes they name.
+// descriptors and row prefixes they name; `max_windows` the most windows any
+// kept query cuts its span's rows into, which sizes the grid.
 extern "C" void run_qsa_shadow(
     const void* spans,
     int32_t n_spans,
+    int32_t max_windows,
     int32_t heads,
     int32_t head_dim,
     int32_t pairs,
@@ -239,9 +218,10 @@ extern "C" void run_qsa_shadow(
     int32_t top_k,
     void* stream
 ) {
-    if (n_spans <= 0) return;
+    if (n_spans <= 0 || max_windows <= 0) return;
     if (heads > QSA_SHADOW_MAX_HEADS || heads * head_dim > QSA_SHADOW_MAX_HEADS * 256) return;
-    dim3 grid(QSA_KEEP_SLOTS, 1, (unsigned)n_spans);
+    const unsigned groups = (unsigned)(max_windows < 16 ? max_windows : 16);
+    dim3 grid(QSA_KEEP_SLOTS, groups, (unsigned)n_spans);
     qsa_shadow::qsa_shadow_kernel<<<grid, qsa_shadow::THREADS, 0, (cudaStream_t)stream>>>(
         (const ShadowSpan*)spans, heads, head_dim, pairs, ratio, top_k);
 }

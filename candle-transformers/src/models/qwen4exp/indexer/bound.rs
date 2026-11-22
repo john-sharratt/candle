@@ -5,8 +5,7 @@
 //! crossover is scored by one GEMM rather than by the paged scorer, and the
 //! crossover is counted in cells because the paged route's time follows cells.
 //! The bounds mirror the two routes exactly, so a price is never short of what
-//! a layer carves. A re-feed's cut uses the same arithmetic whether or not the
-//! cache it describes exists yet.
+//! a layer carves, whether or not the cache it describes exists yet.
 
 use super::*;
 
@@ -79,31 +78,6 @@ pub struct ScoreRows {
 /// the live tail goes to cuBLAS — the rotated tail, its page table and the one
 /// tile's scoring product every tile is written into. `page_chunks` is asked only
 /// when the paged scorer runs.
-/// What a re-feed rewinds of a live index tail: the completed blocks it keeps
-/// and the tokens after them it forwards again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RefeedCut {
-    pub keep_blocks: usize,
-    pub tokens: usize,
-}
-
-/// The re-feed of a live tail of `blocks` completed `ratio`-token blocks and
-/// `open` carried rows: back to the newest block boundary at or after `max`
-/// tokens from its end, so only whole blocks and the open rows are dropped and
-/// the forward pools them again — at most `max` tokens, and the whole tail
-/// when it holds fewer. A tail never reaches back past its own start, which is
-/// the newest closed page.
-pub fn refeed_cut(blocks: usize, open: usize, ratio: usize, max: usize) -> RefeedCut {
-    let ratio = ratio.max(1);
-    let held = blocks * ratio + open;
-    let keep_tokens = held.saturating_sub(max).div_ceil(ratio) * ratio;
-    let keep_blocks = (keep_tokens / ratio).min(blocks);
-    RefeedCut {
-        keep_blocks,
-        tokens: held - keep_blocks * ratio,
-    }
-}
-
 pub fn score_bound_for(
     page_cols: usize,
     page_chunks: impl FnOnce() -> Result<usize>,

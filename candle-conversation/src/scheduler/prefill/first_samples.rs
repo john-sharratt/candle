@@ -773,8 +773,7 @@ impl Scheduler {
         // its question was prefilled against, so the recurrent state and the
         // attended K/V agree. The question's hits are counted; the first
         // boundary to apply them is the rule's first in the reply
-        // (`provenance::boundaries`), which re-feeds the reply's last tokens
-        // over the slot it chooses.
+        // (`provenance::boundaries`).
         self.active_decodes.insert(work.sequence_id, state);
     }
 }

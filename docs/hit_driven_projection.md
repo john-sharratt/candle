@@ -80,7 +80,7 @@ The findings this answers are in
 - **Boundary**: a point where the projection runs. A reply reaches one at a
   line feed past the content gate and once `reproject_every_n_tokens` (64)
   tokens have passed since the last boundary, and never inside a tool call
-  (`provenance::boundaries`, `scheduler/decode.rs`); each chunk of a long
+  (`provenance::boundaries`, `scheduler/decode/mod.rs`); each chunk of a long
   opening ends at one, the opening's last does not (§7.4).
 - **Stride**: the queries between two boundaries.
 
@@ -98,7 +98,7 @@ with.
   (`candle-conversation/src/models/identity/rope_key.rs`) go with it. No
   deployment sets a floor.
 - **The substrate starts empty.** The minimum factor is part of the model's
-  identity key (`models/builder.rs`), so removing it makes every sealed block
+  identity key (`models/builder/mod.rs`), so removing it makes every sealed block
   another model's, and the model binding refuses the old substrate
   (`persistence/model_binding.rs`). That is what it is: past the first
   attention layer, every block's K and V were computed by layers that attended
@@ -151,7 +151,7 @@ at every selecting layer, whatever its score.
   window), the index cache holds up to four `[start, end)` position ranges
   (`IndexCache::set_pins`, `qsa_select::MAX_PINS`), declared after each
   projection walk from the pinned sections' places (`pin_ranges_of` in
-  `candle-conversation/src/scheduler/projection_assembler.rs`) through
+  `candle-conversation/src/scheduler/projection_assembler/mod.rs`) through
   `ManagedBatchedModel::set_selection_pins`. They move with every splice and
   cut, as the prompt span does, and reach the selection kernel as each row's
   block ranges (`PinRow`).
@@ -240,23 +240,28 @@ way back but its base score.
 At each sampled layer, the stride's queries are scored against the unloaded
 rounds' index rows.
 
-- **One context seated behind the query.** The unloaded rows, in pool order,
-  are one context directly behind the query (`docs/reprojection_refeed.md`
-  §2.3): over `S = max(C, L)` blocks for a query of `C` candidate blocks and
-  `L` unloaded rows, row `j` rotates at `(S − L + j) · ratio` and the query,
-  rotated back from where it was kept, at `S · ratio + tail − 1`. The keys and
-  the query rotate on the rung that covers the seats — ×8 for a 2M pool, ×4
-  for 1M, ×2 for 512K — so the indexer ranks the whole pool at once, on the
-  YaRN rung the schedule gives a context that long.
-- **The context holds unloaded rows only.** The slot's prompt and pinned
-  ranges are already attended and are not repeated. Every unloaded row is
-  scored once per query, and the context's top-k is linear in its length.
-- **A hit is a block that would have been read.** The context ranks its blocks
-  as the real selection ranks the slot's: the checkpoint's budget, `keep`
-  blocks. An unloaded block is one hit for its round when it is in that
-  selection **and** scores above the query's cut. The first condition keeps it
-  to what the indexer would choose from the pool; the second keeps a pool of
-  nothing relevant from handing out a full budget of hits.
+- **In windows ending at the query.** The unloaded rows are cut into windows
+  in pool order, each as long as the query's own context — its `C` candidate
+  blocks (`qsa_shadow.cu`). Each window is seated directly behind the query:
+  a window of `L` rows rotates its row `j` at `(C − L + j) · ratio`, on the
+  sequence's own rung, so the query is the one the real selection used,
+  rotated where it already is. The indexer ranks a context of the length the
+  slot gives it, never longer than it was trained on, and its scores are on
+  the scale of the real cut.
+- **Windows hold unloaded rows only.** The slot's prompt and pinned ranges are
+  already attended and are not repeated in any window. The work is bounded by
+  the pool, not by the window count: every unloaded row is scored once per
+  query whatever `C` is, and a window's top-k is linear in its length, so a
+  small `C` early in a dialogue makes many short windows for the same total.
+  A window no longer than the budget keeps every block, and the cut alone
+  decides its hits.
+- **A hit is a block that would have been read.** Each window ranks its blocks
+  as the real selection ranks the slot's: the checkpoint's budget, one
+  window. An unloaded block is one hit for its round when it is in its
+  window's selection **and** scores above the query's cut. The first condition
+  keeps it to what the indexer would choose from a context that size; the
+  second keeps a window of nothing relevant from handing out a full budget of
+  hits.
 - **Weighed as real hits.** A shadow hit counts into the same counter, at the
   same weight, as a hit on a loaded round. Above the cut it would have
   displaced a block the selection did read, so it is evidence of the same
@@ -523,7 +528,7 @@ slot may be renumbered under a reply in progress, as reprojection does today,
 and the reply's own tokens move with it.
 
 A piece chosen at a boundary is loaded through the deferred placement the
-scheduler already runs (`scheduler/decode.rs`, the deferred glue fire): its
+scheduler already runs (`scheduler/decode/decode_step.rs`, the deferred glue fire): its
 K/V comes up from the warm or cold tier while the sequence's next wave is
 built, and the sequence decodes against the slot once the placement lands. A
 piece leaving the slot is released at the same placement.
@@ -537,9 +542,8 @@ for the shadow scan, exactly as decoded queries are. **No boundary fires at its
 end**: the reply decodes on the slot the question was prefilled against, so
 the recurrent layers' state and the attended K/V were computed together. The
 first boundary after it is the rule's first in the reply — a line feed past
-the content gate, or the cadence 64 tokens in — which re-feeds the reply's
-last tokens over the slot it chooses (`docs/reprojection_refeed.md`). A
-boundary fired at the opening's end
+the content gate, or the cadence 64 tokens in. A boundary fired at the
+opening's end
 re-chose the slot with nothing forwarded over it but the token or two after
 `<think>`, and was never measured; on 2026-11-20 (c), with the request read
 once, the direct questions' declines named the journals and guides that slot
@@ -578,12 +582,13 @@ the scan — lets it go on against the slot it has. A staged or captured
 calibration prefill is not cut: its projection points and recurrent arms are
 its own.
 
-**Every projection that changes the slot ends with a re-feed**
-(`docs/reprojection_refeed.md`): the turn's last tokens since its newest index
-page cut, at most 8, are forwarded again over the rebuilt slot, their K/V and
-index rows overwritten and the recurrent state folded on top, so what the
-projection placed reaches the recurrent layers through a prefill before the
-next token is sampled.
+**A projection forwards nothing again.** A rebuilt slot carries the turn's
+tail whole, and the turn samples on from its pending token. What the
+projection placed reaches the recurrent layers through the tokens forwarded
+after it. The re-feed — the turn's last 8 tokens forwarded again over every
+rebuilt slot, the recurrent state folded on top — was built and withdrawn
+(`docs/reprojection_refeed.md`): it wrote each boundary's last tokens into
+the recurrent state twice, and the reasoning it ran under looped.
 
 **A request is read twice; every other opening once.** The question a new
 user message opens is first prefilled, on the conversation's own slot, against
@@ -776,21 +781,21 @@ had said it is read back as something it said
 
 | Piece | File |
 |---|---|
-| `rope: min_yarn_factor` removed with its schema field, error and identity argument; the substrate moved aside under the new key, its kept objects exported and imported | `zend/src/prompts/projection.yaml`, `candle-conversation/src/projection/{schema,error,builder}.rs`, `candle-conversation/src/models/{builder.rs,identity/rope_key.rs}` |
-| `hits:` block; `pin: true` on system-prompt items and `pin_tokens`; `reserve_tokens`; `lineage_base` on the conversation rule; each kind's share of the room as the fill's caps; `slot_tokens` and `lock_tokens` removed, the slot read from the engine's `L0` | `zend/src/prompts/projection.yaml`, `candle-conversation/src/projection/{yaml,schema}.rs` |
-| Pinned ranges in place of the prompt span; forced in every row; one window over the slot | `candle-transformers/src/models/qwen4exp/{indexer,qsa_select,wave}.rs`, `candle-kernels/src/simple/qsa_topk.cu` |
+| `rope: min_yarn_factor` removed with its schema field, error and identity argument; the substrate moved aside under the new key, its kept objects exported and imported | `zend/src/prompts/projection.yaml`, `candle-conversation/src/projection/{schema/mod,error,builder/mod}.rs`, `candle-conversation/src/models/{builder/mod.rs,identity/rope_key.rs}` |
+| `hits:` block; `pin: true` on system-prompt items and `pin_tokens`; `reserve_tokens`; `lineage_base` on the conversation rule; each kind's share of the room as the fill's caps; `slot_tokens` and `lock_tokens` removed, the slot read from the engine's `L0` | `zend/src/prompts/projection.yaml`, `candle-conversation/src/projection/{yaml/mod,schema/mod}.rs` |
+| Pinned ranges in place of the prompt span; forced in every row; one window over the slot | `candle-transformers/src/models/qwen4exp/{indexer/mod,qsa_select,wave/mod}.rs`, `candle-kernels/src/simple/qsa_topk.cu` |
 | Sampled layers from percentiles | `candle-transformers/src/models/selection_strata.rs` beside `StrataTokens` |
-| Index rows resident without K/V; the stride's kept queries and cuts; the shadow scan and its windows | `candle-transformers/src/models/qwen4exp/{resident_page,indexer,hits,shadow}.rs`, `candle-kernels/src/simple/{qsa_topk,qsa_hits,qsa_shadow}.cu` |
-| The block-to-piece table, per-piece counters and the mapped summary | `candle-transformers/src/models/{hit_layers.rs,qwen4exp/hits.rs,qwen4exp/hit_summary.rs}`, read in `candle-conversation/src/scheduler/{projection_assembler,hit_density}.rs` |
-| Openings chunked at `reserve_tokens` with a boundary between chunks | `candle-conversation/src/scheduler/{prefill,decode,held_turn,reproject_abandon}.rs` |
-| Text export and import of every kept custom object and the blobs it names | `zend/src/api/kept_objects.rs` and `npcd/src/api.rs`, over `candle-conversation/src/persistence/kept_objects/` |
-| Scores, the pool, the slot, floors, the lineage, exchanges and tool rounds as units | `candle-conversation/src/projection/{fill,dialogue_fill,rounds,project}.rs`, `candle-conversation/src/scheduler/projection_assembler.rs` |
-| `ManagedBatchedModel` hooks for pinned ranges, hit rounds and summaries, and the trained window (no-ops for a model that does not select) | `candle-transformers/src/models/batched_inference.rs` |
+| Index rows resident without K/V; the stride's kept queries and cuts; the shadow scan and its windows | `candle-transformers/src/models/qwen4exp/{resident_page,indexer/mod,hits,shadow}.rs`, `candle-kernels/src/simple/{qsa_topk,qsa_hits,qsa_shadow}.cu` |
+| The block-to-piece table, per-piece counters and the mapped summary | `candle-transformers/src/models/{hit_layers.rs,qwen4exp/hits.rs,qwen4exp/hit_summary.rs}`, read in `candle-conversation/src/scheduler/{projection_assembler/mod,hit_density}.rs` |
+| Openings chunked at `reserve_tokens` with a boundary between chunks | `candle-conversation/src/scheduler/{prefill/mod,decode/mod,held_turn,reproject_abandon}.rs` |
+| Text export and import of every kept custom object and the blobs it names | `zend/src/api/kept_objects.rs` and `npcd/src/api/npc_routes.rs`, over `candle-conversation/src/persistence/kept_objects/` |
+| Scores, the pool, the slot, floors, the lineage, exchanges and tool rounds as units | `candle-conversation/src/projection/{fill,dialogue_fill,rounds,project/mod}.rs`, `candle-conversation/src/scheduler/projection_assembler/mod.rs` |
+| `ManagedBatchedModel` hooks for pinned ranges, hit rounds and summaries, and the trained window (no-ops for a model that does not select) | `candle-transformers/src/models/batched_inference/mod.rs` |
 | The pool as the candidate set: per-card size and minimum count per kind, type shares, unthrottled admission, insertion order, index pages only | `candle-conversation/src/scheduler/{pool,pool_refresh,pooled_rounds}.rs`, `candle-conversation/src/working_set/` |
-| Rounds carved by the grammar; slot order pins, floors, score; the third-per-boundary entry allowance | `candle-conversation/src/projection/{rounds,fill,dialogue_fill}.rs`, `candle-conversation/src/scheduler/projection_assembler.rs` |
-| Every turn placed whole, with all its index pages | `candle-conversation/src/projection/rounds.rs`, `candle-conversation/src/scheduler/projection_assembler.rs` |
+| Rounds carved by the grammar; slot order pins, floors, score; the third-per-boundary entry allowance | `candle-conversation/src/projection/{rounds,fill,dialogue_fill}.rs`, `candle-conversation/src/scheduler/projection_assembler/mod.rs` |
+| Every turn placed whole, with all its index pages | `candle-conversation/src/projection/rounds.rs`, `candle-conversation/src/scheduler/projection_assembler/mod.rs` |
 | One `file_read` per reply in code-reading ingest, the round limit the file's page count | `zend/src/code_read/mod.rs` |
-| Shared sampled-layer index pages per card | `candle-transformers/src/models/qwen4exp/{resident_page,wave}.rs`, the span's region pool |
+| Shared sampled-layer index pages per card | `candle-transformers/src/models/qwen4exp/{resident_page,wave/mod}.rs`, the span's region pool |
 
 ## 10. Cost
 
@@ -1141,7 +1146,7 @@ done before step 3.
    written between the start and the import (a sign-in, a thread) and is
    reported for a decision.
 8. **Ingest.** The priming chain is built at boot, before a member reports
-   `ready` (`zend/src/session.rs`, `prime`), so it is already primed when
+   `ready` (`zend/src/session/ingesting.rs`, `prime`), so it is already primed when
    step 7 runs and writes nothing the export holds. The code readings come
    back as they are asked for, after the import.
 9. **Check.** On each card, a dialogue places its pins, carves a reading by

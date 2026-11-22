@@ -60,7 +60,7 @@ pub use demand::GapKind;
 pub use launch::gap_jobs_within;
 #[cfg(feature = "cuda")]
 pub use lease_alloc::LeaseRefusal;
+pub use table::gap_take;
 pub(crate) use table::{
     cursor_after_front_eviction, cursor_after_splice, cursor_after_truncate, LayerShape,
 };
-pub use table::{gap_take, HELD_TAIL_TOKENS};

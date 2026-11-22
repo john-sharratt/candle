@@ -3,11 +3,10 @@
 //! The real selection ranks only the slot. At each boundary the shadow scan
 //! asks, of every pooled round that is not loaded, what the indexer would have
 //! selected had it been there: the stride's kept queries — written beside the
-//! hit count, [`super::hits`] — are scored against the unloaded rows as one
-//! context seated behind each query, at the rung covering the context, and a
-//! row in the context's top `keep` and above the query's cut is one hit for its
-//! round, in the same counters (`qsa_shadow.cu`, `docs/reprojection_refeed.md`
-//! §2.3).
+//! hit count, [`super::hits`] — are scored against the unloaded rows in
+//! windows seated behind each query, and a row in its window's top `keep` and
+//! above the query's cut is one hit for its round, in the same counters
+//! (`qsa_shadow.cu`).
 //!
 //! A declaration names the unloaded rows once ([`ShadowRows`]): each pooled
 //! round's resident page at the layer and the rows of it the round holds, and
@@ -73,12 +72,8 @@ pub struct ShadowJob<'a> {
     /// Device address of the sequence's counters.
     pub counters: u64,
     pub n_pieces: u32,
-    /// Device address of the RoPE table of the rung covering the context's
-    /// seats.
+    /// Device address of the RoPE table of the sequence's rung.
     pub tab: u64,
-    /// Device address of the RoPE table the kept queries were rotated on: the
-    /// sequence's rung.
-    pub q_tab: u64,
 }
 
 impl ShadowRows {
@@ -188,7 +183,6 @@ pub fn launch(jobs: &[ShadowJob<'_>], geom: &ShadowGeometry, device: &Device) ->
             row_map: u32_ptr(&job.rows.row_map)? as *const u32,
             counters: job.counters as *mut u32,
             tab: job.tab as *const f32,
-            q_tab: job.q_tab as *const f32,
             pages_off: pages_at as u32,
             first_off: first_at as u32,
             n_rows: job.rows.n_rows as u32,
@@ -208,6 +202,7 @@ pub fn launch(jobs: &[ShadowJob<'_>], geom: &ShadowGeometry, device: &Device) ->
         firsts.extend_from_slice(first);
     }
     words.extend_from_slice(&firsts);
+    let max_rows = jobs.iter().map(|j| j.rows.n_rows).max().unwrap_or(0);
     let stream = cuda.cuda_stream();
     cuda.with_staged_upload(&words, |table| {
         candle::set_kernel_breadcrumb("run_qsa_shadow", file!(), line!());
@@ -220,6 +215,7 @@ pub fn launch(jobs: &[ShadowJob<'_>], geom: &ShadowGeometry, device: &Device) ->
             run_qsa_shadow(
                 table as *const c_void,
                 jobs.len() as i32,
+                max_rows as i32,
                 geom.heads as i32,
                 geom.head_dim as i32,
                 geom.pairs as i32,
@@ -233,50 +229,33 @@ pub fn launch(jobs: &[ShadowJob<'_>], geom: &ShadowGeometry, device: &Device) ->
 }
 
 /// The shadow scan's definition on the host, for one kept query: `q` its
-/// query (`heads × head_dim`) rotated at `qpos`, `cut`, `cand` and `tail` its
-/// cut record, `rows` the unloaded rows' un-rotated keys in pool order and
-/// `counter` each row's counter; `q_cos_sin(pos, pair)` the rotation the query
-/// was kept on and `cos_sin(pos, pair)` the rotation of the context's seats.
+/// rotated query (`heads × head_dim`), `cut`, `cand` and `tail` its cut
+/// record, `rows` the unloaded rows' un-rotated keys in pool order and
+/// `counter` each row's counter; `cos_sin(pos, pair)` the rung's rotation.
 /// Adds the query's hits to `counters`.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn reference(
     q: &[f32],
-    qpos: usize,
     cut: f32,
     cand: usize,
     tail: usize,
     rows: &[Vec<f32>],
     counter: &[u32],
     geom: &ShadowGeometry,
-    q_cos_sin: impl Fn(usize, usize) -> (f32, f32),
     cos_sin: impl Fn(usize, usize) -> (f32, f32),
     counters: &mut [u32],
 ) {
     let (h, d, pairs, ratio) = (geom.heads, geom.head_dim, geom.pairs, geom.ratio);
     let budget = geom.top_k + ratio - 1 - tail;
     let keep = budget.div_ceil(ratio);
-    let n = rows.len();
-    let span = cand.max(n);
-    let qseat = span * ratio + tail - 1;
-    // The query to its seat, in the kernel's f32 order: back from `qpos`, then
-    // forward to `qseat`.
-    let mut q = q.to_vec();
-    for hh in 0..h {
-        for c in 0..pairs {
-            let (lo, hi) = (hh * d + c, hh * d + c + pairs);
-            let (bc, bs) = q_cos_sin(qpos, c);
-            let (a, b) = (q[lo] * bc + q[hi] * bs, q[hi] * bc - q[lo] * bs);
-            let (fc, fs) = cos_sin(qseat, c);
-            q[lo] = a * fc - b * fs;
-            q[hi] = b * fc + a * fs;
-        }
-    }
-    let seat = span - n;
-    {
+    for lo in (0..rows.len()).step_by(cand) {
+        let hi = (lo + cand).min(rows.len());
+        let seat = cand - (hi - lo);
         let mut above: Vec<(f64, usize)> = Vec::new();
-        for (g, k) in rows.iter().enumerate() {
-            let pos = (seat + g) * ratio;
+        for (j, k) in rows[lo..hi].iter().enumerate() {
+            let g = lo + j;
+            let pos = (seat + j) * ratio;
             let mut rot = k.clone();
             for c in 0..pairs {
                 let (co, si) = cos_sin(pos, c);
@@ -326,12 +305,11 @@ mod tests {
 
     /// **The shadow scan counts what its definition counts, byte for byte**:
     /// three pooled rounds over two pages — one round's rows starting partway
-    /// into a page — scored as one context by kept queries of differing depth
-    /// and position, each re-rotated from where it was kept to its seat behind
-    /// the rows, one deeper than the pool so the rows sit back from it; budgets
-    /// small enough that the rows above the cut outnumber the keep; a dense
-    /// slot and an unkept slot that count nothing; the counters' shadow-query
-    /// word one per kept query.
+    /// into a page — scored by four kept queries of differing depth, so the
+    /// rows cut into windows of differing length with a short last window
+    /// seated behind the query; budgets small enough that a window's rows above
+    /// the cut outnumber its keep; a dense slot and an unkept slot that count
+    /// nothing; the counters' shadow-query word one per kept query.
     #[test]
     fn the_shadow_scan_counts_what_its_definition_counts() -> Result<()> {
         let _gpu = gpu_serial();
@@ -392,7 +370,7 @@ mod tests {
             (3, 0.4, 10, 3),
             (9, f32::NAN, 10, 1),
             (12, 0.1, 7, 2),
-            (40, 0.9, 60, 1),
+            (40, 0.9, 13, 1),
             (63, 0.2, 7, 4),
         ];
         let queries: Vec<Vec<f32>> = (0..kept.len())
@@ -426,7 +404,6 @@ mod tests {
             counters: u32_ptr(&counters)?,
             n_pieces: n_pieces as u32,
             tab: super::super::indexer::tensor_ptr(&tab)?,
-            q_tab: super::super::indexer::tensor_ptr(&tab)?,
         };
         launch(&[job], &geom, &device)?;
         device.synchronize()?;
@@ -440,14 +417,12 @@ mod tests {
             shadow_queries += 1;
             reference(
                 &queries[i],
-                slot + 64 * 9,
                 cut,
                 cand,
                 tail,
                 &host_rows,
                 &counter,
                 &geom,
-                |pos, k| rope.rungs().cos_sin(0, pos, k),
                 |pos, k| rope.rungs().cos_sin(0, pos, k),
                 &mut want,
             );

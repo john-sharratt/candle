@@ -503,14 +503,6 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         Qwen4ExpBatched::close_positional_page(self, seq)
     }
 
-    fn refeed_span(&self, seq: usize, max: usize) -> Result<usize> {
-        Qwen4ExpBatched::refeed_span(self, seq, max)
-    }
-
-    fn rewind_positional_tail(&self, seq: usize, tokens: usize) -> Result<()> {
-        Qwen4ExpBatched::rewind_positional_tail(self, seq, tokens)
-    }
-
     fn positional_coverage(&self, seq: usize) -> Option<usize> {
         let map = self.index.read().ok()?;
         // **A sequence with no entry covers nothing, and says so.** Returning

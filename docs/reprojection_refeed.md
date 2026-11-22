@@ -1,10 +1,25 @@
 # The re-feed — every projection ends by reading its own last tokens again
 
-**Status:** built (2026-11-20). Runs beside the request's two readings
-(`scheduler/first_reading.rs`, `docs/hit_driven_projection.md` §7.4), which it
-replaced for runs (c)–(g) and which came back once the fill kept what
-provenance found (§3). Builds on the slot, the pool, the fill and the hit
-counters of `docs/hit_driven_projection.md`, which stay.
+**Status:** withdrawn (2026-11-22). Built 2026-11-20 (`af4135616`) and removed
+whole by a later change, with the two pieces that commit carried alongside it:
+the shadow scan's one context at the rung covering the pool (§2.3), and
+Flash-Next's ×8 rung to 2,097,152. The shadow scan is back to windows seated
+behind the query on the sequence's own rung (`docs/hit_driven_projection.md`
+§6.3), and the schedule ends at ×4 to 1,000,000 (`qwen4exp/rope.rs`). The
+request's two readings (`scheduler/first_reading.rs`,
+`docs/hit_driven_projection.md` §7.4) and the boundary rule of §2.4 stay.
+
+**Why it went.** The recurrent state is not rewound before a re-feed (§2 item
+3), so every rebuild wrote the turn's last tokens into 36 of Flash-Next's 48
+layers a second time: from the recurrent layers' side, each boundary repeated
+the last 8 tokens of the reasoning. At the cadence's 64 tokens that is a
+repeated span in every thinking block, and on 2026-11-22 the reasoning looped.
+In battery (i), d1 wrote `lines=1-44` for about 3,000 of its 3,770 tokens,
+across some 45 boundaries, and escaped only when it closed `</think>`. t1
+looped on its name list in (g) and (h). Before the re-feed landed, loops of
+that kind were rare. It also cost every rebuild a wave row, a tail trim
+and an index rewind, and it kept the writer's last 8 tokens unquantized. The
+rest of this document is the design as it was built, kept as the record.
 
 ## 1. Why
 
@@ -54,7 +69,7 @@ row.
    than storing it twice. The cost: the state ages by the re-fed tokens once
    more (the gate applies per token), and the short convolution's first rows
    read the original last tokens as their predecessors. Nothing in the engine
-   rolls a committed recurrent token back (`state_store.rs`: the timeline is
+   rolls a committed recurrent token back (`candle-transformers/src/models/delta_net/state_store/mod.rs`: the timeline is
    the undo, within one step), and the re-feed needs none.
 4. **No re-feed when nothing changed.** A reprojection that keeps the selection
    the slot already holds (`ReprojectOutcome::Kept`) does not rebuild, and the
@@ -84,7 +99,7 @@ finalize (`carve_view`, `ViewState`). A reprojection captures the turn's tail
 (`snapshot_sequence_tail`), rebuilds the parent, injects the captured tail onto
 it (`inject_sealed_at_tail`) and carves a view borrowing all of it. After a
 reprojection the turn's earlier tokens sit below the new view's `writer_start`,
-and `truncate_sequence_to_tokens` refuses to cut there (`sequence_ops.rs`) — so
+and `truncate_sequence_to_tokens` refuses to cut there (`candle-nn/src/kv_cache/chunked/sequence_ops/tail.rs`) — so
 the re-feed does not cut the rebuilt slot. It cuts what is about to go into it:
 
 - **The captured K/V tail is trimmed** before it is injected
@@ -104,7 +119,7 @@ state moves onto the view as before (`move_recurrent`).
 ### 2.2 The tail stays native where a re-feed can reach
 
 Completed chunks of a live turn are quantized in the gap between forwards
-(`run.rs`, `gap/table.rs`). The gap takes no chunk holding one of the writer's
+(`gap/cycle.rs`, `gap/table.rs`). The gap takes no chunk holding one of the writer's
 last `HELD_TAIL_TOKENS` = 8 tokens (`LayerShape::held_from`): a re-feed reaches
 at most 8 tokens back, crossing at most one 32-token chunk boundary, so the
 current chunk and, when the last 8 tokens straddle a boundary, the previous one
@@ -128,7 +143,7 @@ covering the seats (`ShadowJob::tab`, `max(reach, L · ratio) + ratio`,
 `hits.rs`). For a pool of 2M tokens that is ×8, for 1M ×4, for 512K ×2
 (`scheduler::pool::pool_tokens_for`). The attention stays at the sequence's own
 rung — rung 0, ×1, inside the slot. Index keys are stored un-rotated and
-rotated at read (`indexer.rs`), so the scoring rung is a rotation table the job
+rotated at read (`qwen4exp/indexer/mod.rs`), so the scoring rung is a rotation table the job
 carries, not different stored keys. The schedule has a ×8 rung reaching
 2,097,152 positions, the factored table's reach (`qwen4exp/rope.rs`: ×1 to
 262,144, ×2 to 524,288, ×4 to 1,000,000, ×8 to 2,097,152).
@@ -140,7 +155,7 @@ closes a page at `<think>` and at the prefill→decode boundary, so a boundary a
 the opening's end could re-feed a token or two and never the question: on
 2026-11-20 (c) the reply then reasoned over a slot nothing had been forwarded
 over, and the direct questions fell from 47.9% to 27.1%. No boundary fires
-there (`scheduler/prefill.rs`, the promotion to decode). The reply decodes on
+there (`scheduler/prefill/first_samples.rs`, the promotion to decode). The reply decodes on
 the slot its question was prefilled against, and the first boundary is the
 rule's first in the reply — a line feed past the content gate, or the cadence
 64 tokens in, counted from the reply's start and restarted at every boundary
@@ -198,9 +213,9 @@ opening, the seeds, and the fill report in every projection record.
 |---|---|---|
 | The gap holds the last 8 tokens' chunks native (§2.2) | `gap/table.rs` | `the_chunks_holding_the_last_eight_tokens_stay_native` |
 | The captured tail trimmed (§2.1) | `SealedSequence::trim_tail` | `a_trim_cuts_the_last_tokens_across_a_chunk_boundary`, `a_trim_refuses_a_quantized_chunk_and_an_overlong_cut` |
-| The index rewound to a block boundary (§2 item 5) | `indexer::refeed_cut`, `IndexCache::rewind_live`, `wave.rs` | `a_refeed_rewinds_to_the_newest_block_boundary_within_its_reach`, `a_rewound_tail_keeps_its_first_blocks` |
+| The index rewound to a block boundary (§2 item 5) | `indexer::refeed_cut`, `IndexCache::rewind_live`, `wave/positional.rs` | `a_refeed_rewinds_to_the_newest_block_boundary_within_its_reach`, `a_rewound_tail_keeps_its_first_blocks` |
 | The re-feed row (§2 items 1, 5) | `scheduler/refeed.rs`, `reproject_view_prepare`, `play_stencil_runs` | `the_last_tokens_come_off_the_end`, `a_refeed_row_ends_on_the_pending_token` |
-| No boundary at the opening's end; the cadence from the last boundary; none inside a tool call (§2.4, §2 item 6) | `scheduler/prefill.rs`, `provenance/boundaries.rs` | `a_boundary_restarts_the_cadence`, `a_tool_call_fires_nothing_until_it_closes`, `a_tool_call_pauses_the_cadence` |
+| No boundary at the opening's end; the cadence from the last boundary; none inside a tool call (§2.4, §2 item 6) | `scheduler/prefill/mod.rs`, `provenance/boundaries.rs` | `a_boundary_restarts_the_cadence`, `a_tool_call_fires_nothing_until_it_closes`, `a_tool_call_pauses_the_cadence` |
 | One context at the covering rung, the ×8 rung (§2.3) | `qsa_shadow.cu`, `shadow.rs`, `hits.rs`, `rope.rs` | `the_shadow_scan_counts_what_its_definition_counts`, `a_span_is_the_kernels_layout`, `flash_next_takes_the_reference_angle` |
 
 Measured against 62.2% (`dependency_battery_2026-11-20_b.md`) by the battery.
