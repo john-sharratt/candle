@@ -31,6 +31,12 @@ the schema already says who can read what:
   (`gallery_arena::keep_price`) — and never sets a keep time under a minute
   (`eviction::MIN_KEEP`), so a working set scanned every few seconds is never
   shed only to be uploaded again at its next scan.
+
+  **An upload reads the turn's window back from the log.** The host holds no
+  turn's signature tokens (`docs/substrate_scale.md` O1): a scan sizes a window
+  from its record's header, and an upload reads the record, decodes and
+  transposes it. The upload cost the keep trade weighs is that whole step,
+  timed, so the read is priced in with the rest.
 - **Conversation turns** — read only by their own conversation. A belief scan
   masked to its target's own timeline (the target's own group, or every group
   of an append-only target) reads nothing else. zend's `dialogue` layer is the

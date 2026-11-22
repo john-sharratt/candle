@@ -75,7 +75,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use candle_conversation::persistence::accounting::RecordAccounting;
 use candle_conversation::persistence::content_hash::{turn_stream_id, ContentHash};
@@ -87,8 +87,10 @@ use candle_conversation::persistence::record::{
     ChunkPayload, DistillMode, DistillPayload, Record, RecordHeader, RecordType, TombstonePayload,
     TurnCouplingPayload,
 };
+use candle_conversation::persistence::record_reader::LogFileReader;
 use candle_conversation::persistence::recovery;
 use candle_conversation::persistence::resume::decode_token_ids;
+use candle_conversation::persistence::sealed_reader::SealedReader;
 use candle_conversation::persistence::segment::{SegmentId, FIRST_SEGMENT};
 use candle_conversation::persistence::streams::{ContentAddress, StreamDecl, StreamId, TurnDecl};
 use candle_conversation::persistence::walker;
@@ -518,10 +520,10 @@ fn export_replay(
         turn_meta.insert((tl, idx), meta.clone());
 
         if wanted.contains(&tl) {
-            let sig = dump_sig(tl, idx, s.wide_q_sigs.as_deref());
+            let sig = dump_sig(tl, idx, sig_bytes(&substrate, s).as_deref());
             let mut n_events = 0usize;
-            let ev_file = s.projection_events.as_ref().map(|bytes| {
-                let events = decode_events(bytes);
+            let ev_file = events_bytes(&substrate, s).map(|bytes| {
+                let events = decode_events(&bytes);
                 n_events = events.len();
                 for ev in &events {
                     for t in &ev.selection.turns {
@@ -533,7 +535,7 @@ fn export_replay(
                     }
                 }
                 let name = format!("{tl}_{idx}.events.json");
-                std::fs::write(ev_dir.join(&name), bytes).ok();
+                std::fs::write(ev_dir.join(&name), &bytes).ok();
                 name
             });
             let mut entry = meta.clone();
@@ -545,7 +547,7 @@ fn export_replay(
 
         for tag_filter in tags {
             if decl.tags.iter().any(|t| t.contains(tag_filter.as_str())) {
-                dump_sig(tl, idx, s.wide_q_sigs.as_deref());
+                dump_sig(tl, idx, sig_bytes(&substrate, s).as_deref());
                 targets.entry(tag_filter.clone()).or_default().push(meta);
                 break;
             }
@@ -556,10 +558,8 @@ fn export_replay(
     let mut candidates: Vec<serde_json::Value> = Vec::new();
     for (tl, idx) in &selected {
         let stream_id = turn_stream_id(*tl, *idx);
-        let blob = substrate
-            .stream_of(stream_id)
-            .and_then(|s| s.wide_q_sigs.as_deref());
-        dump_sig(*tl, *idx, blob);
+        let blob = substrate.stream_wide_q_sigs(stream_id).ok().flatten();
+        dump_sig(*tl, *idx, blob.as_deref());
         match turn_meta.get(&(*tl, *idx)) {
             Some(meta) => candidates.push(meta.clone()),
             None => candidates.push(serde_json::json!({
@@ -1358,6 +1358,9 @@ fn main() -> Result<()> {
         target
     };
 
+    // Where stored signature windows and projection events are read back from
+    // (`build_substrate`).
+    let _ = INSPECT_LOG.set(log_path.clone());
     // Always open read-only: the inspector never writes, and this makes it safe
     // to point at the running daemon's active segment without racing its writes
     // or healing/truncating the file underneath it.
@@ -1799,10 +1802,14 @@ fn projections(log: &mut LogFile, only: Option<StreamId>, jsonl: bool) -> Result
         let Some(tl) = TimelineId::from_raw(timeline) else {
             continue;
         };
-        let Some(blob) = substrate.projection_events_blob(tl, TurnIndex(idx)) else {
+        let Some(blob) = substrate
+            .projection_events_blob(tl, TurnIndex(idx))
+            .ok()
+            .flatten()
+        else {
             continue;
         };
-        let events = decode_events(blob);
+        let events = decode_events(&blob);
         if events.is_empty() {
             continue;
         }
@@ -2024,9 +2031,10 @@ fn belief_probe(substrate: &Substrate, probe_id: StreamId, tag: &str) -> Result<
     use candle_conversation::provenance::{decode_wide_sigs, score_slots, WideQSig};
 
     let probe_window = substrate
-        .stream_of(probe_id)
-        .and_then(|e| e.wide_q_sigs.as_ref())
-        .and_then(|b| decode_wide_sigs(b))
+        .stream_wide_q_sigs(probe_id)
+        .ok()
+        .flatten()
+        .and_then(|b| decode_wide_sigs(&b))
         .with_context(|| format!("probe stream {} has no wide-Q signature", probe_id.0))?;
     let probe_tags: Vec<String> = substrate
         .stream_of(probe_id)
@@ -2053,7 +2061,7 @@ fn belief_probe(substrate: &Substrate, probe_id: StreamId, tag: &str) -> Result<
         let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
             continue;
         };
-        let Some(window) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+        let Some(window) = sig_bytes(substrate, e).and_then(|b| decode_wide_sigs(&b)) else {
             continue;
         };
         if window.is_empty() {
@@ -2289,7 +2297,7 @@ fn selection_replay(
         if d.timeline_id != dialogue_tl || !is_dialogue(&d.tags) {
             continue;
         }
-        if let Some(sig) = s.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) {
+        if let Some(sig) = sig_bytes(substrate, s).and_then(|b| decode_wide_sigs(&b)) {
             if !sig.is_empty() {
                 probes.push((d.turn_index, sig));
             }
@@ -2325,7 +2333,7 @@ fn selection_replay(
                 .find(|t| t.as_str() != tag)
                 .cloned()
                 .unwrap_or_else(|| format!("tl{}#{}", d.timeline_id, d.turn_index));
-            let Some(win) = s.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+            let Some(win) = sig_bytes(substrate, s).and_then(|b| decode_wide_sigs(&b)) else {
                 continue;
             };
             if win.is_empty() {
@@ -2516,7 +2524,7 @@ fn belief_eval(
         .transpose()?
         .flatten();
 
-    let mut tagged: Vec<(StreamId, &str, &[u8], &[TurnSegment])> = substrate
+    let mut tagged: Vec<(StreamId, &str, Arc<[u8]>, &[TurnSegment])> = substrate
         .all_streams()
         .filter_map(|(sid, e)| {
             let Some(StreamDecl::Turn(t)) = &e.decl else {
@@ -2529,7 +2537,7 @@ fn belief_eval(
             Some((
                 sid,
                 name.as_str(),
-                e.wide_q_sigs.as_deref()?,
+                sig_bytes(substrate, e)?,
                 t.segments.as_slice(),
             ))
         })
@@ -2555,7 +2563,7 @@ fn belief_eval(
         if limit > 0 && corpus.len() >= limit {
             break;
         }
-        let Some(window) = decode_wide_sigs(blob) else {
+        let Some(window) = decode_wide_sigs(&blob) else {
             continue;
         };
         if window.is_empty() {
@@ -3015,7 +3023,7 @@ fn belief_replay(
         let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
             continue;
         };
-        let Some(sigs) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+        let Some(sigs) = sig_bytes(substrate, e).and_then(|b| decode_wide_sigs(&b)) else {
             continue;
         };
         if sigs.is_empty() {
@@ -3345,7 +3353,7 @@ fn belief_decay(substrate: &Substrate, tag: &str, window: usize, chunk: usize) -
         let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
             continue;
         };
-        let Some(win) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+        let Some(win) = sig_bytes(substrate, e).and_then(|b| decode_wide_sigs(&b)) else {
             continue;
         };
         if win.is_empty() {
@@ -3665,7 +3673,7 @@ fn belief_sweep(
         let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
             continue;
         };
-        let Some(window) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+        let Some(window) = sig_bytes(substrate, e).and_then(|b| decode_wide_sigs(&b)) else {
             continue;
         };
         if window.is_empty() {
@@ -3912,9 +3920,10 @@ fn belief_dissect(
     use candle_conversation::provenance::{decode_wide_sigs, WideQSig};
 
     let probe: Vec<WideQSig> = substrate
-        .stream_of(probe_id)
-        .and_then(|e| e.wide_q_sigs.as_ref())
-        .and_then(|b| decode_wide_sigs(b))
+        .stream_wide_q_sigs(probe_id)
+        .ok()
+        .flatten()
+        .and_then(|b| decode_wide_sigs(&b))
         .with_context(|| format!("probe stream {} has no wide-Q signature", probe_id.0))?;
     let gt_name = substrate
         .stream_of(probe_id)
@@ -3942,7 +3951,7 @@ fn belief_dissect(
         let Some(name) = t.tags.iter().find(|x| x.as_str() != tag) else {
             continue;
         };
-        let Some(win) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+        let Some(win) = sig_bytes(substrate, e).and_then(|b| decode_wide_sigs(&b)) else {
             continue;
         };
         let slot = slot_names
@@ -4284,7 +4293,7 @@ fn calib_baseline(log: &mut LogFile, tag: &str, out: Option<String>) -> Result<(
         srcs.push(Src {
             tool: name.clone(),
             loc,
-            wq: e.wide_q_sigs.clone(),
+            wq: sig_bytes(&substrate, e),
         });
     }
 
@@ -4661,7 +4670,12 @@ fn dump(log: &mut LogFile, only_timeline: Option<u64>, full: bool) -> Result<()>
                 None => (TurnKind::Normal, Vec::new()),
             };
         let proj = tl
-            .and_then(|tl| substrate.projection_events_blob(tl, TurnIndex(t.turn_index)))
+            .and_then(|tl| {
+                substrate
+                    .projection_events_blob(tl, TurnIndex(t.turn_index))
+                    .ok()
+                    .flatten()
+            })
             .map(|b| b.to_vec());
         turns.push(TurnRec {
             id,
@@ -5108,7 +5122,12 @@ fn dump_merged(
                 None => (TurnKind::Normal, Vec::new()),
             };
         let proj = tl
-            .and_then(|tl| substrate.projection_events_blob(tl, TurnIndex(t.turn_index)))
+            .and_then(|tl| {
+                substrate
+                    .projection_events_blob(tl, TurnIndex(t.turn_index))
+                    .ok()
+                    .flatten()
+            })
             .map(|b| b.to_vec());
         turns.push(T {
             decl: t.clone(),
@@ -5745,7 +5764,7 @@ fn streams(log: &mut LogFile) -> Result<()> {
 
     for (n, (id, entry)) in streams.into_iter().enumerate() {
         let tok = if entry.tokens.is_some() { "y" } else { "n" };
-        let wsig = wide_sig_summary(entry.wide_q_sigs.as_deref());
+        let wsig = wide_sig_summary(sig_bytes(&substrate, entry).as_deref());
         let detail = match &entry.decl {
             Some(StreamDecl::Turn(t)) => {
                 let no_think = t.layout().no_think();
@@ -6261,25 +6280,59 @@ fn build_manifest(log: &mut LogFile) -> Result<Manifest> {
 /// tokenizer); streams, chunks, tokens, and signatures live in the
 /// substrate, populated by the same walker pass `open_in_with_substrate`
 /// uses.
+/// `e`'s wide-Q signature window bytes, read back through `substrate`.
+fn sig_bytes(substrate: &Substrate, e: &StreamRuntime) -> Option<Arc<[u8]>> {
+    let value = e.wide_q_sigs.as_ref()?;
+    substrate.located_bytes(value, e.ids.wide_q_sigs).ok()
+}
+
+/// `e`'s projection-events bytes, read back through `substrate`.
+fn events_bytes(substrate: &Substrate, e: &StreamRuntime) -> Option<Arc<[u8]>> {
+    let value = e.projection_events.as_ref()?;
+    substrate.located_bytes(value, e.ids.projection_events).ok()
+}
+
+/// The single-file log the inspector was pointed at — where
+/// [`build_substrate`]'s substrate reads stored bytes back from.
+static INSPECT_LOG: OnceLock<PathBuf> = OnceLock::new();
+
+/// Whether the metadata walk reads a record's payload: not for anything the
+/// substrate keeps by location — KV chunks, token blobs, snapshots, index
+/// pages, signature windows and projection events — nor for header indexes.
+/// The inspector reads those payloads on demand.
+fn walk_reads_payload(rt: RecordType) -> bool {
+    !matches!(
+        rt,
+        RecordType::Chunk
+            | RecordType::Tokens
+            | RecordType::Snapshot
+            | RecordType::HeaderIndex
+            | RecordType::TurnIndexPage
+            | RecordType::WideQSig
+            | RecordType::ProjectionEvents
+    )
+}
+
 /// Merged metadata substrate across every segment of a directory store, in
 /// ascending id order so cross-segment last-writer-wins resolves exactly as the
-/// daemon's reload does. Same payload filter as [`build_substrate`] (KV chunks,
-/// token blobs, and header indexes are skipped; `WideQSig` / `ProjectionEvents`
-/// blobs are kept) — cheap relative to store size.
+/// daemon's reload does. Each segment is walked under its own id, so every
+/// location names the file that holds it, and stored bytes are read back from
+/// the store's segment directory.
 fn build_substrate_merged(segs: &[(u64, PathBuf, bool)]) -> Result<Substrate> {
     let mut substrate = Substrate::new();
+    if let Some(dir) = segs.first().and_then(|(_, p, _)| p.parent()) {
+        substrate
+            .payloads()
+            .set_reader(Arc::new(SealedReader::offline(dir.to_path_buf())));
+    }
     for (id, path, _) in segs {
         let mut log = LogFile::open_read_only(path)?;
-        let (entries, _) =
-            walker::collect_filtered(&mut log, FIRST_SEGMENT, SUPERBLOCK_SIZE, |rt| {
-                !matches!(
-                    rt,
-                    RecordType::Chunk
-                        | RecordType::Tokens
-                        | RecordType::Snapshot
-                        | RecordType::HeaderIndex
-                )
-            })?;
+        let (entries, _) = walker::collect_filtered(
+            &mut log,
+            SegmentId(*id),
+            SUPERBLOCK_SIZE,
+            walk_reads_payload,
+        )?;
         for e in &entries {
             substrate.apply_walker_entry(e);
         }
@@ -6288,21 +6341,20 @@ fn build_substrate_merged(segs: &[(u64, PathBuf, bool)]) -> Result<Substrate> {
     Ok(substrate)
 }
 
+/// The metadata substrate of one single-file log. Fast: payloads the
+/// substrate keeps by location are not read ([`walk_reads_payload`]) — reading
+/// them would scan the whole multi-GB log for nothing, the single biggest cost
+/// in every command — and are read back from the same file on demand.
 fn build_substrate(log: &mut LogFile) -> Result<Substrate> {
     let mut substrate = Substrate::new();
-    // Fast metadata scan: skip the large reference-stored payloads (KV chunks,
-    // token blobs). `apply_walker_entry` keeps only their `(offset, len)` — never
-    // the bytes — and the inspector reads specific payloads on demand, so reading
-    // them here would scan the whole multi-GB log for nothing. This is the single
-    // biggest cost in every command. `WideQSig` / `ProjectionEvents` are NOT
-    // skipped — `apply_walker_entry` mirrors their payload into the stream blob the
-    // belief gallery reads.
-    let (entries, _) = walker::collect_filtered(log, FIRST_SEGMENT, SUPERBLOCK_SIZE, |rt| {
-        !matches!(
-            rt,
-            RecordType::Chunk | RecordType::Tokens | RecordType::Snapshot | RecordType::HeaderIndex
-        )
-    })?;
+    if let Some(path) = INSPECT_LOG.get() {
+        let reader = LogFile::open_read_only(path)?;
+        substrate
+            .payloads()
+            .set_reader(Arc::new(LogFileReader::new(reader)));
+    }
+    let (entries, _) =
+        walker::collect_filtered(log, FIRST_SEGMENT, SUPERBLOCK_SIZE, walk_reads_payload)?;
     for e in &entries {
         substrate.apply_walker_entry(e);
     }

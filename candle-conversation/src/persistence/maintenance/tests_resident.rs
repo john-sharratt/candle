@@ -97,12 +97,19 @@ pub(super) mod tests {
         assert_eq!(&events[..], &[1, 2, 3]);
         assert!(Arc::ptr_eq(
             events,
-            entry.projection_events.as_ref().unwrap()
+            entry
+                .projection_events
+                .as_ref()
+                .and_then(Located::held)
+                .unwrap()
         ));
 
         let sigs = payload_of(RecordType::WideQSig);
         assert_eq!(&sigs[..], &[4, 5, 6, 7]);
-        assert!(Arc::ptr_eq(sigs, entry.wide_q_sigs.as_ref().unwrap()));
+        assert!(Arc::ptr_eq(
+            sigs,
+            entry.wide_q_sigs.as_ref().and_then(Located::held).unwrap()
+        ));
 
         let page = payload_of(RecordType::TurnIndexPage);
         assert_eq!(&page[..], &[8, 9]);

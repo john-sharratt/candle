@@ -316,11 +316,19 @@ pub(super) mod tests {
             let mut substrate = Substrate::new();
             let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             let tl = TimelineId::from_raw(decl.timeline_id).unwrap();
+            // Recovered located, not held: nothing of it stands in RAM.
+            assert_eq!(substrate.held_payload_bytes().projection_events, 0);
+            let stream = substrate.stream_of(stream_id).unwrap();
+            assert!(matches!(
+                stream.projection_events,
+                Some(crate::substrate::Located::Stored(_))
+            ));
             let blob = substrate
                 .projection_events_blob(tl, TurnIndex(decl.turn_index))
+                .expect("a recovered record reads back")
                 .expect("projection events recovered after restart");
-            assert_eq!(blob, payload.as_slice());
-            assert_eq!(decode_events(blob), events);
+            assert_eq!(&blob[..], payload.as_slice());
+            assert_eq!(decode_events(&blob), events);
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -357,11 +365,21 @@ pub(super) mod tests {
             let mut substrate = Substrate::new();
             let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
             let tl = TimelineId::from_raw(decl.timeline_id).unwrap();
+            // Recovered located, not held: nothing of it stands in RAM.
+            assert_eq!(substrate.held_payload_bytes().wide_q_sigs, 0);
             let blob = substrate
                 .wide_q_sigs_blob(tl, TurnIndex(decl.turn_index))
+                .expect("a recovered record reads back")
                 .expect("wide-Q sigs recovered after restart");
-            assert_eq!(blob, payload.as_slice());
-            assert_eq!(decode_wide_sigs(blob), Some(history));
+            assert_eq!(&blob[..], payload.as_slice());
+            assert_eq!(decode_wide_sigs(&blob), Some(history.clone()));
+            // A scan sizes the window from the record's head alone, and reads
+            // its tokens back exactly.
+            let window = substrate
+                .wide_sig_window(stream_id)
+                .expect("the window is sized from its header");
+            assert_eq!(window.len(), 3);
+            assert_eq!(window.decode(), history);
         }
         std::fs::remove_dir_all(&dir).ok();
     }

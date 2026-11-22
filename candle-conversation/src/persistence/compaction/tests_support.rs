@@ -35,6 +35,21 @@ pub(super) mod tests {
             .any(|it| it.header().record_type == rt && it.synth_payload() == Some(payload))
     }
 
+    /// True iff a record of type `rt` and payload length `payload_len` is
+    /// carried by location (`Raw`) — a value the substrate keeps in the log,
+    /// copied byte for byte rather than re-emitted from RAM.
+    pub(in super::super) fn carries_located(
+        live: &[CompactItem],
+        rt: RecordType,
+        payload_len: usize,
+    ) -> bool {
+        live.iter().any(|it| {
+            it.header().record_type == rt
+                && it.synth_payload().is_none()
+                && it.header().payload_len == payload_len as u64
+        })
+    }
+
     /// True iff any record of type `rt` is present (by header, `Raw` or `Synth`).
     pub(in super::super) fn has_type(live: &[CompactItem], rt: RecordType) -> bool {
         live.iter().any(|it| it.header().record_type == rt)

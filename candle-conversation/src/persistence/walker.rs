@@ -149,10 +149,10 @@ pub fn walk_filtered(
         // we already parsed from the probe sector. This is what makes a multi-GB walk
         // cheap — without it the walk re-reads and copies the entire log into RAM. The
         // walk's torn-record detection is header-framed (size/zero-fill), so skipping
-        // the payload read changes nothing there.  `WideQSig` / `ProjectionEvents`
-        // are NOT skipped — the belief gallery re-populates their blobs from the
-        // payload on reload.  `Chunk` / `Tokens` are ALWAYS skipped (never read by
-        // value); `read_payload` lets a caller skip additional types on top.
+        // the payload read changes nothing there.  `Chunk` / `Tokens` are ALWAYS
+        // skipped (never read by value); `read_payload` lets a caller skip
+        // additional types on top — recovery skips every type the substrate
+        // locates rather than holds (`recovery::payload_needed`).
         if matches!(header.record_type, RecordType::Chunk | RecordType::Tokens)
             || !read_payload(header.record_type)
         {

@@ -341,23 +341,48 @@ impl Substrate {
         }
     }
 
-    /// Record `stream_id`'s projection events, record `id` — the greatest
-    /// stamp holds them.
+    /// Record `stream_id`'s projection events, record `id`, from the bytes
+    /// this process wrote — the greatest stamp holds them. Held until the
+    /// append lands ([`Self::apply_projection_events_loc`] settles them).
     pub fn apply_projection_events(
         &mut self,
         stream_id: StreamId,
         payload: Vec<u8>,
         id: RecordIdentity,
     ) {
+        self.apply_events_value(stream_id, Located::Held(payload.into()), id);
+    }
+
+    /// Record `stream_id`'s projection events, record `id`, left in the log at
+    /// `loc` — what recovery, a replicated record, a rewrite's re-apply and a
+    /// settled append record.
+    pub fn apply_projection_events_loc(
+        &mut self,
+        stream_id: StreamId,
+        loc: RecordLoc,
+        id: RecordIdentity,
+    ) {
+        self.apply_events_value(stream_id, Located::Stored(loc), id);
+    }
+
+    fn apply_events_value(&mut self, stream_id: StreamId, value: Located, id: RecordIdentity) {
         let key = StreamKey::of(stream_id, &id);
         if !self.admits(key, &id) {
             return;
         }
         let entry = self.streams.entry(key);
+        // The record already held, placed again: a settle or a relocation.
+        // Only where it is changes — nothing a scan reads from it.
+        if !id.is_none() && entry.ids.projection_events == id && entry.projection_events.is_some() {
+            if matches!(value, Located::Stored(_)) {
+                entry.projection_events = Some(value);
+            }
+            return;
+        }
         if !take(&mut entry.ids.projection_events, id) {
             return;
         }
-        entry.projection_events = Some(payload.into());
+        entry.projection_events = Some(value);
         // The memo belonged to the blob just replaced. `entry` is this
         // version's own copy of the runtime, so older versions keep theirs.
         entry.events_digest = OnceLock::new();
@@ -367,20 +392,50 @@ impl Substrate {
         self.stream_content_changed(key);
     }
 
-    /// Record `stream_id`'s wide-Q signature window, record `id` — the greatest
-    /// stamp holds it.
+    /// Record `stream_id`'s wide-Q signature window, record `id`, from the
+    /// bytes this process wrote — the greatest stamp holds it. Held until the
+    /// append lands ([`Self::apply_wide_q_sigs_loc`] settles it).
     pub fn apply_wide_q_sigs(&mut self, stream_id: StreamId, payload: Vec<u8>, id: RecordIdentity) {
+        self.apply_sigs_value(stream_id, Located::Held(payload.into()), id);
+    }
+
+    /// Record `stream_id`'s wide-Q signature window, record `id`, left in the
+    /// log at `loc` — what recovery, a replicated record, a rewrite's re-apply
+    /// and a settled append record.
+    pub fn apply_wide_q_sigs_loc(
+        &mut self,
+        stream_id: StreamId,
+        loc: RecordLoc,
+        id: RecordIdentity,
+    ) {
+        self.apply_sigs_value(stream_id, Located::Stored(loc), id);
+    }
+
+    fn apply_sigs_value(&mut self, stream_id: StreamId, value: Located, id: RecordIdentity) {
         let key = StreamKey::of(stream_id, &id);
         if !self.admits(key, &id) {
             return;
         }
+        // A new value is stamped with the gallery epoch its write moves to.
+        let stamp = self.gallery_epoch + 1;
         let entry = self.streams.entry(key);
+        // The record already held, placed again: a settle or a relocation.
+        // The window is the same, so its stamp and header stand and nothing
+        // re-uploads.
+        if !id.is_none() && entry.ids.wide_q_sigs == id && entry.wide_q_sigs.is_some() {
+            if matches!(value, Located::Stored(_)) {
+                entry.wide_q_sigs = Some(value);
+            }
+            return;
+        }
         if !take(&mut entry.ids.wide_q_sigs, id) {
             return;
         }
-        let replaced = entry.wide_q_sigs.replace(payload.into()).is_some();
+        let replaced = entry.wide_q_sigs.replace(value).is_some();
+        entry.sig_head = OnceLock::new();
+        entry.sig_stamp = stamp;
         self.sig_rewrites += u64::from(replaced);
-        self.gallery_epoch += 1;
+        self.gallery_epoch = stamp;
         self.stream_gallery_changed(key);
         self.stream_content_changed(key);
     }
@@ -414,6 +469,25 @@ impl Substrate {
         let entry = self.streams.entry(key);
         if entry.ids.index_page == id && matches!(entry.index_page, Some(IndexPage::Resident(_))) {
             entry.index_page = Some(IndexPage::Stored(loc));
+        }
+    }
+
+    /// Record `stream_id`'s located per-stream record of type `rt` — an index
+    /// page, a signature window or projection events — left in the log at
+    /// `loc`: where a relocation or a rewrite placed it. Any other type is
+    /// not a located per-stream record and changes nothing.
+    pub fn apply_stored_loc(
+        &mut self,
+        stream_id: StreamId,
+        rt: RecordType,
+        loc: RecordLoc,
+        id: RecordIdentity,
+    ) {
+        match rt {
+            RecordType::TurnIndexPage => self.apply_index_page_loc(stream_id, loc, id),
+            RecordType::WideQSig => self.apply_wide_q_sigs_loc(stream_id, loc, id),
+            RecordType::ProjectionEvents => self.apply_projection_events_loc(stream_id, loc, id),
+            _ => {}
         }
     }
 

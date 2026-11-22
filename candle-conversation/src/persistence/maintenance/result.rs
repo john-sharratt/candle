@@ -17,7 +17,9 @@ pub struct MaintenanceResult {
     pub(super) chunk_updates: Vec<(StreamKey, u64, ChunkLoc, ChunkLoc)>,
     /// `(stream, old_loc, new_loc)`.
     pub(super) token_updates: Vec<(StreamKey, RecordLoc, RecordLoc)>,
-    pub(super) index_page_updates: Vec<(StreamKey, RecordLoc, RecordLoc)>,
+    /// `((stream, type), old_loc, new_loc)` — located per-stream records: index
+    /// pages, signature windows, projection events.
+    pub(super) located_updates: Vec<((StreamKey, RecordType), RecordLoc, RecordLoc)>,
     /// `(snapshot stream, old_loc, new_loc)`.
     pub(super) snapshot_updates: Vec<(StreamId, RecordLoc, RecordLoc)>,
     /// `(branch stream, old_loc, new_loc)`.
@@ -68,17 +70,11 @@ impl MaintenanceResult {
                 }
             }
         }
-        for (key, old, new) in &self.index_page_updates {
-            // Same guard: a page rewritten since the plan keeps its newer copy.
-            let held = substrate.stream_at(*key).and_then(|s| {
-                s.index_page
-                    .as_ref()
-                    .and_then(IndexPage::stored)
-                    .map(|loc| (loc, s.ids.index_page))
-            });
-            if let Some((loc, id)) = held {
+        for ((key, rt), old, new) in &self.located_updates {
+            // Same guard: a value rewritten since the plan keeps its newer copy.
+            if let Some((loc, id)) = substrate.stored_record_of(*key, *rt) {
                 if loc == *old {
-                    substrate.apply_index_page_loc(key.stream_id, *new, id);
+                    substrate.apply_stored_loc(key.stream_id, *rt, *new, id);
                 }
             }
         }

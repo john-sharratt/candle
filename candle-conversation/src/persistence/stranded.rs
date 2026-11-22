@@ -20,9 +20,10 @@
 
 use std::collections::BTreeSet;
 
+use super::record::RecordType;
 use super::segment::SegmentId;
 use super::streams::StreamId;
-use crate::substrate::{IndexPage, StreamKey, Substrate};
+use crate::substrate::{StreamKey, Substrate};
 
 /// Which index entry a stranded record is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -30,8 +31,32 @@ pub enum StrandedKind {
     Chunk,
     Tokens,
     IndexPage,
+    WideQSig,
+    ProjectionEvents,
     Snapshot,
     BranchCheckpoint,
+}
+
+impl StrandedKind {
+    /// The kind of a located per-stream record of type `rt` — an index page,
+    /// a signature window or projection events.
+    pub fn of_located(rt: RecordType) -> Self {
+        match rt {
+            RecordType::WideQSig => Self::WideQSig,
+            RecordType::ProjectionEvents => Self::ProjectionEvents,
+            _ => Self::IndexPage,
+        }
+    }
+
+    /// The record type of a located per-stream kind, `None` for the others.
+    pub fn located_type(self) -> Option<RecordType> {
+        match self {
+            Self::IndexPage => Some(RecordType::TurnIndexPage),
+            Self::WideQSig => Some(RecordType::WideQSig),
+            Self::ProjectionEvents => Some(RecordType::ProjectionEvents),
+            Self::Chunk | Self::Tokens | Self::Snapshot | Self::BranchCheckpoint => None,
+        }
+    }
 }
 
 /// One record the substrate index names inside a segment an op was about to
@@ -66,10 +91,12 @@ impl StrandedRecord {
                 .stream_at(key)
                 .and_then(|s| s.tokens)
                 .is_some_and(|l| at(l.segment, l.offset)),
-            StrandedKind::IndexPage => substrate
-                .stream_at(key)
-                .and_then(|s| s.index_page.as_ref().and_then(IndexPage::stored))
-                .is_some_and(|l| at(l.segment, l.offset)),
+            StrandedKind::IndexPage | StrandedKind::WideQSig | StrandedKind::ProjectionEvents => {
+                let rt = self.kind.located_type().expect("a located kind");
+                substrate
+                    .stored_record_of(key, rt)
+                    .is_some_and(|(l, _)| at(l.segment, l.offset))
+            }
             StrandedKind::Snapshot => substrate
                 .recurrent_snapshot_loc(key.stream_id)
                 .is_some_and(|l| at(l.segment, l.offset)),

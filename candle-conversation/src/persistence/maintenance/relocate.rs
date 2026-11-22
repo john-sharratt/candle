@@ -33,12 +33,14 @@ pub struct MaintenanceRun {
     pub(super) chunk_updates: Vec<(StreamKey, u64, ChunkLoc, ChunkLoc)>,
     /// Which tail stage [`SubstratePersistence::relocate_tail_batch`] is in.
     /// Tokens, snapshots, branch checkpoints, singletons, characters, file
-    /// events, blobs, index pages, then done.
+    /// events, blobs, located per-stream records, then done.
     pub(super) tail_stage: u8,
     /// How far into the current tail stage the cursor has walked.
     pub(super) tail_cursor: usize,
     pub(super) token_updates: Vec<(StreamKey, RecordLoc, RecordLoc)>,
-    pub(super) index_page_updates: Vec<(StreamKey, RecordLoc, RecordLoc)>,
+    /// `((stream, type), old_loc, new_loc)` of every located per-stream record
+    /// moved so far — index pages, signature windows, projection events.
+    pub(super) located_updates: Vec<((StreamKey, RecordType), RecordLoc, RecordLoc)>,
     pub(super) snapshot_updates: Vec<(StreamId, RecordLoc, RecordLoc)>,
     pub(super) branch_checkpoint_updates: Vec<(StreamId, RecordLoc, RecordLoc)>,
 }
@@ -58,7 +60,7 @@ pub(super) const TAIL_VFS: u8 = 5;
 
 pub(super) const TAIL_BLOBS: u8 = 6;
 
-pub(super) const TAIL_INDEX_PAGES: u8 = 7;
+pub(super) const TAIL_LOCATED: u8 = 7;
 
 pub(super) const TAIL_DONE: u8 = 8;
 
@@ -73,7 +75,7 @@ impl MaintenanceRun {
         MaintenanceResult {
             chunk_updates: std::mem::take(&mut self.chunk_updates),
             token_updates: std::mem::take(&mut self.token_updates),
-            index_page_updates: std::mem::take(&mut self.index_page_updates),
+            located_updates: std::mem::take(&mut self.located_updates),
             snapshot_updates: std::mem::take(&mut self.snapshot_updates),
             branch_checkpoint_updates: std::mem::take(&mut self.branch_checkpoint_updates),
         }
@@ -174,14 +176,12 @@ impl SubstratePersistence {
                 }
             }
         }
-        for (key, old, new) in &run.index_page_updates {
-            let page = metadata_key_parts(RecordType::TurnIndexPage, key.stream_id.0, key.writer);
-            let indexed = substrate
-                .stream_at(*key)
-                .and_then(|s| s.index_page.as_ref().and_then(IndexPage::stored));
-            if self.metadata_locs.get(&page) == Some(new) && indexed == Some(*old) {
-                if let Some(id) = self.metadata_locs.identity(&page) {
-                    restored += usize::from(self.metadata_locs.offer(page, Some(*old), id));
+        for ((key, rt), old, new) in &run.located_updates {
+            let meta = metadata_key_parts(*rt, key.stream_id.0, key.writer);
+            let indexed = substrate.stored_record_of(*key, *rt).map(|(l, _)| l);
+            if self.metadata_locs.get(&meta) == Some(new) && indexed == Some(*old) {
+                if let Some(id) = self.metadata_locs.identity(&meta) {
+                    restored += usize::from(self.metadata_locs.offer(meta, Some(*old), id));
                 }
             }
         }
@@ -211,7 +211,7 @@ impl SubstratePersistence {
             tail_stage: TAIL_TOKENS,
             tail_cursor: 0,
             token_updates: Vec::new(),
-            index_page_updates: Vec::new(),
+            located_updates: Vec::new(),
             snapshot_updates: Vec::new(),
             branch_checkpoint_updates: Vec::new(),
         })
@@ -502,21 +502,25 @@ impl SubstratePersistence {
             TAIL_NPCS => self.take_npcs(plan, run, budget),
             TAIL_VFS => self.take_vfs(plan, run, budget),
             TAIL_BLOBS => self.take_blobs(plan, run, budget),
-            TAIL_INDEX_PAGES => {
+            TAIL_LOCATED => {
                 let (n, bytes, done, batch) = Self::take_budgeted(
-                    &plan.index_page_relocs,
+                    &plan.located_relocs,
                     &mut run.tail_cursor,
                     budget,
-                    |(_, old)| old.record_size,
-                    |(key, old)| {
+                    |(_, _, old)| old.record_size,
+                    |(key, rt, old)| {
                         self.metadata_locs.get(&metadata_key_parts(
-                            RecordType::TurnIndexPage,
+                            *rt,
                             key.stream_id.0,
                             key.writer,
                         )) == Some(old)
                     },
                 );
-                self.extend_stream_updates(&batch, &mut run.index_page_updates)?;
+                let keyed: Vec<((StreamKey, RecordType), RecordLoc)> = batch
+                    .into_iter()
+                    .map(|(key, rt, old)| ((key, rt), old))
+                    .collect();
+                self.extend_stream_updates(&keyed, &mut run.located_updates)?;
                 Ok((n, bytes, done))
             }
             _ => Ok((0, 0, true)),
@@ -837,14 +841,13 @@ impl SubstratePersistence {
                     .snapshot_locs
                     .get(&record.stream_id)
                     .map(|loc| (loc.segment.0, loc.offset)),
-                StrandedKind::IndexPage => self
-                    .metadata_locs
-                    .get(&metadata_key_parts(
-                        RecordType::TurnIndexPage,
-                        record.stream_id,
-                        record.writer,
-                    ))
-                    .map(|loc| (loc.segment.0, loc.offset)),
+                StrandedKind::IndexPage
+                | StrandedKind::WideQSig
+                | StrandedKind::ProjectionEvents => record.kind.located_type().and_then(|rt| {
+                    self.metadata_locs
+                        .get(&metadata_key_parts(rt, record.stream_id, record.writer))
+                        .map(|loc| (loc.segment.0, loc.offset))
+                }),
                 StrandedKind::Chunk | StrandedKind::Tokens => None,
             };
             tracing::warn!(

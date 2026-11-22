@@ -45,6 +45,7 @@ mod file_gallery;
 pub mod gauge;
 mod group_epoch;
 mod label_records;
+mod located;
 mod lock;
 #[cfg(test)]
 mod order_independence_tests;
@@ -90,6 +91,7 @@ use crate::persistence::record::{
 use crate::persistence::streams::{StreamDecl, StreamId, TurnDecl};
 use crate::persistence::tombstone_expiry::Expired;
 use crate::persistence::walker::WalkEntry;
+use crate::persistence::PersistenceError;
 use crate::projection::scan_stats::GroupScan;
 use crate::projection::{
     decode_events, CorruptTurnPolicy, GroupId, HitsConfig, LayerId, OwnedSection, OwnedSections,
@@ -99,7 +101,8 @@ use crate::projection::{
 };
 use crate::provenance::chunk_exclusion::records::{from_json, group_of_key, CutRecord};
 use crate::provenance::chunk_exclusion::ChunkExclusion;
-use crate::provenance::SigWindow;
+use crate::provenance::wide_sig::WIDE_HEADER;
+use crate::provenance::{SigHead, SigWindow, StoredSig};
 use crate::scheduler::profile;
 use crate::summary_tree::exchange::Couplings;
 use crate::summary_tree::exchange::{continued_exchange, exchanges, over_normals};
@@ -117,6 +120,7 @@ use ended_sections::EndedSections;
 pub use file_gallery::FileGallery;
 use file_gallery::{entry_mut, GalleryMemo};
 use label_records::label_records;
+pub use located::{Located, PayloadSource};
 pub use lock::{SubstrateLock, SubstrateReadGuard};
 use pcoll::{arc_mut, ord_arc_mut, PMap, POrdMap, POrdSet, PSet, PVec};
 pub use pending::PendingGauge;
@@ -267,6 +271,10 @@ pub struct Substrate {
     /// the one change to a calibration turn its conversation's length does not
     /// show.
     sig_rewrites: u64,
+
+    /// Reads stored record bytes back ([`Located::Stored`]) — shared by every
+    /// version, set when the store opens and when its owner spawns.
+    payloads: Arc<PayloadSource>,
 
     /// Groups whose conversations are offered to a projection only as its
     /// target's scope names them ([`Self::set_retrieval_scope`]). Ingested
@@ -915,6 +923,8 @@ mod tests_eviction;
 mod tests_labels_tombstones;
 #[cfg(test)]
 mod tests_listing;
+#[cfg(test)]
+mod tests_located;
 #[cfg(test)]
 mod tests_timeline_meta;
 #[cfg(test)]

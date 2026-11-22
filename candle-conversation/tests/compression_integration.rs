@@ -206,12 +206,14 @@ fn compression_tree_over_32_turns() -> candle_conversation::Result<()> {
         assert!(
             guard
                 .wide_q_sigs_blob(timeline, idx)
+                .expect("the signature reads back")
                 .is_some_and(|b| !b.is_empty()),
             "summary node {idx:?} must persist a wide-Q signature"
         );
         let events = guard
             .projection_events_blob(timeline, idx)
-            .map(candle_conversation::projection::decode_events)
+            .expect("the events read back")
+            .map(|b| candle_conversation::projection::decode_events(&b))
             .unwrap_or_default();
         assert_eq!(
             events.len(),

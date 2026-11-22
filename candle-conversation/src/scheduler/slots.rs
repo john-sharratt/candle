@@ -398,12 +398,20 @@ impl Scheduler {
         let mut belief = PriorBelief::default();
         let mut turns_folded = 0usize;
         for idx in read.turn_indices(timeline) {
-            let Some(blob) = read.projection_events_blob(timeline, idx) else {
-                continue;
+            let blob = match read.projection_events_blob(timeline, idx) {
+                Ok(Some(blob)) => blob,
+                Ok(None) => continue,
+                Err(e) => {
+                    tracing::warn!(
+                        "carried belief for slot {slot_id}: turn {idx:?}'s projection events \
+                         could not be read back: {e}"
+                    );
+                    continue;
+                }
             };
             // The turn's last event carries the selection in force at its
             // seal — the composition the live harvest folded into the carry.
-            let Some(last) = decode_events(blob).pop() else {
+            let Some(last) = decode_events(&blob).pop() else {
                 continue;
             };
             belief.merge_from(&PriorBelief::from_selection(&last.selection));

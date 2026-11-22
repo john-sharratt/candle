@@ -16,7 +16,7 @@ pub(super) mod tests {
 
     use crate::persistence::log_file::{read_record_at, MemLog, SUPERBLOCK_SIZE};
 
-    use super::super::tests_support::tests::{has_synth, has_type, record, NO_EXPIRY};
+    use super::super::tests_support::tests::{carries_located, has_type, record, NO_EXPIRY};
 
     /// Compactor drops every record bound to a tombstoned timeline.
     /// The simulation: write a `Label` for timeline X plus a stream
@@ -425,8 +425,8 @@ pub(super) mod tests {
         );
 
         assert!(
-            has_synth(&live, RecordType::ProjectionEvents, &proj_payload),
-            "ProjectionEvents record must survive compaction with its payload intact",
+            carries_located(&live, RecordType::ProjectionEvents, proj_payload.len()),
+            "ProjectionEvents record must survive compaction, carried by location",
         );
     }
 
@@ -476,8 +476,8 @@ pub(super) mod tests {
         );
 
         assert!(
-            has_synth(&live, RecordType::WideQSig, &wide_payload),
-            "WideQSig record must survive compaction with its payload intact",
+            carries_located(&live, RecordType::WideQSig, wide_payload.len()),
+            "WideQSig record must survive compaction, carried by location",
         );
     }
 
@@ -548,7 +548,7 @@ pub(super) mod tests {
             "provenance-only turn keeps its StreamDecl (tags + gallery scope)",
         );
         assert!(
-            has_synth(&live, RecordType::WideQSig, &wide_payload),
+            carries_located(&live, RecordType::WideQSig, wide_payload.len()),
             "provenance-only turn keeps its WideQSig",
         );
         // The content is reclaimed.

@@ -84,6 +84,12 @@ fn payload_needed(rt: RecordType) -> bool {
             // every turn stood in host memory for the life of the process —
             // ~60 GB on a 260 GB substrate, past what the host could commit.
             | RecordType::TurnIndexPage
+            // A turn's wide-Q window and its projection events likewise:
+            // located, a window's header and an events digest read once by the
+            // first scan that wants them. Fetched here, they were 16 GB of heap
+            // on WhiteWorld's store (`docs/substrate_scale.md` O1).
+            | RecordType::WideQSig
+            | RecordType::ProjectionEvents
     )
 }
 

@@ -31,18 +31,54 @@ impl Substrate {
         self.galleries_changed();
     }
 
-    /// The stored projection-event record payload for a turn, if any.
-    pub fn projection_events_blob(&self, timeline: TimelineId, index: TurnIndex) -> Option<&[u8]> {
-        self.streams
-            .get(turn_stream_id(timeline.raw(), index.0))
-            .and_then(|s| s.projection_events.as_deref())
+    /// Where `key`'s stream keeps its located per-stream record of type `rt` —
+    /// an index page, a signature window or projection events — in the log,
+    /// with the identity it is held under. `None` when the value is held in
+    /// RAM, absent, or `rt` is no such type.
+    pub fn stored_record_of(
+        &self,
+        key: StreamKey,
+        rt: RecordType,
+    ) -> Option<(RecordLoc, RecordIdentity)> {
+        let s = self.stream_at(key)?;
+        match rt {
+            RecordType::TurnIndexPage => s
+                .index_page
+                .as_ref()
+                .and_then(IndexPage::stored)
+                .map(|l| (l, s.ids.index_page)),
+            RecordType::WideQSig => s
+                .wide_q_sigs
+                .as_ref()
+                .and_then(Located::stored)
+                .map(|l| (l, s.ids.wide_q_sigs)),
+            RecordType::ProjectionEvents => s
+                .projection_events
+                .as_ref()
+                .and_then(Located::stored)
+                .map(|l| (l, s.ids.projection_events)),
+            _ => None,
+        }
     }
 
-    /// The stored wide-Q signature window payload for a turn, if any.
-    pub fn wide_q_sigs_blob(&self, timeline: TimelineId, index: TurnIndex) -> Option<&[u8]> {
-        self.streams
-            .get(turn_stream_id(timeline.raw(), index.0))
-            .and_then(|s| s.wide_q_sigs.as_deref())
+    /// A turn's projection-event record payload, if any — held, or read back
+    /// from the log.
+    pub fn projection_events_blob(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+    ) -> Result<Option<Arc<[u8]>>, PersistenceError> {
+        self.stream_projection_events(turn_stream_id(timeline.raw(), index.0))
+    }
+
+    /// A turn's wide-Q signature window payload, if any — held, or read back
+    /// from the log.
+    pub fn wide_q_sigs_blob(
+        &self,
+        timeline: TimelineId,
+        index: TurnIndex,
+    ) -> Result<Option<Arc<[u8]>>, PersistenceError> {
+        self.stream_wide_q_sigs(turn_stream_id(timeline.raw(), index.0))
     }
 
     /// Where a turn's QSA index page is, if it has one — held, or located in

@@ -139,7 +139,10 @@ impl Conversation {
             let block_range = r
                 .turn_block_range(from_tl, from_idx)
                 .ok_or_else(|| candle::Error::Msg("adopt_turn: no block range".into()))?;
-            let sigs_blob = r.wide_q_sigs_blob(from_tl, from_idx).map(|b| b.to_vec());
+            let sigs_blob = r
+                .wide_q_sigs_blob(from_tl, from_idx)
+                .map_err(|e| candle::Error::Msg(format!("adopt_turn: signature window: {e}")))?
+                .map(|b| b.to_vec());
             (layout, token_ids, block_range, sigs_blob)
         };
         // The turn's index page after the lock: one left in the log is read

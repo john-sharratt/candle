@@ -339,7 +339,9 @@ impl Sequence {
             let idx = TurnIndex(count - 1);
             let probe = match read
                 .wide_q_sigs_blob(timeline, idx)
-                .and_then(decode_wide_sigs)
+                .ok()
+                .flatten()
+                .and_then(|b| decode_wide_sigs(&b))
             {
                 // Same head+tail window the live reproject scans (see
                 // `scheduler`'s `QUERY_HEAD_CHUNKS` / `max_probe_tokens`). Without

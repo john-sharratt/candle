@@ -221,7 +221,9 @@ impl Sequence {
             })
             .map(|idx| {
                 read.projection_events_blob(timeline, idx)
-                    .map(decode_points)
+                    .ok()
+                    .flatten()
+                    .map(|b| decode_points(&b))
                     .unwrap_or_default()
             })
             .collect()
@@ -244,7 +246,9 @@ impl Sequence {
             })
             .map(|idx| {
                 read.projection_events_blob(timeline, idx)
-                    .map(decode_events)
+                    .ok()
+                    .flatten()
+                    .map(|b| decode_events(&b))
                     .unwrap_or_default()
             })
             .collect()

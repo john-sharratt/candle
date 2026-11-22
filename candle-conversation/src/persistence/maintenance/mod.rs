@@ -51,7 +51,7 @@ use super::vfs::VfsEventId;
 use super::{
     is_tracked_metadata, metadata_key_parts, PersistenceError, Result, SubstratePersistence,
 };
-use crate::substrate::{IndexPage, StreamKey, StreamRuntime, Substrate};
+use crate::substrate::{IndexPage, Located, StreamKey, StreamRuntime, Substrate};
 
 /// The streams maintenance carries forward, keyed `(stream_id, writer)`, each
 /// mapped to whether its signature records go with it. A stream absent from the

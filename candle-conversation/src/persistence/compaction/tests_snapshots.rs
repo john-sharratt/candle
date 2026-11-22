@@ -17,7 +17,7 @@ pub(super) mod tests {
     use crate::persistence::log_file::{MemLog, SUPERBLOCK_SIZE};
 
     use super::super::tests_support::tests::{
-        has_synth, has_type, record, snapshot_payload, NO_EXPIRY,
+        carries_located, has_type, record, snapshot_payload, NO_EXPIRY,
     };
 
     /// **A distilled timeline sheds its recurrent snapshot; its sig survives.**
@@ -101,7 +101,7 @@ pub(super) mod tests {
              that can never be resumed because its K/V is gone"
         );
         assert!(
-            has_synth(&live, RecordType::WideQSig, &wide_payload),
+            carries_located(&live, RecordType::WideQSig, wide_payload.len()),
             "the provenance signature must survive — that is what distillation \
              is for"
         );

@@ -411,46 +411,50 @@ pub fn collect_live_records(
                 ));
             }
         }
-        // Per-turn projection-event timeline — re-emitted from the resident
-        // bytes rather than read back from disk, so the GUI dots survive a
-        // compaction pass. Dropped for TextOnly (`keep_sig` false).
+        // The turn's projection events and its wide-Q window, so the GUI dots
+        // and the decode→decode consensus substrate survive a compaction pass.
+        // Dropped for TextOnly (`keep_sig` false). A value held in RAM is
+        // written from its bytes; one left in the log is carried by location,
+        // as the turn's K/V is.
         if keep_sig {
-            if let Some(payload) = &entry.projection_events {
-                out.push(CompactItem::synth(
+            for (rt, value, id) in [
+                (
+                    RecordType::ProjectionEvents,
+                    &entry.projection_events,
+                    entry.ids.projection_events,
+                ),
+                (
+                    RecordType::WideQSig,
+                    &entry.wide_q_sigs,
+                    entry.ids.wide_q_sigs,
+                ),
+            ] {
+                let header = |payload_len: u64| {
                     RecordHeader {
-                        record_type: RecordType::ProjectionEvents,
+                        record_type: rt,
                         format: 0,
-                        payload_len: payload.len() as u64,
+                        payload_len,
                         crc: 0,
                         stream_id: stream_id.0,
                         chunk_index: 0,
                         token_count: 0,
                         ..RecordHeader::NONE
                     }
-                    .with_identity(entry.ids.projection_events),
-                    payload.clone(),
-                ));
-            }
-        }
-        // Per-turn wide-Q signature window — same resident-bytes re-emit so the
-        // decode→decode consensus substrate survives a compaction pass. Dropped
-        // for TextOnly (`keep_sig` false).
-        if keep_sig {
-            if let Some(payload) = &entry.wide_q_sigs {
-                out.push(CompactItem::synth(
-                    RecordHeader {
-                        record_type: RecordType::WideQSig,
-                        format: 0,
-                        payload_len: payload.len() as u64,
-                        crc: 0,
-                        stream_id: stream_id.0,
-                        chunk_index: 0,
-                        token_count: 0,
-                        ..RecordHeader::NONE
-                    }
-                    .with_identity(entry.ids.wide_q_sigs),
-                    payload.clone(),
-                ));
+                    .with_identity(id)
+                };
+                match value {
+                    Some(Located::Held(payload)) => out.push(CompactItem::synth(
+                        header(payload.len() as u64),
+                        Arc::clone(payload),
+                    )),
+                    Some(Located::Stored(loc)) => out.push(CompactItem::raw(
+                        header(loc.payload_len),
+                        loc.segment,
+                        loc.offset,
+                        loc.record_size,
+                    )),
+                    None => {}
+                }
             }
         }
         // The turn's QSA index page, re-emitted with its K/V for the same

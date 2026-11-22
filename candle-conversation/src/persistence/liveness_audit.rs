@@ -337,7 +337,7 @@ impl LiveIndexes {
         for (_, loc) in ix.blob_relocations(&segments) {
             carried.insert((loc.segment, loc.offset));
         }
-        for (_, loc) in ix.gather_index_page_relocs(substrate, &segments) {
+        for (_, _, loc) in ix.gather_located_relocs(substrate, &segments) {
             carried.insert((loc.segment, loc.offset));
         }
         // Each is written afresh from what it says, not found by a key: the

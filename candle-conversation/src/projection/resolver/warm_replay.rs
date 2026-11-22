@@ -9,6 +9,7 @@
 //! score.
 
 use super::*;
+use crate::substrate::Located;
 
 /// Upper bound on how many recent dialogue turns the normalization warm-up
 /// replays on load (`take_warm_replay`): 512 samples of every child's background
@@ -61,28 +62,31 @@ impl Conversation {
         if self.normalization_warm.swap(true, AtomicOrdering::SeqCst) {
             return None;
         }
-        let mut probes: Vec<(u64, u32, Vec<WideQSig>)> = {
-            let sub = self.inner.read();
-            sub.dialogue_turn_streams()
-                .filter_map(|turn| {
-                    let sig = turn
-                        .runtime
-                        .wide_q_sigs
-                        .as_ref()
-                        .and_then(|b| decode_wide_sigs_for_scoring(b))?;
-                    (!sig.is_empty()).then_some((turn.decl.timeline_id, turn.index.0, sig))
-                })
-                .collect()
-        };
-        probes.sort_by_key(|(tl, idx, _)| (*tl, *idx));
-        let start = probes.len().saturating_sub(WARM_REPLAY_MAX_TURNS);
-        let replay: Vec<WarmProbe> = probes
-            .drain(start..)
-            .map(|(tl, idx, probe)| WarmProbe {
-                source: turn_stream_id(tl, idx).0,
-                probe,
+        // Ordered first and read after: only the turns the replay keeps are read
+        // back and decoded, not every dialogue turn in the store.
+        let sub = self.inner.read();
+        let mut turns: Vec<(u64, u32, Located, RecordIdentity)> = sub
+            .dialogue_turn_streams()
+            .filter_map(|turn| {
+                let value = turn.runtime.wide_q_sigs.clone()?;
+                let id = turn.runtime.ids.wide_q_sigs;
+                Some((turn.decl.timeline_id, turn.index.0, value, id))
             })
             .collect();
+        turns.sort_by_key(|(tl, idx, _, _)| (*tl, *idx));
+        let start = turns.len().saturating_sub(WARM_REPLAY_MAX_TURNS);
+        let replay: Vec<WarmProbe> = turns
+            .drain(start..)
+            .filter_map(|(tl, idx, value, id)| {
+                let bytes = sub.located_bytes(&value, id).ok()?;
+                let probe = decode_wide_sigs_for_scoring(&bytes)?;
+                (!probe.is_empty()).then(|| WarmProbe {
+                    source: turn_stream_id(tl, idx).0,
+                    probe,
+                })
+            })
+            .collect();
+        drop(sub);
         self.warm_replay_progress.add(replay.len());
         Some(replay)
     }

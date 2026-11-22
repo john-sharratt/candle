@@ -117,6 +117,10 @@ impl SubstratePersistence {
         if last_joined.is_none() || purge.drops_any() {
             joined::write(dir, now_ms())?;
         }
+        // The substrate locates what it does not hold; this is what reads it.
+        substrate
+            .payloads()
+            .set_reader(Arc::new(sp.sealed_reader()));
         Ok(sp)
     }
 
@@ -154,6 +158,11 @@ impl SubstratePersistence {
             || **substrate.borrow_mut() = Substrate::new(),
         )?;
         sp.forget_retired_blobs(&substrate.borrow());
+        // The substrate locates what it does not hold; this is what reads it.
+        substrate
+            .borrow()
+            .payloads()
+            .set_reader(Arc::new(sp.sealed_reader()));
         Ok(sp)
     }
 

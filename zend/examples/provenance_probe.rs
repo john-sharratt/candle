@@ -324,13 +324,23 @@ fn projection_probe_cases(substrate: &Substrate, back: usize) -> Vec<ProbeCase> 
         let Some(StreamDecl::Turn(d)) = &e.decl else {
             continue;
         };
-        let Some(history) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+        let Some(history) = e
+            .wide_q_sigs
+            .as_ref()
+            .and_then(|v| substrate.located_bytes(v, e.ids.wide_q_sigs).ok())
+            .and_then(|b| decode_wide_sigs(&b))
+        else {
             continue;
         };
         if history.is_empty() {
             continue;
         }
-        let Some(events) = e.projection_events.as_ref().map(|b| decode_events(b)) else {
+        let Some(events) = e
+            .projection_events
+            .as_ref()
+            .and_then(|v| substrate.located_bytes(v, e.ids.projection_events).ok())
+            .map(|b| decode_events(&b))
+        else {
             continue;
         };
         let asst = d.assistant_content_start() as usize;

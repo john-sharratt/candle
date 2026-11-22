@@ -63,7 +63,12 @@ fn main() -> anyhow::Result<()> {
         if !d.tags.iter().any(|t| t == "repo_map") {
             continue;
         }
-        let Some(sig) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+        let Some(sig) = e
+            .wide_q_sigs
+            .as_ref()
+            .and_then(|v| substrate.located_bytes(v, e.ids.wide_q_sigs).ok())
+            .and_then(|b| decode_wide_sigs(&b))
+        else {
             continue;
         };
         if sig.is_empty() {
@@ -115,7 +120,12 @@ fn main() -> anyhow::Result<()> {
             .all_streams()
             .into_iter()
             .find(|(s, _)| s.0 == *sid)
-            .and_then(|(_, e)| e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)))
+            .and_then(|(_, e)| {
+                e.wide_q_sigs
+                    .as_ref()
+                    .and_then(|v| substrate.located_bytes(v, e.ids.wide_q_sigs).ok())
+                    .and_then(|b| decode_wide_sigs(&b))
+            })
             .ok_or_else(|| anyhow::anyhow!("probe {label} ({sid:#x}) has no sig"))?;
         let scores = score_provenance_late_fusion(&probe, &gref, &gallery_case, n);
         for (ci, s) in scores.iter().enumerate() {

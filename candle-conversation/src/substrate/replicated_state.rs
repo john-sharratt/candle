@@ -82,16 +82,24 @@ impl Substrate {
             if let Some(loc) = &s.tokens {
                 let _ = writeln!(out, "  tokens {} len={}", id(&ids.tokens), loc.payload_len);
             }
+            // By identity and length, like `tokens`: one member may hold a
+            // value's bytes and another only where they are, and the record is
+            // the same.
             if let Some(p) = &s.projection_events {
                 let _ = writeln!(
                     out,
-                    "  events {} {:?}",
+                    "  events {} len={}",
                     id(&ids.projection_events),
-                    hash_bytes(p)
+                    p.payload_len()
                 );
             }
             if let Some(p) = &s.wide_q_sigs {
-                let _ = writeln!(out, "  sigs {} {:?}", id(&ids.wide_q_sigs), hash_bytes(p));
+                let _ = writeln!(
+                    out,
+                    "  sigs {} len={}",
+                    id(&ids.wide_q_sigs),
+                    p.payload_len()
+                );
             }
             // By identity and length, like `tokens`: one member may hold a page's
             // bytes and another only where they are, and the record is the same.

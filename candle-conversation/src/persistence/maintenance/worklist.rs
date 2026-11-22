@@ -184,16 +184,18 @@ impl LiveIndexes {
         (chunks, tokens, snapshots, branch_checkpoints, singletons)
     }
 
-    /// QSA index pages held in the log ([`IndexPage::Stored`]) physically inside
-    /// a target segment — relocated by location, as a turn's tokens are, since
-    /// their bytes are not in RAM to re-emit. The resident set's gates: nothing
-    /// of a stream dropped wholesale or an orphan, and a page only where its
-    /// stream keeps its signature records.
-    pub(in super::super) fn gather_index_page_relocs(
+    /// Located per-stream records — QSA index pages, signature windows and
+    /// projection events left in the log ([`IndexPage::Stored`],
+    /// [`Located::Stored`]) — physically inside a target segment: relocated by
+    /// location, as a turn's tokens are, since their bytes are not in RAM to
+    /// re-emit. The resident set's gates: nothing of a stream dropped wholesale
+    /// or an orphan, and these only where the stream keeps its signature
+    /// records.
+    pub(in super::super) fn gather_located_relocs(
         &self,
         substrate: &Substrate,
         targets: &[SegmentId],
-    ) -> Vec<(StreamKey, RecordLoc)> {
+    ) -> Vec<(StreamKey, RecordType, RecordLoc)> {
         let tombstoned: HashSet<u64> = substrate
             .tombstoned_timelines()
             .iter()
@@ -207,17 +209,33 @@ impl LiveIndexes {
         let node = self.node();
         let mut out = Vec::new();
         for (key, entry) in substrate.all_physical_streams() {
-            let Some(IndexPage::Stored(loc)) = &entry.index_page else {
-                continue;
-            };
-            if !targets.contains(&loc.segment) {
+            let stored = [
+                (
+                    RecordType::TurnIndexPage,
+                    entry.index_page.as_ref().and_then(IndexPage::stored),
+                ),
+                (
+                    RecordType::WideQSig,
+                    entry.wide_q_sigs.as_ref().and_then(Located::stored),
+                ),
+                (
+                    RecordType::ProjectionEvents,
+                    entry.projection_events.as_ref().and_then(Located::stored),
+                ),
+            ];
+            let in_target: Vec<(RecordType, RecordLoc)> = stored
+                .into_iter()
+                .filter_map(|(rt, loc)| loc.map(|l| (rt, l)))
+                .filter(|(_, l)| targets.contains(&l.segment))
+                .collect();
+            if in_target.is_empty() {
                 continue;
             }
             let shed = classify(substrate, key, entry, &tombstoned, &distilled);
             if shed.dropped_wholesale() || entry.is_orphan(node) || !shed.keep_sig() {
                 continue;
             }
-            out.push((key, *loc));
+            out.extend(in_target.into_iter().map(|(rt, l)| (key, rt, l)));
         }
         out
     }

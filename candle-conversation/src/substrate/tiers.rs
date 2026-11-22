@@ -21,6 +21,12 @@ impl Substrate {
         &self.residences
     }
 
+    /// The reader every version of this substrate shares for stored record
+    /// bytes ([`Located::Stored`]).
+    pub fn payloads(&self) -> &Arc<PayloadSource> {
+        &self.payloads
+    }
+
     /// The residence at `idx`.
     pub fn residence(&self, idx: ResidenceIndex) -> &Residence {
         self.residences.get(idx)
@@ -731,11 +737,13 @@ impl Substrate {
     pub fn held_payload_bytes(&self) -> HeldPayloadBytes {
         let mut held = HeldPayloadBytes::default();
         for (_, stream) in self.streams.iter_physical() {
-            held.wide_q_sigs += stream.wide_q_sigs.as_ref().map_or(0, |b| b.len() as u64);
-            held.projection_events += stream
-                .projection_events
-                .as_ref()
-                .map_or(0, |b| b.len() as u64);
+            let held_len = |v: &Option<Located>| {
+                v.as_ref()
+                    .and_then(Located::held)
+                    .map_or(0, |b| b.len() as u64)
+            };
+            held.wide_q_sigs += held_len(&stream.wide_q_sigs);
+            held.projection_events += held_len(&stream.projection_events);
         }
         held
     }

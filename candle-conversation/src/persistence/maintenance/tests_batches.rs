@@ -555,7 +555,7 @@ pub(super) mod tests {
                 .resident_to_carry(&substrate, &[SegmentId(1)]),
             chunk_relocs: Vec::new(),
             token_relocs: Vec::new(),
-            index_page_relocs: Vec::new(),
+            located_relocs: Vec::new(),
             snapshot_relocs: Vec::new(),
             branch_checkpoint_relocs: Vec::new(),
             singleton_relocs: Vec::new(),

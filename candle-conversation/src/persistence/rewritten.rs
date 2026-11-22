@@ -34,7 +34,8 @@ pub const REAPPLY_BATCH: usize = 4096;
 /// See the module documentation.
 pub struct Rewritten {
     /// The fresh segment's records, bulk payloads stripped: the substrate
-    /// reads a chunk's, tokens' or snapshot's header, never its bytes.
+    /// locates a chunk, tokens, a snapshot, an index page, a signature window
+    /// and projection events by header, and never holds their bytes.
     walked: Vec<WalkEntry>,
     /// The segments the rewrite replaced.
     old_segments: HashSet<SegmentId>,
@@ -83,6 +84,9 @@ impl Rewritten {
                 | RecordType::Tokens
                 | RecordType::Snapshot
                 | RecordType::BranchCheckpoint
+                | RecordType::TurnIndexPage
+                | RecordType::WideQSig
+                | RecordType::ProjectionEvents
         ) {
             kept.record.payload = Vec::new();
         }

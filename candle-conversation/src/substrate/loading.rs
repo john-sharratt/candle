@@ -11,6 +11,16 @@
 
 use super::*;
 
+/// Where the walked record `entry` lies.
+fn record_loc(entry: &WalkEntry) -> RecordLoc {
+    RecordLoc {
+        segment: entry.segment,
+        offset: entry.offset,
+        payload_len: entry.record.header.payload_len,
+        record_size: entry.size,
+    }
+}
+
 impl Substrate {
     /// Whether `timeline` is marked for distillation (any mode).
     pub fn is_distilled(&self, timeline: TimelineId) -> bool {
@@ -262,30 +272,22 @@ impl Substrate {
                     self.apply_deleted(&payload);
                 }
             }
+            // A turn's projection events and its wide-Q window: **located, not
+            // held**. The walk leaves their payloads in the log; a scan reads a
+            // window's header and an events digest once, and the bytes are read
+            // back when an upload, a host scan or a replay uses them.
             RecordType::ProjectionEvents => {
-                // Opaque JSON bytes — the projection layer decodes them on read.
-                self.apply_projection_events(stream_id, entry.record.payload.clone(), id);
+                self.apply_projection_events_loc(stream_id, record_loc(entry), id);
             }
             RecordType::WideQSig => {
-                // Opaque wide-Q window bytes (provenance::wide_sig) — each
-                // (re)projection writes the window again.
-                self.apply_wide_q_sigs(stream_id, entry.record.payload.clone(), id);
+                self.apply_wide_q_sigs_loc(stream_id, record_loc(entry), id);
             }
             RecordType::TurnIndexPage => {
                 // Opaque QSA index-page bytes — a turn's or a prompt section's; a
                 // re-seal writes the page again. **Located, not held**: recovery
                 // leaves the payload in the log (`IndexPage::Stored`), and a
                 // projection reads it when it needs it.
-                self.apply_index_page_loc(
-                    stream_id,
-                    RecordLoc {
-                        segment: entry.segment,
-                        offset: entry.offset,
-                        payload_len: h.payload_len,
-                        record_size: entry.size,
-                    },
-                    id,
-                );
+                self.apply_index_page_loc(stream_id, record_loc(entry), id);
             }
             // Singletons go to the manifest, not the substrate; the
             // header-index chain is consumed by recovery, never here.

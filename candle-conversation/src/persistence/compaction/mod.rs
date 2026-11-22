@@ -46,7 +46,7 @@ use super::tombstone_expiry::TombstoneExpiry;
 use super::vfs::{carried, VfsIndex};
 use super::Result;
 use crate::projection::TimelineId;
-use crate::substrate::{IndexPage, Substrate};
+use crate::substrate::{IndexPage, Located, Substrate};
 
 mod branch_checkpoints;
 mod collect;

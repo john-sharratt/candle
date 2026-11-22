@@ -381,22 +381,25 @@ pub struct StreamRuntime {
     pub chunks: POrdMap<u64, ChunkLoc>,
     /// Latest `Tokens` record for the stream.
     pub tokens: Option<RecordLoc>,
-    /// Latest `ProjectionEvents` record payload (opaque JSON bytes — the
-    /// projection layer decodes). Eager bytes rather than a `RecordLoc`: the
-    /// per-turn timeline is tiny, so we keep it resident and re-emit it on
-    /// compaction like the other synthesised per-entity records.
-    ///
-    /// Shared rather than owned, like `index_page`: maintenance re-emits every
-    /// live blob, and an owned one is copied into the op's plan and held there
-    /// for the whole op.
-    pub projection_events: Option<Arc<[u8]>>,
-    /// Opaque encoded wide-Q signature window (`provenance::wide_sig`) for this turn's most
-    /// recent (re)projection — the decode→decode (`Q·Q`) consensus substrate. Last-writer-wins;
-    /// rebuilt from the redo log on replay. `None` until the first projection writes it.
-    ///
-    /// Per-token × heads × words, so hundreds of KB a turn — shared for the
-    /// same reason as `projection_events`.
-    pub wide_q_sigs: Option<Arc<[u8]>>,
+    /// Latest `ProjectionEvents` record (opaque JSON bytes — the projection
+    /// layer decodes): held until this process's append lands, then where the
+    /// log keeps it ([`Located`]). Scans read its [`EventsDigest`], decoded
+    /// once; the bytes are read back only for a replay.
+    pub projection_events: Option<Located>,
+    /// Opaque encoded wide-Q signature window (`provenance::wide_sig`) for this
+    /// turn's most recent (re)projection — the decode→decode (`Q·Q`) consensus
+    /// substrate. Last-writer-wins; `None` until the first projection writes
+    /// it. Per-token × heads × words, so hundreds of KB a turn: held until this
+    /// process's append lands, then where the log keeps it ([`Located`]).
+    pub wide_q_sigs: Option<Located>,
+    /// The stamp the substrate gave `wide_q_sigs`' value when it was written —
+    /// what a window's residency fingerprint is taken from. A relocation or a
+    /// settle keeps it; a new value takes a new one.
+    pub sig_stamp: u64,
+    /// `wide_q_sigs`' header, read from the record's first bytes once and kept:
+    /// what sizes the window on every scan without its tokens. Belongs to the
+    /// value it was read from, like `events_digest`.
+    pub sig_head: OnceLock<Option<SigHead>>,
     /// The QSA index page of a turn or a prompt section — the compressed index
     /// rows covering exactly its tokens, as sealed. Last-writer-wins, rebuilt
     /// from the redo log on replay, `None` for a piece sealed by a model that

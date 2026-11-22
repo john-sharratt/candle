@@ -46,14 +46,23 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
         turns += 1;
-        if let Some(b) = &e.projection_events {
-            let n = decode_events(b).len();
+        if let Some(b) = e
+            .projection_events
+            .as_ref()
+            .and_then(|v| substrate.located_bytes(v, e.ids.projection_events).ok())
+        {
+            let n = decode_events(&b).len();
             if n > 0 {
                 with_proj += 1;
                 proj_event_counts.push(n);
             }
         }
-        if let Some(hist) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) {
+        if let Some(hist) = e
+            .wide_q_sigs
+            .as_ref()
+            .and_then(|v| substrate.located_bytes(v, e.ids.wide_q_sigs).ok())
+            .and_then(|b| decode_wide_sigs(&b))
+        {
             // Complete per-token wide sign(Q) history (the widened Signatures).
             wideq_tok_counts.push(hist.len());
             let nheads = hist.first().map(|t| t.n_heads as u32).unwrap_or(0);
@@ -121,16 +130,13 @@ fn main() -> anyhow::Result<()> {
     let call_close = find("</tool_call>");
 
     // Projection events + wide-Q window for this case.
-    let entry = substrate.stream_of(sid).unwrap();
-    let events = entry
-        .projection_events
-        .as_ref()
-        .map(|b| decode_events(b))
+    let events = substrate
+        .stream_projection_events(sid)?
+        .map(|b| decode_events(&b))
         .unwrap_or_default();
-    let history = entry
-        .wide_q_sigs
-        .as_ref()
-        .and_then(|b| decode_wide_sigs(b))
+    let history = substrate
+        .stream_wide_q_sigs(sid)?
+        .and_then(|b| decode_wide_sigs(&b))
         .unwrap_or_default();
 
     println!("\n=== CASE stream {}  ({n_tok} tokens) ===", sid.0);

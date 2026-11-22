@@ -110,7 +110,7 @@ fn build_engine(
 fn first_turn_sig_blob(engine: &ConversationEngine, timeline: TimelineId) -> Vec<u8> {
     let conv = engine.conversation();
     for _ in 0..100 {
-        if let Some(b) = conv.read().wide_q_sigs_blob(timeline, TurnIndex(0)) {
+        if let Ok(Some(b)) = conv.read().wide_q_sigs_blob(timeline, TurnIndex(0)) {
             if !b.is_empty() {
                 return b.to_vec();
             }

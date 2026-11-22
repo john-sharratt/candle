@@ -52,8 +52,8 @@ fn main() -> anyhow::Result<()> {
     let mut probe = {
         let sub = conv.read();
         let blob = sub
-            .stream_of(probe_id)
-            .and_then(|e| e.wide_q_sigs.clone())
+            .stream_wide_q_sigs(probe_id)
+            .expect("probe's wide_q_sigs read back")
             .expect("probe has no wide_q_sigs");
         decode_wide_sigs(&blob).expect("probe decodes")
     };

@@ -81,6 +81,7 @@ pub mod rebase;
 #[cfg(test)]
 mod rebase_tests;
 pub mod record;
+pub mod record_reader;
 pub mod recovery;
 pub mod relocation_watch;
 pub mod remote;

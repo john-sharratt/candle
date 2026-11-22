@@ -94,6 +94,12 @@ thread_local! {
     static IS_OWNER: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Whether the calling thread is a persistence owner, whose calls would wait
+/// for themselves.
+pub fn on_owner_thread() -> bool {
+    IS_OWNER.with(Cell::get)
+}
+
 /// A closure run on the log by the owner. Its result travels through the
 /// caller's own slot; `done` says it ran, or how it panicked.
 struct Call {
@@ -184,6 +190,7 @@ impl PersistenceOwner {
         let sealed = persistence.sealed_reader();
         let minter = persistence.minter();
         let facts = persistence.facts();
+        let payloads = Arc::clone(substrate.read().payloads());
         let owner = Arc::new(Self {
             calls,
             writes,
@@ -219,6 +226,9 @@ impl PersistenceOwner {
         owner
             .thread
             .store(Box::into_raw(Box::new(handle)), Ordering::Release);
+        // What the substrate cannot read lock-free — a record not yet durable,
+        // or one maintenance moved — it reads through this owner, by identity.
+        payloads.set_owner(&owner);
         owner
     }
 

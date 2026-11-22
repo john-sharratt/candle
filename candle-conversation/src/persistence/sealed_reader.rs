@@ -48,7 +48,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -154,6 +154,21 @@ pub struct SealedReader {
 impl SealedReader {
     pub(super) fn new(dir: PathBuf, active: ActiveSegment) -> SealedReader {
         SealedReader { dir, active }
+    }
+
+    /// A reader over the segment directory `dir` of a store no process is
+    /// writing — what a tool reads a stopped store with. Every segment in it
+    /// counts as sealed.
+    pub fn offline(dir: PathBuf) -> SealedReader {
+        SealedReader {
+            dir,
+            active: ActiveSegment::new(SegmentId(u64::MAX), 0),
+        }
+    }
+
+    /// The segment directory this reader reads.
+    pub(super) fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// How far the active `segment` is durable as of the latest publish.

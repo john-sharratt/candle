@@ -530,18 +530,95 @@ impl Substrate {
     }
 
     /// `stream_id`'s stored wide-Q window, sized and fingerprinted but not
-    /// decoded — it shares the stream's encoded buffer. `None` when the stream
-    /// has no signature, an empty one, or one a scan must not read (see
-    /// [`SigWindow::new`]).
+    /// decoded. `None` when the stream has no signature, an empty one, or one a
+    /// scan must not read (see [`SigWindow`]).
     ///
-    /// Nothing decoded is kept: a gallery resident on the device needs only the
-    /// window's length and fingerprint, and a caller that needs the tokens
-    /// decodes them for as long as it uses them ([`SigWindow::decode`]).
+    /// Sized from the record's header, read once and kept on the stream: a
+    /// gallery resident on the device needs only the window's length and
+    /// fingerprint, and a caller that needs the tokens reads them for as long
+    /// as it uses them ([`SigWindow::decode`]).
     pub fn wide_sig_window(&self, stream_id: StreamId) -> Option<SigWindow> {
-        self.streams
-            .get(stream_id)
-            .and_then(|e| e.wide_q_sigs.clone())
-            .and_then(SigWindow::new)
+        let stream = self.streams.get(stream_id)?;
+        let value = stream.wide_q_sigs.as_ref()?;
+        let id = stream.ids.wide_q_sigs;
+        // Only a header actually read is kept: a read that failed is tried
+        // again by the next scan rather than standing as "no window".
+        let head = match stream.sig_head.get() {
+            Some(head) => (*head)?,
+            None => {
+                let head = match value {
+                    Located::Held(blob) => SigHead::parse(blob),
+                    Located::Stored(loc) => match self.payloads.read_head(id, *loc, WIDE_HEADER) {
+                        Ok(head) => SigHead::parse(&head),
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "candle_conversation::provenance",
+                                stream_id = stream_id.0,
+                                "a stored signature window's header could not be read: {e}"
+                            );
+                            return None;
+                        }
+                    },
+                };
+                (*stream.sig_head.get_or_init(|| head))?
+            }
+        };
+        match value {
+            Located::Held(blob) => SigWindow::held(head, Arc::clone(blob), stream.sig_stamp),
+            Located::Stored(loc) => SigWindow::stored(
+                head,
+                StoredSig {
+                    source: Arc::clone(&self.payloads),
+                    id,
+                    loc: *loc,
+                },
+                stream.sig_stamp,
+            ),
+        }
+    }
+
+    /// The bytes of `value`, record `id`: held, or read back from the log.
+    pub fn located_bytes(
+        &self,
+        value: &Located,
+        id: RecordIdentity,
+    ) -> Result<Arc<[u8]>, PersistenceError> {
+        match value {
+            Located::Held(bytes) => Ok(Arc::clone(bytes)),
+            Located::Stored(loc) => self.payloads.read(id, *loc).map(Arc::from),
+        }
+    }
+
+    /// `stream_id`'s wide-Q signature record bytes, held or read back from the
+    /// log; `None` when it has none.
+    pub fn stream_wide_q_sigs(
+        &self,
+        stream_id: StreamId,
+    ) -> Result<Option<Arc<[u8]>>, PersistenceError> {
+        let Some(stream) = self.streams.get(stream_id) else {
+            return Ok(None);
+        };
+        stream
+            .wide_q_sigs
+            .as_ref()
+            .map(|v| self.located_bytes(v, stream.ids.wide_q_sigs))
+            .transpose()
+    }
+
+    /// `stream_id`'s projection-events record bytes, held or read back from
+    /// the log; `None` when it has none.
+    pub fn stream_projection_events(
+        &self,
+        stream_id: StreamId,
+    ) -> Result<Option<Arc<[u8]>>, PersistenceError> {
+        let Some(stream) = self.streams.get(stream_id) else {
+            return Ok(None);
+        };
+        stream
+            .projection_events
+            .as_ref()
+            .map(|v| self.located_bytes(v, stream.ids.projection_events))
+            .transpose()
     }
 
     /// The hybrid-logical-clock reading of the record that holds
@@ -589,17 +666,29 @@ impl Substrate {
         let Some(stream) = self.streams.get(stream_id) else {
             return Arc::default();
         };
-        stream
-            .events_digest
-            .get_or_init(|| {
-                let events = stream
-                    .projection_events
-                    .as_deref()
-                    .map(decode_events)
-                    .unwrap_or_default();
-                Arc::new(digest_events(&events))
-            })
-            .clone()
+        if let Some(digest) = stream.events_digest.get() {
+            return Arc::clone(digest);
+        }
+        let Some(value) = &stream.projection_events else {
+            return Arc::default();
+        };
+        // Only a digest of bytes actually read is kept: a read that failed is
+        // tried again by the next scan rather than standing as "no events".
+        match self.located_bytes(value, stream.ids.projection_events) {
+            Ok(bytes) => Arc::clone(
+                stream
+                    .events_digest
+                    .get_or_init(|| Arc::new(digest_events(&decode_events(&bytes)))),
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    target: "candle_conversation::provenance",
+                    stream_id = stream_id.0,
+                    "a turn's projection events could not be read back: {e}"
+                );
+                Arc::default()
+            }
+        }
     }
 
     /// True iff `stream_id` names a stream the substrate holds a record of.

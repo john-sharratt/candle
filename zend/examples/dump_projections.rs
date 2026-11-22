@@ -74,9 +74,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut total_events = 0usize;
     for (ti, sid) in &turns {
-        let blob = substrate
-            .stream_of(*sid)
-            .and_then(|s| s.projection_events.clone());
+        let blob = substrate.stream_projection_events(*sid)?;
         let Some(blob) = blob else {
             println!(
                 "\nturn_index {ti} (stream {})  — NO projection_events record",

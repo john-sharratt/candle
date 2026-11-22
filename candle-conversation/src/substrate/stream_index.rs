@@ -38,7 +38,7 @@ use crate::projection::TurnIndex;
 
 use super::pcoll::{PMap, POrdMap, POrdSet};
 use super::stamps::take;
-use super::{IndexPage, StreamRuntime};
+use super::{IndexPage, Located, StreamRuntime};
 use crate::persistence::segment::SegmentId;
 
 /// A declared turn's stream, as callers address it.
@@ -304,6 +304,11 @@ impl StreamIndex {
     /// left holding nothing. What a rewrite does with whatever it did not
     /// carry forward ([`crate::persistence::rewritten::Rewritten::settle`]).
     pub fn drop_segments(&mut self, old: &HashSet<SegmentId>) {
+        let located_in_old = |v: &Option<Located>| {
+            v.as_ref()
+                .and_then(Located::stored)
+                .is_some_and(|l| old.contains(&l.segment))
+        };
         let in_old = |rt: &StreamRuntime| {
             rt.chunks.values().any(|l| old.contains(&l.segment))
                 || rt.tokens.is_some_and(|l| old.contains(&l.segment))
@@ -312,6 +317,8 @@ impl StreamIndex {
                     .as_ref()
                     .and_then(IndexPage::stored)
                     .is_some_and(|l| old.contains(&l.segment))
+                || located_in_old(&rt.wide_q_sigs)
+                || located_in_old(&rt.projection_events)
         };
         let touched: Vec<StreamKey> = self
             .iter_physical()
@@ -342,6 +349,16 @@ impl StreamIndex {
                 if page_in_old {
                     rt.index_page = None;
                     rt.ids.index_page = RecordIdentity::NONE;
+                }
+                if located_in_old(&rt.wide_q_sigs) {
+                    rt.wide_q_sigs = None;
+                    rt.ids.wide_q_sigs = RecordIdentity::NONE;
+                    rt.sig_head = OnceLock::new();
+                }
+                if located_in_old(&rt.projection_events) {
+                    rt.projection_events = None;
+                    rt.ids.projection_events = RecordIdentity::NONE;
+                    rt.events_digest = OnceLock::new();
                 }
             }
             self.drop_if_empty(key);

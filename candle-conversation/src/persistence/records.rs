@@ -105,13 +105,16 @@ impl SubstratePersistence {
     }
 
     /// Append a turn's `ProjectionEvents` record `id` (opaque JSON payload).
+    ///
+    /// Returns the record's location, which the writer settles the substrate's
+    /// held copy to ([`crate::substrate::Substrate::apply_projection_events_loc`]).
     pub fn append_projection_events(
         &mut self,
         stream_id: StreamId,
         payload: &[u8],
         id: RecordIdentity,
-    ) -> Result<()> {
-        self.append_carried(
+    ) -> Result<RecordLoc> {
+        let at = self.append_carried(
             RecordType::ProjectionEvents,
             0,
             stream_id.0,
@@ -121,19 +124,22 @@ impl SubstratePersistence {
             payload,
             id,
         )?;
-        Ok(())
+        Ok(at.loc(payload.len() as u64))
     }
 
     /// Append a turn's `WideQSig` record `id` (opaque wide-Q window payload),
     /// keyed by stream id.
+    ///
+    /// Returns the record's location, which the writer settles the substrate's
+    /// held copy to ([`crate::substrate::Substrate::apply_wide_q_sigs_loc`]).
     pub fn append_wide_q_sigs(
         &mut self,
         stream_id: StreamId,
         payload: &[u8],
         id: RecordIdentity,
-    ) -> Result<()> {
-        self.append_carried(RecordType::WideQSig, 0, stream_id.0, 0, 0, 0, payload, id)?;
-        Ok(())
+    ) -> Result<RecordLoc> {
+        let at = self.append_carried(RecordType::WideQSig, 0, stream_id.0, 0, 0, 0, payload, id)?;
+        Ok(at.loc(payload.len() as u64))
     }
 
     /// Append a turn's QSA index page, record `id` (opaque payload), keyed by

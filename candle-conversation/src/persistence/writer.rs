@@ -274,13 +274,18 @@ pub(super) fn process(
             payload,
             identity,
         } => {
-            if let Err(e) = p.append_wide_q_sigs(stream_id, &payload, identity) {
-                p.mark_unwritten(identity);
-                tracing::error!(
-                    target: "candle_conversation::persistence::writer",
-                    stream_id = stream_id.0,
-                    "wide-Q sigs append failed: {e}"
-                );
+            // Settled to the record's location once appended, as an index page
+            // is: from here a scan reads it back from the log.
+            match p.append_wide_q_sigs(stream_id, &payload, identity) {
+                Ok(loc) => substrate.update(|s| s.apply_wide_q_sigs_loc(stream_id, loc, identity)),
+                Err(e) => {
+                    p.mark_unwritten(identity);
+                    tracing::error!(
+                        target: "candle_conversation::persistence::writer",
+                        stream_id = stream_id.0,
+                        "wide-Q sigs append failed: {e}"
+                    );
+                }
             }
         }
         WriteJob::TurnIndexPage {
@@ -308,8 +313,11 @@ pub(super) fn process(
             stream_id,
             payload,
             identity,
-        } => {
-            if let Err(e) = p.append_projection_events(stream_id, &payload, identity) {
+        } => match p.append_projection_events(stream_id, &payload, identity) {
+            Ok(loc) => {
+                substrate.update(|s| s.apply_projection_events_loc(stream_id, loc, identity))
+            }
+            Err(e) => {
                 p.mark_unwritten(identity);
                 tracing::error!(
                     target: "candle_conversation::persistence::writer",
@@ -317,7 +325,7 @@ pub(super) fn process(
                     "projection events append failed: {e}"
                 );
             }
-        }
+        },
         WriteJob::ConvMeta {
             record,
             payload,

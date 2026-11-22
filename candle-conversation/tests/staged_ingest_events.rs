@@ -106,8 +106,8 @@ fn staged_events_reference_their_turn_and_survive_reload() {
         {
             let read = conv.read();
             let blob = read
-                .stream_of(stream_id)
-                .and_then(|s| s.projection_events.clone())
+                .stream_projection_events(stream_id)
+                .expect("the events read back")
                 .expect("events mirrored into the live substrate");
             assert_eq!(decode_events(&blob), events.to_vec());
         }
@@ -121,7 +121,11 @@ fn staged_events_reference_their_turn_and_survive_reload() {
     let stream_id = turn_stream_id(timeline.raw(), 1);
     let read = conv.read();
     let entry = read.stream_of(stream_id).expect("stream recovered");
-    let events = decode_events(entry.projection_events.as_ref().expect("events recovered"));
+    let blob = read
+        .stream_projection_events(stream_id)
+        .expect("the events read back from the log")
+        .expect("events recovered");
+    let events = decode_events(&blob);
     assert_eq!(events.len(), 2, "user-half + assistant-half events");
     let self_ref = events[0]
         .selection

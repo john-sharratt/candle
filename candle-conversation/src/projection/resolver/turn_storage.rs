@@ -276,9 +276,13 @@ impl Conversation {
         if self.read_only {
             return Ok(());
         }
-        self.persistence
+        let loc = self
+            .persistence
             .call(|p| p.append_wide_q_sigs(stream_id, payload, identity))
-            .map_err(|e| candle::Error::Msg(format!("persist wide-Q sigs: {e}")))
+            .map_err(|e| candle::Error::Msg(format!("persist wide-Q sigs: {e}")))?;
+        // Appended: the substrate holds where it is, not its bytes.
+        self.update(|s| s.apply_wide_q_sigs_loc(stream_id, loc, identity));
+        Ok(())
     }
 
     /// Persist a turn's QSA index page to the redo log (`TurnIndexPage`,

@@ -342,7 +342,9 @@ fn fold_provenance_with(raw: &WideQSig, params: FoldParams) -> WideQSig {
 /// compatibility path: it is the only fold that ever wrote one.
 const WIDE_MAGIC_PREFIX: &[u8; 3] = b"WQS";
 const WIDE_VERSION_CURRENT: u8 = b'5';
-const WIDE_HEADER: usize = 20;
+/// The longest record header any version writes: the bytes a reader needs to
+/// size a window without reading its tokens.
+pub(crate) const WIDE_HEADER: usize = 20;
 
 /// Everything one record's header carries.
 pub(super) struct WideHeader {

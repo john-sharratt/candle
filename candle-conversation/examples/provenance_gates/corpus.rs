@@ -118,7 +118,8 @@ pub fn questions(sub: &Substrate) -> HashMap<u64, Vec<Question>> {
         let sigs = e
             .wide_q_sigs
             .as_ref()
-            .and_then(|b| decode_wide_sigs(b))
+            .and_then(|v| sub.located_bytes(v, e.ids.wide_q_sigs).ok())
+            .and_then(|b| decode_wide_sigs(&b))
             .unwrap_or_default();
         if sigs.is_empty() {
             continue;
@@ -180,7 +181,8 @@ pub fn load(
         let sigs = e
             .wide_q_sigs
             .as_ref()
-            .and_then(|b| decode_wide_sigs(b))
+            .and_then(|v| sub.located_bytes(v, e.ids.wide_q_sigs).ok())
+            .and_then(|b| decode_wide_sigs(&b))
             .unwrap_or_default();
         found.push((
             d.layer_id,

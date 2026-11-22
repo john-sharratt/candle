@@ -67,7 +67,12 @@ fn main() {
         let Some(StreamDecl::Turn(d)) = e.decl.as_ref() else {
             continue;
         };
-        if let Some(sig) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) {
+        if let Some(sig) = e
+            .wide_q_sigs
+            .as_ref()
+            .and_then(|v| sub.located_bytes(v, e.ids.wide_q_sigs).ok())
+            .and_then(|b| decode_wide_sigs(&b))
+        {
             if !sig.is_empty() {
                 by_tl
                     .entry(d.timeline_id)

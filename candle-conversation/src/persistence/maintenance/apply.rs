@@ -34,7 +34,7 @@ impl SubstratePersistence {
             resident,
             chunk_relocs,
             token_relocs,
-            index_page_relocs: ix.gather_index_page_relocs(substrate, &op.targets()),
+            located_relocs: ix.gather_located_relocs(substrate, &op.targets()),
             snapshot_relocs,
             branch_checkpoint_relocs,
             singleton_relocs,

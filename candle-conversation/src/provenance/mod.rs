@@ -56,7 +56,7 @@ pub use scan::{
     score_provenance_late_fusion_weighted, FOLD_GROUPS,
 };
 pub use selection::{GroupBudget, SectionPolicy, SectionSelector};
-pub use sig_window::SigWindow;
+pub use sig_window::{SigHead, SigWindow, StoredSig};
 pub use vote_law::VoteLaw;
 pub use wide_sig::{
     active_fold, decode_wide_sigs, decode_wide_sigs_for_scoring, encode_wide_sigs,

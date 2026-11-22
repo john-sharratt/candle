@@ -35,10 +35,11 @@ pub struct MaintenancePlan {
     pub(super) chunk_relocs: Vec<(StreamKey, u64, ChunkLoc)>,
     /// `(stream, source_loc)` `Tokens` records to relocate.
     pub(super) token_relocs: Vec<(StreamKey, RecordLoc)>,
-    /// `(stream, source_loc)` QSA index pages held in the log to relocate —
+    /// `(stream, type, source_loc)` located per-stream records — index pages,
+    /// signature windows, projection events — held in the log to relocate:
     /// carried by location like `Tokens`, since their bytes are not in RAM
-    /// (`IndexPage::Stored`).
-    pub(super) index_page_relocs: Vec<(StreamKey, RecordLoc)>,
+    /// (`IndexPage::Stored`, `Located::Stored`).
+    pub(super) located_relocs: Vec<(StreamKey, RecordType, RecordLoc)>,
     /// `(snapshot stream, source_loc)` recurrent-state snapshots to relocate.
     pub(super) snapshot_relocs: Vec<(StreamId, RecordLoc)>,
     /// `(branch stream, source_loc)` prompt branch checkpoints to relocate.
@@ -124,10 +125,10 @@ impl MaintenancePlan {
             let (seg, off) = (old.segment, old.offset);
             record(StrandedKind::Tokens, key.stream_id, key.writer, 0, seg, off)
         });
-        let pages = self.index_page_relocs.iter().map(|(key, old)| {
+        let located = self.located_relocs.iter().map(|(key, rt, old)| {
             let (seg, off) = (old.segment, old.offset);
             record(
-                StrandedKind::IndexPage,
+                StrandedKind::of_located(*rt),
                 key.stream_id,
                 key.writer,
                 0,
@@ -146,7 +147,7 @@ impl MaintenancePlan {
         let mut out = Stranded::default();
         for r in chunks
             .chain(tokens)
-            .chain(pages)
+            .chain(located)
             .chain(snapshots)
             .chain(branches)
             .filter(|r| r.named_in(substrate))
@@ -295,7 +296,7 @@ impl LiveIndexes {
         let npc_relocs = self.npc_relocations(&op.targets());
         let vfs_relocs = self.vfs_relocations(substrate, &op.targets());
         let blob_relocs = self.blob_relocations(&op.targets());
-        let index_page_relocs = self.gather_index_page_relocs(substrate, &op.targets());
+        let located_relocs = self.gather_located_relocs(substrate, &op.targets());
         let relocs_ms = t_relocs.elapsed().as_millis() as u64;
         // What this op carries off the target segments, by type. The incremental
         // path is the one that actually runs on a busy store — the 143 GB store
@@ -340,7 +341,7 @@ impl LiveIndexes {
             npcs = npc_relocs.len(),
             vfs = vfs_relocs.len(),
             blobs = blob_relocs.len(),
-            index_pages = index_page_relocs.len(),
+            located = located_relocs.len(),
             liveness_ms,
             resident_ms,
             relocs_ms,
@@ -353,7 +354,7 @@ impl LiveIndexes {
             resident,
             chunk_relocs,
             token_relocs,
-            index_page_relocs,
+            located_relocs,
             snapshot_relocs,
             branch_checkpoint_relocs,
             singleton_relocs,

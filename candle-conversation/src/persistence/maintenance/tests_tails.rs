@@ -311,11 +311,12 @@ pub(super) mod tests {
         assert_eq!(plan.op(), MaintenanceOp::Compact(SegmentId(1)));
         let result = sp.execute_maintenance(&plan).unwrap();
         assert_eq!(
-            result.index_page_updates.len(),
+            result.located_updates.len(),
             1,
             "the live page, and only it"
         );
-        let (_, from, to) = result.index_page_updates[0];
+        let ((_, rt), from, to) = result.located_updates[0];
+        assert_eq!(rt, RecordType::TurnIndexPage);
         assert_eq!(from, old);
         assert_ne!(
             to.segment,
@@ -346,6 +347,154 @@ pub(super) mod tests {
             reloaded.read_with(&mut sp),
             page,
             "the seal's bytes, after a reload"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A turn's signature window and projection events, left in the log,
+    /// survive a segment's maintenance byte for byte, and the window is not
+    /// re-stamped.** Recovered, both are located, not held; a compaction of the
+    /// segment holding them relocates each record by location and repoints the
+    /// substrate at the copy. The bytes read there — and after a reload — are
+    /// exactly the bytes written, and the window's fingerprint is the one it
+    /// had before the move, so a resident gallery uploads nothing again.
+    #[test]
+    fn located_signatures_and_events_relocate_byte_for_byte() {
+        use crate::provenance::{encode_wide_sigs, WideQSig};
+        use crate::substrate::Located;
+
+        let dir = tmp_dir("located_sig_reloc");
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: 5151,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 1,
+            block_start: 0,
+            block_end: 1,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        let sid = decl.stream_id();
+        let window: Vec<WideQSig> = (0..5u64)
+            .map(|t| WideQSig {
+                n_heads: 12,
+                words: (0..24).map(|w| t * 1_000 + w).collect(),
+            })
+            .collect();
+        let sigs = encode_wide_sigs(&window);
+        let events: Vec<u8> = (0..1_300u32).map(|i| (i % 211) as u8).collect();
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            sp.declare_stream(&decl).unwrap();
+            // Superseded copies first — the dead weight that qualifies seg 1
+            // for a compaction — then the live records it carries.
+            sp.append_wide_q_sigs(sid, &[1, 2, 3], sp.mint_for(RecordType::WideQSig, sid))
+                .unwrap();
+            sp.append_projection_events(sid, b"[]", sp.mint_for(RecordType::ProjectionEvents, sid))
+                .unwrap();
+            sp.append_wide_q_sigs(sid, &sigs, sp.mint_for(RecordType::WideQSig, sid))
+                .unwrap();
+            sp.append_projection_events(
+                sid,
+                &events,
+                sp.mint_for(RecordType::ProjectionEvents, sid),
+            )
+            .unwrap();
+            sp.commit().unwrap();
+            sp.seal_active().unwrap();
+        }
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        let stream = substrate.stream_of(sid).expect("the stream recovers");
+        let old_sigs = stream
+            .wide_q_sigs
+            .as_ref()
+            .and_then(Located::stored)
+            .expect("recovered, the window is located, not held");
+        let old_events = stream
+            .projection_events
+            .as_ref()
+            .and_then(Located::stored)
+            .expect("recovered, the events are located, not held");
+        assert_eq!(old_sigs.segment, SegmentId(1));
+        assert_eq!(old_events.segment, SegmentId(1));
+        let before = substrate
+            .wide_sig_window(sid)
+            .expect("the window is sized from its header");
+        assert_eq!(
+            before.decode(),
+            window,
+            "the written window, before relocation"
+        );
+
+        let plan = sp
+            .plan_maintenance(&substrate, true)
+            .unwrap()
+            .expect("seg 1 carries superseded records, force-compact qualifies");
+        assert_eq!(plan.op(), MaintenanceOp::Compact(SegmentId(1)));
+        let result = sp.execute_maintenance(&plan).unwrap();
+        let moved: Vec<(RecordType, RecordLoc, RecordLoc)> = result
+            .located_updates
+            .iter()
+            .map(|((_, rt), from, to)| (*rt, *from, *to))
+            .collect();
+        let types: Vec<RecordType> = moved.iter().map(|(rt, _, _)| *rt).collect();
+        assert_eq!(types.len(), 2, "the live window and events, and only them");
+        assert!(types.contains(&RecordType::WideQSig));
+        assert!(types.contains(&RecordType::ProjectionEvents));
+        for (rt, from, to) in &moved {
+            let old = if *rt == RecordType::WideQSig {
+                old_sigs
+            } else {
+                old_events
+            };
+            assert_eq!(*from, old);
+            assert_ne!(
+                to.segment,
+                SegmentId(1),
+                "relocated off the compacted segment"
+            );
+        }
+        let stranded = result.apply_to_substrate(&plan, &mut substrate);
+        sp.finish_maintenance(&plan, &stranded).unwrap().unlink();
+        assert!(!sealed_log(&dir, 1).exists(), "seg 1 compacted away");
+
+        let after = substrate
+            .wide_sig_window(sid)
+            .expect("the window survives the compaction");
+        assert_eq!(
+            after.fingerprint(),
+            before.fingerprint(),
+            "a moved window keeps its stamp: nothing re-uploads"
+        );
+        assert_eq!(
+            after.decode(),
+            window,
+            "the written window, after relocation"
+        );
+        assert_eq!(
+            &substrate.stream_projection_events(sid).unwrap().unwrap()[..],
+            events.as_slice(),
+            "the written events, after relocation"
+        );
+        drop(sp);
+
+        let mut substrate = Substrate::new();
+        let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        assert_eq!(
+            &substrate.stream_wide_q_sigs(sid).unwrap().unwrap()[..],
+            sigs.as_slice(),
+            "the written window, after a reload"
+        );
+        assert_eq!(
+            &substrate.stream_projection_events(sid).unwrap().unwrap()[..],
+            events.as_slice(),
+            "the written events, after a reload"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

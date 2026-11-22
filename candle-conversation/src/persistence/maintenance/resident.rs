@@ -93,7 +93,10 @@ pub(in super::super) fn gather_resident_set(
             });
         }
         if keep_sig {
-            if let Some(p) = &entry.projection_events {
+            // Only a value this process still holds is re-emitted from RAM; one
+            // left in the log is relocated by location, like the turn's tokens
+            // ([`SubstratePersistence::gather_located_relocs`]).
+            if let Some(Located::Held(p)) = &entry.projection_events {
                 out.push(Resident {
                     rt: RecordType::ProjectionEvents,
                     stream_id: stream_id.0,
@@ -102,7 +105,7 @@ pub(in super::super) fn gather_resident_set(
                     id: entry.ids.projection_events,
                 });
             }
-            if let Some(p) = &entry.wide_q_sigs {
+            if let Some(Located::Held(p)) = &entry.wide_q_sigs {
                 out.push(Resident {
                     rt: RecordType::WideQSig,
                     stream_id: stream_id.0,
@@ -113,10 +116,7 @@ pub(in super::super) fn gather_resident_set(
             }
             // The index page rides with the turn's K/V: a turn that survives
             // relocation with its chunks but loses its page comes back
-            // borrowable and unindexable. Only a page this process holds is
-            // re-emitted from RAM; one left in the log is relocated, by
-            // location, like the turn's tokens
-            // ([`SubstratePersistence::gather_index_page_relocs`]).
+            // borrowable and unindexable. It is held or located the same way.
             if let Some(IndexPage::Resident(p)) = &entry.index_page {
                 out.push(Resident {
                     rt: RecordType::TurnIndexPage,

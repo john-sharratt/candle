@@ -80,7 +80,12 @@ fn main() -> anyhow::Result<()> {
         if !matches!(e.decl, Some(StreamDecl::Turn(_))) {
             continue;
         }
-        let Some(hist) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+        let Some(hist) = e
+            .wide_q_sigs
+            .as_ref()
+            .and_then(|v| substrate.located_bytes(v, e.ids.wide_q_sigs).ok())
+            .and_then(|b| decode_wide_sigs(&b))
+        else {
             continue;
         };
         let n_tok = persistence
@@ -143,7 +148,12 @@ fn main() -> anyhow::Result<()> {
         let Some(StreamDecl::Turn(d)) = &e.decl else {
             continue;
         };
-        let Some(hist) = e.wide_q_sigs.as_ref().and_then(|b| decode_wide_sigs(b)) else {
+        let Some(hist) = e
+            .wide_q_sigs
+            .as_ref()
+            .and_then(|v| substrate.located_bytes(v, e.ids.wide_q_sigs).ok())
+            .and_then(|b| decode_wide_sigs(&b))
+        else {
             continue;
         };
         let Some(ids) = persistence
