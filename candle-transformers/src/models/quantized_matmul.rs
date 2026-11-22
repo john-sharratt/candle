@@ -111,9 +111,9 @@ pub struct QMatMul {
     /// On the weight because that is where the model can say it once, at load, for
     /// every matmul in a stack: `forward_live_as` quantizes the activation itself,
     /// so unlike [`Self::forward_dynamic`] there is no operand to read the
-    /// convention off. [`SumScale::Raw`] is the default; a model whose activations
-    /// can overflow f16 on a block sum sets [`SumScale::ByAmax`] via
-    /// [`Self::with_sum_scale`], as Qwen3.8-Flash-Next and Z-Image do.
+    /// convention off. [`SumScale::Raw`] is the default and is what every language
+    /// model here uses; a model whose activations can overflow f16 on a block sum
+    /// sets [`SumScale::ByAmax`] via [`Self::with_sum_scale`].
     sum_scale: SumScale,
 }
 

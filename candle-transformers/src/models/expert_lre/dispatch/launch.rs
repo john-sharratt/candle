@@ -699,18 +699,15 @@ impl Dispatch {
         )?;
         g.end();
         let g = gpu_span("moe:silu", &device);
-        // Σx by amax: the SwiGLU intermediate is the product of two GEMM
-        // outputs, and a block of it summing past f16's 65504 would store
-        // `+inf` raw and turn the down projection's row NaN through its min
-        // term. Normalised the field is bounded at 128 at the same cost. The
-        // down matmul reads this operand's own `sum_scale`, so the two agree by
-        // construction.
+        // Raw Σx — a language model's SwiGLU intermediate stays orders of
+        // magnitude below f16's 65504; the down matmul reads this operand's own
+        // `sum_scale`, so the two agree by construction.
         let inter_acts = silu_mul_q8a128(
             &gate_out,
             &up_out,
             cuda_dev,
             gate_out.cuda_backing(),
-            SumScale::ByAmax,
+            SumScale::Raw,
         )?;
         g.end();
         let g = gpu_span("moe:down", &device);

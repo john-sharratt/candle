@@ -21,7 +21,7 @@
 use candle::quantized::cuda::DynamicActs;
 #[cfg(feature = "cuda")]
 use candle::quantized::cuda::{silu_mul_q8a128, DynamicTensor};
-use candle::quantized::{GgmlDType, Int8Mode, QTensor, SumScale};
+use candle::quantized::{GgmlDType, Int8Mode, QTensor};
 #[cfg(feature = "cuda")]
 use candle::Device;
 use candle::{DType, LiveTensor, Module, Result, Tensor};
@@ -195,18 +195,6 @@ impl QuantizedMlp {
             act_fn: Activation::Silu,
             span: tracing::span!(tracing::Level::TRACE, "mlp"),
         })
-    }
-
-    /// Declare how every projection's activation stores its per-128 `Σx` —
-    /// [`QMatMul::with_sum_scale`] on each, so the intermediate the down
-    /// projection quantizes follows the model's convention too.
-    pub fn with_sum_scale(mut self, sum_scale: SumScale) -> Self {
-        let set = |m: Option<QMatMul>| m.map(|m| m.with_sum_scale(sum_scale));
-        self.gate_up_proj = set(self.gate_up_proj.take());
-        self.gate_proj = set(self.gate_proj.take());
-        self.up_proj = set(self.up_proj.take());
-        self.down_proj = self.down_proj.with_sum_scale(sum_scale);
-        self
     }
 
     /// The fused `[gate|up]` weight, when fusion applied.

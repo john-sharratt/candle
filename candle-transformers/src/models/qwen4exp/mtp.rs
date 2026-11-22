@@ -57,7 +57,6 @@ use super::config::Qwen4ExpConfig;
 use super::engine::GpuLayer;
 use super::hyper::ko::HcWeightsKo;
 use super::hyper::{hc_grouped_norm, hc_mix, HcWeights};
-use super::sum_scale::ACT_SUM_SCALE;
 use crate::models::latent_moe::GgufModel;
 use crate::models::quantized_matmul::{QMatMul, WeightResidency};
 use crate::quantized_nn::RmsNorm;
@@ -198,10 +197,8 @@ impl MtpDense {
             // session runs them on the KO path, which quantizes each operand
             // beside the rows it reads — on the phase that prices it — where the
             // GGML path quantized into a pool scratch on every call.
-            fc_embedding: QMatMul::from_qtensor_with_mode(fc_embedding, int8mode)?
-                .with_sum_scale(ACT_SUM_SCALE),
-            fc_hidden: QMatMul::from_qtensor_with_mode(fc_hidden, int8mode)?
-                .with_sum_scale(ACT_SUM_SCALE),
+            fc_embedding: QMatMul::from_qtensor_with_mode(fc_embedding, int8mode)?,
+            fc_hidden: QMatMul::from_qtensor_with_mode(fc_hidden, int8mode)?,
         };
         let mixer = HcWeightsKo::from_weights(
             &HcWeights::from_checkpoint(
@@ -220,7 +217,6 @@ impl MtpDense {
                 WeightResidency::Span,
                 DRAFT_LM_HEAD_FORMAT,
             )?
-            .with_sum_scale(ACT_SUM_SCALE)
         } else {
             trunk_lm_head.clone()
         };

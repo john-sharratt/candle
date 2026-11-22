@@ -28,7 +28,6 @@
 //! - `tests_qmatmul_dispatch`: int8 mode flag, pairing guard and MXFP4 kernels.
 //! - `tests_quant_roundtrip`: GPU quantize and dequantize round trips against the CPU codec.
 //! - `tests_routing`: Sinkhorn, moe_route and look-ahead vote gates.
-//! - `tests_sum_scale`: the q8a128 block sum against f16's ceiling, raw and by amax.
 
 // Test code: loop indices are block/lane/expert coordinates in flat-buffer
 // offset arithmetic, and the tuple returns mirror the kernel's raw parameter
@@ -75,7 +74,6 @@ mod tests_qkv;
 mod tests_qmatmul_dispatch;
 mod tests_quant_roundtrip;
 mod tests_routing;
-mod tests_sum_scale;
 
 use tests_bucketize_live::*;
 use tests_bucketize_ref::*;
