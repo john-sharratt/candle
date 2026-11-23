@@ -163,6 +163,9 @@ impl Zend {
             .pointer("/usage/completion_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        if answered_nothing(&text, completion_tokens) {
+            bail!("the turn answered nothing: no text and no tokens decoded");
+        }
         let history = self.get_json(&self.path(conv_id, "")).await?;
         let think = thinking_of(&history);
         let placements = self.get_json(&self.path(conv_id, "/placements")).await?;
@@ -189,6 +192,13 @@ impl Zend {
     pub async fn sample(&self, path: &str) -> anyhow::Result<Value> {
         self.get_json(&format!("{}{path}", self.base)).await
     }
+}
+
+/// Whether a reply is no answer at all: nothing said and nothing decoded — a
+/// turn the daemon declined without saying why, which is a failure to retry,
+/// never a score of zero.
+pub fn answered_nothing(text: &str, completion_tokens: u64) -> bool {
+    text.trim().is_empty() && completion_tokens == 0
 }
 
 /// The reasoning length of a history's last assistant bubble that carries one.
@@ -249,6 +259,14 @@ mod tests {
                 "seed": false, "projection": "full", "reprojection": "held",
             })
         );
+    }
+
+    #[test]
+    fn an_empty_reply_is_no_answer() {
+        assert!(answered_nothing("", 0));
+        assert!(answered_nothing("  \n", 0));
+        assert!(!answered_nothing("", 12), "decoded tokens are an answer");
+        assert!(!answered_nothing("I do not remember.", 5));
     }
 
     #[test]

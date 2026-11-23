@@ -13,6 +13,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -128,11 +129,25 @@ pub fn scored(
     }
 }
 
-/// Ask one job to its line: tried on a fresh conversation each time — cleared
-/// of anything an interrupted run left on it, and deleted once read.
+/// The tag one launch names its conversations with: its start, in hex
+/// seconds. A deleted conversation's id is tombstoned for good, so no launch
+/// may ask on an id another used — a run taken up again after an interruption
+/// asks every answer it still owes on ids of its own.
+pub fn launch_tag(unix_secs: u64) -> String {
+    format!("{unix_secs:x}")
+}
+
+/// The id one try of one question takes under launch `tag`.
+pub fn attempt_id(qid: &str, tag: &str, attempt: u32) -> String {
+    format!("{qid}-{tag}-a{attempt}")
+}
+
+/// Ask one job to its line: tried on a fresh conversation each time, deleted
+/// once read.
 async fn answer_job(
     zend: &Zend,
     plan_thread: &str,
+    tag: &str,
     q: &Question,
     job: Job,
     vocabulary: &HashSet<String>,
@@ -140,16 +155,12 @@ async fn answer_job(
     let prompt = format!("{PREFIX}\n\n{}", q.question);
     let mut last_error = String::new();
     for attempt in 1..=TRIES {
-        let id = format!("{}-a{attempt}", q.id);
-        let conv = conv_id(plan_thread, job.arm, job.run, &id);
-        // A run stopped mid-answer leaves that answer's conversation behind;
-        // asked again on it, the question would follow its own first try.
-        if let Err(e) = zend.delete(&conv).await {
-            tracing::warn!(
-                conv,
-                "a conversation left by an earlier run was not cleared: {e:#}"
-            );
-        }
+        let conv = conv_id(
+            plan_thread,
+            job.arm,
+            job.run,
+            &attempt_id(&q.id, tag, attempt),
+        );
         let asked = zend.ask(&conv, &prompt, job.arm).await;
         if let Err(e) = zend.delete(&conv).await {
             tracing::warn!(conv, "the conversation was not deleted: {e:#}");
@@ -233,6 +244,13 @@ pub async fn run(plan: Plan<'_>) -> anyhow::Result<()> {
     let questions = Arc::new(plan.questions);
     let vocabulary = Arc::new(plan.vocabulary);
     let thread = plan.thread.to_string();
+    let tag = Arc::new(launch_tag(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    ));
+    println!("this launch's conversations are tagged {tag}");
     let total = jobs.len();
     let finished = Arc::new(AtomicUsize::new(0));
     let mut tasks = Vec::with_capacity(total);
@@ -247,10 +265,11 @@ pub async fn run(plan: Plan<'_>) -> anyhow::Result<()> {
             Arc::clone(&finished),
             thread.clone(),
         );
+        let tag = Arc::clone(&tag);
         tasks.push(tokio::spawn(async move {
             in_flight.fetch_add(1, Ordering::AcqRel);
             let q = &questions[job.question];
-            let line = answer_job(&zend, &thread, q, job, &vocabulary).await;
+            let line = answer_job(&zend, &thread, &tag, q, job, &vocabulary).await;
             in_flight.fetch_sub(1, Ordering::AcqRel);
             let n = finished.fetch_add(1, Ordering::AcqRel) + 1;
             println!(
@@ -339,6 +358,18 @@ mod tests {
         assert_eq!(l.missed, vec!["gpu.rs".to_string()]);
         assert_eq!(l.grounding, Some(1.0));
         assert_eq!(l.answer, "It is in `scan.rs`.");
+    }
+
+    /// **No two launches share a conversation id**: a deleted id is
+    /// tombstoned for good, so each launch's tries carry its own tag.
+    #[test]
+    fn each_launch_asks_on_ids_of_its_own() {
+        assert_eq!(launch_tag(0x6923_ab10), "6923ab10");
+        assert_eq!(attempt_id("t07", "6923ab10", 2), "t07-6923ab10-a2");
+        assert_ne!(
+            attempt_id("t07", &launch_tag(100), 1),
+            attempt_id("t07", &launch_tag(101), 1)
+        );
     }
 
     #[test]
