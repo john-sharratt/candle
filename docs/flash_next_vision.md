@@ -328,6 +328,35 @@ the same kind provenance projection already makes on every retrieved chunk,
 which is placed at a slot unrelated to where it was written; the gates (§9)
 measure what it costs.
 
+**Under projection, an image is one unit.** RoPE is applied at read time
+because projection re-places stored K/V at slots unrelated to where it was
+written. δ depends only on a row's place in its image, so it survives any
+placement: `R(slot_new)·R(δ) = R(slot_new + δ)`, and wherever the image
+lands its geometry is exact. That holds only for the image **whole**. If
+part of an image were placed without the rest, the gap would close up
+uniformly on all three axes, and on H and W a uniform shift reads as "those
+rows moved up and left": the image would come back with its pieces out of
+place.
+
+So projection never places part of an image, and today it holds by
+construction. The carving unit is one whole turn
+(`docs/hit_driven_projection.md` §8.1, "Whole turns, never records"; every
+unit of `dialogue_fill.rs` is whole turns), and an image lies inside its
+turn's user segment. The one place a turn is split, the reasoning split
+(`turn_layout/layout.rs`, which windows reasoning out on index-page
+boundaries), splits the assistant segment only. To keep it true:
+
+- `TurnDecl.images` spans are checked at seal to lie within the turn's one
+  real `User` segment, beside `validate_tiling`; a turn that breaks it is
+  refused at seal, not projected wrong later.
+- Anything that comes to carve finer than a turn (paging a long user
+  message, windowing a user segment) treats every image span as atomic: it
+  places the span whole or not at all. This is a rule of the turn layout,
+  stated with `TurnSegment::User`, not a convention of each carver.
+- QSA selection inside a slot is not a placement. It picks which cells a
+  query attends to without moving any, so attending to part of an image
+  sees that part at its exact positions.
+
 **What stays one-dimensional, and why.**
 
 - **The QSA indexer.** Its keys are pooled over four cells, normalised by a
@@ -469,6 +498,7 @@ vision is a 400.
 | `PrefillWork`, `SubmitTurn` | `image_spans` |
 | `turn_text.rs`, `turn_submitter.rs` | the image piece and its ids |
 | `persistence/streams.rs` | `TurnDecl.images` |
+| `turn_layout/` | image spans lie within the `User` segment, checked at seal beside `validate_tiling` |
 | preprocessing (new, `candle-conversation/src/vision/`) | decode, `smart_resize`, `PreparedImage` |
 | `zend/src/types.rs`, `api/chat.rs`, MCP | image parts, `image_upload`, `zen_chat_send.images` |
 | `engine_slot/capabilities.rs` | `vision` |
@@ -534,8 +564,10 @@ reference, at the trunk gates' tolerances.
   as last-position logit agreement and on the two tests above.
 - **Survival**: an image turn, a recurrent catch-up over it, a replicated
   member answering a follow-up about the image.
-- **Retrieval**: an image turn deep in a long conversation, asked about later
-  — the provenance path of §4.4.
+- **Retrieval**: an image turn deep in a long conversation, projected back
+  and asked the grid question — the image re-placed whole (§4.4), its
+  geometry exact at its new slot. Plus a seal-time test: a turn whose image
+  span crosses out of its user segment is refused.
 - **Text unchanged**: the existing gates and `/sweep`, bit-identical: a wave
   without virtual ids takes no new branch.
 
