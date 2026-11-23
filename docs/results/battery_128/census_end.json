@@ -1,0 +1,107 @@
+{
+  "chunks": 16013287,
+  "tokens": 505110776,
+  "stored_bytes": 295648027266,
+  "by_lead_format": {
+    "Q4_0": {
+      "chunks": 11008063,
+      "tokens": 345593988,
+      "bytes": 192729776530
+    },
+    "Q4_1": {
+      "chunks": 3007210,
+      "tokens": 95952825,
+      "bytes": 60584361228
+    },
+    "Q5_0": {
+      "chunks": 1680396,
+      "tokens": 53591468,
+      "bytes": 35352073320
+    },
+    "Q5_1": {
+      "chunks": 109712,
+      "tokens": 3414318,
+      "bytes": 2183276832
+    },
+    "Q8_0": {
+      "chunks": 201835,
+      "tokens": 6391608,
+      "bytes": 4579121274
+    },
+    "Q8_KS": {
+      "chunks": 6071,
+      "tokens": 166569,
+      "bytes": 219418082
+    }
+  },
+  "sample": {
+    "asked": 4096,
+    "unreadable": 1,
+    "tally": {
+      "chunks": 4150,
+      "tokens": 130824,
+      "formats": {
+        "Q1_S": {
+          "k_bands": 0,
+          "v_bands": 7041,
+          "bytes": 2253120
+        },
+        "Q2_A": {
+          "k_bands": 0,
+          "v_bands": 5187,
+          "bytes": 3319680
+        },
+        "Q2_S": {
+          "k_bands": 0,
+          "v_bands": 3003,
+          "bytes": 1729728
+        },
+        "Q3_0": {
+          "k_bands": 0,
+          "v_bands": 9087,
+          "bytes": 8141952
+        },
+        "Q3_1": {
+          "k_bands": 0,
+          "v_bands": 4123,
+          "bytes": 4221952
+        },
+        "Q4_0": {
+          "k_bands": 11167,
+          "v_bands": 2487,
+          "bytes": 15729408
+        },
+        "Q4_1": {
+          "k_bands": 5522,
+          "v_bands": 0,
+          "bytes": 7068160
+        },
+        "Q5_0": {
+          "k_bands": 6616,
+          "v_bands": 2209,
+          "bytes": 12425600
+        },
+        "Q5_1": {
+          "k_bands": 2206,
+          "v_bands": 0,
+          "bytes": 3388416
+        },
+        "Q8_0": {
+          "k_bands": 7681,
+          "v_bands": 63,
+          "bytes": 16850944
+        },
+        "Q8_KS": {
+          "k_bands": 8,
+          "v_bands": 0,
+          "bytes": 18432
+        }
+      },
+      "kv_bytes": 75147392,
+      "bf16_bytes": 271974400,
+      "side_bytes": 1518836,
+      "unresolved": 0
+    }
+  },
+  "bf16_bytes_estimate": 1048815064005
+}
