@@ -264,15 +264,14 @@ impl SubstratePersistence {
         // A relocated `Npc` record is that character's new on-disk home, for
         // exactly the same reason.
         self.track_npc_loc(header, segment, offset, size);
-        // A relocated QSA index page likewise: its copy is where the record is,
-        // and the segment liveness counts it from `metadata_locs`.
-        if header.record_type == RecordType::TurnIndexPage {
-            self.metadata_locs.offer(
-                metadata_key(header),
-                Some(Self::placed_loc(header, segment, offset, size)),
-                header.identity(),
-            );
-        }
+        // A relocated located record — a QSA index page, a signature window,
+        // a turn's projection events — likewise: its copy is where the record
+        // is, the segment liveness counts it from `metadata_locs`, and the
+        // next op carries it only if the map names the copy. Tracked for the
+        // index page alone, a relocated window or event record read as
+        // superseded at its next compaction, was stranded there, and kept its
+        // segment linked for good.
+        self.track_metadata_loc(header, segment, offset, size);
         // `Chunk` / `Tokens` are indexed on the substrate, not the manifest, so
         // no `manifest.ingest` — the caller repoints the substrate index.
         if header.record_type != RecordType::HeaderIndex {

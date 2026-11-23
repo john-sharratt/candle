@@ -499,6 +499,129 @@ pub(super) mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **A relocated signature window and its events are carried again by the
+    /// next compaction of the segment holding the copy.** The relocation's
+    /// verbatim append must leave the location map naming the copy, as the
+    /// substrate index does. Left naming nothing, the next op read the copy as
+    /// not current, skipped it, stranded the record and kept its segment
+    /// linked — and counted its live bytes as dead, so the same segment was
+    /// picked and kept again: BlackWorld's log grew past 500 GB with a third of
+    /// it dead (2026-11-23).
+    #[test]
+    fn a_relocated_window_is_carried_by_the_next_compaction_too() {
+        use crate::provenance::{encode_wide_sigs, WideQSig};
+        use crate::substrate::Located;
+
+        let dir = tmp_dir("located_sig_reloc_twice");
+        let decl = StreamDecl::Turn(TurnDecl {
+            timeline_id: 5152,
+            turn_index: 0,
+            turn_id_day: 0,
+            turn_id_seq: 1,
+            role: 1,
+            block_start: 0,
+            block_end: 1,
+            layer_id: 1,
+            group_id: 1,
+            anchored_prefix: Vec::new(),
+            view: Vec::new(),
+            segments: Vec::new(),
+            tags: Vec::new(),
+        });
+        let sid = decl.stream_id();
+        let window: Vec<WideQSig> = (0..5u64)
+            .map(|t| WideQSig {
+                n_heads: 12,
+                words: (0..24).map(|w| t * 1_000 + w).collect(),
+            })
+            .collect();
+        let sigs = encode_wide_sigs(&window);
+        let events: Vec<u8> = (0..1_300u32).map(|i| (i % 211) as u8).collect();
+        {
+            let mut sp = SubstratePersistence::open_in(&dir).unwrap();
+            sp.declare_stream(&decl).unwrap();
+            sp.append_wide_q_sigs(sid, &[1, 2, 3], sp.mint_for(RecordType::WideQSig, sid))
+                .unwrap();
+            sp.append_wide_q_sigs(sid, &sigs, sp.mint_for(RecordType::WideQSig, sid))
+                .unwrap();
+            sp.append_projection_events(
+                sid,
+                &events,
+                sp.mint_for(RecordType::ProjectionEvents, sid),
+            )
+            .unwrap();
+            sp.commit().unwrap();
+            sp.seal_active().unwrap();
+        }
+        let mut substrate = Substrate::new();
+        let mut sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+
+        let compact = |sp: &mut SubstratePersistence, substrate: &mut Substrate| {
+            let plan = sp
+                .plan_maintenance(substrate, true)
+                .unwrap()
+                .expect("a segment carrying dead weight qualifies for a forced compaction");
+            let MaintenanceOp::Compact(target) = plan.op() else {
+                panic!("a compaction, not {:?}", plan.op());
+            };
+            let result = sp.execute_maintenance(&plan).unwrap();
+            let carried: Vec<RecordType> = result
+                .located_updates
+                .iter()
+                .map(|((_, rt), _, _)| *rt)
+                .collect();
+            let stranded = result.apply_to_substrate(&plan, substrate);
+            assert!(
+                stranded.is_empty(),
+                "nothing the index names is left behind"
+            );
+            sp.finish_maintenance(&plan, &stranded).unwrap().unlink();
+            (target, carried)
+        };
+
+        let (first, carried) = compact(&mut sp, &mut substrate);
+        assert_eq!(first, SegmentId(1));
+        assert_eq!(carried.len(), 2, "the live window and events");
+        assert!(!sealed_log(&dir, 1).exists(), "seg 1 compacted away");
+        let copy = substrate
+            .stream_of(sid)
+            .and_then(|s| s.wide_q_sigs.as_ref().and_then(Located::stored))
+            .expect("the window is located at its copy")
+            .segment;
+
+        // Dead weight beside the copies, then seal the segment holding them.
+        sp.write_debug_id(9, "first", sp.mint()).unwrap();
+        sp.write_debug_id(9, "second", sp.mint()).unwrap();
+        sp.commit().unwrap();
+        sp.seal_active().unwrap();
+
+        let (second, carried) = compact(&mut sp, &mut substrate);
+        assert_eq!(second, copy, "the segment holding the copies");
+        assert_eq!(carried.len(), 2, "the window and events carried again");
+        assert!(
+            !sealed_log(&dir, copy.0).exists(),
+            "and that segment goes too"
+        );
+        assert_eq!(
+            &substrate.stream_wide_q_sigs(sid).unwrap().unwrap()[..],
+            sigs.as_slice()
+        );
+        assert_eq!(
+            &substrate.stream_projection_events(sid).unwrap().unwrap()[..],
+            events.as_slice()
+        );
+        drop(sp);
+
+        let mut substrate = Substrate::new();
+        let _sp = SubstratePersistence::open_in_with_substrate(&dir, &mut substrate).unwrap();
+        assert_eq!(
+            &substrate.stream_wide_q_sigs(sid).unwrap().unwrap()[..],
+            sigs.as_slice(),
+            "the window, after two compactions and a reload"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The plan→execute supersession race: after a maintenance plan targets a
     /// stream's snapshot tail, the seal thread's writer appends a NEWER tail
     /// for the same stream. Execute must skip the planned (now stale) copy
