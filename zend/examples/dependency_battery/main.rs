@@ -18,7 +18,8 @@
 //!   --zend http://192.168.1.2:8081 --node 223ebb209828d84c --repo D:\prog\candle \
 //!   --out docs/results/battery_128/answers.jsonl
 //! cargo run -p zend --release --example dependency_battery -- analyse \
-//!   --answers docs/results/battery_128/answers.jsonl --out docs/results/battery_128
+//!   --answers docs/results/battery_128/answers.jsonl --kv-layers 12 \
+//!   --out docs/results/battery_128
 //! ```
 
 mod analyse;
@@ -101,6 +102,11 @@ enum Cmd {
         /// The telemetry samples; beside `answers` by default.
         #[arg(long)]
         telemetry: Option<PathBuf>,
+        /// The K/V layers of the model that answered: the K/V census counts a
+        /// token once per layer, the format census once. Flash-Next holds K/V
+        /// on 12 of its 48 layers.
+        #[arg(long)]
+        kv_layers: u32,
         #[arg(long)]
         out: PathBuf,
     },
@@ -210,6 +216,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Analyse {
             answers,
             telemetry,
+            kv_layers,
             out,
         } => {
             let lines = run::lines(&answers)?;
@@ -219,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
                 Ok(text) => load::bf16_per_token(
                     &serde_json::from_str(&text)
                         .with_context(|| format!("parsing {}", census.display()))?,
+                    kv_layers,
                 ),
                 Err(_) => None,
             };

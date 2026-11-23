@@ -56,13 +56,19 @@
 
 ## §9.6.9 — the card under load
 
-BF16 bytes per token: 2076.3.
+BF16 bytes per token: 24916.1.
 
 | Under the battery's load | Mean | Peak |
 |---|---:|---:|
 | Sessions in flight | 8.50 | 16.00 |
-| KV bytes resident (GiB) | 6.19 | 11.17 |
+| KV arenas held (GiB) | 6.19 | 11.17 |
 | Tokens resident | 570908.85 | 945212.00 |
-| The same tokens at BF16 (GiB) | 1.10 | 1.83 |
-| Effective compression | 0.18 | 0.23 |
+| The same tokens at BF16 (GiB) | 13.25 | 21.93 |
+| Effective compression (BF16 / arenas held) | 2.16 | 2.70 |
 | Expert zone (GiB) | 36.04 | 50.14 |
+
+| In flight | Samples | Tokens resident | Compression | Q1_S | Q3_0 | Q4_0 | Q4_1 | Q5_0 | Q8_0 | other |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1–4 | 3 | 448487 | 1.71× | 14.7% | 13.2% | 22.6% | 8.5% | 9.9% | 11.3% | 19.8% |
+| 5–8 | 6358 | 562084 | 2.16× | 14.0% | 13.3% | 22.2% | 8.4% | 10.5% | 11.4% | 20.3% |
+| 13–16 | 425 | 703786 | 2.20× | 14.0% | 13.4% | 22.3% | 8.4% | 10.5% | 11.3% | 20.2% |

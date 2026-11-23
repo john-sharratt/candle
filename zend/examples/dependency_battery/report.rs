@@ -2,7 +2,7 @@
 //! CSV per figure (`docs/unbounded_agents.md` §9.12, §6.5, §9.6.9), each a
 //! plain table a plotting script reads without knowing the battery.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -363,6 +363,56 @@ pub fn write(
                     rows.iter()
                         .map(|r| vec![r.label.to_string(), r.mean.to_string(), r.peak.to_string()]),
                 ),
+            )?;
+
+            let bands = load::bands(samples, per_token);
+            let formats: Vec<String> = bands
+                .iter()
+                .flat_map(|b| b.shares.keys().cloned())
+                .collect::<BTreeSet<String>>()
+                .into_iter()
+                .collect();
+            writeln!(
+                md,
+                "\n| In flight | Samples | Tokens resident | Compression | {} |",
+                formats.join(" | ")
+            )?;
+            writeln!(md, "|---|---:|---:|---:|{}", "---:|".repeat(formats.len()))?;
+            let mut band_rows = Vec::new();
+            for b in &bands {
+                let shares: Vec<f64> = formats
+                    .iter()
+                    .map(|f| b.shares.get(f).copied().unwrap_or(0.0))
+                    .collect();
+                writeln!(
+                    md,
+                    "| {}–{} | {} | {:.0} | {:.2}× | {} |",
+                    b.lo,
+                    b.hi,
+                    b.samples,
+                    b.tokens,
+                    b.compression,
+                    shares
+                        .iter()
+                        .map(|s| format!("{:.1}%", 100.0 * s))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                )?;
+                let mut row = vec![
+                    b.lo.to_string(),
+                    b.hi.to_string(),
+                    b.samples.to_string(),
+                    b.tokens.to_string(),
+                    b.compression.to_string(),
+                ];
+                row.extend(shares.iter().map(f64::to_string));
+                band_rows.push(row);
+            }
+            let mut header = vec!["lo", "hi", "samples", "tokens", "compression"];
+            header.extend(formats.iter().map(String::as_str));
+            fs::write(
+                dir.join("table_9_6_load_bands.csv"),
+                csv(&header, band_rows),
             )?;
         }
         None => writeln!(
