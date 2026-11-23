@@ -1,264 +1,1814 @@
-# The dependency battery of docs/unbounded_agents.md §9.12.
+# The dependency battery of docs/unbounded_agents.md §9.12: 128 questions,
+# 43 direct, 43 transitive and 42 architectural, committed before the first run.
 #
 # Every question has an answer the source settles. `expect` lists what a
 # correct answer must name — a file, an identifier or a value — each checked
 # against the repository when the battery was written; `a|b` accepts either
 # spelling. Matching is case-insensitive and on substrings, so a path
-# (`candle-conversation/src/provenance/scan.rs`) names `scan.rs`.
+# (`candle-conversation/src/provenance/scan.rs`) names `scan.rs`. No expected
+# item is spelled in its own question.
 #
-#   direct         — one hop: where a thing is defined, and what calls it
+#   direct         — one hop: where a function is defined, and what calls it.
+#                    Generated from the source by rule, so their selection
+#                    carries no judgement (`direct.rs`; `dependency_battery
+#                    direct --repo <candle>` prints them).
 #   transitive     — a chain of three or more hops through the code
 #   architectural  — an assumption several components share with no single
 #                    call path between them
 #
 # `files` are the repository files that answer the question — what retrieval
 # should place in the conversation for the answer to be read rather than
-# remembered. The scoring lab ranks the code_reading files by them
-# (`candle-conversation/examples/provenance_gates/lab.rs`). A question a
-# design document settles and no source file does names none.
+# remembered. `names_file` says whether the question names one of them (its
+# file name, or a distinctive stem); the split is fixed here, before any run,
+# and `battery.rs` checks each flag against its text.
 
 questions:
   # ── Direct ────────────────────────────────────────────────────────────────
-  - id: d1
+  - id: d01
     category: direct
     question: >-
-      In the candle-conversation crate, where is the function `recorded_reply`
-      defined, and which source file calls it outside its own tests?
-    expect: [recorded_reply.rs, turn_submitter.rs]
-    files: [candle-conversation/src/recorded_reply.rs, candle-conversation/src/conversation/turn_submitter.rs]
-
-  - id: d2
-    category: direct
-    question: >-
-      Where is the function `tier_fits` defined in candle-nn's KV cache, and
-      which file calls it in production code?
-    expect: [span_geometry.rs, transient_tier.rs]
-    files: [candle-nn/src/kv_cache/chunked/span_geometry.rs, candle-nn/src/kv_cache/chunked/region_pool/transient_tier.rs]
-
-  - id: d3
-    category: direct
-    question: >-
-      Where is `elevate_to_hot` defined, and which module calls it outside of
-      tests?
-    expect: [elevate.rs, scheduler]
+      In the candle-conversation crate, where is the function `system_prompt_token_ids` defined, and which source files call it outside of tests?
+    expect: ["conversation_tree.rs", "conversation/sequence_state.rs"]
     files:
-      - candle-conversation/src/persistence/elevate.rs
-      - candle-conversation/src/scheduler/projection_turns.rs
-      - candle-conversation/src/scheduler/sections.rs
+      - candle-conversation/src/tree/conversation_tree.rs
+      - candle-conversation/src/conversation/sequence_state.rs
+    names_file: false
 
-  - id: d4
+  - id: d02
     category: direct
     question: >-
-      Where is the provenance function `heads_per_group` defined, and which
-      other provenance and projection source files call it?
-    expect: [scan.rs, window_score.rs, packed.rs, gpu.rs, belief_collections.rs, belief_files.rs]
+      In the candle-conversation crate, where is the function `group_of_key` defined, and which source files call it outside of tests?
+    expect: ["chunk_exclusion/records.rs", "marking_dead.rs"]
     files:
-      - candle-conversation/src/provenance/scan.rs
-      - candle-conversation/src/provenance/window_score.rs
-      - candle-conversation/src/provenance/packed.rs
-      - candle-conversation/src/provenance/gpu.rs
-      - candle-conversation/src/projection/resolver/belief_collections.rs
-      - candle-conversation/src/projection/belief_files.rs
+      - candle-conversation/src/provenance/chunk_exclusion/records.rs
+      - candle-conversation/src/substrate/marking_dead.rs
+    names_file: false
 
-  - id: d5
+  - id: d03
     category: direct
     question: >-
-      Where is the Rust wrapper `moe_bucketize` defined, which CUDA source
-      holds the kernel it launches, and which model code calls it to dispatch
-      experts?
-    expect: [bucketize.rs, moe_bucketize.cu, launch.rs, dspark_experts.rs]
+      In the candle-nn crate, where is the function `work_dtype` defined, and which source files call it outside of tests?
+    expect: ["wave_plan/geometry.rs", "carve.rs"]
     files:
-      - candle-core/src/quantized/cuda/bucketize.rs
-      - candle-kernels/src/simple/moe_bucketize.cu
-      - candle-transformers/src/models/expert_lre/dispatch/launch.rs
-      - candle-transformers/src/models/latent_moe/dspark_experts.rs
+      - candle-nn/src/kv_cache/chunked/wave_plan/geometry.rs
+      - candle-nn/src/kv_cache/chunked/wave_plan/carve.rs
+    names_file: false
 
-  - id: d6
+  - id: d04
     category: direct
     question: >-
-      In the expert cache, where is `set_eviction_costs` defined and which
-      file calls it?
-    expect: [bookkeeping.rs, ring.rs]
-    files: [candle-transformers/src/models/expert_lre/cache/bookkeeping.rs, candle-transformers/src/models/expert_lre/pipeline/ring.rs]
+      In the zend crate, where is the function `toggle_projection_layer` defined, and which source files call it outside of tests?
+    expect: ["substrate_view_routes.rs", "api/substrate.rs", "tools/layer_toggle.rs"]
+    files:
+      - zend/src/session/substrate_view_routes.rs
+      - zend/src/api/substrate.rs
+      - zend/src/mcp/tools/layer_toggle.rs
+    names_file: false
 
-  - id: d7
+  - id: d05
     category: direct
     question: >-
-      What is the value of `PINNED_LAYERS`, where is it defined, and which
-      model loader uses it?
-    expect: ["= 2|is 2|of 2|two", policy.rs, layer_loader.rs]
-    files: [candle-transformers/src/models/expert_lre/cache/policy.rs, candle-transformers/src/models/qwen35/layer_loader.rs]
+      In the zend crate, where is the function `retire_reply_records` defined, and which source files call it outside of tests?
+    expect: ["retire_replies.rs", "calibrate/run.rs"]
+    files:
+      - zend/src/calibrate/retire_replies.rs
+      - zend/src/calibrate/run.rs
+    names_file: false
 
-  - id: d8
+  - id: d06
     category: direct
     question: >-
-      Where is `FoldParams::derive` defined, and which non-test module calls
-      it?
-    expect: [wide_sig.rs, scheduler]
-    files: [candle-conversation/src/provenance/wide_sig.rs, candle-conversation/src/scheduler/construct.rs]
+      In the zend crate, where is the function `base_branches` defined, and which source files call it outside of tests?
+    expect: ["conv_branches.rs", "load/startup.rs"]
+    files:
+      - zend/src/conv_branches.rs
+      - zend/src/session/load/startup.rs
+    names_file: false
+
+  - id: d07
+    category: direct
+    question: >-
+      In the zend crate, where is the function `archive_worker` defined, and which source files call it outside of tests?
+    expect: ["session/conversations.rs", "archiving.rs", "workers/run.rs"]
+    files:
+      - zend/src/session/conversations.rs
+      - zend/src/mcp/archiving.rs
+      - zend/src/mcp/workers/run.rs
+    names_file: false
+
+  - id: d08
+    category: direct
+    question: >-
+      In the candle-transformers crate, where is the function `begin_config` defined, and which source files call it outside of tests?
+    expect: ["routing_capture.rs", "utils/run.rs"]
+    files:
+      - candle-transformers/src/models/routing_capture.rs
+      - candle-transformers/src/models/batch_test/utils/run.rs
+    names_file: false
+
+  - id: d09
+    category: direct
+    question: >-
+      In the candle-conversation crate, where is the function `find_timelines_by_metadata` defined, and which source files call it outside of tests?
+    expect: ["resolver/metadata.rs", "sequence_history.rs", "engine/metadata.rs"]
+    files:
+      - candle-conversation/src/projection/resolver/metadata.rs
+      - candle-conversation/src/conversation/sequence_history.rs
+      - candle-conversation/src/engine/metadata.rs
+    names_file: true
+
+  - id: d10
+    category: direct
+    question: >-
+      In the candle-conversation crate, where is the function `branch_checkpoint_entries` defined, and which source files call it outside of tests?
+    expect: ["apply_records.rs", "branch_checkpoints.rs", "worklist.rs"]
+    files:
+      - candle-conversation/src/substrate/apply_records.rs
+      - candle-conversation/src/persistence/compaction/branch_checkpoints.rs
+      - candle-conversation/src/persistence/maintenance/worklist.rs
+    names_file: false
+
+  - id: d11
+    category: direct
+    question: >-
+      In the candle-conversation crate, where is the function `branch_checkpoint_stream_id` defined, and which source files call it outside of tests?
+    expect: ["content_hash.rs", "record/mod.rs", "resolver/recurrent_state.rs"]
+    files:
+      - candle-conversation/src/persistence/content_hash.rs
+      - candle-conversation/src/persistence/record/mod.rs
+      - candle-conversation/src/projection/resolver/recurrent_state.rs
+    names_file: false
+
+  - id: d12
+    category: direct
+    question: >-
+      In the candle-conversation crate, where is the function `triggers_holding` defined, and which source files call it outside of tests?
+    expect: ["engine/compile.rs", "code_read/process.rs"]
+    files:
+      - candle-conversation/src/engine/compile.rs
+      - zend/src/code_read/process.rs
+    names_file: false
+
+  - id: d13
+    category: direct
+    question: >-
+      In the candle-conversation crate, where is the function `rewrite_reclaimed` defined, and which source files call it outside of tests?
+    expect: ["residence.rs", "pack_pools.rs"]
+    files:
+      - candle-conversation/src/substrate/residence.rs
+      - candle-conversation/src/scheduler/prefill/pack_pools.rs
+    names_file: false
+
+  - id: d14
+    category: direct
+    question: >-
+      In the candle-transformers crate, where is the function `kernel_attn_decode_assemble` defined, and which source files call it outside of tests?
+    expect: ["kernel_attention.rs", "sweep_wave.rs"]
+    files:
+      - candle-transformers/src/models/latent_moe/kernel_attention.rs
+      - candle-transformers/src/models/latent_moe/wave/sweep_wave.rs
+    names_file: false
+
+  - id: d15
+    category: direct
+    question: >-
+      In the candle-transformers crate, where is the function `page_token_span` defined, and which source files call it outside of tests?
+    expect: ["indexer/cache.rs", "indexer/score.rs"]
+    files:
+      - candle-transformers/src/models/qwen4exp/indexer/cache.rs
+      - candle-transformers/src/models/qwen4exp/indexer/score.rs
+    names_file: false
+
+  - id: d16
+    category: direct
+    question: >-
+      In the candle-transformers crate, where is the function `user_prompt_tokens` defined, and which source files call it outside of tests?
+    expect: ["utils/params.rs", "recurrent_gates.rs"]
+    files:
+      - candle-transformers/src/models/batch_test/utils/params.rs
+      - candle-transformers/src/models/qwen35/recurrent_gates.rs
+    names_file: false
+
+  - id: d17
+    category: direct
+    question: >-
+      In the candle-conversation crate, where is the function `is_timeline_dead` defined, and which source files call it outside of tests?
+    expect: ["dominance.rs", "remote/adopt.rs", "replicated_state.rs"]
+    files:
+      - candle-conversation/src/substrate/dominance.rs
+      - candle-conversation/src/persistence/remote/adopt.rs
+      - candle-conversation/src/substrate/replicated_state.rs
+    names_file: false
+
+  - id: d18
+    category: direct
+    question: >-
+      In the candle-transformers crate, where is the function `buffered_len` defined, and which source files call it outside of tests?
+    expect: ["incremental.rs", "sweep_wave.rs"]
+    files:
+      - candle-transformers/src/models/latent_moe/compressor/incremental.rs
+      - candle-transformers/src/models/latent_moe/wave/sweep_wave.rs
+    names_file: false
+
+  - id: d19
+    category: direct
+    question: >-
+      In the candle-transformers crate, where is the function `from_q8a1024` defined, and which source files call it outside of tests?
+    expect: ["kernel/act.rs", "gpu_parity.rs", "cpu_pool/service.rs"]
+    files:
+      - candle-transformers/src/models/expert_lre/cpu_pool/kernel/act.rs
+      - candle-transformers/src/models/expert_lre/cpu_pool/gpu_parity.rs
+      - candle-transformers/src/models/expert_lre/cpu_pool/service.rs
+    names_file: false
+
+  - id: d20
+    category: direct
+    question: >-
+      In the host crate, where is the function `settle_requests` defined, and which source files call it outside of tests?
+    expect: ["host/src/cluster/mod.rs", "host/src/run.rs"]
+    files:
+      - host/src/cluster/mod.rs
+      - host/src/run.rs
+    names_file: false
+
+  - id: d21
+    category: direct
+    question: >-
+      In the zend-tools crate, where is the function `list_remote_fs` defined, and which source files call it outside of tests?
+    expect: ["sessions.rs", "remote_fs/list.rs", "remote_fs/open.rs"]
+    files:
+      - zend-tools/src/state/sessions.rs
+      - zend-tools/src/tools/remote_fs/list.rs
+      - zend-tools/src/tools/remote_fs/open.rs
+    names_file: false
+
+  - id: d22
+    category: direct
+    question: >-
+      In the candle-nn crate, where is the function `set_kv_free_target` defined, and which source files call it outside of tests?
+    expect: ["kv_negotiation.rs", "scheduler_loop.rs"]
+    files:
+      - candle-nn/src/kv_cache/chunked/region_pool/kv_negotiation.rs
+      - candle-conversation/src/scheduler/run/scheduler_loop.rs
+    names_file: false
+
+  - id: d23
+    category: direct
+    question: >-
+      In the candle-nn crate, where is the function `sample_and_select` defined, and which source files call it outside of tests?
+    expect: ["gpu/sampler.rs", "sampled_selection/sampler.rs"]
+    files:
+      - candle-nn/src/kv_cache/chunked/sampled_selection/gpu/sampler.rs
+      - candle-nn/src/kv_cache/chunked/sampled_selection/sampler.rs
+    names_file: false
+
+  - id: d24
+    category: direct
+    question: >-
+      In the candle-core crate, where is the function `set_print_options_full` defined, and which source files call it outside of tests?
+    expect: ["display.rs", "tensor-tools/src/main.rs"]
+    files:
+      - candle-core/src/display.rs
+      - tensor-tools/src/main.rs
+    names_file: false
+
+  - id: d25
+    category: direct
+    question: >-
+      In the candle-transformers crate, where is the function `incremental_compressor` defined, and which source files call it outside of tests?
+    expect: ["latent_moe/indexer.rs", "kernel_attention.rs"]
+    files:
+      - candle-transformers/src/models/latent_moe/indexer.rs
+      - candle-transformers/src/models/latent_moe/kernel_attention.rs
+    names_file: false
+
+  - id: d26
+    category: direct
+    question: >-
+      In the candle-transformers crate, where is the function `claim_bytes` defined, and which source files call it outside of tests?
+    expect: ["residual_rows/arena.rs", "delegates.rs"]
+    files:
+      - candle-transformers/src/models/residual_rows/arena.rs
+      - candle-transformers/src/models/qwen4exp/wave/delegates.rs
+    names_file: false
+
+  - id: d27
+    category: direct
+    question: >-
+      In the zend crate, where is the function `grammar_schema` defined, and which source files call it outside of tests?
+    expect: ["tool_constraints.rs", "tools/catalog.rs"]
+    files:
+      - zend/src/tool_constraints.rs
+      - zend/src/tools/catalog.rs
+    names_file: false
+
+  - id: d28
+    category: direct
+    question: >-
+      In the zend crate, where is the function `splice_text` defined, and which source files call it outside of tests?
+    expect: ["splice.rs", "session/diag.rs"]
+    files:
+      - zend/src/session/diag/splice.rs
+      - zend/src/session/diag.rs
+    names_file: true
+
+  - id: d29
+    category: direct
+    question: >-
+      In the zend-tools crate, where is the function `http_bearer` defined, and which source files call it outside of tests?
+    expect: ["state/secrets.rs", "http_session/open.rs"]
+    files:
+      - zend-tools/src/state/secrets.rs
+      - zend-tools/src/tools/http_session/open.rs
+    names_file: false
+
+  - id: d30
+    category: direct
+    question: >-
+      In the candle-nn crate, where is the function `free_sequence_detached` defined, and which source files call it outside of tests?
+    expect: ["alloc.rs", "sequences.rs"]
+    files:
+      - candle-nn/src/kv_cache/chunked/sequence_ops/alloc.rs
+      - candle-transformers/src/models/batched_inference/sequences.rs
+    names_file: false
+
+  - id: d31
+    category: direct
+    question: >-
+      In the zend crate, where is the function `dialogue_context` defined, and which source files call it outside of tests?
+    expect: ["tool_host.rs", "stream_turn.rs"]
+    files:
+      - zend/src/tools/tool_host.rs
+      - zend/src/session/inference_stream/stream_turn.rs
+    names_file: false
+
+  - id: d32
+    category: direct
+    question: >-
+      In the candle-nn crate, where is the function `migrate_in_flight` defined, and which source files call it outside of tests?
+    expect: ["migrate_flight.rs", "section_finish.rs"]
+    files:
+      - candle-nn/src/kv_cache/chunked/migrate_flight.rs
+      - candle-conversation/src/scheduler/section_finish.rs
+    names_file: false
+
+  - id: d33
+    category: direct
+    question: >-
+      In the candle-nn crate, where is the function `is_tier_refusal` defined, and which source files call it outside of tests?
+    expect: ["refusals.rs", "failure.rs", "prefill_cohort.rs"]
+    files:
+      - candle-nn/src/kv_cache/chunked/backing/refusals.rs
+      - candle-conversation/src/scheduler/decode/failure.rs
+      - candle-conversation/src/scheduler/run/prefill_cohort.rs
+    names_file: false
+
+  - id: d34
+    category: direct
+    question: >-
+      In the zend crate, where is the function `conversation_tools` defined, and which source files call it outside of tests?
+    expect: ["workspace_tools.rs", "tools/files.rs"]
+    files:
+      - zend/src/session/workspace_tools.rs
+      - zend/src/mcp/tools/files.rs
+    names_file: false
+
+  - id: d35
+    category: direct
+    question: >-
+      In the candle-nn crate, where is the function `chain_bytes` defined, and which source files call it outside of tests?
+    expect: ["wave_plan/plan.rs", "qwen35/draft.rs"]
+    files:
+      - candle-nn/src/kv_cache/chunked/wave_plan/plan.rs
+      - candle-transformers/src/models/qwen35/draft.rs
+    names_file: false
+
+  - id: d36
+    category: direct
+    question: >-
+      In the cluster crate, where is the function `asks_again` defined, and which source files call it outside of tests?
+    expect: ["replicate/catchup.rs", "receive.rs"]
+    files:
+      - cluster/src/replicate/catchup.rs
+      - cluster/src/replicate/receive.rs
+    names_file: false
+
+  - id: d37
+    category: direct
+    question: >-
+      In the candle-nn crate, where is the function `sample_error_surface_gpu_paged` defined, and which source files call it outside of tests?
+    expect: ["error_surface.rs", "sampled_selection/workflow.rs"]
+    files:
+      - candle-nn/src/kv_cache/chunked/sampled_selection/gpu/error_surface.rs
+      - candle-nn/src/kv_cache/chunked/sampled_selection/workflow.rs
+    names_file: true
+
+  - id: d38
+    category: direct
+    question: >-
+      In the candle-core crate, where is the function `slice_scatter0` defined, and which source files call it outside of tests?
+    expect: ["tensor/indexing.rs", "backprop.rs"]
+    files:
+      - candle-core/src/tensor/indexing.rs
+      - candle-core/src/backprop.rs
+    names_file: false
+
+  - id: d39
+    category: direct
+    question: >-
+      In the cluster crate, where is the function `lease_events` defined, and which source files call it outside of tests?
+    expect: ["replicate/lease.rs", "authority/driver.rs", "substrate-git/src/member.rs", "ingest_lease.rs"]
+    files:
+      - cluster/src/replicate/lease.rs
+      - npcd/src/authority/driver.rs
+      - substrate-git/src/member.rs
+      - zend/src/ingest_lease.rs
+    names_file: false
+
+  - id: d40
+    category: direct
+    question: >-
+      In the web crate, where is the function `layer_summary` defined, and which source files call it outside of tests?
+    expect: ["data.rs", "npcd/api.rs"]
+    files:
+      - web/src/mock/npcd/data.rs
+      - web/src/mock/npcd/api.rs
+    names_file: false
+
+  - id: d41
+    category: direct
+    question: >-
+      In the cluster crate, where is the function `certify_prefix` defined, and which source files call it outside of tests?
+    expect: ["upgrade/decisions.rs", "member/app.rs", "candidate.rs", "runtime/commands.rs"]
+    files:
+      - cluster/src/upgrade/decisions.rs
+      - cluster/src/member/app.rs
+      - cluster/src/upgrade/runtime/candidate.rs
+      - cluster/src/upgrade/runtime/commands.rs
+    names_file: false
+
+  - id: d42
+    category: direct
+    question: >-
+      In the cluster crate, where is the function `report_complete` defined, and which source files call it outside of tests?
+    expect: ["member/app.rs", "src/handover.rs"]
+    files:
+      - cluster/src/member/app.rs
+      - zend/src/handover.rs
+    names_file: false
+
+  - id: d43
+    category: direct
+    question: >-
+      In the zend-tools crate, where is the function `fence_tag_for_path` defined, and which source files call it outside of tests?
+    expect: ["file/render.rs", "file/edit.rs"]
+    files:
+      - zend-tools/src/tools/file/render.rs
+      - zend-tools/src/tools/file/edit.rs
+    names_file: false
 
   # ── Transitive ────────────────────────────────────────────────────────────
-  - id: t1
+  - id: t01
     category: transitive
     question: >-
       The provenance signature's fold is derived per model. Trace what has to
       agree with it: from where the fold's group sizes are derived, through
       the constant and helper that split a signature into fold groups, to the
       scoring code that votes per group.
-    expect: [FoldParams, FOLD_GROUPS, heads_per_group, window_score]
+    expect: ["FoldParams", "FOLD_GROUPS", "heads_per_group", "window_score"]
     files:
       - candle-conversation/src/provenance/wide_sig.rs
       - candle-conversation/src/provenance/scan.rs
       - candle-conversation/src/provenance/window_score.rs
+    names_file: false
 
-  - id: t2
+  - id: t02
     category: transitive
     question: >-
       When zend replays a recorded conversation, how do the recorded token ids
       end up committed in place of sampled ones? Trace it from the replay
       harness through the turn option to the function that extracts the ids
       to force.
-    expect: [replay.rs, recorded_turn, turn_submitter.rs, recorded_reply]
+    expect: ["replay.rs", "recorded_turn", "turn_submitter.rs", "recorded_reply"]
     files:
       - zend/src/session/replay.rs
       - candle-conversation/src/turn.rs
       - candle-conversation/src/conversation/turn_submitter.rs
       - candle-conversation/src/recorded_reply.rs
+    names_file: true
 
-  - id: t3
+  - id: t03
     category: transitive
     question: >-
       What breaks, and where, if the 32-token KV block size is changed on the
       Rust side only? Name the constant on each side and the kernels' tables
       that depend on it.
-    expect: [CHUNK_SIZE, blocks.cuh, types/mod.rs, arena_table]
+    expect: ["CHUNK_SIZE", "blocks.cuh", "types/mod.rs", "arena_table"]
     files:
       - candle-nn/src/kv_cache/chunked/types/mod.rs
       - candle-kernels/src/blocks.cuh
       - candle-kernels/src/arena_table.cuh
       - candle-nn/src/kv_cache/arena_table.rs
+    names_file: false
 
-  - id: t4
+  - id: t04
     category: transitive
     question: >-
       Trace how a MoE layer's routing reaches the expert kernels without the
       host reading it back: from the classifying kernel, through what it
       writes, to how a cold expert is waited for.
-    expect: [bucketize, "mapped|pinned", stager, cold]
+    expect: ["bucketize", "mapped|pinned", "stager"]
     files:
       - candle-kernels/src/simple/moe_bucketize.cu
       - candle-transformers/src/models/expert_lre/dispatch/launch.rs
       - candle-transformers/src/models/expert_lre/dispatch/ring.rs
       - candle-transformers/src/models/expert_lre/stager.rs
+    names_file: false
 
-  - id: t5
+  - id: t05
     category: transitive
     question: >-
       Trace why the experts of the first two MoE layers are never evicted:
       from the constant, through the victim search that skips them, to the
-      startup code that places them.
-    expect: [PINNED_LAYERS, best_victim, startup.rs]
-    files: [candle-transformers/src/models/expert_lre/cache/policy.rs, candle-transformers/src/models/expert_lre/startup.rs]
+      code that places them when the cache is first filled.
+    expect: ["PINNED_LAYERS", "best_victim", "startup.rs"]
+    files:
+      - candle-transformers/src/models/expert_lre/cache/policy.rs
+      - candle-transformers/src/models/expert_lre/startup.rs
+    names_file: false
 
-  - id: t6
+  - id: t06
     category: transitive
     question: >-
       Which configuration fields decide when a conversation reprojects in the
       middle of a decode, and through which functions do they reach the
       policy the scheduler runs?
-    expect: [reproject_every_n_tokens, reproject_trigger_texts, boundary_rule, ReprojectionPolicy]
+    expect: ["reproject_every_n_tokens", "reproject_trigger_texts", "boundary_rule", "ReprojectionPolicy"]
     files:
       - candle-conversation/src/config/sequence_config.rs
       - candle-conversation/src/conversation/sequence_state.rs
       - candle-conversation/src/scheduler/reprojection.rs
+    names_file: false
 
-  - id: t7
+  - id: t07
     category: transitive
     question: >-
       How does the projection assembler avoid recomputing structural glue K/V
       on every projection? Name the cache, what it is keyed by, and how long
       an entry is retained.
-    expect: [glue_islands, "hash", GLUE_ISLAND_RETAIN_GENERATIONS]
-    files: [candle-conversation/src/scheduler/projection_assembler/slot_state.rs]
+    expect: ["glue_islands", "hash", "GLUE_ISLAND_RETAIN_GENERATIONS"]
+    files:
+      - candle-conversation/src/scheduler/projection_assembler/slot_state.rs
+    names_file: false
 
-  - id: t8
+  - id: t08
     category: transitive
     question: >-
       Trace how a sealed chunk in the warm tier gets back into VRAM when a
       projection needs it: which module notices, which function lifts it, and
       in which file that function lives.
-    expect: [scheduler, elevate_to_hot, elevate.rs]
+    expect: ["scheduler", "elevate_to_hot", "elevate.rs"]
     files:
       - candle-conversation/src/scheduler/projection_turns.rs
       - candle-conversation/src/scheduler/sections.rs
       - candle-conversation/src/persistence/elevate.rs
+    names_file: false
+
+  - id: t09
+    category: transitive
+    question: >-
+      Support for a new GPU generation is added by editing one list in the
+      kernel crate's build tooling. Trace how that list reaches the runtime
+      check that refuses an unsupported card when the device is created. Name
+      the list, the generated file or constant the build script writes from
+      it, the compatibility predicate that reads that constant (and its
+      minor-version rule), and the CUDA device method that panics.
+    expect: ["KERNEL_ARCHES", "built_arches.rs|BUILT_ARCHES", "has_kernel_image", "validate_compute_capability"]
+    files:
+      - candle-kernels/build_utils.rs
+      - candle-kernels/build.rs
+      - candle-kernels/src/lib.rs
+      - candle-core/src/cuda_backend/device/device_info.rs
+    names_file: false
+
+  - id: t10
+    category: transitive
+    question: >-
+      When a view backed by a wave arena is copied into a 'static tensor that
+      borrows nothing, what allocation chain does the copy go through on CUDA?
+      Name the tensor method, the dispatch it calls on the backend, the call
+      that copies only the view's elements into the new buffer, and the object
+      that keeps the new allocation alive for every later view of the result.
+    expect: ["to_owned_tensor", "alloc_owned", "copy_strided_src", "LeaseAnchor|from_anchored_device_ptr"]
+    files:
+      - candle-core/src/tensor/transfers.rs
+      - candle-core/src/device.rs
+      - candle-core/src/cuda_backend/device/backend_device.rs
+      - candle-core/src/cuda_backend/storage.rs
+    names_file: false
+
+  - id: t11
+    category: transitive
+    question: >-
+      After the asynchronous finiteness asserts in one wave find a non-finite
+      value, how does a later wave end up paying one synchronous fence and
+      dumping operands at exactly that site? Trace it from the wave-end
+      readback that orders findings by the kernel's ticket, through the
+      notification hook the capture module registers, to the static it swaps
+      and compares by pointer. Then name the synchronous check it runs and the
+      directory the dump goes to.
+    expect: ["drain.rs", "on_bad", "ARMED_SITE", "check_now", "nan_capture|DUMP_DIR"]
+    files:
+      - candle-core/src/tensor_assert/drain.rs
+      - candle-core/src/tensor_assert/callback.rs
+      - candle-transformers/src/models/nan_capture.rs
+    names_file: false
+
+  - id: t12
+    category: transitive
+    question: >-
+      When the supervisor crate applies a new build as a trial, trace what
+      happens. How are the trial's bytes put onto the stable path without ever
+      leaving a torn file (what temporary sibling name is used)? Where does the
+      trial's stderr go and which function polls it? What exact text counts as
+      success, and in which crate is it defined? Which helper runs on success
+      to clean up the old binary?
+    expect: [".next", "watch_proof", "INFO serving", "discard_previous"]
+    files:
+      - keep/src/main.rs
+      - keep/src/trial.rs
+      - keep/src/place.rs
+      - cluster/src/upgrade/switch.rs
+    names_file: false
+
+  - id: t13
+    category: transitive
+    question: >-
+      On the chat-completions route, trace how the signed-in caller's role
+      becomes the capability set the turn's tool calls run under. Which
+      function decides the turn's tools mode, and what happens when a
+      non-admin asks for the top mode? How are the per-mode tool contexts
+      built and picked out at turn time? And what does a dialogue's context
+      take out of its file stores when it runs below the top mode?
+    expect: ["effective_mode", "Grants::NONE|Grants::ALL", "level()|mode.level", "memory_hidden", "tool_host.rs"]
+    files:
+      - zend/src/api/chat.rs
+      - zend/src/access.rs
+      - zend/src/tools/tool_host.rs
+      - zend/src/tools/dispatch.rs
+    names_file: false
+
+  - id: t14
+    category: transitive
+    question: >-
+      For a dialogue's retrieval scope, trace how a conversation id becomes a
+      yes or no on one memory-repository file. Which implementation resolves
+      whom the conversation reads as? What does it fall back to when the
+      conversation's record has not been read yet? How are the person and
+      their groups looked up? And how is the file's path sorted to decide
+      whether that reader may retrieve it?
+    expect: ["MemoryReaders", "owner_of", "reader_for", "Owner::Diaries|Owner::Group|Owner::Person", "memory_paths.rs"]
+    files:
+      - zend/src/retrieval_scope.rs
+      - zend/src/mcp/memory/readers.rs
+      - zend/src/retrieval_scope/reader.rs
+      - zend/src/memory_paths.rs
+    names_file: true
+
+  - id: t15
+    category: transitive
+    question: >-
+      When a running worker's turn moves to a markedly faster member at a
+      tool-round boundary, trace the request from the sending member to the
+      one that takes it. How is the body authenticated, and in which request
+      header does the proof travel? Which handler receives it? What checks
+      does that handler run before it believes the body, including the time
+      window? How does the receiver rebuild which conversation it is taking?
+    expect: ["x-zend-handoff-proof|PROOF_HEADER", "HmacSha256|HMAC", "FRESH_MS|120_000|120 s", "read_signed", "conv_id"]
+    files:
+      - zend/src/mcp/workers/handoff.rs
+      - zend/src/worker_hop.rs
+      - zend/src/api/worker_continue.rs
+    names_file: false
+
+  - id: t16
+    category: transitive
+    question: >-
+      Trace how two cluster members avoid calibrating the same unit twice.
+      What string identifies one unit's calibration, and how is it built? What
+      lease key does that string become? When the lease is won, how does the
+      winner learn that an earlier holder may already have finished, and how
+      does the calibration pass then look for a calibration that already
+      exists before asking for a new one?
+    expect: ["spec.rs", "calibrate/", "recheck", "wait_applied", "MARKER_KEY"]
+    files:
+      - zend/src/calibrate/spec.rs
+      - zend/src/calibrate/run.rs
+      - zend/src/ingest_lease.rs
+    names_file: false
+
+  - id: t17
+    category: transitive
+    question: >-
+      After the ingest commits a code-reading unit, trace how a later turn's
+      retrieval scope comes to include it. What does the ingest call once the
+      unit is written, and what state does that flip? When does a later turn
+      actually read the index again, and how often at most? How are the cached
+      per-tree scopes and the shared whole-conversation scopes thrown away?
+    expect: ["mark_stale", "REBUILD_EVERY", "generation", "ArcSwap|try_lock", "process.rs"]
+    files:
+      - zend/src/code_read/process.rs
+      - zend/src/retrieval_scope.rs
+    names_file: false
+
+  - id: t18
+    category: transitive
+    question: >-
+      A turn's stored sign-signature record is rewritten. Trace how that
+      rewrite reaches the GPU gallery arena's choice between reusing the
+      turn's resident pages and uploading it again. Name where the substrate
+      stamps the new value and from which counter, where the signature window
+      for a stream is built with that stamp, how the window's content identity
+      hash is computed, and which resident-turn check compares it.
+    expect: ["sig_stamp", "gallery_epoch", "live_state.rs", "sig_window.rs", "serves"]
+    files:
+      - candle-conversation/src/substrate/apply_records.rs
+      - candle-conversation/src/substrate/live_state.rs
+      - candle-conversation/src/provenance/sig_window.rs
+      - candle-conversation/src/provenance/gallery_arena/resident_turn.rs
+    names_file: false
+
+  - id: t19
+    category: transitive
+    question: >-
+      Trace the GPU arena's paged belief scan from its public weighted entry
+      point to the per-case vote vectors it returns. Which function decides
+      whether to reuse or rebuild the scan index, and what function computes
+      that index's cache key? Which function runs the kernel launch, and in
+      what order does it try backends? Which host-side function does the
+      gating and tallying afterwards?
+    expect: ["with_index", "fingerprint_segments", "launch_paged", "needle_tally_segments", "bmma"]
+    files:
+      - candle-conversation/src/provenance/gallery_arena/scan/index_cache.rs
+      - candle-conversation/src/provenance/gallery_arena/scan_plan.rs
+      - candle-conversation/src/provenance/gallery_arena/scan/launch.rs
+      - candle-conversation/src/provenance/gpu.rs
+    names_file: true
+
+  - id: t20
+    category: transitive
+    question: >-
+      After a new user question starts, how does the next slot fill know to
+      choose the working set whole, with no per-boundary limit on new entries?
+      Trace it from the flag the working set raises when a question starts,
+      through the boundary call that consumes it and the resolver method that
+      reports it, to where the projection pipeline decides whether to pass a
+      per-kind entry limit. How large is that limit at other boundaries?
+    expect: ["clear_withheld", "opening_pending", "targeted_read.rs", "sink.rs", "div_ceil(3)|a third"]
+    files:
+      - candle-conversation/src/working_set/state.rs
+      - candle-conversation/src/projection/resolver/targeted_read.rs
+      - candle-conversation/src/projection/project/pipeline/sink.rs
+      - candle-conversation/src/projection/fill.rs
+    names_file: false
+
+  - id: t21
+    category: transitive
+    question: >-
+      How do the candidate scores from a reprojection's belief scan become the
+      scores that working-set members carry when a projection emits them? Name
+      the method that receives the candidates, the function that reduces them
+      to one aged fresh score per conversation, the accessor the resolver
+      reads pool state through, and the selection origin the emitted picks are
+      tagged with.
+    expect: ["observe_working_set", "working_set_fresh", "momentum_of", "WorkingSetMomentum"]
+    files:
+      - candle-conversation/src/projection/resolver/belief_scoring.rs
+      - candle-conversation/src/projection/working_set_observe.rs
+      - candle-conversation/src/projection/resolver/targeted_read.rs
+      - candle-conversation/src/projection/working_set_pick.rs
+    names_file: false
+
+  - id: t22
+    category: transitive
+    question: >-
+      When a new dialogue opens, how do its configured seed paths become
+      members of its working set? Trace it from the turn-start code, through
+      the session helper that resolves them on the conversation's own branch
+      and the resolver type it builds, to the engine call that seeds the pool.
+      How is a file seed matched to its reading, and which resolved seeds are
+      left out?
+    expect: ["seed_working_set", "Seeding", "find_conversations_by_metadata_values", "working_set_seed", "inherited_chain"]
+    files:
+      - zend/src/session/inference_stream/stream_turn.rs
+      - zend/src/session/working_reads.rs
+      - zend/src/working_set/seeds.rs
+      - candle-conversation/src/substrate/registry.rs
+    names_file: false
+
+  - id: t23
+    category: transitive
+    question: >-
+      Trace what deleting a conversation through the HTTP route does on the
+      member: which session method handles it, which durable record the
+      engine writes, which other record of the conversation it ceases at the
+      same time, and when the conversation's records are physically
+      reclaimed.
+    expect: ["tombstone_conversation", "tombstone_timeline", "cease_journal_text", "compaction"]
+    files:
+      - zend/src/api/conversations.rs
+      - zend/src/session/conversations.rs
+    names_file: false
+
+  - id: t24
+    category: transitive
+    question: >-
+      An append pushes the active redo-log segment past its size target. The
+      record digests gathered since the last flush must end up letting the
+      next open of the store skip a full forward walk of that segment. Trace
+      every hop: the size check after the append, the code that writes the
+      digest record, where its location is saved inside the segment file, and
+      the recovery function that follows the backward chain from there.
+    expect: ["rotate_if_over_target|seal_active", "flush_header_index", "set_last_index", "superblock", "load_index_chain"]
+    files:
+      - candle-conversation/src/persistence/appends.rs
+      - candle-conversation/src/persistence/durability.rs
+      - candle-conversation/src/persistence/log_file.rs
+      - candle-conversation/src/persistence/recovery.rs
+    names_file: true
+
+  - id: t25
+    category: transitive
+    question: >-
+      In the whole-store rewrite that keeps only live records, trace where the
+      live set is first written, which function writes it, how that file
+      becomes the store's only live segment, and why the model, template and
+      tokenizer locations then have to be fixed up. Also give the function
+      that finally removes the old files.
+    expect: [".compact", "write_compacted_log", "adopt_compacted", "FIRST_SEGMENT", "unlink_replaced"]
+    files:
+      - candle-conversation/src/persistence/compacting.rs
+      - candle-conversation/src/persistence/compaction/write_log.rs
+      - candle-conversation/src/persistence/segmented_log.rs
+    names_file: false
+
+  - id: t26
+    category: transitive
+    question: >-
+      This member appends a redo-log record that it originated itself. Trace
+      how that append reaches the cluster replicator's send loop so the
+      record is pushed to peers: the bookkeeping call after the append, how
+      the callback was installed, the replicator method it calls, and what
+      that method updates before waking the sender task.
+    expect: ["track_identity", "set_tap", "tapped", "outbox", "send_wake"]
+    files:
+      - candle-conversation/src/persistence/replication.rs
+      - candle-conversation/src/projection/replication.rs
+      - cluster/src/replicate/replicator.rs
+      - cluster/src/replicate/send.rs
+    names_file: true
+
+  - id: t27
+    category: transitive
+    question: >-
+      A host stores a keyed JSON object through the shared substrate handle
+      and later reads it back by its string key. Trace the write: which
+      persistence call appends the record, how the string key becomes the
+      numeric stream field in the record header (and which value it can never
+      take), and which substrate function decides whether the new write wins.
+      Then explain why a read can return nothing even though a winning record
+      for the key exists.
+    expect: ["write_custom_object", "stream_id_for", "Sha256|SHA-256", "apply_custom_object", "ceased"]
+    files:
+      - candle-conversation/src/persistence/shared.rs
+      - candle-conversation/src/persistence/records.rs
+      - candle-conversation/src/persistence/record/metadata.rs
+      - candle-conversation/src/substrate/apply_records.rs
+    names_file: true
+
+  - id: t28
+    category: transitive
+    question: >-
+      After a turn seals, its QSA pages are framed into a single payload.
+      Trace how that payload becomes a durable redo-log record without the
+      inference thread waiting on disk: the condition under which the seal
+      stores it at all, the method that mirrors it in RAM and queues it, the
+      queued job variant, the append the log owner runs, and what the
+      substrate's held copy turns into after the append succeeds.
+    expect: ["covered == turn_token_count", "enqueue_index_page", "WriteJob::TurnIndexPage", "append_turn_index_page", "settle_index_page"]
+    files:
+      - candle-conversation/src/scheduler/perform_seal.rs
+      - candle-conversation/src/projection/resolver/turn_storage.rs
+      - candle-conversation/src/persistence/writer.rs
+      - candle-conversation/src/persistence/records.rs
+    names_file: false
+
+  - id: t29
+    category: transitive
+    question: >-
+      The persistence thread hands a residence's gathered KV grid off to be
+      written to disk. Trace the sequence that stops the next pass from
+      gathering the same residence again, and that installs the residence's
+      on-disk copy only after its bytes are durable. Name the flag set before
+      the hand-off, the owner-side function, the chunk append, the durability
+      mark, and the final install.
+    expect: ["mark_cold_pending", "write_kv_cold", "persist_turn_chunks_capture", "commit_stream", "install_cold"]
+    files:
+      - candle-conversation/src/projection/resolver/turn_storage.rs
+      - candle-conversation/src/persistence/writer.rs
+    names_file: false
+
+  - id: t30
+    category: transitive
+    question: >-
+      When a chunk is sealed and its device-resident per-head metadata record
+      is created, trace how each band's absolute device pointer ends up inside
+      that record and how the paged decode kernel later reaches it. Name the
+      Rust function that claims the record slots, the function that issues the
+      single device launch, the CUDA kernel that computes the band address
+      (and the formula it uses to split the raw id), and the device accessors
+      that follow the slice header to the record and read the pointer.
+    expect: ["build_meta_records", "fill_records_on_device", "kv_record_fill", "kvhead_k_ptr|get_head_at|get_head"]
+    files:
+      - candle-nn/src/kv_cache/chunked/backing/record_pool.rs
+      - candle-kernels/src/simple/kv_record_fill.cu
+      - candle-kernels/src/paged-decode/slot_types.cuh
+    names_file: false
+
+  - id: t31
+    category: transitive
+    question: >-
+      When the KV side asks the region pool for a fresh 16 MiB region while a
+      forward pass's transient tier is placed, trace how the request gets
+      refused without buying ground from the weight side. Name the inner
+      attempt function, the pool method that computes the current cap, the
+      pure geometry function it delegates to (and which address it uses while
+      a tier stands), and the outcome variant that makes the outer function
+      skip the ground purchase.
+    expect: ["try_claim", "region_ceiling", "ceiling_regions", "TierBlocked"]
+    files:
+      - candle-nn/src/kv_cache/chunked/region_pool/claim_region.rs
+      - candle-nn/src/kv_cache/chunked/region_pool/region_pool_impl.rs
+      - candle-nn/src/kv_cache/chunked/span_geometry.rs
+    names_file: false
+
+  - id: t32
+    category: transitive
+    question: >-
+      A session's compression policy holds only a level (0-10) and four
+      per-model multipliers. Trace how these become the candidate formats and
+      the four error thresholds the fused palette selection on the GPU
+      receives. Name the function that converts the policy, the function
+      giving the per-level candidate lists, the threshold tables it indexes,
+      and the method on the paged selection inputs that finally takes the
+      thresholds.
+    expect: ["policy_selection", "production_adaptive_candidates", "QREL_HIGH_THRESHOLDS|QREL_LOW_THRESHOLDS", "select_palette4_formats_fused"]
+    files:
+      - candle-nn/src/kv_cache/chunked/compression_policy.rs
+      - candle-nn/src/kv_cache/chunked/compress/layer_quantize.rs
+      - candle-nn/src/kv_cache/chunked/sampled_selection/params/production_tables.rs
+      - candle-nn/src/kv_cache/chunked/sampled_selection/gpu/paged_inputs.rs
+    names_file: false
+
+  - id: t33
+    category: transitive
+    question: >-
+      When the last holder of a pooled chunk identifier is dropped, trace how
+      that arena slot becomes reusable and how the next allocation picks it
+      up. Name the step that clears the slot's occupied state, the lock-free
+      structure the slot is pushed onto (and where its next-link is stored),
+      the claim function that pops it before falling back to the high-water
+      mark, and the file that holds them.
+    expect: ["set_free", "recycle_head", "try_claim_one", "refcount.rs"]
+    files:
+      - candle-nn/src/kv_cache/chunked/gid_pool/gid.rs
+      - candle-nn/src/kv_cache/chunked/gid_pool/refcount.rs
+    names_file: false
+
+  - id: t34
+    category: transitive
+    question: >-
+      For the host-side contiguous KV read path, trace how one stored band of
+      one chunk becomes a token-major float tensor. Name the io-module
+      function that reads a single band, the tag method that decides float
+      versus quantized, the helper that computes how many bytes to pull from
+      the slot for a quantized band, and the codec function (and the layout
+      conversion it performs) that turns those bytes into floats.
+    expect: ["read_band_chunk", "to_kv_format", "band_bytes", "decode_band|decode_rank_major"]
+    files:
+      - candle-nn/src/kv_cache/chunked/io.rs
+      - candle-nn/src/kv_cache/arena_table.rs
+      - candle-nn/src/kv_cache/chunked/band_codec.rs
+    names_file: false
+
+  - id: t35
+    category: transitive
+    question: >-
+      Partially filled sealed chunks must not have their dead token slots
+      counted during adaptive format selection or conversion. Trace the
+      per-chunk valid-token window from where the host builds it to where the
+      GPU kernels decode it. Name the host function that packs it (and the bit
+      layout), the device helper the selection kernels use to unpack it, the
+      conversion kernel file that decodes it again, and the default value used
+      when no windows are given.
+    expect: ["bucket_quant_chunks", "<< 8", "unpack_token_window", "palette4_convert"]
+    files:
+      - candle-nn/src/kv_cache/chunked/compress/layer_quantize.rs
+      - candle-nn/src/kv_cache/chunked/sampled_selection/gpu/paged_inputs.rs
+      - candle-kernels/src/quantize/select_kv_format/input_loads_and_relevance.cuh
+      - candle-kernels/src/quantize/palette4_convert.cuh
+    names_file: false
+
+  - id: t36
+    category: transitive
+    question: >-
+      After the INT8 paged decode kernel scatters a step's new token into the
+      chunk currently being appended, the token only becomes visible to the
+      next step once its length is committed on the device. Trace that
+      commit: name the kernel that performs it when split-KV partials exist,
+      the standalone kernel used otherwise, the shared device function both
+      call (and which slot-header field it reads), and the accessor that
+      finally changes the slice bytes.
+    expect: ["int8_decode_combine_kernel", "commit_decode_write_len_kernel", "write_slice", "slice_increment_len"]
+    files:
+      - candle-kernels/src/paged-decode/int8_decode_kernel/launch.cuh
+      - candle-kernels/src/paged-decode/int8_decode_kernel/split_kv_combine.cuh
+      - candle-kernels/src/paged-decode/decode_helpers.cuh
+      - candle-kernels/src/paged-decode/slot_types.cuh
+    names_file: false
+
+  - id: t37
+    category: transitive
+    question: >-
+      For device-side read-ahead of predicted experts, the host computes, per
+      MoE row, where each projection's bytes sit inside a slot image and how
+      many bytes to copy. Trace that per-row table from the host function that
+      builds it, through the bucketize helper that turns it into an 11-word
+      read-ahead item (how it gets the source base and the publish values), to
+      the gate launch worker routine that copies the item in pieces. Name the
+      function that sizes each piece.
+    expect: ["row_layout", "write_ahead_item", "moe_live_ahead_piece", "ahead_piece_bytes"]
+    files:
+      - candle-transformers/src/models/expert_lre/dispatch/read_ahead.rs
+      - candle-kernels/src/simple/moe_bucketize_live.cuh
+      - candle-kernels/src/quantized/kernel/moe_live_worker_and_entry.cuh
+      - candle-kernels/src/moe_read_ahead.cuh
+    names_file: false
+
+  - id: t38
+    category: transitive
+    question: >-
+      When some of a layer's routed experts go to the host CPU pool, how do
+      their input rows reach the pool and their results get back into the
+      GPU's down-projection output? Name the device kernel that copies the
+      rows out and signals the pool, the service-thread function that waits
+      for that signal, the host call that announces the results, and the
+      device-side wait the down launch's CPU items run before copying the rows
+      in.
+    expect: ["moe_cpu_export_kernel", "wait_doorbell", "publish_done", "moe_live_cpu_wait"]
+    files:
+      - candle-kernels/src/simple/moe_cpu_export.cu
+      - candle-transformers/src/models/expert_lre/cpu_pool/service.rs
+      - candle-transformers/src/models/expert_lre/cpu_pool/rings.rs
+      - candle-kernels/src/quantized/kernel/moe_live_device_helpers.cuh
+    names_file: true
+
+  - id: t39
+    category: transitive
+    question: >-
+      In the expert cache's live MoE dispatch, how is the grouped GEMM's
+      token-tile width chosen, and how does that one choice reach both the
+      tile tables and the three expert GEMMs? Trace it from the
+      rows-per-expert estimate, through the width given to bucketize, into the
+      device-table grouped matmul entry point, and on to the helpers that pick
+      the row-tile height and the grid axis order.
+    expect: ["grouped_int8_n_sub", "16 * n_sub|16·n_sub|tile_w", "grouped_qmatmul_dev_q8a128", "grouped_int8_row_fast"]
+    files:
+      - candle-transformers/src/models/expert_lre/dispatch/launch.rs
+      - candle-core/src/quantized/cuda/grouped_grid.rs
+      - candle-core/src/quantized/cuda/grouped_matmul.rs
+    names_file: false
+
+  - id: t40
+    category: transitive
+    question: >-
+      When the stager finishes a speculative pack read into a pad slot, how
+      does that expert end up in the list the device's read-ahead reads? Trace
+      it from the stager's handling of the finished read, through the
+      pipeline-thread functions that pick it up and rebuild the row's listing,
+      including how the pad slot is protected from reuse, to the
+      promotion-ring write that the device reads, and the order it stores
+      entries versus the count.
+    expect: ["landed_ahead", "list_landed", "list_row", "pin_pad"]
+    files:
+      - candle-transformers/src/models/expert_lre/stager.rs
+      - candle-transformers/src/models/expert_lre/pipeline/listing.rs
+      - candle-transformers/src/models/expert_lre/promo.rs
+    names_file: true
+
+  - id: t41
+    category: transitive
+    question: >-
+      In the DSpark drafter's all-resident MoE (latent_moe), trace one routed
+      expert's weights from the GGUF's native FP4 bank to the per-block device
+      pointer table the grouped GEMMs index. Name the repack call and the
+      target format, the helper that takes each uploaded weight's address, and
+      the fixed tile-width constant the forward gives bucketize, which must
+      match the token-tile mode it passes to the GEMMs.
+    expect: ["repack_to_host", "Q2_KO", "extract_weight_info", "GROUPED_GEMM_TILE_W"]
+    files:
+      - candle-transformers/src/models/latent_moe/dspark_experts.rs
+      - candle-core/src/quantized/cuda/grouped_grid.rs
+    names_file: false
+
+  - id: t42
+    category: transitive
+    question: >-
+      Qwen3.5's shared expert has a one-output scalar gate per token. Trace
+      that gate from load to use: how the loader makes the 1-row weight
+      representable in the int8 KO layout, how the forward computes it in the
+      same launch as the router and the shared gate_up and pulls out its
+      column, and how the fused residual kernel reads that column without
+      compacting it. Name the padding constant, the stacked-launch call, the
+      kernel argument that carries the column's row pitch, and the kernel
+      launcher.
+    expect: ["SHARED_GATE_TILE", "forward_stacked", "gate_stride", "run_moe_shared_residual"]
+    files:
+      - candle-transformers/src/models/qwen35/quantized_weights/layer_load.rs
+      - candle-transformers/src/models/qwen35/quantized_moe.rs
+      - candle-transformers/src/models/qwen35/shared_residual.rs
+      - candle-kernels/src/simple/moe_shared_residual.cu
+    names_file: false
+
+  - id: t43
+    category: transitive
+    question: >-
+      At expert-cache startup, after the warm tier is read from the pack, the
+      VRAM tier is filled in layer order. For each expert, which source paths
+      can its upload take, and which ones must go through the pad's landing
+      buffers? Name the per-slot build function, the helper that uploads from
+      a landing buffer and records its event, the ring type that waits out a
+      buffer's previous upload, and the pack call used when the expert has no
+      warm copy.
+    expect: ["build_slot_from_record_on_stream", "upload_from_ring", "StartupRing", "read_into"]
+    files:
+      - candle-transformers/src/models/expert_lre/startup.rs
+      - candle-transformers/src/models/expert_lre/cache/bookkeeping.rs
+    names_file: true
 
   # ── Architectural ─────────────────────────────────────────────────────────
-  - id: a1
+  - id: a01
     category: architectural
     question: >-
       The KV cache's block size is shared between the Rust code and the CUDA
       kernels. What is it, what is the constant called, and which crate holds
       the CUDA side?
-    expect: ["32", CHUNK_SIZE, candle-kernels]
-    files: [candle-nn/src/kv_cache/chunked/types/mod.rs, candle-kernels/src/lib.rs]
+    expect: ["32", "CHUNK_SIZE", "candle-kernels"]
+    files:
+      - candle-nn/src/kv_cache/chunked/types/mod.rs
+      - candle-kernels/src/lib.rs
+    names_file: false
 
-  - id: a2
+  - id: a02
     category: architectural
     question: >-
       The device memory span is shared by several tenants. Which elastic
       boundary separates the KV side from the expert weights, and which check
       refuses a wave's transient tier that would cross it?
-    expect: [weight_floor, tier_fits]
-    files: [candle-nn/src/kv_cache/chunked/span_geometry.rs, candle-nn/src/kv_cache/chunked/region_pool/transient_tier.rs]
+    expect: ["weight_floor", "tier_fits"]
+    files:
+      - candle-nn/src/kv_cache/chunked/span_geometry.rs
+      - candle-nn/src/kv_cache/chunked/region_pool/transient_tier.rs
+    names_file: false
 
-  - id: a3
+  - id: a03
     category: architectural
     question: >-
       Why can a projection for the Qwen3.8-Flash-Next model not contain live
       structural glue between sealed turns, and what refuses it?
-    expect: ["recurren|DeltaNet", "gap-fill|gap fill|gapfill", reserve_glue_island]
+    expect: ["recurren|DeltaNet", "gap-fill|gap fill|gapfill", "reserve_glue_island"]
     files:
       - candle-conversation/src/scheduler/projection_assembler/walk.rs
       - candle-conversation/src/scheduler/projection_assembler/gap_fill.rs
+    names_file: false
 
-  - id: a4
+  - id: a04
     category: architectural
     question: >-
       Stored keys must stay valid when a projection moves a sealed turn to a
       new position. How are keys stored, and what is applied when they are
       read?
     expect: ["un-rotated|unrotated|without rope|before rope", "rope"]
-    files: []
+    files:
+      - candle-kernels/src/paged-decode/int8_decode_tile_kernel/fused_kernel.cuh
+      - candle-transformers/src/models/batched_layer/prefill_attn.rs
+    names_file: false
 
-  - id: a5
+  - id: a05
     category: architectural
     question: >-
       Which hot-path invariant forbids reading MoE routing back to the host,
       and which kernel's output replaces that readback?
-    expect: ["readback|GPU→CPU|GPU-to-CPU|host", bucketize]
-    files: [candle-kernels/src/simple/moe_bucketize.cu, candle-transformers/src/models/expert_lre/dispatch/launch.rs]
+    expect: ["GPU→CPU|GPU-to-CPU|GPU to CPU|device to host|transfer", "bucketize"]
+    files:
+      - candle-kernels/src/simple/moe_bucketize.cu
+      - candle-transformers/src/models/expert_lre/dispatch/launch.rs
+    names_file: false
 
-  - id: a6
+  - id: a06
     category: architectural
     question: >-
       What happens when two provenance signatures folded with different fold
       parameters are compared, and why?
-    expect: [FoldParams, "refus|reject|mismatch"]
-    files: [candle-conversation/src/provenance/wide_sig.rs]
+    expect: ["FoldParams", "refus|reject|mismatch"]
+    files:
+      - candle-conversation/src/provenance/wide_sig.rs
+    names_file: false
 
-  - id: a7
+  - id: a07
     category: architectural
     question: >-
       When a decoded turn is sealed, what happens to its thinking tokens, and
       which module states that contract?
-    expect: ["re-prefill|reprefill|prefill", think, turn_layout]
-    files: [candle-conversation/src/turn_layout/mod.rs]
+    expect: ["re-prefill|reprefill|prefill", "ethereal|dropped|discard", "turn_layout"]
+    files:
+      - candle-conversation/src/turn_layout/mod.rs
+    names_file: false
 
-  - id: a8
+  - id: a08
     category: architectural
     question: >-
       Persistence is mandatory for the conversation substrate. What file is
       its redo log, and which tier of the KV hierarchy is it?
-    expect: [substrate.log, cold]
-    files: [candle-conversation/src/persistence/segmented_log.rs]
+    expect: ["substrate.log", "cold"]
+    files:
+      - candle-conversation/src/persistence/segmented_log.rs
+    names_file: false
+
+  - id: a09
+    category: architectural
+    question: >-
+      Whether a GPU has native FP8 (Ada and later) is decided separately in
+      several CUDA headers, with no shared function between them. What
+      compute-capability threshold do they all use? How is it written in the
+      host-side capability cache compared with the device-side preprocessor
+      guards? Which headers carry it, for the conversion helpers and for the
+      reduce dispatch? What does the Ampere image in the build fall back to?
+    expect: ["890", "has_native_fp8", "device_caps.cuh", "convert.cuh", "dispatchers.cuh"]
+    files:
+      - candle-kernels/src/device_caps.cuh
+      - candle-kernels/src/convert/convert.cuh
+      - candle-kernels/src/api/dispatchers.cuh
+      - candle-kernels/build_utils.rs
+    names_file: false
+
+  - id: a10
+    category: architectural
+    question: >-
+      The guard over VRAM that must never be written after load is fed and
+      checked by components that never call each other. Which model-side
+      component declares the resident expert weights, and under what region
+      name? Which function is called, and from where, when the elastic
+      boundary between the weights and the KV side moves? Which two allocation
+      paths, ones the pool never sees, check every lease against the guard?
+      Which cargo feature makes the whole thing compile to no-ops when it is
+      off?
+    expect: ["expert.weights", "release_below", "set_weight_floor|weight_side.rs", "alloc_inheriting|alloc_following", "tensor-assert"]
+    files:
+      - candle-core/src/readonly_regions.rs
+      - candle-transformers/src/models/expert_lre/slot_integrity.rs
+      - candle-nn/src/kv_cache/chunked/region_pool/weight_side.rs
+      - candle-core/src/cuda_backend/storage.rs
+    names_file: false
+
+  - id: a11
+    category: architectural
+    question: >-
+      The module that checks kernel operands instead of converting them offers
+      a strict density check and a relaxed one. What layout property does only
+      the strict one enforce, and why can a token-window slice that reports
+      itself contiguous still fail it? Which pointer-extraction macro in the
+      latent-MoE hyper-connection kernels makes the relaxed form safe? Which
+      launch function there uses the relaxed form, and for which single
+      operand?
+    expect: ["start_offset", "expect_dense_view", "cuda_f32_ptr", "head_reduce"]
+    files:
+      - candle-transformers/src/models/operand_guard.rs
+      - candle-transformers/src/models/latent_moe/hyper.rs
+    names_file: false
+
+  - id: a12
+    category: architectural
+    question: >-
+      The supervisor crate gives the mere existence of one file beside the
+      stable binary a meaning that several functions must respect, though none
+      of them call each other. What suffix does that file have, and what does
+      its presence mean to a supervisor that is just starting up? Which
+      startup function acts on it? Why does the path that accepts a build
+      without trying it save the replaced binary under a different suffix, and
+      what is that suffix?
+    expect: [".prev", ".last", "roll_back_interrupted_trial", "previous_of|last_of"]
+    files:
+      - keep/src/place.rs
+      - keep/src/main.rs
+      - keep/src/trial.rs
+    names_file: false
+
+  - id: a13
+    category: architectural
+    question: >-
+      A conversation that zend's MCP endpoint starts carries its owner inside
+      its id, and no lookup table backs this. Which function mints the id, and
+      what is its layout? How is the owner segment derived from the signed-in
+      account? Name two separate parts of the daemon that parse the owner back
+      out of the id, and say what each one decides from it.
+    expect: ["conv_id", "owner_of", "Sha256|sha256", "branches_only", "not_found|404"]
+    files:
+      - zend/src/mcp/threads.rs
+      - zend/src/mcp/caller.rs
+      - zend/src/mcp/ownership.rs
+      - zend/src/tools/tool_host.rs
+    names_file: false
+
+  - id: a14
+    category: architectural
+    question: >-
+      Zend learns who a caller is only from headers that the gateway forwards.
+      Which two separate layers make those headers safe to believe, and which
+      network peers count as trusted? Which two of the forwarded values
+      together form the account key? What does the shared parser return when
+      the subject arrives without its issuer, or is only whitespace?
+    expect: ["IDENTITY_HEADERS", "Gateways|trusts", "x-tokera-provider", "NotSignedIn"]
+    files:
+      - web/src/proxy.rs
+      - web/src/auth/gateways.rs
+      - web/src/auth/forwarded.rs
+      - zend/src/mcp/caller.rs
+    names_file: true
+
+  - id: a15
+    category: architectural
+    question: >-
+      Zend's cluster lease module gives two different answers to a member that
+      cannot propose (for example, one that has not joined), depending on what
+      is being leased. Contrast what happens for a file or folder unit to be
+      read with what happens for a worker conversation's turns. Which
+      functions encode each outcome? Why do the async callers of the worker
+      variant run it off the async runtime, and how long can the vote wait?
+    expect: ["claim_worker", "Guard::local", "Share::Theirs", "spawn_blocking", "CLAIM_WAIT|from_secs(5)|5 s"]
+    files:
+      - zend/src/ingest_lease.rs
+      - zend/src/mcp/workers/turn_start.rs
+      - zend/src/mcp/workers/resume.rs
+    names_file: false
+
+  - id: a16
+    category: architectural
+    question: >-
+      Zend decides whether an ingested code-reading chain read its whole file
+      without asking the tool. It parses text that a file-reading tool in a
+      different crate writes. Which source file renders that text, and what
+      does it look like? Which daemon functions pull out the line range and
+      then test it against the file's line count? Which similar closing line
+      does the parser deliberately skip?
+    expect: ["render.rs", "coverage.rs", "end of part", "covers"]
+    files:
+      - zend/src/working_set/coverage.rs
+      - zend-tools/src/tools/file/render.rs
+    names_file: true
+
+  - id: a17
+    category: architectural
+    question: >-
+      Zen chat runs its workers under a thread whose name starts with a
+      special character that a person cannot type into a thread name. What is
+      that prefix, what shape is the chat id after it, and where does the id's
+      randomness come from? Which validation in the separate thread-naming
+      module guarantees that no thread a person names can collide with a
+      chat's thread?
+    expect: ["naming.rs", "random_token", "names::check|fn check", "ID_LEN|16 hex", "lowercase letters, digits and hyphens|is_ascii_lowercase"]
+    files:
+      - zend/src/mcp/chats/naming.rs
+      - zend/src/mcp/names.rs
+    names_file: true
+
+  - id: a18
+    category: architectural
+    question: >-
+      To size a signature window stored in the log without reading its
+      tokens, the substrate reads only a fixed-length prefix of the record.
+      How many bytes does it read, what constant names that length, and why
+      is that length enough for every record version the store may hold?
+      Which header parser do the substrate's read and the signature-window
+      type both use?
+    expect: ["WIDE_HEADER", "20", "parse_wide_header", "live_state.rs"]
+    files:
+      - candle-conversation/src/provenance/wide_sig.rs
+      - candle-conversation/src/provenance/sig_window.rs
+      - candle-conversation/src/substrate/live_state.rs
+    names_file: false
+
+  - id: a19
+    category: architectural
+    question: >-
+      The Rust host code and the CUDA scalar provenance kernel must agree on
+      how many query tokens one block tile holds, because the host computes
+      the kernel's dynamic shared-memory size from that number. Name the
+      constant, its value, and the kernel source file that holds the mirror.
+      What shared-memory ceiling do the contiguous-gallery path and the
+      paged-arena path each check against, and in which host files?
+    expect: ["BDP_TQ", "bdp_scan.cu", "48 * 1024|48 KiB|BDP_MAX_DYN_SHMEM", "launch.rs"]
+    files:
+      - candle-conversation/src/provenance/gpu.rs
+      - candle-conversation/src/provenance/gallery_arena/scan/launch.rs
+      - candle-kernels/src/provenance/bdp_scan.cu
+    names_file: false
+
+  - id: a20
+    category: architectural
+    question: >-
+      The GPU gallery arena stores each turn's signatures in fixed-size
+      group-major pages, and each scan-index entry marks which of a page's
+      tokens it scans with a single 32-bit mask. How many tokens does a page
+      hold? Which host module enforces at compile time that the mask can cover
+      a page? What does the scalar CUDA kernel call its copy of the page size?
+    expect: ["PAGE_TOKENS", "index_entries.rs", "BDP_PAGE_TOKENS"]
+    files:
+      - candle-conversation/src/provenance/gallery_arena/pages.rs
+      - candle-conversation/src/provenance/gallery_arena/index_entries.rs
+      - candle-kernels/src/provenance/bdp_scan.cu
+      - candle-kernels/src/provenance/bdp_bmma.cu
+    names_file: false
+
+  - id: a21
+    category: architectural
+    question: >-
+      Four separate scoring paths each keep only the top share of probe
+      tokens by summed vote size before tallying: the CPU reference
+      late-fusion scan, the host tally that follows the GPU kernel, the
+      windowed provenance scorer, and chunk exclusion's cut. Which constant do
+      they all share, what is its value, in which file is it defined, and
+      which chunk-exclusion file reads it?
+    expect: ["NEEDLE_KEEP_FRAC", "0.25", "scan.rs", "cut.rs"]
+    files:
+      - candle-conversation/src/provenance/scan.rs
+      - candle-conversation/src/provenance/gpu.rs
+      - candle-conversation/src/provenance/window_score.rs
+      - candle-conversation/src/projection/chunk_exclusion/cut.rs
+    names_file: false
+
+  - id: a22
+    category: architectural
+    question: >-
+      On a model that keeps a per-position index, the slot's index rows must
+      stay lined up with its K/V. When a sealed prefix section, sealed
+      section, or sealed turn arrives with no usable index page (absent or
+      refused by the model), what do the scheduler's section path and the
+      projection assembler's own path each do instead of pushing a page?
+      Which model call do both reach, and how many tokens does it advance by?
+    expect: ["push_positional_gap", "place_gap", "sections.rs", "inject.rs"]
+    files:
+      - candle-conversation/src/scheduler/sections.rs
+      - candle-conversation/src/scheduler/projection_assembler/inject.rs
+      - candle-conversation/src/scheduler/projection_assembler/prefill.rs
+    names_file: false
+
+  - id: a23
+    category: architectural
+    question: >-
+      Three fast paths assume the locked width of one layer group in the
+      folded signature: the CPU's 512-bit vector popcount and the two
+      tensor-core GPU backends. What width do they assume, in 64-bit words?
+      What constant names it on the CPU side, and what do the CUDA kernels
+      call it? What does each side fall back to when a gallery's group width
+      differs?
+    expect: ["GROUP_WORDS", "BMMA_GW|IMMA_GW", "agreement_scalar", "Scalar"]
+    files:
+      - candle-conversation/src/provenance/popcount.rs
+      - candle-conversation/src/provenance/gallery_arena/scan/launch.rs
+      - candle-kernels/src/provenance/bdp_bmma.cu
+      - candle-kernels/src/provenance/bdp_imma.cu
+    names_file: true
+
+  - id: a24
+    category: architectural
+    question: >-
+      Some redo-log record types (model binding, tokenizer, branch
+      checkpoints, the member's own housekeeping) must never leave the member
+      that wrote them. Several components each enforce this on their own,
+      with no shared call path. Name the shared predicate and how each of
+      these treats such a record: the code that answers a peer's range
+      listing, the code that applies an incoming record, and the host store
+      method a catch-up uses to filter listed headers.
+    expect: ["is_local_only", "Refusal::LocalOnly|LocalOnly", "travels", "listing.rs", "receive.rs"]
+    files:
+      - candle-conversation/src/persistence/listing.rs
+      - candle-conversation/src/persistence/remote/apply.rs
+      - host/src/cluster/store.rs
+      - cluster/src/replicate/receive.rs
+    names_file: true
+
+  - id: a25
+    category: architectural
+    question: >-
+      An engine runs one persistence thread per attached substrate, but host
+      RAM for the KV tier between VRAM and disk is budgeted for the whole
+      machine. How do the per-substrate purges and the scheduler's admission
+      check agree on one budget? Name the structure the threads share, the
+      function that computes each substrate's purge target and its formula
+      when the total is over budget, the budget field, and the scheduler-side
+      check.
+    expect: ["WarmLedger|WarmShare", "share_of", "kv_warm_budget_bytes", "host_ram_budget", "warm_over_budget"]
+    files:
+      - candle-conversation/src/persistence/warm_ledger.rs
+      - candle-conversation/src/persistence/thread/pass.rs
+      - candle-conversation/src/scheduler/prefill/ingest_pressure.rs
+      - candle-conversation/src/engine/mod.rs
+    names_file: false
+
+  - id: a26
+    category: architectural
+    question: >-
+      The scheduler quantizes a running turn's K/V in the decode gap, and the
+      persistence thread separately copies finished turns from device to host
+      memory. Which single function keeps the two in agreement on whether a
+      conversation's turns get quantized, and what does a lossless
+      conversation resolve to on the scheduler side? How does the copy side
+      avoid copying bytes the gap is about to replace?
+    expect: ["effective_turn_policy", "GapSeal::Native", "gap_owes", "holds_native"]
+    files:
+      - candle-conversation/src/persistence/thread/warm_copy.rs
+      - candle-conversation/src/scheduler/turn_seal.rs
+      - candle-conversation/src/persistence/thread/pass.rs
+    names_file: false
+
+  - id: a27
+    category: architectural
+    question: >-
+      The summary-forest code compiles and has tests, but no live
+      conversation ever produces a summary node. Which separate places keep
+      turns away from it: how the engine builds the background thread, which
+      substrate turn-append paths check the per-timeline flag, and what queue
+      they would push onto? What extra refusal does the mechanism-level
+      enqueue method apply beyond the per-timeline flag?
+    expect: ["SummariserThread::disabled", "pending_summary_queue", "loading.rs", "push_pending_summary", "append_only_layers"]
+    files:
+      - candle-conversation/src/engine/mod.rs
+      - candle-conversation/src/substrate/loading.rs
+      - candle-conversation/src/substrate/live_state.rs
+    names_file: false
+
+  - id: a28
+    category: architectural
+    question: >-
+      The segmented redo log keeps no manifest of its files. What ordering
+      rule do the opener, the merge of singleton locations across segments,
+      and the whole-store rewrite all rely on to decide which copy of a record
+      is newest? Name the directory scan, the singleton merge function, how
+      file names are formatted so a plain lexical sort works, and how the
+      rewrite picks the id of the file it produces so that it wins.
+    expect: ["scan_segments", "merge_singletons", "{:010}|seg-", "active_id.next"]
+    files:
+      - candle-conversation/src/persistence/segmented_log.rs
+      - candle-conversation/src/persistence/compacting.rs
+    names_file: false
+
+  - id: a29
+    category: architectural
+    question: >-
+      The per-head metadata record that decode kernels read through a slice's
+      record pointer (palette maps, per-band pointers, format bytes, outer
+      scales) has its byte size worked out independently in several Rust and
+      CUDA places, with no shared definition. Give the size formula in terms
+      of head dimension and band count, and name the CUDA helper and the Rust
+      helpers that each encode it, plus the device kernel that writes records
+      under the same layout.
+    expect: ["kv_head_byte_size", "kv_head_record_bytes|kv_head_serialized_size", "26", "kv_record_fill"]
+    files:
+      - candle-nn/src/kv_cache/chunked/meta_pool.rs
+      - candle-nn/src/kv_cache/chunked/gpu_chunks/encoding.rs
+      - candle-kernels/src/paged-decode/slot_types.cuh
+      - candle-kernels/src/simple/kv_record_fill.cu
+    names_file: false
+
+  - id: a30
+    category: architectural
+    question: >-
+      Explain why the smallest KV band slot stride and the smallest
+      per-head-record slot stride cannot be made any smaller. Name the raw-id
+      packing constant (and its value) that the slot count per 16 MiB region
+      must stay under, the largest per-region slot count the band ladder
+      produces, the record stride table whose floor is chosen to avoid
+      hitting the limit exactly, and the atomic word type of the per-slot
+      table of reference counts and free links that also depends on indices
+      fitting.
+    expect: ["GID_STRIDE", "52,428|52428|52_428", "RECORD_STRIDES", "AtomicU16"]
+    files:
+      - candle-nn/src/kv_cache/chunked/size_class.rs
+      - candle-nn/src/kv_cache/chunked/arena.rs
+      - candle-nn/src/kv_cache/chunked/gid_pool/refcount.rs
+      - candle-nn/src/kv_cache/chunked/gid_pool/gid.rs
+    names_file: false
+
+  - id: a31
+    category: architectural
+    question: >-
+      Fresh tokens are written straight into a chunk's bands by the paged
+      prefill/decode store, which never quantizes. Which Rust predicates set
+      the format tags such a writable band may carry (and how K and V differ),
+      how does the CUDA store helper react to any other tag, and which 8-bit
+      float format is excluded even though the CUDA element-size helper gives
+      it a nonzero width?
+    expect: ["takes_active_k_writes", "store_kv_chunk_arena", "float_elem_size", "F8E5M2"]
+    files:
+      - candle-nn/src/kv_cache/arena_table.rs
+      - candle-kernels/src/paged-prefill/kv_store.cuh
+      - candle-kernels/src/arena_table.cuh
+      - candle-nn/src/kv_cache/chunked/types/sealed.rs
+    names_file: false
+
+  - id: a32
+    category: architectural
+    question: >-
+      Each head's dimensions are routed to four palette sub-bands through a
+      packed per-dimension map. Describe the bit packing that the host writer
+      and the decode kernels both assume, and the strict partition invariant
+      the host enforces because the kernel's shared-memory layout depends on
+      it. Name the host packing function, the decode-side iterator that
+      scatters dims by palette, the device helper in the shared arena header
+      that extracts one entry, and the per-palette dimension count.
+    expect: ["pack_head_palette_maps", "PalIter", "palette_map_extract", "head_dim / N_PALETTE|HEAD_DIM / N_PALETTE"]
+    files:
+      - candle-nn/src/kv_cache/chunked/compress/band_layout.rs
+      - candle-kernels/src/paged-decode/pal_iter.cuh
+      - candle-kernels/src/arena_table.cuh
+      - candle-kernels/src/simple/kv_record_fill.cu
+    names_file: false
+
+  - id: a33
+    category: architectural
+    question: >-
+      The raw-key band format that also keeps a captured copy of the query has
+      a per-dimension block layout written by three unrelated pieces of code:
+      the prefill store, the decode-side register writer, and the host
+      in-place band patcher. Describe the block (its size, where the K halves
+      and the Q-capture halves sit, how a token indexes into it), and name the
+      three writer functions.
+    expect: ["store_kv_chunk_arena", "write_regs_to_r16", "patch_band", "128"]
+    files:
+      - candle-kernels/src/paged-prefill/kv_store.cuh
+      - candle-kernels/src/paged-decode/decode_helpers.cuh
+      - candle-nn/src/kv_cache/chunked/band_codec.rs
+    names_file: false
+
+  - id: a34
+    category: architectural
+    question: >-
+      A chunk's per-band chunk identifiers are kept as one flat interleaved
+      array that the Rust side, the paged attention header and the device
+      record-fill kernel all index on their own. Describe the slot ordering
+      (head, band, K/V side), name the Rust constant for the per-head stride
+      and the CUDA helpers that read per-band K/V ids, and explain which
+      per-head stride the tag iterator and record fill must use instead of
+      that constant when a head has more than four bands.
+    expect: ["GIDS_PER_HEAD", "head_gid_k_pal|head_gid_v_pal", "band_tags", "n_palette * 2|bands * 2"]
+    files:
+      - candle-nn/src/kv_cache/chunked/head_gids.rs
+      - candle-kernels/src/arena_table.cuh
+      - candle-kernels/src/simple/kv_record_fill.cu
+      - candle-nn/src/kv_cache/chunked/meta_pool.rs
+    names_file: false
+
+  - id: a35
+    category: architectural
+    question: >-
+      The one-byte format tag stored per KV band (and persisted to disk) has
+      to mean the same thing in the Rust cache, the paged-attention CUDA
+      header, and the quantized-matmul kernels' type enum, though no code
+      converts between them. Name the Rust enum and its byte-decoding
+      function, the prefix of the CUDA matmul enum's constants, and give the
+      shared numeric value for FP8 E4M3. Also say which low values exist only
+      on the arena side.
+    expect: ["ArenaFormatTag", "from_u8", "QTYPE_", "34"]
+    files:
+      - candle-nn/src/kv_cache/arena_table.rs
+      - candle-kernels/src/arena_table.cuh
+      - candle-kernels/src/quantized/block_compact/qtype_enum_and_helpers.cuh
+    names_file: false
+
+  - id: a36
+    category: architectural
+    question: >-
+      When a live MoE GEMM worker gives up waiting (on a cold expert, or on
+      the CPU pool's results), it packs what happened into one mapped 64-bit
+      word that the host decodes after the forward. What is that word's bit
+      layout? Which constants does the CUDA side define and the Rust side
+      mirror, what value in the expert field means the CPU pool's results
+      never arrived, and which host module decodes it?
+    expect: ["MOE_FAULT_ROW_SHIFT", "MOE_FAULT_EXPERT_SHIFT", "MOE_FAULT_CPU_EXPERT", "fault.rs"]
+    files:
+      - candle-kernels/src/quantized/kernel/moe_live_device_helpers.cuh
+      - candle-kernels/src/quantized/api.rs
+      - candle-transformers/src/models/expert_lre/fault.rs
+    names_file: false
+
+  - id: a37
+    category: architectural
+    question: >-
+      An expert's live-table entry is three addresses (gate, up, down) that
+      host threads and device workers both rewrite, while bucketize reads them
+      concurrently with no lock. What store order do all writers follow when
+      publishing and when withdrawing an expert? Which host module and which
+      device read-ahead routine both follow it, and how does bucketize's
+      classification function use it to decide whether an expert counts as
+      host-pinned?
+    expect: ["live_table.rs", "moe_live_ahead_piece", "snapshot_expert", "CLS_PINNED"]
+    files:
+      - candle-transformers/src/models/expert_lre/live_table.rs
+      - candle-kernels/src/quantized/kernel/moe_live_worker_and_entry.cuh
+      - candle-kernels/src/simple/moe_bucketize_live.cuh
+      - candle-transformers/src/models/expert_lre/cpu_pool/service.rs
+    names_file: false
+
+  - id: a38
+    category: architectural
+    question: >-
+      Evicting an expert retargets its live entry while a bucketize already
+      running may have snapshotted the old address. What two-sided
+      store-then-fenced-load protocol between the device and the host decides
+      when the old slot's bytes may be reused? Name the device helper that
+      stores the invocation's ticket, the per-row word container, the host
+      call that reads the key after the retarget, and the predicate that
+      releases the slot.
+    expect: ["store_started_ticket", "StartedRows", "retire_key", "reclaimable"]
+    files:
+      - candle-kernels/src/simple/moe_bucketize.cu
+      - candle-transformers/src/models/expert_lre/started.rs
+      - candle-transformers/src/models/expert_lre/reclaim.rs
+    names_file: false
+
+  - id: a39
+    category: architectural
+    question: >-
+      MXFP4 expert weights are decoded both by the CPU-side block code (the
+      repack/oracle path) and by the CUDA int8 tensor-core loader, and the two
+      must agree bit for bit. Which function on each side turns the E8M0 scale
+      byte into an fp32, what bit pattern does it use for scale bytes below 2,
+      and how does the GPU side encode the integer E2M1 magnitude table
+      without a constant-memory lookup?
+    expect: ["e8m0_to_f32_half", "mxfp4_e8m0_half", "0x00200000|0x0020_0000", "0xC8643210"]
+    files:
+      - candle-core/src/quantized/k_quants/mxfp4.rs
+      - candle-kernels/src/quantized/loader/mxfp4.cuh
+    names_file: false
+
+  - id: a40
+    category: architectural
+    question: >-
+      The sparse-latent MoE's paged KV latent has a fixed (head width, rope
+      width, band count) shape that Rust host code and CUDA templates each
+      declare separately. Which CUDA constexpr repeats the Rust constructor's
+      divisibility rules, which macros pin the compiled shape, which exported
+      C function lets the host read it back, and which load-time Rust check
+      refuses to run when any of the four declarations disagree?
+    expect: ["geometry_ok", "LM_HEAD_DIM|LM_NPAL", "run_latent_geometry", "assert_geometry"]
+    files:
+      - candle-transformers/src/models/latent_moe/geometry.rs
+      - candle-transformers/src/models/latent_moe/paged/paged_geometry.rs
+      - candle-kernels/src/paged-latent/paged_latent_api_bf16.cu
+      - candle-kernels/src/paged-latent/latent_common.cuh
+    names_file: false
+
+  - id: a41
+    category: architectural
+    question: >-
+      Bucketize writes the CPU expert pool's per-layer work slot into mapped
+      memory, and the pool's Rust side reads it with raw volatile loads rather
+      than a shared struct. What layout do the two sides agree on (header
+      size, per-expert record size, where the three weight addresses sit)?
+      Name the CUDA record struct, the slot-size constant mirrored in Rust,
+      the Rust header type, and the offset formula the reader uses for expert
+      j.
+    expect: ["CpuWorkExpert", "CPU_WORK_SLOT_BYTES", "WorkHeader", "16 + 40|40 * j"]
+    files:
+      - candle-kernels/src/simple/moe_bucketize_cpu.cuh
+      - candle-kernels/src/simple/moe_bucketize.rs
+      - candle-transformers/src/models/expert_lre/cpu_pool/rings.rs
+    names_file: false
+
+  - id: a42
+    category: architectural
+    question: >-
+      On a routed Qwen3.5 checkpoint the expert cache is keyed by a dense
+      MoE-layer index, while the model pack's expert section is written in its
+      own order. Which loader counter and helper hand out that index to trunk
+      layers and to the MTP draft head, which pack function fixes the
+      section's block order to match, and which config field makes the
+      cache's layer count include the head?
+    expect: ["moe_layer_idx_next", "pending_ffn", "qwen_expert_blocks", "num_mtp_layers"]
+    files:
+      - candle-transformers/src/models/qwen35/quantized_weights/layer_load.rs
+      - candle-transformers/src/models/qwen35/quantized_weights/mod.rs
+      - candle-transformers/src/models/model_pack/experts.rs
+      - candle-transformers/src/models/qwen35/expert_loader.rs
+    names_file: false

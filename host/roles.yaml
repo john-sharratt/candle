@@ -46,3 +46,8 @@ people:
   # person `zen`, and grants nothing — `approval_grant` is an admin's.
   - sub: "service:zen"
     role: user
+  # The dependency battery (`zend/examples/dependency_battery`), asking its
+  # questions on conversations of its own so a run can be swept without
+  # touching anyone else's (`docs/unbounded_agents.md` §9.12).
+  - sub: "service:battery"
+    role: user

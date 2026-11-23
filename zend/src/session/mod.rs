@@ -223,7 +223,6 @@ use crate::working_set::seeds::Seeding;
 use crate::working_set::{corpus, dialogue_config};
 use crate::workspace::UPLOADS_REPO;
 
-mod ask;
 pub mod diag;
 mod memory_writer;
 mod prewarm;
@@ -234,7 +233,6 @@ use titler::{retire_titler_timelines, Titler};
 pub mod restore;
 mod titles;
 
-pub use ask::{AskOutcome, AskSpec};
 pub use replay::{
     RecordedTurn, ReplayOutcome, ReplayReport, ReplaySampling, ReplaySpec, TurnComparison,
 };

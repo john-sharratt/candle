@@ -42,6 +42,7 @@ pub mod journal;
 pub mod journals;
 pub mod kept_objects;
 pub mod models;
+pub mod placements;
 pub mod projections;
 pub mod prompt_tokens;
 mod repo_map;
@@ -327,6 +328,12 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             get(projections::get),
         )
         .route(
+            "/v1/conversations/:id/placements",
+            Role::User,
+            conversation(),
+            get(placements::get),
+        )
+        .route(
             "/v1/conversations/:id/projection-context",
             Role::User,
             conversation(),
@@ -523,6 +530,7 @@ mod tests {
                 ("/v1/conversations/:id/archive", "user"),
                 ("/v1/conversations/:id/live", "user"),
                 ("/v1/conversations/:id/projections/:turn/:event", "user"),
+                ("/v1/conversations/:id/placements", "user"),
                 ("/v1/conversations/:id/projection-context", "user"),
                 ("/v1/conversations/:id/diag/decode", "user"),
                 ("/v1/conversations/:id/diag/decode/:run", "user"),
@@ -573,6 +581,7 @@ mod tests {
             ("POST", "/v1/conversations/c-1/archive"),
             ("GET", "/v1/conversations/c-1/live"),
             ("GET", "/v1/conversations/c-1/projections/3/4"),
+            ("GET", "/v1/conversations/c-1/placements"),
             ("POST", "/v1/conversations/c-1/projection-context"),
             ("POST", "/v1/conversations/c-1/diag/decode"),
             ("GET", "/v1/conversations/c-1/diag/decode/1"),
