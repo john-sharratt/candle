@@ -83,6 +83,30 @@ pub(super) mod tests {
         }
     }
 
+    /// **A fork nobody is left to receive is freed at once**: its asker gave
+    /// up while the scheduler made it, and only the asker would have freed it.
+    #[test]
+    fn a_fork_whose_asker_is_gone_is_freed() {
+        let (mut scheduler, _tx) = make_test_scheduler();
+        let conversation = crate::projection::Conversation::new();
+        let parent = create_scratch_slot(&mut scheduler, &conversation);
+        let slots_before = scheduler.slot_conversations.len();
+        let (tx, rx) = flume::bounded(1);
+        drop(rx);
+        scheduler.handle_request(SchedulerRequest::ForkEphemeralSequence {
+            parent,
+            band: DecodePriority::Low,
+            response_tx: tx,
+        });
+        assert!(scheduler.ephemeral_slots.is_empty(), "no fork survives");
+        assert!(scheduler.slot_bands.is_empty());
+        assert_eq!(scheduler.slot_conversations.len(), slots_before);
+        assert!(scheduler.turn_views.is_empty());
+        // And the parent still forks for an asker who waits.
+        let child = fork_request(&mut scheduler, parent).expect("fork");
+        assert!(scheduler.ephemeral_slots.contains(&child));
+    }
+
     /// **A slot's band can be raised while it lives, and given back.** Set, it
     /// decodes at that band; cleared, at the one its conversation records —
     /// or, recording none, at no band of its own.

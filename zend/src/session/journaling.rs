@@ -617,7 +617,26 @@ pub(super) fn spawn_journal_draft(
     tokio::spawn(async move {
         let mut desk = journal_desk(&state, &conv_id, timeline, open.asker, WRITE_TOKENS);
         let world = JournalsAbove(citable_above(&state, &conv_id));
-        let record = draft::draft(&mut desk, &journal, &span, &world, skip).await;
+        // Nobody reads a deleted conversation's journal: its draft is dropped
+        // where it stands, and its forks of the slot are freed with it.
+        let drafting = draft::draft(&mut desk, &journal, &span, &world, skip);
+        let engine = &state.engine;
+        let Some(record) = state
+            .deletions
+            .unless_deleted(drafting, || engine.is_timeline_tombstoned(timeline))
+            .await
+        else {
+            // The delete dropped the journal too (`journals.forget`): nothing
+            // reads the draft it was running.
+            tracing::info!(
+                target: "zend::journal",
+                conv_id = %conv_id,
+                from_part = span.from_turn,
+                to_part = span.to_turn,
+                "journal draft stopped: the conversation was deleted",
+            );
+            return;
+        };
         tracing::info!(
             target: "zend::journal",
             conv_id = %conv_id,

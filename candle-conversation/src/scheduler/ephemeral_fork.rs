@@ -23,9 +23,9 @@
 //! journal draft put beside a coding session is background to it, and a
 //! self-check of a reply about to be shown is not.
 
-use flume::Sender;
+use flume::{SendError, Sender};
 
-use super::Scheduler;
+use super::{Scheduler, SchedulerRequest};
 use crate::error::ConversationError;
 use crate::projection::DecodePriority;
 use crate::sequence_handle::SequenceId;
@@ -64,7 +64,21 @@ impl Scheduler {
             });
             return;
         }
-        let _ = response_tx.send(self.fork_ephemeral_sequence(parent, band));
+        let forked = self.fork_ephemeral_sequence(parent, band);
+        self.answer_fork(&response_tx, forked);
+    }
+
+    /// Hand `forked` to its requester; a fork nobody is left to receive — its
+    /// asker dropped while the scheduler made it — is freed at once, since only
+    /// the asker would ever have freed it.
+    fn answer_fork(
+        &mut self,
+        response_tx: &Sender<Result<SequenceId, ConversationError>>,
+        forked: Result<SequenceId, ConversationError>,
+    ) {
+        if let Err(SendError(Ok(child))) = response_tx.send(forked) {
+            self.handle_request_now(SchedulerRequest::FreeSequence { sequence_id: child });
+        }
     }
 
     /// Answer every parked request whose parent has no turn in flight, and fail
@@ -85,9 +99,8 @@ impl Scheduler {
                 self.parked_forks.push(fork);
                 continue;
             }
-            let _ = fork
-                .response_tx
-                .send(self.fork_ephemeral_sequence(fork.parent, fork.band));
+            let forked = self.fork_ephemeral_sequence(fork.parent, fork.band);
+            self.answer_fork(&fork.response_tx, forked);
         }
     }
 
