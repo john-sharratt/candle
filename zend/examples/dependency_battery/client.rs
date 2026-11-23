@@ -7,6 +7,15 @@
 //! (`host/roles.yaml`), stated on the forwarded-identity headers a member
 //! believes from its own address, and names its conversations
 //! `mcp:<its key>:<thread>/<name>` so they open to it alone (`ownership`).
+//!
+//! **Every answer is one member's.** A joined member forwards each request up
+//! to a gateway, which may place it on any member; the battery measures one
+//! card, so each request names that member's node on `x-tokera-node`. The
+//! member keeps the header on a request from a peer it trusts — its own
+//! address among them (`host::cluster::listener::scrub`) — and the gateway
+//! honours it on a request a member sent up (`web::cluster::route::addressed`).
+//! Run the battery on the member it asks: from anywhere else the header is
+//! scrubbed and the request is placed as any client's is.
 
 use std::time::{Duration, Instant};
 
@@ -15,11 +24,32 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use cluster::gateway::NODE_HEADER;
+
 use crate::arms::Arm;
 use crate::placement::Point;
 
 pub const PROVIDER: &str = "service";
 pub const SUBJECT: &str = "service:battery";
+
+/// What every request states: who asks, and the member — by its node, 16 hex
+/// digits — that answers it.
+pub fn headers(node: &str) -> [(&'static str, String); 3] {
+    [
+        ("x-tokera-user", SUBJECT.to_string()),
+        ("x-tokera-provider", PROVIDER.to_string()),
+        (NODE_HEADER, node.to_string()),
+    ]
+}
+
+/// `node` as a member's node id: 16 hex digits, lowercased.
+pub fn node_id(node: &str) -> anyhow::Result<String> {
+    let n = node.trim().to_ascii_lowercase();
+    if n.len() != 16 || !n.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("`{node}` is not a node id: 16 hex digits, as `cluster_status` lists them");
+    }
+    Ok(n)
+}
 
 /// The thinking effort every question is asked at: the chat tools' default.
 pub const EFFORT: u8 = 2;
@@ -71,20 +101,24 @@ pub struct Answered {
 
 pub struct Zend {
     base: String,
+    node: String,
     http: Client,
 }
 
 impl Zend {
-    pub fn new(base: &str) -> anyhow::Result<Self> {
+    /// The daemon at `base`, every request answered by member `node`.
+    pub fn new(base: &str, node: &str) -> anyhow::Result<Self> {
         Ok(Self {
             base: base.trim_end_matches('/').to_string(),
+            node: node_id(node)?,
             http: Client::builder().timeout(ANSWER_TIMEOUT).build()?,
         })
     }
 
     fn with_identity(&self, r: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        r.header("x-tokera-user", SUBJECT)
-            .header("x-tokera-provider", PROVIDER)
+        headers(&self.node)
+            .into_iter()
+            .fold(r, |r, (k, v)| r.header(k, v))
     }
 
     fn path(&self, conv_id: &str, rest: &str) -> String {
@@ -238,6 +272,25 @@ mod tests {
         assert_eq!(points.len(), 2);
         assert_eq!(points[0].placed[0].path.as_deref(), Some("candle/a.rs"));
         assert!(last_turn_points(&json!([])).unwrap().is_empty());
+    }
+
+    /// **Every request names the member that answers it**, on the header the
+    /// gateway routes by, and a node that is no node id is refused.
+    #[test]
+    fn every_request_names_its_member() {
+        let h = headers("223ebb209828d84c");
+        assert_eq!(
+            h,
+            [
+                ("x-tokera-user", "service:battery".to_string()),
+                ("x-tokera-provider", "service".to_string()),
+                ("x-tokera-node", "223ebb209828d84c".to_string()),
+            ]
+        );
+        assert_eq!(h[2].0, NODE_HEADER);
+        assert_eq!(node_id(" 223EBB209828D84C ").unwrap(), "223ebb209828d84c");
+        assert!(node_id("BlackWorld").is_err());
+        assert!(node_id("223ebb209828d84").is_err());
     }
 
     #[test]

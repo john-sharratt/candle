@@ -58,6 +58,8 @@ pub struct Line {
 /// What a run is given.
 pub struct Plan<'a> {
     pub base: &'a str,
+    /// The member that answers every question, by node id.
+    pub node: &'a str,
     pub thread: &'a str,
     pub questions: Vec<Question>,
     pub vocabulary: HashSet<String>,
@@ -176,7 +178,7 @@ async fn answer_job(
 
 /// Run `plan` to its end.
 pub async fn run(plan: Plan<'_>) -> anyhow::Result<()> {
-    let zend = Arc::new(Zend::new(plan.base)?);
+    let zend = Arc::new(Zend::new(plan.base, plan.node)?);
     let done = recorded(plan.out)?;
     let jobs: Vec<Job> = queue(plan.questions.len(), plan.runs, plan.seed)
         .into_iter()

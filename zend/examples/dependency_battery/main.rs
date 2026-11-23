@@ -14,7 +14,7 @@
 //!
 //! ```sh
 //! cargo run -p zend --release --example dependency_battery -- run \
-//!   --zend http://192.168.1.2:8081 --repo D:\prog\candle \
+//!   --zend http://192.168.1.2:8081 --node 223ebb209828d84c --repo D:\prog\candle \
 //!   --out docs/results/battery_128/answers.jsonl
 //! cargo run -p zend --release --example dependency_battery -- analyse \
 //!   --answers docs/results/battery_128/answers.jsonl --out docs/results/battery_128
@@ -57,9 +57,14 @@ struct Cli {
 enum Cmd {
     /// Ask the battery.
     Run {
-        /// The member's HTTP base, e.g. `http://192.168.1.2:8081`.
+        /// The member's HTTP base, e.g. `http://192.168.1.2:8081`, reached
+        /// from the member's own machine.
         #[arg(long)]
         zend: String,
+        /// The member that answers every question: its zend node id, 16 hex
+        /// digits, as `cluster_status` lists it.
+        #[arg(long)]
+        node: String,
         /// The repository the questions are about, for its files and its
         /// grounding vocabulary.
         #[arg(long)]
@@ -163,6 +168,7 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Cmd::Run {
             zend,
+            node,
             repo,
             battery,
             out,
@@ -188,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
             let telemetry = telemetry.unwrap_or_else(|| beside(&out, "telemetry.jsonl"));
             run::run(run::Plan {
                 base: &zend,
+                node: &node,
                 thread: &thread,
                 questions,
                 vocabulary: vocabulary(&repo)?,
