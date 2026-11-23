@@ -224,6 +224,7 @@ use crate::working_set::{corpus, dialogue_config};
 use crate::workspace::UPLOADS_REPO;
 
 pub mod diag;
+mod kv_census;
 mod memory_writer;
 mod prewarm;
 mod replay;

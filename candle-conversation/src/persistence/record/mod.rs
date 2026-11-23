@@ -382,6 +382,7 @@ impl RecordType {
 mod branch;
 mod bytes;
 mod chunk;
+mod chunk_head;
 mod crc;
 mod decode;
 mod distill;
@@ -409,6 +410,7 @@ mod tombstone;
 pub use branch::*;
 pub use bytes::*;
 pub use chunk::*;
+pub use chunk_head::*;
 pub use crc::*;
 pub use decode::*;
 pub use distill::*;

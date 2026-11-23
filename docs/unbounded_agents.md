@@ -758,7 +758,7 @@ From C0 to C10 the cache shrinks 3.2× further for 8% of decode, and C5 — the 
 | C5 against BF16 on Flash-Next (the forward gate above) | 4.15× |
 | Bytes on disk per resident token, every record included | ≈ 8.0 KB |
 
-The log holds every record of every token — its K/V at C5, its 192-byte signature, its token id, its index page — and the same memory at BF16 would need the K/V share of it 4.15 times over. *[PENDING: battery-128]* The format census — the share of the substrate's K/V bytes in each format, and its K/V bytes against their BF16 equivalent — is taken with the store quiescent at the battery's start: __ GiB of K/V standing for __ GiB at BF16, an effective __×.
+The log holds every record of every token — its K/V at C5, its 192-byte signature, its token id, its index page — and the same memory at BF16 would need the K/V share of it 4.15 times over. *[PENDING: battery-128]* The format census — the share of the substrate's K/V bytes in each format, and its K/V bytes against their BF16 equivalent — is read from the serving daemon at the battery's start (`GET /v1/kv/census`): every live chunk's stored bytes and tokens exactly, from the substrate's chunk index, and the per-sub-band format mix and BF16 ratio from the metadata heads of a 4,096-chunk uniform sample: __ GiB of K/V standing for __ GiB at BF16, an effective __×.
 
 **The span, live.** The production daemon reserves one contiguous span per card and divides it between persistent tensors, KV regions, a per-wave transient tier and expert weights, with an elastic boundary between the KV side and the experts (§10.2). BlackWorld's accounting at rest, from `/v1/memory` on 2026-11-23 — Flash-Next, the 72 GB card:
 

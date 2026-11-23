@@ -33,6 +33,9 @@ pub const PREFIX: &str = "Answer from your memory of the repository only — do 
 /// How many times an answer is tried before it is recorded as failed.
 pub const TRIES: u32 = 3;
 
+/// The chunk heads the K/V census samples.
+pub const CENSUS_SAMPLE: usize = 4_096;
+
 /// One answer's line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Line {
@@ -68,6 +71,9 @@ pub struct Plan<'a> {
     pub concurrency: usize,
     pub out: &'a Path,
     pub telemetry: &'a Path,
+    /// Where the K/V census taken as the run starts and as it ends goes:
+    /// `census_start.json` and `census_end.json` in this folder.
+    pub census_dir: &'a Path,
 }
 
 /// The `(arm, run, id)` of every answer `out` already records.
@@ -213,6 +219,7 @@ pub async fn run(plan: Plan<'_>) -> anyhow::Result<()> {
         .append(true)
         .open(plan.telemetry)
         .with_context(|| format!("opening {}", plan.telemetry.display()))?;
+    census(&zend, &plan.census_dir.join("census_start.json")).await?;
     let in_flight = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let sampler = tokio::spawn(telemetry::sample(
@@ -269,6 +276,18 @@ pub async fn run(plan: Plan<'_>) -> anyhow::Result<()> {
     }
     stop.store(true, Ordering::Release);
     sampler.await?;
+    census(&zend, &plan.census_dir.join("census_end.json")).await
+}
+
+/// The answering member's K/V census, written to `path`.
+async fn census(zend: &Zend, path: &Path) -> anyhow::Result<()> {
+    let c = zend
+        .sample(&format!("/v1/kv/census?sample={CENSUS_SAMPLE}"))
+        .await
+        .context("the K/V census")?;
+    std::fs::write(path, serde_json::to_string_pretty(&c)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    println!("K/V census written to {}", path.display());
     Ok(())
 }
 

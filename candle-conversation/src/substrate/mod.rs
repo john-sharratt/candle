@@ -44,6 +44,7 @@ mod faces;
 mod file_gallery;
 pub mod gauge;
 mod group_epoch;
+pub mod kv_census;
 mod label_records;
 mod located;
 mod lock;

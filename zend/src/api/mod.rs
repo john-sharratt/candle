@@ -41,6 +41,7 @@ pub mod jobs;
 pub mod journal;
 pub mod journals;
 pub mod kept_objects;
+pub mod kv_census;
 pub mod models;
 pub mod placements;
 pub mod projections;
@@ -197,6 +198,13 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             Role::User,
             Dispatch::Any,
             get(repo_map::completeness),
+        )
+        // Each member's own substrate: pinned to a member by its node.
+        .route(
+            "/v1/kv/census",
+            Role::User,
+            Dispatch::Any,
+            get(kv_census::get),
         )
         // By shape: each member maps its own checkouts (§3.8).
         .mirror(Mirror::Shape)
@@ -510,6 +518,7 @@ mod tests {
                 ("/v1/jobs/view", "user"),
                 ("/v1/jobs/lines", "user"),
                 ("/v1/repo_map", "user"),
+                ("/v1/kv/census", "user"),
                 ("/v1/substrate/zend/system-prompt", "admin"),
                 ("/v1/substrate/zend/system-prompt", "admin"),
                 ("/v1/substrate/zend/layer/:name", "admin"),
@@ -606,6 +615,7 @@ mod tests {
             ),
             ("GET", "/v1/models", Dispatch::Any),
             ("GET", "/v1/repo_map", Dispatch::Any),
+            ("GET", "/v1/kv/census", Dispatch::Any),
             ("GET", "/v1/agents", Dispatch::Any),
             ("PUT", "/v1/agents/00000000000000a1", Dispatch::Any),
             (

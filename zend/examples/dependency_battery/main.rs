@@ -6,7 +6,8 @@
 //!   answer a fresh conversation over the daemon's HTTP API with tools off and
 //!   the arm's retrieval dials, scored (`score.rs`), read back for what its
 //!   projection points placed (`placement.rs`) and deleted, one JSON line
-//!   each; the card's load sampled beside it (`telemetry.rs`).
+//!   each; the card's load sampled beside it (`telemetry.rs`), and the
+//!   member's K/V census (`GET /v1/kv/census`) taken as it starts and ends.
 //! - `analyse`: every figure's data and table of §9.12, §6.5 and §9.6.9 from
 //!   those lines (`analyse.rs`, `report.rs`).
 //! - `direct`: the direct questions, generated from the source by rule
@@ -203,6 +204,7 @@ async fn main() -> anyhow::Result<()> {
                 concurrency,
                 out: &out,
                 telemetry: &telemetry,
+                census_dir: out.parent().unwrap_or_else(|| Path::new(".")),
             })
             .await
         }
