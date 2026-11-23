@@ -36,7 +36,7 @@ mod telemetry;
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -148,14 +148,12 @@ fn samples(path: &Path) -> anyhow::Result<Vec<Value>> {
     let Ok(f) = File::open(path) else {
         return Ok(Vec::new());
     };
-    let mut out = Vec::new();
-    for line in BufReader::new(f).lines() {
-        let line = line?;
-        if !line.trim().is_empty() {
-            out.push(serde_json::from_str(&line).context("a telemetry sample")?);
-        }
+    let (samples, cut) = telemetry::read(BufReader::new(f))
+        .with_context(|| format!("reading {}", path.display()))?;
+    if !cut.is_empty() {
+        tracing::warn!(lines = ?cut, "telemetry lines cut short by a stopped launch, left out");
     }
-    Ok(out)
+    Ok(samples)
 }
 
 #[tokio::main]
