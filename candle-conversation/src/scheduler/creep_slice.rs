@@ -80,6 +80,53 @@ pub(super) fn window_end(cursor: usize, budget: usize, n: usize, head: usize) ->
     (cursor + budget, 0)
 }
 
+/// Whether a creep whose members carry `member_rows` this step sweeps every
+/// layer left in one step, as a stencil's static run does: when every member
+/// is within the model's short span (`span`,
+/// `ManagedBatchedModel::short_span_rows`).
+///
+/// **A short prompt is a stencil run, not a creep.** Within the short span a
+/// recurrent stack writes the rows into its timeline and claims no prefill
+/// scratch, and the rows route about what a few decode rows do, so a layer of
+/// them costs what a decode row's layer does. The slice's per-layer floor is
+/// learned from wide creeps, which route most of a layer's experts: priced at
+/// it, a 7-row prompt on the RTX 3090 (a ~60 ms layer floor against a 95 ms
+/// decode step, a 250 ms decode-less slice) advanced one to four layers a
+/// step, every step a forward of its own. Swept whole it costs one forward. A
+/// card that holds its experts pays the same for slicing in another coin: on
+/// BlackWorld (2026-11-23, 72 GB, eight answers in flight) 75 of 241 prefill
+/// forwards in 27 minutes carried nine rows or fewer, each beside six to eight
+/// waiting decodes. A stack with no short span (`None`) slices every creep.
+pub(super) fn sweeps_whole(
+    span: Option<usize>,
+    mut member_rows: impl Iterator<Item = usize>,
+) -> bool {
+    let Some(span) = span else {
+        return false;
+    };
+    let mut any = false;
+    member_rows.all(|rows| {
+        any = true;
+        rows <= span
+    }) && any
+}
+
+/// Short spans a short prompt may ride in: a prompt of up to this many spans
+/// is cut into pieces of the span ([`short_piece`]), each swept whole on a
+/// step of its own, rather than claiming the prefill scratch a longer span
+/// writes.
+pub(super) const SHORT_PIECES: usize = 4;
+
+/// The piece a prompt with `left` rows still to prefill is cut to, when it
+/// rides in short spans: a prompt of at most [`SHORT_PIECES`] spans of the
+/// model's short span (`span`) rides one span a step, as a stencil's played
+/// run does — each piece written into the recurrent timeline, none claiming
+/// the prefill scratch, and the whole of it priced without one. `None` for a
+/// longer prompt or a stack with no short span.
+pub(super) fn short_piece(span: Option<usize>, left: usize) -> Option<usize> {
+    span.filter(|&s| s > 0 && left <= s.saturating_mul(SHORT_PIECES))
+}
+
 /// The newest step's weight in [`next_layer_row_cost`].
 const COST_WEIGHT: f64 = 0.25;
 
@@ -222,6 +269,51 @@ mod tests {
             time_bounded_layers(48, 8_190, Some(row), Some(ms(1)), Some(ms(250))),
             3
         );
+    }
+
+    /// **A short creep sweeps whole.** Every member within the short span
+    /// sweeps; one member past it, an empty creep, or a stack with no short
+    /// span all slice.
+    #[test]
+    fn a_short_creep_sweeps_whole() {
+        assert!(sweeps_whole(Some(8), [7].into_iter()));
+        assert!(sweeps_whole(Some(8), [8, 3, 1].into_iter()));
+        assert!(
+            !sweeps_whole(Some(8), [7, 9].into_iter()),
+            "one past the span"
+        );
+        assert!(!sweeps_whole(Some(8), [].into_iter()), "no creep");
+        assert!(!sweeps_whole(None, [7].into_iter()), "no short span");
+    }
+
+    /// **A prompt of up to four short spans rides one span a step.** Past four,
+    /// or on a stack with no short span, it is not cut.
+    #[test]
+    fn a_prompt_of_four_spans_rides_in_short_pieces() {
+        assert_eq!(short_piece(Some(8), 7), Some(8));
+        assert_eq!(short_piece(Some(8), 32), Some(8));
+        assert_eq!(short_piece(Some(8), 33), None, "past four spans");
+        assert_eq!(short_piece(None, 7), None, "no short span");
+        assert_eq!(short_piece(Some(0), 0), None, "a zero span");
+        // 20 rows ride 8, 8 and 4: every piece within the span, so each sweeps.
+        let pieces: Vec<usize> = std::iter::successors(Some(20usize), |l| l.checked_sub(8))
+            .take_while(|&l| l > 0)
+            .map(|l| l.min(short_piece(Some(8), 20).unwrap()))
+            .collect();
+        assert_eq!(pieces, vec![8, 8, 4]);
+        assert!(sweeps_whole(Some(8), pieces.into_iter()));
+    }
+
+    /// The WhiteWorld case the rule replaces: a 7-row creep beside a 95 ms
+    /// decode step at a 60 ms layer floor took one layer of 48.
+    #[test]
+    fn a_short_creep_priced_at_the_layer_floor_took_a_layer() {
+        let row = Duration::from_nanos(10_000);
+        assert_eq!(
+            time_bounded_layers(48, 7, Some(row), Some(ms(60)), Some(ms(95))),
+            1
+        );
+        assert!(sweeps_whole(Some(8), [7].into_iter()));
     }
 
     /// Unmeasured, the first slice is one layer.

@@ -332,6 +332,15 @@ impl Scheduler {
             .unwrap_or(0)
     }
 
+    /// Whether this card streams its experts now ([`streams_experts`]): the
+    /// weight zone it can reach, against every expert image of the model.
+    pub(in super::super) fn card_streams_experts(&self) -> bool {
+        streams_experts(
+            interleave::achievable_weight_now().unwrap_or(u64::MAX),
+            self.expert_set_bytes(),
+        )
+    }
+
     /// The recurrent store **one** new sequence needs, or zero on a stack that
     /// carries none.
     ///

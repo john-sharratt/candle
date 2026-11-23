@@ -196,6 +196,7 @@ impl Scheduler {
                 self.wave_step_creep_layer_rows = 0;
                 self.wave_step_creep_layers = 0;
                 self.wave_step_creep_layer_pairs = 0.0;
+                self.wave_step_short_sweep = false;
                 // What the creep had to ride with, before the step moves it.
                 let admitted = self.prefill_width() > 0 || self.section_ingest_width() > 0;
                 let queued = !self.prefill_queue.is_empty() || !self.pending_submits.is_empty();
@@ -270,7 +271,10 @@ impl Scheduler {
                 self.width_steps.record(width, step, Instant::now());
                 if !self.wave_cobatched {
                     self.decode_only_step = Some(next_decode_only(self.decode_only_step, step));
-                } else if let Some(decode_only) = self.decode_only_step {
+                } else if let Some(decode_only) = self
+                    .decode_only_step
+                    .filter(|_| !self.wave_step_short_sweep)
+                {
                     // What the creep that rode cost beside decode, so the next
                     // slice fits a decode step's worth of it.
                     self.creep_layer_row_cost = next_layer_row_cost(

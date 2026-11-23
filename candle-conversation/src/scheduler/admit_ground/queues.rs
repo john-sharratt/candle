@@ -9,9 +9,31 @@
 //! submissions are priced the same way prefills are, and an admitted item leaves
 //! the queue at once, with the other bands' cursors walked back over it.
 
+use super::super::creep_slice::short_piece;
 use super::*;
 
 impl AdmitPass<'_> {
+    /// The carried state a turn of `turn` tokens on `seq` claims: a store when
+    /// it holds none (`holds_store` false), and the prefill scratch a span
+    /// past the short span claims on top.
+    ///
+    /// **A turn that rides in short pieces claims no scratch** (`short_piece`):
+    /// each piece is written into the recurrent timeline. Charged it anyway, a
+    /// 7-row turn on Flash-Next was priced its ~66 MiB store plus a 144 MiB
+    /// scratch it never took, and a streaming card's store rule weighed its
+    /// rows against three times the state it holds.
+    pub(super) fn recurrent_charge(&self, seq: usize, turn: usize, holds_store: bool) -> u64 {
+        let short = short_piece(self.sched.model.short_span_rows(), turn).is_some();
+        match (holds_store, short) {
+            (true, true) => 0,
+            (true, false) => self.sched.model.prefill_scratch_bytes(seq) as u64,
+            (false, true) => self
+                .recurrent
+                .saturating_sub(self.sched.model.sequence_scratch_bytes() as u64),
+            (false, false) => self.recurrent,
+        }
+    }
+
     /// Rows of this wave's forward still free for an offer — see `peek_prefill`
     /// — or `None` when the forward is full and one more member could not
     /// advance a chunk beside the rest.
@@ -82,11 +104,8 @@ impl AdmitPass<'_> {
         let (turn, seq) = (s.tokens.len(), s.sequence_id);
         // A reused slot already holds a store, whose regions the residency
         // already counts: its restart zeroes that store where it stands.
-        let recurrent = if self.sched.model.has_recurrent_state(seq.0) {
-            self.sched.model.prefill_scratch_bytes(seq.0) as u64
-        } else {
-            self.recurrent
-        };
+        let recurrent =
+            self.recurrent_charge(seq.0, turn, self.sched.model.has_recurrent_state(seq.0));
         let (room, ahead) = self.section_room(prio, turn)?;
         let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
         let kv = prefill_cost_bytes(turn, self.per_block)
@@ -201,11 +220,7 @@ impl AdmitPass<'_> {
             self.sched.uncarved_case(w).is_none() && self.sched.model.has_recurrent_state(seq.0);
         // A store it holds is in the residency already; the prefill scratch it
         // will claim on top is not (`ManagedBatchedModel::prefill_scratch_bytes`).
-        let recurrent = if holds_store {
-            self.sched.model.prefill_scratch_bytes(seq.0) as u64
-        } else {
-            self.recurrent
-        };
+        let recurrent = self.recurrent_charge(seq.0, turn, holds_store);
         let (room, ahead) = self.prompt_room(prio, turn, seq.0)?;
         let depth = self.sched.session.sequence_offset(seq.0).unwrap_or(0);
         let kv = prefill_cost_bytes(turn, self.per_block)
@@ -250,17 +265,14 @@ impl AdmitPass<'_> {
         let kv = prefill_cost_bytes(turn, self.per_block)
             .saturating_add(lift)
             .saturating_add(self.sched.model.index_growth_bytes(depth, turn) as u64);
-        let (rows, activations, residual) = self.offer_tier(
-            room,
-            turn,
-            depth,
-            parent.0,
-            kv.saturating_add(self.recurrent),
-        );
+        // Its view is carved at admission, so it holds no store yet.
+        let recurrent = self.recurrent_charge(parent.0, turn, false);
+        let (rows, activations, residual) =
+            self.offer_tier(room, turn, depth, parent.0, kv.saturating_add(recurrent));
         self.offering_submit = true;
         Some(self.credited(Cost {
             kv,
-            recurrent: self.recurrent,
+            recurrent,
             residual,
             hole_credit: 0,
             narrow_credit: 0,

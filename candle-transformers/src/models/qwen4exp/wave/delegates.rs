@@ -340,12 +340,14 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
             .ok()
             .and_then(|map| map.get(&seq).map(|store| store.holds_scratch()));
         match held {
-            Some(false) => {
-                let cfg = &self.model.cfg;
-                RecurrentStateStore::scratch_bytes_for(&cfg.layer_kinds, &cfg.delta_net)
-            }
+            Some(false) => self.sequence_scratch_bytes(),
             _ => 0,
         }
+    }
+
+    fn sequence_scratch_bytes(&self) -> usize {
+        let cfg = &self.model.cfg;
+        RecurrentStateStore::scratch_bytes_for(&cfg.layer_kinds, &cfg.delta_net)
     }
 
     /// Per selecting layer, the live tail's Q8_0 key pages a prefill of `rows`

@@ -306,6 +306,7 @@ impl Scheduler {
             creep_layer_cost: None,
             wave_step_creep_layer_rows: 0,
             wave_step_creep_layers: 0,
+            wave_step_short_sweep: false,
             section_relief_pacing: ReliefPacing::default(),
             reproject_census: ReprojectCensus::new(Instant::now()),
             wave_step_creep_layer_pairs: 0.0,

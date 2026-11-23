@@ -942,6 +942,9 @@ pub(crate) struct Scheduler {
     wave_step_creep_layer_rows: usize,
     /// The layers of creep the last wave step swept; zero as above.
     wave_step_creep_layers: usize,
+    /// The last wave step swept a creep of short prompts whole
+    /// (`creep_slice::sweeps_whole`), so its cost teaches the slice nothing.
+    wave_step_short_sweep: bool,
     /// When the section gate's relief may run next (`relief_pacing`).
     section_relief_pacing: ReliefPacing,
     /// Every live reprojection's parts, summed and written once a minute.

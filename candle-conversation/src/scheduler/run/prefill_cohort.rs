@@ -103,6 +103,7 @@ impl Scheduler {
         self.wave_step_creep_layer_rows = 0;
         self.wave_step_creep_layers = 0;
         self.wave_step_creep_layer_pairs = 0.0;
+        self.wave_step_short_sweep = false;
         let t_step = Instant::now();
         let out = self.decode_forward_cobatched(&[], &[], &[], &[], &[], &[]);
         self.step_census.record(
@@ -120,19 +121,22 @@ impl Scheduler {
                     tracing::info!(failures, "decode-less wave step ran after failing");
                 }
                 // What a layer-row of creep costs with nothing beside it, so
-                // the next decode-less step fits `DECODE_LESS_SLICE`.
-                self.creep_layer_row_cost = next_layer_row_cost(
-                    self.creep_layer_row_cost,
-                    t_step.elapsed(),
-                    Duration::ZERO,
-                    self.wave_step_creep_layer_rows,
-                );
-                self.creep_layer_cost = next_layer_row_cost(
-                    self.creep_layer_cost,
-                    t_step.elapsed(),
-                    Duration::ZERO,
-                    self.wave_step_creep_layers,
-                );
+                // the next decode-less step fits `DECODE_LESS_SLICE`. A short
+                // creep swept whole prices nothing the slice is cut by.
+                if !self.wave_step_short_sweep {
+                    self.creep_layer_row_cost = next_layer_row_cost(
+                        self.creep_layer_row_cost,
+                        t_step.elapsed(),
+                        Duration::ZERO,
+                        self.wave_step_creep_layer_rows,
+                    );
+                    self.creep_layer_cost = next_layer_row_cost(
+                        self.creep_layer_cost,
+                        t_step.elapsed(),
+                        Duration::ZERO,
+                        self.wave_step_creep_layers,
+                    );
+                }
             }
             // A refused tier is answered where it was refused — the next wave is
             // composed narrower, or one already at the least chunk waits for

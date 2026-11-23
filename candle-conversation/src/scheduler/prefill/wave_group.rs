@@ -408,6 +408,7 @@ impl Scheduler {
             self.wave_prefill_members = members;
             return;
         }
+        self.cut_to_short_pieces(&mut members);
         self.fit_cohort_to_ground(&mut members);
         self.cut_at_recurrent_spans(&mut members);
         self.cut_at_page_breaks(&mut members);
@@ -446,6 +447,43 @@ impl Scheduler {
         let held = self.held_arena_bytes();
         self.sweep_forecast.held_formed(held);
         self.wave_prefill_members = members;
+    }
+
+    /// Cut a group of short prompts to one short span each (`short_piece`), so
+    /// the step carrying it sweeps every layer at once (`sweeps_whole`) and no
+    /// member claims its prefill scratch: a prompt of up to four spans rides
+    /// four steps, a piece each, as a stencil's played run does.
+    ///
+    /// **Only a group whose every member is short.** A group with a longer
+    /// member is sliced whatever its short members ride, and cut to a span they
+    /// would take several of its sweeps to finish what one carries now. Their
+    /// windows then claim the scratch, which the fit prices from the rows each
+    /// writes.
+    pub(super) fn cut_to_short_pieces(&self, members: &mut [WaveMember]) {
+        let span = self.model.short_span_rows();
+        let left = |m: &WaveMember| match m {
+            WaveMember::Prefill { seq_id, .. } => self
+                .active_prefills
+                .iter()
+                .find(|p| p.work.sequence_id.0 == *seq_id)
+                .map(|p| p.work.tokens.len().saturating_sub(p.offset)),
+            WaveMember::Section { seq_id, .. } => self
+                .active_section_ingests
+                .iter()
+                .find(|s| s.sequence_id.0 == *seq_id)
+                .map(|s| s.tokens.len().saturating_sub(s.offset)),
+        };
+        let pieces: Option<Vec<usize>> = members
+            .iter()
+            .map(|m| left(m).and_then(|l| short_piece(span, l)))
+            .collect();
+        let Some(pieces) = pieces else {
+            return;
+        };
+        for (m, piece) in members.iter_mut().zip(pieces) {
+            let (WaveMember::Prefill { advance, .. } | WaveMember::Section { advance, .. }) = m;
+            *advance = (*advance).min(piece);
+        }
     }
 
     /// End each prefill's chunk just past the first page break it would cross
@@ -597,10 +635,17 @@ impl Scheduler {
                 .filter(|m| !self.model.has_recurrent_state(m.seq_id()))
                 .count() as u64;
             // And the prefill scratch a member that kept its store still claims
-            // at its first window — one more slot per recurrent layer.
+            // at its first window — one more slot per recurrent layer — when
+            // its rows run past the model's short span. Within it the rows are
+            // written into the recurrent timeline and claim none: a 7-row
+            // cohort was charged 144 MiB it never took (WhiteWorld,
+            // 2026-11-23).
+            let span = self.model.short_span_rows();
             let scratch: u64 = members
                 .iter()
-                .map(|m| self.model.prefill_scratch_bytes(m.seq_id()) as u64)
+                .zip(&q_lens)
+                .filter(|(_, &q)| span.is_none_or(|s| q > s))
+                .map(|(m, _)| self.model.prefill_scratch_bytes(m.seq_id()) as u64)
                 .sum();
             let claims = (q_lens
                 .iter()

@@ -546,6 +546,14 @@ pub trait ManagedBatchedModel {
         0
     }
 
+    /// The prefill scratch any one sequence claims for a span longer than
+    /// [`Self::short_span_rows`], priced from the geometry: part of
+    /// [`Self::recurrent_store_bytes`], and the part a turn that rides only in
+    /// short spans never claims. Zero on a stack with no recurrent state.
+    fn sequence_scratch_bytes(&self) -> usize {
+        0
+    }
+
     /// The longest span this stack writes without claiming its sequence's
     /// prefill scratch: the recurrent timeline's rows, on a stack that carries
     /// recurrent state. A longer span writes a second copy of the whole state

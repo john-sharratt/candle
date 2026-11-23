@@ -266,6 +266,30 @@ prefill phase. A card whose zone holds its experts judges prefills on their
 trade alone, as before; each member's `learned rates published` line says which
 (`streams`).
 
+**A short prompt rides as a stencil run does, a short span a step.** A prompt of
+at most four of the model's short spans (`ManagedBatchedModel::short_span_rows`,
+eight rows on a recurrent stack; `creep_slice::short_piece`, `SHORT_PIECES`) is
+cut to one span per sweep when every member of its group is that short
+(`cut_to_short_pieces`). A group whose every member is within the span sweeps
+every layer in the step that carries it (`creep_slice::sweeps_whole`), beside
+the decodes or alone, as a stencil's played run rides the decode step
+(`stencil_wave`). So a prompt of up to 32 rows finishes in at most four steps. A
+span within the short span is written into the recurrent timeline and claims no
+prefill scratch, so admission charges such a turn its store alone
+(`AdmitPass::recurrent_charge`), and the cohort fit charges scratch only to a
+member whose rows run past the span. These steps teach the slice's costs
+nothing (`wave_step_short_sweep`): those costs price the wide creeps that are
+sliced, and a whole-sweep sample of a few rows would drag the per-layer floor
+down under them.
+
+Before this, a slice cut a short prompt like any creep. On WhiteWorld
+(2026-11-23) a 7-row prompt priced at the ~60 ms per-layer floor learned from
+wide creeps advanced one layer a step beside a decode, and four alone within the
+250 ms decode-less slice. Each step was a forward of its own, and the turn was
+charged a 144 MiB scratch it never took. On BlackWorld (72 GB, eight answers in
+flight), 75 of 241 prefill forwards in 27 minutes carried nine rows or fewer,
+each beside six to eight waiting decodes.
+
 The normalization warm-up replay (`scheduler/norm_warm.rs`) is the one piece of
 background work that does not ride a forward: it runs on the loop thread, one
 replayed turn per loop iteration, which a decode quantum bounds to one per

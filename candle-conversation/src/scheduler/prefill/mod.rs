@@ -41,7 +41,9 @@ use super::admit_ground::{joins_a_full_forward, AdmitPass};
 use super::band::rank;
 use super::compaction_split::TenantPart;
 use super::compaction_stall::{FrontierPass, PassOutcome, PoolShape};
-use super::creep_slice::{slice_target, time_bounded_layers, window_end};
+use super::creep_slice::{
+    short_piece, slice_target, sweeps_whole, time_bounded_layers, window_end,
+};
 use super::first_sample::{
     contiguous_runs, row_is_nan_free, FirstSample, FirstSampled, PrefillEnd,
 };

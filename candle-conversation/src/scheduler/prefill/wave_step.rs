@@ -368,7 +368,14 @@ impl Scheduler {
         // `window_end`, and counted in what the step teaches the cost.
         let head = self.model.sweep_head_layers();
         let left = n - cursor.min(n) + head;
-        let budget = if finish_sweep {
+        // A creep of short prompts rides the step whole, as a stencil's static
+        // run does (`creep_slice::sweeps_whole`). It teaches the slice's costs
+        // nothing: they price the wide creeps that are sliced.
+        self.wave_step_short_sweep = sweeps_whole(
+            self.model.short_span_rows(),
+            inputs.iter().map(|t| t.dims().get(1).copied().unwrap_or(0)),
+        );
+        let budget = if finish_sweep || self.wave_step_short_sweep {
             left
         } else if head_rows > 0 {
             time_bounded_layers(
