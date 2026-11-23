@@ -13,6 +13,7 @@
 use super::*;
 use crate::provenance::gallery_arena::eviction::keep_within;
 use crate::provenance::gallery_arena::keep_price::WeightTallies;
+use crate::scheduler::admit::gate::streams_experts;
 
 /// How often the learned rates are logged — and, with no reader registered
 /// (`phase_ring::rates_read_every`), how often they are priced at all.
@@ -595,6 +596,13 @@ impl Scheduler {
                     idle,
                     prefill_samples = samples,
                     decode_samples,
+                    // Which admission rules bind this member: a card that
+                    // streams its experts holds every prefill to the decode
+                    // floor and charges a new store against its rows.
+                    streams = streams_experts(
+                        interleave::achievable_weight_now().unwrap_or(u64::MAX),
+                        self.expert_set_bytes(),
+                    ),
                     "learned rates published"
                 ),
                 None => tracing::info!(

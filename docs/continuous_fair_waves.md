@@ -249,16 +249,22 @@ experts): a restart's live backlog took 23 recurrent stores, the zone fell from
 10.9 GB to 6.1 GB under its 7.4 GB hold, and prefill ran at ~60 t/s with 10–30%
 of routed experts resident.
 
-**On such a card a prefill that will decode pays its way as a decode too.** The
+**On such a card a new member's store must buy its own ground in rows.** The
 floor bounds how far residency may fall, not how many turns may stand above it:
 with the hold at half the achievable residency, a backlog's trade admitted
 narrow prefill after narrow prefill — each a ~210 MB store advancing 10–20
-tokens a forward — until sixteen stood (WhiteWorld, 2026-11-23). So the turn's
-decode is asked the joins' question (`WaveRate::decode_would_carry`): does the
-wave step more decodes a second with it decoding, at the residency its store
-leaves, than without it at the residency found. Admitted, its decode is charged
-to the wave, so each later offer is judged with the earlier ones decoding. A card
-whose zone holds its experts judges prefills on their trade alone, as before.
+tokens a forward, the forward carrying ~150 rows between them — until sixteen
+stood (WhiteWorld, 2026-11-23). The store and the forward's tier come out of the
+same expert zone, so where turns already in the wave have rows waiting, a
+prefill or section whose rows add fewer tier bytes than its store costs is
+refused: the same ground carries more rows widening the turns already there.
+With nothing else waiting for rows it is the wave's work and is admitted on the
+rules above, and the head of an idle wave is carried. Asking the new turn's
+decode whether it pays (`WaveRate::decode_would_carry`) did not bind: beside a
+few running decodes one more always reads as a gain, while the cost lands in the
+prefill phase. A card whose zone holds its experts judges prefills on their
+trade alone, as before; each member's `learned rates published` line says which
+(`streams`).
 
 The normalization warm-up replay (`scheduler/norm_warm.rs`) is the one piece of
 background work that does not ride a forward: it runs on the loop thread, one

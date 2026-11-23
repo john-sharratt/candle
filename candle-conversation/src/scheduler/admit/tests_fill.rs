@@ -78,8 +78,10 @@ pub(super) mod tests {
         pub(in super::super) reports_ahead: bool,
         /// The card streams its experts ([`Budget::streams_experts`]).
         pub(in super::super) streams: bool,
-        /// Every prefill carries its rows and goes on to decode, as a turn does.
-        pub(in super::super) prefills_decode: bool,
+        /// The recurrent store each prefill or section claims, and the tier its
+        /// rows add to the forward.
+        pub(in super::super) store: u64,
+        pub(in super::super) tier: u64,
     }
 
     impl Fake {
@@ -107,7 +109,8 @@ pub(super) mod tests {
                 ahead: false,
                 reports_ahead: false,
                 streams: false,
-                prefills_decode: false,
+                store: 0,
+                tier: 0,
             }
         }
         pub(in super::super) fn queue(&mut self, kind: Kind) -> &mut Vec<u64> {
@@ -181,10 +184,16 @@ pub(super) mod tests {
                 _ => ROWS,
             };
             // A turn joining ahead goes on to decode, as a turn does.
-            let decodes_after = kind == Kind::Prefill && (self.ahead || self.prefills_decode);
+            let decodes_after = kind == Kind::Prefill && self.ahead;
             let ahead = kind == Kind::Prefill && self.reports_ahead;
+            let (recurrent, activations) = match kind {
+                Kind::Decode => (0, 0),
+                _ => (self.store, self.tier),
+            };
             self.queue(kind).first().map(|&kv| Cost {
                 kv,
+                recurrent,
+                activations,
                 rows,
                 decodes_after,
                 ahead,
@@ -464,52 +473,45 @@ pub(super) mod tests {
         );
     }
 
-    /// **On a streaming card a prefill that will decode pays its way as a
-    /// decode.** Beside many running decodes, one more decode does not pay the
-    /// gain the planner asks for, so the turn whose decode it is waits there —
-    /// above the floor, with room for many more — while a card that holds its
-    /// experts judges the same turn on its trade alone. Admitted, a turn's
-    /// decode is charged, so each later one is judged with it decoding.
+    /// **On a streaming card a new member's store must buy its own ground in
+    /// rows.** Beside a cohort whose rows are waiting, a turn whose rows add
+    /// fewer tier bytes than its store costs is refused, above the floor and
+    /// with room to spare, while one whose rows pay for its store is admitted;
+    /// a card that holds its experts takes either. With nothing waiting for
+    /// rows, the first turn is the wave's work and is admitted whatever its
+    /// store, and the one behind it is judged against it.
     #[test]
-    fn a_streaming_cards_prefill_pays_its_way_as_a_decode() {
-        let learned = || {
-            let mut rate = WaveRate::with_link_rate(
-                25e9,
-                ExpertGeometry::QWEN36_35B_A3B,
-                RateModel::default(),
-                DecodeModel::default(),
-            );
-            for _ in 0..WaveRate::MIN_DECODE_SAMPLES {
-                rate.observe_decode(1, 0, u64::MAX, 20e-3);
-            }
-            rate
-        };
-        let offer = |streams: bool, running: usize| {
-            let mut f = Fake::new(Vec::new(), vec![REGION; 4], 12 << 30);
-            f.active = running;
-            f.decodes_active = running;
-            f.prefill_prio = DecodePriority::High;
-            f.prefills_decode = true;
+    fn a_streaming_cards_new_store_must_buy_its_ground_in_rows() {
+        let offer = |streams: bool, standing: usize, tier: u64, queued: usize| {
+            let mut f = Fake::new(Vec::new(), vec![REGION; queued], 12 << 30);
+            f.active = 4;
+            f.standing = standing;
             f.streams = streams;
-            let mut rate = learned().with_min_gain(0.5);
-            let got = fill(&mut f, &mut rate);
-            (got.prefills, got.stopped_on_rate, rate.decodes())
+            f.prefill_prio = DecodePriority::High;
+            f.store = 4 * REGION;
+            f.tier = tier;
+            let got = fill_once(&mut f);
+            (got.prefills, got.stopped_on_rate)
         };
-        let (held, on_rate, _) = offer(true, 24);
-        assert_eq!(held, 0, "a 25th decode does not pay: the turn waits");
-        assert!(on_rate, "refused on the rate, not the floor");
-        let (traded, _, decodes) = offer(false, 24);
-        assert!(traded > 0, "a card holding its experts trades it as before");
-        assert_eq!(decodes, 24, "and charges no decode for it");
-        let (paying, _, decodes) = offer(true, 1);
-        assert!(
-            paying > 0,
-            "beside one decode, a second pays and is admitted"
+        assert_eq!(
+            offer(true, 512, REGION, 1),
+            (0, true),
+            "its rows buy a quarter of its store: refused"
         );
         assert_eq!(
-            decodes,
-            1 + paying,
-            "and each admitted turn's decode is charged"
+            offer(true, 512, 4 * REGION, 1),
+            (1, false),
+            "its rows buy its store: admitted"
+        );
+        assert_eq!(
+            offer(false, 512, REGION, 1),
+            (1, false),
+            "a card holding its experts trades it as before"
+        );
+        assert_eq!(
+            offer(true, 0, REGION, 2),
+            (1, true),
+            "nothing waiting: the first is admitted, the second crowds it"
         );
     }
 

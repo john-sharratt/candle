@@ -385,38 +385,29 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                     }
                 }
             };
-            // **On a card that streams its experts, a prefill that will decode
-            // pays its way as a decode too.** Its trade weighs the rows it adds
-            // against the decodes already running, and leaves out that the turn
-            // becomes one of them, holding its store — about a hundred experts
-            // of residency on WhiteWorld — for its whole life. So during a
-            // backlog the trade admits narrow prefill after narrow prefill, each
-            // a store, until only the floor refuses: sixteen of them on
-            // WhiteWorld (2026-11-23), each advancing 10–20 tokens a forward.
-            // Here the turn's decode is asked the joins' question — does the
-            // wave step more decodes a second with it decoding, at the residency
-            // its store leaves, than without it at the residency found — and,
-            // admitted, its decode is charged, so the next offer is judged with
-            // it in the wave. A join's trade (`try_join_trading`) already asks
-            // this of its own decode, and the head of an idle wave is carried.
-            let judged_as_decode = allowed
+            // **On a card that streams its experts, a new member's store must
+            // buy at least its own ground in rows.** The store and the forward's
+            // tier come out of the same expert zone, so where turns already in
+            // the wave have rows waiting, ground spent on another turn's store
+            // is ground those turns' rows could have widened into. A turn that
+            // adds fewer tier bytes of rows than its store costs leaves the wave
+            // carrying fewer rows on the same residency: during a backlog on
+            // WhiteWorld (2026-11-23) the trade and the floor admitted sixteen
+            // stores of ~210 MB, each advancing 10–20 tokens a forward, while the
+            // forward carried ~150 rows between them. With nothing else waiting
+            // for rows the new turn is the wave's work and is admitted on the
+            // rules above; the head of an idle wave is carried.
+            let crowds = allowed
                 && budget.streams_experts
-                && kind == Kind::Prefill
-                && cost.rows > 0
-                && cost.decodes_after
-                && !(idle && out.admitted() == 0);
-            let allowed = if judged_as_decode {
-                match rate.decode_would_carry(0, before, after) {
-                    Ok(_) => {
-                        rate.charge(Admission::Decode { draft: 0 }, after);
-                        true
-                    }
-                    Err(r) => {
-                        out.note(r);
-                        log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
-                        false
-                    }
-                }
+                && kind != Kind::Decode
+                && (standing > 0 || out.prefills + out.sections > 0)
+                && !(idle && out.admitted() == 0)
+                && cost.activations < cost.recurrent;
+            let allowed = if crowds {
+                let r = rate::Refusal::Saturated { gain: 0.0 };
+                out.note(r);
+                log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
+                false
             } else {
                 allowed
             };
