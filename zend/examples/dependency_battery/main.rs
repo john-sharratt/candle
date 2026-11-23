@@ -26,6 +26,7 @@ mod arms;
 mod battery;
 mod client;
 mod direct;
+mod load;
 mod placement;
 mod report;
 mod run;
@@ -35,7 +36,7 @@ mod stats;
 mod telemetry;
 
 use std::collections::HashSet;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
@@ -213,7 +214,15 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let lines = run::lines(&answers)?;
             let telemetry = telemetry.unwrap_or_else(|| beside(&answers, "telemetry.jsonl"));
-            report::write(&lines, &samples(&telemetry)?, &out)?;
+            let census = beside(&answers, "census_start.json");
+            let bf16_per_token = match fs::read_to_string(&census) {
+                Ok(text) => load::bf16_per_token(
+                    &serde_json::from_str(&text)
+                        .with_context(|| format!("parsing {}", census.display()))?,
+                ),
+                Err(_) => None,
+            };
+            report::write(&lines, &samples(&telemetry)?, bf16_per_token, &out)?;
             println!("wrote {}", out.join("summary.md").display());
             Ok(())
         }

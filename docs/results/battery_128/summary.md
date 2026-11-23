@@ -53,3 +53,16 @@
 | C1 | 384 | 51.6% | 57.8% | 57.8% | 17.1 | 25.8% |
 
 6787 telemetry samples in `fig_9_6_telemetry.csv` (Figures 9.6-1 to 9.6-3).
+
+## §9.6.9 — the card under load
+
+BF16 bytes per token: 2076.3.
+
+| Under the battery's load | Mean | Peak |
+|---|---:|---:|
+| Sessions in flight | 8.50 | 16.00 |
+| KV bytes resident (GiB) | 6.19 | 11.17 |
+| Tokens resident | 570908.85 | 945212.00 |
+| The same tokens at BF16 (GiB) | 1.10 | 1.83 |
+| Effective compression | 0.18 | 0.23 |
+| Expert zone (GiB) | 36.04 | 50.14 |

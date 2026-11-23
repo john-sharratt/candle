@@ -15,6 +15,7 @@ use crate::analyse::{
     telemetry_table,
 };
 use crate::arms::{Arm, ARMS};
+use crate::load;
 use crate::run::Line;
 
 /// The token positions Figure 9.12-5 samples: every 64 tokens to 4,096.
@@ -40,9 +41,14 @@ fn csv(header: &[&str], rows: impl IntoIterator<Item = Vec<String>>) -> String {
     out
 }
 
-/// Write every table and figure of `lines` (and of `samples`, the telemetry)
-/// into `dir`.
-pub fn write(lines: &[Line], samples: &[Value], dir: &Path) -> anyhow::Result<()> {
+/// Write every table and figure of `lines` (and of `samples`, the telemetry,
+/// whose tokens take `bf16_per_token` bytes each at BF16) into `dir`.
+pub fn write(
+    lines: &[Line],
+    samples: &[Value],
+    bf16_per_token: Option<f64>,
+    dir: &Path,
+) -> anyhow::Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     let s = scores(lines);
     let mut md = String::new();
@@ -337,6 +343,33 @@ pub fn write(lines: &[Line], samples: &[Value], dir: &Path) -> anyhow::Result<()
         "\n{} telemetry samples in `fig_9_6_telemetry.csv` (Figures 9.6-1 to 9.6-3).",
         samples.len()
     )?;
+
+    match bf16_per_token {
+        Some(per_token) => {
+            let rows = load::table(samples, per_token);
+            writeln!(
+                md,
+                "\n## §9.6.9 — the card under load\n\nBF16 bytes per token: {per_token:.1}.\n"
+            )?;
+            writeln!(md, "| Under the battery's load | Mean | Peak |")?;
+            writeln!(md, "|---|---:|---:|")?;
+            for r in &rows {
+                writeln!(md, "| {} | {:.2} | {:.2} |", r.label, r.mean, r.peak)?;
+            }
+            fs::write(
+                dir.join("table_9_6_load.csv"),
+                csv(
+                    &["row", "mean", "peak"],
+                    rows.iter()
+                        .map(|r| vec![r.label.to_string(), r.mean.to_string(), r.peak.to_string()]),
+                ),
+            )?;
+        }
+        None => writeln!(
+            md,
+            "\nNo K/V census beside the answers, so no load table (§9.6.9)."
+        )?,
+    }
 
     fs::write(dir.join("summary.md"), md)?;
     Ok(())
