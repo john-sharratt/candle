@@ -122,8 +122,8 @@ pub fn scored(
     }
 }
 
-/// Ask one job to its line: tried on a fresh conversation each time, each
-/// conversation deleted once read.
+/// Ask one job to its line: tried on a fresh conversation each time — cleared
+/// of anything an interrupted run left on it, and deleted once read.
 async fn answer_job(
     zend: &Zend,
     plan_thread: &str,
@@ -136,6 +136,14 @@ async fn answer_job(
     for attempt in 1..=TRIES {
         let id = format!("{}-a{attempt}", q.id);
         let conv = conv_id(plan_thread, job.arm, job.run, &id);
+        // A run stopped mid-answer leaves that answer's conversation behind;
+        // asked again on it, the question would follow its own first try.
+        if let Err(e) = zend.delete(&conv).await {
+            tracing::warn!(
+                conv,
+                "a conversation left by an earlier run was not cleared: {e:#}"
+            );
+        }
         let asked = zend.ask(&conv, &prompt, job.arm).await;
         if let Err(e) = zend.delete(&conv).await {
             tracing::warn!(conv, "the conversation was not deleted: {e:#}");
