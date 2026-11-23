@@ -76,6 +76,8 @@ pub(super) mod tests {
         /// full forward (`Cost::ahead`).
         pub(in super::super) ahead: bool,
         pub(in super::super) reports_ahead: bool,
+        /// The card streams its experts ([`Budget::streams_experts`]).
+        pub(in super::super) streams: bool,
     }
 
     impl Fake {
@@ -102,6 +104,7 @@ pub(super) mod tests {
                 prefill_floor: FLOOR,
                 ahead: false,
                 reports_ahead: false,
+                streams: false,
             }
         }
         pub(in super::super) fn queue(&mut self, kind: Kind) -> &mut Vec<u64> {
@@ -152,6 +155,7 @@ pub(super) mod tests {
                 decode_floor: FLOOR,
                 max_rows: 8_192,
                 max_decodes: 64,
+                streams_experts: self.streams,
             }
         }
         fn resident_weights(&self) -> u64 {
@@ -349,7 +353,14 @@ pub(super) mod tests {
             hole_credit: REGION,
             ..Default::default()
         };
-        let breaks = |p: DecodePriority, c: &Cost, after: u64| breaks_the_hold(p, c, after, FLOOR);
+        let budget = |streams: bool| Budget {
+            decode_floor: FLOOR,
+            streams_experts: streams,
+            ..Default::default()
+        };
+        let breaks = |p: DecodePriority, c: &Cost, after: u64| {
+            breaks_the_hold(Kind::Prefill, p, true, c, after, &budget(false), false)
+        };
         use DecodePriority::{High, Low, Normal, Urgent};
         assert!(breaks(Normal, &claim, FLOOR - 1));
         assert!(breaks(Low, &claim, FLOOR - 1));
@@ -357,6 +368,112 @@ pub(super) mod tests {
         assert!(!breaks(High, &claim, 0));
         assert!(!breaks(Urgent, &claim, 0));
         assert!(!breaks(Normal, &in_holes, 0));
+        // Not outranking, on a card that holds its experts: the trade decides.
+        assert!(!breaks_the_hold(
+            Kind::Prefill,
+            Low,
+            false,
+            &claim,
+            0,
+            &budget(false),
+            false
+        ));
+        // On a card that streams them, every prefill and section is held —
+        // a person's turn included — and the head of an idle wave is carried.
+        for kind in [Kind::Prefill, Kind::Section] {
+            for p in [Low, Normal, High, Urgent] {
+                assert!(breaks_the_hold(
+                    kind,
+                    p,
+                    false,
+                    &claim,
+                    FLOOR - 1,
+                    &budget(true),
+                    false
+                ));
+                assert!(!breaks_the_hold(
+                    kind,
+                    p,
+                    false,
+                    &claim,
+                    FLOOR,
+                    &budget(true),
+                    false
+                ));
+                assert!(!breaks_the_hold(
+                    kind,
+                    p,
+                    false,
+                    &claim,
+                    0,
+                    &budget(true),
+                    true
+                ));
+                assert!(!breaks_the_hold(
+                    kind,
+                    p,
+                    false,
+                    &in_holes,
+                    0,
+                    &budget(true),
+                    false
+                ));
+            }
+        }
+    }
+
+    /// **On a card that streams its experts, a turn somebody waits on keeps
+    /// the decodes' hold too.** The same `High` turn the card that holds its
+    /// experts admits past the decode floor
+    /// (`a_turn_outranking_the_running_slots_is_admitted_under_the_floor`) is
+    /// refused there, and so is a plain prefill the trade alone would take;
+    /// above the floor both are admitted as before.
+    #[test]
+    fn a_streaming_card_holds_every_prefill_to_the_decode_floor() {
+        let offer = |streams: bool, outranking: bool, resident: u64| {
+            let mut f = Fake::new(Vec::new(), vec![REGION], resident);
+            f.active = 14;
+            f.streams = streams;
+            f.prefill_prio = DecodePriority::High;
+            f.prefill_floor = FLOOR - 8 * REGION;
+            if outranking {
+                f.running_band = Some(DecodePriority::Low);
+            }
+            let got = fill_once(&mut f);
+            (got.prefills, got.stopped_on_weights)
+        };
+        let under = FLOOR - 4 * REGION;
+        assert_eq!(
+            offer(false, true, under),
+            (1, false),
+            "holds its experts: spends the hold"
+        );
+        assert_eq!(offer(true, true, under), (0, true), "streams them: held");
+        assert_eq!(
+            offer(true, false, under),
+            (0, true),
+            "a plain prefill is held too"
+        );
+        assert_eq!(
+            offer(true, false, FLOOR + 4 * REGION),
+            (1, false),
+            "above the hold it is admitted"
+        );
+    }
+
+    /// **The head of an idle wave is carried on a streaming card.** With
+    /// nothing running and nothing standing, the first offer runs whatever it
+    /// costs, so a turn too large to ever fit cannot block the queue; the one
+    /// behind it is held.
+    #[test]
+    fn a_streaming_cards_idle_wave_still_carries_its_head() {
+        let mut f = Fake::new(Vec::new(), vec![REGION, REGION], FLOOR - 4 * REGION);
+        f.streams = true;
+        f.prefill_prio = DecodePriority::High;
+        f.prefill_floor = FLOOR - 8 * REGION;
+        let got = fill_once(&mut f);
+        assert_eq!(got.prefills, 1, "the head runs, the next is held");
+        assert!(got.stopped_on_weights);
     }
 
     /// **Outranking orders the queue; it does not exempt the trade.** A `High`

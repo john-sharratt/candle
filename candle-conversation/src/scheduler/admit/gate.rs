@@ -85,6 +85,37 @@ impl Headroom {
     }
 }
 
+/// The share of the model's expert set the weight zone must be unable to hold,
+/// at the most it could reach, before a card counts as streaming its experts.
+///
+/// A card that holds nearly every expert still streams a handful — the
+/// long tail the zone never quite reaches — and a prefill's residency costs its
+/// decodes next to nothing there; the hold would only refuse prefills for
+/// ground decode does not miss. Past this share a decode misses on a
+/// significant part of every layer, and each byte a prefill takes adds to it.
+pub(crate) const STREAMING_SHARE: f64 = 0.30;
+
+/// Whether the weight zone, at the most it could reach (`achievable`), leaves
+/// more than [`STREAMING_SHARE`] of the model's expert set (`set`) unheld: a
+/// card that **streams** its experts.
+///
+/// On such a card every byte of residency a prefill takes — its K/V, and above
+/// all its recurrent store, which stays for the conversation's whole life — is
+/// a miss on every later decode step, so a prefill that will decode is held to
+/// the decode floor whatever its band (`breaks_the_hold`). On WhiteWorld
+/// (2026-11-22, Flash-Next Q3_KO: ~14.8 GB achievable against ~48 GB of
+/// experts) a restart's live backlog was judged against the cache's own minimum
+/// instead: 23 recurrent stores took the zone from 10.9 GB to 6.1 GB, under its
+/// 7.4 GB hold, and prefill ran at ~60 t/s with 10–30% of routed experts
+/// resident. A card whose zone holds all or nearly all its experts loses a
+/// decode next to nothing to a prefill's residency, so there the prefill keeps
+/// the cache-minimum floor and the rate model's trade alone.
+///
+/// A dense stack has no expert set (`set == 0`) and streams nothing.
+pub(crate) fn streams_experts(achievable: u64, set: u64) -> bool {
+    set > 0 && (achievable as f64) < (set as f64) * (1.0 - STREAMING_SHARE)
+}
+
 /// Whether a wave carrying no decode at all may start one.
 ///
 /// **This exists to keep the decode weights hot.** Prefill routes across many
@@ -121,6 +152,24 @@ mod tests {
             zone_min_prefill: 2 << 30,
             forward_reserve: 0,
         }
+    }
+
+    /// A card streams its experts exactly when the most its zone could reach
+    /// is short of the whole set; a dense stack streams nothing.
+    #[test]
+    fn a_card_streams_when_its_zone_cannot_hold_the_set() {
+        // WhiteWorld's 3090 on Flash-Next Q3_KO, and BlackWorld's 72 GB card.
+        assert!(streams_experts(14_815 << 20, 48 << 30));
+        assert!(!streams_experts(60 << 30, 48 << 30));
+        assert!(
+            !streams_experts(48 << 30, 48 << 30),
+            "a zone holding the set exactly"
+        );
+        // A handful streamed is not streaming: up to 30% unheld keeps the trade.
+        assert!(!streams_experts(40 << 30, 48 << 30), "a sixth unheld");
+        assert!(streams_experts(34 << 30, 50 << 30), "32% unheld streams");
+        assert!(!streams_experts(35 << 30, 50 << 30), "exactly 30% unheld");
+        assert!(!streams_experts(0, 0), "a dense stack");
     }
 
     #[test]

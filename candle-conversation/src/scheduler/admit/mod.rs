@@ -73,7 +73,9 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
     // the floor. So a busy engine charges the wave even when the creep is
     // empty, and only a genuinely idle one gets the waiver.
     let standing = ground.standing_rows();
-    if standing > 0 || ground.active() > 0 {
+    // A wave with nothing to run: its first offer is the head the waiver carries.
+    let idle = standing == 0 && ground.active() == 0;
+    if !idle {
         rate.charge(Admission::Prefill { tokens: standing }, budget.resident);
     }
     // **The decodes the engine is already running, charged before any offer.**
@@ -227,9 +229,25 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                 // while the expert hit rate went from 99% to 61%. Such a turn is
                 // refused where it would leave residency under the decode floor;
                 // the trades and the floors judge it as before above it.
-                Kind::Prefill
-                    if ground.outranks_active(prio)
-                        && breaks_the_hold(prio, &cost, after, budget.decode_floor) =>
+                // **On a card that streams its experts, every prefill stands on
+                // the decode floor.** There each byte it takes is a miss on every
+                // later decode step, and its recurrent store stays for the
+                // conversation's whole life — so the hold binds whatever the
+                // band, a turn somebody waits on included. A card whose zone
+                // holds every expert keeps the exemption above and the trades
+                // below (`gate::streams_experts`). The head of an idle wave is
+                // carried either way: a wave runs something, so a turn too large
+                // to ever fit cannot block the queue behind it.
+                Kind::Prefill | Kind::Section
+                    if breaks_the_hold(
+                        kind,
+                        prio,
+                        ground.outranks_active(prio),
+                        &cost,
+                        after,
+                        &budget,
+                        idle && out.admitted() == 0,
+                    ) =>
                 {
                     let r = rate::Refusal::Floor {
                         resident_after: after,
@@ -415,14 +433,28 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
     out
 }
 
-/// Whether an outranking prefill of `prio` costing `cost` would leave the
-/// weight residency at `after`, under the decode floor the running decodes are
-/// held to, without a person waiting on it: a band that is not
-/// [`DecodePriority::is_live`] and dislodges something. A live band may spend
-/// the hold down to the prefill floor; a claim landing wholly in holes
-/// dislodges nothing and breaks no hold.
-fn breaks_the_hold(prio: DecodePriority, cost: &Cost, after: u64, decode_floor: u64) -> bool {
-    !prio.is_live() && cost.dislodged_bytes() > 0 && after < decode_floor
+/// Whether an offer of `kind` and `prio` costing `cost` would leave the weight
+/// residency at `after`, under the decode floor the running decodes are held
+/// to, where that floor binds it.
+///
+/// It binds **every** prefill and section on a card that streams its experts
+/// ([`Budget::streams_experts`]); elsewhere, only an `outranking` prefill
+/// without a person waiting on it — a band that is not
+/// [`DecodePriority::is_live`] — while a live band may spend the hold down to
+/// the prefill floor. `head`, the first offer of an idle wave, is carried
+/// whatever it costs. A claim landing wholly in holes dislodges nothing and
+/// breaks no hold.
+fn breaks_the_hold(
+    kind: Kind,
+    prio: DecodePriority,
+    outranking: bool,
+    cost: &Cost,
+    after: u64,
+    budget: &Budget,
+    head: bool,
+) -> bool {
+    let bound = budget.streams_experts || (kind == Kind::Prefill && outranking && !prio.is_live());
+    bound && !head && cost.dislodged_bytes() > 0 && after < budget.decode_floor
 }
 
 /// One decode offer as the rate model reads it: a verify block of `1 + draft`

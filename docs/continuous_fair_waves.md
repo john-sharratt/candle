@@ -235,6 +235,20 @@ admissions of a pass were outranking calibration, none refused, and residency
 fell to 4.1 GB against a 29.7 GB hold while the expert hit rate went from 99% to
 61%.
 
+**On a card that streams its experts, every prefill keeps the hold.** Where the
+weight zone at the most it could reach leaves more than 30% of the model's
+expert set unheld (`admit::gate::streams_experts`, `STREAMING_SHARE`) — not a
+card that streams only the handful its zone never quite reaches — every byte a prefill takes is a miss on
+every later decode step, and its recurrent store stays for the conversation's
+whole life — so every prefill and section is refused where its claim would leave
+residency under the decode floor, a live band's included. The head of an idle
+wave is still carried, so a turn too large to fit cannot block the queue. A card
+whose zone holds all or nearly all its experts keeps the live exemption above. Measured on
+WhiteWorld (2026-11-22, Flash-Next Q3_KO: ~14.8 GB achievable against ~48 GB of
+experts): a restart's live backlog took 23 recurrent stores, the zone fell from
+10.9 GB to 6.1 GB under its 7.4 GB hold, and prefill ran at ~60 t/s with 10–30%
+of routed experts resident.
+
 The normalization warm-up replay (`scheduler/norm_warm.rs`) is the one piece of
 background work that does not ride a forward: it runs on the loop thread, one
 replayed turn per loop iteration, which a decode quantum bounds to one per

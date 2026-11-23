@@ -34,6 +34,11 @@ pub(crate) struct Budget {
     pub max_rows: usize,
     /// The most decodes a wave will carry.
     pub max_decodes: usize,
+    /// The weight zone cannot hold the model's whole expert set
+    /// ([`gate::streams_experts`]): every prefill is held to
+    /// [`Self::decode_floor`], not only the bands `breaks_the_hold` names
+    /// otherwise.
+    pub streams_experts: bool,
 }
 
 /// The engine, as the fill needs to see it.

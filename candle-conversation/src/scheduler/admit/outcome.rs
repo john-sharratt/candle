@@ -78,6 +78,11 @@ pub(super) fn log_refusal(
 }
 
 impl Filled {
+    /// Offers this pass has admitted so far, of every kind.
+    pub(super) fn admitted(&self) -> usize {
+        self.decodes + self.prefills + self.sections
+    }
+
     /// Record which kind of refusal ended a band.
     pub(super) fn note(&mut self, refusal: rate::Refusal) {
         use rate::Refusal;

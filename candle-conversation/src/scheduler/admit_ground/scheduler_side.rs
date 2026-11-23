@@ -315,7 +315,21 @@ impl Scheduler {
             decode_floor: room.floor().saturating_add(room.forward_reserve),
             max_rows: chunk_rows,
             max_decodes: MAX_DECODE_WIDTH,
+            streams_experts: streams_experts(room.zone_max, self.expert_set_bytes()),
         }
+    }
+
+    /// Every expert image of the model, in bytes: the residency at which a
+    /// decode never misses. Zero for a dense stack.
+    pub(in super::super) fn expert_set_bytes(&self) -> u64 {
+        self.model
+            .expert_stats_shared()
+            .and_then(|s| {
+                s.lock()
+                    .ok()
+                    .map(|s| (s.total_experts as u64).saturating_mul(s.expert_slot_bytes as u64))
+            })
+            .unwrap_or(0)
     }
 
     /// The recurrent store **one** new sequence needs, or zero on a stack that
