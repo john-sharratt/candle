@@ -1546,6 +1546,58 @@ decode is up on every row: 26.2 → 33.4 at one cold session, 66.5 → 108.5 at
 BF16 ×8, 71.5 → 107.9 at C5 ×8, 50.8 → 101.3 at C10 ×8, and 36.5 → 51.0 at
 C10 ×2. Prefill at ×8 is 1,051.3 → 1,127.5.
 
+### 3.10 Short prompts in live service — a short span a step
+
+Under live load rather than the width gate. `3c73da839` lets a prompt of up to
+four short spans (4 × 8 rows on Flash-Next) skip the time-sliced creep. It rides
+whole sweeps a span at a time, the way a tool stencil does, and it is charged no
+long-span scratch at admission (`docs/continuous_fair_waves.md` §3). The figures
+are aggregate prefill, read from the scheduler's `wave_flush` and `creep cohort`
+lines. They are not single-stream results.
+
+**RTX PRO 5000 Blackwell 72 GB**, battery-128 at 8-way, Qwen3.8-Flash-Next. The
+same 12 minutes of the hour on each build: before is 05:15–05:27 UTC on build
+5470 (`6eb469ce5`), after is 07:15–07:27 on build 5475 (`3c73da839`). The bracketed
+column is the 27-minute window 07:05–07:32 on build 5475.
+
+| | before | after | after [27 min] |
+|---|---:|---:|---:|
+| prefill forwards | 1,418 | 971 | 2,173 |
+| prefill tokens | 25,324 | 27,670 | 50,252 |
+| prefill t/s | 35.2 | 38.4 | 31.0 |
+| prefill forward ms (weighted) | 24.7 | 62.9 | 60.2 |
+| forwards ≤ 9 tok | 59.6% | 37.7% | 38.0% |
+| forwards 10–32 tok | 22.6% | 43.3% | 43.9% |
+| forwards 33–99 tok | 17.8% | 17.4% | — |
+| forwards ≥ 100 tok | 0 | 1.6% | — |
+| decode forwards | 2,097 | 2,207 | 5,166 |
+| decode step ms (weighted) | 183.3 | 168.0 | 159.3 |
+| expert hit | 95.0% | 96.4% | 97.3% |
+| creep cohorts | 102 | 266 | 650 |
+| mean members a cohort | 2.97 | 1.41 | — |
+
+**Prefill forwards carry more rows each, and there are 32% fewer of them for 9%
+more tokens.** Forwards in the 10–32 token range roughly double, from 22.6% to
+43.3%, and forwards of 9 tokens or fewer fall from 59.6% to 37.7%. A short prompt
+now goes through in a few full sweeps, where before it crept a few layers at a
+time. Decode steps are 8% faster, 183.3 → 168.0 ms, with no loss of expert hits.
+
+**Prefill throughput is flat within noise**, 35.2 → 38.4 t/s. Over 12 minutes
+it is driven by a few long prompts: three of them supply 8,221 of the after
+window's 27,670 tokens. Every cohort of 8 rows a member or fewer is charged no
+scratch: 136 of 136 after and 328 of 328 over the 27-minute window. Cohorts
+longer than a span still carry it, as they should (1 of 322 reads 0). Admission
+now lets in more, smaller cohorts, 266 against 102, as expected once short
+prompts are priced at their recurrent store alone.
+
+**RTX 3090 24 GB** (WhiteWorld), same build, 07:42–07:43 UTC. Short prompts run as
+pieces of 8, 8, 8, 8, 7 rows, about 90 ms apart, one forward each, with
+`scratch_mib=0`. Cohorts longer than a span still carry 144 MiB a member. The
+card has no settled window to compare: the backlog sits at 2,300–3,900
+tokens, expert hits are at 20–42%, and the prefill group never exceeds one
+sequence (`seqs max=1`). That one-sequence limit, not the forward's size, holds
+its prefill rate at present.
+
 ---
 
 ## 4. Limits and open items
