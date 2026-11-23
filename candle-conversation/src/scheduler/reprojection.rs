@@ -48,9 +48,11 @@ pub(crate) struct ReprojectionPolicy {
     /// this many tokens the prior reprojection already captured the
     /// older intent.  Must be `>= 1`.
     pub(crate) max_probe_tokens: usize,
-    /// Whether a boundary inside the think block reprojects
-    /// (`SequenceConfig::reproject_in_thinking`); see [`think_gate`].
-    pub(crate) in_thinking: bool,
+    /// Which decode boundaries reproject: the turn's reprojection
+    /// (`ReprojectionMode`), over `SequenceConfig::reproject_in_thinking`;
+    /// see [`think_gate`]. The opening boundary ([`Self::opening_chunk`])
+    /// selects whatever this says.
+    pub(crate) decode: DecodeReprojection,
 }
 
 impl ReprojectionPolicy {

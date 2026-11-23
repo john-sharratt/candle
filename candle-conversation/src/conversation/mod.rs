@@ -49,8 +49,8 @@ use crate::provenance::{decode_wide_sigs, WideQSig};
 use crate::reply_wait::replied;
 use crate::scheduler::projection_assembler::materialize_conversation;
 use crate::scheduler::{
-    note_branch_checkpoint_computed, note_branch_checkpoint_installed, ProjectionInputs,
-    RemoteArena, ReprojectionPolicy, SchedulerRequest, TurnContent,
+    note_branch_checkpoint_computed, note_branch_checkpoint_installed, DecodeReprojection,
+    ProjectionInputs, RemoteArena, ReprojectionPolicy, SchedulerRequest, TurnContent,
 };
 use crate::sealed_turn::{SealedPages, SealedTurn};
 use crate::sequence_handle::{BlockCount, SequenceId};

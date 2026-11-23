@@ -87,7 +87,8 @@ pub enum ReprojectionMode {
     Full,
     /// Not inside the think block: once at its close, and through the answer.
     Held,
-    /// Only at the turn's opening.
+    /// Only at the turn's opening: the question's first reading and opening
+    /// boundary choose the working set, and no decode boundary re-selects it.
     Opening,
 }
 

@@ -541,13 +541,15 @@ impl Sequence {
         if !boundary.is_active() {
             return None;
         }
-        // The turn's reprojection dial, over the conversation's configuration:
-        // an opening-only turn selects once and never again.
-        let in_thinking = match self.selection.reprojection_mode() {
-            Some(ReprojectionMode::Opening) => return None,
-            Some(ReprojectionMode::Full) => true,
-            Some(ReprojectionMode::Held) => false,
-            None => self.config.reproject_in_thinking,
+        // The turn's reprojection dial, over the conversation's configuration.
+        // An opening-only turn keeps its policy: its opening boundary is the
+        // one selection the question drives, and no decode boundary follows.
+        let decode = match self.selection.reprojection_mode() {
+            Some(ReprojectionMode::Opening) => DecodeReprojection::Never,
+            Some(ReprojectionMode::Full) => DecodeReprojection::Every,
+            Some(ReprojectionMode::Held) => DecodeReprojection::HoldThinking,
+            None if self.config.reproject_in_thinking => DecodeReprojection::Every,
+            None => DecodeReprojection::HoldThinking,
         };
         Some(ReprojectionPolicy {
             target: self.target,
@@ -556,7 +558,7 @@ impl Sequence {
             substrate: self.substrate.clone(),
             boundary,
             max_probe_tokens: self.config.reproject_max_probe_tokens.max(1),
-            in_thinking,
+            decode,
         })
     }
 

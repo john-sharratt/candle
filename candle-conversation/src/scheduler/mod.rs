@@ -1152,3 +1152,4 @@ pub(crate) use reprojection::*;
 pub(crate) use requests::*;
 use seal_turn::*;
 use telemetry::*;
+pub(crate) use think_gate::DecodeReprojection;

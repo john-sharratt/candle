@@ -866,7 +866,7 @@ impl Scheduler {
                                         .is_some_and(|ss| ss.in_segment),
                                     state.sampling_config.segment_close_token_id,
                                 );
-                                let fires = reprojects(step.fires(), thinking, p.in_thinking);
+                                let fires = reprojects(step.fires(), thinking, p.decode);
                                 if fires && !step.fires() {
                                     state.boundary.restart();
                                 }
