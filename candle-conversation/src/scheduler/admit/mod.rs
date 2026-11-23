@@ -385,6 +385,41 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
                     }
                 }
             };
+            // **On a card that streams its experts, a prefill that will decode
+            // pays its way as a decode too.** Its trade weighs the rows it adds
+            // against the decodes already running, and leaves out that the turn
+            // becomes one of them, holding its store — about a hundred experts
+            // of residency on WhiteWorld — for its whole life. So during a
+            // backlog the trade admits narrow prefill after narrow prefill, each
+            // a store, until only the floor refuses: sixteen of them on
+            // WhiteWorld (2026-11-23), each advancing 10–20 tokens a forward.
+            // Here the turn's decode is asked the joins' question — does the
+            // wave step more decodes a second with it decoding, at the residency
+            // its store leaves, than without it at the residency found — and,
+            // admitted, its decode is charged, so the next offer is judged with
+            // it in the wave. A join's trade (`try_join_trading`) already asks
+            // this of its own decode, and the head of an idle wave is carried.
+            let judged_as_decode = allowed
+                && budget.streams_experts
+                && kind == Kind::Prefill
+                && cost.rows > 0
+                && cost.decodes_after
+                && !(idle && out.admitted() == 0);
+            let allowed = if judged_as_decode {
+                match rate.decode_would_carry(0, before, after) {
+                    Ok(_) => {
+                        rate.charge(Admission::Decode { draft: 0 }, after);
+                        true
+                    }
+                    Err(r) => {
+                        out.note(r);
+                        log_refusal(rate, kind, prio, &cost, before, after, &budget, r);
+                        false
+                    }
+                }
+            } else {
+                allowed
+            };
             ground.charge(FillPart::Judge, t_judge.elapsed());
             if !allowed {
                 break;
