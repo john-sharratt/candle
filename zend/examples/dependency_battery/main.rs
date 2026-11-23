@@ -10,6 +10,8 @@
 //!   member's K/V census (`GET /v1/kv/census`) taken as it starts and ends.
 //! - `analyse`: every figure's data and table of §9.12, §6.5 and §9.6.9 from
 //!   those lines (`analyse.rs`, `report.rs`).
+//! - `figures`: the paper's ten data figures as inline-SVG snippets, drawn
+//!   from those CSVs (`figures/`).
 //! - `direct`: the direct questions, generated from the source by rule
 //!   (`direct.rs`), as `battery.yaml` lists them.
 //!
@@ -27,6 +29,7 @@ mod arms;
 mod battery;
 mod client;
 mod direct;
+mod figures;
 mod load;
 mod placement;
 mod report;
@@ -109,6 +112,20 @@ enum Cmd {
         kv_layers: u32,
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Draw the paper's ten data figures as inline-SVG snippets from the
+    /// CSVs `analyse` wrote into `dir`, into `dir/figures`.
+    Figures {
+        #[arg(long)]
+        dir: PathBuf,
+        /// The files the provenance gallery ranked the needle questions
+        /// among: the random ranking's denominator.
+        #[arg(long)]
+        gallery_files: u32,
+        /// The BF16 bytes one resident token's K/V takes over every K/V
+        /// layer, as `summary.md`'s load table gives it.
+        #[arg(long)]
+        bf16_per_token: f64,
     },
     /// Print the direct questions generated from `repo`.
     Direct {
@@ -232,6 +249,16 @@ async fn main() -> anyhow::Result<()> {
             };
             report::write(&lines, &samples(&telemetry)?, bf16_per_token, &out)?;
             println!("wrote {}", out.join("summary.md").display());
+            Ok(())
+        }
+        Cmd::Figures {
+            dir,
+            gallery_files,
+            bf16_per_token,
+        } => {
+            for path in figures::write(&dir, gallery_files, bf16_per_token)? {
+                println!("wrote {}", path.display());
+            }
             Ok(())
         }
         Cmd::Direct { repo, count, seed } => {
