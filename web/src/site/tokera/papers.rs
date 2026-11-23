@@ -265,9 +265,15 @@ fn citation(p: &Paper) -> String {
         s.push_str(&format!("({year}). "));
     }
     s.push_str(&title);
-    s.push_str(". Zenodo.");
-    if !p.doi.is_empty() {
-        s.push_str(&format!(" https://doi.org/{}", p.doi));
+    s.push('.');
+    if p.doi.is_empty() {
+        // Not deposited: the page is the only place it can be found.
+        if !p.status.is_empty() {
+            s.push_str(&format!(" {}.", p.status));
+        }
+        s.push_str(&format!(" https://tokera.com/papers/{}", p.slug));
+    } else {
+        s.push_str(&format!(" Zenodo. https://doi.org/{}", p.doi));
     }
     s
 }
@@ -375,6 +381,27 @@ mod tests {
             "papers:\n  - slug: s\n    title: t\n    source: a.md\n    athors: x\n"
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_deposited_paper_cites_its_doi_and_a_draft_cites_its_page() {
+        let m = Manifest::parse(
+            "papers:\n  \
+             - slug: one-card-v2\n    title: One Card\n    authors: A. Author\n    \
+               status: v2 working draft\n    source: a.md\n  \
+             - slug: one-card\n    title: One Card\n    authors: A. Author\n    \
+               published: \"2026-05-13\"\n    doi: 10.5281/zenodo.1\n    \
+               status: v1 technical report\n    source: b.md\n",
+        )
+        .unwrap();
+        assert_eq!(
+            citation(&m.papers[0]),
+            "A. Author. One Card. v2 working draft. https://tokera.com/papers/one-card-v2"
+        );
+        assert_eq!(
+            citation(&m.papers[1]),
+            "A. Author. (2026). One Card. Zenodo. https://doi.org/10.5281/zenodo.1"
+        );
     }
 
     #[test]
