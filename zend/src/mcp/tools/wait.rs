@@ -208,6 +208,7 @@ mod tests {
             effort: Default::default(),
             kind: Default::default(),
             driven: Default::default(),
+            dials: Default::default(),
             started_ms: workers::now_ms(),
             turn_ms: workers::now_ms(),
             beat_ms: 0,

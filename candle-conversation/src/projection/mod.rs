@@ -290,10 +290,11 @@ pub use plain_prompt::PlainPromptFrames;
 pub use policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 pub(crate) use project::turn_belief_key;
 pub use project::{
-    GeneratedIdentity, GroupKey, OptionalState, PriorBelief, Projection, ProjectionMode,
-    ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedSelection, ResolvedTurn,
-    SealedKind, SelectionState, FORCE_TOOL_SELECTOR, FORCE_TOOL_SEPARATOR, NO_THINK_SELECTOR,
-    TOOLS_ENABLED_SELECTOR, TOOL_ROUND_SELECTOR,
+    GeneratedIdentity, GroupKey, OptionalState, PriorBelief, Projection, ProjectionLevel,
+    ProjectionMode, ProjectionSegment, ProjectionTarget, ReprojectionMode, ResolvedSection,
+    ResolvedSelection, ResolvedTurn, SealedKind, SelectionState, FORCE_TOOL_SELECTOR,
+    FORCE_TOOL_SEPARATOR, NO_THINK_SELECTOR, PROJECTION_SELECTOR, REPROJECTION_SELECTOR,
+    SEED_SELECTOR, TOOLS_ENABLED_SELECTOR, TOOL_ROUND_SELECTOR,
 };
 pub use reconcile::{EPSILON_TOKENS, MAX_ITERATIONS};
 pub(crate) use resolver::SubstrateRef;

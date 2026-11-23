@@ -154,8 +154,8 @@ pub use group_scanner::{GroupScanner, ScanRefused};
 pub use handle::{TokenDecoder, TurnEvent, TurnHandle, TurnResponse};
 pub use ingest_warmer::IngestWarmer;
 pub use projection::{
-    BucketKind, OptionalState, ProjectionBucket, ProjectionEvent, ProjectionPoint, SelectionState,
-    NO_THINK_SELECTOR, TOOL_ROUND_SELECTOR,
+    BucketKind, OptionalState, ProjectionBucket, ProjectionEvent, ProjectionLevel, ProjectionPoint,
+    ReprojectionMode, SelectionState, NO_THINK_SELECTOR, TOOL_ROUND_SELECTOR,
 };
 pub use recovered_message::RecoveredMessage;
 pub use scheduler::branch_checkpoint_counts;

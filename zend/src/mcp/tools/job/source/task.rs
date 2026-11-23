@@ -226,6 +226,7 @@ mod tests {
             effort: Default::default(),
             kind: Default::default(),
             driven: Default::default(),
+            dials: Default::default(),
             started_ms: 1_000_000,
             turn_ms: 1_000_000,
             beat_ms: 0,

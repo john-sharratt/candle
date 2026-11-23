@@ -38,6 +38,7 @@ pub(super) mod tests {
             effort: Effort::Deep,
             kind: WorkerKind::Coder,
             driven: Driven::Attended,
+            dials: Default::default(),
             started_ms: 0,
             turn_ms: 0,
             beat_ms: 0,

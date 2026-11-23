@@ -23,7 +23,7 @@ worker's evidence. A chat is a conversation, and disposing of it keeps nothing.
 
 | Tool | Does | Returns |
 |---|---|---|
-| `zen_chat_send {text, chat?, effort?, wait_s?}` | Sends `text` to Zen on the chat `chat` names, or opens a new chat when it names none, and waits up to `wait_s` (45 by default) for the answer. Zen thinks at `effort` — `balanced` by default, so a chat answers soonest. `chat` may instead name a web UI conversation (§6) | The chat's id, Zen's answer, or that Zen is still answering and what it is doing |
+| `zen_chat_send {text, chat?, effort?, projection?, seed?, reprojection?, wait_s?}` | Sends `text` to Zen on the chat `chat` names, or opens a new chat when it names none, and waits up to `wait_s` (45 by default) for the answer. Zen thinks at `effort` — `balanced` by default, so a chat answers soonest — and retrieves as the three retrieval dials say, each absent for the production default (`docs/claude_zend_gateway.md` §3.4). `chat` may instead name a web UI conversation (§6) | The chat's id, Zen's answer, or that Zen is still answering and what it is doing |
 | `zen_chat_read {chat, after?, wait_s?}` | Reads the chat's messages after message `after`; with no `after`, Zen's messages since Claude's last one. While Zen is answering and nothing new is there, waits up to `wait_s` (45 by default). `chat` may instead name a web UI conversation (§6) | The messages, each numbered, and whether Zen is still answering |
 | `zen_chat_close {chat}` | Disposes of the chat now. A Zen answer still running is stopped at its next tool round and the chat is disposed of as it ends | `disposed`, or `closing` until the answer stops |
 

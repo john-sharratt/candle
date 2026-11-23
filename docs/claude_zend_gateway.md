@@ -157,7 +157,7 @@ thread, `T:review-layers/verify-expiry` for a worker under it. A tool taking a
 | Tool | Does | Returns |
 |---|---|---|
 | `thread_attach {thread}` | Binds the MCP session to `thread`, creating it on first use (§4) | The thread's path and its journal's head lines |
-| `repo_task_start {thread, name, prompt, priority?, effort?, wait_s?}` | Starts a worker named `name` under `thread` (§4, §5.2), runs the task on it, waits for its journal entry (§5), records the outcome on the thread, and archives the worker once it is `done` | One of the states of §3.3 |
+| `repo_task_start {thread, name, prompt, role?, priority?, effort?, driven?, projection?, seed?, reprojection?, wait_s?}` | Starts a worker named `name` under `thread` (§4, §5.2), runs the task on it, waits for its journal entry (§5), records the outcome on the thread, and archives the worker once it is `done` | One of the states of §3.3 |
 | `job_status {jobs, wait_s?}` (`docs/jobs.md` §4) | Waits on one or more running jobs, tasks among them (`task:<thread>/<name>`), answering as soon as any of them leaves `running` (§3.3) | That worker's state, and for each still running what it has done so far, with any journal entries not yet given |
 | `job_read {job, page, wait_s?}` (`docs/jobs.md` §3) | One 200-line page of a task's output: its prompt, its journal entries as drafted, its question or answer, then its turn's report (rounds, time, calls by tool, what failed) at the end | The page, and where it is |
 | `repo_task_reply {task, answer}` | Answers a worker's question or unsticks it (§6.2): the answer is the worker's next turn | As `repo_task_start` |
@@ -172,7 +172,7 @@ thread, `T:review-layers/verify-expiry` for a worker under it. A tool taking a
 | `user_episode_note {tool, summary?}` | Records an episode on the conversation's journal — called by the aggregator only; in no listing (`docs/mcp_user_context.md` §2.3) | The episode's line |
 | `thread_list {prefix?}` | The caller's threads, newest first | Path, last activity, open items, any worker waiting on Claude |
 | `thread_archive {thread}` | Archives a finished feature's thread | The thread's last state |
-| `zen_chat_send {text, chat?, effort?, wait_s?}`, `zen_chat_read {chat, after?, wait_s?}`, `zen_chat_close {chat}` | A private chat with Zen, named by the id the send that opened it answers with — never by the MCP session, which claude.ai shares across conversations — disposed of, conversation tombstoned and records ceased, when closed or twelve hours idle (`docs/zen_chat.md`) | The chat's id and Zen's answer; the chat's messages; `disposed` |
+| `zen_chat_send {text, chat?, effort?, projection?, seed?, reprojection?, wait_s?}`, `zen_chat_read {chat, after?, wait_s?}`, `zen_chat_close {chat}` | A private chat with Zen, named by the id the send that opened it answers with — never by the MCP session, which claude.ai shares across conversations — disposed of, conversation tombstoned and records ceased, when closed or twelve hours idle (`docs/zen_chat.md`) | The chat's id and Zen's answer; the chat's messages; `disposed` |
 
 **How they are served.** The member serving `/mcp` runs the tools in
 process, on the session (`zend/src/mcp/tools/`, one file per tool), not
@@ -298,6 +298,17 @@ it sits 24 hours untouched (`docs/mcp_guides.md` §3).
   with under 3K tokens of thinking extracted the facts and missed that two of
   its own findings contradicted each other. Effort is how hard a turn thinks;
   priority, below, is only how soon it decodes.
+- **Retrieval dials, absent for the production default** (`retrieval_dials.rs`).
+  `repo_task_start` and `zen_chat_send` take `projection` — `full` (every
+  layer provenance selects from), `limited` (the journals and the
+  conversation's own turns alone) or `minimal` (the tool catalog alone, so
+  nothing with tools off) — `seed` (whether a new conversation opens on its
+  configured seed files) and `reprojection` — `full`, `held` (not inside the
+  think block) or `opening` (selected once, at the turn's opening). They are
+  kept on the worker's record and set on every turn it runs, as selectors of
+  the turn (`projection::turn_dials`); a lower level keeps a task to what it
+  is given. On a web UI conversation (`docs/zen_chat.md` §6) they go on the
+  chat request as its own fields.
 - **`driven` `attended` or `alone`** (`mcp::driven`,
   `docs/zen_memory_and_guides.md` D5). A task is `attended` when its
   coordinator waits on it, answers its questions and checks its result;

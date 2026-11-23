@@ -196,6 +196,7 @@ mod resolved;
 mod section_tree;
 #[cfg(test)]
 mod tests_belief;
+mod turn_dials;
 
 pub use belief::*;
 use collection::*;
@@ -205,3 +206,4 @@ pub use mode::*;
 pub use pipeline::*;
 pub use resolved::*;
 pub use section_tree::*;
+pub use turn_dials::*;

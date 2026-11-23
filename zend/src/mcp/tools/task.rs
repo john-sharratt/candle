@@ -1,4 +1,5 @@
-//! `repo_task_start {thread, name, prompt, role?, priority?, effort?, wait_s?}`: start a
+//! `repo_task_start {thread, name, prompt, role?, priority?, effort?, driven?,
+//! projection?, seed?, reprojection?, wait_s?}`: start a
 //! task on a new worker, and wait for it up to `wait_s`; it answers the task's
 //! handle, `task:<thread>/<name>` (`docs/claude_zend_gateway.md` §3.2, §3.4,
 //! `docs/jobs.md` §1).
@@ -11,11 +12,12 @@ use crate::mcp::driven::Driven;
 use crate::mcp::roles::WorkerKind;
 use crate::mcp::threads::{Effort, Priority};
 use crate::mcp::workers;
+use crate::retrieval_dials::RetrievalDials;
 
 pub const NAME: &str = "repo_task_start";
 
 pub fn definition() -> Value {
-    json!({
+    RetrievalDials::with_schema(json!({
         "name": NAME,
         "description": "Delegate a task: start it on a new worker under a thread, and wait for it up to \
             `wait_s`. Read the guide for the kind of work first (`delegate`, then `implement`, `review`, \
@@ -47,7 +49,7 @@ pub fn definition() -> Value {
             "required": ["thread", "name", "prompt"],
             "additionalProperties": false
         }
-    })
+    }))
 }
 
 pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
@@ -75,13 +77,17 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         Ok(d) => d,
         Err(e) => return Answer::error(e),
     };
+    let dials = match RetrievalDials::of_args(args) {
+        Ok(d) => d,
+        Err(e) => return Answer::error(e),
+    };
     let worker = match workers::start(
         &ctx.session,
         &ctx.caller,
         thread,
         name,
         prompt,
-        (priority, effort, kind, driven),
+        (priority, effort, kind, driven, dials),
         false,
         None,
     ) {

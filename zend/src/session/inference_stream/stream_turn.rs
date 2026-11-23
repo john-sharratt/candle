@@ -263,6 +263,9 @@ pub(in super::super) fn run_inference_stream(
             if let Some(config) = state.working_set.clone() {
                 let open_state = Arc::clone(&state);
                 let open_conv = conv_id.clone();
+                // The turn's seed dial: off, the conversation opens on no seeds
+                // and its working set is what provenance alone brings in.
+                let seeding = selection.seeds();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     let t_open = Instant::now();
                     open_state.engine.working_set_clear(timeline);
@@ -281,8 +284,11 @@ pub(in super::super) fn run_inference_stream(
                     );
                     let scope_ms = t_scope.elapsed().as_millis() as u64;
                     let t_seed = Instant::now();
-                    let seeded =
-                        seed_working_set(&open_state, timeline, &open_conv, &files, &config);
+                    let seeded = if seeding {
+                        seed_working_set(&open_state, timeline, &open_conv, &files, &config)
+                    } else {
+                        0
+                    };
                     let seed_ms = t_seed.elapsed().as_millis() as u64;
                     tracing::info!(
                         target: "zend::working_set",

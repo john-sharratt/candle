@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use super::builder::Builder;
 use super::ids::{GroupId, TimelineId, TurnIndex, TurnKey};
 use super::project::{
-    OptionalState, ProjectionMode, ProjectionTarget, SelectionState, TOOL_ROUND_SELECTOR,
+    OptionalState, ProjectionLevel, ProjectionMode, ProjectionTarget, SelectionState,
+    TOOL_ROUND_SELECTOR,
 };
 use super::working_set_pick::WorkingSetMembers;
 use crate::substrate::ContentResolver;
@@ -335,6 +336,34 @@ fn the_working_set_sits_between_the_chain_and_the_dialogues_own_turns() {
         emitted(&f.b, f.target, &r),
         vec![(CHAIN, 1), (20, 1), (31, 1), (30, 1), (DIALOGUE, 1)],
     );
+}
+
+/// **The projection dial**: Full places the chain and the working set as
+/// production does; Limited and Minimal place neither — the fixture holds no
+/// journal, which is all Limited would add — and the conversation's own turns
+/// are placed exactly as at Full.
+#[test]
+fn a_lower_projection_level_places_only_the_conversation() {
+    let f = fixture();
+    const CHAIN: u64 = 5;
+    let r = WsResolver::default()
+        .with_conversation(DIALOGUE, f.conversation, 1, 10)
+        .with_conversation(CHAIN, f.conversation, 1, 10)
+        .with_conversation(20, f.structure, 1, 100)
+        .with_conversation(30, f.scopes, 1, 100)
+        .provenance(f.structure, 20, 900.0)
+        .provenance(f.scopes, 30, 900.0);
+    let at = |level: ProjectionLevel| {
+        let mut s = SelectionState::new();
+        s.set_projection_level(level);
+        emitted_with(&f.b, f.target, &r, &s)
+    };
+    assert_eq!(
+        at(ProjectionLevel::Full),
+        vec![(CHAIN, 1), (20, 1), (30, 1), (DIALOGUE, 1)],
+    );
+    assert_eq!(at(ProjectionLevel::Limited), vec![(DIALOGUE, 1)]);
+    assert_eq!(at(ProjectionLevel::Minimal), vec![(DIALOGUE, 1)]);
 }
 
 /// **A focused projection carries no working set**: it is held to the

@@ -12,8 +12,9 @@
 use super::*;
 
 /// Start `prompt` on a new worker named after `wanted` under `thread`,
-/// decoding at `priority`, thinking at `effort`, doing `kind`'s work and
-/// driven as `driven` says; the worker's record, `running`. A worker a
+/// decoding at `priority`, thinking at `effort`, doing `kind`'s work,
+/// driven as `driven` says and retrieving as `dials` say; the worker's
+/// record, `running`. A worker a
 /// conversation of Zen's starts — `from` names it — begins on that
 /// conversation's branches and uncommitted changes (`conv_inherit`).
 #[allow(clippy::too_many_arguments)]
@@ -23,7 +24,7 @@ pub fn start(
     thread: &str,
     wanted: &str,
     prompt: &str,
-    (priority, effort, kind, driven): (Priority, Effort, WorkerKind, Driven),
+    (priority, effort, kind, driven, dials): (Priority, Effort, WorkerKind, Driven, RetrievalDials),
     by_task: bool,
     from: Option<&str>,
 ) -> Result<Worker, String> {
@@ -57,6 +58,7 @@ pub fn start(
     );
     worker.by_task = by_task;
     worker.driven = driven;
+    worker.dials = dials;
     if let Some(Err(e)) = from.and_then(|starter| session.begin_on(&worker.conv_id, starter)) {
         return Err(format!(
             "the task could not be given its starter's work: {e}"
@@ -147,6 +149,7 @@ pub(in super::super) fn fresh(
         effort,
         kind,
         driven: Driven::default(),
+        dials: Default::default(),
         started_ms: now,
         turn_ms: now,
         beat_ms: now,

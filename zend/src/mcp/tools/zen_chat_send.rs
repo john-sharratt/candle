@@ -1,4 +1,5 @@
-//! `zen_chat_send {text, chat?, effort?, wait_s?}`: send a message to Zen on a
+//! `zen_chat_send {text, chat?, effort?, projection?, seed?, reprojection?,
+//! wait_s?}`: send a message to Zen on a
 //! private chat — a new one, or the one `chat` names — or on a conversation of
 //! the web UI's that `chat` names by its id, and wait for the answer
 //! (`docs/zen_chat.md` §1, §6).
@@ -10,11 +11,12 @@ use crate::mcp::chats::dialogue::{self, target, Target};
 use crate::mcp::chats::talk::{self, render};
 use crate::mcp::threads::Effort;
 use crate::mcp::workers::now_ms;
+use crate::retrieval_dials::RetrievalDials;
 
 pub const NAME: &str = "zen_chat_send";
 
 pub fn definition() -> Value {
-    json!({
+    RetrievalDials::with_schema(json!({
         "name": NAME,
         "description": "Send a message to Zen on a private chat, and wait up to `wait_s` for its answer. Zen is \
             the user's own model, on hardware the user owns, with the user's repositories, journals and the web \
@@ -40,7 +42,7 @@ pub fn definition() -> Value {
             "required": ["text"],
             "additionalProperties": false
         }
-    })
+    }))
 }
 
 /// The effort a send names, if it names one.
@@ -67,9 +69,13 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         Ok(t) => t,
         Err(e) => return Answer::error(e),
     };
-    let (effort, on) = match (effort_of(args), chat_of(args)) {
-        (Ok(e), Ok(on)) => (e, on),
-        (Err(e), _) | (_, Err(e)) => return Answer::error(e),
+    let (effort, on, dials) = match (
+        effort_of(args),
+        chat_of(args),
+        RetrievalDials::of_args(args),
+    ) {
+        (Ok(e), Ok(on), Ok(d)) => (e, on, d),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return Answer::error(e),
     };
     let on = match on {
         Some(Target::Conversation(id)) => {
@@ -79,7 +85,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
                 &ctx.caller,
                 &id,
                 text,
-                effort,
+                (effort, dials),
                 wait.duration(),
             )
             .await
@@ -99,7 +105,13 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     // A chat's answer is wanted soon.
     let effort = effort.unwrap_or(Effort::Balanced);
-    let sent = match talk::send(&ctx.session, &ctx.caller, on.as_deref(), text, effort) {
+    let sent = match talk::send(
+        &ctx.session,
+        &ctx.caller,
+        on.as_deref(),
+        text,
+        (effort, dials),
+    ) {
         Ok(s) => s,
         Err(e) => return Answer::error(e),
     };

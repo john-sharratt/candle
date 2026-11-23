@@ -1,6 +1,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+use crate::retrieval_dials::RetrievalDials;
+
 // ── Roles ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -154,6 +156,10 @@ pub struct ChatCompletionRequest {
     /// nothing else.
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    /// The turn's retrieval dials — `projection`, `seed`, `reprojection` —
+    /// each absent for the production default ([`RetrievalDials`]).
+    #[serde(flatten)]
+    pub dials: RetrievalDials,
 }
 
 /// The request's `stream_options`.

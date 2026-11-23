@@ -11,6 +11,16 @@
 
 use super::*;
 
+/// The fill kind a working-set group's members count toward.
+fn share_kind(share: Option<WorkingSetShare>) -> Kind {
+    match share {
+        Some(WorkingSetShare::Folders) => Kind::Folder,
+        Some(WorkingSetShare::Guides) => Kind::Guide,
+        Some(WorkingSetShare::Journals) => Kind::Journal,
+        Some(WorkingSetShare::Readings) | None => Kind::Reading,
+    }
+}
+
 /// Variant of [`run`] that delivers score-density [`SelectionDiagnostics`]
 /// to a sink the caller provides.  Used by the scheduler to ferry the
 /// diagnostic straight into the substrate's
@@ -97,6 +107,9 @@ pub fn run_with_sink<R: ContentResolver>(
     // in an ingest profile.
     let any_layer_disabled = resolver.any_layer_disabled();
     let tool_round = selection.optional(TOOL_ROUND_SELECTOR) == Some(OptionalState::Present);
+    // The turn's projection dial: a lower level selects none of the retrieved
+    // memory it leaves out (`turn_dials`).
+    let level = selection.projection_level();
 
     for (li, layer) in visible_layers.iter().enumerate() {
         let layer_is_target = layer.id == target.layer;
@@ -137,6 +150,14 @@ pub fn run_with_sink<R: ContentResolver>(
             // working-set members it was served (`Schema::focus`).
             if schema.focus
                 && !layer_is_target
+                && !matches!(group.selection, SelectionRule::WorkingSet { .. })
+            {
+                continue;
+            }
+            // Nor, at a lower projection level, anything another layer holds
+            // outside the working set.
+            if !layer_is_target
+                && !level.places(Kind::Layer(li))
                 && !matches!(group.selection, SelectionRule::WorkingSet { .. })
             {
                 continue;
@@ -599,6 +620,10 @@ pub fn run_with_sink<R: ContentResolver>(
             if schema.focus {
                 continue;
             }
+            // A kind the projection dial leaves out picks nothing.
+            if !level.places(share_kind(gs.working_set)) {
+                continue;
+            }
             let Some(members) = resolver.working_set_members(gs.schema.id) else {
                 continue;
             };
@@ -609,6 +634,16 @@ pub fn run_with_sink<R: ContentResolver>(
                     gs.selected.push((key, p.score));
                 }
             }
+        }
+    }
+    // Below Full the target's group keeps its own turns and drops the lineage
+    // it inherited.
+    if !level.places_lineage() {
+        if let Some(gs) = group_states
+            .iter_mut()
+            .find(|gs| gs.schema.id == target.group)
+        {
+            gs.selected.retain(|(k, _)| k.timeline == target.timeline);
         }
     }
 
@@ -1030,12 +1065,7 @@ pub fn run_with_sink<R: ContentResolver>(
         let mut working: Vec<WorkingPiece> = Vec::new();
         let mut working_groups: Vec<GroupId> = Vec::new();
         for gs in group_states.iter().filter(|gs| gs.working_set.is_some()) {
-            let kind = match gs.working_set {
-                Some(WorkingSetShare::Folders) => Kind::Folder,
-                Some(WorkingSetShare::Guides) => Kind::Guide,
-                Some(WorkingSetShare::Journals) => Kind::Journal,
-                Some(WorkingSetShare::Readings) | None => Kind::Reading,
-            };
+            let kind = share_kind(gs.working_set);
             let mut order: Vec<TimelineId> = Vec::new();
             for (k, _) in &gs.selected {
                 if !order.contains(&k.timeline) {
@@ -1082,16 +1112,23 @@ pub fn run_with_sink<R: ContentResolver>(
         }
         // Each kind's cap is its share of this projection's room
         // (`docs/hit_driven_projection.md` §7.2 step 4).
+        // A kind the projection dial leaves out has no room at all.
         let shares = ws.fill_shares.caps(room);
+        let cap = |kind: Kind, tokens: usize| if level.places(kind) { tokens } else { 0 };
+        let readings = cap(Kind::Reading, shares.readings);
         let caps = Caps {
-            readings: shares.readings,
-            folders: shares.folders,
-            guides: shares.guides,
-            journals: shares.journals,
+            readings,
+            folders: cap(Kind::Folder, shares.folders),
+            guides: cap(Kind::Guide, shares.guides),
+            journals: cap(Kind::Journal, shares.journals),
             dialogue: shares.dialogue,
-            layers: visible_layers.iter().map(|l| l.window).collect(),
-            reading_piece: reading_piece_cap(shares.readings),
-            minimum: minimum_cap(shares.readings),
+            layers: visible_layers
+                .iter()
+                .enumerate()
+                .map(|(i, l)| cap(Kind::Layer(i), l.window))
+                .collect(),
+            reading_piece: reading_piece_cap(readings),
+            minimum: minimum_cap(readings),
         };
         // What the slot holds from the boundary before, and whether this is
         // the first boundary after a new user message — which chooses whole,

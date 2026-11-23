@@ -42,6 +42,7 @@ use crate::mcp::ops;
 use crate::mcp::ownership::Viewer;
 use crate::mcp::threads::Effort;
 use crate::mcp::workers;
+use crate::retrieval_dials::RetrievalDials;
 use crate::session::{ConvEntry, ConversationDials, ZendSession};
 use crate::turn_claims;
 use crate::types::{Role, ToolMode};
@@ -103,12 +104,13 @@ fn answering(session: &ZendSession, id: &str) -> bool {
 /// The request a send makes: `text` as the next user message, at the dials
 /// the conversation last ran at — the web UI sends its composer's on every
 /// turn, and a turn sent without them would reset the conversation's — with
-/// the thinking effort `effort` when the caller names one.
+/// the thinking effort `effort` when the caller names one, and every retrieval
+/// dial `retrieval` names.
 pub fn request(
     id: &str,
     text: &str,
     dials: Option<ConversationDials>,
-    effort: Option<Effort>,
+    (effort, retrieval): (Option<Effort>, RetrievalDials),
 ) -> Value {
     let mut body = json!({
         "model": "zen-code",
@@ -126,18 +128,23 @@ pub fn request(
         body["effort"] = json!(e.level());
         body["think"] = json!(true);
     }
+    if let Ok(Value::Object(named)) = serde_json::to_value(retrieval) {
+        for (dial, value) in named {
+            body[dial] = value;
+        }
+    }
     body
 }
 
 /// Send `text` on the conversation `id` for `caller`, waiting up to `wait` for
 /// the reply; Zen thinks at `effort` when one is named, else at the
-/// conversation's own dial.
+/// conversation's own dial, and retrieves as `retrieval` names.
 pub async fn send(
     session: &Arc<ZendSession>,
     caller: &Caller,
     id: &str,
     text: &str,
-    effort: Option<Effort>,
+    effort: (Option<Effort>, RetrievalDials),
     wait: Duration,
 ) -> Result<String, String> {
     if text.trim().is_empty() {
@@ -308,6 +315,7 @@ pub async fn read(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::retrieval_dials::ProjectionDial;
 
     fn said(pairs: &[(Role, &str)]) -> Vec<(Role, String)> {
         pairs
@@ -327,21 +335,41 @@ mod tests {
             think: true,
             tools: 2,
         };
+        let none = RetrievalDials::default();
         assert_eq!(
-            request("c-1", "fix it", Some(dials), None),
+            request("c-1", "fix it", Some(dials), (None, none)),
             json!({
                 "model": "zen-code", "stream": true, "conv_id": "c-1",
                 "messages": [{"role": "user", "content": "fix it"}],
                 "effort": 2, "verbosity": 3, "think": true, "tools": "comprehensive",
             })
         );
-        let deep = request("c-1", "fix it", Some(dials), Some(Effort::Deep));
+        let deep = request("c-1", "fix it", Some(dials), (Some(Effort::Deep), none));
         assert_eq!(
             (deep["effort"].clone(), deep["think"].clone()),
             (json!(3), json!(true))
         );
-        let bare = request("c-1", "fix it", None, None);
+        let bare = request("c-1", "fix it", None, (None, none));
         assert!(bare.get("effort").is_none() && bare.get("tools").is_none());
+    }
+
+    /// **A send carries the retrieval dials it names**, as the chat request's
+    /// own fields, and no field for a dial it leaves unnamed.
+    #[test]
+    fn a_send_carries_the_retrieval_dials_it_names() {
+        let named = RetrievalDials {
+            projection: Some(ProjectionDial::Limited),
+            seed: Some(false),
+            reprojection: None,
+        };
+        assert_eq!(
+            request("c-1", "fix it", None, (None, named)),
+            json!({
+                "model": "zen-code", "stream": true, "conv_id": "c-1",
+                "messages": [{"role": "user", "content": "fix it"}],
+                "projection": "limited", "seed": false,
+            })
+        );
     }
 
     /// **A read with no `after` starts after the last message a person

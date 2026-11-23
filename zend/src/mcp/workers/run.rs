@@ -345,6 +345,7 @@ pub(super) async fn turn(
     selection.select(ROLE_SELECTOR, worker.kind.option());
     selection.select(DRIVEN_SELECTOR, worker.driven.option());
     apply_tools_dial(&mut selection, mode);
+    worker.dials.apply(&mut selection);
     let (message, round) = first.into_start();
     let mut stream = session
         .submit_worker(

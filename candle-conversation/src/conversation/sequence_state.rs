@@ -10,6 +10,7 @@
 //! key-value state and leaves the shared turns in place.
 
 use super::*;
+use crate::projection::ReprojectionMode;
 
 impl Sequence {
     /// This conversation's **live** recurrent memory, right now, without sealing
@@ -540,6 +541,14 @@ impl Sequence {
         if !boundary.is_active() {
             return None;
         }
+        // The turn's reprojection dial, over the conversation's configuration:
+        // an opening-only turn selects once and never again.
+        let in_thinking = match self.selection.reprojection_mode() {
+            Some(ReprojectionMode::Opening) => return None,
+            Some(ReprojectionMode::Full) => true,
+            Some(ReprojectionMode::Held) => false,
+            None => self.config.reproject_in_thinking,
+        };
         Some(ReprojectionPolicy {
             target: self.target,
             projection: Arc::clone(&self.projection),
@@ -547,7 +556,7 @@ impl Sequence {
             substrate: self.substrate.clone(),
             boundary,
             max_probe_tokens: self.config.reproject_max_probe_tokens.max(1),
-            in_thinking: self.config.reproject_in_thinking,
+            in_thinking,
         })
     }
 

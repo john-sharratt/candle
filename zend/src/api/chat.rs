@@ -123,6 +123,9 @@ pub async fn completions(
     // entire block (markers included), the other modes show it. Which *members*
     // appear under Restricted vs Comprehensive is still the mode_builders' job.
     apply_tools_dial(&mut selection, tools_mode);
+    // The retrieval dials: how much of the memory the turn is shown, whether
+    // it opens on its seeds, and when it re-selects.
+    req.dials.apply(&mut selection);
     let messages = req.messages;
     // `passthrough` runs the client's own context as-is — see
     // `crate::passthrough`; every other model name runs the daemon's projection.

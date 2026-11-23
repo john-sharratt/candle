@@ -23,6 +23,7 @@ use crate::mcp::records::Records;
 use crate::mcp::roles::WorkerKind;
 use crate::mcp::threads::{self, Effort, Priority, State, Worker};
 use crate::mcp::workers::{self, now_ms};
+use crate::retrieval_dials::RetrievalDials;
 use crate::session::ZendSession;
 
 use super::dispose::{dispose, tombstone_with, When};
@@ -148,18 +149,19 @@ pub fn recap(earlier: &[Said], text: &str) -> String {
 }
 
 /// `w`, finished and kept, made ready to answer `text` as its next turn at
-/// `effort`: its last answer and how it ended are cleared, so a reader never
-/// takes them for this one's.
+/// `effort` and `dials`: its last answer and how it ended are cleared, so a
+/// reader never takes them for this one's.
 fn continued(
     session: &ZendSession,
     mut w: Worker,
     text: &str,
     caller: &Caller,
-    effort: Effort,
+    (effort, dials): (Effort, RetrievalDials),
     now: u64,
 ) -> Worker {
     workers::ready_for_turn(session, &mut w, caller, now);
     w.effort = effort;
+    w.dials = dials;
     w.prompt = text.to_string();
     w.stopped = false;
     w.error = None;
@@ -168,14 +170,14 @@ fn continued(
 }
 
 /// Send `text` to Zen on `caller`'s chat `on`, or on a new chat when `on` is
-/// `None`; Zen's answer runs at `effort`. A chat that is closing or no longer
-/// kept takes no message: [`not_open`].
+/// `None`; Zen's answer runs at `effort`, retrieving as `dials` say. A chat
+/// that is closing or no longer kept takes no message: [`not_open`].
 pub fn send(
     session: &Arc<ZendSession>,
     caller: &Caller,
     on: Option<&str>,
     text: &str,
-    effort: Effort,
+    (effort, dials): (Effort, RetrievalDials),
 ) -> Result<Sent, String> {
     let records = session.shared_substrate().ok_or_else(workers::loading)?;
     if text.trim().is_empty() {
@@ -211,11 +213,11 @@ pub fn send(
     let number = records.count_under(&record::said_prefix(&owner, &chat.id)) + 1;
     let (worker, message) = match next(&all, &thread)? {
         Next::Continue(w) => (
-            continued(session, *w, text, caller, effort, now),
+            continued(session, *w, text, caller, (effort, dials), now),
             text.to_string(),
         ),
-        Next::Fresh(name) => (
-            workers::fresh(
+        Next::Fresh(name) => {
+            let mut fresh = workers::fresh(
                 session,
                 &owner,
                 &thread,
@@ -229,9 +231,13 @@ pub fn send(
                     WorkerKind::Chat,
                 ),
                 now,
-            ),
-            recap(&record::said(&records, &owner, &chat.id), text),
-        ),
+            );
+            fresh.dials = dials;
+            (
+                fresh,
+                recap(&record::said(&records, &owner, &chat.id), text),
+            )
+        }
     };
     let said = Said {
         at_ms: now,
@@ -435,6 +441,7 @@ mod tests {
     use crate::mcp::chats::dispose::{Disposal, STOPPED};
     use crate::mcp::records::MemRecords;
     use crate::mcp::stops;
+    use crate::retrieval_dials::ProjectionDial;
     use crate::workspace::single_repo;
 
     const THREAD: &str = "~0123456789abcdef";
@@ -694,19 +701,28 @@ mod tests {
         session.hold_substrate(Conversation::new());
         let records = session.shared_substrate().unwrap();
         let (caller, owner) = (caller(), caller().key());
+        let minimal = RetrievalDials {
+            projection: Some(ProjectionDial::Minimal),
+            ..RetrievalDials::default()
+        };
+        let plain = (Effort::Balanced, RetrievalDials::default());
 
         let first = send(
             &session,
             &caller,
             None,
             "how big is the arena?",
-            Effort::Balanced,
+            (Effort::Balanced, minimal),
         )
         .unwrap();
         assert_eq!(first.number, 1);
         assert_eq!(first.worker.name, ZEN);
         assert!(first.worker.kind.is_chat());
         assert_eq!(first.worker.effort, Effort::Balanced);
+        assert_eq!(
+            first.worker.dials, minimal,
+            "the chat's turn carries its dials"
+        );
         assert_eq!(
             record::chat(&records, &owner, &first.chat.id),
             Some(first.chat.clone())
@@ -747,14 +763,14 @@ mod tests {
                 &caller,
                 Some(&first.chat.id),
                 "still there?",
-                Effort::Balanced
+                plain
             )
             .unwrap_err(),
             still_answering(&first.chat.id)
         );
         assert_eq!(record::said(&records, &owner, &first.chat.id).len(), 1);
 
-        let other = send(&session, &caller, None, "a second chat", Effort::Balanced).unwrap();
+        let other = send(&session, &caller, None, "a second chat", plain).unwrap();
         assert_ne!(
             other.chat.id, first.chat.id,
             "each send naming no chat opens its own"
@@ -774,7 +790,7 @@ mod tests {
                 },
                 Some(&first.chat.id),
                 "may I read it?",
-                Effort::Balanced
+                plain
             )
             .unwrap_err(),
             not_open(&first.chat.id),
@@ -814,7 +830,7 @@ mod tests {
                 &caller,
                 Some(&first.chat.id),
                 "and now?",
-                Effort::Deep
+                (Effort::Deep, RetrievalDials::default())
             )
             .unwrap_err(),
             not_open(&first.chat.id),
@@ -822,18 +838,11 @@ mod tests {
         );
 
         for i in record::kept_count(&records, &owner)..MAX_CHATS {
-            send(
-                &session,
-                &caller,
-                None,
-                &format!("chat {i}"),
-                Effort::Balanced,
-            )
-            .unwrap();
+            send(&session, &caller, None, &format!("chat {i}"), plain).unwrap();
         }
         assert_eq!(record::kept_count(&records, &owner), MAX_CHATS);
         assert_eq!(
-            send(&session, &caller, None, "one too many", Effort::Balanced).unwrap_err(),
+            send(&session, &caller, None, "one too many", plain).unwrap_err(),
             too_many()
         );
     }

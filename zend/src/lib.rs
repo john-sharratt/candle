@@ -74,6 +74,7 @@ pub mod reprojection_settings;
 pub mod resident;
 pub mod response_section;
 pub mod resume;
+pub mod retrieval_dials;
 pub mod retrieval_scope;
 pub mod round_timing;
 pub mod schema_layers;

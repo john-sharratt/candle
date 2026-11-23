@@ -164,7 +164,13 @@ pub fn start(call: &OpsCall, args: &Value) -> Answer {
         name,
         prompt,
         // Its starter — a task, a chat, a dialogue — waits on it.
-        (Priority::Normal, effort, kind, Driven::Attended),
+        (
+            Priority::Normal,
+            effort,
+            kind,
+            Driven::Attended,
+            Default::default(),
+        ),
         by_task,
         Some(&call.lineage),
     ) {

@@ -28,6 +28,7 @@ use super::driven::Driven;
 use super::names::Path;
 use super::records::Records;
 use super::roles::WorkerKind;
+use crate::retrieval_dials::RetrievalDials;
 
 /// Orders the notes one process writes within one millisecond.
 static NOTE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -172,6 +173,10 @@ pub struct Worker {
     /// Whether anyone drives it: an `alone` task is told nobody will answer.
     #[serde(default)]
     pub driven: Driven,
+    /// The retrieval dials its turns run with — what the call that started it
+    /// named, the production default when it named none.
+    #[serde(default)]
+    pub dials: RetrievalDials,
     pub started_ms: u64,
     /// When its current turn began.
     pub turn_ms: u64,
@@ -693,6 +698,7 @@ mod tests {
             effort: Effort::Deep,
             kind: WorkerKind::Coder,
             driven: Driven::Attended,
+            dials: RetrievalDials::default(),
             started_ms: 0,
             turn_ms: 0,
             beat_ms: 1_000,

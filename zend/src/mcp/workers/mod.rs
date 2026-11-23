@@ -60,6 +60,7 @@ use crate::access;
 use crate::api::chat::{apply_tools_dial, dial_selection};
 use crate::hand_records::{self, Carrying};
 use crate::ingest_lease::{self, Guard, Share};
+use crate::retrieval_dials::RetrievalDials;
 use crate::session::{NoDraft, Resume, StreamItem, ZendSession, CLOSED_BY_CLAUDE};
 use crate::tools::Dispatch;
 use crate::worker_hop;
