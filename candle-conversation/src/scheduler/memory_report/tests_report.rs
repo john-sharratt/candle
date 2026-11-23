@@ -159,6 +159,7 @@ pub(super) mod tests {
                         slots: 16,
                         holders: (0..16).map(|i| format!("conv-{i:02}")).collect(),
                     }],
+                    stores: Vec::new(),
                 },
             },
             // Shaped like the measured 3.6-35B so the sums mean something: a

@@ -128,22 +128,9 @@ impl Scheduler {
 
     /// Whether nothing is running or waiting on `slot`: no turn view carved
     /// from it, no decode or prefill of its own, no section ingest, and no
-    /// ephemeral fork waiting for it.
+    /// ephemeral fork waiting for it — none of what `slot_doing` names.
     pub(super) fn slot_idle(&self, slot: SequenceId) -> bool {
-        !self.turn_views.values().any(|v| v.parent_id == slot)
-            && !self.active_decodes.contains_key(&slot)
-            && !self
-                .active_prefills
-                .iter()
-                .any(|p| p.work.sequence_id == slot)
-            && !self.prefill_queue.iter().any(|w| w.sequence_id == slot)
-            && !self.section_queue.iter().any(|s| s.sequence_id == slot)
-            && !self
-                .active_section_ingests
-                .iter()
-                .any(|s| s.sequence_id == slot)
-            && !self.pending_submits.iter().any(|p| p.parent() == slot)
-            && !self.fork_waits_on(slot)
+        self.slot_doing(slot).is_empty()
     }
 
     /// Stage `slot`'s state back from its record if it is parked, before

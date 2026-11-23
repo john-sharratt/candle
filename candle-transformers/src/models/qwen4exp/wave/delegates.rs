@@ -329,6 +329,10 @@ impl ManagedBatchedModel for Qwen4ExpBatched {
         )
     }
 
+    fn recurrent_holders(&self) -> Vec<usize> {
+        Qwen4ExpBatched::recurrent_holders(self)
+    }
+
     fn prefill_scratch_bytes(&self, seq: usize) -> usize {
         let held = self
             .recurrent

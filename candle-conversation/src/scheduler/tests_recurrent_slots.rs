@@ -419,6 +419,60 @@ pub(super) mod tests {
         assert!(scheduler.slot_idle(parent));
     }
 
+    /// **Every store is listed with why it stands.** A store on a sequence no
+    /// slot accounts for is named as such; a turn's view and the slot it was
+    /// carved from each say what keeps them; and once the view is gone the slot
+    /// reads idle, with no seal to wait on, which is exactly what nothing
+    /// parks.
+    #[test]
+    fn every_store_is_listed_with_why_it_stands() {
+        let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
+        let raw = scheduler.session.create_sequence().unwrap();
+        forward_on(&mut scheduler, raw, &[1, 2, 3]);
+        let parent = SequenceId(raw);
+        let stores = scheduler.store_holders(&[], Instant::now());
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].seq, raw as u64);
+        assert_eq!(stores[0].role, "unaccounted");
+        assert_eq!(
+            stores[0].kept_because,
+            "no slot or view accounts for this sequence"
+        );
+
+        let (view, borrowed) = scheduler.carve_view(parent, &[]).expect("view carve");
+        scheduler.turn_views.insert(
+            view,
+            ViewState {
+                parent_id: parent,
+                original_borrowed: borrowed,
+                turn_start_parent_blocks: 0,
+                question_tokens: 0,
+                applied_identity: None,
+                state_forked: true,
+                holds_parent_state: false,
+            },
+        );
+        assert_eq!(
+            scheduler.slot_doing(parent),
+            vec!["parent of a turn's view"]
+        );
+        let views: Vec<_> = scheduler
+            .store_holders(&[], Instant::now())
+            .into_iter()
+            .filter(|s| s.role == "view")
+            .collect();
+        for v in &views {
+            assert_eq!(v.parent, Some(raw as u64));
+            assert_eq!(
+                v.kept_because,
+                "a turn's view: freed when its turn finishes"
+            );
+        }
+
+        scheduler.discard_turn_view(view);
+        assert!(scheduler.slot_doing(parent).is_empty());
+    }
+
     /// **A parked slot whose record cannot be read back is an error**, never a
     /// slot that starts again from sequence-start: that would read fluently and
     /// remember nothing.

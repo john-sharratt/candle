@@ -153,6 +153,7 @@ mod spec_chooser;
 pub mod state_census;
 mod stencil_wave;
 mod step_census;
+pub mod store_holders;
 mod submit_admit;
 mod sweep_forecast;
 #[cfg(test)]

@@ -34,6 +34,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use super::store_holders::StoreHolder;
 use super::turn_status::{turn_in, TurnStatus};
 use super::Scheduler;
 use crate::projection::{
@@ -147,6 +148,9 @@ pub struct RecurrentBreakdown {
     pub parked_stores: usize,
     /// The engine's slots by the layer and group they serve, most first.
     pub slots: Vec<SlotRow>,
+    /// Every store on the device, by the sequence holding it: what it serves,
+    /// what it is doing, and why it is not parked.
+    pub stores: Vec<StoreHolder>,
 }
 
 /// `runs` — the resident turns — summed by `class_of` each turn, largest
@@ -345,20 +349,9 @@ impl Scheduler {
     ) -> RecurrentBreakdown {
         let (live_stores, parked_stores) = self.model.recurrent_census();
         let mut held: HashMap<(String, String), Vec<String>> = HashMap::new();
-        for (slot, target) in &self.slot_targets {
-            let conv = self.slot_conversations.get(slot);
-            let named = conv
-                .and_then(|conv| names.iter().find(|(r, _)| r.is(conv)))
-                .and_then(|(_, n)| n.get(&target.group))
-                .cloned()
-                .unwrap_or_default();
-            let holder = conv
-                .and_then(|c| {
-                    c.conv_id_of(target.timeline)
-                        .or_else(|| c.label_of(target.timeline))
-                })
-                .unwrap_or_else(|| format!("timeline {}", target.timeline.raw()));
-            held.entry(named).or_default().push(holder);
+        for slot in self.slot_targets.keys() {
+            let (holder, layer, group) = self.slot_names(*slot, names);
+            held.entry((layer, group)).or_default().push(holder);
         }
         let unbound = self
             .slot_conversations
@@ -375,6 +368,7 @@ impl Scheduler {
             live_stores,
             parked_stores,
             slots: slot_rows(held),
+            stores: self.store_holders(names, Instant::now()),
         }
     }
 }

@@ -574,6 +574,14 @@ pub trait ManagedBatchedModel {
         (0, 0)
     }
 
+    /// The sequences holding a recurrent store on the device, sorted — the
+    /// `held` of [`Self::recurrent_census`], by sequence: what names a store
+    /// whose sequence the scheduler no longer accounts for. Empty on a stack
+    /// with none.
+    fn recurrent_holders(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
     /// Claim `seq`'s carried per-sequence state now — whatever of it the
     /// sequence does not already hold — rather than at its first wave.
     ///

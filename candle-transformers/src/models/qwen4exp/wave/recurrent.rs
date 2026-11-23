@@ -44,6 +44,17 @@ impl Qwen4ExpBatched {
     }
 
     /// How many sequences currently carry recurrent state.
+    /// The sequences holding a recurrent store, sorted.
+    pub fn recurrent_holders(&self) -> Vec<usize> {
+        let mut seqs: Vec<usize> = self
+            .recurrent
+            .read()
+            .map(|r| r.keys().copied().collect())
+            .unwrap_or_default();
+        seqs.sort_unstable();
+        seqs
+    }
+
     pub fn recurrent_len(&self) -> Result<usize> {
         Ok(self
             .recurrent

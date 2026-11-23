@@ -630,6 +630,12 @@ pub(super) mod tests {
             self.probe.parked.lock().unwrap().contains(&seq)
         }
 
+        fn recurrent_holders(&self) -> Vec<usize> {
+            let mut seqs: Vec<usize> = self.probe.states.lock().unwrap().keys().copied().collect();
+            seqs.sort_unstable();
+            seqs
+        }
+
         fn move_recurrent(&self, child: usize, parent: usize) -> candle::Result<()> {
             let taken = self.probe.states.lock().unwrap().remove(&child);
             self.probe.seeded.lock().unwrap().remove(&child);
