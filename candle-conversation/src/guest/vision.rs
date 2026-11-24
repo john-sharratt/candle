@@ -218,7 +218,10 @@ mod tests {
         let tokens = (width as usize / 32) * (height as usize / 32);
         assert_eq!(rows.rows.len(), 1);
         assert_eq!(rows.rows[0].len(), tokens * 2560);
-        assert!(rows.rows[0].iter().all(|v| v.is_finite()), "a row is not finite");
+        assert!(
+            rows.rows[0].iter().all(|v| v.is_finite()),
+            "a row is not finite"
+        );
         assert!(rows.rows[0].iter().any(|v| *v != 0.0), "every row is zero");
     }
 }
