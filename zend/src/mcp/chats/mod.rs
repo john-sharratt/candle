@@ -10,10 +10,12 @@
 //! | [`dispose`] | Disposing of a chat: tombstone its conversations, cease its records |
 //! | [`sweep`] | The sweep that disposes of the chats closed or idle |
 //! | [`dialogue`] | The same tools on a conversation of the web UI's, named by its id |
+//! | [`pictures`] | The user's pictures a message shows Zen, fetched and kept |
 
 pub mod dialogue;
 pub mod dispose;
 pub mod naming;
+pub mod pictures;
 pub mod record;
 pub mod sweep;
 pub mod talk;

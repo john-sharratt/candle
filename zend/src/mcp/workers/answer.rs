@@ -71,7 +71,14 @@ pub fn answer(
         label,
         first_line(text, PROMPT_QUOTE),
     )?;
-    begin(session, &records, &owner, worker, format!("{text}{ASKING}"))
+    begin(
+        session,
+        &records,
+        &owner,
+        worker,
+        format!("{text}{ASKING}"),
+        Vec::new(),
+    )
 }
 
 /// `worker`, which settled, made ready for its next turn, run for `caller` —

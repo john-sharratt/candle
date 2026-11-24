@@ -93,13 +93,14 @@ pub(super) mod tests {
     #[test]
     fn a_turn_starts_as_what_it_finishes() {
         assert_eq!(
-            First::Message("m".into()).into_start(),
-            ("m".to_string(), None)
+            First::Message("m".into(), vec!["0123456789abcdef".into()]).into_start(),
+            ("m".to_string(), vec!["0123456789abcdef".to_string()], None)
         );
         assert_eq!(
             First::Interrupted { call_turn: 7 }.into_start(),
             (
                 String::new(),
+                Vec::new(),
                 Some(Resume {
                     call_turn: 7,
                     dispatch: Dispatch::Resumed,
@@ -115,6 +116,7 @@ pub(super) mod tests {
             .into_start(),
             (
                 String::new(),
+                Vec::new(),
                 Some(Resume {
                     call_turn: 7,
                     dispatch: Dispatch::Live,

@@ -169,14 +169,16 @@ fn continued(
     w
 }
 
-/// Send `text` to Zen on `caller`'s chat `on`, or on a new chat when `on` is
-/// `None`; Zen's answer runs at `effort`, retrieving as `dials` say. A chat
-/// that is closing or no longer kept takes no message: [`not_open`].
+/// Send `text`, showing the kept images `images`, to Zen on `caller`'s chat
+/// `on`, or on a new chat when `on` is `None`; Zen's answer runs at `effort`,
+/// retrieving as `dials` say. A chat that is closing or no longer kept takes
+/// no message: [`not_open`].
 pub fn send(
     session: &Arc<ZendSession>,
     caller: &Caller,
     on: Option<&str>,
     text: &str,
+    images: Vec<String>,
     (effort, dials): (Effort, RetrievalDials),
 ) -> Result<Sent, String> {
     let records = session.shared_substrate().ok_or_else(workers::loading)?;
@@ -246,7 +248,7 @@ pub fn send(
         failed: false,
     };
     record::say(&records, &owner, &chat.id, &said).map_err(|e| e.to_string())?;
-    let worker = workers::begin(session, &records, &owner, worker, message)?;
+    let worker = workers::begin(session, &records, &owner, worker, message, images)?;
     Ok(Sent {
         chat,
         worker,

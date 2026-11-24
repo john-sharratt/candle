@@ -60,7 +60,7 @@ pub fn prepare(bytes: &[u8]) -> Result<PreparedImage, String> {
 /// The media type of an image's bytes, by their format's signature.
 pub fn mime_of(bytes: &[u8]) -> &'static str {
     image::guess_format(bytes)
-        .map(image::ImageFormat::to_mime_type)
+        .map(|f| f.to_mime_type())
         .unwrap_or("application/octet-stream")
 }
 

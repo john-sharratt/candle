@@ -104,7 +104,7 @@ pub fn resume(
                 .map_err(|e| e.to_string())?;
             First::Interrupted { call_turn }
         }
-        None => First::Message(format!("{told}{}", closing_of(worker.kind))),
+        None => First::Message(format!("{told}{}", closing_of(worker.kind)), Vec::new()),
     };
     begin_held(session, &records, owner, worker, first, Some(lease))?;
     Ok(true)

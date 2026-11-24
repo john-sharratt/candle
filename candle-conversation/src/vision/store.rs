@@ -11,7 +11,8 @@ use serde_json::json;
 
 use super::prepare::PreparedImage;
 use super::rows_codec::{decode_rows, encode_rows};
-use crate::persistence::{CustomObjectPayload, SharedSubstrate};
+use crate::persistence::record::CustomObjectPayload;
+use crate::persistence::SharedSubstrate;
 
 /// The record that names an image's blobs.
 pub fn image_key(id: &str) -> String {

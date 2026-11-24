@@ -86,17 +86,21 @@ impl ZendSession {
     /// or on the member that handed it here — by running that round's tools.
     /// With `may_hand` it moves to a markedly faster member at a round boundary
     /// ([`StreamItem::Handed`]).
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit_worker(
         &self,
         message: String,
+        images: Vec<String>,
         conv_id: String,
         tools_mode: ToolMode,
         selection: candle_conversation::SelectionState,
         resume: Option<Resume>,
         may_hand: bool,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
+        let mut asked = ChatMessage::new(Role::User, message);
+        asked.images = images;
         self.submit_turn(
-            vec![ChatMessage::new(Role::User, message)],
+            vec![asked],
             None,
             conv_id,
             None,

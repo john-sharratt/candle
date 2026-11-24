@@ -234,7 +234,10 @@ pub(super) async fn run(
             if let Err(e) = note(&records, &owner, &worker, "Task sent back:", line) {
                 tracing::warn!(conv_id = %worker.conv_id, "mcp: a send-back could not be entered: {e}");
             }
-            next = First::Message(format!("{SENT_BACK}{}{ASKING}", told.join("\n\n")));
+            next = First::Message(
+                format!("{SENT_BACK}{}{ASKING}", told.join("\n\n")),
+                Vec::new(),
+            );
             first = Some((worker.final_text.clone(), audit, settled));
             worker.state = State::Running;
             worker.checked = true;
@@ -346,10 +349,11 @@ pub(super) async fn turn(
     selection.select(DRIVEN_SELECTOR, worker.driven.option());
     apply_tools_dial(&mut selection, mode);
     worker.dials.apply(&mut selection);
-    let (message, round) = first.into_start();
+    let (message, images, round) = first.into_start();
     let mut stream = session
         .submit_worker(
             message,
+            images,
             worker.conv_id.clone(),
             mode,
             selection,

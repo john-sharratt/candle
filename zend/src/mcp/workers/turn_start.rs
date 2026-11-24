@@ -10,20 +10,22 @@
 
 use super::*;
 
-/// Keep `worker` as running and start its turn on `message`.
+/// Keep `worker` as running and start its turn on `message`, showing the kept
+/// images `images`.
 pub(in super::super) fn begin(
     session: &Arc<ZendSession>,
     records: &dyn Records,
     owner: &str,
     worker: Worker,
     message: String,
+    images: Vec<String>,
 ) -> Result<Worker, String> {
     begin_held(
         session,
         records,
         owner,
         worker,
-        First::Message(message),
+        First::Message(message, images),
         None,
     )
 }
@@ -67,8 +69,9 @@ pub(super) fn begin_held(
 
 /// What a worker's next turn starts from.
 pub(super) enum First {
-    /// A message: the task, an answer, a correction.
-    Message(String),
+    /// A message — the task, an answer, a correction — and the kept images it
+    /// shows.
+    Message(String, Vec<String>),
     /// A round whose call turn `call_turn`, round `iteration` of its turn, is
     /// sealed and whose tools have not run — handed here by a slower member,
     /// or kept when a handing failed.
@@ -79,15 +82,16 @@ pub(super) enum First {
 }
 
 impl First {
-    /// What the turn is sent, and the round it finishes.
-    pub(super) fn into_start(self) -> (String, Option<Resume>) {
+    /// What the turn is sent, the images it shows, and the round it finishes.
+    pub(super) fn into_start(self) -> (String, Vec<String>, Option<Resume>) {
         match self {
-            First::Message(message) => (message, None),
+            First::Message(message, images) => (message, images, None),
             First::Round {
                 call_turn,
                 iteration,
             } => (
                 String::new(),
+                Vec::new(),
                 Some(Resume {
                     call_turn,
                     dispatch: Dispatch::Live,
@@ -96,6 +100,7 @@ impl First {
             ),
             First::Interrupted { call_turn } => (
                 String::new(),
+                Vec::new(),
                 Some(Resume {
                     call_turn,
                     dispatch: Dispatch::Resumed,

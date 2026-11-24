@@ -101,22 +101,33 @@ fn answering(session: &ZendSession, id: &str) -> bool {
     session.live_turn(id).is_some() || turn_claims::held_elsewhere(id)
 }
 
-/// The request a send makes: `text` as the next user message, at the dials
-/// the conversation last ran at — the web UI sends its composer's on every
-/// turn, and a turn sent without them would reset the conversation's — with
-/// the thinking effort `effort` when the caller names one, and every retrieval
-/// dial `retrieval` names.
+/// The request a send makes: `text` as the next user message, showing the
+/// kept images `images`, at the dials the conversation last ran at — the web
+/// UI sends its composer's on every turn, and a turn sent without them would
+/// reset the conversation's — with the thinking effort `effort` when the
+/// caller names one, and every retrieval dial `retrieval` names.
 pub fn request(
     id: &str,
     text: &str,
+    images: &[String],
     dials: Option<ConversationDials>,
     (effort, retrieval): (Option<Effort>, RetrievalDials),
 ) -> Value {
+    let content = if images.is_empty() {
+        json!(text)
+    } else {
+        let mut parts: Vec<Value> = images
+            .iter()
+            .map(|url| json!({"type": "image_url", "image_url": {"url": url}}))
+            .collect();
+        parts.push(json!({"type": "text", "text": text}));
+        Value::Array(parts)
+    };
     let mut body = json!({
         "model": "zen-code",
         "stream": true,
         "conv_id": id,
-        "messages": [{"role": "user", "content": text}],
+        "messages": [{"role": "user", "content": content}],
     });
     if let Some(d) = dials {
         body["effort"] = json!(d.effort);
@@ -144,6 +155,7 @@ pub async fn send(
     caller: &Caller,
     id: &str,
     text: &str,
+    images: &[String],
     effort: (Option<Effort>, RetrievalDials),
     wait: Duration,
 ) -> Result<String, String> {
@@ -159,7 +171,7 @@ pub async fn send(
     if answering(session, id) {
         return Err(still_answering(id));
     }
-    let body = request(id, text, session.conversation_dials(id), effort);
+    let body = request(id, text, images, session.conversation_dials(id), effort);
     let reply = ops::up(
         session,
         caller,
@@ -337,20 +349,37 @@ mod tests {
         };
         let none = RetrievalDials::default();
         assert_eq!(
-            request("c-1", "fix it", Some(dials), (None, none)),
+            request("c-1", "fix it", &[], Some(dials), (None, none)),
             json!({
                 "model": "zen-code", "stream": true, "conv_id": "c-1",
                 "messages": [{"role": "user", "content": "fix it"}],
                 "effort": 2, "verbosity": 3, "think": true, "tools": "comprehensive",
             })
         );
-        let deep = request("c-1", "fix it", Some(dials), (Some(Effort::Deep), none));
+        let deep = request("c-1", "fix it", &[], Some(dials), (Some(Effort::Deep), none));
         assert_eq!(
             (deep["effort"].clone(), deep["think"].clone()),
             (json!(3), json!(true))
         );
-        let bare = request("c-1", "fix it", None, (None, none));
+        let bare = request("c-1", "fix it", &[], None, (None, none));
         assert!(bare.get("effort").is_none() && bare.get("tools").is_none());
+    }
+
+    /// **A send showing images carries them as image parts**, before its
+    /// text, each named by its kept id.
+    #[test]
+    fn a_send_carries_its_images_as_parts() {
+        let none = RetrievalDials::default();
+        assert_eq!(
+            request("c-1", "what is it?", &["0123456789abcdef".into()], None, (None, none)),
+            json!({
+                "model": "zen-code", "stream": true, "conv_id": "c-1",
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "0123456789abcdef"}},
+                    {"type": "text", "text": "what is it?"},
+                ]}],
+            })
+        );
     }
 
     /// **A send carries the retrieval dials it names**, as the chat request's
@@ -363,7 +392,7 @@ mod tests {
             reprojection: None,
         };
         assert_eq!(
-            request("c-1", "fix it", None, (None, named)),
+            request("c-1", "fix it", &[], None, (None, named)),
             json!({
                 "model": "zen-code", "stream": true, "conv_id": "c-1",
                 "messages": [{"role": "user", "content": "fix it"}],

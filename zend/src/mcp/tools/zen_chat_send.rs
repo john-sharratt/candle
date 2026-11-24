@@ -1,5 +1,5 @@
-//! `zen_chat_send {text, chat?, effort?, projection?, seed?, reprojection?,
-//! wait_s?}`: send a message to Zen on a
+//! `zen_chat_send {text, images?, chat?, effort?, projection?, seed?,
+//! reprojection?, wait_s?}`: send a message, with any pictures, to Zen on a
 //! private chat — a new one, or the one `chat` names — or on a conversation of
 //! the web UI's that `chat` names by its id, and wait for the answer
 //! (`docs/zen_chat.md` §1, §6).
@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 
 use super::{string, wait_secs, Answer, Ctx};
 use crate::mcp::chats::dialogue::{self, target, Target};
+use crate::mcp::chats::pictures;
 use crate::mcp::chats::talk::{self, render};
 use crate::mcp::threads::Effort;
 use crate::mcp::workers::now_ms;
@@ -35,6 +36,7 @@ pub fn definition() -> Value {
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "The message."},
+                "images": {"type": "array", "items": {"type": "string"}, "maxItems": 4, "description": "Pictures of the user's own for Zen to look at with the message: each the id (or the link) `image_upload` answered once the picture was sent. Zen reads them and answers about them."},
                 "chat": {"type": "string", "description": "The chat to send on: the id an earlier `zen_chat_send` answered with, or a web UI conversation's id when the user asked you to speak in it. Leave it out to open a new chat."},
                 "effort": {"type": "string", "enum": ["balanced", "deep", "exhaustive"], "description": "How hard Zen thinks about its answer: on a chat `balanced` by default, which answers soonest; on a conversation, its own dial unless named. `deep` or `exhaustive` for a question that must weigh evidence."},
                 "wait_s": {"type": "integer", "minimum": 0, "description": "How long to wait for the answer (45 by default)."}
@@ -50,6 +52,22 @@ fn effort_of(args: &Value) -> Result<Option<Effort>, String> {
     match args.get("effort").and_then(Value::as_str) {
         None => Ok(None),
         named => Effort::of(named).map(Some),
+    }
+}
+
+/// The pictures a send shows, as it names them.
+fn pictures_of(args: &Value) -> Result<Vec<String>, String> {
+    match args.get("images") {
+        None => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|i| {
+                i.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| "each of `images` is a picture's id or link".to_string())
+            })
+            .collect(),
+        Some(_) => Err("`images` is a list of pictures' ids or links".into()),
     }
 }
 
@@ -77,14 +95,28 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         (Ok(e), Ok(on), Ok(d)) => (e, on, d),
         (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return Answer::error(e),
     };
+    // Fetched before the message goes: a picture that cannot be had sends
+    // nothing.
+    let fetched = match pictures_of(args) {
+        Ok(named) if named.is_empty() => Vec::new(),
+        Ok(named) => match pictures::fetch(&ctx.session, &ctx.caller, &named).await {
+            Ok(fetched) => fetched,
+            Err(e) => return Answer::error(e),
+        },
+        Err(e) => return Answer::error(e),
+    };
     let on = match on {
         Some(Target::Conversation(id)) => {
+            // The turn runs where the gateway places it: the pictures go
+            // with it.
+            let images: Vec<String> = fetched.iter().map(|b| pictures::data_url(b)).collect();
             let wait = wait_secs(ctx, args);
             return match dialogue::send(
                 &ctx.session,
                 &ctx.caller,
                 &id,
                 text,
+                &images,
                 (effort, dials),
                 wait.duration(),
             )
@@ -103,6 +135,11 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         Some(Target::Chat(id)) => Some(id),
         None => None,
     };
+    // A chat's turn begins on this member: its pictures are read here, once.
+    let images = match pictures::keep(&ctx.session, fetched).await {
+        Ok(kept) => kept,
+        Err(e) => return Answer::error(e),
+    };
     // A chat's answer is wanted soon.
     let effort = effort.unwrap_or(Effort::Balanced);
     let sent = match talk::send(
@@ -110,6 +147,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         &ctx.caller,
         on.as_deref(),
         text,
+        images,
         (effort, dials),
     ) {
         Ok(s) => s,
@@ -158,6 +196,17 @@ mod tests {
             Ok(Some(Effort::Deep))
         );
         assert!(effort_of(&json!({"effort": "quick"})).is_err());
+    }
+
+    #[test]
+    fn a_send_shows_the_pictures_it_names() {
+        assert_eq!(pictures_of(&json!({"text": "hi"})), Ok(Vec::new()));
+        assert_eq!(
+            pictures_of(&json!({"text": "hi", "images": ["a1", "b2"]})),
+            Ok(vec!["a1".to_string(), "b2".to_string()])
+        );
+        assert!(pictures_of(&json!({"images": "a1"})).is_err());
+        assert!(pictures_of(&json!({"images": [1]})).is_err());
     }
 
     #[test]
