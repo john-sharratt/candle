@@ -1,0 +1,24 @@
+   Compiling cluster v0.1.0 (D:\prog\candle\cluster)
+   Compiling cluster-dial v0.1.0 (D:\prog\candle\cluster-dial)
+   Compiling web v0.1.0 (D:\prog\candle\web)
+   Compiling agent v0.1.0 (D:\prog\candle\agent)
+   Compiling substrate-git v0.1.0 (D:\prog\candle\substrate-git)
+   Compiling host v0.1.0 (D:\prog\candle\host)
+   Compiling mcp-server v0.1.0 (D:\prog\candle\mcp-server)
+   Compiling zend v0.1.0 (D:\prog\candle\zend)
+    Finished `release` profile [optimized] target(s) in 1m 45s
+     Running `target\release\examples\dependency_battery.exe run --zend 'http://192.168.1.2:8081' --node 223ebb209828d84c --repo 'D:/prog/candle' --out docs/results/battery_128/answers.jsonl --arms 'r1,t1,c1:6,b1:6' --runs 3`
+R1 retrieves from 7059 files of D:/prog/candle
+9 answers to ask (4215 already recorded), 16 at a time
+K/V census written to docs/results/battery_128\census_start.json
+this launch's conversations are tagged 6b05b537
+[1/9] t1 r1 t29  recall 100.0%  opening false think-end false answer false  2777 tokens
+[2/9] t1 r1 t15  recall 100.0%  opening false think-end false answer false  3127 tokens
+[3/9] t1 r2 a15  recall 100.0%  opening false think-end false answer false  3667 tokens
+[4/9] t1 r3 a15  recall  80.0%  opening false think-end false answer false  3302 tokens
+[5/9] t1 r2 a13  recall  80.0%  opening false think-end false answer false  4010 tokens
+[6/9] t1 r2 t30  recall 100.0%  opening false think-end false answer false  5852 tokens
+[7/9] t1 r3 t30  recall 100.0%  opening false think-end false answer false  6373 tokens
+[8/9] t1 r1 a15  recall 100.0%  opening false think-end false answer false  9245 tokens
+[9/9] t1 r2 t15  recall 100.0%  opening false think-end false answer false  45690 tokens
+K/V census written to docs/results/battery_128\census_end.json
