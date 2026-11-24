@@ -104,6 +104,25 @@ __global__ void __launch_bounds__(EMBED_GATHER_THREADS) embed_gather_dequant_f32
   if (id >= n_src_rows) {
     const int64_t e = id - n_src_rows;
     const float *src = (extra && e < n_extra) ? extra + e * ncols : nullptr;
+    // 16-byte moves where the row and every pointer allow them: an F32 row is
+    // four times a Q8_0 row's bytes, and scalar moves leave it short of the
+    // quantized path's bandwidth.
+    const bool vec = (ncols & 3) == 0 && ((uintptr_t)src & 15) == 0 &&
+                     ((uintptr_t)wide_row & 15) == 0 && ((uintptr_t)narrow_row & 15) == 0;
+    if (vec) {
+      const int64_t n4 = ncols >> 2;
+      const float4 *src4 = (const float4 *)src;
+      for (int64_t i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = src4 ? src4[i] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int32_t r = 0; r < replicas && wide_row; ++r) {
+          ((float4 *)(wide_row + r * ncols))[i] = v;
+        }
+        if (narrow_row) {
+          ((float4 *)narrow_row)[i] = v;
+        }
+      }
+      return;
+    }
     for (int64_t i = threadIdx.x; i < ncols; i += blockDim.x) {
       const float v = src ? src[i] : 0.0f;
       for (int32_t r = 0; r < replicas && wide_row; ++r) {

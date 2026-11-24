@@ -20,6 +20,7 @@ use host::access::role;
 use super::chat_frames::{call_id, finish_reason, Framer, Framing};
 use super::CONVERSATION_HEADER;
 use crate::access;
+use crate::images;
 use crate::mcp::caller::Caller;
 use crate::mcp::ownership;
 use crate::openai_tools::{self, wire_function};
@@ -94,6 +95,18 @@ pub async fn completions(
         if last_preview.len() == 80 { "…" } else { "" },
     );
 
+    // An image url that names nothing this daemon reads is the request's
+    // fault, refused before a turn starts.
+    let last_images = req
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User)
+        .map_or(&[][..], |m| &m.images[..]);
+    if let Err(why) = images::parse_all(last_images) {
+        return invalid_image(&why);
+    }
+
     let max_tokens = req.max_tokens.map(|n| n as usize);
     let conv_id = req.conv_id;
     let force_hires = req.force_high_resolution;
@@ -135,6 +148,11 @@ pub async fn completions(
     // `tool_calls`. A client that describes its tools in its own prompt sends
     // none, and gets the reply as text to parse itself.
     let passthrough = model == PASSTHROUGH_MODEL;
+    // The passthrough runs the client's transcript as text; an image in it
+    // would be dropped, and a reply that never saw it read as one that had.
+    if passthrough && messages.iter().any(|m| !m.images.is_empty()) {
+        return invalid_image("the passthrough model reads text only; send images to zen-code");
+    }
     let framing = Framing {
         split_reasoning: passthrough,
         tools: (passthrough && !client_tools.is_empty())
@@ -215,6 +233,22 @@ fn missing_conv_id() -> Response {
                 "type": "invalid_request_error",
                 "param": "conv_id",
                 "code": "missing_conv_id",
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// `400` for an image part whose url names nothing this daemon reads.
+fn invalid_image(why: &str) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": {
+                "message": why,
+                "type": "invalid_request_error",
+                "param": "messages",
+                "code": "invalid_image",
             }
         })),
     )

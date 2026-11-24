@@ -39,6 +39,7 @@ pub mod hand_records;
 pub mod handover;
 pub mod held_paths;
 pub mod held_values;
+pub mod images;
 pub mod ingest;
 pub mod ingest_backlog;
 pub mod ingest_cancel;

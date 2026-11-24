@@ -57,10 +57,24 @@ pub fn prepare(bytes: &[u8]) -> Result<PreparedImage, String> {
     })
 }
 
+/// The media type of an image's bytes, by their format's signature.
+pub fn mime_of(bytes: &[u8]) -> &'static str {
+    image::guess_format(bytes)
+        .map(image::ImageFormat::to_mime_type)
+        .unwrap_or("application/octet-stream")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use image::{ImageBuffer, ImageFormat, Rgb};
+
+    #[test]
+    fn an_images_type_is_read_from_its_bytes() {
+        assert_eq!(mime_of(&png(2, 2).0), "image/png");
+        assert_eq!(mime_of(b"\xff\xd8\xff\xe0rest"), "image/jpeg");
+        assert_eq!(mime_of(b"hello"), "application/octet-stream");
+    }
 
     fn png(width: u32, height: u32) -> (Vec<u8>, Vec<u8>) {
         let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(width, height, |x, y| {

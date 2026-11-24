@@ -129,7 +129,7 @@ pub struct Resume {
 }
 
 /// How a turn begins (`run_inference_stream`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TurnStart {
     /// A sealed call turn whose round this turn finishes; `None` for a turn
     /// that begins from its message.
@@ -138,6 +138,8 @@ pub struct TurnStart {
     /// boundary (`crate::worker_hop`). Nothing else may: a chat client reads
     /// its own turn, and a turn the boot scan finishes has nobody to hand to.
     pub may_hand: bool,
+    /// The images the message carries, read before its first round.
+    pub images: Vec<ImageRef>,
 }
 
 /// [`StreamItem::Closing`]'s reason when the repeat guard closed the loop.

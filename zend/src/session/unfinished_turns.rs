@@ -440,6 +440,7 @@ pub(super) async fn resume_conversation(
                     iteration: 0,
                 }),
                 may_hand: false,
+                images: Vec::new(),
             },
         ),
         // The first round never sealed: its message is asked again.

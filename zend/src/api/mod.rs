@@ -3,7 +3,8 @@
 //! [`routes`] wires the OpenAI-compatible `/v1/chat/completions` endpoint plus
 //! zend's own REST surface to per-resource submodules — `chat`,
 //! `conversations`, `projections` (one projection point in full, for the
-//! projection panel), `files` (conversation-attached uploads), `models`,
+//! projection panel), `files` (conversation-attached uploads), `images` (images
+//! kept for the turns that name them), `models`,
 //! `repo_map`, `substrate` (zend's layer/timeline inspection and projection
 //! debug, under `/v1/substrate/zend/`), `agents` (the machines its commands
 //! run on, watched and switched by an admin), and `journals` (the memory's
@@ -37,6 +38,7 @@ pub mod conversations;
 pub mod deploys;
 pub mod diag;
 pub mod files;
+pub mod images;
 pub mod jobs;
 pub mod journal;
 pub mod journals;
@@ -139,7 +141,21 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
                 KeySource::Body("conv_id".into()),
                 KeySource::Derived(Derived::Passthrough),
             ]),
-            post(chat::completions),
+            post(chat::completions).body_limit(images::CHAT_BODY_LIMIT),
+        )
+        // An image kept ahead of the turn that names it: read by the tower on
+        // whichever member takes it, and replicated with the substrate.
+        .route(
+            "/v1/images",
+            Role::User,
+            Dispatch::Any,
+            post(images::keep).body_limit(images::IMAGE_BYTES),
+        )
+        .route(
+            "/v1/images/:id",
+            Role::User,
+            Dispatch::Any,
+            get(images::original),
         )
         .route(
             "/v1/models",

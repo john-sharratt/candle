@@ -1,4 +1,4 @@
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::retrieval_dials::RetrievalDials;
@@ -20,15 +20,19 @@ pub enum Role {
 // ── Request ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "WireMessage")]
 pub struct ChatMessage {
     pub role: Role,
-    #[serde(default, deserialize_with = "text_content")]
     pub content: String,
+    /// The `url` of each image part of `content`, in order: a `data:` URL, or
+    /// the id `POST /v1/images` answered with.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
     /// The calls an assistant message made — a client that runs its own tools.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<MessageToolCall>,
     /// The call a `tool` message answers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 }
 
@@ -38,8 +42,77 @@ impl ChatMessage {
         Self {
             role,
             content: content.into(),
+            images: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+        }
+    }
+}
+
+/// A message as the wire carries it: `content` a string, `null` or parts.
+#[derive(Deserialize)]
+struct WireMessage {
+    role: Role,
+    #[serde(default)]
+    content: Option<Content>,
+    /// A message this daemon wrote back out, its images already apart.
+    #[serde(default)]
+    images: Vec<String>,
+    #[serde(default)]
+    tool_calls: Vec<MessageToolCall>,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+}
+
+/// An OpenAI message `content`: a string, or an array of typed parts.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Content {
+    Text(String),
+    Parts(Vec<Part>),
+}
+
+/// One part of an array `content`: a `text` part, or an `image_url` part.
+#[derive(Deserialize)]
+struct Part {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    image_url: Option<ImageUrl>,
+}
+
+#[derive(Deserialize)]
+struct ImageUrl {
+    url: String,
+}
+
+/// The text parts join in order; each image part's `url` is kept apart from
+/// them, for the turn to read the image.
+impl From<WireMessage> for ChatMessage {
+    fn from(w: WireMessage) -> Self {
+        let mut images = w.images;
+        let content = match w.content {
+            None => String::new(),
+            Some(Content::Text(text)) => text,
+            Some(Content::Parts(parts)) => {
+                let mut texts = Vec::new();
+                for p in parts {
+                    if let Some(t) = p.text {
+                        texts.push(t);
+                    }
+                    if let Some(i) = p.image_url {
+                        images.push(i.url);
+                    }
+                }
+                texts.join("\n\n")
+            }
+        };
+        Self {
+            role: w.role,
+            content,
+            images,
+            tool_calls: w.tool_calls,
+            tool_call_id: w.tool_call_id,
         }
     }
 }
@@ -59,33 +132,6 @@ pub struct FunctionCall {
     pub name: String,
     #[serde(default)]
     pub arguments: Value,
-}
-
-/// An OpenAI message `content`, as text: a string; `null` (an assistant message
-/// that carries only tool calls); or an array of typed parts, whose `text` parts
-/// are joined in order. A part with no text (an image) carries nothing a text
-/// model reads and is dropped.
-fn text_content<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Content {
-        Text(String),
-        Parts(Vec<Part>),
-    }
-    #[derive(Deserialize)]
-    struct Part {
-        #[serde(default)]
-        text: Option<String>,
-    }
-    Ok(match Option::<Content>::deserialize(d)? {
-        None => String::new(),
-        Some(Content::Text(text)) => text,
-        Some(Content::Parts(parts)) => parts
-            .into_iter()
-            .filter_map(|p| p.text)
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-    })
 }
 
 /// OpenAI-compatible `POST /v1/chat/completions` request body.
@@ -293,8 +339,27 @@ mod request_tests {
         .unwrap();
         let texts: Vec<&str> = req.messages.iter().map(|m| m.content.as_str()).collect();
         assert_eq!(texts, ["sys", "task\n\nenv", "", "result"]);
+        // The image part is kept apart from the text, by its url.
+        assert_eq!(req.messages[1].images, ["data:x"]);
+        assert!(req.messages[0].images.is_empty());
         assert_eq!(req.messages[3].role, Role::Tool);
         assert!(req.stream_options.is_some_and(|o| o.include_usage));
+    }
+
+    /// A message written back out keeps its images apart, and reads back as
+    /// it was written.
+    #[test]
+    fn a_message_round_trips_with_its_images() {
+        let mut m = ChatMessage::new(Role::User, "what is this?");
+        m.images.push("0123456789abcdef".to_string());
+        let wire = serde_json::to_string(&m).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"role":"user","content":"what is this?","images":["0123456789abcdef"]}"#
+        );
+        let back: ChatMessage = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.content, "what is this?");
+        assert_eq!(back.images, ["0123456789abcdef"]);
     }
 
     #[test]

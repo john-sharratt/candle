@@ -106,7 +106,11 @@ impl ZendSession {
             tools_mode,
             None,
             selection,
-            TurnStart { resume, may_hand },
+            TurnStart {
+                resume,
+                may_hand,
+                images: Vec::new(),
+            },
         )
         .await
     }
@@ -239,14 +243,15 @@ impl ZendSession {
         tools_mode: ToolMode,
         identity: Option<String>,
         selection: candle_conversation::SelectionState,
-        start: TurnStart,
+        mut start: TurnStart,
     ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
-        let last_user = messages
-            .iter()
-            .rev()
-            .find(|m| m.role == Role::User)
-            .map(|m| m.content.clone())
-            .unwrap_or_default();
+        let last = messages.iter().rev().find(|m| m.role == Role::User);
+        let last_user = last.map(|m| m.content.clone()).unwrap_or_default();
+        // The message's images, read before its first round. The HTTP route
+        // refuses a url that names nothing before it gets here.
+        let parsed = images::parse_all(last.map_or(&[][..], |m| &m.images[..]));
+        let refused = parsed.as_ref().err().cloned();
+        start.images = parsed.unwrap_or_default();
         // A turn starts having read nothing from outside
         // (`docs/zen_tool_reach.md` §6.2).
         self.mcp.ops().turn_began(&conv_id);
@@ -259,6 +264,10 @@ impl ZendSession {
         let (tx, rx) = tokio::sync::mpsc::channel::<anyhow::Result<StreamItem>>(64);
 
         tokio::spawn(async move {
+            if let Some(why) = refused {
+                let _ = tx.send(Err(anyhow::anyhow!("the message's images: {why}"))).await;
+                return;
+            }
             // Phase 1 — emit status updates while model is loading.
             if inference.load().is_none() {
                 let cur = status_rx.borrow_and_update().clone();

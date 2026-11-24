@@ -31,7 +31,7 @@ pub(in super::super) fn run_inference_stream(
     // Not from the HTTP handler: how the turn begins. When it resumes a sealed
     // call turn — the boot scan's, or a worker's handed here — `user_message`
     // is unused: the turn's message is the tool output, produced below.
-    start: TurnStart,
+    mut start: TurnStart,
 ) -> Pin<Box<dyn Stream<Item = anyhow::Result<StreamItem>> + Send + 'static>> {
     let (tx, rx) = mpsc::channel::<anyhow::Result<StreamItem>>(64);
 
@@ -57,10 +57,40 @@ pub(in super::super) fn run_inference_stream(
         tracing::info!(
             conv_id = %conv_id,
             msg_len = user_message.len(),
+            images = start.images.len(),
             "inference start  \"{}{}\"",
             msg_preview,
             if user_message.len() > 60 { "…" } else { "" },
         );
+        // The message's images, read before its first round: from the
+        // substrate when an earlier turn read the same image, by the tower
+        // otherwise — a guest job between waves, which this waits out on the
+        // blocking pool.
+        let mut turn_images = Vec::new();
+        if !start.images.is_empty() {
+            let _ = tx
+                .send(Ok(StreamItem::Status("Reading the images…".into())))
+                .await;
+            let (reader, refs) = (Arc::clone(&state), std::mem::take(&mut start.images));
+            let read = tokio::task::spawn_blocking(move || {
+                let substrate = reader.engine.conversation().shared();
+                images::resolve(&reader.engine, &substrate, refs)
+            })
+            .await;
+            match read {
+                Ok(Ok(read)) => turn_images = read,
+                Ok(Err(e)) => {
+                    let _ = tx.send(Err(anyhow::anyhow!("the message's images: {e}"))).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!("reading the message's images panicked: {e}")))
+                        .await;
+                    return;
+                }
+            }
+        }
 
         let timeline = timeline_for(&conv_id);
         // Only a freshly-forked conv uses the stored identity; a reused conv
@@ -681,6 +711,13 @@ pub(in super::super) fn run_inference_stream(
                 },
                 selection: round_selection,
                 triggers,
+                // The message's images belong to its own turn; a tool round's
+                // message is the results.
+                images: if iteration == 0 {
+                    std::mem::take(&mut turn_images)
+                } else {
+                    Vec::new()
+                },
                 ..Default::default()
             };
             // What this turn may retrieve from the branch layers: the units its
