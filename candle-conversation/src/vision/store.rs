@@ -13,7 +13,7 @@
 //! the image again and keeps its rows beside the first tower's.
 
 use candle_transformers::models::qwen_vision::ImageRows;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use super::blob_refs::{hex, put_named, release};
 use super::prepare::PreparedImage;
@@ -74,7 +74,7 @@ pub fn store_image(
     let mut towers = before
         .as_ref()
         .and_then(|obj| obj.blob["rows"].as_object().cloned())
-        .unwrap_or_else(Map::new);
+        .unwrap_or_default();
     let original = put_named(substrate, original, id)?;
     let thumb = put_named(substrate, image.thumb.clone(), id)?;
     let fresh = put_named(substrate, encode_rows(rows), id)?;
