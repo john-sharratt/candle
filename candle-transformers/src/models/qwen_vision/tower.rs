@@ -27,7 +27,7 @@ use candle_nn::LayerNorm;
 use super::geometry::{
     position_taps, vit_rope_angles, Grid, MERGE, PATCH, POS_SIDE, VIT_ROPE_FREQS,
 };
-use crate::models::z_image::attention::{banded, scale_of, ATTN_Q_BAND};
+use crate::models::z_image::attention::{banded, scale_of};
 use crate::quantized_nn::{linear_b_mode, Linear};
 use crate::quantized_var_builder::VarBuilder;
 
@@ -48,6 +48,17 @@ pub const EPS: f64 = 1e-6;
 pub const PATCH_VALUES: usize = 3 * PATCH * PATCH;
 /// Values in one merged row: four patches side by side.
 const MERGED_VALUES: usize = HIDDEN * MERGE * MERGE;
+/// Query rows one attention band covers. A band's scores and probabilities are
+/// `2 · 16 · 512 · patches` bf16 — 32 KiB a patch, 512 MiB at the largest image
+/// (16 384 patches) — against twice that at z_image's 1 024, for one more
+/// launch pair per band on an image the size of a screen.
+pub const ATTN_BAND: usize = 512;
+/// Activation bytes per patch a forward needs at its peak: one block's
+/// intermediates (the residual, its norm, `qkv`, the rotated heads and the
+/// context, about 13 hidden widths; the MLP's 4 304, twice), the band's scores,
+/// and the chain's two carried hidden states — about 110 KiB in bf16, with the
+/// margin a carve's alignment and the merger's tail take.
+pub const ACTIVATION_BYTES_PER_PATCH: usize = 128 * 1024;
 
 /// One image, resized to its grid: RGB8, row-major, `grid.height · grid.width · 3`
 /// bytes.
@@ -130,7 +141,7 @@ impl Block {
         let q = (q * scale_of(HEAD_DIM))?;
         let kt = k.transpose(2, 3)?.contiguous()?;
         // Non-causal, every patch of the image against every other.
-        let ctx = banded(&q, &kt, &v, ATTN_Q_BAND)?
+        let ctx = banded(&q, &kt, &v, ATTN_BAND)?
             .squeeze(0)?
             .transpose(0, 1)?
             .contiguous()?

@@ -228,7 +228,7 @@ impl GuestRegistry {
 pub(crate) mod testing {
     use super::*;
     use crate::guest::progress::GuestEvent;
-    use crate::guest::work::{GuestImage, GuestMatte, GuestRequest};
+    use crate::guest::work::{GuestImage, GuestMatte, GuestRequest, VisionRows};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A guest that runs no kernels, for testing everything around one.
@@ -306,6 +306,9 @@ pub(crate) mod testing {
                     height: r.height,
                     side: 1,
                     alpha: vec![128],
+                }),
+                GuestRequest::Vision(r) => GuestOutcome::Vision(VisionRows {
+                    rows: r.images.iter().map(|_| vec![0.0]).collect(),
                 }),
             })
         }

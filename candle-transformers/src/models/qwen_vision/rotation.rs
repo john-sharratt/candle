@@ -17,7 +17,7 @@
 
 use std::cell::RefCell;
 
-use candle::{DType, Result, Tensor};
+use candle::{DType, LiveTensor, Result, Tensor};
 
 use super::geometry::{image_delta, trunk_axis, Grid};
 
@@ -96,7 +96,7 @@ impl ImageRotation {
 
     /// Turn the runs' rows of `x` (`[rows, heads, head_dim]`, contiguous) in
     /// place.
-    pub fn apply(&self, x: &Tensor) -> Result<()> {
+    pub fn apply<'w>(&self, x: &LiveTensor<'w>) -> Result<()> {
         if self.runs.is_empty() {
             return Ok(());
         }

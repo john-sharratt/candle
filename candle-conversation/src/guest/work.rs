@@ -5,6 +5,8 @@
 //! back, so both have to be `Send` and neither may hold anything that borrows
 //! the engine.
 
+use candle_transformers::models::qwen_vision::geometry::MAX_PIXELS;
+use candle_transformers::models::qwen_vision::{Grid, VisionInput};
 use serde::{Deserialize, Serialize};
 
 /// The largest image a caller may ask for, per side.
@@ -221,12 +223,35 @@ pub struct GuestMatte {
     pub alpha: Vec<u8>,
 }
 
+/// Images for the text model to read: each already decoded and resized to its
+/// patch grid ([`crate::vision::prepare`]), so the guest only reshapes bytes.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct VisionRequest {
+    pub images: Vec<VisionImage>,
+}
+
+/// One image at its grid: RGB8, `height · width · 3` bytes, both sides a whole
+/// number of merge blocks.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VisionImage {
+    pub rgb: Vec<u8>,
+    pub height: u32,
+    pub width: u32,
+}
+
+/// Each image's rows, `tokens × 2560` F32 row-major, in the request's order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VisionRows {
+    pub rows: Vec<Vec<f32>>,
+}
+
 /// One unit of guest work.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GuestRequest {
     Image(ImageRequest),
     Matte(MatteRequest),
+    Vision(VisionRequest),
 }
 
 impl GuestRequest {
@@ -236,6 +261,7 @@ impl GuestRequest {
         match self {
             Self::Image(_) => Guest::Image,
             Self::Matte(_) => Guest::Matte,
+            Self::Vision(_) => Guest::Vision,
         }
     }
 
@@ -346,6 +372,36 @@ impl GuestRequest {
                 }
                 Ok(())
             }
+            Self::Vision(r) => {
+                if r.images.is_empty() {
+                    return Err("a vision job needs at least one image".into());
+                }
+                for i in &r.images {
+                    i.input().check()?;
+                    let pixels = i.height as usize * i.width as usize;
+                    if pixels > MAX_PIXELS {
+                        return Err(format!(
+                            "{}x{} is past the tower's {MAX_PIXELS} pixels — images are resized \
+                             under it before they are queued",
+                            i.width, i.height
+                        ));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl VisionImage {
+    /// The tower's input for this image.
+    pub fn input(&self) -> VisionInput {
+        VisionInput {
+            rgb: self.rgb.clone(),
+            grid: Grid {
+                height: self.height as usize,
+                width: self.width as usize,
+            },
         }
     }
 }
@@ -362,15 +418,18 @@ impl GuestRequest {
 pub enum Guest {
     Image,
     Matte,
+    /// The text model's own vision tower, turning images into rows it reads.
+    Vision,
 }
 
 impl Guest {
-    pub const ALL: [Guest; 2] = [Guest::Image, Guest::Matte];
+    pub const ALL: [Guest; 3] = [Guest::Image, Guest::Matte, Guest::Vision];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Image => "image",
             Self::Matte => "matte",
+            Self::Vision => "vision",
         }
     }
 }
@@ -399,6 +458,7 @@ pub struct GuestImage {
 pub enum GuestOutcome {
     Image(GuestImage),
     Matte(GuestMatte),
+    Vision(VisionRows),
 }
 
 impl GuestOutcome {
@@ -406,6 +466,7 @@ impl GuestOutcome {
         match self {
             Self::Image(_) => Guest::Image,
             Self::Matte(_) => Guest::Matte,
+            Self::Vision(_) => Guest::Vision,
         }
     }
 }

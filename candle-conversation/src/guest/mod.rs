@@ -47,6 +47,7 @@
 //! | [`reach`] | How large a draw this node's card serves, from its size. |
 //! | [`foreground`] | The subject's colour under a cutout's soft edges, so no old background shows. |
 //! | [`image`] | The Stable Diffusion backend. |
+//! | [`vision`] | The text model's vision tower: images into the rows it reads. |
 
 pub mod checkpoint;
 pub mod drain;
@@ -63,6 +64,7 @@ pub mod seed;
 pub mod staging;
 pub mod tiled;
 pub mod varground;
+pub mod vision;
 pub mod windowed;
 pub mod work;
 
@@ -75,10 +77,11 @@ pub use progress::{GuestEvent, GuestSink};
 pub use queue::{GuestQueue, GuestReceipt};
 pub use seed::{resolve_seed, Seeded, EXACT_IN_JSON};
 pub use varground::GroundVars;
+pub use vision::VisionGuest;
 pub use work::{
     Guest, GuestError, GuestImage, GuestMatte, GuestOutcome, GuestRequest, ImageLora,
-    ImageReference, ImageRequest, MatteRequest, DEFAULT_REFERENCE_HOLD, MAX_REFERENCE_HOLD,
-    MAX_SHIFT, MIN_SHIFT,
+    ImageReference, ImageRequest, MatteRequest, VisionImage, VisionRequest, VisionRows,
+    DEFAULT_REFERENCE_HOLD, MAX_REFERENCE_HOLD, MAX_SHIFT, MIN_SHIFT,
 };
 
 use std::sync::Arc;
