@@ -15,6 +15,7 @@
 //! - `core`: access to the model, substrate, cluster and roles.
 //! - `dials`: composer dials recorded per conversation, and their settings.
 //! - `history`: a conversation's recovered turns and their errors.
+//! - `image_sweep`: kept images no conversation uses, retired on their own clock.
 //! - `inference_stream`: one chat turn as an async task.
 //! - `ingesting`: background ingest passes and calibration.
 //! - `journaling`: journal sections, drafts and folds.
@@ -224,8 +225,10 @@ use crate::working_set::coverage::Coverage;
 use crate::working_set::seeds::Seeding;
 use crate::working_set::{corpus, dialogue_config};
 use crate::workspace::UPLOADS_REPO;
-use candle_conversation::vision::tenancy::{holds, note_use, release_conversation, sweep_unused};
-use candle_conversation::vision::{load_original, load_thumb, marker, split_markers, ImageSource};
+use candle_conversation::vision::tenancy::{holds, note_use, release_timeline};
+use candle_conversation::vision::{
+    load_original, load_thumb, marker, split_markers, touch, ImageSource,
+};
 
 pub mod diag;
 mod kv_census;
@@ -512,6 +515,7 @@ mod conversations;
 mod core;
 mod dials;
 mod history;
+mod image_sweep;
 mod inference_stream;
 mod ingesting;
 mod journaling;
@@ -544,6 +548,7 @@ pub(crate) use builders::*;
 pub use conversations::*;
 pub use dials::*;
 use history::*;
+use image_sweep::spawn_image_sweep;
 use inference_stream::*;
 pub use journaling::*;
 pub use kept_images::{ImageRead, KeptImage};

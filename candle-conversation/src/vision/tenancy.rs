@@ -4,13 +4,15 @@
 //! its rows, named by id in a turn, are read by a person who sent it
 //! ([`holds`]) or by an admin, never by anyone who merely learned its id.
 //!
-//! An image lives as long as a conversation uses it ([`note_use`]). When the
-//! last conversation that used it is deleted ([`release_conversation`]), its
-//! bytes and rows are retired, and with them every record of it. An archived
-//! conversation still uses its images: its text is kept, and the history shows
-//! them. An image kept that no conversation ever used — `POST /v1/images` for a
-//! turn that never came — is retired once it has stood unused for
-//! [`UNUSED_GRACE_MS`] ([`sweep_unused`]).
+//! An image lives as long as a timeline uses it ([`note_use`]) — a
+//! conversation's, or any other a turn naming it was written to. When the last
+//! timeline that used it is deleted ([`release_timeline`]), whichever path
+//! deleted it, its blobs are released and every record of it ceases. An
+//! archived conversation still uses its images: its text is kept, and the
+//! history shows them. An image kept that no timeline ever used —
+//! `POST /v1/images` for a turn that never came — is retired once it has stood
+//! unused for [`UNUSED_GRACE_MS`] ([`sweep_unused`]); sending it again renews
+//! its keeping (`store::touch`).
 //!
 //! Every fact is a keyed record of its own, never an entry in a list inside
 //! one: two members adding a holder or a use at once write two keys, where a
@@ -19,33 +21,32 @@
 //! | key | means |
 //! |---|---|
 //! | `vision/held/<id>/<holder>` | `holder` sent image `id` |
-//! | `vision/used/<id>/<conv>` | conversation `conv` reads image `id` |
-//! | `vision/conv/<conv>/<id>` | the same, found from the conversation |
+//! | `vision/used/<id>/<timeline>` | timeline `timeline` reads image `id` |
+//! | `vision/timeline/<timeline>/<id>` | the same, found from the timeline |
 //!
 //! `<holder>` is the caller's own key — the daemon's account key, a digest of
-//! who they are — and `<conv>` is [`conversation_key`] of the conversation's
-//! id, so neither ever puts a person's identity or a client's id into a key.
+//! who they are — and `<timeline>` is the timeline's id in hex, itself a
+//! digest, so neither ever puts a person's identity or a client's id into a
+//! key.
 
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
-use super::store::{image_key, unhex};
+use super::blob_refs::release;
+use super::store::{blobs_of, image_key};
 use crate::persistence::record::CustomObjectPayload;
 use crate::persistence::SharedSubstrate;
+use crate::projection::TimelineId;
 
-/// How long an image no conversation uses is kept: a day, ample for a client
+/// How long an image no timeline uses is kept: a day, ample for a client
 /// that keeps an image ahead of the turn that names it.
 pub const UNUSED_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// The images every key of this module lives under.
 const IMAGES: &str = "vision/image/";
 
-/// The 16 hex digits a conversation's id is named by in these keys.
-pub fn conversation_key(conv_id: &str) -> String {
-    Sha256::digest(conv_id.as_bytes())[..8]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+/// The 16 hex digits a timeline is named by in these keys.
+pub fn timeline_key(timeline: TimelineId) -> String {
+    format!("{:016x}", timeline.raw())
 }
 
 fn held_prefix(id: &str) -> String {
@@ -56,8 +57,8 @@ fn used_prefix(id: &str) -> String {
     format!("vision/used/{id}/")
 }
 
-fn conv_prefix(conv: &str) -> String {
-    format!("vision/conv/{conv}/")
+fn timeline_prefix(timeline: &str) -> String {
+    format!("vision/timeline/{timeline}/")
 }
 
 fn put(substrate: &SharedSubstrate, key: String) -> Result<(), String> {
@@ -88,26 +89,28 @@ pub fn holds(substrate: &SharedSubstrate, id: &str, holder: &str) -> bool {
         .is_some()
 }
 
-/// Record that the conversation `conv_id` reads image `id`, which keeps the
-/// image while the conversation lasts.
-pub fn note_use(substrate: &SharedSubstrate, id: &str, conv_id: &str) -> Result<(), String> {
-    let conv = conversation_key(conv_id);
-    let used = format!("{}{conv}", used_prefix(id));
+/// Record that `timeline` reads image `id`, which keeps the image while the
+/// timeline lasts. A turn notes its images before it reads them, so no delete
+/// of another timeline between the read and the turn's writing finds the
+/// image unused.
+pub fn note_use(substrate: &SharedSubstrate, id: &str, timeline: TimelineId) -> Result<(), String> {
+    let tl = timeline_key(timeline);
+    let used = format!("{}{tl}", used_prefix(id));
     if substrate.custom_object(&used).is_some() {
         return Ok(());
     }
     put(substrate, used)?;
-    put(substrate, format!("{}{id}", conv_prefix(&conv)))
+    put(substrate, format!("{}{id}", timeline_prefix(&tl)))
 }
 
-/// Forget every image the deleted conversation `conv_id` used, and retire each
-/// that no other conversation uses. The ids retired, in key order.
-pub fn release_conversation(
+/// Forget every image the deleted `timeline` used, and retire each that no
+/// other timeline uses. The ids retired, in key order.
+pub fn release_timeline(
     substrate: &SharedSubstrate,
-    conv_id: &str,
+    timeline: TimelineId,
 ) -> Result<Vec<String>, String> {
-    let conv = conversation_key(conv_id);
-    let prefix = conv_prefix(&conv);
+    let tl = timeline_key(timeline);
+    let prefix = timeline_prefix(&tl);
     let ids: Vec<String> = substrate
         .custom_objects_under(&prefix)
         .into_iter()
@@ -115,7 +118,7 @@ pub fn release_conversation(
         .collect();
     let mut retired = Vec::new();
     for id in ids {
-        cease(substrate, format!("{}{conv}", used_prefix(&id)))?;
+        cease(substrate, format!("{}{tl}", used_prefix(&id)))?;
         cease(substrate, format!("{prefix}{id}"))?;
         if substrate.custom_objects_count_under(&used_prefix(&id)) == 0 {
             retire(substrate, &id)?;
@@ -125,37 +128,45 @@ pub fn release_conversation(
     Ok(retired)
 }
 
-/// Retire every image no conversation uses that was kept at least
-/// [`UNUSED_GRACE_MS`] before `now_ms`. The ids retired, in key order.
-///
-/// An image whose record carries no keeping time predates the record's
-/// stating one, and is as old as any.
-pub fn sweep_unused(substrate: &SharedSubstrate, now_ms: u64) -> Result<Vec<String>, String> {
-    let stale: Vec<String> = substrate
-        .custom_objects_under(IMAGES)
-        .into_iter()
-        .filter_map(|(obj, _)| {
-            let id = obj.key.strip_prefix(IMAGES)?.to_string();
-            let kept_ms = obj.blob["kept_ms"].as_u64().unwrap_or(0);
-            (now_ms.saturating_sub(kept_ms) >= UNUSED_GRACE_MS
-                && substrate.custom_objects_count_under(&used_prefix(&id)) == 0)
-                .then_some(id)
-        })
-        .collect();
-    for id in &stale {
-        retire(substrate, id)?;
-    }
-    Ok(stale)
+/// Whether image `id` has stood unused for its grace at `now_ms`, read as it
+/// stands now.
+fn stale(substrate: &SharedSubstrate, id: &str, now_ms: u64) -> bool {
+    let Some(obj) = substrate.custom_object(&image_key(id)) else {
+        return false;
+    };
+    let kept_ms = obj.blob["kept_ms"].as_u64().unwrap_or(0);
+    now_ms.saturating_sub(kept_ms) >= UNUSED_GRACE_MS
+        && substrate.custom_objects_count_under(&used_prefix(id)) == 0
 }
 
-/// Retire image `id`: its bytes, its thumbnail and its rows, its record, and
+/// Retire every image no timeline uses that was kept at least
+/// [`UNUSED_GRACE_MS`] before `now_ms`. The ids retired, in key order.
+///
+/// Each is judged again just before it is retired, so one sent again or used
+/// while the sweep ran is kept. An image whose record carries no keeping time
+/// predates the record's stating one, and is as old as any.
+pub fn sweep_unused(substrate: &SharedSubstrate, now_ms: u64) -> Result<Vec<String>, String> {
+    let ids: Vec<String> = substrate
+        .custom_objects_under(IMAGES)
+        .into_iter()
+        .filter_map(|(obj, _)| obj.key.strip_prefix(IMAGES).map(str::to_string))
+        .collect();
+    let mut retired = Vec::new();
+    for id in ids {
+        if stale(substrate, &id, now_ms) {
+            retire(substrate, &id)?;
+            retired.push(id);
+        }
+    }
+    Ok(retired)
+}
+
+/// Retire image `id`: release every blob it names, and cease its record and
 /// who held it.
 fn retire(substrate: &SharedSubstrate, id: &str) -> Result<(), String> {
     if let Some(obj) = substrate.custom_object(&image_key(id)) {
-        for field in ["sha256", "thumb", "rows"] {
-            if let Some(digest) = obj.blob[field].as_str().and_then(unhex) {
-                substrate.retire_blob(&digest).map_err(|e| e.to_string())?;
-            }
+        for sha in blobs_of(&obj.blob) {
+            release(substrate, &sha, id)?;
         }
         cease(substrate, image_key(id))?;
     }
@@ -171,15 +182,21 @@ mod tests {
     use crate::guest::VisionImage;
     use crate::persistence::Admit;
     use crate::vision::prepare::PreparedImage;
-    use crate::vision::store::{load_original, load_thumb, store_image};
+    use crate::vision::store::{load_original, load_rows, load_thumb, store_image};
     use candle_transformers::models::qwen_vision::{Grid, ImageRows};
+    use sha2::{Digest, Sha256};
 
     fn substrate(dir: &tempfile::TempDir) -> SharedSubstrate {
         SharedSubstrate::open_in(dir.path(), Admit::Unbound).unwrap()
     }
 
-    /// Keep an image of id `id` whose file is `original`, kept at `kept_ms`.
-    fn keep(s: &SharedSubstrate, id: &str, original: &[u8], kept_ms: u64) {
+    fn timeline(n: u64) -> TimelineId {
+        TimelineId::from_raw(n).unwrap()
+    }
+
+    /// Keep an image of id `id` whose file is `original`, kept at `kept_ms`,
+    /// its rows `value`.
+    fn keep(s: &SharedSubstrate, id: &str, original: &[u8], kept_ms: u64, value: f32) {
         let image = PreparedImage {
             id: id.into(),
             sha256: String::new(),
@@ -198,16 +215,15 @@ mod tests {
                 width: 32,
             },
             width: 2,
-            values: vec![0.5, -0.5],
+            values: vec![value, -value],
         };
         store_image(s, &image, original.to_vec(), &rows, "test-tower", kept_ms).unwrap();
     }
 
-    /// The key a conversation is named by is the start of its id's SHA-256:
-    /// `abc`'s is `ba7816bf8f01cfea`.
+    /// A timeline is named by its id's sixteen hex digits.
     #[test]
-    fn a_conversation_is_named_by_its_ids_digest() {
-        assert_eq!(conversation_key("abc"), "ba7816bf8f01cfea");
+    fn a_timeline_is_named_by_its_id() {
+        assert_eq!(timeline_key(timeline(0xab)), "00000000000000ab");
     }
 
     /// **Only the people who sent an image hold it**; holding it twice writes
@@ -216,7 +232,7 @@ mod tests {
     fn an_image_is_held_by_the_people_who_sent_it() {
         let dir = tempfile::tempdir().unwrap();
         let s = substrate(&dir);
-        keep(&s, "00000000000000aa", b"cat", 0);
+        keep(&s, "00000000000000aa", b"cat", 0, 0.5);
         assert!(!holds(&s, "00000000000000aa", "1111111111111111"));
         hold(&s, "00000000000000aa", "1111111111111111").unwrap();
         hold(&s, "00000000000000aa", "1111111111111111").unwrap();
@@ -228,28 +244,28 @@ mod tests {
         );
     }
 
-    /// **An image goes with the last conversation that used it**: deleting one
-    /// of two leaves it; deleting the second retires its bytes, its record and
+    /// **An image goes with the last timeline that used it**: deleting one of
+    /// two leaves it; deleting the second retires its blobs, its record and
     /// its holders.
     #[test]
-    fn an_image_goes_with_the_last_conversation_that_used_it() {
+    fn an_image_goes_with_the_last_timeline_that_used_it() {
         let dir = tempfile::tempdir().unwrap();
         let s = substrate(&dir);
         let id = "00000000000000bb";
-        keep(&s, id, b"dog", 0);
+        keep(&s, id, b"dog", 0, 0.5);
         hold(&s, id, "1111111111111111").unwrap();
-        note_use(&s, id, "conv-a").unwrap();
-        note_use(&s, id, "conv-b").unwrap();
+        note_use(&s, id, timeline(1)).unwrap();
+        note_use(&s, id, timeline(2)).unwrap();
 
         assert_eq!(
-            release_conversation(&s, "conv-a").unwrap(),
+            release_timeline(&s, timeline(1)).unwrap(),
             Vec::<String>::new()
         );
         assert_eq!(load_original(&s, id).unwrap(), Some(b"dog".to_vec()));
         assert_eq!(load_thumb(&s, id).unwrap(), Some(b"dog-thumb".to_vec()));
 
         assert_eq!(
-            release_conversation(&s, "conv-b").unwrap(),
+            release_timeline(&s, timeline(2)).unwrap(),
             vec![id.to_string()]
         );
         assert_eq!(load_original(&s, id).unwrap(), None);
@@ -261,26 +277,46 @@ mod tests {
         assert_eq!(s.custom_objects_count_under("vision/"), 0);
     }
 
-    /// A conversation that used nothing releases nothing.
+    /// **Two images sharing rows keep them until both are gone**: same pixels
+    /// in two files are one rows blob.
     #[test]
-    fn a_conversation_without_images_releases_nothing() {
+    fn rows_two_images_share_go_with_the_second() {
         let dir = tempfile::tempdir().unwrap();
         let s = substrate(&dir);
-        keep(&s, "00000000000000cc", b"fox", 0);
-        assert!(release_conversation(&s, "conv-x").unwrap().is_empty());
+        let (a, b) = ("00000000000000a1", "00000000000000b2");
+        keep(&s, a, b"one file", 0, 0.25);
+        keep(&s, b, b"another file", 0, 0.25);
+        note_use(&s, a, timeline(1)).unwrap();
+        note_use(&s, b, timeline(2)).unwrap();
+        release_timeline(&s, timeline(1)).unwrap();
+        assert_eq!(
+            load_rows(&s, b, "test-tower").unwrap().unwrap().values,
+            vec![0.25, -0.25]
+        );
+        release_timeline(&s, timeline(2)).unwrap();
+        assert_eq!(s.custom_objects_count_under("vision/"), 0);
+    }
+
+    /// A timeline that used nothing releases nothing.
+    #[test]
+    fn a_timeline_without_images_releases_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = substrate(&dir);
+        keep(&s, "00000000000000cc", b"fox", 0, 0.5);
+        assert!(release_timeline(&s, timeline(9)).unwrap().is_empty());
         assert!(s.custom_object(&image_key("00000000000000cc")).is_some());
     }
 
-    /// **An image no conversation uses is kept for its grace, then retired**;
-    /// one a conversation uses is kept however old.
+    /// **An image no timeline uses is kept for its grace, then retired**; one
+    /// a timeline uses is kept however old.
     #[test]
     fn an_unused_image_is_retired_after_its_grace() {
         let dir = tempfile::tempdir().unwrap();
         let s = substrate(&dir);
         let kept_at = 1_000_000;
-        keep(&s, "00000000000000dd", b"owl", kept_at);
-        keep(&s, "00000000000000ee", b"elk", kept_at);
-        note_use(&s, "00000000000000ee", "conv-a").unwrap();
+        keep(&s, "00000000000000dd", b"owl", kept_at, 0.5);
+        keep(&s, "00000000000000ee", b"elk", kept_at, 0.75);
+        note_use(&s, "00000000000000ee", timeline(1)).unwrap();
 
         let just_short = kept_at + UNUSED_GRACE_MS - 1;
         assert!(sweep_unused(&s, just_short).unwrap().is_empty());

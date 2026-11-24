@@ -38,6 +38,27 @@ pub struct ConvEntry {
     pub updated_ms: u64,
 }
 
+/// Release the images the deleted `timeline` used, retiring each no other
+/// timeline reads (`vision::tenancy`). A failure leaves an image kept, never a
+/// timeline undeleted.
+fn release_images(state: &InferenceState, timeline: projection::TimelineId) {
+    let substrate = state.engine.conversation().shared();
+    match release_timeline(&substrate, timeline) {
+        Ok(retired) if !retired.is_empty() => {
+            tracing::info!(
+                timeline = timeline.raw(),
+                retired = retired.len(),
+                "its images retired"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            timeline = timeline.raw(),
+            "releasing its images failed: {e}"
+        ),
+    }
+}
+
 impl ZendSession {
     /// Name `starter` as the conversation `conv_id`, a task not yet begun,
     /// begins on: its branches and its changes ([`conv_inherit`]). `None`
@@ -213,17 +234,7 @@ impl ZendSession {
             close_tool_sessions(&state, conv_id, "deleted");
             state.conversations.remove(conv_id);
             state.journals.forget(conv_id);
-            // Its images go with it, unless another conversation reads them
-            // (`vision::tenancy`). A failure here leaves an image kept, never a
-            // conversation undeleted.
-            let substrate = state.engine.conversation().shared();
-            match release_conversation(&substrate, conv_id) {
-                Ok(retired) if !retired.is_empty() => {
-                    tracing::info!(%conv_id, retired = retired.len(), "its images retired");
-                }
-                Ok(_) => {}
-                Err(e) => tracing::warn!(%conv_id, "releasing its images failed: {e}"),
-            }
+            release_images(&state, timeline);
             // After the tombstone, so a turn woken by it finds its timeline
             // tombstoned.
             state.deletions.deleted();
@@ -238,7 +249,8 @@ impl ZendSession {
     /// Backs `DELETE /v1/substrate/zend/timeline/{tl}`. Nothing is removed from the
     /// dialogue conversation map, because a derived-layer timeline was never in
     /// it: these are `repo_map` / `code_reading` ingests, addressed only by the
-    /// id the substrate views print.
+    /// id the substrate views print. The images a turn on it read are released
+    /// as the conversation delete releases them.
     ///
     /// `None` when the model is not loaded or `raw` is not a valid timeline id
     /// (zero) — the same shape the sibling routes return.
@@ -246,6 +258,9 @@ impl ZendSession {
         let state = self.inference.load_full()?;
         let timeline = projection::TimelineId::from_raw(raw)?;
         let result = state.engine.tombstone_timeline(timeline);
+        if result.is_ok() {
+            release_images(&state, timeline);
+        }
         Some(result)
     }
 

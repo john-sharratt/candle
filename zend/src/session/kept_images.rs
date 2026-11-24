@@ -31,8 +31,8 @@ impl ZendSession {
     /// and held by them. In order. `None` before the model is loaded.
     /// Blocking: the tower runs as a guest between waves.
     ///
-    /// Images kept with no conversation are swept here too: one that has stood
-    /// unused past its grace is retired (`vision::tenancy::sweep_unused`).
+    /// An image sent again is as new as its sending (`vision::touch`), so the
+    /// sweep of unused images (`image_sweep`) never retires one just answered.
     pub fn keep_images(
         &self,
         files: Vec<Vec<u8>>,
@@ -45,19 +45,18 @@ impl ZendSession {
             images::claim(&substrate, &sources, caller)
                 .and_then(|()| images::resolve(&state.engine, &substrate, sources))
                 .and_then(|read| {
-                    let retired = sweep_unused(&substrate, now_ms())?;
-                    if !retired.is_empty() {
-                        tracing::info!(retired = retired.len(), "unused kept images retired");
-                    }
-                    Ok(read
-                        .into_iter()
-                        .map(|image| KeptImage {
-                            rows: image.handle.len(),
-                            id: image.id,
-                            width: image.width,
-                            height: image.height,
+                    let now = now_ms();
+                    read.into_iter()
+                        .map(|image| {
+                            touch(&substrate, &image.id, now)?;
+                            Ok(KeptImage {
+                                rows: image.handle.len(),
+                                id: image.id,
+                                width: image.width,
+                                height: image.height,
+                            })
                         })
-                        .collect())
+                        .collect()
                 }),
         )
     }
