@@ -10,9 +10,9 @@ Persistent agents need context that grows without bound. Under full attention ev
 
 The system combines (1) online Markov expert prediction with wave-batched grouped GEMM for MoE inference under partial VRAM residency; (2) per-block adaptive KV quantization across eleven levels (C0–C10) with asymmetric K/V error metrics and a prefill refresh at every turn seal, compressing the KV cache 4.1–7.6× at the top level; (3) attentional provenance indexing — Q-vector sign signatures scanned on the GPU, re-selecting the working set during decode; and (4) an unbounded three-tier context, VRAM-hot, RAM-warm and disk-cold.
 
-Implemented in Rust on a Candle fork, the system runs a **180B-parameter MoE model on a 16 GB laptop GPU**, serving eight sessions at 108.5 t/s aggregate decode, above every published llama.cpp run of the model and every published multi-session figure for it. From 32K to 128K tokens it keeps **96–99% of its prefill and 93–111% of its decode** across two tasks. One card's aggregate decode is **1.3–37.9×** the best published llama.cpp single-stream rate for the same model and card class, reaching **2,869.9 t/s across 64 sessions**, and a **284B model serves sixteen sessions from one GPU** at 4.1× the best published single-GPU decode.
+Implemented in Rust on a Candle fork, the system runs a **180B-parameter MoE model on a 16 GB laptop GPU**, serving eight sessions at 108.5 t/s aggregate decode, above every published llama.cpp run of the model and every published multi-session figure for it. From 32K to 128K tokens it keeps **96–99% of its prefill and 93–111% of its decode** across two tasks. One card's aggregate decode is **1.4–37.9×** the best published llama.cpp single-stream rate for the same model and card class, reaching **2,869.9 t/s across 64 sessions**, and a **284B model serves sixteen sessions from one GPU** at 4.1× the best published single-GPU decode.
 
-On the system's own 2.2M-line codebase, retrieval ranks one of a question's answer files first among 7,943 files on 49% of 121 questions and in the top five on 69%, by Q-signature agreement alone. Answering 128 questions from memory with tools forbidden, over seven arms and three runs, the memory is worth **36.7 points of recall**, re-selection during reasoning 4.6, and continuous re-selection 6.5 over a single retrieval, every interval clear of zero (§9.12). Mid-decode reprojection selects every fact planted in a history twelve times the working set, at the top compression level as at near-lossless, where a single projection and a rolling window select none (§9.11.2).
+On the system's own 2.2M-line codebase, retrieval ranks one of a question's answer files first among 7,943 files on 49% of 121 questions and in the top five on 69%, by Q-signature agreement alone. Answering 128 questions from memory with tools forbidden, over seven arms and three to seven runs each, the memory is worth **37.0 points of recall**, re-selection during reasoning 5.3, and continuous re-selection 6.9 over a single retrieval, every interval clear of zero; against BM25 retrieval over the same repository, the memory puts the answer's text in front of the model more often — 48.5% of expected items against 38.2% — while plain text is read more reliably than sealed K/V (§9.12). Mid-decode reprojection selects every fact planted in a history twelve times the working set, at the top compression level as at near-lossless, where a single projection and a rolling window select none (§9.11.2).
 
 ---
 
@@ -27,8 +27,8 @@ The system came from two constraints held together: persistent agent conversatio
 - A **180B-parameter MoE model** (Qwen3.8-Flash-Next, 6B active) on a 16 GB laptop GPU with 32 GB of RAM, experts streamed VRAM → RAM → NVMe, serving eight sessions at 108.5 t/s aggregate decode — above every published llama.cpp run of it, each on a host with 64–128 GB, and above Strata's published 63.1 t/s across four sessions (§9.6.5).
 - **Throughput flat in depth**: 96–99% of prefill and 93–111% of decode kept from 32K to 128K across two tasks, the model's own sparse-attention indexer bounding each token's attended set (§9.6.2).
 - **KV compression up to 7.6×**, each 32-token block choosing its format as it is sealed; at 8K the top level costs 0–8% of decode for 3.3–6.3× (§9.6.3).
-- **Concurrency**: aggregate decode 1.3–37.9× the best published llama.cpp rate for the same model and card class, 2,869.9 t/s across 64 sessions on one card; a 284B model at sixteen sessions on one GPU, 4.1× the best published single-GPU decode (§9.6.4, §9.6.6).
-- **Retrieval over its own codebase**: an answer file first of 7,943 on 49% of 121 questions and top-five on 69%; the memory worth 36.7 points of recall with tools forbidden, re-selection during reasoning 4.6 (§9.12).
+- **Concurrency**: aggregate decode 1.4–37.9× the best published llama.cpp rate for the same model and card class, 2,869.9 t/s across 64 sessions on one card; a 284B model at sixteen sessions on one GPU, 4.1× the best published single-GPU decode (§9.6.4, §9.6.6).
+- **Retrieval over its own codebase**: an answer file first of 7,943 on 49% of 121 questions and top-five on 69%; the memory worth 37.0 points of recall with tools forbidden, re-selection during reasoning 5.3; it places the answer's text more often than BM25 retrieval, 48.5% of expected items against 38.2% (§9.12).
 - **Selection at depth**: every fact planted in a history twelve times the working set is selected, at C10 as at C0 (§9.11.2).
 
 The agent use case is the existence proof that the parts run together; it is not the subject of the paper. To our knowledge no prior serving system states a bound on per-step error exposure at unbounded depth. An 80 GB card holds more tokens at full precision, but once a token is compressed or evicted it is in the same position as on a 16 GB card (§11.2, Corollary 2).
@@ -37,7 +37,7 @@ The agent use case is the existence proof that the parts run together; it is not
 
 1. **Online Markov expert prediction** (§4) — a transition matrix learned from live routing, with no calibration, and a wave-batched grouped GEMM that amortises each expert's transfer across the sessions that route to it.
 2. **Two-phase KV quantization** (§5) — K/V re-prefilled from the finished turn at its seal, removing decode drift, then a per-block format chosen independently for K and V by error metrics matched to K's softmax-amplified and V's linear error paths [AsymKV, COLING 2025].
-3. **Attentional provenance indexing** (§6) — Q-vector sign signatures matched Q→Q by XNOR and popcount, scanned on the GPU over a VRAM-resident gallery by tensor-core kernels (~9.5 ms on a 16 GB laptop GPU) and re-selecting the working set every 64 decoded tokens, off the decode's critical path. The think block is the probe that decodes ahead of the answer.
+3. **Attentional provenance indexing** (§6) — Q-vector sign signatures matched Q→Q by XNOR and popcount, scanned on the GPU over a VRAM-resident gallery by tensor-core kernels (~9.5 ms over a 591K-token gallery on a 16 GB laptop GPU; a median 83 ms over the 36.1M-token production gallery with sixteen sessions in flight) and re-selecting the working set every 64 decoded tokens, off the decode's critical path. The think block is the probe that decodes ahead of the answer.
 4. **Unbounded three-tier context** (§7, §11.2) — VRAM-hot, RAM-warm and disk-cold paging, with the proof that the stored error entering a step is bounded independent of depth under provenance-selected attention.
 5. **Native quantized kernels** (§8, supporting) — matmuls that never materialise a full-precision weight copy, greedy batch decomposition, and a fused sampling kernel.
 
@@ -53,7 +53,7 @@ Fiddler [Kamahori et al., 2024] and HybriMoE [Zhong et al., 2025] partition expe
 
 **KIVI** [Liu et al., ICML 2024] established channel-wise outliers in K and token-wise structure in V, quantizing both uniformly at 2 bits. **KVQuant** [Hooper et al., NeurIPS 2024] added per-vector outlier handling and first-token special-casing, under 0.1 perplexity at 3 bits. **TurboQuant** [Zandieh et al., ICLR 2026] rotates and Lloyd-Max quantizes, with its advantage below 3 bits; community benchmarks on Qwen3 find Q4_0 matching its residual implementation at 4–5×. **KITTY** [Xia et al., 2025] boosts 12.5–25% of K channels to 4 bits by an offline magnitude ranking and names adaptive selection as future work. Token eviction (H2O, TOVA, StreamingLLM) is lossy by design, DMS needs fine-tuning, SVD approaches (xKV, LoRC) are per-prompt, and KVTC [Staniszewski & Łańcucki, ICLR 2026] compresses ~20× offline for storage rather than live inference. OTT [Su et al., ACL 2025] finds outlier tokens cluster at block boundaries, independently motivating our 4/28 sub-block structure.
 
-Every one of these optimises the compression *primitive*. None treats format assignment as a per-block decision with a quality guarantee, and none states a result on error scaling with depth. Here each (layer, head) block chooses its own K and V formats, by Q-projected error for K and normalised L2 for V, along an 11-point Pareto curve (C0–C10) that runs on dense, MoE, DeltaNet-hybrid and native-sparse models up to 284B with no per-model calibration data beyond a threshold scale (§9.9).
+Every one of these optimises the compression *primitive*. None treats format assignment as a per-block decision with a quality guarantee, and none states a result on error scaling with depth. Here each (layer, head) block chooses its own K and V formats, by Q-projected error for K and normalised L2 for V, along an 11-point Pareto curve (C0–C10) that runs on dense, MoE and DeltaNet-hybrid models up to 180B with no per-model calibration data beyond a threshold scale (§9.9).
 
 ### 2.3 Autoregressive Error Accumulation
 
@@ -61,7 +61,7 @@ GEAR [Kang et al., 2024] showed quantization error in autoregressive decode comp
 
 ### 2.4 Attention Sinks
 
-StreamingLLM [Xiao et al., ICLR 2024] showed initial tokens carry disproportionate attention; KVSink [Su & Yuan, COLM 2025] extended this to mid-sequence sinks. Here, on attention-only models, turn-boundary sinks are recomputed in the current frame at every assembly rather than stored (§5). KVTuner [2025] and [llama.cpp #20969, 2025] find boundary layers more sensitive to K quantization on Qwen3.
+StreamingLLM [Xiao et al., ICLR 2024] showed initial tokens carry disproportionate attention; KVSink [Su & Yuan, COLM 2025] extended this to mid-sequence sinks. Here, on attention-only models, turn-boundary sinks are recomputed in the current frame at every assembly rather than stored (§5). KVTuner [2025] and [llama.cpp #20969, 2026] find boundary layers more sensitive to K quantization on Qwen3.
 
 ### 2.5 KV-Based Retrieval
 
@@ -74,7 +74,7 @@ RetrievalAttention [Liu et al., NeurIPS 2025] measured the Q→K gap: Q vectors 
 One requirement organises the system: the tokens attending any step must be bounded independently of context depth, the property §11.2 uses. Figure 3-1 shows one decode step and the two loops that feed it. No component materialises an intermediate the next operation does not consume: there is no dequantised weight copy and no BF16 expansion between the logits and the sampling modifiers.
 
 <figure class="fig">
-<svg viewBox="0 0 640 292" role="img" aria-label="Figure 3-1. One decode step: embedding, attention over a working set, MoE experts streamed from VRAM, RAM and NVMe, a fused sampling kernel, and the next token. Every 64 decoded tokens the last 128 Q signatures are scanned against the VRAM gallery in about 9.5 ms, off the critical path, and the result assembles the next forward's working set. When a turn ends it is re-prefilled and each 32-token block is sealed in its own format, C0 to C10, into three tiers: VRAM hot, RAM warm, disk cold, which also hold the gallery.">
+<svg viewBox="0 0 640 292" role="img" aria-label="Figure 3-1. One decode step: embedding, attention over a working set, MoE experts streamed from VRAM, RAM and NVMe, a fused sampling kernel, and the next token. Every 64 decoded tokens the last 128 Q signatures are scanned against the VRAM gallery, in about 9.5 ms over 591 thousand tokens and a median 83 ms over the 36.1 million-token production gallery, off the critical path, and the result assembles the next forward's working set. When a turn ends it is re-prefilled and each 32-token block is sealed in its own format, C0 to C10, into three tiers: VRAM hot, RAM warm, disk cold, which also hold the gallery.">
   <text class="ttl" x="16" y="20">Figure 3-1 · One decode step, and the loops that feed it</text>
   <text class="ttl-sub" x="16" y="36">each forward attends a working set, never the whole context</text>
   <rect class="box" x="16" y="56" width="96" height="52" rx="6"/>
@@ -93,7 +93,7 @@ One requirement organises the system: the tokens attending any step must be boun
   <text class="t-lbl mid" x="588" y="86">token</text>
   <rect class="box" x="132" y="140" width="400" height="50" rx="6"/>
   <text class="t-lbl mid" x="332" y="161">Provenance scan, every 64 decoded tokens</text>
-  <text class="t-dim mid" x="332" y="178">last 128 Q signatures vs the VRAM gallery · ~9.5 ms</text>
+  <text class="t-dim mid" x="332" y="178">last 128 Q signatures vs the VRAM gallery · off the critical path</text>
   <rect class="box" x="132" y="222" width="284" height="50" rx="6"/>
   <text class="t-lbl mid" x="274" y="243">Turn seal: re-prefill the finished turn</text>
   <text class="t-dim mid" x="274" y="260">fresh K/V; each block's format C0–C10</text>
@@ -136,13 +136,13 @@ Timestamp eviction cascades — a miss at L evicts an expert L+5 needs — and h
 **Production: three tiers.** The production cache treats the on-disk expert pack as authoritative and VRAM and pinned RAM as independent copies of it, so eviction never writes back. Its key is access frequency weighted by the wrapped distance to the layer's next use — Bélády's ordering, exact because the layer wave is a cycle — evaluated by tier, so an expert whose miss costs an NVMe read is protected over one whose miss is a pinned copy (Figure 4-1). The same gate on the laptop now measures 6,139.1 t/s at twenty contexts with its experts streaming (§9.6).
 
 <figure class="fig">
-<svg viewBox="0 0 640 262" role="img" aria-label="Figure 4-1. Aggregate prefill on Qwen3-30B-A3B, RTX 4090 Laptop GPU, two-tier against three-tier expert cache. F16 one context 377.5 to 708.1 t/s, plus 87 percent. BF16 one context 509.4 to 780.6, plus 53 percent. BF16 ten contexts 1,931.4 to 2,726.1, plus 41 percent. Q8_0 twenty contexts 2,448.1 to 2,732.5, plus 12 percent. C9 two contexts 951.4 to 1,463.1, plus 54 percent.">
+<svg viewBox="0 0 640 262" role="img" aria-label="Figure 4-1. Aggregate prefill on Qwen3-30B-A3B, RTX 4090 Laptop GPU, two-tier against three-tier expert cache. F16 one context 377.5 to 708.1 t/s, plus 88 percent. BF16 one context 509.4 to 780.6, plus 53 percent. BF16 ten contexts 1,931.4 to 2,726.1, plus 41 percent. Q8_0 twenty contexts 2,448.1 to 2,732.5, plus 12 percent. C9 two contexts 951.4 to 1,463.1, plus 54 percent.">
   <text class="ttl" x="16" y="20">Figure 4-1 · The three-tier expert cache, against two tiers</text>
   <text class="ttl-sub" x="16" y="36">Qwen3-30B-A3B · RTX 4090 Laptop 16 GB · aggregate prefill t/s · amber two-tier, green three-tier</text>
   <path class="grid" d="M335.7 54 V226 M471.4 54 V226"/>
   <path class="grid base" d="M200 54 V226"/>
   <text class="cat" x="16" y="72">F16 × 1 context</text>
-  <text class="cat-sub" x="16" y="85">+87%</text>
+  <text class="cat-sub" x="16" y="85">+88%</text>
   <rect class="them" x="200" y="60" width="51.2" height="11"/>
   <rect class="us" x="200" y="73" width="96.1" height="11"/>
   <text class="v-them" x="257.2" y="69">377.5</text>
@@ -350,7 +350,7 @@ B1's 0.6 is the reprojection on `</think>` itself, stamped on the block's last t
 
 `WideQSig` folds each token's `sign(Q)` over every attention layer into three groups — all but the top two layers, then each of the top two alone (`[n − 2, 1, 1]`, `FoldParams::derive`), each layer bit-rotated before the XOR so correlated layers do not cancel — of one 128-bit signature per KV head: 3 × 4 × 128 bits, 192 bytes a token. It is the successor of v1's two-layer fold (§9.10), over every layer and with no K term. Signatures cover content tokens only, never the template's self-similar structural tokens, and are persisted beside the turn's K/V at its seal.
 
-Re-uploading signatures every scan was the first GPU implementation's bottleneck, so they stay **resident in VRAM** in a paged gallery arena modelled on the KV cache — 32-token pages, a free-list pool, a pre-resolved pointer table the kernel reads in place. Its warm and cold tiers are the substrate's persisted signatures. Three scan backends are **bit-identical** under an adversarial parity test: a scalar reference; 1-bit tensor cores (`BMMA.88128.XOR.POPC`, sm_75–sm_89), ~9.5 ms on the RTX 4090 Laptop GPU; and INT8 tensor cores (`mma.m16n8k32.s8`), the production path on Blackwell, which dropped the 1-bit instruction.
+Re-uploading signatures every scan was the first GPU implementation's bottleneck, so they stay **resident in VRAM** in a paged gallery arena modelled on the KV cache — 32-token pages, a free-list pool, a pre-resolved pointer table the kernel reads in place. Its warm and cold tiers are the substrate's persisted signatures. Three scan backends are **bit-identical** under an adversarial parity test: a scalar reference; 1-bit tensor cores (`BMMA.88128.XOR.POPC`, sm_75–sm_89), ~9.5 ms over a 591K-token gallery on the RTX 4090 Laptop GPU; and INT8 tensor cores (`mma.m16n8k32.s8`), the production path on Blackwell, which dropped the 1-bit instruction. On BlackWorld's 36.1M-token production gallery, with sixteen sessions in flight, 1,277 reprojections scanned in a median 83 ms (p90 182 ms; `docs/results/battery_128/reproject_scans.md`), every 64 decoded tokens and off the decode's critical path.
 
 ---
 
@@ -395,7 +395,7 @@ The context is paged in 32-token blocks aligned to turn and system-prompt bounda
 Standard GEMM libraries (cuBLAS, CUTLASS default paths) dequantise weight matrices to BF16 before execution. For a 30B model during prefill:
 
 ```
-Quantized weights:    ~15GB stored  (Q4)
+Quantized weights:    ~18GB stored  (Q4_K_M)
 Dequantized BF16:     ~60GB materialised
 ```
 
@@ -473,7 +473,7 @@ Twelve models, spanning dense, mixture-of-experts, DeltaNet-hybrid and native-sp
 
 ### 9.4 Quantized Matmul Kernel Benchmarks
 
-The weight formats (**qmatmul**) and the KV formats share one block structure and dispatch; the KV-only formats (Q8_KS, Q4_KS, Q4_1, Q3_0, Q2_0) are validated by the per-block selector instead, since KV quality is attention-output fidelity, not reconstruction error. Figure 9.4-1 measures the weight kernels on the RTX 4090 Laptop GPU, 200 iterations a format under Criterion.rs, with no BF16 weight copy at any point. FP8 data formats ran at F16's ~80.5 GiB/s with no gain, and their non-uniform spacing suits block-normalised KV worse than integer formats, so FP8 left the KV ladder; E4M3 survives only as the `_KS` sub-block scale.
+The weight formats (**qmatmul**) and the KV formats share one block structure and dispatch; the KV-only formats (Q8_KS, Q4_KS, Q4_1, Q3_0, Q2_0) are validated by the per-block selector instead, since KV quality is attention-output fidelity, not reconstruction error. Figure 9.4-1 measures the weight kernels on the RTX 4090 Laptop GPU, 200 iterations a format under Criterion.rs, with no BF16 weight copy at any point. FP8 data formats ran at ~80.5 GiB/s, level with F16's 82.7, with no gain, and their non-uniform spacing suits block-normalised KV worse than integer formats, so FP8 left the KV ladder; E4M3 survives only as the `_KS` sub-block scale.
 
 <figure class="fig">
 <svg viewBox="0 0 640 302" role="img" aria-label="Figure 9.4-1. Native quantized matmul bandwidth on the RTX 4090 Laptop GPU, GiB per second. F32 84.5, F16 82.7. Q8_0 59.7, Q8_1 59.4, Q8_K 59.6, Q6_K 57.9, Q5_0 58.9, Q5_1 59.8, Q5_K 59.0, Q4_0 59.9, Q4_1 59.6, Q4_K 59.3. Q3_K 34.0, Q2_K 35.0.">
@@ -608,7 +608,7 @@ At 8K the top level costs **2–8% of decode for 4.6–6.3×**. At 32K the large
 Figure 9.6-2 sets our aggregate decode, serving concurrent sessions, against the best published llama.cpp single-stream decode for the same model on the same class of card; the Blackwell rows compare our RTX PRO 5000, each at its best validated row of §9.6.1, with published RTX 5090 figures. Aggregate against single-stream is the comparison the llama.cpp record allows, and it answers how much work one card does. The published aggregates are larger engines on larger cards: vLLM serves Qwen3.6-35B-A3B at 449.0 t/s across five concurrent requests on a 96 GB RTX PRO 6000 [41], where this engine serves it at 2,761.0 across sixty-four on a 72 GB card, 6.1×; Strata serves Flash-Next at 63.1 t/s across four on a 12 GB card [49], where the 16 GB laptop serves eight at 108.5. Published single-card serving of the 35B models stops at 5–10 concurrent requests [40, 41]; this engine runs them at 64, and Qwen3.5-0.8B at 256.
 
 <figure class="fig">
-<svg viewBox="0 0 640 494" role="img" aria-label="Figure 9.6-2. Our aggregate decode against the best published llama.cpp single-stream decode, same model and card class, on a log scale. RTX 3090: Qwen3.5-35B-A3B 11.1 times, Qwen3.6-35B-A3B 8.5, Llama-2-7B 5.8, Qwen3-8B 3.3, Qwen3.8-27B 5.5, Qwen3-30B-A3B 2.6, Flash-Next 36.3. 16 GB: Qwen3.6-35B-A3B 1.3 to 1.8, Qwen3-8B 3.0, Flash-Next 3.7. Blackwell: Qwen3.5-35B-A3B 14.8, Qwen3.6-35B-A3B 8.3, Flash-Next 37.9, Llama-2-7B 5.6, Qwen3-30B-A3B 4.4, Qwen3-8B 3.2.">
+<svg viewBox="0 0 640 494" role="img" aria-label="Figure 9.6-2. Our aggregate decode against the best published llama.cpp single-stream decode, same model and card class, on a log scale. RTX 3090: Qwen3.5-35B-A3B 11.1 times, Qwen3.6-35B-A3B 8.5, Llama-2-7B 5.8, Qwen3-8B 3.3, Qwen3.8-27B 5.5, Qwen3-30B-A3B 2.6, Flash-Next 36.3. 16 GB: Qwen3.6-35B-A3B 1.4 to 1.8, Qwen3-8B 3.0, Flash-Next 3.7. Blackwell: Qwen3.5-35B-A3B 14.8, Qwen3.6-35B-A3B 8.3, Flash-Next 37.9, Llama-2-7B 5.6, Qwen3-30B-A3B 4.4, Qwen3-8B 3.2.">
   <text class="ttl" x="16" y="20">Figure 9.6-2 · One card's aggregate decode, against the published record</text>
   <text class="ttl-sub" x="16" y="36">× the best published llama.cpp single-stream decode, same model and card · log scale</text>
   <path class="grid" d="M313.8 46 V466 M398.1 46 V466 M461.9 46 V466 M525.7 46 V466 M610 46 V466"/>
@@ -628,7 +628,7 @@ Figure 9.6-2 sets our aggregate decode, serving concurrent sessions, against the
   <text class="cat" x="16" y="218">Flash-Next, BF16 ×16</text><text class="cat-sub" x="16" y="230">RTX 3090 · 543.8 vs 15 at ~130K [32]</text>
   <path class="line-us" d="M250 220 H580.5"/><circle class="dot-us" cx="580.5" cy="220" r="5"/><text class="v-us" x="570.5" y="214" text-anchor="end">36.3×</text>
   <text class="cat" x="16" y="244">Qwen3.6-35B-A3B, C10 ×16</text><text class="cat-sub" x="16" y="256">16 GB · 336.7 vs 183.3 / 249.3 MTP [38]</text>
-  <path class="line-us" d="M250 246 H304.1"/><circle class="dot-us" cx="274.1" cy="246" r="4"/><circle class="dot-us" cx="304.1" cy="246" r="5"/><text class="v-us" x="314.1" y="251">1.3–1.8×</text>
+  <path class="line-us" d="M250 246 H304.1"/><circle class="dot-us" cx="274.1" cy="246" r="4"/><circle class="dot-us" cx="304.1" cy="246" r="5"/><text class="v-us" x="314.1" y="251">1.4–1.8×</text>
   <text class="cat" x="16" y="270">Qwen3-8B, C8 ×10</text><text class="cat-sub" x="16" y="282">16 GB · 308.4 vs 102.7, RTX 4080 [29]</text>
   <path class="line-us" d="M250 272 H351.1"/><circle class="dot-us" cx="351.1" cy="272" r="5"/><text class="v-us" x="361.1" y="277">3.0×</text>
   <text class="cat" x="16" y="296">Flash-Next, BF16 ×8</text><text class="cat-sub" x="16" y="308">16 GB · 108.5 vs 27.5–29, RTX 5080 [32]</text>
@@ -654,7 +654,7 @@ Figure 9.6-2 sets our aggregate decode, serving concurrent sessions, against the
 </svg>
 </figure>
 
-Two rows are not like-for-like. The RTX 3090 Flash-Next row is against a published run at ~130K context on UD-Q4_K_XL, where ours is a ~700-token prompt on Q2_KO experts; at a matched short prompt it is 37.9× on Blackwell and 3.7× at 16 GB. The 16 GB Qwen3.6-35B row is the weakest on purpose: a 3-bit quant that fits wholly in VRAM decodes one stream faster than streamed Q6_K experts can, so the honest multiple there is 1.3–1.8×.
+Two rows are not like-for-like. The RTX 3090 Flash-Next row is against a published run at ~130K context on UD-Q4_K_XL, where ours is a ~700-token prompt on Q2_KO experts; at a matched short prompt it is 37.9× on Blackwell and 3.7× at 16 GB. The 16 GB Qwen3.6-35B row is the weakest on purpose: a 3-bit quant that fits wholly in VRAM decodes one stream faster than streamed Q6_K experts can, so the honest multiple there is 1.4–1.8×.
 
 #### 9.6.5 The 16GB laptop
 
@@ -720,7 +720,7 @@ The native kernels keep weights at their stored size (§8.1) and per-block quant
 
 From C0 to C10 the cache shrinks 3.2× further for 8% of decode; C5, the level everything is sealed at, holds 4.15× the tokens of BF16 at C0's throughput.
 
-**The substrate.** The dialogue and every ingest layer seal at C5. On 2026-11-23 BlackWorld's redo log held 103 segments, 409 GiB, ≈ 8.0 KB on disk per resident token with every record included; the galleries held 54.7M signature tokens over 29,747 turns and 7,830 code files. The K/V census (`GET /v1/kv/census`, `docs/results/battery_128/census_start_5470.json`) — exact chunk bytes from the chunk index, the sub-band format mix from a 4,096-chunk sample — finds 16,006,522 chunks holding 504.9M layer-tokens, 42.1M tokens over Flash-Next's 12 K/V layers, in 275.3 GiB of K/V standing for 976.7 GiB at BF16: **3.55×**. By lead format 68.7% of chunks are Q4_0, 18.8% Q4_1, 10.5% Q5_0 and 1.3% Q8_0; 46% of the V sub-bands are Q1_S, Q2_A or Q2_S, while no K sub-band falls below Q4_0.
+**The substrate.** The dialogue and every ingest layer seal at C5. On 2026-11-23 BlackWorld's redo log held 103 segments, 409 GiB, ≈ 8.0 KB on disk per resident token with every record included; the galleries held 54.7M signature tokens over 29,747 turns and 7,830 code files. The K/V census (`GET /v1/kv/census`, `docs/results/battery_128/census_start_5470.json`) — exact chunk bytes from the chunk index, the sub-band format mix from a sample of 4,096 chunk heads (4,157 chunks) — finds 16,006,522 chunks holding 504.9M layer-tokens, 42.1M tokens over Flash-Next's 12 K/V layers, in 275.3 GiB of K/V standing for 976.7 GiB at BF16: **3.55×**. By lead format 68.7% of chunks are Q4_0, 18.8% Q4_1, 10.5% Q5_0 and 1.3% Q8_0; 46% of the V sub-bands are Q1_S, Q2_A or Q2_S, while no K sub-band falls below Q4_0.
 
 **The span.** The daemon reserves one contiguous span per card and divides it between persistent tensors, KV regions, a per-wave transient tier and expert weights, with an elastic boundary between the KV side and the experts (§10.2; Figure 9.6-4). Behind it the warm tier holds 14.4 GiB of payload in host RAM.
 
@@ -892,7 +892,7 @@ The card holds 571 thousand tokens of context on average and 945 thousand at its
 
 ### 9.7 Ablation: Expert Prediction and Eviction Policy
 
-The three-tier cache's effect is Figure 4-1 (+12% to +87% prefill). A cleaner ablation came from replacing the MoE dispatch with the live, device-side one: the dense models in the same sweep, which do not touch it, moved −1.2% to +0.5% on prefill and −1.6% to +0.2% on decode — a control reading as a control should — while Qwen3.5-35B-A3B gained 24–36% prefill and 11–23% decode, Qwen3.6-35B-A3B likewise, and Qwen3-30B-A3B's single-session decode went from 45.8 to 54.9 t/s (+20%) on the same card and artifact (`docs/results/moe_live_dispatch_rtx_3090_24gb_2026-10-04.md`).
+The three-tier cache's effect is Figure 4-1 (+12% to +88% prefill). A cleaner ablation came from replacing the MoE dispatch with the live, device-side one: the dense models in the same sweep, which do not touch it, moved −1.2% to +0.5% on prefill and −1.6% to +0.2% on decode — a control reading as a control should — while Qwen3.5-35B-A3B gained 24–36% prefill and 11–23% decode, Qwen3.6-35B-A3B likewise, and Qwen3-30B-A3B's single-session decode went from 45.8 to 54.9 t/s (+20%) on the same card and artifact (`docs/results/moe_live_dispatch_rtx_3090_24gb_2026-10-04.md`).
 
 **The predictor and eviction, isolated** on a captured Qwen3-30B-A3B routing trace of 21 prompts (code, prose, facts, maths, lists) by 21-fold leave-one-out, each prompt predicted by a model trained on the other twenty and learning causally as it decodes (`docs/archived/markov_expert_prediction_eval.md`). Coverage is the share of *cold* experts a prefetch of fan-out k would have staged.
 
@@ -916,11 +916,11 @@ At 60% residency ≈82% of accesses hit, ≈5% become overlapped loads by predic
 
 ### 9.8 Quality Evaluation: Multi-Session Identity Discrimination
 
-Up to 256 sessions run in one batch, each assigned a distinct character (name and gender, period 99) and asked to rewrite a passage with it. A session passes if its name appears, its pronouns match, and no other session's name appears — stressing the session-discriminating signal aggressive K quantization degrades first. Every throughput row of §9.6 passes with every session correct: 213 rows on the RTX 3090, 192 on the laptop, 212 on Blackwell. C10 passes on every model at 4.1–7.6×, just inside the edge where the test fails; two exceptions are on record and reported as failures. Flash-Next's C10 ×8 under the TCC build validated 7 of 8 sessions; the WDDM build's 885.8 t/s is the validated figure for that rung. Qwen3.6-35B-A3B's C10 at ×32 and ×64 validated 31 of 32 and 61 of 64 sessions on one sweep and every session on the next. Past the edge, Llama-3.2-3B fails in three regimes — clean, soft drift, then identity collapse: small errors move the text, large ones move which session the model attends.
+Up to 256 sessions run in one batch, each assigned a distinct character (name and gender, period 99) and asked to rewrite a passage with it. A session passes if its name appears, its pronouns match, and no other session's name appears — stressing the session-discriminating signal aggressive K quantization degrades first. Every throughput row of §9.6 passes with every session correct: 213 rows on the RTX 3090, 192 on the laptop, 212 on Blackwell. C10 passes on every model that compresses at 4.1–7.6×, just inside the edge where the test fails; two exceptions are on record and reported as failures. Flash-Next's C10 ×8 under the TCC build validated 7 of 8 sessions; the WDDM build's 885.8 t/s is the validated figure for that rung. Qwen3.6-35B-A3B's C10 at ×32 and ×64 validated 31 of 32 and 61 of 64 sessions on one sweep and every session on the next. Past the edge, Llama-3.2-3B fails in three regimes — clean, soft drift, then identity collapse: small errors move the text, large ones move which session the model attends.
 
 ### 9.9 Cross-Architecture Transfer: Held-Out Model Validation
 
-The selector was derived from two reference models, Qwen3-30B-A3B (MoE) and Llama-3.2-3B (dense). Deployed unchanged on held-out Qwen3-8B it compressed *more* than either — 7.42× in v1 against 7.04× and 5.02×, and **6.31×** against 5.94× and 4.62× on the current 8K gates (§9.6.3) — the opposite of what overfitting would produce. It now runs on twelve models, dense, MoE, DeltaNet-hybrid and native-sparse, 0.5B to 284B, reaching 4.1–7.6× at the top level on each, with no calibration data: a model carries at most a scale on its thresholds (`*_KV_FACTORS`), set by stepping C10 to the story gate's edge. Unlike GPTQ, AWQ or KVQuant's sensitivity profiles, the kernel responds to each block's distribution at inference time.
+The selector was derived from two reference models, Qwen3-30B-A3B (MoE) and Llama-3.2-3B (dense). Deployed unchanged on held-out Qwen3-8B it compressed *more* than either — 7.42× in v1 against 7.04× and 5.02×, and **6.31×** against 5.94× and 4.62× on the current 8K gates (§9.6.3) — the opposite of what overfitting would produce. It now runs on ten of the fleet's twelve models, dense, MoE and DeltaNet-hybrid, 0.8B to 180B, reaching 4.1–7.6× at the top level on each, with no calibration data (Qwen2-0.5B's ladder has no compressed rung, and DeepSeek-V4-Flash runs its latent K/V at BF16): a model carries at most a scale on its thresholds (`*_KV_FACTORS`), set by stepping C10 to the story gate's edge. Unlike GPTQ, AWQ or KVQuant's sensitivity profiles, the kernel responds to each block's distribution at inference time.
 
 ### 9.10 Attentional Provenance Indexing: The Signal, and Tool Selection
 
@@ -996,9 +996,9 @@ Is the bounded working set delivered when the history is many times larger than 
 
 A harder property than recall: multi-hop reasoning over the system's own Candle fork (2.2M lines of Rust and CUDA), each decode step's Q vectors retrieving the next node of a dependency chain. The production code-reading ingest has the daemon's model, Flash-Next, read the repository file by file as turns of its own, sealing their K/V and signatures with calibration questions beside each file; nothing in it was written by an external model. It persists as the substrate does (§7), valid for the model that wrote it.
 
-**The claim.** *Provenance projection supplies the memory the answers come from, and re-selecting the working set while the model reasons brings in the files a question does not name.* The battery isolates the memory, the seed files a conversation opens on, reprojection during reasoning, and continuous reprojection against a single retrieval, holding all else equal.
+**The claim.** *Provenance projection supplies the memory the answers come from, and re-selecting the working set while the model reasons brings in the files a question does not name.* The battery isolates the memory, the seed files a conversation opens on, reprojection during reasoning, and continuous reprojection against a single retrieval, holding all else equal, and measures the memory against retrieval-augmented generation over the same repository.
 
-**Questions.** 128 (`zend/examples/dependency_battery/battery.yaml`): 43 direct, 43 transitive, 42 architectural, each listing the items a correct answer must name, its answer files, and whether it names its answer's file — all from the source and committed before the first run with the analysis; no question spells an item it expects. The direct questions are generated mechanically (`direct.rs`: a public function defined once and called from one to three other non-test files, picked by a seeded hash), so their selection carries no judgement; the rest are the 24-question pilot's and 69 more, written by hand against the lines they cite. *Direct:* where `tier_fits` is defined and what calls it. *Transitive:* how MoE routing reaches the expert kernels with no host readback — the bucketize kernel, the mapped ring, the stager's word, the cold expert's wait. *Architectural:* the elastic boundary between KV and experts (`weight_floor`) and the check that refuses a tier crossing it.
+**Questions.** 128 (`zend/examples/dependency_battery/battery.yaml`): 43 direct, 43 transitive, 42 architectural, each listing the items a correct answer must name, its answer files, and whether it names its answer's file — all from the source and committed before the first run with the analysis; no question spells an item it expects. The direct questions are generated mechanically (`direct.rs`: a public function defined once and called from one to three other non-test files, picked by a seeded hash), so their selection carries no judgement; the rest are the 24-question pilot's 16 transitive and architectural questions and 69 more, written by hand against the lines they cite. *Direct:* where `tier_fits` is defined and what calls it. *Transitive:* how MoE routing reaches the expert kernels with no host readback — the bucketize kernel, the mapped ring, the stager's word, the cold expert's wait. *Architectural:* the elastic boundary between KV and experts (`weight_floor`) and the check that refuses a tier crossing it.
 
 **Arms.** Three request-level dials: `projection` *Full* or *Minimal* (the tool catalog alone, and so nothing with tools off); `seed` on or off; and reprojection through the think block, held in it, or at the opening only:
 
@@ -1011,93 +1011,128 @@ A harder property than recall: multi-hop reasoning over the system's own Candle 
 | B1 | on | Full | held in thinking | reasoning-time reprojection removed |
 | C0 | off | Full | full | — |
 | C1 | on | Full | full | the production system |
+| R1 | off | Minimal | — | retrieval-augmented generation: BM25's top files as text |
+| T1 | off | Minimal | — | reading the repository with tools, for reference |
 
-**Running.** On BlackWorld through the daemon's chat API (`dependency_battery run`), the first 748 answers at build 5470-6eb469ce5 and the rest at 5475-3c73da839, which changes no retrieval dial. One fresh conversation per question, its arm's dials on the request, deleted once its answer and projection points (`GET /v1/conversations/{id}/placements`) are read; every question asks for an answer from memory with no tool. The first 142 answers ran sixteen at once and the rest eight, and the order mixes the arms throughout, so drift falls on every arm alike. Each arm answers the 128 questions three times: 2,688 answers.
+The two baselines project no memory. **R1** ranks every text file of the repository by BM25 over identifier terms of path and body (`zend/examples/dependency_battery/rag/`), the battery and its results left out of the index, and packs the best-ranked files, whole, into the prompt ahead of the question until 24,000 tokens, cutting the file that reaches the budget; its prompt asks for an answer from those files. **T1** may call the workspace's read and search tools and answers once it has read what it needs.
 
-**Scoring.** Recall is the share of a question's expected items the answer names, any spelling, case-insensitive; a question's score in an arm is its mean over three runs. Intervals are 95% bootstrap intervals over questions (10,000 resamples, paired for differences); contrasts are Wilcoxon signed-rank on per-question differences, Holm-corrected across five. Every figure's data and `summary.md` are in `docs/results/battery_128/`.
+**Running.** On BlackWorld through the daemon's chat API (`dependency_battery run`), the first 748 answers at build 5470-6eb469ce5 and the rest at 5475-3c73da839, which changes no retrieval dial. One fresh conversation per question, its arm's dials on the request, deleted once its answer and projection points (`GET /v1/conversations/{id}/placements`) are read; every memory arm's question asks for an answer from memory with no tool. The first 142 answers ran sixteen at once and the rest eight, and the order mixes the arms throughout, so drift falls on every arm alike. Each arm answers the 128 questions three times: 2,688 answers. The runs added after — R1 and T1 three times each, B1 runs 4–6, C1 runs 4–7, R1 run 4 — ran sixteen at once, interleaved across the arms still owed, on the builds deployed while they ran; none changed retrieval code (no commit to `candle-conversation/src/projection`, `provenance` or `scheduler/reproject*` in the period). 4,480 answers in all.
+
+**Scoring.** Recall is the share of a question's expected items the answer names, any spelling, case-insensitive; a question's score in an arm is its mean over the arm's runs. Intervals are 95% bootstrap intervals over questions (10,000 resamples, paired for differences); contrasts are Wilcoxon signed-rank on per-question differences, Holm-corrected across the five pre-registered, and the three against the baselines as a family of their own. Every figure's data and `summary.md` are in `docs/results/battery_128/`.
 
 <figure class="fig">
-<svg viewBox="0 0 640 306" role="img" aria-label="Figure 9.12-1. Mean recall by arm over 128 questions, each with its 95% bootstrap interval: A0 0.4% (0.1% to 0.9%); A1 0.5% (0.1% to 1.0%); D1 30.6% (25.0% to 36.4%); B0 31.9% (26.1% to 37.7%); B1 32.5% (26.8% to 38.3%); C0 36.7% (30.8% to 42.6%); C1 37.2% (31.0% to 43.2%). The reprojecting arms C0 and C1 recall the most.">
+<svg viewBox="0 0 640 306" role="img" aria-label="Figure 9.12-1. Mean recall by arm over 128 questions, each with its 95% bootstrap interval: A0 0.4% (0.1% to 0.9%); A1 0.5% (0.1% to 1.0%); D1 30.6% (25.0% to 36.4%); B0 31.9% (26.1% to 37.7%); B1 32.2% (26.8% to 37.6%); C0 36.7% (30.8% to 42.6%); C1 37.5% (31.7% to 43.1%); R1 52.6% (46.1% to 58.9%); T1 95.3% (93.3% to 97.1%). Of the memory arms, the reprojecting C0 and C1 recall the most; R1 is handed BM25's files as text and T1 reads the repository with tools.">
   <text class="ttl" x="16" y="20">Figure 9.12-1 · Recall by arm</text>
   <text class="ttl-sub" x="16" y="38">mean recall over 128 questions · bar: 95% bootstrap interval · small dots: each run's mean</text>
-  <path class="grid" d="M70 212.4 H624 M70 174.8 H624 M70 137.2 H624 M70 99.6 H624 M70 62 H624"/>
+  <path class="grid" d="M70 231.2 H624 M70 212.4 H624 M70 193.6 H624 M70 174.8 H624 M70 156 H624 M70 137.2 H624 M70 118.4 H624 M70 99.6 H624 M70 80.8 H624 M70 62 H624"/>
   <text class="tick" x="62" y="253.5" text-anchor="end">0%</text>
-  <text class="tick" x="62" y="215.9" text-anchor="end">10%</text>
-  <text class="tick" x="62" y="178.3" text-anchor="end">20%</text>
-  <text class="tick" x="62" y="140.7" text-anchor="end">30%</text>
-  <text class="tick" x="62" y="103.1" text-anchor="end">40%</text>
-  <text class="tick" x="62" y="65.5" text-anchor="end">50%</text>
+  <text class="tick" x="62" y="234.7" text-anchor="end">10%</text>
+  <text class="tick" x="62" y="215.9" text-anchor="end">20%</text>
+  <text class="tick" x="62" y="197.1" text-anchor="end">30%</text>
+  <text class="tick" x="62" y="178.3" text-anchor="end">40%</text>
+  <text class="tick" x="62" y="159.5" text-anchor="end">50%</text>
+  <text class="tick" x="62" y="140.7" text-anchor="end">60%</text>
+  <text class="tick" x="62" y="121.9" text-anchor="end">70%</text>
+  <text class="tick" x="62" y="103.1" text-anchor="end">80%</text>
+  <text class="tick" x="62" y="84.3" text-anchor="end">90%</text>
+  <text class="tick" x="62" y="65.5" text-anchor="end">100%</text>
   <path class="grid base" d="M70 250 H624"/>
-  <rect class="them" opacity="0.35" x="102.6" y="246.7" width="14" height="3.1"/>
-  <circle class="q1" cx="125.6" cy="248.3" r="2.5"/>
-  <circle class="q1" cx="125.6" cy="248.4" r="2.5"/>
-  <circle class="q1" cx="125.6" cy="248.8" r="2.5"/>
-  <circle class="dot-them" cx="109.6" cy="248.5" r="6"/>
-  <text class="v-them mid" x="109.6" y="238.7">0.4%</text>
-  <text class="cat mid" x="109.6" y="268">A0</text>
-  <text class="cat-sub mid" x="109.6" y="282">no memory</text>
-  <text class="cat-sub mid" x="109.6" y="295">no seed</text>
-  <rect class="them" opacity="0.35" x="181.7" y="246.3" width="14" height="3.3"/>
-  <circle class="q1" cx="204.7" cy="247.6" r="2.5"/>
-  <circle class="q1" cx="204.7" cy="248.4" r="2.5"/>
-  <circle class="q1" cx="204.7" cy="248.7" r="2.5"/>
-  <circle class="dot-them" cx="188.7" cy="248.2" r="6"/>
-  <text class="v-them mid" x="188.7" y="238.3">0.5%</text>
-  <text class="cat mid" x="188.7" y="268">A1</text>
-  <text class="cat-sub mid" x="188.7" y="282">no memory</text>
-  <text class="cat-sub mid" x="188.7" y="295">seed</text>
-  <rect class="them" opacity="0.35" x="260.9" y="113" width="14" height="43"/>
-  <circle class="q1" cx="283.9" cy="134.3" r="2.5"/>
-  <circle class="q1" cx="283.9" cy="132.3" r="2.5"/>
-  <circle class="q1" cx="283.9" cy="137.9" r="2.5"/>
-  <circle class="dot-them" cx="267.9" cy="134.8" r="6"/>
-  <text class="v-them mid" x="267.9" y="105">30.6%</text>
-  <text class="cat mid" x="267.9" y="268">D1</text>
-  <text class="cat-sub mid" x="267.9" y="282">once</text>
-  <text class="cat-sub mid" x="267.9" y="295">seed</text>
-  <rect class="them" opacity="0.35" x="340" y="108.3" width="14" height="43.5"/>
-  <circle class="q1" cx="363" cy="130.9" r="2.5"/>
-  <circle class="q1" cx="363" cy="135.8" r="2.5"/>
-  <circle class="q1" cx="363" cy="123.8" r="2.5"/>
-  <circle class="dot-them" cx="347" cy="130.2" r="6"/>
-  <text class="v-them mid" x="347" y="100.3">31.9%</text>
-  <text class="cat mid" x="347" y="268">B0</text>
+  <rect class="them" opacity="0.35" x="93.8" y="248.4" width="14" height="1.5"/>
+  <circle class="q1" cx="116.8" cy="249.1" r="2.5"/>
+  <circle class="q1" cx="116.8" cy="249.2" r="2.5"/>
+  <circle class="q1" cx="116.8" cy="249.4" r="2.5"/>
+  <circle class="dot-them" cx="100.8" cy="249.3" r="6"/>
+  <text class="v-them mid" x="100.8" y="240.4">0.4%</text>
+  <text class="cat mid" x="100.8" y="268">A0</text>
+  <text class="cat-sub mid" x="100.8" y="282">no memory</text>
+  <text class="cat-sub mid" x="100.8" y="295">no seed</text>
+  <rect class="them" opacity="0.35" x="155.3" y="248.1" width="14" height="1.7"/>
+  <circle class="q1" cx="178.3" cy="248.8" r="2.5"/>
+  <circle class="q1" cx="178.3" cy="249.2" r="2.5"/>
+  <circle class="q1" cx="178.3" cy="249.3" r="2.5"/>
+  <circle class="dot-them" cx="162.3" cy="249.1" r="6"/>
+  <text class="v-them mid" x="162.3" y="240.1">0.5%</text>
+  <text class="cat mid" x="162.3" y="268">A1</text>
+  <text class="cat-sub mid" x="162.3" y="282">no memory</text>
+  <text class="cat-sub mid" x="162.3" y="295">seed</text>
+  <rect class="them" opacity="0.35" x="216.9" y="181.5" width="14" height="21.5"/>
+  <circle class="q1" cx="239.9" cy="192.1" r="2.5"/>
+  <circle class="q1" cx="239.9" cy="191.1" r="2.5"/>
+  <circle class="q1" cx="239.9" cy="194" r="2.5"/>
+  <circle class="dot-them" cx="223.9" cy="192.4" r="6"/>
+  <text class="v-them mid" x="223.9" y="173.5">30.6%</text>
+  <text class="cat mid" x="223.9" y="268">D1</text>
+  <text class="cat-sub mid" x="223.9" y="282">once</text>
+  <text class="cat-sub mid" x="223.9" y="295">seed</text>
+  <rect class="them" opacity="0.35" x="278.4" y="179.1" width="14" height="21.8"/>
+  <circle class="q1" cx="301.4" cy="190.4" r="2.5"/>
+  <circle class="q1" cx="301.4" cy="192.9" r="2.5"/>
+  <circle class="q1" cx="301.4" cy="186.9" r="2.5"/>
+  <circle class="dot-them" cx="285.4" cy="190.1" r="6"/>
+  <text class="v-them mid" x="285.4" y="171.1">31.9%</text>
+  <text class="cat mid" x="285.4" y="268">B0</text>
+  <text class="cat-sub mid" x="285.4" y="282">held</text>
+  <text class="cat-sub mid" x="285.4" y="295">no seed</text>
+  <rect class="them" opacity="0.35" x="340" y="179.2" width="14" height="20.4"/>
+  <circle class="q1" cx="363" cy="187.2" r="2.5"/>
+  <circle class="q1" cx="363" cy="188.7" r="2.5"/>
+  <circle class="q1" cx="363" cy="190.8" r="2.5"/>
+  <circle class="q1" cx="363" cy="189.7" r="2.5"/>
+  <circle class="q1" cx="363" cy="190.3" r="2.5"/>
+  <circle class="q1" cx="363" cy="190.4" r="2.5"/>
+  <circle class="dot-them" cx="347" cy="189.5" r="6"/>
+  <text class="v-them mid" x="347" y="171.2">32.2%</text>
+  <text class="cat mid" x="347" y="268">B1</text>
   <text class="cat-sub mid" x="347" y="282">held</text>
-  <text class="cat-sub mid" x="347" y="295">no seed</text>
-  <rect class="them" opacity="0.35" x="419.1" y="106.1" width="14" height="43.1"/>
-  <circle class="q1" cx="442.1" cy="124.3" r="2.5"/>
-  <circle class="q1" cx="442.1" cy="127.4" r="2.5"/>
-  <circle class="q1" cx="442.1" cy="131.5" r="2.5"/>
-  <circle class="dot-them" cx="426.1" cy="127.8" r="6"/>
-  <text class="v-them mid" x="426.1" y="98.1">32.5%</text>
-  <text class="cat mid" x="426.1" y="268">B1</text>
-  <text class="cat-sub mid" x="426.1" y="282">held</text>
-  <text class="cat-sub mid" x="426.1" y="295">seed</text>
-  <rect class="us-soft" x="498.3" y="89.9" width="14" height="44.2"/>
-  <circle class="q1" cx="521.3" cy="111.4" r="2.5"/>
-  <circle class="q1" cx="521.3" cy="108.4" r="2.5"/>
-  <circle class="q1" cx="521.3" cy="115.7" r="2.5"/>
-  <circle class="dot-us" cx="505.3" cy="111.8" r="6"/>
-  <text class="v-us mid" x="505.3" y="81.9">36.7%</text>
-  <text class="cat mid" x="505.3" y="268">C0</text>
-  <text class="cat-sub mid" x="505.3" y="282">reprojecting</text>
-  <text class="cat-sub mid" x="505.3" y="295">no seed</text>
-  <rect class="us-soft" x="577.4" y="87.5" width="14" height="45.9"/>
-  <circle class="q1" cx="600.4" cy="112.6" r="2.5"/>
-  <circle class="q1" cx="600.4" cy="102.3" r="2.5"/>
-  <circle class="q1" cx="600.4" cy="116.1" r="2.5"/>
-  <circle class="dot-us" cx="584.4" cy="110.3" r="6"/>
-  <text class="v-us mid" x="584.4" y="79.5">37.2%</text>
-  <text class="cat mid" x="584.4" y="268">C1</text>
-  <text class="cat-sub mid" x="584.4" y="282">reprojecting</text>
-  <text class="cat-sub mid" x="584.4" y="295">seed</text>
+  <text class="cat-sub mid" x="347" y="295">seed</text>
+  <rect class="us-soft" x="401.6" y="169.9" width="14" height="22.1"/>
+  <circle class="q1" cx="424.6" cy="180.7" r="2.5"/>
+  <circle class="q1" cx="424.6" cy="179.2" r="2.5"/>
+  <circle class="q1" cx="424.6" cy="182.9" r="2.5"/>
+  <circle class="dot-us" cx="408.6" cy="180.9" r="6"/>
+  <text class="v-us mid" x="408.6" y="161.9">36.7%</text>
+  <text class="cat mid" x="408.6" y="268">C0</text>
+  <text class="cat-sub mid" x="408.6" y="282">reprojecting</text>
+  <text class="cat-sub mid" x="408.6" y="295">no seed</text>
+  <rect class="us-soft" x="463.1" y="169" width="14" height="21.3"/>
+  <circle class="q1" cx="486.1" cy="181.3" r="2.5"/>
+  <circle class="q1" cx="486.1" cy="176.1" r="2.5"/>
+  <circle class="q1" cx="486.1" cy="183" r="2.5"/>
+  <circle class="q1" cx="486.1" cy="176.9" r="2.5"/>
+  <circle class="q1" cx="486.1" cy="180.5" r="2.5"/>
+  <circle class="q1" cx="486.1" cy="178.1" r="2.5"/>
+  <circle class="q1" cx="486.1" cy="180.7" r="2.5"/>
+  <circle class="dot-us" cx="470.1" cy="179.5" r="6"/>
+  <text class="v-us mid" x="470.1" y="161">37.5%</text>
+  <text class="cat mid" x="470.1" y="268">C1</text>
+  <text class="cat-sub mid" x="470.1" y="282">reprojecting</text>
+  <text class="cat-sub mid" x="470.1" y="295">seed</text>
+  <rect class="them" opacity="0.35" x="524.7" y="139.3" width="14" height="24"/>
+  <circle class="q1" cx="547.7" cy="148" r="2.5"/>
+  <circle class="q1" cx="547.7" cy="153" r="2.5"/>
+  <circle class="q1" cx="547.7" cy="151.8" r="2.5"/>
+  <circle class="q1" cx="547.7" cy="151.7" r="2.5"/>
+  <circle class="dot-them" cx="531.7" cy="151.1" r="6"/>
+  <text class="v-them mid" x="531.7" y="131.3">52.6%</text>
+  <text class="cat mid" x="531.7" y="268">R1</text>
+  <text class="cat-sub mid" x="531.7" y="282">BM25 files</text>
+  <text class="cat-sub mid" x="531.7" y="295">no seed</text>
+  <rect class="them" opacity="0.35" x="586.2" y="67.4" width="14" height="7.3"/>
+  <circle class="q1" cx="609.2" cy="71.4" r="2.5"/>
+  <circle class="q1" cx="609.2" cy="70.7" r="2.5"/>
+  <circle class="q1" cx="609.2" cy="70.2" r="2.5"/>
+  <circle class="dot-them" cx="593.2" cy="70.8" r="6"/>
+  <text class="v-them mid" x="593.2" y="59.4">95.3%</text>
+  <text class="cat mid" x="593.2" y="268">T1</text>
+  <text class="cat-sub mid" x="593.2" y="282">tools</text>
+  <text class="cat-sub mid" x="593.2" y="295">no seed</text>
 </svg>
 </figure>
 
-Recall climbs the ladder the design predicts. The model alone (A0, 0.4%) says it has no record of what is asked rather than invent it; the seed files alone (A1, 0.5%) add nothing; a single retrieval (D1, 30.6%) adds the memory; re-selection during reasoning (C1, 37.2%) adds the files the question does not name. Full marks: 0, 0, 9, 13, 10, 11 and 12 questions across A0–C1. The direct questions are drawn mechanically, so they include call sites no document describes, which makes the 128 harder than the pilot's 24.
+Recall climbs the ladder the design predicts. The model alone (A0, 0.4%) says it has no record of what is asked rather than invent it; the seed files alone (A1, 0.5%) add nothing; a single retrieval (D1, 30.6%) adds the memory; re-selection during reasoning (C1, 37.5%) adds the files the question does not name. Full marks in every run: 0, 0, 9, 13, 3, 11 and 6 questions across A0–C1, B1's over six runs and C1's over seven. The direct questions are drawn mechanically, so they include call sites no document describes, which makes the 128 harder than the pilot's 24.
 
 <figure class="fig">
-<svg viewBox="0 0 640 294" role="img" aria-label="Figure 9.12-2. The effect of each contrast on mean recall over 128 paired questions, with its 95% bootstrap interval and Holm-corrected Wilcoxon p-value: The memory (C1 − A1 · Holm p = 1.8e-15), +36.7 points (+30.7 to +42.7); Reasoning-time reprojection (C1 − B1 · Holm p = 0.047), +4.6 points (+1.2 to +8.2); Continuous against retrieve-once (C1 − D1 · Holm p = 0.001), +6.5 points (+2.8 to +10.3); Reasoning-time reprojection without the seed (C0 − B0 · Holm p = 0.010), +4.9 points (+1.7 to +8.2); The seed files (C1 − C0 · Holm p = 0.670), +0.4 points (−2.7 to +3.5).">
+<svg viewBox="0 0 640 294" role="img" aria-label="Figure 9.12-2. The effect of each contrast on mean recall over 128 paired questions, with its 95% bootstrap interval and Holm-corrected Wilcoxon p-value: The memory (C1 − A1 · Holm p = 1.9e-17), +37.0 points (+31.3 to +42.6); Reasoning-time reprojection (C1 − B1 · Holm p = 2.8e-6), +5.3 points (+3.2 to +7.4); Continuous against retrieve-once (C1 − D1 · Holm p = 1.7e-4), +6.9 points (+3.6 to +10.1); Reasoning-time reprojection without the seed (C0 − B0 · Holm p = 0.007), +4.9 points (+1.7 to +8.2); The seed files (C1 − C0 · Holm p = 0.539), +0.7 points (−1.7 to +3.3).">
   <text class="ttl" x="16" y="20">Figure 9.12-2 · What each part of the memory buys</text>
   <text class="ttl-sub" x="16" y="38">paired difference in mean recall, points · 128 questions · 95% interval · faded: Holm p ≥ 0.05</text>
   <path class="grid" d="M372 66 V270 M410.7 66 V270 M449.3 66 V270 M488 66 V270 M526.7 66 V270 M565.3 66 V270 M604 66 V270"/>
@@ -1110,47 +1145,47 @@ Recall climbs the ladder the design predicts. The model alone (A0, 0.4%) says it
   <text class="tick mid" x="604" y="284">+50</text>
   <path class="parity" d="M410.7 66 V270"/>
   <text class="cat" x="16" y="82">The memory</text>
-  <text class="cat-sub" x="16" y="96">C1 − A1 · Holm p = 1.8e-15</text>
-  <path class="line-us" d="M529.2 84 H575.7"/>
-  <circle class="dot-us" cx="552.5" cy="84" r="6"/>
-  <text class="v-us mid" x="552.5" y="74">+36.7</text>
+  <text class="cat-sub" x="16" y="96">C1 − A1 · Holm p = 1.9e-17</text>
+  <path class="line-us" d="M531.8 84 H575.4"/>
+  <circle class="dot-us" cx="553.8" cy="84" r="6"/>
+  <text class="v-us mid" x="553.8" y="74">+37.0</text>
   <text class="cat" x="16" y="122">Reasoning-time reprojection</text>
-  <text class="cat-sub" x="16" y="136">C1 − B1 · Holm p = 0.047</text>
-  <path class="line-us" d="M415.4 124 H442.3"/>
-  <circle class="dot-us" cx="428.6" cy="124" r="6"/>
-  <text class="v-us mid" x="428.6" y="114">+4.6</text>
+  <text class="cat-sub" x="16" y="136">C1 − B1 · Holm p = 2.8e-6</text>
+  <path class="line-us" d="M423 124 H439.4"/>
+  <circle class="dot-us" cx="431.2" cy="124" r="6"/>
+  <text class="v-us mid" x="431.2" y="114">+5.3</text>
   <text class="cat" x="16" y="162">Continuous against retrieve-once</text>
-  <text class="cat-sub" x="16" y="176">C1 − D1 · Holm p = 0.001</text>
-  <path class="line-us" d="M421.6 164 H450.4"/>
-  <circle class="dot-us" cx="435.9" cy="164" r="6"/>
-  <text class="v-us mid" x="435.9" y="154">+6.5</text>
+  <text class="cat-sub" x="16" y="176">C1 − D1 · Holm p = 1.7e-4</text>
+  <path class="line-us" d="M424.7 164 H449.8"/>
+  <circle class="dot-us" cx="437.2" cy="164" r="6"/>
+  <text class="v-us mid" x="437.2" y="154">+6.9</text>
   <text class="cat" x="16" y="202">Reasoning-time reprojection without the seed</text>
-  <text class="cat-sub" x="16" y="216">C0 − B0 · Holm p = 0.010</text>
+  <text class="cat-sub" x="16" y="216">C0 − B0 · Holm p = 0.007</text>
   <path class="line-us" d="M417.2 204 H442.3"/>
   <circle class="dot-us" cx="429.5" cy="204" r="6"/>
   <text class="v-us mid" x="429.5" y="194">+4.9</text>
   <text class="cat" x="16" y="242">The seed files</text>
-  <text class="cat-sub" x="16" y="256">C1 − C0 · Holm p = 0.670</text>
-  <path class="line-us" opacity="0.45" d="M400.2 244 H424.1"/>
-  <circle class="dot-us" opacity="0.45" cx="412.2" cy="244" r="6"/>
-  <text class="v-them mid" x="412.2" y="234">+0.4</text>
+  <text class="cat-sub" x="16" y="256">C1 − C0 · Holm p = 0.539</text>
+  <path class="line-us" opacity="0.45" d="M404 244 H423.3"/>
+  <circle class="dot-us" opacity="0.45" cx="413.6" cy="244" r="6"/>
+  <text class="v-them mid" x="413.6" y="234">+0.7</text>
 </svg>
 </figure>
 
 | Contrast | Arms | Effect | 95% interval | p (Holm) |
 |---|---|---:|---:|---:|
-| The memory | C1 − A1 | 36.7 | 30.7 to 42.7 | 1.8 × 10⁻¹⁵ |
-| Reasoning-time reprojection | C1 − B1 | 4.6 | 1.2 to 8.2 | 0.047 |
-| Continuous against retrieve-once | C1 − D1 | 6.5 | 2.8 to 10.3 | 0.0015 |
-| Reasoning-time reprojection without the seed | C0 − B0 | 4.9 | 1.7 to 8.2 | 0.010 |
-| The seed files | C1 − C0 | 0.4 | −2.7 to 3.5 | 0.67 |
+| The memory | C1 − A1 | 37.0 | 31.3 to 42.6 | 1.9 × 10⁻¹⁷ |
+| Reasoning-time reprojection | C1 − B1 | 5.3 | 3.2 to 7.4 | 2.8 × 10⁻⁶ |
+| Continuous against retrieve-once | C1 − D1 | 6.9 | 3.6 to 10.1 | 1.7 × 10⁻⁴ |
+| Reasoning-time reprojection without the seed | C0 − B0 | 4.9 | 1.7 to 8.2 | 0.0069 |
+| The seed files | C1 − C0 | 0.7 | −1.7 to 3.3 | 0.54 |
 
 Every contrast that removes a part of provenance retrieval lowers recall, with an interval clear of zero; the seed files change nothing measurable.
 
 <figure class="fig">
-<svg viewBox="0 0 640 384" role="img" aria-label="Figure 9.12-3. Each of the 128 questions' mean recall under reprojection during the reasoning (C1) against the held projection (B1): 51 questions lie above the diagonal, where C1 recalls more, 29 below it, where B1 does, and 48 on it.">
+<svg viewBox="0 0 640 384" role="img" aria-label="Figure 9.12-3. Each of the 128 questions' mean recall under reprojection during the reasoning (C1) against the held projection (B1): 71 questions lie above the diagonal, where C1 recalls more, 29 below it, where B1 does, and 28 on it.">
   <text class="ttl" x="16" y="20">Figure 9.12-3 · Question by question</text>
-  <text class="ttl-sub" x="16" y="38">each question's mean recall over its runs · 51 above the diagonal, 29 below, 48 on it</text>
+  <text class="ttl-sub" x="16" y="38">each question's mean recall over its runs · 71 above the diagonal, 29 below, 28 on it</text>
   <path class="grid" d="M70 270 H350 M70 200 H350 M70 130 H350 M70 60 H350"/>
   <text class="tick" x="62" y="343.5" text-anchor="end">0%</text>
   <text class="tick" x="62" y="273.5" text-anchor="end">25%</text>
@@ -1165,178 +1200,176 @@ Every contrast that removes a part of provenance retrieval lowers recall, with a
   <text class="tick mid" x="280" y="356">75%</text>
   <text class="tick mid" x="350" y="356">100%</text>
   <path class="parity" d="M70 340 L350 60"/>
+  <circle class="us" opacity="0.3" cx="303.3" cy="86.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="350" cy="80" r="4"/>
+  <circle class="us" opacity="0.3" cx="163.3" cy="260" r="4"/>
+  <circle class="us" opacity="0.3" cx="186.7" cy="140" r="4"/>
+  <circle class="us" opacity="0.3" cx="303.3" cy="60" r="4"/>
+  <circle class="us" opacity="0.3" cx="280" cy="180" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="273.3" r="4"/>
   <circle class="us" opacity="0.3" cx="350" cy="60" r="4"/>
-  <circle class="us" opacity="0.3" cx="350" cy="60" r="4"/>
-  <circle class="us" opacity="0.3" cx="163.3" cy="246.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="210" cy="153.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="350" cy="60" r="4"/>
-  <circle class="us" opacity="0.3" cx="303.3" cy="200" r="4"/>
-  <circle class="us" opacity="0.3" cx="132.2" cy="215.6" r="4"/>
-  <circle class="us" opacity="0.3" cx="350" cy="60" r="4"/>
-  <circle class="us" opacity="0.3" cx="182" cy="172" r="4"/>
-  <circle class="us" opacity="0.3" cx="256.7" cy="116" r="4"/>
-  <circle class="us" opacity="0.3" cx="280" cy="83.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="210" cy="60" r="4"/>
-  <circle class="us" opacity="0.3" cx="144.7" cy="228" r="4"/>
-  <circle class="us" opacity="0.3" cx="233.3" cy="223.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="331.3" cy="78.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="163.3" cy="200" r="4"/>
-  <circle class="us" opacity="0.3" cx="275.3" cy="172" r="4"/>
-  <circle class="us" opacity="0.3" cx="116.7" cy="270" r="4"/>
-  <circle class="us" opacity="0.3" cx="210" cy="130" r="4"/>
-  <circle class="us" opacity="0.3" cx="194.4" cy="246.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="233.3" cy="130" r="4"/>
-  <circle class="us" opacity="0.3" cx="163.3" cy="223.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="233.3" cy="153.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="182" cy="302.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="144.7" cy="116" r="4"/>
-  <circle class="us" opacity="0.3" cx="233.3" cy="106.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="238" cy="153.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="163.3" cy="196" r="4"/>
+  <circle class="us" opacity="0.3" cx="228.7" cy="164" r="4"/>
+  <circle class="us" opacity="0.3" cx="256.7" cy="80" r="4"/>
+  <circle class="us" opacity="0.3" cx="268.3" cy="60" r="4"/>
+  <circle class="us" opacity="0.3" cx="172.7" cy="196" r="4"/>
+  <circle class="us" opacity="0.3" cx="186.7" cy="200" r="4"/>
+  <circle class="us" opacity="0.3" cx="331.3" cy="116" r="4"/>
+  <circle class="us" opacity="0.3" cx="140" cy="220" r="4"/>
+  <circle class="us" opacity="0.3" cx="247.3" cy="164" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="240" r="4"/>
+  <circle class="us" opacity="0.3" cx="233.3" cy="150" r="4"/>
+  <circle class="us" opacity="0.3" cx="178.9" cy="246.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="256.7" cy="130" r="4"/>
+  <circle class="us" opacity="0.3" cx="151.7" cy="230" r="4"/>
+  <circle class="us" opacity="0.3" cx="163.3" cy="220" r="4"/>
+  <circle class="us" opacity="0.3" cx="172.7" cy="292" r="4"/>
+  <circle class="us" opacity="0.3" cx="219.3" cy="148" r="4"/>
+  <circle class="us" opacity="0.3" cx="186.7" cy="180" r="4"/>
+  <circle class="us" opacity="0.3" cx="228.7" cy="156" r="4"/>
+  <circle class="us" opacity="0.3" cx="93.3" cy="320" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="280" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="320" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="220" r="4"/>
+  <circle class="us" opacity="0.3" cx="93.3" cy="310" r="4"/>
+  <circle class="us" opacity="0.3" cx="198.3" cy="220" r="4"/>
+  <circle class="us" opacity="0.3" cx="245" cy="140" r="4"/>
+  <circle class="us" opacity="0.3" cx="175" cy="220" r="4"/>
+  <circle class="us" opacity="0.3" cx="291.7" cy="190" r="4"/>
+  <circle class="us" opacity="0.3" cx="128.3" cy="280" r="4"/>
+  <circle class="us" opacity="0.3" cx="315" cy="100" r="4"/>
+  <circle class="us" opacity="0.3" cx="338.3" cy="70" r="4"/>
+  <circle class="us" opacity="0.3" cx="256.7" cy="140" r="4"/>
+  <circle class="us" opacity="0.3" cx="151.7" cy="190" r="4"/>
+  <circle class="us" opacity="0.3" cx="175" cy="210" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="300" r="4"/>
+  <circle class="us" opacity="0.3" cx="163.3" cy="320" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="320" r="4"/>
+  <circle class="us" opacity="0.3" cx="85.6" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="300" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="326.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="93.3" cy="260" r="4"/>
+  <circle class="us" opacity="0.3" cx="93.3" cy="320" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="320" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="326.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
   <circle class="us" opacity="0.3" cx="93.3" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="93.3" cy="316.7" r="4"/>
   <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="116.7" cy="130" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="316.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="186.7" cy="246.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="210" cy="153.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="233.3" cy="246.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="280" cy="200" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="246.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="350" cy="106.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="350" cy="83.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="256.7" cy="223.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="163.3" cy="106.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="163.3" cy="223.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="260" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="320" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="300" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="300" r="4"/>
   <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
   <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
   <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="101.1" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="163.3" cy="293.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="101.1" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="101.1" cy="308.9" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="116.7" cy="246.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="116.7" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="293.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="140" cy="260" r="4"/>
   <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
   <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
   <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="326.7" r="4"/>
   <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
   <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
   <circle class="us" opacity="0.3" cx="116.7" cy="340" r="4"/>
   <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="280" r="4"/>
+  <circle class="us" opacity="0.3" cx="81.7" cy="330" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="260" r="4"/>
   <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
   <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="163.3" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="293.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="151.7" cy="200" r="4"/>
+  <circle class="us" opacity="0.3" cx="210" cy="170" r="4"/>
+  <circle class="us" opacity="0.3" cx="268.3" cy="140" r="4"/>
+  <circle class="us" opacity="0.3" cx="334.4" cy="140" r="4"/>
+  <circle class="us" opacity="0.3" cx="210" cy="180" r="4"/>
+  <circle class="us" opacity="0.3" cx="128.3" cy="140" r="4"/>
+  <circle class="us" opacity="0.3" cx="85.6" cy="220" r="4"/>
+  <circle class="us" opacity="0.3" cx="194.4" cy="140" r="4"/>
+  <circle class="us" opacity="0.3" cx="338.3" cy="70" r="4"/>
+  <circle class="us" opacity="0.3" cx="256.7" cy="140" r="4"/>
+  <circle class="us" opacity="0.3" cx="294" cy="108" r="4"/>
+  <circle class="us" opacity="0.3" cx="291.7" cy="80" r="4"/>
+  <circle class="us" opacity="0.3" cx="172.7" cy="244" r="4"/>
+  <circle class="us" opacity="0.3" cx="219.3" cy="180" r="4"/>
+  <circle class="us" opacity="0.3" cx="284.7" cy="148" r="4"/>
+  <circle class="us" opacity="0.3" cx="210" cy="204" r="4"/>
   <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="324" r="4"/>
+  <circle class="us" opacity="0.3" cx="126" cy="292" r="4"/>
+  <circle class="us" opacity="0.3" cx="144.7" cy="252" r="4"/>
+  <circle class="us" opacity="0.3" cx="175" cy="230" r="4"/>
+  <circle class="us" opacity="0.3" cx="191.3" cy="188" r="4"/>
+  <circle class="us" opacity="0.3" cx="280" cy="60" r="4"/>
+  <circle class="us" opacity="0.3" cx="294" cy="92" r="4"/>
+  <circle class="us" opacity="0.3" cx="228.7" cy="140" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="268" r="4"/>
+  <circle class="us" opacity="0.3" cx="154" cy="268" r="4"/>
+  <circle class="us" opacity="0.3" cx="294" cy="116" r="4"/>
+  <circle class="us" opacity="0.3" cx="294" cy="100" r="4"/>
+  <circle class="us" opacity="0.3" cx="81.7" cy="330" r="4"/>
+  <circle class="us" opacity="0.3" cx="105" cy="300" r="4"/>
+  <circle class="us" opacity="0.3" cx="140" cy="280" r="4"/>
   <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="240" r="4"/>
+  <circle class="us" opacity="0.3" cx="93.3" cy="290" r="4"/>
+  <circle class="us" opacity="0.3" cx="198.3" cy="180" r="4"/>
+  <circle class="us" opacity="0.3" cx="128.3" cy="210" r="4"/>
   <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="163.3" cy="293.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="116.7" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="293.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="93.3" cy="316.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="293.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="116.7" cy="176.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="210" cy="176.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="233.3" cy="130" r="4"/>
-  <circle class="us" opacity="0.3" cx="350" cy="215.6" r="4"/>
-  <circle class="us" opacity="0.3" cx="194.4" cy="184.4" r="4"/>
-  <circle class="us" opacity="0.3" cx="93.3" cy="60" r="4"/>
-  <circle class="us" opacity="0.3" cx="101.1" cy="215.6" r="4"/>
-  <circle class="us" opacity="0.3" cx="194.4" cy="184.4" r="4"/>
-  <circle class="us" opacity="0.3" cx="326.7" cy="60" r="4"/>
-  <circle class="us" opacity="0.3" cx="233.3" cy="130" r="4"/>
-  <circle class="us" opacity="0.3" cx="294" cy="97.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="326.7" cy="83.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="163.3" cy="228" r="4"/>
-  <circle class="us" opacity="0.3" cx="238" cy="116" r="4"/>
-  <circle class="us" opacity="0.3" cx="256.7" cy="134.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="238" cy="190.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="302.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="126" cy="302.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="144.7" cy="302.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="116.7" cy="246.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="182" cy="265.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="210" cy="60" r="4"/>
-  <circle class="us" opacity="0.3" cx="312.7" cy="60" r="4"/>
-  <circle class="us" opacity="0.3" cx="107.3" cy="153.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="88.7" cy="302.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="238" cy="302.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="275.3" cy="116" r="4"/>
+  <circle class="us" opacity="0.3" cx="268.3" cy="110" r="4"/>
+  <circle class="us" opacity="0.3" cx="151.7" cy="300" r="4"/>
   <circle class="us" opacity="0.3" cx="350" cy="60" r="4"/>
-  <circle class="us" opacity="0.3" cx="93.3" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="93.3" cy="316.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="116.7" cy="270" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
   <circle class="us" opacity="0.3" cx="116.7" cy="200" r="4"/>
-  <circle class="us" opacity="0.3" cx="116.7" cy="316.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="233.3" cy="176.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="93.3" cy="200" r="4"/>
-  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
-  <circle class="us" opacity="0.3" cx="256.7" cy="153.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="140" cy="316.7" r="4"/>
-  <circle class="us" opacity="0.3" cx="350" cy="60" r="4"/>
-  <circle class="us" opacity="0.3" cx="116.7" cy="223.3" r="4"/>
-  <circle class="us" opacity="0.3" cx="350" cy="60" r="4"/>
+  <circle class="us" opacity="0.3" cx="291.7" cy="60" r="4"/>
   <text class="t-dim" x="82" y="76">C1 higher</text>
   <text class="t-dim" x="338" y="330" text-anchor="end">B1 higher</text>
   <text class="t-dim mid" x="210" y="372">B1 recall · projection held</text>
   <text class="t-dim" x="70" y="52">C1 recall · reprojecting</text>
-  <text class="v-us" x="396" y="110">51</text>
+  <text class="v-us" x="396" y="110">71</text>
   <text class="cat-sub" x="396" y="126">above the diagonal: C1 recalls more</text>
   <text class="v-them" x="396" y="166">29</text>
   <text class="cat-sub" x="396" y="182">below it: B1 recalls more</text>
-  <text class="v-them" x="396" y="222">48</text>
+  <text class="v-them" x="396" y="222">28</text>
   <text class="cat-sub" x="396" y="238">on it: the same recall</text>
 </svg>
 </figure>
 
-The gain is broad: 51 of 128 questions sit above the diagonal, 29 below and 48 on it.
+The gain is broad: 71 of 128 questions sit above the diagonal, 29 below and 28 on it.
 
 <figure class="fig">
-<svg viewBox="0 0 640 174" role="img" aria-label="Figure 9.12-4. The gain in mean recall of reprojecting during the reasoning (C1) over the held projection (B1), split by whether the question names its answer file, with 95% bootstrap intervals: Names its file (n=17), −3.1 points (−11.2 to +4.1); Does not (n=111), +5.8 points (+2.2 to +9.7).">
+<svg viewBox="0 0 640 174" role="img" aria-label="Figure 9.12-4. The gain in mean recall of reprojecting during the reasoning (C1) over the held projection (B1), split by whether the question names its answer file, with 95% bootstrap intervals: Names its file (n=17), +2.6 points (−2.3 to +7.2); Does not (n=111), +5.7 points (+3.5 to +8.0).">
   <text class="ttl" x="16" y="20">Figure 9.12-4 · Where the gain falls</text>
   <text class="ttl-sub" x="16" y="38">C1 − B1 in mean recall, points · 95% bootstrap interval over questions</text>
-  <path class="grid" d="M372 66 V150 M418.4 66 V150 M464.8 66 V150 M511.2 66 V150 M557.6 66 V150 M604 66 V150"/>
-  <text class="tick mid" x="372" y="164">−15</text>
-  <text class="tick mid" x="418.4" y="164">−10</text>
-  <text class="tick mid" x="464.8" y="164">−5</text>
-  <text class="tick mid" x="511.2" y="164">0</text>
-  <text class="tick mid" x="557.6" y="164">+5</text>
+  <path class="grid" d="M372 66 V150 M449.3 66 V150 M526.7 66 V150 M604 66 V150"/>
+  <text class="tick mid" x="372" y="164">−5</text>
+  <text class="tick mid" x="449.3" y="164">0</text>
+  <text class="tick mid" x="526.7" y="164">+5</text>
   <text class="tick mid" x="604" y="164">+10</text>
-  <path class="parity" d="M511.2 66 V150"/>
+  <path class="parity" d="M449.3 66 V150"/>
   <text class="cat" x="16" y="82">Names its file (n=17)</text>
   <text class="cat-sub" x="16" y="96">the question names its answer file</text>
-  <path class="line-us" opacity="0.45" d="M407.5 84 H549.4"/>
-  <circle class="dot-us" opacity="0.45" cx="482.1" cy="84" r="6"/>
-  <text class="v-them mid" x="482.1" y="74">−3.1</text>
+  <path class="line-us" opacity="0.45" d="M413.7 84 H560"/>
+  <circle class="dot-us" opacity="0.45" cx="489.6" cy="84" r="6"/>
+  <text class="v-them mid" x="489.6" y="74">+2.6</text>
   <text class="cat" x="16" y="122">Does not (n=111)</text>
   <text class="cat-sub" x="16" y="136">the question leaves its answer file unnamed</text>
-  <path class="line-us" d="M531.3 124 H601.3"/>
-  <circle class="dot-us" cx="565.3" cy="124" r="6"/>
-  <text class="v-us mid" x="565.3" y="114">+5.8</text>
+  <path class="line-us" d="M503.3 124 H573.8"/>
+  <circle class="dot-us" cx="537.8" cy="124" r="6"/>
+  <text class="v-us mid" x="537.8" y="114">+5.7</text>
 </svg>
 </figure>
 
-The gain lies on the 111 questions that do not name their answer's file, 5.8 points (2.2 to 9.7); on the 17 that do it is −3.1 (−11.2 to 4.1), indistinguishable from zero — a split fixed before any run. What the question names, the opening finds; what it does not, the reasoning reaches, and only a reprojection inside the reasoning places it while the reasoning can use it.
+The gain lies on the 111 questions that do not name their answer's file, 5.7 points (3.5 to 8.0); on the 17 that do it is 2.6 (−2.3 to 7.2), indistinguishable from zero — a split fixed before any run. What the question names, the opening finds; what it does not, the reasoning reaches, and only a reprojection inside the reasoning places it while the reasoning can use it.
 
 <figure class="fig">
-<svg viewBox="0 0 640 324" role="img" aria-label="Figure 9.12-5. The share of answers whose projection held an answer file, by decoded token, with 95% bootstrap bands: C1 from 51.6% at the first token to 57.8% at token 4,096; B1 from 51.6% at the first token to 54.9% at token 4,096; D1 from 48.7% at the first token to 54.9% at token 4,096.">
+<svg viewBox="0 0 640 324" role="img" aria-label="Figure 9.12-5. The share of answers whose projection held an answer file, by decoded token, with 95% bootstrap bands: C1 from 51.5% at the first token to 58.6% at token 4,096; B1 from 51.6% at the first token to 56.2% at token 4,096; D1 from 48.7% at the first token to 54.9% at token 4,096.">
   <text class="ttl" x="16" y="20">Figure 9.12-5 · Retrieval as the reasoning proceeds</text>
   <text class="ttl-sub" x="16" y="38">answers with an answer file placed, by decoded token · band: 95% bootstrap interval</text>
   <path class="grid" d="M62 210 H616 M62 140 H616 M62 70 H616"/>
@@ -1352,11 +1385,11 @@ The gain lies on the 111 questions that do not name their answer's file, 5.8 poi
   <text class="tick mid" x="477.5" y="296">3,072</text>
   <text class="tick mid" x="616" y="296">4,096</text>
   <text class="t-dim mid" x="339" y="314">decoded token</text>
-  <path class="area-us" d="M62 142.6 L70.7 144.4 L79.3 98.8 L88 102.4 L96.6 102.4 L105.3 104.3 L113.9 111.6 L122.6 111.6 L131.3 109.7 L139.9 118.9 L148.6 106.1 L157.2 113.4 L165.9 109.7 L174.5 111.6 L183.2 102.4 L191.8 107.9 L200.5 117 L209.2 115.2 L217.8 106.1 L226.5 111.5 L235.1 104.3 L243.8 97 L252.4 107.9 L261.1 104.3 L269.8 107.9 L278.4 104.3 L287.1 100.6 L295.7 102.4 L304.4 106.1 L313 100.6 L321.7 100.6 L330.3 98.8 L339 102.4 L347.7 102.4 L356.3 104.3 L365 104.2 L373.6 104.3 L382.3 106.1 L390.9 106.1 L399.6 102.4 L408.3 104.3 L416.9 102.4 L425.6 104.3 L434.2 104.3 L442.9 102.4 L451.5 102.4 L460.2 104.3 L468.8 100.6 L477.5 104.3 L486.2 102.4 L494.8 104.3 L503.5 106.1 L512.1 106.1 L520.8 106.1 L529.4 104.3 L538.1 104.3 L546.8 104.3 L555.4 104.3 L564.1 104.3 L572.7 104.3 L581.4 102.4 L590 104.3 L598.7 104.3 L607.3 102.4 L616 102.4 L616 210 L607.3 210 L598.7 211.8 L590 211.8 L581.4 210 L572.7 211.8 L564.1 211.8 L555.4 211.8 L546.8 211.8 L538.1 211.8 L529.4 211.8 L520.8 213.6 L512.1 213.6 L503.5 213.6 L494.8 211.8 L486.2 210 L477.5 211.8 L468.8 208.2 L460.2 211.8 L451.5 210 L442.9 210 L434.2 211.8 L425.6 211.8 L416.9 210 L408.3 211.8 L399.6 210 L390.9 213.6 L382.3 213.6 L373.6 213.6 L365 211.8 L356.3 211.8 L347.7 210 L339 210 L330.3 204.5 L321.7 208.2 L313 206.4 L304.4 213.6 L295.7 210 L287.1 208.2 L278.4 211.8 L269.8 215.5 L261.1 211.8 L252.4 215.5 L243.8 200.9 L235.1 211.8 L226.5 219.1 L217.8 213.6 L209.2 222.8 L200.5 224.6 L191.8 213.6 L183.2 206.4 L174.5 215.5 L165.9 215.5 L157.2 219.1 L148.6 211.8 L139.9 224.6 L131.3 215.5 L122.6 217.3 L113.9 219.1 L105.3 210 L96.6 208.2 L88 208.2 L79.3 208.2 L70.7 255.6 L62 253.8 Z"/>
-  <path class="them" opacity="0.12" d="M62 144.4 L70.7 144.4 L79.3 144.4 L88 142.6 L96.6 142.6 L105.3 138.9 L113.9 140.7 L122.6 133.4 L131.3 137.1 L139.9 135.3 L148.6 131.6 L157.2 124.3 L165.9 126.1 L174.5 128 L183.2 126.1 L191.8 133.4 L200.5 133.4 L209.2 128 L217.8 122.5 L226.5 120.7 L235.1 122.5 L243.8 118.9 L252.4 120.7 L261.1 118.9 L269.8 118.9 L278.4 118.9 L287.1 117 L295.7 118.9 L304.4 118.9 L313 117 L321.7 122.5 L330.3 122.5 L339 120.7 L347.7 118.9 L356.3 120.7 L365 126.1 L373.6 122.5 L382.3 118.9 L390.9 120.7 L399.6 122.5 L408.3 122.5 L416.9 122.5 L425.6 120.7 L434.2 118.9 L442.9 120.7 L451.5 120.7 L460.2 120.7 L468.8 120.7 L477.5 120.7 L486.2 120.7 L494.8 122.5 L503.5 120.7 L512.1 120.7 L520.8 122.5 L529.4 122.5 L538.1 122.5 L546.8 120.7 L555.4 118.9 L564.1 122.5 L572.7 118.9 L581.4 118.9 L590 118.9 L598.7 118.9 L607.3 118.9 L616 120.7 L616 230.1 L607.3 228.2 L598.7 228.2 L590 228.2 L581.4 228.2 L572.7 228.2 L564.1 231.9 L555.4 228.2 L546.8 230.1 L538.1 231.9 L529.4 231.9 L520.8 231.9 L512.1 230.1 L503.5 230.1 L494.8 231.9 L486.2 228.2 L477.5 228.2 L468.8 230.1 L460.2 230.1 L451.5 230.1 L442.9 230.1 L434.2 228.2 L425.6 230.1 L416.9 231.9 L408.3 231.9 L399.6 231.9 L390.9 230.1 L382.3 226.4 L373.6 230.1 L365 233.7 L356.3 228.2 L347.7 226.4 L339 228.2 L330.3 230.1 L321.7 230.1 L313 224.6 L304.4 226.4 L295.7 226.4 L287.1 224.6 L278.4 226.4 L269.8 226.4 L261.1 226.4 L252.4 226.4 L243.8 226.4 L235.1 230.1 L226.5 228.2 L217.8 230.1 L209.2 235.5 L200.5 241 L191.8 241 L183.2 233.7 L174.5 235.5 L165.9 231.9 L157.2 231.9 L148.6 239.2 L139.9 242.8 L131.3 244.6 L122.6 242.8 L113.9 250.1 L105.3 248.3 L96.6 251.9 L88 251.9 L79.3 253.8 L70.7 253.8 L62 253.8 Z"/>
-  <path class="line-them dash" d="M62 219.1 L70.7 219.1 L79.3 219.1 L88 219.1 L96.6 219.1 L105.3 219.1 L113.9 213.6 L122.6 213.6 L131.3 213.6 L139.9 211.8 L148.6 211.8 L157.2 206.4 L165.9 206.4 L174.5 206.4 L183.2 204.5 L191.8 202.7 L200.5 200.9 L209.2 199.1 L217.8 197.2 L226.5 197.2 L235.1 193.6 L243.8 193.6 L252.4 193.6 L261.1 193.6 L269.8 191.8 L278.4 191.8 L287.1 189.9 L295.7 189.9 L304.4 188.1 L313 184.5 L321.7 184.5 L330.3 182.7 L339 182.7 L347.7 182.7 L356.3 179 L365 177.2 L373.6 177.2 L382.3 177.2 L390.9 177.2 L399.6 177.2 L408.3 177.2 L416.9 177.2 L425.6 177.2 L434.2 177.2 L442.9 177.2 L451.5 177.2 L460.2 177.2 L468.8 177.2 L477.5 175.4 L486.2 175.4 L494.8 175.4 L503.5 175.4 L512.1 175.4 L520.8 175.4 L529.4 175.4 L538.1 175.4 L546.8 175.4 L555.4 175.4 L564.1 175.4 L572.7 175.4 L581.4 175.4 L590 175.4 L598.7 175.4 L607.3 175.4 L616 175.4"/>
-  <path class="line-them" d="M62 199.1 L70.7 199.1 L79.3 199.1 L88 197.2 L96.6 197.2 L105.3 193.6 L113.9 195.4 L122.6 188.1 L131.3 191.8 L139.9 189.9 L148.6 186.3 L157.2 179 L165.9 179 L174.5 182.7 L183.2 180.8 L191.8 188.1 L200.5 188.1 L209.2 182.7 L217.8 177.2 L226.5 175.4 L235.1 177.2 L243.8 173.5 L252.4 173.5 L261.1 173.5 L269.8 173.5 L278.4 173.5 L287.1 171.7 L295.7 173.5 L304.4 173.5 L313 171.7 L321.7 177.2 L330.3 177.2 L339 175.4 L347.7 173.5 L356.3 175.4 L365 180.8 L373.6 177.2 L382.3 173.5 L390.9 175.4 L399.6 177.2 L408.3 177.2 L416.9 177.2 L425.6 175.4 L434.2 173.5 L442.9 175.4 L451.5 175.4 L460.2 175.4 L468.8 175.4 L477.5 175.4 L486.2 175.4 L494.8 177.2 L503.5 175.4 L512.1 175.4 L520.8 177.2 L529.4 177.2 L538.1 177.2 L546.8 175.4 L555.4 173.5 L564.1 177.2 L572.7 173.5 L581.4 173.5 L590 173.5 L598.7 173.5 L607.3 173.5 L616 175.4"/>
-  <path class="line-us" d="M62 199.1 L70.7 200.9 L79.3 153.5 L88 155.3 L96.6 155.3 L105.3 157.1 L113.9 164.4 L122.6 164.4 L131.3 162.6 L139.9 171.7 L148.6 159 L157.2 166.2 L165.9 162.6 L174.5 162.6 L183.2 153.5 L191.8 160.8 L200.5 169.9 L209.2 168.1 L217.8 159 L226.5 164.4 L235.1 157.1 L243.8 148 L252.4 160.8 L261.1 157.1 L269.8 160.8 L278.4 157.1 L287.1 153.5 L295.7 155.3 L304.4 159 L313 153.5 L321.7 153.5 L330.3 151.7 L339 155.3 L347.7 155.3 L356.3 157.1 L365 157.1 L373.6 159 L382.3 159 L390.9 159 L399.6 155.3 L408.3 157.1 L416.9 155.3 L425.6 157.1 L434.2 157.1 L442.9 155.3 L451.5 155.3 L460.2 157.1 L468.8 153.5 L477.5 157.1 L486.2 155.3 L494.8 157.1 L503.5 159 L512.1 159 L520.8 159 L529.4 157.1 L538.1 157.1 L546.8 157.1 L555.4 157.1 L564.1 157.1 L572.7 157.1 L581.4 155.3 L590 157.1 L598.7 157.1 L607.3 155.3 L616 155.3"/>
+  <path class="area-us" d="M62 145.9 70.7 145.9 79.3 96.7 88 100.6 96.6 102.9 105.3 108.4 113.9 109.2 122.6 108.4 131.3 105.3 139.9 112.3 148.6 103 157.2 106.9 165.9 109.2 174.5 110 183.2 101.4 191.8 104.5 200.5 109.2 209.2 107.6 217.8 99.8 226.5 103.8 235.1 102.2 243.8 98.3 252.4 104.5 261.1 103 269.8 106.1 278.4 103 287.1 100.6 295.7 100.6 304.4 103.7 313 100.6 321.7 101.4 330.3 100.6 339 102.2 347.7 99.8 356.3 100.6 365 102.2 373.6 99.1 382.3 99.8 390.9 99.1 399.6 98.3 408.3 99.1 416.9 99.8 425.6 101.4 434.2 100.6 442.9 98.3 451.5 99.1 460.2 99.8 468.8 99.1 486.2 99.1 494.8 99.8 503.5 99.1 512.1 99.1 520.8 99.8 529.4 99.1 538.1 99.8 555.4 99.8 564.1 101.4 572.7 99.8 581.4 98.3 590 99.1 598.7 99.1 607.3 99.8 616 99.1 616 201.4 590 201.4 581.4 200.6 572.7 202.2 564.1 203.8 555.4 203 546.8 202.2 529.4 202.2 520.8 203 512.1 202.2 503.5 202.2 494.8 203 486.2 202.2 477.5 202.2 468.8 201.4 460.2 203 451.5 203 442.9 201.4 434.2 203.7 425.6 204.5 416.9 203 408.3 202.2 399.6 201.4 390.9 202.2 382.3 203 373.6 202.2 365 205.3 356.3 203.7 347.7 203.7 339 206.1 330.3 204.5 321.7 205.3 313 204.5 304.4 206.9 295.7 203 287.1 203.7 278.4 206.1 269.8 209.2 261.1 206.1 252.4 206.9 243.8 199.1 235.1 203.8 226.5 205.3 217.8 200.6 209.2 208.4 200.5 211.6 191.8 206.9 183.2 203.8 174.5 212.3 165.9 211.6 157.2 208.4 148.6 205.3 139.9 213.9 131.3 206.9 122.6 209.2 113.9 212.3 105.3 210.8 96.6 205.3 88 204.5 79.3 199.8 70.7 252.2 62 252.2 Z"/>
+  <path class="them" opacity="0.12" d="M62 144.4 88 144.4 96.6 143.4 105.3 139.8 113.9 139.8 122.6 135.3 131.3 140.7 139.9 138 148.6 134.3 157.2 129.8 165.9 128.9 174.5 131.6 183.2 129.8 191.8 130.7 200.5 128 209.2 122.5 217.8 120.7 226.5 121.6 235.1 118.9 243.8 118.9 252.4 120.7 261.1 119.7 269.8 117 278.4 117 287.1 115.2 295.7 117 313 117 321.7 121.6 330.3 120.7 339 117.9 347.7 116.1 356.3 116.1 365 118.9 373.6 117.9 382.3 116.1 390.9 117 399.6 117.9 408.3 117 416.9 117 425.6 116.1 434.2 115.2 442.9 116.1 486.2 116.1 494.8 115.2 503.5 114.3 512.1 114.3 520.8 116.1 538.1 116.1 546.8 115.2 555.4 114.3 564.1 115.2 572.7 115.2 581.4 114.3 607.3 114.3 616 115.2 616 217.3 607.3 216.4 581.4 216.4 572.7 217.3 564.1 217.3 555.4 216.4 546.8 217.3 538.1 218.2 520.8 218.2 512.1 216.4 503.5 216.4 494.8 217.3 477.5 217.3 468.8 218.2 442.9 218.2 434.2 217.3 425.6 218.2 416.9 219.1 408.3 219.1 399.6 220.9 390.9 220 382.3 218.2 373.6 220.9 365 221.8 356.3 218.2 347.7 218.2 330.3 221.8 321.7 222.8 313 219.1 304.4 218.2 295.7 218.2 287.1 216.4 278.4 218.2 269.8 218.2 261.1 221.8 252.4 221 243.8 219.1 235.1 220 226.5 222.8 217.8 220.9 209.2 224.6 200.5 230.1 191.8 232.8 183.2 233.7 174.5 234.6 165.9 232.8 157.2 233.7 148.6 238.3 139.9 242.8 131.3 246.5 122.6 241.9 113.9 246.5 105.3 246.5 96.6 250.1 88 251 79.3 251.9 62 251.9 Z"/>
+  <path class="line-them dash" d="M62 219.1 105.3 219.1 113.9 213.6 131.3 213.6 139.9 211.8 148.6 211.8 157.2 206.4 174.5 206.4 183.2 204.5 191.8 202.7 209.2 199.1 217.8 197.2 226.5 197.2 235.1 193.6 261.1 193.6 269.8 191.8 278.4 191.8 287.1 189.9 295.7 189.9 304.4 188.1 313 184.5 321.7 184.5 330.3 182.7 347.7 182.7 356.3 179 365 177.2 468.8 177.2 477.5 175.4 616 175.4"/>
+  <path class="line-them" d="M62 199.1 79.3 199.1 88 198.2 96.6 197.2 105.3 193.6 113.9 193.6 122.6 189 131.3 193.6 139.9 190.9 148.6 187.2 157.2 182.7 165.9 181.7 174.5 183.6 183.2 182.7 191.8 182.7 200.5 179.9 209.2 174.5 217.8 171.7 226.5 172.6 235.1 170.8 243.8 169.9 252.4 171.7 261.1 170.8 269.8 168.1 278.4 168.1 287.1 166.3 295.7 168.1 304.4 168.1 313 169 321.7 172.6 330.3 171.7 347.7 168.1 356.3 168.1 365 170.8 373.6 169.9 382.3 168.1 390.9 169 399.6 169.9 408.3 169 416.9 169 425.6 168.1 434.2 167.2 442.9 168.1 468.8 168.1 477.5 167.2 486.2 167.2 494.8 166.3 503.5 165.3 512.1 165.3 520.8 167.2 538.1 167.2 546.8 166.3 555.4 165.3 564.1 166.3 572.7 166.3 581.4 165.3 607.3 165.3 616 166.3"/>
+  <path class="line-us" d="M62 199.8 70.7 199.8 79.3 148.3 88 152.2 96.6 153.8 105.3 159.2 113.9 160.8 122.6 158.4 131.3 156.1 139.9 163.1 148.6 153.7 157.2 156.9 165.9 160 174.5 160.8 183.2 152.2 191.8 155.3 200.5 160 209.2 157.7 217.8 149.8 226.5 153.8 235.1 152.2 243.8 148.3 252.4 155.3 261.1 153.8 269.8 156.9 278.4 153.8 287.1 151.4 295.7 151.4 304.4 154.5 313 152.2 321.7 153 330.3 152.2 339 153.8 347.7 151.4 356.3 151.4 365 153 373.6 149.8 382.3 150.6 390.9 149.8 399.6 149.1 408.3 149.8 416.9 150.6 425.6 152.2 434.2 151.4 442.9 149.1 451.5 150.6 460.2 150.6 468.8 149.8 486.2 149.8 494.8 150.6 503.5 149.8 512.1 149.8 520.8 150.6 529.4 149.8 538.1 150.6 555.4 150.6 564.1 152.2 572.7 150.6 581.4 149.1 590 149.8 616 149.8"/>
   <g class="legend">
   <path class="line-us" d="M330 53 H344"/>
   <text x="348" y="56">C1 reprojecting</text>
@@ -1368,10 +1401,10 @@ The gain lies on the 111 questions that do not name their answer's file, 5.8 poi
 </svg>
 </figure>
 
-With reprojection the share of answers with an answer file in the working set jumps from 51.6% at the opening to 58.1% by the 128th decoded token, inside the reasoning's first two reprojection intervals, and holds there. Held or retrieved once, it stays at the opening's 51.6% or 48.7% until the reasoning ends, and only then climbs — to 54.9% by token 4,096 — as those arms' answers reproject: the file arrives, but after the thought that needed it.
+With reprojection the share of answers with an answer file in the working set jumps from 51.5% at the opening to 58.8% by the 128th decoded token, inside the reasoning's first two reprojection intervals, and holds there. Held or retrieved once, it stays at the opening's 51.6% or 48.7% until the reasoning ends, and only then climbs — to 56.2% and 54.9% by token 4,096 — as those arms' answers reproject: the file arrives, but after the thought that needed it.
 
 <figure class="fig">
-<svg viewBox="0 0 640 188" role="img" aria-label="Figure 9.12-6. Mean recall of the answers by whether their projection held an answer file for the first answer token, with 95% bootstrap intervals: answer file placed (1,025 answers): 51.1% (49.0% to 53.3%); not placed (895 answers): 13.9% (12.0% to 15.8%).">
+<svg viewBox="0 0 640 188" role="img" aria-label="Figure 9.12-6. Mean recall of the answers by whether their projection held an answer file for the first answer token, with 95% bootstrap intervals: answer file placed (1,534 answers): 51.4% (49.6% to 53.2%); not placed (1,282 answers): 13.7% (12.1% to 15.3%).">
   <text class="ttl" x="16" y="20">Figure 9.12-6 · Recall when the answer file is in view</text>
   <text class="ttl-sub" x="16" y="38">mean recall by whether an answer file was placed for the first answer token · 95% interval</text>
   <path class="grid" d="M250 66 V162 M308.3 66 V162 M366.7 66 V162 M425 66 V162 M483.3 66 V162 M541.7 66 V162 M600 66 V162"/>
@@ -1383,19 +1416,62 @@ With reprojection the share of answers with an answer file in the working set ju
   <text class="tick mid" x="541.7" y="176">50%</text>
   <text class="tick mid" x="600" y="176">60%</text>
   <text class="cat" x="16" y="84">Answer file placed</text>
-  <text class="cat-sub" x="16" y="98">1,025 answers</text>
-  <rect class="us" x="250" y="75" width="298.3" height="22"/>
-  <path class="grid base" d="M535.6 80 V92 M535.6 86 H561.2 M561.2 80 V92"/>
-  <text class="v-us" x="569.2" y="90">51.1%</text>
+  <text class="cat-sub" x="16" y="98">1,534 answers</text>
+  <rect class="us" x="250" y="75" width="299.8" height="22"/>
+  <path class="grid base" d="M539.4 80 V92 M539.4 86 H560.5 M560.5 80 V92"/>
+  <text class="v-us" x="568.5" y="90">51.4%</text>
   <text class="cat" x="16" y="130">Not placed</text>
-  <text class="cat-sub" x="16" y="144">895 answers</text>
-  <rect class="us-soft" x="250" y="121" width="81.2" height="22"/>
-  <path class="grid base" d="M320.2 126 V138 M320.2 132 H342.3 M342.3 126 V138"/>
-  <text class="v-us" x="350.3" y="136">13.9%</text>
+  <text class="cat-sub" x="16" y="144">1,282 answers</text>
+  <rect class="us-soft" x="250" y="121" width="80" height="22"/>
+  <path class="grid base" d="M320.9 126 V138 M320.9 132 H339.1 M339.1 126 V138"/>
+  <text class="v-us" x="347.1" y="136">13.7%</text>
 </svg>
 </figure>
 
-Over 1,920 answers in the projecting arms, recall is 51.1% (49.0–53.3%) with the answer file placed for the first answer token and 13.9% (12.0–15.8%) without it: retrieval and the answers are one measurement seen twice.
+Over 2,816 answers in the projecting arms, recall is 51.4% (49.6–53.2%) with the answer file placed for the first answer token and 13.7% (12.1–15.3%) without it: retrieval and the answers are one measurement seen twice.
+
+**Against retrieval-augmented generation.** R1 hands the model the files BM25 ranks best for the question, as text, under a 24,000-token budget; T1 reads the repository with tools. Their contrasts form a second Holm family, so the five above are corrected without them:
+
+<figure class="fig">
+<svg viewBox="0 0 640 214" role="img" aria-label="Figure 9.12-2b. The effect of each contrast on mean recall over 128 paired questions, with its 95% bootstrap interval and Holm-corrected Wilcoxon p-value: the memory against BM25 retrieval (C1 − R1 · Holm p = 4.3e-4), −15.1 points (−23.0 to −7.1); the memory against tool use (C1 − T1 · Holm p = 3.0e-21), −57.8 points (−64.1 to −51.5); BM25 retrieval against the seed files (R1 − A1 · Holm p = 1.3e-18), +52.1 points (+45.6 to +58.4).">
+  <text class="ttl" x="16" y="20">Figure 9.12-2b · The memory against the baselines</text>
+  <text class="ttl-sub" x="16" y="38">paired difference in mean recall, points · 128 questions · 95% interval · faded: Holm p ≥ 0.05</text>
+  <path class="grid" d="M372 66 V190 M389.8 66 V190 M407.7 66 V190 M425.5 66 V190 M443.4 66 V190 M461.2 66 V190 M479.1 66 V190 M496.9 66 V190 M514.8 66 V190 M532.6 66 V190 M550.5 66 V190 M568.3 66 V190 M586.2 66 V190 M604 66 V190"/>
+  <text class="tick mid" x="372" y="204">−70</text>
+  <text class="tick mid" x="407.7" y="204">−50</text>
+  <text class="tick mid" x="443.4" y="204">−30</text>
+  <text class="tick mid" x="479.1" y="204">−10</text>
+  <text class="tick mid" x="496.9" y="204">0</text>
+  <text class="tick mid" x="532.6" y="204">+20</text>
+  <text class="tick mid" x="568.3" y="204">+40</text>
+  <text class="tick mid" x="604" y="204">+60</text>
+  <path class="parity" d="M496.9 66 V190"/>
+  <text class="cat" x="16" y="82">The memory against BM25 retrieval</text>
+  <text class="cat-sub" x="16" y="96">C1 − R1 · Holm p = 4.3e-4</text>
+  <path class="line-us" d="M455.9 84 H484.2"/>
+  <circle class="dot-us" cx="470" cy="84" r="6"/>
+  <text class="v-us mid" x="470" y="74">−15.1</text>
+  <text class="cat" x="16" y="122">The memory against tool use</text>
+  <text class="cat-sub" x="16" y="136">C1 − T1 · Holm p = 3.0e-21</text>
+  <path class="line-us" d="M382.6 124 H405"/>
+  <circle class="dot-us" cx="393.7" cy="124" r="6"/>
+  <text class="v-us mid" x="393.7" y="114">−57.8</text>
+  <text class="cat" x="16" y="162">BM25 retrieval against the seed files</text>
+  <text class="cat-sub" x="16" y="176">R1 − A1 · Holm p = 1.3e-18</text>
+  <path class="line-us" d="M578.4 164 H601.2"/>
+  <circle class="dot-us" cx="589.9" cy="164" r="6"/>
+  <text class="v-us mid" x="589.9" y="154">+52.1</text>
+</svg>
+</figure>
+
+BM25 retrieval recalls 52.6% (46.1–58.9%) against the memory's 37.5%, 15.1 points (7.1 to 23.0) more. To find where, each expected item of C1's seventh run and R1's fourth was looked for in the text the model held as its answer began — for C1, the bodies of the turns the governing projection point injected; for R1, the files its prompt carried — by the same spellings recall matches (`zend/examples/dependency_battery/view.rs`):
+
+| Arm | Items | In an answer file's text | Named, when there | Named, when not | Anywhere in view | Named, when anywhere |
+|---|---:|---:|---:|---:|---:|---:|
+| C1 (the memory) | 445 | **48.5%** | 69.9% | 14.0% | **60.4%** | 66.2% |
+| R1 (BM25 files) | 445 | 38.2% | **97.6%** | 22.5% | 56.0% | **90.0%** |
+
+The memory puts the answer in front of the model more often than BM25 does — 48.5% of expected items were in the text of an answer file it injected, against 38.2% for the files BM25 retrieved, and 60.4% against 56.0% anywhere in view. It placed 48.3% of an answer file's reading turns, and those carried the item more often than BM25's whole files did. The difference is in what the model does with an item once it holds it: from BM25's plain text it names 97.6%, from the memory's sealed C5 K/V 69.9%. Selection is not where retrieval-augmented generation leads; reading is, and the reading of sealed K/V is the term left to close (`docs/results/battery_128/summary_run11.md`, `table_9_12_in_view.csv`). T1, reading the source with 12.3 tool calls an answer, recalls 95.3%, the reference for what the questions allow.
 
 **Ranking, apart from the answers.** A scoring lab (`provenance_gates lab`) probes each question once through the daemon — prefilled and decoded through its thinking — scans its votes against every ingested file on the resident gallery, and re-ranks on the host under formulas read from a file, so every variant scores the same votes. It found the binding limit was votes per token (§6.3); every non-linear alternative tried scored below summed `z × margin` (`docs/results/provenance_scoring_lab_2026-11-16.md`). Over the whole battery, on the gallery of 2026-11-24 — 7,943 files, 36.1M tokens, every probe fresh (`docs/results/battery_128/needle.md`) — 121 questions rank; seven name only files since split away:
 
@@ -1445,7 +1521,7 @@ Over 1,920 answers in the projecting arms, recall is 51.1% (49.0–53.3%) with t
 
 An answer file is first of 7,943 on 49% of questions and in the top five on 69%, about 1,500 and 430 times a random ranking — by sign agreement alone, with no text index and no embedding model. By kind it is first on 43% of direct, 52% of transitive and 50% of architectural questions. Most misses lose their top places to the same few files that score on every question (`tests_grid.rs`, `file_grep.yaml`, `tasks.rs`, `AGENTS.md`).
 
-**The pilot.** A 24-question pilot, run on production from 2026-11-10 as retrieval changed (57.6% → 62.2% by 2026-11-20; `docs/results/dependency_battery_2026-11-20_b.md`), first measured reasoning-time reprojection with a daemon-wide switch, `reproject_in_thinking: false`, which passes over every boundary inside the think block and keeps the rest — the opening, the answer's boundaries, and one reprojection on `</think>`. Over three runs per arm at one build (`docs/results/dependency_battery_2026-11-23_l_m.md`), reprojecting averaged **57.3%** and holding **38.8%**; every held run scored below every reprojecting run (p = 0.05, one-sided permutation), and per question reprojection won 14 to 4 (sign test, p = 0.031). Its loss fell where the answer lives in a file the question does not name. The 128-question battery measures the same contrast at 4.6 points: smaller, and with an interval clear of zero.
+**The pilot.** A 24-question pilot, run on production from 2026-11-10 as retrieval changed (57.6% → 62.2% by 2026-11-20; `docs/results/dependency_battery_2026-11-20_b.md`), first measured reasoning-time reprojection with a daemon-wide switch, `reproject_in_thinking: false`, which passes over every boundary inside the think block and keeps the rest — the opening, the answer's boundaries, and one reprojection on `</think>`. Over three runs per arm at one build (`docs/results/dependency_battery_2026-11-23_l_m.md`), reprojecting averaged **57.3%** and holding **38.8%**; every held run scored below every reprojecting run (p = 0.05, one-sided permutation), and per question reprojection won 14 to 4 (sign test, p = 0.031). Its loss fell where the answer lives in a file the question does not name. The 128-question battery measures the same contrast at 5.3 points: smaller, and with an interval clear of zero.
 
 **What the answers show.** The memory holds documentation and module structure more than the call graph. Answers cite their sources — a design document's section, a module header — and when the model had not read the source it said so, declining rather than inventing; the errors found on reading are near-misses (a constant placed in the header beside the one that defines it, an out-of-date caller), not invented names.
 
@@ -1466,7 +1542,7 @@ It decoded one token for every 2.9 prefilled (82,963 against 238,619). Every tok
 OpenRouter's picture of agent traffic is ~87% cached prompt, 12% novel prompt and 1% output, "because an agent re-sends its whole context on every step" [OpenRouter, *Cache is Crucial*, October 2026; 47]; on SWE-bench Verified under OpenHands, input tokens dominate the cost of agentic coding even with caching [Bai et al., arXiv:2604.22750; 48]. Against genuinely new input, this session wrote about four times as much per token read (Figure 9.13-1). OpenRouter's novel prompt includes re-reads a provider failed to cache, so this is a comparison, not a result; counted as a re-sending client counts it, ~19M tokens, the session would be 1 : 230. What the architecture changes is not how much a long session would re-read, but that it does not.
 
 <figure class="fig">
-<svg viewBox="0 0 640 128" role="img" aria-label="Figure 9.13-1. Tokens written per token of new input. This revision session decoded one token for every 2.9 prefilled, 0.345. OpenRouter's agentic mix, output against novel prompt, about one in twelve, 0.083.">
+<svg viewBox="0 0 640 128" role="img" aria-label="Figure 9.13-1. Tokens written per token of new input. This revision session decoded one token for every 2.9 prefilled, 0.348. OpenRouter's agentic mix, output against novel prompt, about one in twelve, 0.083.">
   <text class="ttl" x="16" y="20">Figure 9.13-1 · Written per token newly read</text>
   <text class="ttl-sub" x="16" y="36">decoded or output tokens ÷ new input tokens · amber: published agent traffic</text>
   <path class="grid base" d="M200 48 V104"/>
@@ -1526,9 +1602,9 @@ Exposure is not output error. Attention's output is a convex combination of valu
 
 ---
 
-**Theorem (Asymptotic Numerical Stability).** *Let N denote context depth, B the fixed provenance selection token budget (a system constant), W_hot_max the hot tier capacity, W_warm_max = B − W_hot_max the retrieval budget — the tokens selected per step from outside the hot tier, whether they reside in the warm or the cold tier — and ε(t) the total accumulated numerical error of token t under any finite-precision arithmetic. Let ε_warm and ε_cold bound the per-token error of a warm-tier and a cold-tier token, and ε_ret = max(ε_warm, ε_cold). Under attentional provenance selection, the expected total numerical error contribution per generation step is bounded by a constant independent of N:*
+**Theorem (Asymptotic Numerical Stability).** *Let N denote context depth, B the fixed provenance selection token budget (a system constant), W_hot_max the hot tier capacity, W_warm_max = B − W_hot_max the retrieval budget — the tokens selected per step from outside the hot tier, whether they reside in the warm or the cold tier — and ε(t) the total accumulated numerical error of token t under any finite-precision arithmetic. Let ε_h, ε_warm and ε_cold bound the per-token error of a hot-, warm- and cold-tier token, ε_hot = W_hot_max · ε_h the hot tier's summed error, and ε_ret = max(ε_warm, ε_cold). Under attentional provenance selection, the total numerical error contribution of every generation step is bounded by a constant independent of N:*
 
-$$E\left[\sum_{t \in \mathcal{W}} \varepsilon(t)\right] \leq \varepsilon_{\text{hot}} + W_{\text{warm\_max}} \cdot \varepsilon_{\text{ret}} = O(1)$$
+$$\sum_{t \in \mathcal{W}} \varepsilon(t) \leq \varepsilon_{\text{hot}} + W_{\text{warm\_max}} \cdot \varepsilon_{\text{ret}} = O(1)$$
 
 *Under full attention the same sum is Θ(N · ε̄), with ε̄ the mean per-token error over the context, and grows without limit. The bound's independence of N holds at any hardware scale and in any precision format; the format sets the constant, through ε_hot and ε_ret.*
 
@@ -1536,7 +1612,7 @@ $$E\left[\sum_{t \in \mathcal{W}} \varepsilon(t)\right] \leq \varepsilon_{\text{
 
 **Proof.** Partition the context into three tiers as N grows.
 
-*Hot tier* (H): tokens always present in the working set. |H| ≤ W_hot_max is bounded by a hardware constant independent of N. Tokens in H are prefill-refreshed: their decode drift is zero and their quantization error is bounded by the selection kernel threshold. ε_hot is a small constant independent of N.
+*Hot tier* (H): tokens always present in the working set. |H| ≤ W_hot_max is bounded by a hardware constant independent of N. Tokens in H are prefill-refreshed: their decode drift is zero and their quantization error is bounded by the selection kernel threshold, so each carries at most ε_h and together at most ε_hot = W_hot_max · ε_h, a small constant independent of N.
 
 *Warm tier* (W_warm): tokens eligible for retrieval but not permanently resident. The provenance selection mechanism operates under the fixed budget B — at most W_warm_max tokens from outside the hot tier can be selected per generation step, from the warm and cold tiers together, regardless of how large either grows with N. This bound is structural: the selection kernel enforces it by construction. Let k_warm and k_cold be the numbers of warm- and cold-tier tokens a step selects; the budget enforces k_warm + k_cold ≤ W_warm_max. The warm tier's aggregate error contribution per step is therefore at most:
 
@@ -1558,19 +1634,23 @@ $$\sum_{t \in C \cap \mathcal{W}} \varepsilon(t) \leq k_{\text{cold}} \cdot \var
 
 It does not vanish as N grows. A bound that decays as O(1/N) would follow only if every cold token were equally likely to be selected — the opposite of relevance-driven selection.
 
-Summing across tiers, with k_warm + k_cold ≤ W_warm_max:
+Summing across tiers, with k_warm + k_cold ≤ W_warm_max at every step — the budget is enforced per step, not on average, so the bound holds for each step and not only in expectation:
 
-$$E\left[\sum_{t \in \mathcal{W}} \varepsilon(t)\right] \leq \varepsilon_{\text{hot}} + E[k_{\text{warm}}] \cdot \varepsilon_{\text{warm}} + E[k_{\text{cold}}] \cdot \varepsilon_{\text{cold}} \leq \varepsilon_{\text{hot}} + W_{\text{warm\_max}} \cdot \varepsilon_{\text{ret}} = O(1)$$
+$$\sum_{t \in \mathcal{W}} \varepsilon(t) \leq \varepsilon_{\text{hot}} + k_{\text{warm}} \cdot \varepsilon_{\text{warm}} + k_{\text{cold}} \cdot \varepsilon_{\text{cold}} \leq \varepsilon_{\text{hot}} + W_{\text{warm\_max}} \cdot \varepsilon_{\text{ret}} = O(1)$$
 
 □
 
+**Recurrent layers.** On the DeltaNet-hybrid models — Flash-Next is 36 Gated DeltaNet layers and 12 attention layers — the recurrent layers store no per-token K/V and read no working set: each holds one fixed-size state per sequence, `[h_v, d_v, d_k]`, kept in F32 and never quantized by the ladder, so what a step reads from them is the same size at any N. Each update is non-expansive — S ← e^g · S, g ≤ 0, then S ← S + β(v − Sk)kᵀ with k l2-normed and β ∈ (0, 1), so S(I − βkkᵀ) has operator norm at most ‖S‖ — and adds one F32 rounding (`candle-kernels/src/delta-net/delta_net_decode_kernel.cuh`). An error already in the state is therefore never amplified and decays wherever the gate is below one; the arithmetic is the reference model's own, and the bound neither adds to it nor relies on it. Measured with all 36 recurrent layers in the path, Flash-Next's divergence from BF16 is flat from 4K to 124K at C0 (2.2e-4 → 1.4e-4 nats) and at C5 (9.8e-3 → 7.6e-3) (§9.6.8).
+
+**Cost is not error.** The bound is on what a step attends; the work of choosing it is separate. Exact attention reads at most B tokens a step at any depth. The 1-bit provenance scan that selects them reads every signature in the gallery, linear in N, once per reprojection — every 64 decoded tokens, off the decode's critical path (§6.6) — and its result is a selection, which the bound covers through the budget whatever the scan's size.
+
 ---
 
-**Corollary 1 (Near-zero convergence).** *In this system's design, warm- and cold-tier blocks alike originate from prefill-refreshed hot-tier blocks — they were quantized from clean activations and assigned a format by the adaptive per-block selection kernel at threshold θ, θ being the loosest threshold any retrievable block was sealed under. Consequently ε_ret ≤ θ, which is a small system parameter. Then C_ret = W_warm_max · ε_ret is small, and:*
+**Corollary 1 (Near-zero convergence).** *In this system's design, warm- and cold-tier blocks alike originate from prefill-refreshed hot-tier blocks — they were quantized from clean activations and assigned a format by the adaptive per-block selection kernel at threshold θ, θ being the loosest threshold any block was sealed under. Measure ε(t) in the selector's own per-block metric — Q-projected relative error for K, normalised L2 for V — so that θ bounds it directly. Then ε_h ≤ θ and ε_ret ≤ θ, and since W_hot_max + W_warm_max = B:*
 
-$$E\left[\sum_{t \in \mathcal{W}} \varepsilon(t)\right] \approx \varepsilon_{\text{hot}} + C_{\text{ret}} \approx 0$$
+$$\sum_{t \in \mathcal{W}} \varepsilon(t) \leq B \cdot \theta, \qquad \text{every attended token's error} \leq \theta$$
 
-*The total error is not merely bounded — it is bounded by a small constant determined by the selection kernel's quality threshold, approaching zero in the limit of tight thresholds. Empirically: always-attended blocks operating in top-quality compression mode (C0) achieve K_SNR 58.6 dB and V_SNR 58.8 dB (per-block ideal), confirming ε_hot ≈ 0 for the working set.*
+*The total error is not merely bounded — every token a step attends carries at most the selection kernel's quality threshold, at any depth, approaching zero in the limit of tight thresholds. Empirically, at C0 the always-attended blocks reach K_SNR 58.6 dB and V_SNR 58.8 dB (per-block ideal), and Flash-Next's output stays within 4.4e-4 nats of BF16 at C0 and 2.1e-2 at C5, production's sealing level, from 4K to 124K (§9.6.8).*
 
 ---
 
@@ -1590,7 +1670,7 @@ KIVI, KVQuant and TurboQuant optimise the compression *primitive*: given that ev
 
 ### 11.4 Attention Was Always Retrieval
 
-Attention is retrieval: Q queries K, scores select, V is aggregated by relevance. This system runs it at two scales — approximate 1-bit attention over the whole unbounded context to select the working set (§6.6), then exact attention over what it selected — hierarchical retrieval at constant attention cost per step, where standard attention is flat retrieval over N. The trade is real: full attention reads all N exactly, while this system can surface the wrong B tokens. The guarantee is bounded error on the attended set, not the relevance of the set; it trades exposure that grows with N for a retrieval-quality problem the provenance mechanism bounds but cannot eliminate. That is a different trade-off from full attention, not a strict improvement on it.
+Attention is retrieval: Q queries K, scores select, V is aggregated by relevance. This system runs it at two scales — approximate 1-bit attention over the whole unbounded context to select the working set (§6.6), then exact attention over what it selected — hierarchical retrieval at constant exact-attention cost per step, the scan's linear 1-bit work running every 64 tokens off the decode's critical path, where standard attention is flat retrieval over N at every step. The trade is real: full attention reads all N exactly, while this system can surface the wrong B tokens. The guarantee is bounded error on the attended set, not the relevance of the set; it trades exposure that grows with N for a retrieval-quality problem the provenance mechanism bounds but cannot eliminate. That is a different trade-off from full attention, not a strict improvement on it.
 
 It is not RAG, and the difference is structural. *The signal*: RAG retrieves from text, so iterative RAG (FLARE, Self-RAG) must wait for the model to write a query; Q vectors carry what the model is reaching for before any text forms. *Causal continuity*: RAG injects text into a fresh context, while this system promotes stored K/V computed in its original causal context, K stored un-rotated and positioned on read. *Leading the answer*: reprojection inside the think block, whose K/V is dropped at seal, steers the answer's context by everything the model thought (§6.5). A RAG system given Q→Q matching, causal K/V continuity and retrieval from Q during generation would no longer be RAG; it would be this architecture. §9.12 shows it working: the answer file found among 7,943 by sign agreement alone, and a single retrieval before reasoning 6.5 points below continuous reprojection.
 
@@ -1612,11 +1692,11 @@ In each case the replacement is more efficient in the dimension the constraint b
 
 The four contributions — online Markov expert prediction with wave-batched GEMM, per-block adaptive KV quantization with two-phase refresh, attentional provenance indexing with mid-decode reprojection, and an unbounded three-tier context — have precedents individually and had not been integrated.
 
-Together they run a 180B MoE model for eight sessions on a 16 GB laptop GPU, above every published llama.cpp run of it, on hosts with two to four times the memory; keep throughput flat from 32K to 128K, through the model's own sparse-attention indexer with no depth-dependent cost from the engine; compress the KV cache up to 7.6× inline, nearly 4× llama.cpp's q8_0 for less decode at 32K, with every session of every width row reproducing its reference; and serve concurrent sessions at 1.3–37.9× the best published single-stream rate for the same model and card class, up to 2,869.9 t/s across 64 sessions, with a 284B model at sixteen sessions on one GPU at 4.1× the best published single-GPU decode. The memory behind it is a 42M-token code substrate held at C5; under sixteen concurrent answers the card's resident context peaks at 945 thousand tokens, 21.9 GiB at full precision, while the expert zone streams the rest of the model. The most comparable published study found standard frameworks degrade beyond two concurrent users on an RTX 5090 [Herz et al., arXiv:2512.23029].
+Together they run a 180B MoE model for eight sessions on a 16 GB laptop GPU, above every published llama.cpp run of it, on hosts with two to four times the memory; keep throughput flat from 32K to 128K, through the model's own sparse-attention indexer with no depth-dependent cost from the engine; compress the KV cache up to 7.6× inline, nearly 4× llama.cpp's q8_0 for less decode at 32K, with every session of every width row reproducing its reference; and serve concurrent sessions at 1.4–37.9× the best published single-stream rate for the same model and card class, up to 2,869.9 t/s across 64 sessions, with a 284B model at sixteen sessions on one GPU at 4.1× the best published single-GPU decode. The memory behind it is a 42M-token substrate held at C5, its code gallery 36.1M tokens; under sixteen concurrent answers the card's resident context peaks at 945 thousand tokens, 21.9 GiB at full precision, while the expert zone streams the rest of the model. The most comparable published study found standard frameworks degrade beyond two concurrent users on an RTX 5090 [Herz et al., arXiv:2512.23029].
 
 The Asymptotic Numerical Stability theorem bounds the summed stored error entering a step by a constant independent of depth, where full attention's grows linearly. It bounds exposure, not output error, and it does not show full attention degrades; what it changes is the question the KV quantization literature asks — not how small each token's error can be made inside the full-attention regime, but whether the regime can be left. Provenance selection leaves it, and §9.11.2 shows the premise holds: every planted turn selected from a history twelve times the working set, at the top compression level as at near-lossless.
 
-On the system's own codebase, retrieval ranks an answer file first among 7,943 on 49% of 121 questions by sign agreement alone, and answering 128 questions from memory with tools forbidden, the memory is worth 36.7 points of recall, re-selection during reasoning 4.6, and continuous re-selection 6.5 over a single retrieval, each clear of zero after Holm correction; the gain falls on the questions that do not name their answer's file, the ones only the reasoning can reach. Attention is retrieval: this system runs it hierarchically, approximate over the unbounded context and exact over what it selects, preserving the mechanism RAG replaces and removing the scaling constraint on exact attention. The deeper lesson is methodological: constraints accepted as design requirements forced decisions more efficient in the dimension they bound, measured here on three cards from 16 GB to 72 GB, with a bound that carries to any card.
+On the system's own codebase, retrieval ranks an answer file first among 7,943 on 49% of 121 questions by sign agreement alone, and answering 128 questions from memory with tools forbidden, the memory is worth 37.0 points of recall, re-selection during reasoning 5.3, and continuous re-selection 6.9 over a single retrieval, each clear of zero after Holm correction; the gain falls on the questions that do not name their answer's file, the ones only the reasoning can reach. Against BM25 retrieval of the same repository, the memory places the answer's text more often, and what remains between them is reading: from plain text the model names 97.6% of the items it holds, from sealed K/V 69.9%. Attention is retrieval: this system runs it hierarchically, approximate over the unbounded context and exact over what it selects, preserving the mechanism RAG replaces and removing the scaling constraint on exact attention. The deeper lesson is methodological: constraints accepted as design requirements forced decisions more efficient in the dimension they bound, measured here on three cards from 16 GB to 72 GB, with a bound that carries to any card.
 
 ---
 
@@ -1630,7 +1710,7 @@ On the system's own codebase, retrieval ranks an answer file first among 7,943 o
 
 [4] Zandieh, A., et al. (2026). **TurboQuant: Online Vector Quantization for Quantized KV Cache in Large Language Models.** ICLR 2026. https://arxiv.org/abs/2504.19874
 
-[5] TurboQuant community benchmarks on Qwen3. llama.cpp discussion #20969, 2025. https://github.com/ggml-org/llama.cpp/discussions/20969
+[5] TurboQuant community benchmarks on Qwen3. llama.cpp discussion #20969, 2026. https://github.com/ggml-org/llama.cpp/discussions/20969
 
 [6] Kang, H., et al. (2024). **GEAR: An Efficient KV Cache Compression Recipe for Near-Lossless Generative Inference of LLM.** arXiv:2403.05527. https://arxiv.org/abs/2403.05527
 
@@ -1642,7 +1722,7 @@ On the system's own codebase, retrieval ranks an answer file first among 7,943 o
 
 [10] Pan, S.J., Yuan, M. (2025). **KVTuner: Sensitivity-Aware Layer-Wise Mixed-Precision KV Cache Quantization.** https://arxiv.org/abs/2502.04420
 
-[11] KITTY: Accurate and Efficient 2-Bit KV Cache Quantization. (2024). https://arxiv.org/pdf/2511.18643
+[11] Xia, H., et al. (2025). **Kitty: Accurate and Efficient 2-bit KV Cache Quantization with Dynamic Channel-wise Precision Boost.** arXiv:2511.18643. https://arxiv.org/abs/2511.18643
 
 [12] Tao, et al. (2024). **AsymKV: Enabling 1-Bit Quantization of KV Cache with Layer-Wise Asymmetric Quantization Configurations.** COLING 2025. https://arxiv.org/abs/2410.13212
 
@@ -1724,7 +1804,7 @@ On the system's own codebase, retrieval ranks an answer file first among 7,943 o
 
 [49] Niko1221 and contributors. (2026). **Strata.** Community RTX 5090 run, Strata 0.1.29 (d6708a4), IQ2_XS, MTP, median of 3, https://github.com/Niko1221/Strata/tree/main/bench/results/2026-09-30-community-rtx-5090; batching, RTX 5070 12 GB, https://github.com/Niko1221/Strata/blob/main/docs/BATCHING.md
 
-[16], [17], [19]–[23] are background reading and are not cited in the text.
+[17] and [19]–[24] are background reading and are not cited in the text.
 
 ---
 
