@@ -286,3 +286,44 @@ impl VisionTower {
         self.dtype
     }
 }
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::*;
+    use crate::models::gpu_test_lock::gpu_serial;
+    use crate::models::quantized_qwen38_moe::cached_vision_tower_file;
+
+    /// **The real tower runs on the card**: Flash-Next's pinned mmproj, loaded
+    /// as the guest loads it, reads a 768 × 512 image — 1 536 patches, two
+    /// attention bands and a ragged third — into one finite 2 560-wide row
+    /// per `<|image_pad|>`. On a machine that has not fetched the tower there
+    /// is nothing to run.
+    #[test]
+    fn the_pinned_tower_reads_an_image_on_the_card() {
+        let _gpu = gpu_serial();
+        let Ok(dev) = Device::new_cuda(0) else { return };
+        let Some(path) = cached_vision_tower_file() else {
+            return;
+        };
+        let vb = VarBuilder::from_gguf(&path, &dev).unwrap();
+        let tower = VisionTower::load(&vb, Int8Mode::auto(&dev)).unwrap();
+        let grid = Grid {
+            height: 512,
+            width: 768,
+        };
+        let rgb: Vec<u8> = (0..grid.height * grid.width * 3)
+            .map(|i| (i * 31 % 251) as u8)
+            .collect();
+        let rows = tower.forward(&VisionInput { rgb, grid }).unwrap();
+        assert_eq!(rows.dims(), [grid.tokens(), OUT_HIDDEN]);
+        let values = rows
+            .to_dtype(DType::F32)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(values.iter().all(|v| v.is_finite()), "a row is not finite");
+        assert!(values.iter().any(|v| *v != 0.0), "every row is zero");
+    }
+}
