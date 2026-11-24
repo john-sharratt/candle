@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use candle::quantized::Int8Mode;
 use candle::{DType, Device};
+use candle_nn::kv_cache::{close_guest_arena, open_guest_arena};
 use candle_transformers::models::qwen_vision::tower::ACTIVATION_BYTES_PER_PATCH;
 use candle_transformers::models::qwen_vision::VisionTower;
 
@@ -118,7 +119,7 @@ impl GuestModel for VisionGuest {
         let vb = place_gguf(&self.path()?, device, ground, mode, &[])?;
         let tower = VisionTower::load(&vb, mode).map_err(|e| format!("vision guest: {e}"))?;
         if let Device::Cuda(cuda) = device {
-            candle_nn::kv_cache::open_guest_arena(&cuda.cuda_stream(), arena.0.ptr, arena.1);
+            open_guest_arena(&cuda.cuda_stream(), arena.0.ptr, arena.1);
         }
         tracing::info!(
             target: "candle_conversation::guest",
@@ -155,10 +156,8 @@ impl GuestModel for VisionGuest {
     fn unload(&mut self) {
         // Before the ground goes back: a ticket outliving the arena would carve
         // from regions that are attention state again.
-        if let Some((device, _)) = self.loaded.as_ref() {
-            if let Device::Cuda(cuda) = device {
-                candle_nn::kv_cache::close_guest_arena(&cuda.cuda_stream());
-            }
+        if let Some((Device::Cuda(cuda), _)) = self.loaded.as_ref() {
+            close_guest_arena(&cuda.cuda_stream());
         }
         self.loaded = None;
     }
