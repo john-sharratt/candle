@@ -104,8 +104,10 @@ pub(crate) struct Cost {
     ///
     /// Read by the streaming card's store rule (`admit::fill`): a turn that
     /// finishes in one forward claims its store for the decode it becomes
-    /// whichever wave it runs in, so refusing it saves no residency and only
-    /// moves it to a later wave, where it is carried as that wave's head.
+    /// whichever wave it runs in, so it is exempt from the rule while the
+    /// residency it leaves stays above the zone's midpoint
+    /// (`gate::Headroom::midpoint`). Below it the stores standing at once are
+    /// what the decodes are short of, and the rule judges it as any other.
     pub finishes: bool,
 }
 
