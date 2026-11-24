@@ -89,6 +89,7 @@ pub fn start(
         &owner,
         worker,
         format!("{prompt}{ASKING}"),
+        Vec::new(),
     )
 }
 

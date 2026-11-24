@@ -1955,7 +1955,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
 
   function send(text) {
     text = (text || '').trim();
-    if (!text) return;
+    const images = (S.pendingImages || []).map((p) => p.url);
+    if (!text && !images.length) return;
     const conv = activeConv();
     if (conv && conv.streaming) return;
     // Its history has not arrived yet: a send now would read as the first
@@ -1974,22 +1975,23 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // conv_order), not a clock. Sending is a use, so the conversation takes
     // the top at once; the server ranks it first too, so the next sync agrees.
     const topRank = S.conversations.reduce((m, c) => Math.max(m, c.updated_ms || 0), 0);
+    const title = text || 'Image';
     if (!target) {
       const id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'c' + Date.now();
-      target = { id, title: titleOf(text), archived: false, updated_ms: topRank + 1, turn_count: 0, history: [], files: [] };
+      target = { id, title: titleOf(title), archived: false, updated_ms: topRank + 1, turn_count: 0, history: [], files: [] };
       conversations = [target].concat(conversations);
       activeId = id;
       S.loaded[id] = true;
     } else {
-      if (target.history.length === 0) target.title = titleOf(text);
+      if (target.history.length === 0) target.title = titleOf(title);
       if (target.updated_ms !== topRank) target.updated_ms = topRank + 1;
     }
     target.history = target.history.concat([
-      { role: 'user', content: text },
+      { role: 'user', content: text, images },
       { role: 'assistant', content: '', streaming: true, status: '' },
     ]);
     target.streaming = true;
-    setState({ conversations, activeId, promptValue: '' }, () => {
+    setState({ conversations, activeId, promptValue: '', pendingImages: [] }, () => {
       writeHashConv(activeId);
       scrollChat();
       addLog(API.nextLogLine());
@@ -2226,10 +2228,60 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     if (convId === S.activeId) setTimeout(() => { if (S.activeId === convId) loadJournal(); }, JOURNAL_FOLLOW_MS);
   }
 
+  // ── images (docs/flash_next_vision.md §6.1) ──────────────────────────────
+  // An image a message shows travels with it, as a data: URL in an image part.
+  // Once the turn is stored its text names each image by a marker the daemon
+  // wrote, and the bubble draws it from GET /v1/images/{id}.
+  const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|tiff?)$/i;
+  const MAX_PENDING_IMAGES = 4;
+  const IMAGE_MARKER = /^\[image ([0-9a-f]{16}) \d+×\d+\]\n/;
+  function isImageFile(f) { return (f.type && f.type.indexOf('image/') === 0) || IMAGE_EXT.test(f.name || ''); }
+  // Read `files` onto the composer as the next message's images.
+  function attachImages(files) {
+    const room = MAX_PENDING_IMAGES - (S.pendingImages || []).length;
+    files.slice(0, Math.max(room, 0)).forEach((f) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        S.pendingImages = (S.pendingImages || []).concat([{ name: f.name, url: String(reader.result) }]);
+        render();
+      };
+      reader.readAsDataURL(f);
+    });
+  }
+  function dropPendingImage(i) {
+    S.pendingImages = (S.pendingImages || []).filter((_, j) => j !== i);
+    render();
+  }
+  // A user message's images and its text: the images it was sent with, or the
+  // ones its stored text names.
+  function userParts(m) {
+    if (m.images && m.images.length) return { images: m.images, text: m.content };
+    let text = m.content || '';
+    const images = [];
+    let hit;
+    while ((hit = IMAGE_MARKER.exec(text))) {
+      images.push('/v1/images/' + hit[1]);
+      text = text.slice(hit[0].length);
+    }
+    return { images, text };
+  }
+  function imageStrip(srcs, size, onRemove) {
+    return h('div', { style: 'display:flex; flex-wrap:wrap; gap:6px; margin-bottom:0.45rem;' },
+      ...srcs.map((src, i) => h('div', { style: 'position:relative;' },
+        h('img', { src, alt: 'image ' + (i + 1), style: 'display:block; max-height:' + size + 'px; max-width:100%; border-radius:8px; border:1px solid #38342f;' }),
+        onRemove ? h('button', { 'aria-label': 'Remove image', title: 'Remove', onClick: () => onRemove(i), style: 'position:absolute; top:3px; right:3px; width:20px; height:20px; border-radius:10px; border:none; background:rgba(0,0,0,0.65); color:#ece8e4; cursor:pointer; font-size:12px; line-height:20px; padding:0;' }, '×') : null)));
+  }
+
   // ── files / upload ───────────────────────────────────────────────────────
   function startUpload(fileList) {
     if (!fileList.length) return;
-    const all = [].slice.call(fileList);
+    // Images go on the composer, for the next message to show; the rest are
+    // the conversation's files.
+    const picked = [].slice.call(fileList);
+    const pictures = picked.filter(isImageFile);
+    if (pictures.length) attachImages(pictures);
+    const all = picked.filter((f) => !isImageFile(f));
+    if (!all.length) { if (S.dragActive) setState({ dragActive: false }); return; }
     // Uploads only ever target an already-open conversation — `onChatDrop` gates
     // the drop on `canDropFiles()`, so there is no home-screen "conjure a new
     // conversation from the drop" path. Defensive: bail if somehow called with no
@@ -2843,8 +2895,11 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
         return;
       }
       if (m.role === 'user') {
+        const parts = userParts(m);
         scroller.appendChild(h('div', { class: 'z-turn z-selectable', style: 'display:flex; flex-direction:row-reverse; gap:0.85rem; margin-bottom:2rem; padding-left:3rem;' },
-          h('div', { class: 'z-userbubble', style: 'background:#2f2c29; border:1px solid #252220; border-radius:16px 16px 3px 16px; padding:0.65rem 1.05rem; white-space:pre-wrap; word-break:break-word; line-height:1.6;' }, m.content),
+          h('div', { class: 'z-userbubble', style: 'background:#2f2c29; border:1px solid #252220; border-radius:16px 16px 3px 16px; padding:0.65rem 1.05rem; white-space:pre-wrap; word-break:break-word; line-height:1.6;' },
+            parts.images.length ? imageStrip(parts.images, 220, null) : null,
+            parts.text),
           turnCopyBtn(m, 'right:0;')));
       } else {
         const open = openThinks(conv.id + ':' + idx);
@@ -3345,7 +3400,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     }
     const streaming = !!(conv && conv.streaming);
     const loadingHere = !!(conv && S.hydrating[conv.id]);
-    const ready = S.promptValue.trim().length > 0 && !streaming && !loadingHere;
+    const pending = S.pendingImages || [];
+    const ready = (S.promptValue.trim().length > 0 || pending.length > 0) && !streaming && !loadingHere;
     const sendHint = streaming ? 'Generating…' : loadingHere ? 'Loading…' : (ready ? '↵ send' : '');
 
     const ta = h('textarea', {
@@ -3368,6 +3424,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const attachBtn = h('button', { 'aria-label': 'Attach files', title: 'Attach files', onClick: () => fileInput.click(), style: 'flex-shrink:0; width:32px; height:32px; border-radius:9px; border:1px solid #38342f; background:#232120; color:#8a8074; cursor:pointer; display:flex; align-items:center; justify-content:center; padding:0;', html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>' });
 
     const box = h('div', { class: 'z-composer', style: 'display:flex; flex-direction:column; background:#232120; border:1px solid #38342f; border-radius:16px; padding:0.7rem 0.7rem 0.55rem 1rem; box-shadow:0 2px 14px rgba(0,0,0,0.28);' },
+      pending.length ? imageStrip(pending.map((p) => p.url), 72, dropPendingImage) : null,
       ta,
       h('div', { style: 'display:flex; align-items:center; justify-content:space-between; gap:0.5rem; margin-top:0.3rem;' },
         h('div', { style: 'display:flex; align-items:center; gap:0.4rem; flex-wrap:wrap;' },
@@ -3449,7 +3506,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const conv = activeConv();
     const streaming = !!(conv && conv.streaming);
     const loadingHere = !!(conv && S.hydrating[conv.id]);
-    const ready = S.promptValue.trim().length > 0 && !streaming && !loadingHere;
+    const ready = (S.promptValue.trim().length > 0 || (S.pendingImages || []).length > 0) && !streaming && !loadingHere;
     const box = e.target.parentNode;
     const btn = box.querySelector('button[aria-label="Send"]');
     if (btn) { btn.disabled = !ready; btn.style.opacity = ready ? 1 : 0.3; btn.style.cursor = ready ? 'pointer' : 'default'; }

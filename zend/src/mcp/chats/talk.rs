@@ -714,6 +714,7 @@ mod tests {
             &caller,
             None,
             "how big is the arena?",
+            Vec::new(),
             (Effort::Balanced, minimal),
         )
         .unwrap();
@@ -765,6 +766,7 @@ mod tests {
                 &caller,
                 Some(&first.chat.id),
                 "still there?",
+                Vec::new(),
                 plain
             )
             .unwrap_err(),
@@ -772,7 +774,7 @@ mod tests {
         );
         assert_eq!(record::said(&records, &owner, &first.chat.id).len(), 1);
 
-        let other = send(&session, &caller, None, "a second chat", plain).unwrap();
+        let other = send(&session, &caller, None, "a second chat", Vec::new(), plain).unwrap();
         assert_ne!(
             other.chat.id, first.chat.id,
             "each send naming no chat opens its own"
@@ -792,6 +794,7 @@ mod tests {
                 },
                 Some(&first.chat.id),
                 "may I read it?",
+                Vec::new(),
                 plain
             )
             .unwrap_err(),
@@ -832,6 +835,7 @@ mod tests {
                 &caller,
                 Some(&first.chat.id),
                 "and now?",
+                Vec::new(),
                 (Effort::Deep, RetrievalDials::default())
             )
             .unwrap_err(),
@@ -840,11 +844,11 @@ mod tests {
         );
 
         for i in record::kept_count(&records, &owner)..MAX_CHATS {
-            send(&session, &caller, None, &format!("chat {i}"), plain).unwrap();
+            send(&session, &caller, None, &format!("chat {i}"), Vec::new(), plain).unwrap();
         }
         assert_eq!(record::kept_count(&records, &owner), MAX_CHATS);
         assert_eq!(
-            send(&session, &caller, None, "one too many", plain).unwrap_err(),
+            send(&session, &caller, None, "one too many", Vec::new(), plain).unwrap_err(),
             too_many()
         );
     }
