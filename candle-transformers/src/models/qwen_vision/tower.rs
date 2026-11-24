@@ -82,7 +82,9 @@ impl VisionInput {
                 self.rgb.len()
             ));
         }
-        if self.grid.height % (PATCH * MERGE) != 0 || self.grid.width % (PATCH * MERGE) != 0 {
+        if !self.grid.height.is_multiple_of(PATCH * MERGE)
+            || !self.grid.width.is_multiple_of(PATCH * MERGE)
+        {
             return Err(format!(
                 "{}×{} is not a whole number of merge blocks",
                 self.grid.width, self.grid.height
