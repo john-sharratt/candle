@@ -235,10 +235,14 @@ pub async fn show(state: Arc<State>, slug: &str, req: &HeaderMap) -> Response {
         &meta,
         &pane_index(&m, Some(slug)),
         &format!(
-            "{title}{sheet}<article class=\"prose paper\">{body}</article>{cite}\
+            "{title}{sheet}<article class=\"prose paper\">{head}{body}</article>{cite}\
              <script type=\"module\" src=\"/lib/paper.js\"></script>",
             title = page::title_block(&meta),
             sheet = toolbar(paper),
+            head = sheet_head(
+                &doc.title.clone().unwrap_or_else(|| full_title(paper)),
+                &byline
+            ),
             body = doc.html,
             cite = cite_block(paper),
         ),
@@ -246,16 +250,36 @@ pub async fn show(state: Arc<State>, slug: &str, req: &HeaderMap) -> Response {
     page_answer(&state, html, req)
 }
 
+/// The top of the paper sheet: the document's own title, as it is printed, and
+/// its byline. The page's heading above the sheet is the manifest's short
+/// title; the sheet is the paper itself, so it opens the way the paper does.
+fn sheet_head(title: &str, byline: &str) -> String {
+    let by = if byline.is_empty() {
+        String::new()
+    } else {
+        format!("<p class=\"paper-by\">{}</p>", page::esc(byline))
+    };
+    format!(
+        "<header class=\"paper-head\"><h1>{}</h1>{by}</header>",
+        page::esc(title)
+    )
+}
+
+/// The manifest's title with its subtitle, for a document with no `# H1`.
+fn full_title(p: &Paper) -> String {
+    if p.subtitle.is_empty() {
+        p.title.clone()
+    } else {
+        format!("{}: {}", p.title, p.subtitle)
+    }
+}
+
 /// Plain-text citation, which is what a reader pastes. Deliberately not BibTeX:
 /// the button has to produce something useful in an email and a slide as well
 /// as a `.bib`, and a DOI carries enough for a manager to recover the rest.
 fn citation(p: &Paper) -> String {
     let year = p.published.get(..4).unwrap_or("");
-    let title = if p.subtitle.is_empty() {
-        p.title.clone()
-    } else {
-        format!("{}: {}", p.title, p.subtitle)
-    };
+    let title = full_title(p);
     let mut s = String::new();
     if !p.authors.is_empty() {
         s.push_str(&p.authors);
@@ -381,6 +405,21 @@ mod tests {
             "papers:\n  - slug: s\n    title: t\n    source: a.md\n    athors: x\n"
         )
         .is_err());
+    }
+
+    /// The sheet opens on the paper's title and byline, escaped, and drops the
+    /// byline line when there is none.
+    #[test]
+    fn the_sheet_opens_on_the_papers_title_and_byline() {
+        assert_eq!(
+            sheet_head("A & B: <C>", "J. S. · 24 November 2026"),
+            "<header class=\"paper-head\"><h1>A &amp; B: &lt;C&gt;</h1>\
+             <p class=\"paper-by\">J. S. · 24 November 2026</p></header>"
+        );
+        assert_eq!(
+            sheet_head("Title", ""),
+            "<header class=\"paper-head\"><h1>Title</h1></header>"
+        );
     }
 
     #[test]

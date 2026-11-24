@@ -453,6 +453,11 @@ mod tests {
                 "{}: no title",
                 paper.slug
             );
+            assert!(
+                html.contains("<article class=\"prose paper\"><header class=\"paper-head\"><h1>"),
+                "{}: the sheet does not open on the paper's title",
+                paper.slug
+            );
             assert!(html.contains("<table"), "{}: no tables", paper.slug);
             assert!(html.contains("<math"), "{}: no maths", paper.slug);
             // Linear: the document's own headings and prose, with no contents
