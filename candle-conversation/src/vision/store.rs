@@ -23,7 +23,7 @@ fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn unhex(text: &str) -> Option<[u8; 32]> {
+pub(super) fn unhex(text: &str) -> Option<[u8; 32]> {
     if text.len() != 64 {
         return None;
     }
@@ -34,12 +34,15 @@ fn unhex(text: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Keep `image`'s original bytes and `rows`, and name them by its id.
+/// Keep `image`'s original bytes and `rows`, and name them by its id, kept at
+/// `kept_ms` (Unix milliseconds) — the age an image no conversation uses is
+/// retired by (`vision::tenancy`).
 pub fn store_image(
     substrate: &SharedSubstrate,
     image: &PreparedImage,
     original: Vec<u8>,
     rows: &ImageRows,
+    kept_ms: u64,
 ) -> Result<(), String> {
     let original = substrate.put_blob(original).map_err(|e| e.to_string())?;
     let rows = substrate
@@ -53,6 +56,7 @@ pub fn store_image(
                 "rows": hex(&rows),
                 "width": image.width,
                 "height": image.height,
+                "kept_ms": kept_ms,
             }),
         ))
         .map_err(|e| e.to_string())

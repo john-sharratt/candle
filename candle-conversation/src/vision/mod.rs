@@ -9,6 +9,7 @@
 //! | `spans` | where a prompt's images are, and its ids as the engine reads them |
 //! | `stored` | the image spans of stored turns, for a path that prefills them again |
 //! | `encode` | uploads into a turn's images: prepared, read by the tower, registered |
+//! | `tenancy` | who may read a kept image, and how long it is kept |
 //!
 //! Design: `docs/flash_next_vision.md`.
 
@@ -19,6 +20,7 @@ pub mod rows_codec;
 pub mod spans;
 pub mod store;
 pub mod stored;
+pub mod tenancy;
 
 pub use encode::{encode, turn_images, ImageSource, TurnImage};
 pub use marker::{marker, split_markers};

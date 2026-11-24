@@ -179,6 +179,7 @@ use crate::layers::keys::SUBJECT_KEY;
 use crate::leaving::{Leaving, Running, LEAVE_TURNS_WAIT};
 use crate::live_turn::{LiveTurn, LiveTurns};
 use crate::loading::{LoadProgress, LoadStep, LoadingSnapshot};
+use crate::mcp::caller::Caller;
 use crate::mcp::chats::sweep as chat_sweep;
 use crate::mcp::diaries::placement as diary_placement;
 use crate::mcp::memory::readers::MemoryReaders;
@@ -223,6 +224,7 @@ use crate::working_set::coverage::Coverage;
 use crate::working_set::seeds::Seeding;
 use crate::working_set::{corpus, dialogue_config};
 use crate::workspace::UPLOADS_REPO;
+use candle_conversation::vision::tenancy::{holds, note_use, release_conversation, sweep_unused};
 use candle_conversation::vision::{load_original, marker, split_markers, ImageSource};
 
 pub mod diag;

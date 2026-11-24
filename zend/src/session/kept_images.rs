@@ -19,34 +19,53 @@ pub struct KeptImage {
 }
 
 impl ZendSession {
-    /// Keep each of `files` as an image: decoded, read by the tower — every
-    /// one not already kept, in one job — and stored with its rows. In order.
-    /// `None` before the model is loaded. Blocking: the tower runs as a guest
-    /// between waves.
-    pub fn keep_images(&self, files: Vec<Vec<u8>>) -> Option<Result<Vec<KeptImage>, String>> {
+    /// Keep each of `files` as an image `caller` sent: decoded, read by the
+    /// tower — every one not already kept, in one job — stored with its rows,
+    /// and held by them. In order. `None` before the model is loaded.
+    /// Blocking: the tower runs as a guest between waves.
+    ///
+    /// Images kept with no conversation are swept here too: one that has stood
+    /// unused past its grace is retired (`vision::tenancy::sweep_unused`).
+    pub fn keep_images(
+        &self,
+        files: Vec<Vec<u8>>,
+        caller: &Caller,
+    ) -> Option<Result<Vec<KeptImage>, String>> {
         let state = self.loaded()?;
         let substrate = state.engine.conversation().shared();
-        let sources = files.into_iter().map(ImageSource::Bytes).collect();
+        let sources: Vec<ImageSource> = files.into_iter().map(ImageSource::Bytes).collect();
         Some(
-            images::resolve(&state.engine, &substrate, sources).map(|read| {
-                read.into_iter()
-                    .map(|image| KeptImage {
-                        rows: image.handle.len(),
-                        id: image.id,
-                        width: image.width,
-                        height: image.height,
-                    })
-                    .collect()
-            }),
+            images::claim(&substrate, &sources, caller)
+                .and_then(|()| images::resolve(&state.engine, &substrate, sources))
+                .and_then(|read| {
+                    let retired = sweep_unused(&substrate, now_ms())?;
+                    if !retired.is_empty() {
+                        tracing::info!(retired = retired.len(), "unused kept images retired");
+                    }
+                    Ok(read
+                        .into_iter()
+                        .map(|image| KeptImage {
+                            rows: image.handle.len(),
+                            id: image.id,
+                            width: image.width,
+                            height: image.height,
+                        })
+                        .collect())
+                }),
         )
     }
 
-    /// The bytes image `id` arrived as. `None` before the model is loaded;
-    /// `Some(Ok(None))` for an id the substrate keeps no image under. Reads a
-    /// blob, so a caller on the async runtime runs it on the blocking pool.
-    pub fn kept_image(&self, id: &str) -> Option<Result<Option<Vec<u8>>, String>> {
+    /// The bytes image `id` arrived as, for `caller`: an image they sent, or
+    /// any for an admin. `None` before the model is loaded; `Some(Ok(None))`
+    /// for an id the substrate keeps no image under, and for one `caller` did
+    /// not send — an id learned is not an image shared. Reads a blob, so a
+    /// caller on the async runtime runs it on the blocking pool.
+    pub fn kept_image(&self, id: &str, caller: &Caller) -> Option<Result<Option<Vec<u8>>, String>> {
         let state = self.loaded()?;
         let substrate = state.engine.conversation().shared();
+        if !caller.is_admin() && !holds(&substrate, id, &caller.key()) {
+            return Some(Ok(None));
+        }
         Some(load_original(&substrate, id))
     }
 }

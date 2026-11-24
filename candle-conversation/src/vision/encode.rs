@@ -3,6 +3,7 @@
 //! prefill that reads them.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "hub")]
 use candle_transformers::models::quantized_qwen38_moe::{vision_tower_pack, VISION_TOWER_MODE};
@@ -116,8 +117,11 @@ pub fn turn_images(
     if !unread.is_empty() {
         let prepared: Vec<PreparedImage> = unread.iter().map(|(_, p, _)| p.clone()).collect();
         let fresh = encode(engine, &prepared)?;
+        let kept_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
         for ((i, p, bytes), rows) in unread.into_iter().zip(fresh) {
-            store_image(substrate, &p, bytes, &rows)?;
+            store_image(substrate, &p, bytes, &rows, kept_ms)?;
             known[i] = Some((p.id, p.width, p.height, rows));
         }
     }

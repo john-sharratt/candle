@@ -68,6 +68,22 @@ pub const ATTN_BAND: usize = 512;
 /// half's own. The embedding and each block half are stages, so no two of
 /// them hold intermediates at once.
 pub const ACTIVATION_BYTES_PER_PATCH: usize = 128 * 1024;
+/// Device bytes [`VisionTower::load`] allocates beyond the weights it is
+/// handed: the tensors it converts to the activations' type, with the f32
+/// each passes through.
+///
+/// | tensor | bytes |
+/// |---|---:|
+/// | patch embedding: two slices, their sum and its transpose in f32, then bf16 | 15 925 248 |
+/// | position table, f32 then bf16 | 15 925 248 |
+/// | 27 blocks' norms and biases, f32 then bf16 | 2 376 864 |
+/// | the patch bias, `post_ln`, `mm.0` and `mm.2` biases | 63 744 |
+/// | **sum** | **34 291 104** (32.7 MiB) |
+///
+/// On a guest arena every one of them stays until it closes — a bump frees
+/// nothing — so this is what a load holds there, priced with the alignment of
+/// its ~350 allocations and a little over.
+pub const LOAD_BYTES: usize = 36 << 20;
 
 /// One image, resized to its grid: RGB8, row-major, `grid.height · grid.width · 3`
 /// bytes.

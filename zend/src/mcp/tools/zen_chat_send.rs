@@ -148,7 +148,7 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
     };
     // A chat's turn begins on this member: its pictures are read here, in one
     // job.
-    let images = match pictures::keep(&ctx.session, fetched).await {
+    let images = match pictures::keep(&ctx.session, &ctx.caller, fetched).await {
         Ok(kept) => kept,
         Err(e) => return Answer::error(e),
     };

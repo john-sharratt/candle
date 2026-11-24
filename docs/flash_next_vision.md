@@ -176,7 +176,11 @@ at `Int8Mode::Off`: every tensor, twins included, is one DMA of its stored
 bytes from the pinned staging buffers — no source upload, no repack kernel,
 no scratch off the ground), loads `VisionTower` (`qwen_vision/tower.rs`:
 plain candle ops, one forward that is both the CPU reference and the guest
-arena's run), runs each image, and gives the ground back. Its footprint is the weights plus
+arena's run), runs each image, and gives the ground back. The arena is opened
+before the tower loads, so the load's own conversions — the patch embedding,
+the position table, the norms and biases into bf16, with the f32 each passes
+through, 32.7 MiB (`LOAD_BYTES`) — carve from the ground and none from the
+pool the span leaves. Its footprint is the weights, the load's conversions and
 the largest image's activations, stated per patch
 (`ACTIVATION_BYTES_PER_PATCH`; 88 KiB measured at 768 × 512 against 128
 priced). The arena is a bump, so what bounds it is the stages: the embedding,
@@ -446,6 +450,22 @@ tail prefills prefill text the engine wrote itself and need nothing.
   and replicated, answered with its id, size and row count.
   **`GET /v1/images/{id}`** serves the bytes it arrived as, typed by their
   format (`zend/src/api/images.rs`).
+- **Whose an image is, and how long it is kept** (`vision/tenancy.rs`). An
+  image is its sender's: a file sent — a `data:` part, `POST /v1/images`, a
+  `zen_chat_send` picture — records its sender as a holder
+  (`vision/held/<id>/<holder>`, the caller's account key), and the GET, or a
+  turn naming the image by id, answers a holder or an admin and no one else:
+  a stranger's GET is the `404` an unkept id gets, and their turn the `400`
+  (`images::claim`). An id learned is not an image shared. A turn records
+  that its conversation reads each image (`vision/used/<id>/<conv>`, and
+  `vision/conv/<conv>/<id>` to find them from the conversation); deleting a
+  conversation — the user's delete, or a chat closed — forgets its uses and
+  retires every image no other conversation reads: both blobs tombstoned,
+  the record and its holders ceased. An archived conversation keeps its
+  images, as it keeps its text. An image no conversation ever read is
+  retired a day after it was kept (`kept_ms` on its record; the sweep runs
+  whenever an image is kept). Each fact is a key of its own, so two members
+  adding a holder or a use at once never overwrite each other.
 - **The turn.** The session parses the last user message's images into
   `TurnStart.images`, and the turn reads them before its first round
   (`images::resolve` on the blocking pool, under a "Reading the images…"

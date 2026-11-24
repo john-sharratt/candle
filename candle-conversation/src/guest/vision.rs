@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use candle::quantized::Int8Mode;
 use candle::{DType, Device};
 use candle_nn::kv_cache::{close_guest_arena, open_guest_arena};
-use candle_transformers::models::qwen_vision::tower::ACTIVATION_BYTES_PER_PATCH;
+use candle_transformers::models::qwen_vision::tower::{ACTIVATION_BYTES_PER_PATCH, LOAD_BYTES};
 use candle_transformers::models::qwen_vision::VisionTower;
 
 use super::gguf_pick::Pick;
@@ -86,6 +86,12 @@ fn activation_bytes(jobs: &[GuestRequest]) -> usize {
         * ACTIVATION_BYTES_PER_PATCH
 }
 
+/// The arena the backlog wants: the tower's load conversions, which stand on it
+/// for the whole drain, beneath the largest image's activations.
+fn arena_bytes(jobs: &[GuestRequest]) -> usize {
+    LOAD_BYTES + activation_bytes(jobs).max(MIN_ARENA_BYTES)
+}
+
 impl GuestModel for VisionGuest {
     fn guest(&self) -> Guest {
         Guest::Vision
@@ -96,7 +102,7 @@ impl GuestModel for VisionGuest {
             .path()
             .and_then(|p| ground_bytes(&p, PLACEMENT, Pick::default()))
             .unwrap_or(0);
-        weights + activation_bytes(jobs).max(MIN_ARENA_BYTES) + ARENA_HEADROOM_BYTES
+        weights + arena_bytes(jobs) + ARENA_HEADROOM_BYTES
     }
 
     fn load(
@@ -116,13 +122,13 @@ impl GuestModel for VisionGuest {
         }
         // The arena first, on the widest run: it must be one stretch, and the
         // weights are tensors of a few megabytes that fit the runs it leaves.
-        let wanted = activation_bytes(jobs).max(MIN_ARENA_BYTES);
+        let wanted = arena_bytes(jobs);
         let arena = {
             let mut g = ground
                 .lock()
                 .map_err(|_| "vision guest: the ground lock was poisoned".to_string())?;
             let len = wanted.min(g.largest_free_run().saturating_sub(ARENA_HEADROOM_BYTES));
-            if len < MIN_ARENA_BYTES {
+            if len < LOAD_BYTES + MIN_ARENA_BYTES {
                 return Err(format!(
                     "vision guest: the ground's widest run leaves {} MiB for activations, \
                      {} MiB wanted",
@@ -136,10 +142,21 @@ impl GuestModel for VisionGuest {
             (at, len)
         };
         let vb = place_gguf(&self.path()?, device, ground, PLACEMENT, Pick::default())?;
-        let tower = VisionTower::load(&vb, self.mode).map_err(|e| format!("vision guest: {e}"))?;
+        // Open before the tower loads: its conversions read placed weights, so
+        // they carve from the arena — on the ground this guest holds — rather
+        // than from the pool the span leaves.
         if let Device::Cuda(cuda) = device {
             open_guest_arena(&cuda.cuda_stream(), arena.0.ptr, arena.1);
         }
+        let tower = match VisionTower::load(&vb, self.mode) {
+            Ok(tower) => tower,
+            Err(e) => {
+                if let Device::Cuda(cuda) = device {
+                    close_guest_arena(&cuda.cuda_stream());
+                }
+                return Err(format!("vision guest: {e}"));
+            }
+        };
         tracing::info!(
             target: "candle_conversation::guest",
             arena_mib = arena.1 >> 20,
@@ -187,6 +204,7 @@ mod tests {
     use super::*;
     use crate::guest::progress::GuestSink;
     use crate::guest::work::{VisionImage, VisionRequest};
+    use candle_nn::kv_cache::guest_domain_stats;
     use candle_transformers::models::quantized_qwen38_moe::{
         cached_vision_tower_pack, vision_tower_pack, VISION_TOWER_MODE,
     };
@@ -225,6 +243,13 @@ mod tests {
         let ground = Arc::new(Mutex::new(GuestGround::for_test(vec![base], bytes)));
 
         guest.load(&device, &ground, &jobs).unwrap();
+        // The load's conversions stand on the arena, inside their price.
+        let (loaded, _, _) = guest_domain_stats(stream.context().ordinal()).unwrap();
+        println!("the tower's load holds {} KiB of the arena", loaded >> 10);
+        assert!(
+            loaded <= LOAD_BYTES,
+            "the load holds {loaded} bytes of the arena, priced at {LOAD_BYTES}"
+        );
         let out = guest.run(&jobs[0], &GuestSink::none());
         guest.unload();
 

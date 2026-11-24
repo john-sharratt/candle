@@ -198,7 +198,8 @@ impl ZendSession {
     /// (turns, KV, provenance) are physically reclaimed at the next compaction
     /// (lazy — the tombstone is the commit, compaction does the delete). Also
     /// drops the conversation from the in-RAM map so it vanishes from the sidebar
-    /// at once. Returns `None` when the model isn't loaded yet.
+    /// at once, and retires every image no other conversation reads. Returns
+    /// `None` when the model isn't loaded yet.
     pub fn tombstone_conversation(&self, conv_id: &str) -> Option<candle_conversation::Result<()>> {
         let state = self.inference.load_full()?;
         let timeline = conversation_timeline(conv_id);
@@ -212,6 +213,17 @@ impl ZendSession {
             close_tool_sessions(&state, conv_id, "deleted");
             state.conversations.remove(conv_id);
             state.journals.forget(conv_id);
+            // Its images go with it, unless another conversation reads them
+            // (`vision::tenancy`). A failure here leaves an image kept, never a
+            // conversation undeleted.
+            let substrate = state.engine.conversation().shared();
+            match release_conversation(&substrate, conv_id) {
+                Ok(retired) if !retired.is_empty() => {
+                    tracing::info!(%conv_id, retired = retired.len(), "its images retired");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(%conv_id, "releasing its images failed: {e}"),
+            }
             // After the tombstone, so a turn woken by it finds its timeline
             // tombstoned.
             state.deletions.deleted();

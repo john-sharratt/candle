@@ -27,6 +27,19 @@ pub struct PreparedImage {
     pub image: VisionImage,
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The id the image whose file is `bytes` is kept under — what [`prepare`]
+/// names it — without decoding it.
+pub fn image_id(bytes: &[u8]) -> String {
+    sha256_hex(bytes)[..ID_HEX].to_string()
+}
+
 /// Decode `bytes` (JPEG, PNG, WebP, GIF's first frame, BMP, TIFF) and size it
 /// for the tower.
 pub fn prepare(bytes: &[u8]) -> Result<PreparedImage, String> {
@@ -40,10 +53,7 @@ pub fn prepare(bytes: &[u8]) -> Result<PreparedImage, String> {
     } else {
         image::imageops::resize(&rgb, gw, gh, FilterType::CatmullRom)
     };
-    let sha256: String = Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let sha256 = sha256_hex(bytes);
     Ok(PreparedImage {
         id: sha256[..ID_HEX].to_string(),
         sha256,
@@ -105,6 +115,15 @@ mod tests {
         let p = prepare(&bytes).unwrap();
         assert_eq!((p.image.width, p.image.height), (384, 192));
         assert_eq!(p.image.rgb.len(), 384 * 192 * 3);
+    }
+
+    /// An image's id is the start of its bytes' SHA-256 — `abc`'s is
+    /// `ba7816bf8f01cfea` — whether it is decoded or not.
+    #[test]
+    fn an_image_is_named_by_its_bytes_digest() {
+        assert_eq!(image_id(b"abc"), "ba7816bf8f01cfea");
+        let (bytes, _) = png(64, 64);
+        assert_eq!(image_id(&bytes), prepare(&bytes).unwrap().id);
     }
 
     #[test]
