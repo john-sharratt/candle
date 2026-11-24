@@ -287,7 +287,9 @@ impl VisionTower {
     }
 }
 
-#[cfg(test)]
+// Under `cuda` for the pinned file's lookup alone, which lives with the
+// model; the test runs on the CPU.
+#[cfg(all(test, feature = "cuda"))]
 mod cpu_tests {
     use super::*;
     use crate::models::quantized_qwen38_moe::cached_vision_tower_file;
