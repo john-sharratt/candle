@@ -449,7 +449,13 @@ tail prefills prefill text the engine wrote itself and need nothing.
   body is the file, read by the tower once on the member that takes it, kept
   and replicated, answered with its id, size and row count.
   **`GET /v1/images/{id}`** serves the bytes it arrived as, typed by their
-  format (`zend/src/api/images.rs`).
+  format, and **`GET /v1/images/{id}/thumb`** its thumbnail
+  (`zend/src/api/images.rs`): a JPEG at most 480 px on its longest side
+  (`vision/thumb.rs`), made once when the image is prepared and kept as a
+  third blob of its record beside the original and the rows, so a
+  conversation of photographs loads in kilobytes. Both are cached by the
+  browser (`private`, a day): an id is its content's digest, so its bytes
+  never change.
 - **Whose an image is, and how long it is kept** (`vision/tenancy.rs`). An
   image is its sender's: a file sent — a `data:` part, `POST /v1/images`, a
   `zen_chat_send` picture — records its sender as a holder
@@ -460,7 +466,7 @@ tail prefills prefill text the engine wrote itself and need nothing.
   that its conversation reads each image (`vision/used/<id>/<conv>`, and
   `vision/conv/<conv>/<id>` to find them from the conversation); deleting a
   conversation — the user's delete, or a chat closed — forgets its uses and
-  retires every image no other conversation reads: both blobs tombstoned,
+  retires every image no other conversation reads: its three blobs tombstoned,
   the record and its holders ceased. An archived conversation keeps its
   images, as it keeps its text. An image no conversation ever read is
   retired a day after it was kept (`kept_ms` on its record; the sweep runs
@@ -485,7 +491,9 @@ tail prefills prefill text the engine wrote itself and need nothing.
   there as a thumbnail instead of uploading as a file, and goes with the
   next message as an image part (`zend/web/index.html`,
   `zend-api.live.js`); a stored user turn draws its images from the markers
-  in its text through `GET /v1/images/{id}`.
+  in its text, each its thumbnail (`GET /v1/images/{id}/thumb`), and a click
+  opens the original (`GET /v1/images/{id}`) over the page, closed by a
+  click or Escape.
 
 ### 6.2 Turns
 

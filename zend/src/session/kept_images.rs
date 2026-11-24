@@ -61,11 +61,27 @@ impl ZendSession {
     /// not send — an id learned is not an image shared. Reads a blob, so a
     /// caller on the async runtime runs it on the blocking pool.
     pub fn kept_image(&self, id: &str, caller: &Caller) -> Option<Result<Option<Vec<u8>>, String>> {
+        self.kept_part(id, caller, load_original)
+    }
+
+    /// The thumbnail of image `id`, a JPEG, for `caller` — read as
+    /// [`Self::kept_image`] reads the original.
+    pub fn kept_thumb(&self, id: &str, caller: &Caller) -> Option<Result<Option<Vec<u8>>, String>> {
+        self.kept_part(id, caller, load_thumb)
+    }
+
+    /// What `load` reads of image `id`, when `caller` may read it.
+    fn kept_part(
+        &self,
+        id: &str,
+        caller: &Caller,
+        load: fn(&SharedSubstrate, &str) -> Result<Option<Vec<u8>>, String>,
+    ) -> Option<Result<Option<Vec<u8>>, String>> {
         let state = self.loaded()?;
         let substrate = state.engine.conversation().shared();
         if !caller.is_admin() && !holds(&substrate, id, &caller.key()) {
             return Some(Ok(None));
         }
-        Some(load_original(&substrate, id))
+        Some(load(&substrate, id))
     }
 }

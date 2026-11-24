@@ -158,6 +158,12 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             get(images::original),
         )
         .route(
+            "/v1/images/:id/thumb",
+            Role::User,
+            Dispatch::Any,
+            get(images::thumb),
+        )
+        .route(
             "/v1/models",
             Role::Unauthenticated,
             Dispatch::Any,

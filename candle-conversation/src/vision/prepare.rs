@@ -1,5 +1,6 @@
 //! An uploaded image, made ready for the tower: decoded, sized to its patch
-//! grid by `smart_resize`, and named by the digest of the bytes it arrived as.
+//! grid by `smart_resize`, named by the digest of the bytes it arrived as, and
+//! given its thumbnail.
 //!
 //! Host work, once per image, on the caller's thread — never inside a drain.
 
@@ -7,6 +8,7 @@ use candle_transformers::models::qwen_vision::smart_resize;
 use image::imageops::FilterType;
 use sha2::{Digest, Sha256};
 
+use super::thumb::thumbnail;
 use crate::guest::VisionImage;
 
 /// Hex digits of an image's digest that name it in a turn's text and in the
@@ -25,6 +27,8 @@ pub struct PreparedImage {
     pub height: u32,
     /// Resized to its grid.
     pub image: VisionImage,
+    /// Its thumbnail, a JPEG ([`super::thumb`]).
+    pub thumb: Vec<u8>,
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -46,6 +50,7 @@ pub fn prepare(bytes: &[u8]) -> Result<PreparedImage, String> {
     let decoded = image::load_from_memory(bytes).map_err(|e| format!("not an image: {e}"))?;
     let rgb = decoded.to_rgb8();
     let (width, height) = rgb.dimensions();
+    let thumb = thumbnail(&rgb)?;
     let grid = smart_resize(height as usize, width as usize)?;
     let (gw, gh) = (grid.width as u32, grid.height as u32);
     let sized = if (gw, gh) == (width, height) {
@@ -64,6 +69,7 @@ pub fn prepare(bytes: &[u8]) -> Result<PreparedImage, String> {
             height: gh,
             width: gw,
         },
+        thumb,
     })
 }
 
@@ -106,6 +112,8 @@ mod tests {
         assert_eq!(p.image.rgb, raw);
         assert_eq!(p.id.len(), ID_HEX);
         assert!(p.sha256.starts_with(&p.id));
+        let thumb = image::load_from_memory(&p.thumb).unwrap();
+        assert_eq!((thumb.width(), thumb.height()), (480, 360));
     }
 
     /// Another size is resized to `smart_resize`'s grid.

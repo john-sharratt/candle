@@ -225,7 +225,7 @@ use crate::working_set::seeds::Seeding;
 use crate::working_set::{corpus, dialogue_config};
 use crate::workspace::UPLOADS_REPO;
 use candle_conversation::vision::tenancy::{holds, note_use, release_conversation, sweep_unused};
-use candle_conversation::vision::{load_original, marker, split_markers, ImageSource};
+use candle_conversation::vision::{load_original, load_thumb, marker, split_markers, ImageSource};
 
 pub mod diag;
 mod kv_census;

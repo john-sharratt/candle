@@ -10,6 +10,7 @@
 //! | `stored` | the image spans of stored turns, for a path that prefills them again |
 //! | `encode` | uploads into a turn's images: prepared, read by the tower, registered |
 //! | `tenancy` | who may read a kept image, and how long it is kept |
+//! | `thumb` | an image's thumbnail, made once and kept beside it |
 //!
 //! Design: `docs/flash_next_vision.md`.
 
@@ -21,10 +22,11 @@ pub mod spans;
 pub mod store;
 pub mod stored;
 pub mod tenancy;
+pub mod thumb;
 
 pub use encode::{encode, turn_images, ImageSource, TurnImage};
 pub use marker::{marker, split_markers};
 pub use prepare::{prepare, PreparedImage};
 pub use spans::{engine_ids, turn_spans, ImageSpan, VisionTokens};
-pub use store::{load_kept, load_original, load_rows, store_image, KeptRows};
+pub use store::{load_kept, load_original, load_rows, load_thumb, store_image, KeptRows};
 pub use stored::stored_spans;

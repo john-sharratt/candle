@@ -148,10 +148,11 @@ pub fn sweep_unused(substrate: &SharedSubstrate, now_ms: u64) -> Result<Vec<Stri
     Ok(stale)
 }
 
-/// Retire image `id`: its bytes and its rows, its record, and who held it.
+/// Retire image `id`: its bytes, its thumbnail and its rows, its record, and
+/// who held it.
 fn retire(substrate: &SharedSubstrate, id: &str) -> Result<(), String> {
     if let Some(obj) = substrate.custom_object(&image_key(id)) {
-        for field in ["sha256", "rows"] {
+        for field in ["sha256", "thumb", "rows"] {
             if let Some(digest) = obj.blob[field].as_str().and_then(unhex) {
                 substrate.retire_blob(&digest).map_err(|e| e.to_string())?;
             }
@@ -170,7 +171,7 @@ mod tests {
     use crate::guest::VisionImage;
     use crate::persistence::Admit;
     use crate::vision::prepare::PreparedImage;
-    use crate::vision::store::{load_original, store_image};
+    use crate::vision::store::{load_original, load_thumb, store_image};
     use candle_transformers::models::qwen_vision::{Grid, ImageRows};
 
     fn substrate(dir: &tempfile::TempDir) -> SharedSubstrate {
@@ -189,6 +190,7 @@ mod tests {
                 height: 32,
                 width: 32,
             },
+            thumb: [original, &b"-thumb"[..]].concat(),
         };
         let rows = ImageRows {
             grid: Grid {
@@ -244,12 +246,16 @@ mod tests {
             Vec::<String>::new()
         );
         assert_eq!(load_original(&s, id).unwrap(), Some(b"dog".to_vec()));
+        assert_eq!(load_thumb(&s, id).unwrap(), Some(b"dog-thumb".to_vec()));
 
         assert_eq!(
             release_conversation(&s, "conv-b").unwrap(),
             vec![id.to_string()]
         );
         assert_eq!(load_original(&s, id).unwrap(), None);
+        assert_eq!(load_thumb(&s, id).unwrap(), None);
+        let thumb_sha: [u8; 32] = Sha256::digest(b"dog-thumb").into();
+        assert!(!s.has_blob(&thumb_sha));
         assert!(s.custom_object(&image_key(id)).is_none());
         assert!(!holds(&s, id, "1111111111111111"));
         assert_eq!(s.custom_objects_count_under("vision/"), 0);
