@@ -87,6 +87,7 @@ fn deepseek_spec(model_path: &std::path::Path) -> ModelSpec {
         default_sampling: SamplingConfig::argmax(),
         supports_thinking: true,
         non_thinking_sampling: None,
+        vision: None,
     }
 }
 

@@ -100,7 +100,6 @@ use crate::models::quantized_matmul::QMatMul;
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
 use crate::models::qwen35::spec::split_block_rows;
 use crate::models::qwen38_flash_next_sweep as flash_next_sweep;
-use crate::models::qwen_vision::{rotation_tables, ImageRotation, ImageRun};
 use crate::models::residency_rows::residency_decode_rows;
 use crate::models::residual_rows::{CreepResidual, ResidualArena, ResidualIn};
 use crate::models::rope_schedule::{FactoredRope, RopeRungs, RopeSchedule, RungSelect};
@@ -301,7 +300,6 @@ enum Inherited {
 mod delegates;
 #[cfg(test)]
 mod experts;
-mod images;
 mod layers;
 mod model_core;
 mod positional;
@@ -317,5 +315,5 @@ mod speculative;
 mod step;
 mod wave_sweep;
 
-use images::{count_image_rows, take_wave_images};
+use crate::models::qwen_vision::wave_images::{count_image_rows, image_rotation, take_wave_images};
 use layers::*;

@@ -200,7 +200,7 @@ mod tests {
             width: 2,
             values: vec![0.5, -0.5],
         };
-        store_image(s, &image, original.to_vec(), &rows, kept_ms).unwrap();
+        store_image(s, &image, original.to_vec(), &rows, "test-tower", kept_ms).unwrap();
     }
 
     /// The key a conversation is named by is the start of its id's SHA-256:

@@ -82,6 +82,7 @@ use crate::config::{SamplingConfig, SequenceConfig};
 use crate::error::ConversationError;
 use candle::DType;
 pub use candle_transformers::models::hit_layers::HitPercentiles;
+use candle_transformers::models::qwen_vision::VisionTowerSource;
 pub use candle_transformers::models::rope_schedule::RopePreset;
 pub use candle_transformers::models::selection_strata::{Recent, StrataTokens};
 use std::path::Path;
@@ -498,6 +499,12 @@ pub struct ModelSpec {
     /// Qwen3 recommends different settings for non-thinking mode:
     /// temperature=0.7, top_p=0.8, top_k=20.
     pub non_thinking_sampling: Option<SamplingConfig>,
+
+    /// The vision tower this model's release carries, when it carries one
+    /// (`docs/vision_models.md` §2.2). Naming it registers the vision guest
+    /// with the engine, so the model's turns take images; `None` is a model
+    /// that reads text alone, whose image turns are refused.
+    pub vision: Option<&'static VisionTowerSource>,
 }
 
 // ────────────────────────────────────────────────────────────────────────────

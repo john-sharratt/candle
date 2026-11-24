@@ -138,6 +138,12 @@ impl ConversationEngine {
         self.core.guests.registry.configured()
     }
 
+    /// The vision tower this engine's model reads images with, or `None` for a
+    /// model that reads text alone (`docs/vision_models.md` §2.2).
+    pub fn vision(&self) -> Option<&'static VisionTowerSource> {
+        self.core.guests.registry.vision()
+    }
+
     /// The largest square side this node draws ([`crate::guest::reach`]).
     pub fn guest_reach(&self) -> u32 {
         self.core.guests.queue.reach()

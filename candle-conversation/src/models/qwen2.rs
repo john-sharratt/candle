@@ -40,5 +40,6 @@ pub(super) fn qwen2_0_5b() -> ModelSpec {
         default_sampling: SamplingConfig::for_gguf_architecture("qwen2"),
         supports_thinking: false,
         non_thinking_sampling: None,
+        vision: None,
     }
 }

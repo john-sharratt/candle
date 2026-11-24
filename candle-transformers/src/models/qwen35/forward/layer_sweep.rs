@@ -212,6 +212,15 @@ pub(super) fn sweep_layers(
     };
     g_meta.end();
 
+    // The wave's images: its virtual ids resolved against the registry and
+    // its inputs as the embedding reads them, or `None` for a text wave
+    // (`docs/vision_models.md` §2.3).
+    let hidden_size = q.cfg.hidden_size;
+    let wave_images = wave_image_inputs(inputs, hidden_size)?;
+    let image_rows_n = wave_images
+        .as_ref()
+        .map_or(0, |w| w.images.values.len() / hidden_size);
+
     let mut contexts = assemble_wave_contexts(session, seq_ids, inputs)?;
     let contexts = contexts.as_mut_slice();
 
@@ -290,8 +299,9 @@ pub(super) fn sweep_layers(
                 qsa_bytes: 0,
                 // Its MoE layers apply no look-ahead routers.
                 look_ahead_hops: 0,
-                // This lineage's engine takes no image rows.
-                image_rows: 0,
+                // The image rows the wave uploads and copies over their
+                // placeholders.
+                image_rows: image_rows_n,
                 // A one-row prefill group takes the decode kernels, so it carves
                 // no span-table entry and, alone, no scan transient.
                 prefill_spans: pre_q.iter().filter(|&&l| l > 1).count(),
@@ -360,9 +370,27 @@ pub(super) fn sweep_layers(
     // Every row's id in one buffer on the span — one upload for ids handed over
     // on the host, a copy for ids already on the device — read by the embedding
     // and, when the wave reaches it, by the draft head.
+    // A wave with images reads its inputs with each image position a
+    // placeholder, whose row the image's is copied over below.
     let ids = {
-        let inputs: Vec<&Tensor> = contexts.iter().map(|c| c.input_ids).collect();
+        let inputs: Vec<&Tensor> = match &wave_images {
+            Some(w) => w.inputs.iter().collect(),
+            None => contexts.iter().map(|c| c.input_ids).collect(),
+        };
         device_token_ids(&inputs, dev, fwd_ticket)?
+    };
+    // The image rows in the residual's type, uploaded once for the two
+    // embeddings that read them: the trunk's, when this window starts the
+    // residual, and the draft head's, when it reaches the head.
+    let image_rows = match &wave_images {
+        Some(w) if x_in.is_none() || layer_end == num_layers => Some(upload_image_rows(
+            &w.images,
+            hidden_size,
+            embed_dtype,
+            dev,
+            fwd_ticket,
+        )?),
+        _ => None,
     };
 
     // Combined residual: embed every row flat `[1, total, hidden]`, or resume a
@@ -382,7 +410,18 @@ pub(super) fn sweep_layers(
             resume.gather_into(&buf)?;
             TensorCat::from_cat_tensor(buf, 0)?
         }
-        None => TensorCat::from_cat_tensor(embed_rows(q, &ids, embed_dtype, fwd_ticket)?, 0)?,
+        None => {
+            let rows = embed_rows(q, &ids, embed_dtype, fwd_ticket)?;
+            if let (Some(w), Some(image)) = (&wave_images, &image_rows) {
+                place_image_rows(
+                    &rows.reshape((total_rows, hidden_size))?,
+                    image,
+                    &w.images,
+                    0,
+                )?;
+            }
+            TensorCat::from_cat_tensor(rows, 0)?
+        }
     };
     g_embed.end();
 
@@ -428,6 +467,20 @@ pub(super) fn sweep_layers(
         generation,
         &dec_pm,
     );
+    // The prefill group's image rows turned by their place in the image, the
+    // trunk's attention and the draft head's alike: image ids arrive in
+    // prompts, which are prefill rows, after the decode group.
+    let rotation = match &wave_images {
+        Some(w) => Some(image_rotation(
+            &w.images,
+            n_decode,
+            q.cfg.rope_dim,
+            f64::from(theta),
+            dev,
+            fwd_ticket,
+        )?),
+        None => None,
+    };
     let pre_params = BatchedAttentionParams::new(
         &pre_rope,
         interleaved,
@@ -436,7 +489,8 @@ pub(super) fn sweep_layers(
         pre_q,
         generation,
         &pre_pm,
-    );
+    )
+    .with_image_rotation(rotation.as_ref());
 
     // Where each sequence's rows sit in the packed buffer — what a recurrent
     // mixer needs to run one sequence at a time against its own state.
@@ -716,6 +770,10 @@ pub(super) fn sweep_layers(
                 kv_layer,
                 act_dtype: embed_dtype,
                 forward: fwd_ticket,
+                images: match (&wave_images, &image_rows) {
+                    (Some(w), Some(rows)) => Some((rows, &w.images)),
+                    _ => None,
+                },
             },
         )?;
     }

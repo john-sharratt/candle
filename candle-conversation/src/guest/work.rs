@@ -239,9 +239,11 @@ pub struct VisionImage {
     pub width: u32,
 }
 
-/// Each image's rows, `tokens × 2560` F32 row-major, in the request's order.
+/// Each image's rows, `tokens × width` F32 row-major, in the request's order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VisionRows {
+    /// The rows' width: the tower's output, its trunk's hidden size.
+    pub width: usize,
     pub rows: Vec<Vec<f32>>,
 }
 

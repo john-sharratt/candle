@@ -41,6 +41,7 @@ pub(super) fn hermes3_3b_q6() -> ModelSpec {
         default_sampling: SamplingConfig::for_gguf_architecture("llama"),
         supports_thinking: false,
         non_thinking_sampling: None,
+        vision: None,
     }
 }
 
@@ -74,5 +75,6 @@ pub(super) fn hermes3_70b_q4() -> ModelSpec {
         default_sampling: SamplingConfig::for_gguf_architecture("llama"),
         supports_thinking: false,
         non_thinking_sampling: None,
+        vision: None,
     }
 }
