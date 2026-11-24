@@ -12,20 +12,21 @@ Scope is **still images in user turns**. Video (token 248057, grids with
 `t > 1`) uses the same tower with time stepping and is not part of this
 design.
 
-**The shape of it, in five sentences.** An image in a prompt is a run of
-*virtual token ids* above the vocabulary, swapped in for its
-`<|image_pad|>` ids at the one place the scheduler turns a prompt into the
-engine's input, so nothing recorded ever holds one. The engine, seeing
-virtual ids in a wave, runs the tower over those images on the wave's own
-arena and hands the rows to the embedding gather as a second table, so the
-rows exist only inside the wave that uses them. Each image row's query and
-key are rotated once, in place, by the difference between its multimodal
-position and its slot, so every attention kernel's read-time rotation
-composes to the right position and no kernel or KV structure changes. The
-image itself is a replicated blob in zend's substrate, named from the turn;
-every path that rebuilds a turn from its ids re-derives the virtual ids from
-it. The tower's weights are one more source in the model pack, loaded by
-name like the MTP head.
+**The shape of it, in five sentences.** The tower runs as a **guest** — the
+mechanism the image-generation model already uses — between waves, once per
+image, and its rows come back to the host, where the image's original bytes
+and its rows are kept in the substrate under the image's id. An image in a
+prompt is a run of *virtual token ids* above the vocabulary, naming its rows
+in a process-wide registry, swapped in for its `<|image_pad|>` ids at the one
+place the scheduler turns a prompt into the engine's input, so nothing
+recorded ever holds one. The engine resolves the virtual ids of a wave after
+the id readback it already makes and uploads their rows as the embedding
+gather's second table. Each image row's query and key are rotated once, in
+place, by the difference between its multimodal position and its slot, so
+every attention kernel's read-time rotation composes to the right position
+and no kernel or KV structure changes. A turn's text names each image by a
+marker, which is how every path that runs a stored turn again finds its
+rows.
 
 Sources, in order of authority:
 
@@ -131,9 +132,11 @@ All on the host at **submission**, once per image, in
    torchvision's bicubic with antialias — close, not bit-identical; parity
    tests feed pre-sized images, §9).
 
-The result, a `PreparedImage { rgb: Vec<u8>, grid: [h, w] }` (patch units),
-is what travels to the engine. Normalization `(x/255 − 0.5)/0.5` and the
-patch permutation happen on the device (§4.2). Reference sizes:
+The result, a `PreparedImage` (`candle-conversation/src/vision/prepare.rs`) —
+the resized RGB8 as a `VisionImage`, the size it arrived at, and its id, the
+first 16 hex digits of the original bytes' SHA-256 — is what travels to the
+tower. Normalization `(x/255 − 0.5)/0.5` and the patch permutation are the
+tower's first ops (§3). Reference sizes:
 
 | Input | Resized | grid | `<|image_pad|>` | advance `max(h/2, w/2)` |
 |---|---|---|---|---|
@@ -146,35 +149,44 @@ patch permutation happen on the device (§4.2). Reference sizes:
 
 ---
 
-## 3. Weights: one more pack source, like the MTP head
+## 3. The tower: a guest, its rows kept
 
-The MTP head is the template, end to end:
+**The weights.** `mmproj-F16.gguf` at the pinned revision
+(`quantized_qwen38_moe/checkpoint_pins.rs`, `QWEN4EXP_MMPROJ_FILE` with its
+length and SHA-256), fetched from the hub into its cache by the caller that
+is about to need it (`vision_tower_file`, which checks the length every call
+and the digest once a process) — never by the drain that reads it, which runs
+with every wave stopped. It is not a pack source: the engine recipe, and the
+190 GB pack built from it, stay as they are.
 
-- the recipe lists a source by role — `SourceRole::{Trunk, DraftHead,
-  ExpertImport}` (`qwen4exp/prepare/recipe.rs:34-51`), the Flash-Next recipe
-  adds `DraftHead` (`quantized_qwen38_moe/engine_artifact.rs:47-55`);
-- `prepare_engine` gathers sources by role and merges their tensors into the
-  one pack (`prepare/build.rs:97-138`);
-- the engine reads them by name from the same `GgufModel` as resident
-  `QMatMul`s (`MtpDense::load`, `qwen4exp/mtp.rs:175-233`,
-  `WeightResidency::Span`), before `dense_span::close_load`
-  (`engine.rs:481-518`), and attaches the module (`engine.rs:583-605`).
+**The guest.** `Guest::Vision` (`candle-conversation/src/guest/vision.rs`)
+serves a `VisionRequest` — images at their grid — with each image's rows on
+the host. Between waves it places its activation arena on the guest ground's
+widest run, places the GGUF's tensors in the ground beside it
+(`place_gguf`; GEMM weights at the card's int8 mode), loads `VisionTower`
+(`qwen_vision/tower.rs`: plain candle ops, one forward that is both the CPU
+reference and the guest arena's run), runs each image, and gives the ground
+back. Its footprint is the weights plus the largest image's activations,
+stated per patch (`ACTIVATION_BYTES_PER_PATCH`); the tower attends in
+512-row bands so a 16 384-patch image never materialises `N × N` scores.
+Flash-Next's engine registers the guest itself
+(`models/builder/model_guests.rs`): the tower ships with the model, so it is
+not named in a deployment's `guests.yaml`.
 
-The tower is a fourth role, **`SourceRole::Vision`**: repo
-`unsloth/Qwen3.8-Flash-Next-GGUF`, the pinned revision above,
-`mmproj-F16.gguf`. At build its GEMM weights are requantized to Q8_0, the
-patch weight is folded (`W₀ + W₁`) and kept F16, biases, norms and the
-position table stay F32, and the `v.*`/`mm.*` names are kept. At load a
-`VisionTower` is read the way `MtpDense` is and attached as `model.vision`.
-0.48 GB of dense weights, resident — an image arrives any time, and loading
-it per image would be ~40 ms over the PCIe-limited links of the 4090 Mobile
-and the 3090 for memory the expert cache would only lend back.
+**Why a guest, not resident weights in the wave.** An image is read once:
+its rows are a function of its bytes alone, so they are kept (§6.2) and no
+later turn, replay, or member runs the tower for it again. Resident, the
+tower would hold 0.48 GB of the card for the whole run, against the expert
+cache, for work done once per image. As a guest it costs nothing between
+images, and the engine's own load is untouched.
 
-The image-generation guest (`candle-conversation/src/guest/`) is the other
-existing way to run a network on the card, and the wrong one here: it loads
-per drain, stops every wave while it runs, and hands only host data back
-(`guest/mod.rs:10-22`, `work.rs:386-402`). The tower's rows are wanted on
-the device, inside a prefill wave.
+**Keeping the rows.** `vision::turn_images` prepares each upload, takes its
+rows from the substrate when an earlier turn already read the same image,
+and otherwise runs the guest and keeps them: the original bytes and the rows
+(`rows_codec.rs`: `ZVR1`, height, width, row width as `u32`, then bf16
+values) as two content-addressed blobs, and a keyed record
+`vision/image/<id>` naming both (`vision/store.rs`). Blobs replicate with the
+substrate, so a member that adopts the turn finds the image too.
 
 ---
 
@@ -184,82 +196,66 @@ the device, inside a prefill wave.
 
 An image's `h'·w'` placeholder positions (`h' = grid_h/2`, `w' = grid_w/2`)
 are recorded everywhere as `<|image_pad|>` 248056. In the **engine's input
-only**, they are `VOCAB + base + i` for `i` in `0..h'·w'`, where `base` is
-the image's range in the engine's **image registry**:
+only**, they are `VIRTUAL_BASE + base + i` for `i` in `0..h'·w'`
+(`VIRTUAL_BASE = 0x8000_0000`, far above any vocabulary), where `base` is the
+image's range in the process-wide **image registry**
+(`qwen_vision/registry.rs`):
 
 ```rust
-/// Host-side: images waiting to be read, by the virtual id range each holds.
-pub struct ImageRegistry { … }                  // in the engine, Arc-shared
-impl ImageRegistry {
-    pub fn register(&self, image: Arc<PreparedImage>) -> ImageHandle;
+/// RAII: holds `rows` under the id range `VIRTUAL_BASE + base ..` until dropped.
+pub struct ImageHandle { base: u32, len: u32, rows: Arc<ImageRows>, … }
+impl ImageHandle {
+    pub fn register(rows: ImageRows) -> Result<Arc<Self>, String>;
+    pub fn id(&self, i: usize) -> u32;
 }
-/// RAII: holds the id range `VOCAB + base ..` until dropped.
-pub struct ImageHandle { base: u32, len: u32, … }
+pub fn lookup(id: u32) -> Option<(Arc<ImageRows>, usize)>;
 ```
 
-Registering is host-only (no device work), so it can be done from any
-thread. A range is returned to the registry when its handle drops.
+Registering is host-only, so it is done from any thread. A range goes back
+to the registry when its last handle drops; the scheduler's work holds the
+handles for as long as it can be prefilled.
 
-### 4.2 Reading the images
+### 4.2 Reading the rows in a wave
 
 `sweep_layers` already reads every input id to the host once, for the PLE
-hash (`host_token_ids`, `wave/layers.rs:202`). Right after it:
+hash (`host_token_ids`). Right after it, `take_wave_images`
+(`qwen4exp/wave/images.rs`):
 
-1. Collect the distinct images named by ids ≥ `VOCAB` in this wave.
-   None → everything below is skipped, and a text wave is the wave it is
-   today.
-2. Run the tower over **all of them in one call** on the wave's forward
-   arena (`fwd_ticket`, the arena the residual lives on): upload each
-   image's RGB8, then `vision_patchify` (normalize + merge-block permute into
-   768-wide rows), the patch GEMM, the position-embedding add, 27 blocks, the
-   merger — into one `[Σ h'w', 2560]` F32 buffer, images back to back.
-3. Rewrite the wave's ids: a virtual id becomes `VOCAB + offset_of(image) + i`,
-   its row in that buffer; and for the PLE hash, `seq_tokens` gets 248056 in
-   its place (`ple.rs:184-199` hashes the id, and HF hashes `input_ids`,
-   which hold `<|image_pad|>` there; `PleState.prev` must never carry a
-   virtual id, `ple.rs:231`).
-4. `gather_into` (`layers.rs:212-213`) takes the buffer as a **second
-   table**: in `embed_gather_dequant.cu`, an id in `[n_src_rows, n_src_rows + n_extra)`
-   copies that F32 row into every destination — the residual's `hc` copies
-   and the head's `row_embeds` — where today any id past the table writes
-   zeros (`:94-104`). One branch in the kernel, two arguments in the
-   launcher. The MTP head therefore sees image rows as HF's does, through
-   `inputs_embeds`.
+1. Finds the virtual ids in the wave. None → nothing below runs, and a text
+   wave is the wave it was.
+2. Lays the rows they name back to back in one F32 `[Σ rows, 2560]` upload
+   on the wave's forward ticket, priced in the transient plan as
+   `WaveBuffer::ImageRows` from `WaveWidth::image_rows` — so `tier_fits`
+   refuses a wave the tier cannot hold, as it refuses any other
+   (invariant 7).
+3. Rewrites the gather's ids: a virtual id becomes `n_vocab + row`, its row
+   in that upload; and for the PLE hash the wave's ids get 248056 in its
+   place (HF hashes `input_ids`, which hold `<|image_pad|>` there; the PLE
+   state never carries a virtual id).
+4. `gather_into` takes the upload as a **second table**: in
+   `embed_gather_dequant.cu`, an id in `[n_src_rows, n_src_rows + n_extra)`
+   copies that F32 row into every destination — the residual's copies and
+   the head's `row_embeds` — and an id past both writes zeros. The MTP head
+   therefore sees image rows as HF's does, through `inputs_embeds`.
 
-The rows live only for this wave. A wave holding part of an image runs the
-tower over the whole image and uses the part it holds; an image cut across
-two waves (`pack_prefill_slabs`, `wave_driver.rs:479-527`; prefill caps at
-8 192 rows) is encoded twice. That is milliseconds against a prefill, and it
-is what makes the rows need no lifetime, no cache and no eviction: nothing
-about an image outlives a wave on the device.
+The kernel moves image rows in 16-byte stores where the row width and every
+pointer allow, the quantized rows as before. `embed_gather_bench` is its
+micro harness: a correctness gate (text, text with a second table bound,
+image rows), then µs a call and GB/s for each. On the RTX PRO 5000 at 8 192
+rows, binding the second table costs a text gather nothing (472.6 µs both
+ways, 935 GB/s).
 
-The tower's buffers are priced in the wave's transient plan like the
-residual is (`WaveBuffer::HyperResidual`, `HeadRowEmbeds` in
-`layers.rs:173-174`): a `WaveBuffer::VisionRows` for the output and the
-largest block's activations for the blocks, from the wave's patch count —
-so `tier_fits` refuses a wave the tier cannot hold, as it refuses any other
-(invariant 7). The scheduler's admission sees the cost through the same
-plan.
+### 4.3 The tower's own ops
 
-### 4.3 What the tower needs that does not exist
-
-- **`vision_patchify`** — normalize and permute RGB8 into patch rows, emitted
-  in the GEMM's input type (invariants 1 and 4).
-- **ViT attention** — non-causal, segmented by image, head dim 72 (padded to
-  80 in shared memory, not in tensors), online softmax, never materialising
-  `N × N` scores: a 4 096-token image is 16 384 patches. Nothing in the
-  fork fits (`sdpa` is Metal-only, `ops.rs:1630`; `z_image`'s int8 kernel is
-  head-dim 128, `dit-attn/api.rs:24`; `candle-flash-attn` is an sm80-only
-  optional feature candle-conversation does not enable). Check the
-  `perf-boost` branch first (`feedback_port_perf_boost_kernels`).
-- **`rope_axes_inplace`** — §4.4; it also serves the ViT's 2D RoPE, with a
-  different axis rule.
-
-Everything else is what the trunk and the MTP head already call:
-`QMatMul::forward_live`, the fused LayerNorm with a ticket, `gelu` /
-`gelu_erf`, `broadcast_add` for biases. The position-embedding resample is
-four gathers and a weighted sum of the resident 2304-row table, from a tap
-table built per image on the host (grid only).
+`VisionTower::encode` is plain candle ops over tensors in the guest arena:
+patchify on the device (normalize, merge-block permute into 768-wide rows),
+the folded patch GEMM, the position-embedding resample as four row gathers
+of the 2304-row table weighted from a tap table built per image on the host,
+27 blocks (`guest_chain`), and the merger with exact-erf GELU. Attention is
+`z_image::attention::banded` over 512-row bands at head dim 72; the 2D RoPE
+is NeoX `rope` with per-patch angle tables (`vit_rope_angles`: row angles on
+the first 18 pairs, column angles on the next 18). It runs BF16 on CUDA and
+F32 on the CPU, where the CPU run is the reference.
 
 ### 4.4 Positions: rotate each image row once
 
@@ -296,17 +292,24 @@ prefill kernel rotates Q in registers at `prefix_len + tok`
 In kernel slot order rotary pair `f` is dims `(f, f + 128)`
 (`rotary_layout.rs:15-23, 105-107`), so the axis of a pair is `f % 3`.
 
-`rope_axes_inplace(x, runs, half, axis_rule, rung)` rotates pair
-`(f, f + half)` of each row in `runs` by the row's position on axis
-`axis_rule(f)`. For the trunk: `half = 128`, 32 pairs, `axis = f % 3`, the
-sequence's rung (`rope_schedule/rungs.rs`), and the per-row `δ` computed in
-the kernel from a run descriptor per image span in the wave
-`(wave_row, len, i0, n, m, w')`, so the host builds one entry per image, not
-one per row. It reaches `forward_attn_batched` (`batched_layer/mod.rs:288`)
-as an `Option` on `BatchedAttentionParams`: `None` for every wave without an
-image. The MTP head runs the same `forward_attn_batched` over the wave's
-prefill rows (`draft.rs:228, 295`) and gets the same runs, shifted by its
-one-row offset.
+`ImageRotation` (`qwen_vision/rotation.rs`) is the turn. Once per forward,
+`rotation_tables` lists the prefill group's image rows and each one's
+`(cos, sin)` of `δ · inv_freq` at the 32 rotary pairs (`axis = f % 3`,
+`trunk_axis`), F32, uploaded on the forward ticket — about 260 bytes an image
+row, so an 8 192-row wave of image is 2.1 MB of the forward span's 16 MiB.
+Then each attention layer turns Q and K in place with one launch each,
+`image_rope_rows` (`candle-kernels/src/simple/image_rope_rows.cu`): pair
+`(f, f + 128)` of every head of every listed row, in f32, each product
+rounded before the sum so the result is the host's arithmetic to the bit,
+rounded once to BF16. It reaches `forward_attn_batched_multi` as an `Option`
+on `BatchedAttentionParams` (`with_image_rotation`): `None` for every wave
+without an image, which takes no new branch. `image_rope_bench` is the
+kernel's micro harness: Q and K gated bit for bit against the host, then
+µs a call and GB/s.
+
+The turn is at the slot's base frequencies. Past 262 144 positions a
+sequence moves to the next rope rung (below); `δ·freq` at the low
+frequencies YaRN changes is tiny.
 
 **Where the image is anchored.** The exact rule shifts every token after an
 image down by `n − max(h', w')`, which is not local to the image: decode Q
@@ -338,20 +341,19 @@ uniformly on all three axes, and on H and W a uniform shift reads as "those
 rows moved up and left": the image would come back with its pieces out of
 place.
 
-So projection never places part of an image, and today it holds by
-construction. The carving unit is one whole turn
-(`docs/hit_driven_projection.md` §8.1, "Whole turns, never records"; every
-unit of `dialogue_fill.rs` is whole turns), and an image lies inside its
-turn's user segment. The one place a turn is split, the reasoning split
-(`turn_layout/layout.rs`, which windows reasoning out on index-page
-boundaries), splits the assistant segment only. To keep it true:
+So projection never places part of an image, and it holds by construction.
+The carving unit is one whole turn (`docs/hit_driven_projection.md` §8.1,
+"Whole turns, never records"; every unit of `dialogue_fill.rs` is whole
+turns), and an image lies inside its turn's user segment: its block is put at
+the head of the user tokens by the submitter itself
+(`TurnSubmitter::image_blocks`), and no other path writes one. The one place
+a turn is split, the reasoning split (`turn_layout/layout.rs`, which windows
+reasoning out on index-page boundaries), splits the assistant segment only.
+To keep it true:
 
-- `TurnDecl.images` spans are checked at seal to lie within the turn's one
-  real `User` segment, beside `validate_tiling`; a turn that breaks it is
-  refused at seal, not projected wrong later.
 - Anything that comes to carve finer than a turn (paging a long user
-  message, windowing a user segment) treats every image span as atomic: it
-  places the span whole or not at all. This is a rule of the turn layout,
+  message, windowing a user segment) treats every image block as atomic: it
+  places the block whole or not at all. This is a rule of the turn layout,
   stated with `TurnSegment::User`, not a convention of each carver.
 - QSA selection inside a slot is not a placement. It picks which cells a
   query attends to without moving any, so attending to part of an image
@@ -382,36 +384,33 @@ boundaries), splits the assistant segment only. To keep it true:
 
 ## 5. The scheduler: where virtual ids enter
 
-A live turn's prompt reaches the engine through one copy:
-`scheduler/prefill/wave_run.rs:93` (`work.tokens[off..end].to_vec()` in
-`build_wave_group_inputs`), and nothing recorded reads that copy — the
-substrate's token record (`seal_turn.rs:297`), the penalty and DRY context
-(`first_samples.rs:370`, which asserts ids below vocab,
-`penalty_counts.rs:47`), the context dump, the page cut and the replay
-check all read `work.tokens` itself. So the swap goes **there**: each
-position inside an image span becomes `VOCAB + handle.base + (pos − start)`.
+A live turn's prompt reaches the engine through one copy, in
+`build_wave_group_inputs` (`scheduler/prefill/wave_run.rs`), and nothing
+recorded reads that copy — the substrate's token record, the penalty and DRY
+context, the context dump, the page cut and the replay check all read
+`work.tokens` itself. So the swap goes **there**:
+`engine_ids(&work.tokens[off..end], off, &work.image_spans)`
+(`vision/spans.rs`) names each position inside an image span by its row's
+virtual id.
 
-The spans travel exactly as `recurrent_spans` do — built in
-`turn_submitter.rs:220-236`, shifted by the turn head at `:487-493`, carried
-in `SubmitTurn` (`requests.rs:238`), copied into `PrefillWork` at
-`submit_turn.rs:588` — as `image_spans: Vec<(u32, ImageHandle)>`. The
+The spans travel exactly as `recurrent_spans` do — built by
+`TurnSubmitter::image_blocks`, shifted by the turn head in
+`submit_prefill_unit`, carried in `SubmitTurn.image_spans`, copied into
+`PrefillWork.image_spans` — as `Vec<ImageSpan { start, handle }>`. The
 handles drop with the `PrefillWork`, which returns the ranges.
 
-The other places that turn ids into engine input take spans the same way,
-through one helper, `engine_ids(&tokens, &spans)`:
+The other places that turn ids into engine input:
 
 | Path | Engine input | Spans from |
 |---|---|---|
-| live turn, compression turn, zend replay | `wave_run.rs:93` | `PrefillWork.image_spans` |
-| recurrent-memory catch-up, branch checkpoint pass | `recurrent.rs:375` (`prefill_tokens_on`) | the turn's `images` (§6.2) |
-| section ingest / restore | `section_ingest.rs:87`, `wave_run.rs:120` | the section's turns' `images` |
+| live turn, compression turn, zend replay | `build_wave_group_inputs` | `PrefillWork.image_spans` |
+| recurrent-memory catch-up over spliced turns | `prefill_tokens_on` | `vision::stored_spans`: each turn's user half, its markers, its rows from the substrate |
+| branch checkpoint pass, section ingest | — | sections hold ingested text and catalogs; no path writes an image block into one |
 
 Cold reload re-prefills nothing — it restores sealed K/V
 (`persistence/integrity.rs`) — and cold-to-warm, projection injection and
 replication move K/V; the image is in it already. Glue, stencil, heal and
-tail prefills (`wave_run.rs:407`, `gap_fill.rs:57`, `stencil_wave.rs:112`,
-`decode/commit.rs:902`, `cleanup.rs:513-520`) prefill text the engine wrote
-itself and need nothing.
+tail prefills prefill text the engine wrote itself and need nothing.
 
 ---
 
@@ -419,65 +418,75 @@ itself and need nothing.
 
 ### 6.1 Requests
 
-- **`POST /v1/chat/completions`** (`zend/src/api/chat.rs:70`). Today
-  `text_content` keeps only the `text` of array content and drops every
-  image part (`zend/src/types.rs:66-87`, pinned by a test at `:275-292`).
-  `ChatMessage.content` becomes a list of parts; an image part is the
-  OpenAI shape `{"type": "image_url", "image_url": {"url": …}}`, the url a
-  `data:` URL or a substrate image id. Nothing on the request path fetches
-  from the network; a client sends the bytes.
-- **The routing key and the passthrough transcript** read text
-  (`cluster/src/dispatch/derived.rs:92`, `session.rs:8384`) and keep doing
-  so, with an image rendered as its marker (§6.4).
-- **`zen_chat_send`** gains `images`: ids of images uploaded through a zend
-  `image_upload` (a signed `PUT`, as npcd's, `npcd/src/mcp/image_upload.rs`),
-  or of images npcd drew (`npcd/src/images.rs`), which the host — both
-  tenants in one process — copies into zend's substrate as zend's own blob.
+- **`POST /v1/chat/completions`** (`zend/src/api/chat.rs`). A message's
+  `content` is a string, `null`, or OpenAI parts; its text parts join in
+  order and each `{"type": "image_url", "image_url": {"url": …}}` part's url
+  is kept apart as `ChatMessage.images` (`zend/src/types.rs`). A url is a
+  `data:` URL carrying the file, or the id `POST /v1/images` answered with
+  (`zend/src/images.rs`). Nothing on the request path fetches from the
+  network; a client sends the bytes. A url that names nothing readable is a
+  `400 invalid_image` before a turn starts, and so is an image sent to the
+  `passthrough` model, which runs the client's transcript as text.
+- **`POST /v1/images`** keeps an image ahead of the turn that names it: the
+  body is the file, read by the tower once on the member that takes it, kept
+  and replicated, answered with its id, size and row count.
+  **`GET /v1/images/{id}`** serves the bytes it arrived as, typed by their
+  format (`zend/src/api/images.rs`).
+- **The turn.** The session parses the last user message's images into
+  `TurnStart.images`, and the turn reads them before its first round
+  (`images::resolve` on the blocking pool, under a "Reading the images…"
+  status): from the substrate when an earlier turn read the same image, by
+  the tower otherwise. They go to that round's `TurnOptions.images`; a tool
+  round's message is the results and carries none.
+- **`zen_chat_send`** takes `images`: the ids (or links) the existing
+  `image_upload` tool answered once the caller's sandbox sent the picture
+  (`npcd/src/mcp/image_upload.rs`). Each is fetched up the cluster as the
+  caller, `GET /v1/image/{id}`, as their browser would fetch it
+  (`zend/src/mcp/chats/pictures.rs`). On a conversation of the web UI's the
+  turn runs where the gateway places it, so the pictures go with it as
+  `data:` URLs; on a private chat the worker's first turn runs on this
+  member, so they are kept here first and named by their kept ids
+  (`First::Message(text, images)`).
+- **The web UI.** An image dropped on or picked into the composer waits
+  there as a thumbnail instead of uploading as a file, and goes with the
+  next message as an image part (`zend/web/index.html`,
+  `zend-api.live.js`); a stored user turn draws its images from the markers
+  in its text through `GET /v1/images/{id}`.
 
 ### 6.2 Turns
 
-- **Tokens.** An image is a third kind of `TurnText` piece (`turn_text.rs`),
-  `Image { id, grid }`. Its ids — `248053, h'·w' × 248056, 248054` — are
-  spliced into `user_tokens` right after `encode_text`
-  (`turn_submitter.rs:217`), where the scaffold's raw ids are the precedent
-  (`:262-269`); `user_content_end` (`:307`) stays right. Never as markup
-  text: `user_text` is stored verbatim and the byte spans at `:224-229`
-  would stop lining up.
-- **The image.** A `Blob` in **zend's** substrate, named by SHA-256
-  (`RecordType::Blob`, `persistence/record.rs:300-309`; `put_blob`,
-  `persistence/mod.rs:561-580`) — content-addressed, replicated. The
-  original bytes.
-- **The turn.** `TurnDecl` (`persistence/streams.rs:65-113`) gains
-  `#[serde(default)] images: Vec<TurnImage>`, `TurnImage { id: sha256,
-  start: u32, grid: [u32; 2] }` — the turn-relative position of the first
-  `<|image_pad|>` and the grid, fixed at submission so the placeholder count
-  never changes under a turn. Not a new `TurnSegment` variant: that enum has
-  no `#[serde(other)]`, and a member that does not know a variant drops the
-  whole turn (`substrate.rs:6388-6392`).
-- **Replay paths** (§5) read `images`, load and prepare the blobs, register
-  them, and pass the handles as spans.
-- **Lifetime.** Blobs are not retired by a timeline tombstone; deleting a
-  conversation retires its images' blobs with a replicating tombstone, as
-  npcd's kept images do (`npcd/src/images/kept.rs`), once no turn names
-  them.
+- **Tokens.** Each image's ids — `<|vision_start|>`, `h'·w'` ×
+  `<|image_pad|>`, `<|vision_end|>` (`VisionTokens::block`) — are put at the
+  head of the turn's user tokens by `TurnSubmitter::image_blocks`, before the
+  text, and recorded like every other id.
+- **The text.** The user text the turn records starts with one marker per
+  image, `[image <16 hex> W×H]` and a newline (`vision/marker.rs`), so the
+  turn's own text names its images; the `k`-th image block in the ids is the
+  `k`-th marker. `TurnDecl` does not change.
+- **The image.** Its original bytes and its rows are kept under
+  `vision/image/<id>` (§3), content-addressed and replicated.
+- **Replay paths** (§5) read a stored turn's user half (`Substrate::user_half`),
+  pair its blocks with its markers (`turn_spans`), read the rows from the
+  substrate, register them, and pass the handles as spans. A turn whose
+  blocks and markers do not pair, or whose rows the substrate does not hold,
+  is refused rather than prefilled as pads.
+- **Lifetime.** An image is content-addressed and shared by every turn that
+  shows it, in any conversation, so deleting one conversation leaves it kept;
+  it goes with the substrate.
 
-### 6.3 Capabilities
+### 6.3 Which engines read images
 
-`Capabilities { tokens, dialect }` (`engine_slot/capabilities.rs:11-50`)
-gains `vision: bool`, checked at attach (`engine_slot/mod.rs:186-195`)
-against the model spec's `vision` flag (beside `supports_thinking`,
-`models/qwen38_flash_next.rs:115`); zend declares it and the three tokens
-(`zend/src/tenant.rs:41-46`). A request with an image to a model without
-vision is a 400.
+Flash-Next's engine registers the vision guest itself (§3). An engine without
+one answers an image's guest job with `Unavailable(Vision)`, which the turn
+reports as its error. An image whose rows are already kept needs no guest.
 
-### 6.4 Text views and hashes
+### 6.4 Text views and penalties
 
-- `user_text_of` and the history and hydrate paths
-  (`substrate.rs:6886-6951`) render an image as `[image <8 hex>, W×H]`.
-- Section content hashes (`persistence/content_hash.rs:153`,
-  `projection/plain_prompt.rs:127`) take the image ids with the tokens.
-- Repetition and DRY counts skip `<|image_pad|>`: a run of thousands of one
-  id would dominate them.
+- The history shows a user turn's markers as recorded; the web UI draws them
+  as the images (§6.1).
+- Repetition and DRY counts see `<|image_pad|>` like any id: it is never a
+  token the model should write, so counting it only keeps the model from
+  writing it.
 
 ---
 
@@ -485,26 +494,26 @@ vision is a 400.
 
 | Where | Change |
 |---|---|
-| `qwen4exp/prepare/recipe.rs`, `build.rs`, `engine_artifact.rs` | `SourceRole::Vision`; fold, requant, merge |
-| `qwen4exp/vision/` (new: `tower.rs`, `patchify.rs`, `pos_embed.rs`, `registry.rs`) | `VisionTower` load + forward; `ImageRegistry`, `ImageHandle` |
-| `qwen4exp/engine.rs` | load the tower beside `MtpDense`; own the registry |
-| `qwen4exp/wave/layers.rs` | after `host_token_ids`: images → tower → id rewrite, PLE ids; second table to `gather_into`; runs to attention |
+| `qwen_vision/` (new: `geometry.rs`, `registry.rs`, `tower.rs`, `rotation.rs`) | grid and positions; `ImageHandle` and virtual ids; `VisionTower`; `ImageRotation` |
+| `quantized_qwen38_moe/checkpoint_pins.rs`, `vision_tower.rs` | the pinned `mmproj`, fetched and checked |
+| `qwen4exp/wave/images.rs`, `layers.rs`, `wave_sweep.rs` | after `host_token_ids`: rows uploaded, ids rewritten, PLE ids; second table to `gather_into`; the turn to attention; `WaveWidth::image_rows` |
 | `models/device_embedding.rs`, `simple/embed_gather_dequant.cu` | the second F32 table |
-| `batched_layer/prefill_attn.rs`, `mod.rs` | `BatchedAttentionParams.image_runs`; `rope_axes_inplace` on `q`, `k` |
-| `candle-kernels` (new) | `vision_patchify`, ViT attention, `rope_axes_inplace` |
-| wave transient plan | `WaveBuffer::VisionRows` and the tower's blocks |
-| `qwen4exp/config.rs` | parse and assert `ple.image_token_id` |
-| `scheduler/prefill/wave_run.rs`, `recurrent.rs`, `section_ingest.rs` | `engine_ids` with spans |
-| `PrefillWork`, `SubmitTurn` | `image_spans` |
-| `turn_text.rs`, `turn_submitter.rs` | the image piece and its ids |
-| `persistence/streams.rs` | `TurnDecl.images` |
-| `turn_layout/` | image spans lie within the `User` segment, checked at seal beside `validate_tiling` |
-| preprocessing (new, `candle-conversation/src/vision/`) | decode, `smart_resize`, `PreparedImage` |
-| `zend/src/types.rs`, `api/chat.rs`, MCP | image parts, `image_upload`, `zen_chat_send.images` |
-| `engine_slot/capabilities.rs` | `vision` |
+| `simple/image_rope_rows.cu` (new) | the in-place turn |
+| `batched_layer/prefill_attn.rs`, `mod.rs` | `BatchedAttentionParams.image_rotation`, applied to `q`, `k` |
+| `candle-nn` wave plan | `WaveBuffer::ImageRows` |
+| `qwen4exp/config.rs` | `ple.image_token_id` |
+| `guest/vision.rs`, `guest/work.rs`, `models/builder/model_guests.rs` | `Guest::Vision`, registered for Flash-Next |
+| `candle-conversation/src/vision/` (new) | prepare, rows codec, store, markers, spans, stored spans, `turn_images` |
+| `turn_submitter.rs`, `turn.rs` | markers in the user text, image blocks in the user tokens, `TurnOptions.images` |
+| `scheduler/` | `image_spans` on `SubmitTurn`, `PrefillWork`, `MemoryCatchUp`; `engine_ids` at `build_wave_group_inputs` and `prefill_tokens_on` |
+| `substrate/user_half.rs`, `turn_access.rs` | a stored turn's user half in place |
+| `zend/src/types.rs`, `images.rs`, `api/chat.rs`, `api/images.rs`, `session/` | image parts, `/v1/images`, the turn's images |
+| `zend/src/mcp/chats/pictures.rs`, `zen_chat_send.rs`, `workers/` | `zen_chat_send.images` |
+| `zend/web/` | the composer's images, the bubble's images |
 
 No change to: any paged attention kernel, `ChunkMeta`, the KV formats, the
-QSA indexer, the substrate's chunk records, replication, or the decode path.
+QSA indexer, the engine recipe and its pack, `TurnDecl`, the substrate's
+chunk records, replication, or the decode path.
 
 ---
 
@@ -512,13 +521,13 @@ QSA indexer, the substrate's chunk records, replication, or the decode path.
 
 | Invariant | How it holds |
 |---|---|
-| 1, 1b | patchify emits the GEMM's input type; the merger writes F32, the gather's second table's type and the residual's |
-| 2, 2b | the merger's `[N/4, 4608]` is a view; images are written back to back by patchify, never concatenated after; the gather reads the second table in place |
-| 3 | no readback: the virtual ids are read in the readback PLE already makes |
-| 4 | host work is per image (decode, resize, a tap table, one run descriptor per span); normalize, permute and every layer are kernels |
-| 5 | one tower call per wave over all its images; one `rope_axes_inplace` per attention layer over all image rows |
-| 6 | every tower buffer and the rows are uninitialised; every byte written |
-| 7 | the tower's weights are budgeted dense weights; its activations are priced in the wave's transient plan |
+| 1, 1b | the rows are F32, the gather's second table's type; the turn reads Q and K in their own type and writes it back |
+| 2, 2b | the rows are uploaded back to back once; the gather reads them in place; the turn rotates in place, no copy |
+| 3 | no readback: the virtual ids are read in the readback PLE already makes; the rows go host → device once a wave |
+| 4 | host work is per image (decode, resize) and per forward (the row list and its tables); the rows come from the guest, which runs between waves |
+| 5 | one upload per wave for all its images; one turn per attention layer per tensor over all image rows |
+| 6 | the rows' upload and the tables are written whole |
+| 7 | the rows are priced in the wave's transient plan (`WaveBuffer::ImageRows`); the tables sit in the forward span; the tower runs in guest ground between waves |
 
 ---
 
@@ -529,17 +538,21 @@ TDD; each piece lands with its tests.
 ### 9.1 Exact values
 
 - `smart_resize`: §2's table, both bounds, half-to-even, the aspect refusal.
-- `vision_patchify`: a 32 × 32 image whose bytes encode `(c, y, x)`, the
-  patch rows as raw expected values, merge-block order included.
-- Position-embedding taps and weights for 1-, 2-, 16- and 48-wide grids.
-- `rope_axes_inplace`: rows whose δ-rotation then slot-rotation is compared
-  with a direct rotation at the target position, per axis rule; the δ table
-  for a 3 × 5 image, by hand.
+- Patch order (merge-block), position-embedding taps and weights, the ViT
+  and trunk rotary positions, by hand.
+- The turn: rows whose δ-rotation then slot-rotation is compared with a
+  direct rotation at the target position, on the kernel, the rows outside
+  the image and the pairs past the rotary width bit for bit as they were;
+  `image_rope_bench` against the host's arithmetic bit for bit at the
+  trunk's geometry.
 - The gather's second table: virtual ids among real ones, every destination,
-  bit patterns.
+  bit patterns (`device_embedding`, `embed_gather_bench`).
 - `engine_ids`: spans in, virtual ids at exactly the span positions, the
-  rest untouched; the PLE ids carry 248056.
-- `TurnDecl` with and without `images`; the image piece's ids.
+  rest untouched; the PLE ids carry 248056 (`wave::images`).
+- The rows codec's exact bytes; markers and image blocks; a stored turn's
+  spans from its ids and text, refused when they do not pair.
+- The chat request's image parts; `/v1/images` urls; `zen_chat_send`'s
+  pictures as parts, ids and links.
 
 ### 9.2 Tower parity
 
@@ -575,29 +588,25 @@ reference, at the trunk gates' tolerances.
 
 ## 10. Order of work
 
-Each step lands complete, tested and committed before the next.
-
-1. The pack source, the tower's load, and its CPU reference; preprocessing;
-   §9.2's first test.
-2. The CUDA tower: patchify, attention, the plan's prices; §9.2's second
-   test.
-3. The registry, the second gather table, the id rewrite in
-   `sweep_layers`, PLE ids; `rope_axes_inplace` at `prefill_attn.rs`.
+1. The tower, its geometry and its CPU reference; preprocessing.
+2. The registry, the second gather table, the id rewrite in
+   `sweep_layers`, PLE ids; the turn at `prefill_attn.rs`.
+3. The tower as a guest; the rows kept.
 4. The scheduler's spans and `engine_ids` at every site of §5.
-5. The conversation layer: the image piece, blobs, `TurnDecl.images`, text
-   views, hashes, penalties, capabilities, blob retirement.
-6. Clients: chat-completions parts, `image_upload`, `zen_chat_send.images`.
+5. The conversation layer: markers, image blocks, stored spans.
+6. Clients: chat-completions parts, `/v1/images`, `zen_chat_send.images`,
+   the web UI.
 7. §9.3 on each machine.
 
 ---
 
-## 11. Decisions for the author
+## 11. Decisions
 
 - **The end anchor** (§4.4) — exact within the image and after it, stretched
   across it. The exact rule needs a per-sequence shift carried by every
   later token, decode included.
 - **The QSA indexer stays one-dimensional** (§4.4).
 - **4 096 image tokens per image** (§2); HF allows 16 384.
-- **The tower resident** (§3), 0.48 GB.
-- **Re-encode per wave** (§4.2) rather than keep rows across waves.
+- **The tower a guest, its rows kept** (§3): read once per image, not
+  resident, not run inside a wave.
 - **Erf GELU in the merger** (§1.3), following HF over llama.cpp.

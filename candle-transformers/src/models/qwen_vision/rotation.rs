@@ -11,15 +11,16 @@
 //!
 //! The head is in the kernels' slot order (`rotary_layout`): rotary pair `f`
 //! is slots `(f, f + head_dim/2)` for `f < rope_dim/2`, at frequency `f`, and
-//! every other pair passes through. The turn is one launch per tensor over
-//! every image row of the group (`simple/image_rope_rows.cu`), from a table of
-//! `(cos, sin)` per listed row and rotary pair built once per forward.
+//! every other pair passes through. The turn is one launch per attention
+//! layer over every image row of the group, Q and K together
+//! (`simple/image_rope_rows.cu`), from a table of `(cos, sin)` per listed row
+//! and rotary pair built once per forward.
 
 use std::ffi::c_void;
 
 use candle::backend::BackendStorage;
 use candle::cuda_backend::cudarc::driver::DevicePtr;
-use candle::{DType, LiveTensor, Result, Storage, Tensor};
+use candle::{CudaStorage, DType, LiveTensor, Result, Storage, Tensor};
 use candle_kernels::simple::image_rope_rows::{
     run_image_rope_rows, IMAGE_ROPE_BAD_SHAPE, IMAGE_ROPE_BF16, IMAGE_ROPE_F16, IMAGE_ROPE_F32,
     IMAGE_ROPE_UNSUPPORTED_DTYPE,
@@ -94,6 +95,22 @@ pub struct ImageRotation {
     sin: Tensor,
 }
 
+/// `t`'s dense `[rows, heads, dim]` geometry, or why it cannot be turned.
+fn heads_of(t: &LiveTensor<'_>, what: &str) -> Result<(usize, usize, usize)> {
+    if !t.is_contiguous() {
+        candle::bail!("image rotation: {what} is {:?} stride {:?}, not dense", t.dims(), t.stride());
+    }
+    t.dims3()
+}
+
+/// A storage's CUDA side, for a pointer taken in the caller's scope.
+fn cuda_of<'s>(s: &'s Storage, what: &str) -> Result<&'s CudaStorage> {
+    match s {
+        Storage::Cuda(c) => Ok(c),
+        _ => candle::bail!("image rotation: {what} is not on a CUDA device"),
+    }
+}
+
 impl ImageRotation {
     /// The tables `rotation_tables` built, uploaded where the caller placed
     /// them (a wave's forward span), with their `rows_end`.
@@ -126,85 +143,94 @@ impl ImageRotation {
         self.rows.elem_count() == 0
     }
 
-    /// Turn the listed rows of `x` (`[rows, heads, head_dim]`, dense) in place.
-    pub fn apply(&self, x: &LiveTensor<'_>) -> Result<()> {
+    /// Turn the listed rows of `q` and `k` (`[rows, heads, head_dim]` each,
+    /// dense, one type) in place.
+    pub fn apply(&self, q: &LiveTensor<'_>, k: &LiveTensor<'_>) -> Result<()> {
         if self.is_empty() {
             return Ok(());
         }
-        if !x.is_contiguous() {
-            candle::bail!("image rotation: x is {:?} stride {:?}, not dense", x.dims(), x.stride());
-        }
-        let (x_rows, heads, dim) = x.dims3()?;
-        if self.rows_end > x_rows {
+        let (q_rows, q_heads, dim) = heads_of(q, "q")?;
+        let (k_rows, k_heads, k_dim) = heads_of(k, "k")?;
+        if (k_rows, k_dim) != (q_rows, dim) || k.dtype() != q.dtype() {
             candle::bail!(
-                "image rotation: rows up to {} listed for a tensor of {x_rows}",
+                "image rotation: q is {:?} {:?} and k {:?} {:?}",
+                q.dtype(),
+                q.dims(),
+                k.dtype(),
+                k.dims()
+            );
+        }
+        if self.rows_end > q_rows {
+            candle::bail!(
+                "image rotation: rows up to {} listed for tensors of {q_rows}",
                 self.rows_end
             );
         }
         let (n, pairs) = self.cos.dims2()?;
-        let code = match x.dtype() {
+        let code = match q.dtype() {
             DType::F32 => IMAGE_ROPE_F32,
             DType::F16 => IMAGE_ROPE_F16,
             DType::BF16 => IMAGE_ROPE_BF16,
-            other => candle::bail!("image rotation: x is {other:?}, not a float type"),
+            other => candle::bail!("image rotation: q is {other:?}, not a float type"),
         };
-        let (xs, xl) = x.storage_and_layout();
-        let Storage::Cuda(xc) = &*xs else {
-            candle::bail!("image rotation: x is not on a CUDA device");
-        };
-        let stream = xc.device().cuda_stream();
-        let at = xl.start_offset();
         // Every borrow and device-pointer guard is held until the launch has
         // been issued.
+        let (qs, ql) = q.storage_and_layout();
+        let (ks, kl) = k.storage_and_layout();
         let (rs, rl) = self.rows.storage_and_layout();
         let (cs, cl) = self.cos.storage_and_layout();
         let (ss, sl) = self.sin.storage_and_layout();
-        let (Storage::Cuda(rc), Storage::Cuda(cc), Storage::Cuda(sc)) = (&*rs, &*cs, &*ss) else {
-            candle::bail!("image rotation: the tables are not on a CUDA device");
-        };
+        let (qc, kc) = (cuda_of(&qs, "q")?, cuda_of(&ks, "k")?);
+        let (rc, cc, sc) = (
+            cuda_of(&rs, "the row list")?,
+            cuda_of(&cs, "cos")?,
+            cuda_of(&ss, "sin")?,
+        );
+        let stream = qc.device().cuda_stream();
         let rows_v = rc.as_cuda_slice::<u32>()?.slice(rl.start_offset()..);
         let cos_v = cc.as_cuda_slice::<f32>()?.slice(cl.start_offset()..);
         let sin_v = sc.as_cuda_slice::<f32>()?.slice(sl.start_offset()..);
         let (rows_p, _rg) = rows_v.device_ptr(&stream);
         let (cos_p, _cg) = cos_v.device_ptr(&stream);
         let (sin_p, _sg) = sin_v.device_ptr(&stream);
-        let launch = |xp: u64| {
+        let launch = |qp: u64, kp: u64| {
             candle::set_kernel_breadcrumb("run_image_rope_rows", file!(), line!());
             unsafe {
                 run_image_rope_rows(
                     code,
-                    xp as *mut c_void,
+                    qp as *mut c_void,
+                    q_heads as i32,
+                    kp as *mut c_void,
+                    k_heads as i32,
                     rows_p as *const u32,
                     cos_p as *const f32,
                     sin_p as *const f32,
                     n as i32,
-                    heads as i32,
                     dim as i32,
                     pairs as i32,
                     stream.cu_stream() as *mut c_void,
                 )
             }
         };
-        let status = match x.dtype() {
-            DType::F32 => {
-                let v = xc.as_cuda_slice::<f32>()?.slice(at..);
-                let (p, _g) = v.device_ptr(&stream);
-                launch(p)
-            }
-            DType::F16 => {
-                let v = xc.as_cuda_slice::<f16>()?.slice(at..);
-                let (p, _g) = v.device_ptr(&stream);
-                launch(p)
-            }
-            _ => {
-                let v = xc.as_cuda_slice::<bf16>()?.slice(at..);
-                let (p, _g) = v.device_ptr(&stream);
-                launch(p)
-            }
+        macro_rules! typed {
+            ($t:ty) => {{
+                let qv = qc.as_cuda_slice::<$t>()?.slice(ql.start_offset()..);
+                let kv = kc.as_cuda_slice::<$t>()?.slice(kl.start_offset()..);
+                let (qp, _qg) = qv.device_ptr(&stream);
+                let (kp, _kg) = kv.device_ptr(&stream);
+                launch(qp, kp)
+            }};
+        }
+        let status = match q.dtype() {
+            DType::F32 => typed!(f32),
+            DType::F16 => typed!(f16),
+            _ => typed!(bf16),
         };
         match status {
             0 => Ok(()),
-            IMAGE_ROPE_UNSUPPORTED_DTYPE => candle::bail!("image rotation: no kernel for {:?}", x.dtype()),
+            IMAGE_ROPE_UNSUPPORTED_DTYPE => {
+                candle::bail!("image rotation: no kernel for {:?}", q.dtype())
+            }
             IMAGE_ROPE_BAD_SHAPE => {
                 candle::bail!("image rotation: {pairs} pairs do not fit a {dim}-wide head")
             }
@@ -276,8 +302,8 @@ mod tests {
 
     /// Turning by δ and then by the slot is turning by the slot plus δ — the
     /// property the whole design rests on — checked on the kernel, in F32,
-    /// with the rows outside the image and the pairs past the rotary width
-    /// left bit for bit as they were.
+    /// for Q and K in one launch, with the rows outside the image and the
+    /// pairs past the rotary width left bit for bit as they were.
     #[test]
     fn a_turn_then_the_slot_rotation_is_the_multimodal_rotation() {
         let _gpu = gpu_serial();
@@ -286,7 +312,7 @@ mod tests {
             height: 2 * FACTOR,
             width: 2 * FACTOR,
         };
-        // Head 8 wide, 2 of its 4 pairs rotary.
+        // Heads 8 wide, 2 of their 4 pairs rotary; Q 2 heads, K 1.
         let (head_dim, rope_dim, theta) = (8, 4, 50.0);
         let run = ImageRun {
             row: 1,
@@ -295,10 +321,14 @@ mod tests {
             first: 0,
         };
         let rows = 6;
-        let vals: Vec<f32> = (0..rows * 2 * head_dim)
-            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
-            .collect();
-        let x = Tensor::from_vec(vals.clone(), (rows, 2, head_dim), &dev).unwrap();
+        let values = |heads: usize, seed: usize| -> Vec<f32> {
+            (0..rows * heads * head_dim)
+                .map(|i| (((i + seed) * 37 % 101) as f32 - 50.0) / 25.0)
+                .collect()
+        };
+        let (qv, kv) = (values(2, 0), values(1, 11));
+        let q = Tensor::from_vec(qv.clone(), (rows, 2, head_dim), &dev).unwrap();
+        let k = Tensor::from_vec(kv.clone(), (rows, 1, head_dim), &dev).unwrap();
         let t = rotation_tables(&[run], rope_dim, theta);
         let n = t.rows.len();
         let rot = ImageRotation::from_tables(
@@ -308,14 +338,7 @@ mod tests {
             Tensor::from_vec(t.sin, (n, t.pairs), &dev).unwrap(),
         )
         .unwrap();
-        rot.apply(&x).unwrap();
-        let turned = x.to_vec3::<f32>().unwrap();
-        let orig = Tensor::from_vec(vals, (rows, 2, head_dim), &Device::Cpu)
-            .unwrap()
-            .to_vec3::<f32>()
-            .unwrap();
-        assert_eq!(turned[0], orig[0]);
-        assert_eq!(turned[5], orig[5]);
+        rot.apply(&q, &k).unwrap();
         let half = head_dim / 2;
         let pairs = rope_dim / 2;
         let rotate = |v: &[f32], angle: &dyn Fn(usize) -> f64| -> Vec<f32> {
@@ -329,22 +352,59 @@ mod tests {
             out
         };
         let inv = |f: usize| 1.0 / theta.powf(2.0 * f as f64 / rope_dim as f64);
-        for j in 0..4 {
-            let slot = 10.0 + j as f64;
-            let d = image_delta(grid, j);
-            for h in 0..2 {
-                for f in pairs..half {
-                    assert_eq!(turned[1 + j][h][f], orig[1 + j][h][f]);
-                    assert_eq!(turned[1 + j][h][f + half], orig[1 + j][h][f + half]);
-                }
-                let via_turn = rotate(&turned[1 + j][h], &|f| slot * inv(f));
-                let direct = rotate(&orig[1 + j][h], &|f| {
-                    (slot + d[trunk_axis(f)] as f64) * inv(f)
-                });
-                for (a, b) in via_turn.iter().zip(&direct) {
-                    assert!((a - b).abs() < 1e-5, "row {j} head {h}: {a} vs {b}");
+        for (x, vals, heads) in [(&q, qv, 2), (&k, kv, 1)] {
+            let turned = x.to_vec3::<f32>().unwrap();
+            let orig = Tensor::from_vec(vals, (rows, heads, head_dim), &Device::Cpu)
+                .unwrap()
+                .to_vec3::<f32>()
+                .unwrap();
+            assert_eq!(turned[0], orig[0]);
+            assert_eq!(turned[5], orig[5]);
+            for j in 0..4 {
+                let slot = 10.0 + j as f64;
+                let d = image_delta(grid, j);
+                for h in 0..heads {
+                    for f in pairs..half {
+                        assert_eq!(turned[1 + j][h][f], orig[1 + j][h][f]);
+                        assert_eq!(turned[1 + j][h][f + half], orig[1 + j][h][f + half]);
+                    }
+                    let via_turn = rotate(&turned[1 + j][h], &|f| slot * inv(f));
+                    let direct = rotate(&orig[1 + j][h], &|f| {
+                        (slot + d[trunk_axis(f)] as f64) * inv(f)
+                    });
+                    for (a, b) in via_turn.iter().zip(&direct) {
+                        assert!((a - b).abs() < 1e-5, "row {j} head {h}: {a} vs {b}");
+                    }
                 }
             }
         }
+    }
+
+    /// A list past the tensors' rows is refused before anything launches.
+    #[test]
+    fn rows_past_the_tensors_are_refused() {
+        let _gpu = gpu_serial();
+        let Ok(dev) = Device::new_cuda(0) else { return };
+        let grid = Grid {
+            height: FACTOR,
+            width: FACTOR,
+        };
+        let run = ImageRun {
+            row: 3,
+            len: 1,
+            grid,
+            first: 0,
+        };
+        let t = rotation_tables(&[run], 4, 10.0);
+        let rot = ImageRotation::from_tables(
+            Tensor::from_vec(t.rows, 1, &dev).unwrap(),
+            t.rows_end,
+            Tensor::from_vec(t.cos, (1, t.pairs), &dev).unwrap(),
+            Tensor::from_vec(t.sin, (1, t.pairs), &dev).unwrap(),
+        )
+        .unwrap();
+        let q = Tensor::zeros((3, 1, 8), DType::F32, &dev).unwrap();
+        let k = Tensor::zeros((3, 1, 8), DType::F32, &dev).unwrap();
+        assert!(rot.apply(&q, &k).is_err());
     }
 }

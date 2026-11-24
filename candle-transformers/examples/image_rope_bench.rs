@@ -2,10 +2,10 @@
 //! of an image's rows of Q and K, at Qwen3.8-Flash-Next's attention geometry:
 //! 256-wide heads, 32 rotary pairs, BF16.
 //!
-//! A wave of `rows` rows holds one image of `image` rows in the middle. Each
-//! tensor (Q at `q_heads`, K at `kv_heads`) is gated **bit for bit** against
-//! the host's f32 arithmetic before it is timed: every listed row's rotary
-//! pairs turned, every other value of the tensor untouched.
+//! A wave of `rows` rows holds one image of `image` rows in the middle. Q (16
+//! heads) and K (2), turned in one launch, are gated **bit for bit** against
+//! the host's f32 arithmetic before they are timed: every listed row's rotary
+//! pairs turned, every other value of either tensor untouched.
 //!
 //! Usage:
 //!   cargo run -p candle-transformers --example image_rope_bench \
@@ -67,17 +67,23 @@ fn main() -> candle::Result<()> {
             .wrapping_add(1442695040888963407);
         ((s >> 40) as f32 / (1u64 << 24) as f32) - 0.5
     };
-    for (name, heads) in [("q", 16usize), ("k", 2usize)] {
-        let vals: Vec<bf16> = (0..rows * heads * HEAD_DIM)
+    const Q_HEADS: usize = 16;
+    const K_HEADS: usize = 2;
+    let mut fill = |heads: usize| -> Vec<bf16> {
+        (0..rows * heads * HEAD_DIM)
             .map(|_| bf16::from_f32(next() * 4.0))
-            .collect();
-        let x = Tensor::from_vec(vals.clone(), (rows, heads, HEAD_DIM), &dev)?;
-        rot.apply(&x)?;
-        let got = x.flatten_all()?.to_vec1::<bf16>()?;
+            .collect()
+    };
+    let (qv, kv) = (fill(Q_HEADS), fill(K_HEADS));
+    let q = Tensor::from_vec(qv.clone(), (rows, Q_HEADS, HEAD_DIM), &dev)?;
+    let k = Tensor::from_vec(kv.clone(), (rows, K_HEADS, HEAD_DIM), &dev)?;
+    rot.apply(&q, &k)?;
 
-        // The host's answer: the same f32 products and sums, rounded once.
+    // The host's answer: the same f32 products and sums, rounded once.
+    let half = HEAD_DIM / 2;
+    for (name, x, vals, heads) in [("q", &q, &qv, Q_HEADS), ("k", &k, &kv, K_HEADS)] {
+        let got = x.flatten_all()?.to_vec1::<bf16>()?;
         let mut want = vals.clone();
-        let half = HEAD_DIM / 2;
         for (i, &r) in t.rows.iter().enumerate() {
             for h in 0..heads {
                 let base = (r as usize * heads + h) * HEAD_DIM;
@@ -101,26 +107,27 @@ fn main() -> candle::Result<()> {
                 want[at]
             );
         }
-
-        for _ in 0..10 {
-            rot.apply(&x)?;
-        }
-        dev.synchronize()?;
-        let t0 = std::time::Instant::now();
-        for _ in 0..iters {
-            rot.apply(&x)?;
-        }
-        dev.synchronize()?;
-        let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
-        // Each listed row's rotary pairs read and written, its tables read.
-        let bytes = (n * heads * t.pairs * 2 * 2 * 2 + n * t.pairs * 2 * 4 + n * 4) as f64;
-        println!(
-            "{name} {rows:>6} rows, {n:>5} image rows, {heads:>2} heads {us:>8.1} us/call \
-             {:>7.1} GB/s",
-            bytes / (us * 1e-6) / 1e9
-        );
     }
     println!("correctness gate: q and k match the host bit for bit");
+
+    for _ in 0..10 {
+        rot.apply(&q, &k)?;
+    }
+    dev.synchronize()?;
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        rot.apply(&q, &k)?;
+    }
+    dev.synchronize()?;
+    let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+    // Each listed row's rotary pairs read and written, its tables read.
+    let heads = Q_HEADS + K_HEADS;
+    let bytes = (n * heads * t.pairs * 2 * 2 * 2 + n * t.pairs * 2 * 4 + n * 4) as f64;
+    println!(
+        "q+k {rows:>6} rows, {n:>5} image rows, {Q_HEADS}+{K_HEADS} heads {us:>8.1} us/call \
+         {:>7.1} GB/s",
+        bytes / (us * 1e-6) / 1e9
+    );
     Ok(())
 }
 

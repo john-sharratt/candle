@@ -76,8 +76,7 @@ pub(super) fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     // read's slot rotation composes to the multimodal position, wherever the
     // chunk is placed (`docs/flash_next_vision.md` §4.4).
     if let Some(rotation) = image_rotation {
-        rotation.apply(&q)?;
-        rotation.apply(&k)?;
+        rotation.apply(&q, &k)?;
     }
 
     // Check for paged (chunked) CUDA path BEFORE applying model-side RoPE.
