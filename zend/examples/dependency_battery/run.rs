@@ -203,12 +203,17 @@ async fn asked_line(
         retrieved.map_or("", |p| p.text.as_str()),
     );
     let mut last_error = String::new();
-    for attempt in 1..=TRIES {
+    // `asked_n` names each conversation, so no two asks share one; `attempt`
+    // counts only the tries that were the answer's own to fail.
+    let mut attempt = 1;
+    let mut asked_n = 0;
+    while attempt <= TRIES {
+        asked_n += 1;
         let conv = conv_id(
             plan_thread,
             job.arm,
             job.run,
-            &attempt_id(&q.id, tag, attempt),
+            &attempt_id(&q.id, tag, asked_n),
         );
         let asked = zend.ask(&conv, &prompt, job.arm).await;
         if let Err(e) = zend.delete(&conv).await {
@@ -234,6 +239,11 @@ async fn asked_line(
             Err(e) => {
                 last_error = format!("{e:#}");
                 tracing::warn!(conv, attempt, "the answer failed: {last_error}");
+                if zend.was_down().await {
+                    tracing::warn!(conv, "the member was down; asked again, no try spent");
+                } else {
+                    attempt += 1;
+                }
             }
         }
     }
