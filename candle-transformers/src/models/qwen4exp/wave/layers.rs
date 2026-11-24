@@ -306,12 +306,13 @@ impl Qwen4ExpBatched {
                         ..*r
                     })
                     .collect();
-                Some(ImageRotation::new(
-                    runs,
-                    cfg.attn_head_dim,
-                    cfg.rope_dim,
-                    f64::from(theta),
-                    |v, s| wave_from_vec_ticketed(v, s, dev, fwd_ticket),
+                let t = rotation_tables(&runs, cfg.rope_dim, f64::from(theta));
+                let n = t.rows.len();
+                Some(ImageRotation::from_tables(
+                    wave_from_vec_ticketed(t.rows, n, dev, fwd_ticket)?,
+                    t.rows_end,
+                    wave_from_vec_ticketed(t.cos, (n, t.pairs), dev, fwd_ticket)?,
+                    wave_from_vec_ticketed(t.sin, (n, t.pairs), dev, fwd_ticket)?,
                 )?)
             }
             None => None,

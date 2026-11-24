@@ -96,7 +96,7 @@ use crate::models::prefill_utils::paged_decode_q8_head_dim;
 use crate::models::prefill_utils::SharedPm;
 use crate::models::profile::{pipeline_record, profile_now, span, ProfileSnapshot};
 use crate::models::qsa_selection::QsaSelection;
-use crate::models::qwen_vision::{ImageRotation, ImageRun};
+use crate::models::qwen_vision::{rotation_tables, ImageRotation, ImageRun};
 use crate::models::quantized_matmul::QMatMul;
 use crate::models::qwen35::quantized_weights::SHARED_GATE_TILE;
 use crate::models::qwen35::spec::split_block_rows;

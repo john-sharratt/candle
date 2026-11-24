@@ -22,6 +22,7 @@
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::kv_cache::{guest_chain, guest_stage};
+use candle_nn::rotary_emb::rope;
 use candle_nn::LayerNorm;
 
 use super::geometry::{
@@ -135,8 +136,8 @@ impl Block {
                 .unsqueeze(0)?
                 .contiguous()
         };
-        let q = candle_nn::rotary_emb::rope(&part(0)?, cos, sin)?;
-        let k = candle_nn::rotary_emb::rope(&part(1)?, cos, sin)?;
+        let q = rope(&part(0)?, cos, sin)?;
+        let k = rope(&part(1)?, cos, sin)?;
         let v = part(2)?;
         let q = (q * scale_of(HEAD_DIM))?;
         let kt = k.transpose(2, 3)?.contiguous()?;

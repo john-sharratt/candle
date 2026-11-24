@@ -61,6 +61,9 @@ pub mod gather_rows;
 /// dequantize and replicate across residual streams in one launch.
 pub mod embed_gather_dequant;
 
+/// An image's rows of Q and K turned in place by their place in the image.
+pub mod image_rope_rows;
+
 // Provenance sign(Q) bit-pack: GPU read+sign+pack, one launch for all layers
 pub mod prov_sign_pack;
 
