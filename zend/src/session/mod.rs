@@ -546,7 +546,7 @@ pub use dials::*;
 use history::*;
 use inference_stream::*;
 pub use journaling::*;
-pub use kept_images::KeptImage;
+pub use kept_images::{ImageRead, KeptImage};
 pub use status::*;
 pub use timeline_ids::*;
 use title_worker::*;

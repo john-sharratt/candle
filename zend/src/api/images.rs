@@ -24,7 +24,7 @@ use candle_conversation::vision::prepare::mime_of;
 use tokio::task::JoinError;
 
 use crate::mcp::caller::Caller;
-use crate::session::ZendSession;
+use crate::session::{ImageRead, ZendSession};
 
 /// The largest image a request carries: past a 4096-token image's pixels at
 /// any sane encoding.
@@ -94,7 +94,7 @@ pub async fn thumb(
 /// `503` before the model is loaded. Cached by the browser for a day: an
 /// image's id is its content's digest, so its bytes never change, and only
 /// its sender reads it.
-fn served(read: Result<Option<Result<Option<Vec<u8>>, String>>, JoinError>) -> Response {
+fn served(read: Result<ImageRead, JoinError>) -> Response {
     match read {
         Ok(Some(Ok(Some(bytes)))) => (
             [

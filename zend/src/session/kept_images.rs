@@ -18,6 +18,13 @@ pub struct KeptImage {
     pub rows: usize,
 }
 
+/// A kept image's bytes as a session reads them: `None` before the model is
+/// loaded, `Some(Ok(None))` for nothing the caller may read under that id.
+pub type ImageRead = Option<Result<Option<Vec<u8>>, String>>;
+
+/// Reads one blob of a kept image — its original, or its thumbnail.
+type PartLoader = fn(&SharedSubstrate, &str) -> Result<Option<Vec<u8>>, String>;
+
 impl ZendSession {
     /// Keep each of `files` as an image `caller` sent: decoded, read by the
     /// tower — every one not already kept, in one job — stored with its rows,
@@ -60,23 +67,18 @@ impl ZendSession {
     /// for an id the substrate keeps no image under, and for one `caller` did
     /// not send — an id learned is not an image shared. Reads a blob, so a
     /// caller on the async runtime runs it on the blocking pool.
-    pub fn kept_image(&self, id: &str, caller: &Caller) -> Option<Result<Option<Vec<u8>>, String>> {
+    pub fn kept_image(&self, id: &str, caller: &Caller) -> ImageRead {
         self.kept_part(id, caller, load_original)
     }
 
     /// The thumbnail of image `id`, a JPEG, for `caller` — read as
     /// [`Self::kept_image`] reads the original.
-    pub fn kept_thumb(&self, id: &str, caller: &Caller) -> Option<Result<Option<Vec<u8>>, String>> {
+    pub fn kept_thumb(&self, id: &str, caller: &Caller) -> ImageRead {
         self.kept_part(id, caller, load_thumb)
     }
 
     /// What `load` reads of image `id`, when `caller` may read it.
-    fn kept_part(
-        &self,
-        id: &str,
-        caller: &Caller,
-        load: fn(&SharedSubstrate, &str) -> Result<Option<Vec<u8>>, String>,
-    ) -> Option<Result<Option<Vec<u8>>, String>> {
+    fn kept_part(&self, id: &str, caller: &Caller, load: PartLoader) -> ImageRead {
         let state = self.loaded()?;
         let substrate = state.engine.conversation().shared();
         if !caller.is_admin() && !holds(&substrate, id, &caller.key()) {
