@@ -1,13 +1,16 @@
 //! `dependency_battery` — the codebase dependency battery of
 //! `docs/unbounded_agents.md` §9.12, against a running zend.
 //!
-//! - `run`: ask every question of `battery.yaml` under each of the seven arms,
-//!   three runs each, sixteen at a time and interleaved (`schedule.rs`); each
-//!   answer a fresh conversation over the daemon's HTTP API with tools off and
-//!   the arm's retrieval dials, scored (`score.rs`), read back for what its
-//!   projection points placed (`placement.rs`) and deleted, one JSON line
-//!   each; the card's load sampled beside it (`telemetry.rs`), and the
-//!   member's K/V census (`GET /v1/kv/census`) taken as it starts and ends.
+//! - `run`: ask every question of `battery.yaml` under each arm (`arms.rs`) —
+//!   or those `--arms` names (`selection.rs`) — up to its highest run, what
+//!   the results file does not already record, sixteen at a time and
+//!   interleaved (`schedule.rs`); each answer a fresh conversation over the
+//!   daemon's HTTP API with the arm's tools mode, retrieval dials and prompt
+//!   (`prompt.rs`; R1's files retrieved by BM25, `rag/`), scored
+//!   (`score.rs`), read back for what its projection points placed
+//!   (`placement.rs`) and deleted, one JSON line each; the card's load
+//!   sampled beside it (`telemetry.rs`), and the member's K/V census
+//!   (`GET /v1/kv/census`) taken as it starts and ends.
 //! - `analyse`: every figure's data and table of §9.12, §6.5 and §9.6.9 from
 //!   those lines (`analyse.rs`, `report.rs`).
 //! - `figures`: the paper's ten data figures as inline-SVG snippets, drawn
@@ -19,6 +22,10 @@
 //! cargo run -p zend --release --example dependency_battery -- run \
 //!   --zend http://192.168.1.2:8081 --node 223ebb209828d84c --repo D:\prog\candle \
 //!   --out docs/results/battery_128/answers.jsonl
+//! # the two baselines' three runs, and three more of C1 and B1, interleaved:
+//! cargo run -p zend --release --example dependency_battery -- run \
+//!   --zend http://192.168.1.2:8081 --node 223ebb209828d84c --repo D:\prog\candle \
+//!   --out docs/results/battery_128/answers.jsonl --arms r1,t1,c1:6,b1:6 --runs 3
 //! cargo run -p zend --release --example dependency_battery -- analyse \
 //!   --answers docs/results/battery_128/answers.jsonl --kv-layers 12 \
 //!   --out docs/results/battery_128
@@ -30,16 +37,22 @@ mod battery;
 mod client;
 mod direct;
 mod figures;
+mod grounding;
+mod hits;
 mod load;
 mod placement;
+mod prompt;
+mod rag;
 mod report;
+mod report_baselines;
 mod run;
 mod schedule;
 mod score;
+mod selection;
 mod stats;
 mod telemetry;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -49,8 +62,12 @@ use clap::{Parser, Subcommand};
 use serde_json::Value;
 use tracing_subscriber::EnvFilter;
 
-use battery::{checked, Battery};
+use arms::Arm;
+use battery::{checked, Battery, Question};
+use rag::context::Packed;
+use rag::Retriever;
 use score::words;
+use selection::arm_runs;
 
 #[derive(Parser)]
 #[command(about = "The §9.12 dependency battery against a running zend")]
@@ -87,8 +104,14 @@ enum Cmd {
         /// The thread the battery's conversations are named under.
         #[arg(long, default_value = "battery-128")]
         thread: String,
+        /// The highest run each arm is asked to; the runs `out` already
+        /// records are not asked again.
         #[arg(long, default_value_t = 3)]
         runs: u32,
+        /// Ask only these arms, by id; `id:n` asks that arm to run `n`
+        /// instead of `--runs`. Every arm when none is named.
+        #[arg(long, value_delimiter = ',')]
+        arms: Vec<String>,
         #[arg(long, default_value_t = 16)]
         concurrency: usize,
         /// The queue's shuffle seed.
@@ -160,6 +183,26 @@ fn vocabulary(repo: &Path) -> anyhow::Result<HashSet<String>> {
     Ok(vocab)
 }
 
+/// R1's files block for each of `questions`, from `repo` indexed without
+/// `exclude` — the battery, whose `expect` lists are its answers, and the
+/// folder its results go to.
+fn retrieval(
+    repo: &Path,
+    exclude: &[PathBuf],
+    questions: &[Question],
+) -> anyhow::Result<HashMap<String, Packed>> {
+    let retriever = Retriever::build(repo, exclude)?;
+    println!(
+        "R1 retrieves from {} files of {}",
+        retriever.files(),
+        repo.display()
+    );
+    Ok(questions
+        .iter()
+        .map(|q| (q.id.clone(), retriever.retrieve(&q.question)))
+        .collect())
+}
+
 fn default_battery() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/dependency_battery/battery.yaml")
 }
@@ -198,22 +241,26 @@ async fn main() -> anyhow::Result<()> {
             telemetry,
             thread,
             runs,
+            arms,
             concurrency,
             seed,
             only,
         } => {
-            let battery = checked(
-                Battery::load(&battery.unwrap_or_else(default_battery))?,
-                &repo,
-            )?;
-            let questions = battery
+            let arms = arm_runs(&arms, runs)?;
+            let battery_path = battery.unwrap_or_else(default_battery);
+            let battery = checked(Battery::load(&battery_path)?, &repo)?;
+            let questions: Vec<Question> = battery
                 .questions
                 .into_iter()
                 .filter(|q| only.is_empty() || only.contains(&q.id))
                 .collect();
-            if let Some(dir) = out.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
+            let results_dir = out.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+            fs::create_dir_all(&results_dir)?;
+            let retrieval = if arms.iter().any(|(a, _)| *a == Arm::R1) {
+                retrieval(&repo, &[battery_path, results_dir], &questions)?
+            } else {
+                HashMap::new()
+            };
             let telemetry = telemetry.unwrap_or_else(|| beside(&out, "telemetry.jsonl"));
             run::run(run::Plan {
                 base: &zend,
@@ -221,7 +268,8 @@ async fn main() -> anyhow::Result<()> {
                 thread: &thread,
                 questions,
                 vocabulary: vocabulary(&repo)?,
-                runs,
+                arms,
+                retrieval,
                 seed,
                 concurrency,
                 out: &out,

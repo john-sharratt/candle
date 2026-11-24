@@ -38,7 +38,8 @@ fn interval(r: &Row) -> String {
     )
 }
 
-pub fn contrasts_svg(rows: &[Row], questions: u32) -> String {
+/// A family of contrasts as a forest titled `title`.
+fn family_svg(title: &str, rows: &[Row], questions: u32) -> String {
     let described: Vec<String> = rows
         .iter()
         .map(|r| format!("{} ({}), {}", r.label, r.sub, interval(r)))
@@ -50,7 +51,7 @@ pub fn contrasts_svg(rows: &[Row], questions: u32) -> String {
     );
     forest::svg(
         &Frame {
-            title: "What each part of the memory buys",
+            title,
             subtitle: &format!(
                 "paired difference in mean recall, points · {questions} questions · 95% interval · faded: Holm p ≥ 0.05"
             ),
@@ -59,6 +60,16 @@ pub fn contrasts_svg(rows: &[Row], questions: u32) -> String {
         },
         rows,
     )
+}
+
+/// Figure 9.12-2: the pre-registered family.
+pub fn contrasts_svg(rows: &[Row], questions: u32) -> String {
+    family_svg("What each part of the memory buys", rows, questions)
+}
+
+/// Figure 9.12-2b: the secondary family, the memory against the baselines.
+pub fn secondary_svg(rows: &[Row], questions: u32) -> String {
+    family_svg("The memory against the baselines", rows, questions)
 }
 
 /// `fig_9_12_4_gain_by_naming.csv`'s two halves as rows, strong where the
@@ -133,6 +144,24 @@ mod tests {
              bootstrap interval and Holm-corrected Wilcoxon p-value: The memory (C1 \u{2212} A1 · Holm p = 1.8e-15), \
              +36.0 points (+30.0 to +42.0); The seed files (C1 \u{2212} C0 · Holm p = 0.670), +0.4 points (\u{2212}2.7 to +3.5).\""
         ));
+    }
+
+    /// **The secondary family is drawn as its own forest**, under its own
+    /// title, from a CSV of the same columns.
+    #[test]
+    fn the_secondary_family_is_its_own_forest() {
+        let t = Table::parse(
+            "contrast,arm,against,questions,effect,lo,hi,p,p_holm\n\
+             \"Provenance memory against tool use\",C1,T1,128,0.1,0.05,0.15,0.001,0.002\n",
+        )
+        .unwrap();
+        let rows = contrast_rows(&t).unwrap();
+        assert_eq!(rows[0].sub, "C1 \u{2212} T1 · Holm p = 0.002");
+        let out = secondary_svg(&rows, 128);
+        assert!(out.contains(">The memory against the baselines</text>"));
+        assert!(out.contains(">Provenance memory against tool use</text>"));
+        assert!(!out.contains("What each part of the memory buys"));
+        assert!(!out.contains("\n\n"));
     }
 
     #[test]

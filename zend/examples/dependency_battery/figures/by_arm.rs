@@ -1,7 +1,8 @@
 //! Figure 9.12-1, recall by arm: each arm's mean recall over the questions as
-//! a dot on its 95% bootstrap interval, its three runs' means as small dots
+//! a dot on its 95% bootstrap interval, each of its runs' means as a small dot
 //! beside it. The reprojecting arms (C) are drawn in the post's colour, the
-//! arms they are measured against in the comparison colour.
+//! arms they are measured against — the baselines R1 and T1 among them, when
+//! the answers hold them — in the comparison colour.
 
 use crate::figures::svg::{Anchor, Linear, Svg, WIDTH};
 use crate::figures::table::Table;
@@ -33,21 +34,43 @@ pub fn points(t: &Table) -> anyhow::Result<Vec<ArmPoint>> {
         .collect()
 }
 
-/// The arm's reprojection and its seed, as its two label lines.
+/// The arm's reprojection and its seed, as its two label lines; a baseline's
+/// in place of the reprojection, and no seed.
 pub fn dials(arm: &str) -> (&'static str, &'static str) {
     let reprojection = match arm.chars().next() {
         Some('A') => "no memory",
         Some('D') => "once",
         Some('B') => "held",
         Some('C') => "reprojecting",
+        Some('R') => "BM25 files",
+        Some('T') => "tools",
         _ => "",
     };
-    let seed = if arm.ends_with('1') {
+    let baseline = matches!(arm.chars().next(), Some('R' | 'T'));
+    let seed = if arm.ends_with('1') && !baseline {
         "seed"
     } else {
         "no seed"
     };
     (reprojection, seed)
+}
+
+/// The arms at the highest mean, joined for the description.
+pub fn best(points: &[ArmPoint]) -> String {
+    let top = points
+        .iter()
+        .map(|p| p.mean)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let arms: Vec<&str> = points
+        .iter()
+        .filter(|p| p.mean == top)
+        .map(|p| p.arm.as_str())
+        .collect();
+    match arms.as_slice() {
+        [] => String::new(),
+        [one] => format!(" {one} recalls the most."),
+        many => format!(" {} recall the most.", many.join(" and ")),
+    }
 }
 
 const X0: f64 = 70.0;
@@ -62,9 +85,9 @@ pub fn svg(points: &[ArmPoint]) -> String {
         .map(|p| format!("{} {} ({} to {})", p.arm, pct(p.mean), pct(p.lo), pct(p.hi)))
         .collect();
     let aria = format!(
-        "Mean recall by arm over {questions} questions, each with its 95% bootstrap interval: {}. \
-         The reprojecting arms C0 and C1 recall the most.",
-        described.join("; ")
+        "Mean recall by arm over {questions} questions, each with its 95% bootstrap interval: {}.{}",
+        described.join("; "),
+        best(points)
     );
     let mut svg = Svg::new(
         306.0,
@@ -155,7 +178,35 @@ mod tests {
         ] {
             assert!(lines.contains(&want), "missing {want}\n{out}");
         }
-        assert!(out.contains("aria-label=\"Mean recall by arm over 128 questions, each with its 95% bootstrap interval: B1 25.0% (20.0% to 30.0%); C1 37.5% (30.0% to 40.0%)."));
+        assert!(out.contains("aria-label=\"Mean recall by arm over 128 questions, each with its 95% bootstrap interval: B1 25.0% (20.0% to 30.0%); C1 37.5% (30.0% to 40.0%). C1 recalls the most.\""));
         assert!(!out.contains("\n\n"));
+    }
+
+    /// **A baseline is labelled by what it is handed, and has no seed.**
+    #[test]
+    fn the_baselines_are_labelled_by_what_they_are_given() {
+        assert_eq!(dials("C1"), ("reprojecting", "seed"));
+        assert_eq!(dials("A0"), ("no memory", "no seed"));
+        assert_eq!(dials("R1"), ("BM25 files", "no seed"));
+        assert_eq!(dials("T1"), ("tools", "no seed"));
+    }
+
+    /// **The description names whichever arm recalls the most**, not the one
+    /// expected to.
+    #[test]
+    fn the_description_names_the_best_arm_from_the_data() {
+        let mut ps = points(&table()).unwrap();
+        ps.push(ArmPoint {
+            arm: "R1".into(),
+            questions: 128,
+            mean: 0.375,
+            lo: 0.3,
+            hi: 0.45,
+            runs: vec![0.375],
+        });
+        assert_eq!(best(&ps), " C1 and R1 recall the most.");
+        ps[2].mean = 0.5;
+        assert_eq!(best(&ps), " R1 recalls the most.");
+        assert_eq!(best(&[]), "");
     }
 }

@@ -1,5 +1,6 @@
-//! The paper's ten data figures (`docs/unbounded_agents.md` §9.12, §9.6) as
-//! inline-SVG snippets, drawn from the CSVs `analyse` writes: each a
+//! The paper's data figures (`docs/unbounded_agents.md` §9.12, §9.6) as
+//! inline-SVG snippets, drawn from the CSVs `analyse` writes — ten, and the
+//! secondary family's forest when the answers hold a baseline: each a
 //! `<figure class="fig">` coloured only by the site's chart classes, written
 //! to `<dir>/figures/<name>.svg.html` for the paper's markdown to carry as is.
 //! The three figures over time also write the points they plot as a CSV
@@ -34,6 +35,10 @@ use timeline::Drawn;
 /// The most points a figure over time plots.
 pub const MAX_POINTS: usize = 96;
 
+/// The secondary family's CSV; a file `analyse` wrote before the baselines
+/// has none, and an answers file without them writes it header-only.
+pub const SECONDARY_CSV: &str = "fig_9_12_2b_effects_secondary.csv";
+
 /// Write every figure of `dir`'s CSVs into `dir/figures`, a gallery of
 /// `gallery_files` files ranked for the needle figure and a token taking
 /// `bf16_per_token` bytes at BF16 for the context figure; the paths written.
@@ -57,6 +62,19 @@ pub fn write(dir: &Path, gallery_files: u32, bf16_per_token: f64) -> anyhow::Res
         "fig_9_12_2_effects",
         effects::contrasts_svg(&effects::contrast_rows(&contrasts)?, paired),
     ));
+    // The secondary family, drawn when the answers held a baseline to test.
+    let secondary_csv = dir.join(SECONDARY_CSV);
+    if secondary_csv.is_file() {
+        let secondary = Table::read(&secondary_csv)?;
+        let first = secondary.records().next().map(|r| r.num("questions"));
+        if let Some(questions) = first {
+            let paired = questions? as u32;
+            snippets.push((
+                "fig_9_12_2b_effects_secondary",
+                effects::secondary_svg(&effects::contrast_rows(&secondary)?, paired),
+            ));
+        }
+    }
     snippets.push((
         "fig_9_12_3_questions",
         questions::svg(&questions::points(&read("fig_9_12_3_questions.csv")?)?),

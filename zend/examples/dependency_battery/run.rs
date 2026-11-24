@@ -7,7 +7,7 @@
 //! already recorded is not asked twice. An answer whose turn fails is retried
 //! on a fresh conversation, and recorded as failed once its tries are spent.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
@@ -23,13 +23,12 @@ use crate::arms::Arm;
 use crate::battery::Question;
 use crate::client::{conv_id, Zend};
 use crate::placement::{placement, Placement};
-use crate::schedule::{queue, Job};
+use crate::prompt::prompt;
+use crate::rag::context::{Packed, RetrievedFile};
+use crate::rag::mark;
+use crate::schedule::{queue, Job, Recorded};
 use crate::score::{answer, grounding, recall};
 use crate::telemetry;
-
-/// What every question is prefixed with: the pilot's instruction.
-pub const PREFIX: &str = "Answer from your memory of the repository only — do not call any \
-     tool, do not read or search any file. If you do not remember, say so.";
 
 /// How many times an answer is tried before it is recorded as failed.
 pub const TRIES: u32 = 3;
@@ -57,6 +56,16 @@ pub struct Line {
     /// Why the answer failed, when every try did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// R1's files, as its prompt carried them, best first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retrieved: Vec<RetrievedFile>,
+    /// On R1's lines: whether an answer file was among `retrieved`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_hit: Option<bool>,
+    /// The tool calls the daemon ran during the turn, as its history gives
+    /// them; absent from the lines recorded before they were read back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<u32>,
 }
 
 /// What a run is given.
@@ -67,7 +76,10 @@ pub struct Plan<'a> {
     pub thread: &'a str,
     pub questions: Vec<Question>,
     pub vocabulary: HashSet<String>,
-    pub runs: u32,
+    /// The arms asked, each up to its highest run.
+    pub arms: Vec<(Arm, u32)>,
+    /// R1's files block for each question, by id; empty when R1 is not asked.
+    pub retrieval: HashMap<String, Packed>,
     pub seed: u64,
     pub concurrency: usize,
     pub out: &'a Path,
@@ -78,11 +90,11 @@ pub struct Plan<'a> {
 }
 
 /// The `(arm, run, id)` of every answer `out` already records.
-pub fn recorded(out: &Path) -> anyhow::Result<HashSet<(String, u32, String)>> {
+pub fn recorded(out: &Path) -> anyhow::Result<Recorded> {
     let Ok(f) = File::open(out) else {
-        return Ok(HashSet::new());
+        return Ok(Recorded::new());
     };
-    let mut done = HashSet::new();
+    let mut done = Recorded::new();
     for line in BufReader::new(f).lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -126,7 +138,18 @@ pub fn scored(
         secs,
         answer: said.to_string(),
         error: None,
+        retrieved: Vec::new(),
+        retrieval_hit: None,
+        tool_calls: None,
     }
+}
+
+/// `line` given R1's files for `q`, each answer file among them marked.
+pub fn with_retrieval(mut line: Line, q: &Question, packed: &Packed) -> Line {
+    let mut files = packed.files.clone();
+    line.retrieval_hit = Some(mark(&mut files, &q.files));
+    line.retrieved = files;
+    line
 }
 
 /// The tag one launch names its conversations with: its start, in hex
@@ -151,8 +174,30 @@ async fn answer_job(
     q: &Question,
     job: Job,
     vocabulary: &HashSet<String>,
+    retrieved: Option<&Packed>,
 ) -> Line {
-    let prompt = format!("{PREFIX}\n\n{}", q.question);
+    let line = asked_line(zend, plan_thread, tag, q, job, vocabulary, retrieved).await;
+    match retrieved {
+        Some(packed) => with_retrieval(line, q, packed),
+        None => line,
+    }
+}
+
+/// One job's line, as [`answer_job`] records it before its retrieval.
+async fn asked_line(
+    zend: &Zend,
+    plan_thread: &str,
+    tag: &str,
+    q: &Question,
+    job: Job,
+    vocabulary: &HashSet<String>,
+    retrieved: Option<&Packed>,
+) -> Line {
+    let prompt = prompt(
+        job.arm,
+        &q.question,
+        retrieved.map_or("", |p| p.text.as_str()),
+    );
     let mut last_error = String::new();
     for attempt in 1..=TRIES {
         let conv = conv_id(
@@ -168,7 +213,7 @@ async fn answer_job(
         match asked {
             Ok(a) => {
                 let p = placement(&a.points, &q.files, a.think);
-                return scored(
+                let mut line = scored(
                     q,
                     job.arm,
                     job.run,
@@ -179,6 +224,8 @@ async fn answer_job(
                     p,
                     a.secs,
                 );
+                line.tool_calls = Some(a.tool_calls);
+                return line;
             }
             Err(e) => {
                 last_error = format!("{e:#}");
@@ -205,13 +252,17 @@ async fn answer_job(
 pub async fn run(plan: Plan<'_>) -> anyhow::Result<()> {
     let zend = Arc::new(Zend::new(plan.base, plan.node)?);
     let done = recorded(plan.out)?;
-    let jobs: Vec<Job> = queue(plan.questions.len(), plan.runs, plan.seed)
-        .into_iter()
-        .filter(|j| {
-            let q = &plan.questions[j.question];
-            !done.contains(&(j.arm.id().to_string(), j.run, q.id.clone()))
-        })
-        .collect();
+    let ids: Vec<String> = plan.questions.iter().map(|q| q.id.clone()).collect();
+    let jobs: Vec<Job> = queue(&ids, &plan.arms, &done, plan.seed);
+    if let Some(j) = jobs
+        .iter()
+        .find(|j| j.arm == Arm::R1 && !plan.retrieval.contains_key(&ids[j.question]))
+    {
+        bail!(
+            "R1 is asked {} with no files retrieved for it",
+            ids[j.question]
+        );
+    }
     println!(
         "{} answers to ask ({} already recorded), {} at a time",
         jobs.len(),
@@ -243,6 +294,7 @@ pub async fn run(plan: Plan<'_>) -> anyhow::Result<()> {
     let gate = Arc::new(Semaphore::new(plan.concurrency));
     let questions = Arc::new(plan.questions);
     let vocabulary = Arc::new(plan.vocabulary);
+    let retrieval = Arc::new(plan.retrieval);
     let thread = plan.thread.to_string();
     let tag = Arc::new(launch_tag(
         SystemTime::now()
@@ -266,10 +318,12 @@ pub async fn run(plan: Plan<'_>) -> anyhow::Result<()> {
             thread.clone(),
         );
         let tag = Arc::clone(&tag);
+        let retrieval = Arc::clone(&retrieval);
         tasks.push(tokio::spawn(async move {
             in_flight.fetch_add(1, Ordering::AcqRel);
             let q = &questions[job.question];
-            let line = answer_job(&zend, &thread, &tag, q, job, &vocabulary).await;
+            let files = (job.arm == Arm::R1).then(|| retrieval.get(&q.id)).flatten();
+            let line = answer_job(&zend, &thread, &tag, q, job, &vocabulary, files).await;
             in_flight.fetch_sub(1, Ordering::AcqRel);
             let n = finished.fetch_add(1, Ordering::AcqRel) + 1;
             println!(
@@ -369,6 +423,71 @@ mod tests {
         assert_ne!(
             attempt_id("t07", &launch_tag(100), 1),
             attempt_id("t07", &launch_tag(101), 1)
+        );
+    }
+
+    /// **R1's line names the files its prompt carried**, the answer file
+    /// marked and the hit recorded; a line recorded before these fields reads
+    /// back without them.
+    #[test]
+    fn r1s_line_records_what_it_retrieved() {
+        let packed = Packed {
+            text: String::new(),
+            files: vec![
+                RetrievedFile {
+                    path: "b/other.rs".into(),
+                    rank: 1,
+                    score: 3.0,
+                    chars: 10,
+                    cut: false,
+                    answer_file: false,
+                },
+                RetrievedFile {
+                    path: "a/scan.rs".into(),
+                    rank: 2,
+                    score: 2.0,
+                    chars: 4,
+                    cut: true,
+                    answer_file: false,
+                },
+            ],
+        };
+        let base = scored(
+            &question(),
+            Arm::R1,
+            1,
+            "scan.rs",
+            &HashSet::new(),
+            3,
+            None,
+            Placement::default(),
+            1.0,
+        );
+        let l = with_retrieval(base, &question(), &packed);
+        assert_eq!(l.retrieval_hit, Some(true));
+        assert_eq!(
+            l.retrieved
+                .iter()
+                .map(|f| (f.rank, f.answer_file))
+                .collect::<Vec<_>>(),
+            vec![(1, false), (2, true)]
+        );
+        let text = serde_json::to_string(&l).unwrap();
+        assert!(text.contains("\"retrieval_hit\":true"));
+        assert!(
+            !text.contains("tool_calls"),
+            "an unread count is not written"
+        );
+
+        let old = r#"{"arm":"a1","run":1,"id":"d05","category":"direct","names_file":false,
+            "recall":0.0,"missed":[],"grounding":1.0,"ungrounded":[],"completion_tokens":263,
+            "think":153,"placement":{"points":7,"in_thinking":3,"opening":false,
+            "think_end":false,"first_answer":false,"ever":false,"series":[[0,false]]},
+            "secs":39.5,"answer":"x"}"#;
+        let back: Line = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            (back.retrieved.len(), back.retrieval_hit, back.tool_calls),
+            (0, None, None)
         );
     }
 

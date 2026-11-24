@@ -12,10 +12,11 @@ use serde_json::Value;
 
 use crate::analyse::{
     arm_rows, contrasts, gain_by_naming, reach, recall_by_placement, retrieval_curve, scores,
-    telemetry_table,
+    telemetry_table, ContrastRow,
 };
 use crate::arms::{Arm, ARMS};
 use crate::load;
+use crate::report_baselines;
 use crate::run::Line;
 
 /// The token positions Figure 9.12-5 samples: every 64 tokens to 4,096.
@@ -23,7 +24,7 @@ pub fn curve_grid() -> Vec<u32> {
     (0..=64).map(|i| i * 64).collect()
 }
 
-fn pct(x: f64) -> String {
+pub fn pct(x: f64) -> String {
     if x.is_nan() {
         "—".into()
     } else {
@@ -31,7 +32,7 @@ fn pct(x: f64) -> String {
     }
 }
 
-fn csv(header: &[&str], rows: impl IntoIterator<Item = Vec<String>>) -> String {
+pub fn csv(header: &[&str], rows: impl IntoIterator<Item = Vec<String>>) -> String {
     let mut out = header.join(",");
     out.push('\n');
     for r in rows {
@@ -39,6 +40,61 @@ fn csv(header: &[&str], rows: impl IntoIterator<Item = Vec<String>>) -> String {
         out.push('\n');
     }
     out
+}
+
+/// A family of contrasts as `summary.md`'s table.
+pub fn contrast_table(md: &mut String, rows: &[ContrastRow]) -> anyhow::Result<()> {
+    writeln!(
+        md,
+        "| Contrast | Arms | Questions | Effect (points) | 95% interval | p | p (Holm) |"
+    )?;
+    writeln!(md, "|---|---|---:|---:|---|---:|---:|")?;
+    for c in rows {
+        writeln!(
+            md,
+            "| {} | {:?} − {:?} | {} | {} | {} to {} | {:.2e} | {:.2e} |",
+            c.name,
+            c.arm,
+            c.against,
+            c.questions,
+            pct(c.effect),
+            pct(c.lo),
+            pct(c.hi),
+            c.p,
+            c.p_holm
+        )?;
+    }
+    Ok(())
+}
+
+/// A family of contrasts as its figure's CSV.
+pub fn contrast_csv(rows: &[ContrastRow]) -> String {
+    csv(
+        &[
+            "contrast",
+            "arm",
+            "against",
+            "questions",
+            "effect",
+            "lo",
+            "hi",
+            "p",
+            "p_holm",
+        ],
+        rows.iter().map(|c| {
+            vec![
+                format!("\"{}\"", c.name),
+                format!("{:?}", c.arm),
+                format!("{:?}", c.against),
+                c.questions.to_string(),
+                c.effect.to_string(),
+                c.lo.to_string(),
+                c.hi.to_string(),
+                c.p.to_string(),
+                c.p_holm.to_string(),
+            ]
+        }),
+    )
 }
 
 /// Write every table and figure of `lines` (and of `samples`, the telemetry,
@@ -114,56 +170,13 @@ pub fn write(
     )?;
 
     let cs = contrasts(&s);
-    writeln!(md, "\n## Figure 9.12-2 — effect sizes\n")?;
     writeln!(
         md,
-        "| Contrast | Arms | Questions | Effect (points) | 95% interval | p | p (Holm) |"
+        "\n## Figure 9.12-2 — effect sizes (the pre-registered family)\n"
     )?;
-    writeln!(md, "|---|---|---:|---:|---|---:|---:|")?;
-    for c in &cs {
-        writeln!(
-            md,
-            "| {} | {:?} − {:?} | {} | {} | {} to {} | {:.2e} | {:.2e} |",
-            c.name,
-            c.arm,
-            c.against,
-            c.questions,
-            pct(c.effect),
-            pct(c.lo),
-            pct(c.hi),
-            c.p,
-            c.p_holm
-        )?;
-    }
-    fs::write(
-        dir.join("fig_9_12_2_effects.csv"),
-        csv(
-            &[
-                "contrast",
-                "arm",
-                "against",
-                "questions",
-                "effect",
-                "lo",
-                "hi",
-                "p",
-                "p_holm",
-            ],
-            cs.iter().map(|c| {
-                vec![
-                    format!("\"{}\"", c.name),
-                    format!("{:?}", c.arm),
-                    format!("{:?}", c.against),
-                    c.questions.to_string(),
-                    c.effect.to_string(),
-                    c.lo.to_string(),
-                    c.hi.to_string(),
-                    c.p.to_string(),
-                    c.p_holm.to_string(),
-                ]
-            }),
-        ),
-    )?;
+    contrast_table(&mut md, &cs)?;
+    fs::write(dir.join("fig_9_12_2_effects.csv"), contrast_csv(&cs))?;
+    report_baselines::write(&mut md, lines, &s, dir)?;
 
     // Figure 9.12-3: each question, held (B1) against reprojecting (C1).
     let categories: BTreeMap<&str, (&str, bool)> = lines

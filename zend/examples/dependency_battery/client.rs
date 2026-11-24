@@ -1,7 +1,7 @@
 //! The battery's calls to a running zend, over its HTTP API as any client of
 //! it makes them: a question as one chat turn on a conversation of its own,
-//! that turn's reasoning length and projection placements read back, and the
-//! conversation deleted once read.
+//! that turn's reasoning length, tool calls and projection placements read
+//! back, and the conversation deleted once read.
 //!
 //! The battery speaks as the service identity `service:battery`
 //! (`host/roles.yaml`), stated on the forwarded-identity headers a member
@@ -69,8 +69,8 @@ pub fn conv_id(thread: &str, arm: Arm, run: u32, qid: &str) -> String {
     format!("mcp:{}:{thread}/{}-r{run}-{qid}", owner_key(), arm.id())
 }
 
-/// The chat request asking `prompt` on `conv_id` under `arm`'s dials, tools
-/// off, thinking at [`EFFORT`].
+/// The chat request asking `prompt` on `conv_id` under `arm`'s dials and
+/// tools mode, thinking at [`EFFORT`].
 pub fn request(conv_id: &str, prompt: &str, arm: Arm) -> Value {
     let mut body = json!({
         "model": "zen-code",
@@ -79,7 +79,7 @@ pub fn request(conv_id: &str, prompt: &str, arm: Arm) -> Value {
         "messages": [{"role": "user", "content": prompt}],
         "effort": EFFORT,
         "think": true,
-        "tools": "none",
+        "tools": arm.tools(),
     });
     if let (Some(b), Value::Object(dials)) = (body.as_object_mut(), arm.dials()) {
         b.extend(dials);
@@ -96,6 +96,8 @@ pub struct Answered {
     pub think: Option<u32>,
     /// The turn's projection points.
     pub points: Vec<Point>,
+    /// The tool calls the daemon ran during the turn.
+    pub tool_calls: u32,
     pub secs: f64,
 }
 
@@ -174,6 +176,7 @@ impl Zend {
             completion_tokens,
             think,
             points: last_turn_points(&placements)?,
+            tool_calls: tool_calls_of(&history),
             secs,
         })
     }
@@ -211,6 +214,22 @@ pub fn thinking_of(history: &Value) -> Option<u32> {
         .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
         .find_map(|m| m.pointer("/thinking/tokens")?.as_u64())
         .map(|t| t as u32)
+}
+
+/// The tool calls a history's assistant bubbles carry: each bubble's parts
+/// (`zend::parts::Part`), of which a call is `{"kind": "call", ..}`. A
+/// battery conversation holds one question, so every call is its turn's.
+pub fn tool_calls_of(history: &Value) -> u32 {
+    history
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .filter_map(|m| m.get("parts")?.as_array())
+        .flatten()
+        .filter(|p| p.get("kind").and_then(Value::as_str) == Some("call"))
+        .count() as u32
 }
 
 /// The last assistant turn's points, from the placements route's answer.
@@ -259,6 +278,37 @@ mod tests {
                 "seed": false, "projection": "full", "reprojection": "held",
             })
         );
+        assert_eq!(
+            request("c", "Where?", Arm::T1),
+            json!({
+                "model": "zen-code", "stream": false, "conv_id": "c",
+                "messages": [{"role": "user", "content": "Where?"}],
+                "effort": 2, "think": true, "tools": "restricted",
+                "seed": false, "projection": "minimal",
+            })
+        );
+    }
+
+    /// **Every call of every assistant bubble is counted**, and nothing else.
+    #[test]
+    fn the_history_gives_the_tool_calls() {
+        let h = json!({"messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a", "parts": [
+                {"kind": "think", "id": "t0", "text": "x"},
+                {"kind": "call", "id": "c0", "args": [], "ok": true},
+                {"kind": "call", "id": "c1", "args": [], "ok": false},
+            ]},
+            {"role": "user", "content": "<tool_response>r</tool_response>",
+             "parts": [{"kind": "call", "id": "u", "args": [], "ok": true}]},
+            {"role": "assistant", "content": "b", "parts": [
+                {"kind": "call", "id": "c2", "args": [], "ok": true},
+                {"kind": "prose", "text": "done"},
+            ]},
+        ]});
+        assert_eq!(tool_calls_of(&h), 3);
+        assert_eq!(tool_calls_of(&json!({"messages": []})), 0);
+        assert_eq!(tool_calls_of(&json!({})), 0);
     }
 
     #[test]
