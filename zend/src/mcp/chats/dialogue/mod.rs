@@ -356,7 +356,13 @@ mod tests {
                 "effort": 2, "verbosity": 3, "think": true, "tools": "comprehensive",
             })
         );
-        let deep = request("c-1", "fix it", &[], Some(dials), (Some(Effort::Deep), none));
+        let deep = request(
+            "c-1",
+            "fix it",
+            &[],
+            Some(dials),
+            (Some(Effort::Deep), none),
+        );
         assert_eq!(
             (deep["effort"].clone(), deep["think"].clone()),
             (json!(3), json!(true))
@@ -371,7 +377,13 @@ mod tests {
     fn a_send_carries_its_images_as_parts() {
         let none = RetrievalDials::default();
         assert_eq!(
-            request("c-1", "what is it?", &["0123456789abcdef".into()], None, (None, none)),
+            request(
+                "c-1",
+                "what is it?",
+                &["0123456789abcdef".into()],
+                None,
+                (None, none)
+            ),
             json!({
                 "model": "zen-code", "stream": true, "conv_id": "c-1",
                 "messages": [{"role": "user", "content": [

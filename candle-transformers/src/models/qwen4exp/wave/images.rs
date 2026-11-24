@@ -146,10 +146,7 @@ mod tests {
     fn virtual_ids_become_the_second_tables_rows_and_runs() {
         let a = ImageHandle::register(image(1, 3, 10.0)).unwrap();
         let b = ImageHandle::register(image(1, 2, 50.0)).unwrap();
-        let mut seq = vec![
-            vec![7, a.id(1), a.id(2), 8],
-            vec![b.id(0), b.id(1)],
-        ];
+        let mut seq = vec![vec![7, a.id(1), a.id(2), 8], vec![b.id(0), b.id(1)]];
         let got = take_wave_images(&mut seq, 100, 9, 2, &Device::Cpu, None)
             .unwrap()
             .unwrap();
@@ -160,8 +157,14 @@ mod tests {
             [[12.0, 13.0], [14.0, 15.0], [50.0, 51.0], [52.0, 53.0]]
         );
         assert_eq!(got.runs.len(), 2);
-        assert_eq!((got.runs[0].row, got.runs[0].len, got.runs[0].first), (1, 2, 1));
-        assert_eq!((got.runs[1].row, got.runs[1].len, got.runs[1].first), (4, 2, 0));
+        assert_eq!(
+            (got.runs[0].row, got.runs[0].len, got.runs[0].first),
+            (1, 2, 1)
+        );
+        assert_eq!(
+            (got.runs[1].row, got.runs[1].len, got.runs[1].first),
+            (4, 2, 0)
+        );
         assert_eq!(got.runs[1].grid, b.rows().grid);
     }
 

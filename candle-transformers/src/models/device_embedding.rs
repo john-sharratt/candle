@@ -385,7 +385,8 @@ mod tests {
         let ids = Tensor::new([5u32, 1, 1].as_slice(), &dev).unwrap();
         let wide = Tensor::empty((3, hc, ncols), DType::F32, &dev).unwrap();
         let narrow = Tensor::empty((3, ncols), DType::F32, &dev).unwrap();
-        emb.gather_into(&ids, None, Some(&wide), Some(&narrow)).unwrap();
+        emb.gather_into(&ids, None, Some(&wide), Some(&narrow))
+            .unwrap();
         let rows = bits(&narrow);
         let streams = wide.to_vec3::<f32>().unwrap();
         for (t, per_stream) in streams.iter().enumerate() {
@@ -412,7 +413,8 @@ mod tests {
         let ids = Tensor::new([1u32, 3, u32::MAX].as_slice(), &dev).unwrap();
         let wide = Tensor::full(f32::NAN, (3, hc, ncols), &dev).unwrap();
         let narrow = Tensor::full(f32::NAN, (3, ncols), &dev).unwrap();
-        emb.gather_into(&ids, None, Some(&wide), Some(&narrow)).unwrap();
+        emb.gather_into(&ids, None, Some(&wide), Some(&narrow))
+            .unwrap();
         let rows = narrow.to_vec2::<f32>().unwrap();
         assert!(
             rows[0].iter().any(|v| *v != 0.0),

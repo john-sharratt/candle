@@ -80,12 +80,16 @@ pub(in super::super) fn run_inference_stream(
             match read {
                 Ok(Ok(read)) => turn_images = read,
                 Ok(Err(e)) => {
-                    let _ = tx.send(Err(anyhow::anyhow!("the message's images: {e}"))).await;
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!("the message's images: {e}")))
+                        .await;
                     return;
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(Err(anyhow::anyhow!("reading the message's images panicked: {e}")))
+                        .send(Err(anyhow::anyhow!(
+                            "reading the message's images panicked: {e}"
+                        )))
                         .await;
                     return;
                 }

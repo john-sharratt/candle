@@ -131,10 +131,7 @@ impl Block {
             .reshape((n, 3, HEADS, HEAD_DIM))?;
         // [1, heads, n, 72], each contiguous for the rotary kernel.
         let part = |i: usize| -> Result<Tensor> {
-            qkv.i((.., i))?
-                .transpose(0, 1)?
-                .unsqueeze(0)?
-                .contiguous()
+            qkv.i((.., i))?.transpose(0, 1)?.unsqueeze(0)?.contiguous()
         };
         let q = rope(&part(0)?, cos, sin)?;
         let k = rope(&part(1)?, cos, sin)?;
@@ -210,7 +207,14 @@ impl VisionTower {
             pos,
             blocks,
             post_ln: layer_norm(vb.pp("v.post_ln"), dtype)?,
-            fc1: linear_b_mode(MERGED_VALUES, MERGED_VALUES, true, mode, dtype, vb.pp("mm.0"))?,
+            fc1: linear_b_mode(
+                MERGED_VALUES,
+                MERGED_VALUES,
+                true,
+                mode,
+                dtype,
+                vb.pp("mm.0"),
+            )?,
             fc2: linear_b_mode(MERGED_VALUES, OUT_HIDDEN, true, mode, dtype, vb.pp("mm.2"))?,
             dtype,
         })
@@ -240,7 +244,9 @@ impl VisionTower {
             .contiguous()?
             .reshape((n, PATCH_VALUES))?
             .to_dtype(self.dtype)?;
-        let x = patches.matmul(&self.patch_w)?.broadcast_add(&self.patch_b)?;
+        let x = patches
+            .matmul(&self.patch_w)?
+            .broadcast_add(&self.patch_b)?;
 
         let (idx, w) = position_taps(grid);
         let idx = Tensor::from_vec(idx, n * 4, &dev)?;

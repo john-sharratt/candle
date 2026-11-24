@@ -37,8 +37,6 @@ use candle::quantized::Int8Mode;
 mod checkpoint_pins;
 mod engine_artifact;
 mod forward_gates;
-#[cfg(any(test, feature = "hub"))]
-mod vision_tower;
 #[cfg(test)]
 mod tests_gpu_engine;
 #[cfg(test)]
@@ -51,6 +49,8 @@ mod tests_recipes;
 mod tests_speculation;
 #[cfg(test)]
 mod tests_support;
+#[cfg(any(test, feature = "hub"))]
+mod vision_tower;
 
 pub use checkpoint_pins::*;
 pub use engine_artifact::*;

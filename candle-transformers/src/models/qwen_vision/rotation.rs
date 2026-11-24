@@ -98,7 +98,11 @@ pub struct ImageRotation {
 /// `t`'s dense `[rows, heads, dim]` geometry, or why it cannot be turned.
 fn heads_of(t: &LiveTensor<'_>, what: &str) -> Result<(usize, usize, usize)> {
     if !t.is_contiguous() {
-        candle::bail!("image rotation: {what} is {:?} stride {:?}, not dense", t.dims(), t.stride());
+        candle::bail!(
+            "image rotation: {what} is {:?} stride {:?}, not dense",
+            t.dims(),
+            t.stride()
+        );
     }
     t.dims3()
 }
@@ -129,7 +133,11 @@ impl ImageRotation {
             }
         }
         if cos.dims() != sin.dims() {
-            candle::bail!("image rotation: cos {:?} and sin {:?} differ", cos.dims(), sin.dims());
+            candle::bail!(
+                "image rotation: cos {:?} and sin {:?} differ",
+                cos.dims(),
+                sin.dims()
+            );
         }
         Ok(Self {
             rows,

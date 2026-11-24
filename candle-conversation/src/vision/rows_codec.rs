@@ -36,10 +36,7 @@ pub fn decode_rows(bytes: &[u8]) -> Result<ImageRows, String> {
     let want = grid.tokens() * width;
     let body = &bytes[16..];
     if body.len() != want * 2 {
-        return Err(format!(
-            "{} bytes of rows for {want} values",
-            body.len()
-        ));
+        return Err(format!("{} bytes of rows for {want} values", body.len()));
     }
     let values = body
         .chunks_exact(2)

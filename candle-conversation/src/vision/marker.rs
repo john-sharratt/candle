@@ -73,10 +73,7 @@ mod tests {
     fn marker_ids_are_read_in_order() {
         let text = "[image 0123456789abcdef 640×480]\n[image short 1×1] and \
                     [image fedcba9876543210 32×32] what is this?";
-        assert_eq!(
-            marker_ids(text),
-            ["0123456789abcdef", "fedcba9876543210"]
-        );
+        assert_eq!(marker_ids(text), ["0123456789abcdef", "fedcba9876543210"]);
         assert!(marker_ids("no images here").is_empty());
     }
 

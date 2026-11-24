@@ -269,7 +269,9 @@ impl ZendSession {
 
         tokio::spawn(async move {
             if let Some(why) = refused {
-                let _ = tx.send(Err(anyhow::anyhow!("the message's images: {why}"))).await;
+                let _ = tx
+                    .send(Err(anyhow::anyhow!("the message's images: {why}")))
+                    .await;
                 return;
             }
             // Phase 1 — emit status updates while model is loading.

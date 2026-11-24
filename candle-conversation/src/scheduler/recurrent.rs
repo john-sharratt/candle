@@ -594,11 +594,13 @@ impl Scheduler {
             "memory catch-up: replaying {} adopted tokens over {injected} injected turns",
             tokens.len(),
         );
-        let result = self.prefill_tokens_on(scratch, tokens, image_spans).and_then(|()| {
-            self.model
-                .move_recurrent(scratch, sequence_id.0)
-                .map_err(ConversationError::Model)
-        });
+        let result = self
+            .prefill_tokens_on(scratch, tokens, image_spans)
+            .and_then(|()| {
+                self.model
+                    .move_recurrent(scratch, sequence_id.0)
+                    .map_err(ConversationError::Model)
+            });
         let _ = self.model.release_sequence(scratch);
         let _ = self.session.free_sequence(scratch);
         result.map(|()| true)

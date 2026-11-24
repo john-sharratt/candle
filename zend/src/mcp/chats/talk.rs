@@ -844,7 +844,15 @@ mod tests {
         );
 
         for i in record::kept_count(&records, &owner)..MAX_CHATS {
-            send(&session, &caller, None, &format!("chat {i}"), Vec::new(), plain).unwrap();
+            send(
+                &session,
+                &caller,
+                None,
+                &format!("chat {i}"),
+                Vec::new(),
+                plain,
+            )
+            .unwrap();
         }
         assert_eq!(record::kept_count(&records, &owner), MAX_CHATS);
         assert_eq!(

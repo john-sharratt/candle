@@ -102,7 +102,8 @@ pub fn turn_spans(
         .into_iter()
         .zip(named)
         .map(|((start, len), id)| {
-            let r = rows(&id)?.ok_or_else(|| format!("image {id}'s rows are not in the substrate"))?;
+            let r =
+                rows(&id)?.ok_or_else(|| format!("image {id}'s rows are not in the substrate"))?;
             if r.len() != len {
                 return Err(format!("image {id} has {} rows, its block {len}", r.len()));
             }
@@ -145,7 +146,10 @@ mod tests {
         let got = engine_ids(&[10, 20, 20, 20], 2, &[span]);
         assert_eq!(got, [10, h.id(0), h.id(1), h.id(2)]);
         // A slice before the image is untouched.
-        let span = ImageSpan { start: 3, handle: h };
+        let span = ImageSpan {
+            start: 3,
+            handle: h,
+        };
         assert_eq!(engine_ids(&[1, 2], 0, &[span]), [1, 2]);
     }
 

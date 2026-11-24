@@ -26,7 +26,10 @@ pub struct TurnImage {
 }
 
 /// The rows of `images`, from the tower.
-pub fn encode(engine: &ConversationEngine, images: &[PreparedImage]) -> Result<Vec<ImageRows>, String> {
+pub fn encode(
+    engine: &ConversationEngine,
+    images: &[PreparedImage],
+) -> Result<Vec<ImageRows>, String> {
     // Fetched here, on the caller's thread: the drain only reads the cache.
     #[cfg(feature = "hub")]
     vision_tower_file().map_err(|e| format!("the vision tower: {e}"))?;
@@ -88,7 +91,10 @@ pub fn turn_images(
     if !missing.is_empty() {
         let fresh = encode(
             engine,
-            &missing.iter().map(|&i| prepared[i].clone()).collect::<Vec<_>>(),
+            &missing
+                .iter()
+                .map(|&i| prepared[i].clone())
+                .collect::<Vec<_>>(),
         )?;
         for (&i, r) in missing.iter().zip(fresh) {
             store_image(substrate, &prepared[i], uploads[i].clone(), &r)?;

@@ -235,7 +235,6 @@ use crate::provenance::{
 };
 use crate::recorded_reply::{RecordedReply, Replay};
 use crate::recurrent_span::TokenSpan;
-use crate::vision::{engine_ids, ImageSpan};
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::stencil::{
     Healed, StencilDriver, StepMask, TriggerRegistry, TurnGrammar, TOOL_CALL_TREE_LABEL,
@@ -249,6 +248,7 @@ use crate::token_buffer::TokenBuffer;
 use crate::turn::Role;
 use crate::turn_layout::{GlueKind, KvSpan, TurnLayout, TurnSegment};
 use crate::turn_text::TurnText;
+use crate::vision::{engine_ids, ImageSpan};
 use crate::{FinishReason, SubstrateReloadStatus, TurnStats};
 use admit::pass_budget::{RateWidth, RefusedDepth, RefusedWidth};
 use first_sample::PrefillEnd;

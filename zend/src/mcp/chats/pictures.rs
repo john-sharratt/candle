@@ -71,7 +71,16 @@ pub async fn fetch(
     let mut fetched = Vec::with_capacity(ids.len());
     for id in ids {
         let path = format!("/v1/image/{id}");
-        let reply = ops::up(session, caller, Method::GET, &path, None, None, FETCH_WITHIN).await?;
+        let reply = ops::up(
+            session,
+            caller,
+            Method::GET,
+            &path,
+            None,
+            None,
+            FETCH_WITHIN,
+        )
+        .await?;
         match reply.status {
             200 if reply.complete => fetched.push(reply.body.to_vec()),
             200 => return Err(format!("picture `{id}` did not arrive whole")),
@@ -91,7 +100,10 @@ pub async fn fetch(
 /// their kept ids, in order. For a turn that runs on this member — one the
 /// gateway places may land where the kept image has not yet replicated, and
 /// takes the bytes instead ([`data_url`]).
-pub async fn keep(session: &Arc<ZendSession>, pictures: Vec<Vec<u8>>) -> Result<Vec<String>, String> {
+pub async fn keep(
+    session: &Arc<ZendSession>,
+    pictures: Vec<Vec<u8>>,
+) -> Result<Vec<String>, String> {
     let mut kept = Vec::with_capacity(pictures.len());
     for (i, bytes) in pictures.into_iter().enumerate() {
         let keeper = Arc::clone(session);
@@ -131,7 +143,10 @@ mod tests {
     #[test]
     fn a_picture_travels_as_a_typed_data_url() {
         let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
-        assert_eq!(data_url(png), "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==");
+        assert_eq!(
+            data_url(png),
+            "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+        );
     }
 
     #[test]
