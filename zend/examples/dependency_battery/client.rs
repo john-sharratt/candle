@@ -28,7 +28,8 @@ use tokio::time::sleep;
 use cluster::gateway::NODE_HEADER;
 
 use crate::arms::Arm;
-use crate::placement::Point;
+use crate::placement::{answer_token, Point};
+use crate::view::governing;
 
 pub const PROVIDER: &str = "service";
 pub const SUBJECT: &str = "service:battery";
@@ -97,6 +98,9 @@ pub struct Answered {
     pub think: Option<u32>,
     /// The turn's projection points.
     pub points: Vec<Point>,
+    /// The point governing the answer's first token in full, its injected
+    /// turns' bodies beside it; read for an arm that projects.
+    pub first_answer: Option<Value>,
     /// The tool calls the daemon ran during the turn.
     pub tool_calls: u32,
     pub secs: f64,
@@ -172,11 +176,27 @@ impl Zend {
         let history = self.get_json(&self.path(conv_id, "")).await?;
         let think = thinking_of(&history);
         let placements = self.get_json(&self.path(conv_id, "/placements")).await?;
+        let points = last_turn_points(&placements)?;
+        let starts: Vec<u32> = points.iter().map(|p| p.start_token).collect();
+        let first_answer = match (arm.projects(), governing(&starts, answer_token(think))) {
+            (true, Some(event)) => {
+                let turn = placements
+                    .as_array()
+                    .map_or(0, |t| t.len().saturating_sub(1));
+                Some(
+                    self.get_json(&self.path(conv_id, &format!("/projections/{turn}/{event}")))
+                        .await
+                        .context("the point governing the answer's first token")?,
+                )
+            }
+            _ => None,
+        };
         Ok(Answered {
             text,
             completion_tokens,
             think,
-            points: last_turn_points(&placements)?,
+            points,
+            first_answer,
             tool_calls: tool_calls_of(&history),
             secs,
         })

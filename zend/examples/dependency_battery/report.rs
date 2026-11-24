@@ -18,6 +18,7 @@ use crate::arms::{Arm, ARMS};
 use crate::load;
 use crate::report_baselines;
 use crate::run::Line;
+use crate::seen;
 
 /// The token positions Figure 9.12-5 samples: every 64 tokens to 4,096.
 pub fn curve_grid() -> Vec<u32> {
@@ -177,6 +178,7 @@ pub fn write(
     contrast_table(&mut md, &cs)?;
     fs::write(dir.join("fig_9_12_2_effects.csv"), contrast_csv(&cs))?;
     report_baselines::write(&mut md, lines, &s, dir)?;
+    seen::write(&mut md, lines, dir)?;
 
     // Figure 9.12-3: each question, held (B1) against reprojecting (C1).
     let categories: BTreeMap<&str, (&str, bool)> = lines

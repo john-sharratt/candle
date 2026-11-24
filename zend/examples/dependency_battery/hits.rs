@@ -104,6 +104,7 @@ mod tests {
             retrieval_hit: Some(retrieved.iter().any(|f| f.answer_file)),
             retrieved,
             tool_calls: None,
+            view: None,
         }
     }
 

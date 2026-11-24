@@ -70,6 +70,12 @@ pub fn placed_at(series: &[(u32, bool)], t: u32) -> bool {
         .is_some_and(|(_, placed)| *placed)
 }
 
+/// The token the answer's first token is read at, the think block `think`
+/// tokens long (`None` for a turn that did not reason).
+pub fn answer_token(think: Option<u32>) -> u32 {
+    think.unwrap_or(0) + 1
+}
+
 /// The reading of `points` for `files`, the think block `think` tokens long
 /// (`None` for a turn that did not reason).
 pub fn placement(points: &[Point], files: &[String], think: Option<u32>) -> Placement {
@@ -78,13 +84,14 @@ pub fn placement(points: &[Point], files: &[String], think: Option<u32>) -> Plac
         .map(|p| (p.start_token, places(p, files)))
         .collect();
     let at = |t: u32| placed_at(&series, t);
+    let first_answer = answer_token(think);
     let think = think.unwrap_or(0);
     Placement {
         points: points.len(),
         in_thinking: series.iter().filter(|(s, _)| *s > 0 && *s < think).count(),
         opening: at(0),
         think_end: at(think.saturating_sub(1)),
-        first_answer: at(think + 1),
+        first_answer: at(first_answer),
         ever: series.iter().any(|(_, p)| *p),
         series,
     }

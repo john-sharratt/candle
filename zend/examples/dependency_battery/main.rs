@@ -48,9 +48,11 @@ mod report_baselines;
 mod run;
 mod schedule;
 mod score;
+mod seen;
 mod selection;
 mod stats;
 mod telemetry;
+mod view;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};

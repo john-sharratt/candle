@@ -29,6 +29,7 @@ use crate::rag::mark;
 use crate::schedule::{queue, Job, Recorded};
 use crate::score::{answer, grounding, recall};
 use crate::telemetry;
+use crate::view::{of_packed, of_point, with_named, View};
 
 /// How many times an answer is tried before it is recorded as failed.
 pub const TRIES: u32 = 3;
@@ -66,6 +67,10 @@ pub struct Line {
     /// them; absent from the lines recorded before they were read back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<u32>,
+    /// Which expected items were in what the model had in view as it began
+    /// to answer; absent from the lines recorded before it was read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<View>,
 }
 
 /// What a run is given.
@@ -145,14 +150,23 @@ pub fn scored(
         retrieved: Vec::new(),
         retrieval_hit: None,
         tool_calls: None,
+        view: None,
     }
 }
 
-/// `line` given R1's files for `q`, each answer file among them marked.
+/// `line` given R1's files for `q`, each answer file among them marked, and
+/// what of `q`'s expected items they held.
 pub fn with_retrieval(mut line: Line, q: &Question, packed: &Packed) -> Line {
     let mut files = packed.files.clone();
     line.retrieval_hit = Some(mark(&mut files, &q.files));
     line.retrieved = files;
+    if line.error.is_none() {
+        line.view = Some(with_named(
+            of_packed(packed, &q.files, &q.expect),
+            &line.answer,
+            &q.expect,
+        ));
+    }
     line
 }
 
@@ -234,6 +248,13 @@ async fn asked_line(
                     a.secs,
                 );
                 line.tool_calls = Some(a.tool_calls);
+                line.view = a.first_answer.as_ref().map(|detail| {
+                    with_named(
+                        of_point(detail, &q.files, &q.expect),
+                        &line.answer,
+                        &q.expect,
+                    )
+                });
                 return line;
             }
             Err(e) => {
@@ -506,6 +527,12 @@ mod tests {
         assert_eq!(
             (back.retrieved.len(), back.retrieval_hit, back.tool_calls),
             (0, None, None)
+        );
+        assert_eq!(back.view, None);
+        assert_eq!(
+            l.view.as_ref().map(|v| v.in_files.clone()),
+            Some(vec![false, false]),
+            "R1's view is read from its packed block, empty here"
         );
     }
 

@@ -82,6 +82,7 @@ mod tests {
             retrieved: Vec::new(),
             retrieval_hit: None,
             tool_calls: calls,
+            view: None,
         }
     }
 
