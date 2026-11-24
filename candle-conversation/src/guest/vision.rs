@@ -1,12 +1,17 @@
 //! The text model's vision tower, as a guest.
 //!
 //! An image the text model is to read becomes rows here, once, between the
-//! engine's waves: the tower's weights are placed in guest ground from the
-//! model's `mmproj` GGUF, each image runs through it on the guest arena, and
-//! the rows come back on the host. The engine then reads them from the vision
+//! engine's waves: the tower's weights are placed in guest ground from its
+//! twinned model pack, each image runs through it on the guest arena, and the
+//! rows come back on the host. The engine then reads them from the vision
 //! registry by the virtual ids a prompt names them with
 //! (`candle_transformers::models::qwen_vision`). The tower holds no VRAM
 //! between images, and the engine's own load is untouched by it.
+//!
+//! The pack stores each projection as the KO twin the tower's matmuls read
+//! (`model_pack::twins`), so placement copies every tensor as it is: one DMA a
+//! tensor from the pinned staging buffers, and nothing allocated off the
+//! ground.
 //!
 //! Design: `docs/flash_next_vision.md` §3.
 
@@ -16,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use candle::quantized::Int8Mode;
 use candle::{DType, Device};
 use candle_nn::kv_cache::{close_guest_arena, open_guest_arena};
-use candle_transformers::models::qwen_vision::tower::{ACTIVATION_BYTES_PER_PATCH, POSITION_TABLE};
+use candle_transformers::models::qwen_vision::tower::ACTIVATION_BYTES_PER_PATCH;
 use candle_transformers::models::qwen_vision::VisionTower;
 
 use super::gguf_pick::Pick;
@@ -31,35 +36,35 @@ use super::work::{Guest, GuestOutcome, GuestRequest, VisionRows};
 const ARENA_HEADROOM_BYTES: usize = 32 << 20;
 /// The smallest arena opened: a 64-token image's forward.
 const MIN_ARENA_BYTES: usize = 64 << 20;
-/// Every tensor of the mmproj, the position table as its file bytes: the
-/// tower dequantizes it, and an int8 twin is a layout only the matmul reads.
-const TOWER_PICK: Pick = Pick {
-    skip: &[],
-    verbatim: &[POSITION_TABLE],
-};
+/// The placement's mode: the pack already holds every twin, so none is built
+/// as the tower goes down.
+const PLACEMENT: Int8Mode = Int8Mode::Off;
 
-/// The tower, configured by where its `mmproj` GGUF is found.
+/// The tower, configured by where its pack is found, and the int8 mode that
+/// pack was built at.
 ///
-/// `mmproj` answers from the local cache alone. The file is fetched by the
-/// caller before it queues a job ([`crate::vision::encode`]), so a drain — every
-/// wave stopped — never waits on the network.
+/// `pack` answers from the local cache alone. The pack is fetched and built by
+/// the caller before it queues a job ([`crate::vision::encode`]), so a drain —
+/// every wave stopped — never waits on the network or a build.
 pub struct VisionGuest {
-    mmproj: fn() -> Option<PathBuf>,
+    pack: fn() -> Option<PathBuf>,
+    mode: Int8Mode,
     loaded: Option<(Device, VisionTower)>,
 }
 
 impl VisionGuest {
-    pub fn new(mmproj: fn() -> Option<PathBuf>) -> Self {
+    pub fn new(pack: fn() -> Option<PathBuf>, mode: Int8Mode) -> Self {
         Self {
-            mmproj,
+            pack,
+            mode,
             loaded: None,
         }
     }
 
     fn path(&self) -> Result<PathBuf, String> {
-        (self.mmproj)().ok_or_else(|| {
-            "vision guest: the tower's mmproj is not in the local cache — it is fetched before a \
-             job is queued"
+        (self.pack)().ok_or_else(|| {
+            "vision guest: the tower's pack is not on this machine — it is built before a job is \
+             queued"
                 .to_string()
         })
     }
@@ -87,10 +92,9 @@ impl GuestModel for VisionGuest {
     }
 
     fn footprint_bytes(&self, jobs: &[GuestRequest]) -> usize {
-        let mode = Int8Mode::auto(&Device::Cpu);
         let weights = self
             .path()
-            .and_then(|p| ground_bytes(&p, mode, TOWER_PICK))
+            .and_then(|p| ground_bytes(&p, PLACEMENT, Pick::default()))
             .unwrap_or(0);
         weights + activation_bytes(jobs).max(MIN_ARENA_BYTES) + ARENA_HEADROOM_BYTES
     }
@@ -101,7 +105,15 @@ impl GuestModel for VisionGuest {
         ground: &Arc<Mutex<GuestGround>>,
         jobs: &[GuestRequest],
     ) -> Result<(), String> {
-        let mode = Int8Mode::auto(device);
+        // The pack's twins are read by the int8 matmul alone; a card without it
+        // has no tower to load.
+        if !Int8Mode::auto(device).is_int8() {
+            return Err(format!(
+                "vision guest: the tower's pack stores {:?} twins, which need the int8 matmul \
+                 this device does not have",
+                self.mode
+            ));
+        }
         // The arena first, on the widest run: it must be one stretch, and the
         // weights are tensors of a few megabytes that fit the runs it leaves.
         let wanted = activation_bytes(jobs).max(MIN_ARENA_BYTES);
@@ -123,8 +135,8 @@ impl GuestModel for VisionGuest {
                 .map_err(|e| format!("vision guest: placing the arena: {e}"))?;
             (at, len)
         };
-        let vb = place_gguf(&self.path()?, device, ground, mode, TOWER_PICK)?;
-        let tower = VisionTower::load(&vb, mode).map_err(|e| format!("vision guest: {e}"))?;
+        let vb = place_gguf(&self.path()?, device, ground, PLACEMENT, Pick::default())?;
+        let tower = VisionTower::load(&vb, self.mode).map_err(|e| format!("vision guest: {e}"))?;
         if let Device::Cuda(cuda) = device {
             open_guest_arena(&cuda.cuda_stream(), arena.0.ptr, arena.1);
         }
@@ -175,22 +187,26 @@ mod tests {
     use super::*;
     use crate::guest::progress::GuestSink;
     use crate::guest::work::{VisionImage, VisionRequest};
-    use candle_transformers::models::quantized_qwen38_moe::cached_vision_tower_file;
+    use candle_transformers::models::quantized_qwen38_moe::{
+        cached_vision_tower_pack, vision_tower_pack, VISION_TOWER_MODE,
+    };
     use cudarc::driver::DevicePtr;
 
+    fn tower_pack() -> Option<PathBuf> {
+        cached_vision_tower_pack(VISION_TOWER_MODE)
+    }
+
     /// **The guest reads an image from its own ground**, as a drain runs it:
-    /// the footprint it asks for, the tower placed into that ground with its
-    /// int8 twins, the arena opened on it, one 768 × 512 image run, and the
-    /// guest unloaded — one finite 2 560-wide row per `<|image_pad|>`. Nothing
-    /// to run on a machine without a card or without the tower fetched.
+    /// the footprint it asks for, the tower's pack placed into that ground —
+    /// its twins as they are stored — the arena opened on it, one 768 × 512
+    /// image run, and the guest unloaded: one finite 2 560-wide row per
+    /// `<|image_pad|>`. Nothing to run on a machine without a card.
     #[test]
     fn the_vision_guest_reads_an_image_from_its_ground() {
         let Ok(device) = Device::new_cuda(0) else {
             return;
         };
-        if cached_vision_tower_file().is_none() {
-            return;
-        }
+        vision_tower_pack(VISION_TOWER_MODE).unwrap();
         let (width, height) = (768u32, 512u32);
         let rgb = (0..(width * height * 3) as usize)
             .map(|i| (i * 31 % 251) as u8)
@@ -198,7 +214,7 @@ mod tests {
         let jobs = vec![GuestRequest::Vision(VisionRequest {
             images: vec![VisionImage { rgb, height, width }],
         })];
-        let mut guest = VisionGuest::new(cached_vision_tower_file);
+        let mut guest = VisionGuest::new(tower_pack, VISION_TOWER_MODE);
         let bytes = guest.footprint_bytes(&jobs);
         let Device::Cuda(cuda) = &device else {
             unreachable!()

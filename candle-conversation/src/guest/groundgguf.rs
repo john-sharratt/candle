@@ -89,8 +89,10 @@ const PLACE_ALIGN: usize = 256;
 /// placed. Ground is the KV side's, taken for the length of a drain, and a
 /// tensor nothing reads is that much of the engine's working set evicted for
 /// nothing — a text encoder's embedding table is 414 MiB of a 4 GiB checkpoint.
-/// `pick.verbatim` names tileable tensors the model reads densely rather than
-/// through a matmul — a table it dequantizes — which keep their file bytes.
+///
+/// A twinned model pack (`model_pack::twins`) already stores its twins, so it
+/// is placed under `Int8Mode::Off`: every tensor goes down as its file bytes,
+/// the twins among them, one DMA each and no repack.
 pub fn place_gguf(
     path: &Path,
     device: &Device,
@@ -150,7 +152,7 @@ pub fn place_gguf(
             let (shape, dtype) = (shape, *dtype);
             let raw = &window[(start - from) as usize..(end - from) as usize];
 
-            let twin = pick.twins(name, shape.dims(), mode);
+            let twin = pick.twins(shape.dims(), dtype, mode);
             // Named before it is placed, not after: a placement that faults
             // takes the process with it, and the last line written is then the
             // only evidence of which tensor did it.
@@ -345,7 +347,7 @@ pub fn ground_bytes(path: &Path, mode: Int8Mode, pick: Pick) -> Result<usize, St
         }
         let shape = Shape::from(info.shape.dims().to_vec());
         let dtype = info.ggml_dtype;
-        let twin = pick.twins(name, shape.dims(), mode);
+        let twin = pick.twins(shape.dims(), dtype, mode);
         let bytes = if twin {
             let ko = dtype
                 .to_ko(mode)

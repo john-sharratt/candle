@@ -56,4 +56,4 @@ pub use checkpoint_pins::*;
 pub use engine_artifact::*;
 pub use forward_gates::*;
 #[cfg(any(test, feature = "hub"))]
-pub use vision_tower::{cached_vision_tower_file, vision_tower_file};
+pub use vision_tower::{cached_vision_tower_pack, vision_tower_pack, VISION_TOWER_MODE};

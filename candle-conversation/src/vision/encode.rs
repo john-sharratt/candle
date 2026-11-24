@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 #[cfg(feature = "hub")]
-use candle_transformers::models::quantized_qwen38_moe::vision_tower_file;
+use candle_transformers::models::quantized_qwen38_moe::{vision_tower_pack, VISION_TOWER_MODE};
 use candle_transformers::models::qwen_vision::tower::OUT_HIDDEN;
 use candle_transformers::models::qwen_vision::{Grid, ImageHandle, ImageRows};
 
@@ -30,9 +30,11 @@ pub fn encode(
     engine: &ConversationEngine,
     images: &[PreparedImage],
 ) -> Result<Vec<ImageRows>, String> {
-    // Fetched here, on the caller's thread: the drain only reads the cache.
+    // Fetched and packed here, on the caller's thread — the first time, a
+    // download and a few seconds of host conversion — so the drain only reads
+    // the pack.
     #[cfg(feature = "hub")]
-    vision_tower_file().map_err(|e| format!("the vision tower: {e}"))?;
+    vision_tower_pack(VISION_TOWER_MODE).map_err(|e| format!("the vision tower: {e}"))?;
     let request = GuestRequest::Vision(VisionRequest {
         images: images.iter().map(|i| i.image.clone()).collect(),
     });

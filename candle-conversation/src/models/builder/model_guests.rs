@@ -1,19 +1,28 @@
 //! The guests a model brings with it, beside the ones a deployment configures.
 //!
 //! Flash-Next's vision tower ships in its own `mmproj` GGUF, pinned with the
-//! model: every engine on the model can read images, so the guest that runs
-//! the tower is registered with the engine rather than named in a
-//! deployment's `guests.yaml`.
+//! model and packed for the guest that runs it: every engine on the model can
+//! read images, so that guest is registered with the engine rather than named
+//! in a deployment's `guests.yaml`.
+
+use std::path::PathBuf;
 
 use super::ModelArch;
 use crate::guest::{Guest, GuestModel, GuestRegistry, VisionGuest};
-use candle_transformers::models::quantized_qwen38_moe::cached_vision_tower_file;
+use candle_transformers::models::quantized_qwen38_moe::{
+    cached_vision_tower_pack, VISION_TOWER_MODE,
+};
+
+/// The tower's pack, if this machine holds it.
+fn tower_pack() -> Option<PathBuf> {
+    cached_vision_tower_pack(VISION_TOWER_MODE)
+}
 
 /// Register the guests `arch` brings on `guests`.
 pub(super) fn register_model_guests(arch: &ModelArch, guests: &mut GuestRegistry) {
     if matches!(arch, ModelArch::Qwen4Exp) {
         guests.register(Guest::Vision, || {
-            Box::new(VisionGuest::new(cached_vision_tower_file)) as Box<dyn GuestModel>
+            Box::new(VisionGuest::new(tower_pack, VISION_TOWER_MODE)) as Box<dyn GuestModel>
         });
     }
 }

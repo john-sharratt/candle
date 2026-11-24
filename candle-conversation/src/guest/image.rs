@@ -90,7 +90,6 @@ const ENCODER_SKIP_LAST: usize = 1;
 /// the host ([`EmbedTable`]) and never placed.
 const ENCODER_PICK: Pick = Pick {
     skip: &[EMBED_TOKENS],
-    verbatim: &[],
 };
 
 /// The width the autoencoder holds its weights and runs its decode at.

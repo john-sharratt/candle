@@ -39,8 +39,11 @@ fn pad32(size: usize) -> usize {
 /// ([`ko_tileable`]). Embeddings are lookup tables, never matmul'd, so
 /// they are excluded by the standard `token_embd` name (a llama.cpp convention, not a per-model
 /// list). 2-D weights repack directly; 3-D MoE expert banks `[n_expert, nrows, ncols]` repack
-/// per expert. Only MXFP4 is handled today; extend here for the affine twins.
-fn ko_target(name: &str, shape: &Shape, dtype: GgmlDType, mode: Int8Mode) -> Option<GgmlDType> {
+/// per expert. A mode with no int8 matmul (`Int8Mode::Off`) has no twin for anything.
+pub fn ko_target(name: &str, shape: &Shape, dtype: GgmlDType, mode: Int8Mode) -> Option<GgmlDType> {
+    if !mode.is_int8() {
+        return None;
+    }
     // Embeddings are lookup tables, not matmul weights — never repack (llama.cpp convention).
     if name.contains("token_embd") {
         return None;
@@ -141,6 +144,42 @@ fn repack_matrix(
         }
         other => crate::bail!("prepare: KO twin {other:?} not supported"),
     }
+}
+
+/// Write the KO twin `ko` of a `src_dtype` tensor of `dims` — its file bytes `src` — to `out`,
+/// one innermost 2-D matrix at a time: one for a weight, `n_expert` for a MoE bank. The twin
+/// [`ko_target`] names; the bytes are the ones `qtensor_from_ggml` uploads as they are.
+pub fn write_ko_twin(
+    src: &[u8],
+    dims: &[usize],
+    src_dtype: GgmlDType,
+    ko: GgmlDType,
+    out: &mut impl Write,
+) -> Result<()> {
+    let (n_mat, nrows, ncols) = match *dims {
+        [nrows, ncols] => (1, nrows, ncols),
+        [n, nrows, ncols] => (n, nrows, ncols),
+        _ => crate::bail!("a KO twin of a {}-D tensor", dims.len()),
+    };
+    let src_mat = tensor_bytes(&Shape::from((nrows, ncols)), src_dtype);
+    if src.len() < n_mat * src_mat {
+        crate::bail!(
+            "{} bytes for {n_mat} × [{nrows}, {ncols}] of {src_dtype:?}, which takes {}",
+            src.len(),
+            n_mat * src_mat
+        );
+    }
+    for m in 0..n_mat {
+        repack_matrix(
+            &src[m * src_mat..(m + 1) * src_mat],
+            nrows,
+            ncols,
+            src_dtype,
+            ko,
+            out,
+        )?;
+    }
+    Ok(())
 }
 
 /// Merge `sources` (one file, or the ordered GGUF splits) and repack matmul weights to their KO
@@ -246,24 +285,8 @@ pub fn prepare_ko_gguf(sources: &[&Path], dst: &Path, mode: Int8Mode) -> Result<
         if t.out_dtype == t.src_dtype {
             w.write_all(src)?; // pass-through
         } else {
-            // Repack per innermost 2-D matrix (1 for a weight, n_expert for a MoE bank).
-            let d = t.shape.dims();
-            let (n_mat, nrows, ncols) = match d.len() {
-                2 => (1, d[0], d[1]),
-                3 => (d[0], d[1], d[2]),
-                _ => crate::bail!("prepare: repack of {}-D tensor {}", d.len(), t.name),
-            };
-            let src_mat = tensor_bytes(&Shape::from((nrows, ncols)), t.src_dtype);
-            for m in 0..n_mat {
-                repack_matrix(
-                    &src[m * src_mat..(m + 1) * src_mat],
-                    nrows,
-                    ncols,
-                    t.src_dtype,
-                    t.out_dtype,
-                    &mut w,
-                )?;
-            }
+            write_ko_twin(src, t.shape.dims(), t.src_dtype, t.out_dtype, &mut w)
+                .map_err(|e| crate::Error::Msg(format!("prepare: {}: {e}", t.name)))?;
         }
         w.write_all(&vec![0u8; pad32(t.out_size)])?;
     }
@@ -449,6 +472,70 @@ mod tests {
 
         let _ = std::fs::remove_file(&src_path);
         let _ = std::fs::remove_file(&dst_path);
+        Ok(())
+    }
+
+    /// A mode with no int8 matmul twins nothing, a float projection included; an int8 mode
+    /// twins a tileable float projection to Q8_KO and leaves a 1-D one alone.
+    #[test]
+    fn only_an_int8_mode_names_a_twin() {
+        let shape = Shape::from((32, 128));
+        let name = "v.blk.0.attn_qkv.weight";
+        assert_eq!(ko_target(name, &shape, GgmlDType::F16, Int8Mode::Off), None);
+        for mode in [Int8Mode::Performance, Int8Mode::Precision] {
+            assert_eq!(
+                ko_target(name, &shape, GgmlDType::F16, mode),
+                Some(GgmlDType::Q8_KO)
+            );
+            assert_eq!(
+                ko_target(
+                    "v.blk.0.ln1.weight",
+                    &Shape::from(128),
+                    GgmlDType::F16,
+                    mode
+                ),
+                None
+            );
+        }
+    }
+
+    /// **An F16 matrix's twin is its widened values quantized**, byte for byte: the bytes
+    /// `write_ko_twin` writes are `quantize_ko` of the F16 read as F32, and a source short of
+    /// its matrix is refused rather than read past.
+    #[test]
+    fn an_f16_twin_is_its_values_quantized() -> Result<()> {
+        let (nrows, ncols) = (32usize, 128usize);
+        let values: Vec<half::f16> = (0..nrows * ncols)
+            .map(|i| half::f16::from_f32(((i % 29) as f32 - 14.0) * 0.03))
+            .collect();
+        let src: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut got = Vec::new();
+        write_ko_twin(
+            &src,
+            &[nrows, ncols],
+            GgmlDType::F16,
+            GgmlDType::Q8_KO,
+            &mut got,
+        )?;
+        let widened: Vec<f32> = values.iter().map(|v| v.to_f32()).collect();
+        let want = quantize_ko(&widened, nrows, ncols, GgmlDType::Q8_KO);
+        assert_eq!(got.len(), nrows / 8 * (ncols / 128) * 1056);
+        assert_eq!(got, want);
+        // The first row's scale: amax 14 × 0.03 → 0.42 / 127, stored as f16.
+        let scale = half::f16::from_le_bytes([got[1024], got[1025]]).to_f32();
+        assert_eq!(
+            scale,
+            half::f16::from_f32(half::f16::from_f32(0.42).to_f32() / 127.0).to_f32()
+        );
+        let mut short = Vec::new();
+        assert!(write_ko_twin(
+            &src[..src.len() - 2],
+            &[nrows, ncols],
+            GgmlDType::F16,
+            GgmlDType::Q8_KO,
+            &mut short
+        )
+        .is_err());
         Ok(())
     }
 

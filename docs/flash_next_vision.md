@@ -151,23 +151,32 @@ tower's first ops (§3). Reference sizes:
 
 ## 3. The tower: a guest, its rows kept
 
-**The weights.** `mmproj-F16.gguf` at the pinned revision
-(`quantized_qwen38_moe/checkpoint_pins.rs`, `QWEN4EXP_MMPROJ_FILE` with its
-length and SHA-256), fetched from the hub into its cache by the caller that
-is about to need it (`vision_tower_file`, which checks the length every call
-and the digest once a process) — never by the drain that reads it, which runs
-with every wave stopped. It is not a pack source: the engine recipe, and the
-190 GB pack built from it, stay as they are.
+**The weights.** A model pack of its own
+(`docs/self_contained_model_packs.md`), built from `mmproj-F16.gguf` at the
+pinned revision (`quantized_qwen38_moe/checkpoint_pins.rs`,
+`QWEN4EXP_MMPROJ_FILE` with its length and SHA-256, checked before the build)
+by the caller that is about to need it (`vision_tower_pack`) — never by the
+drain that reads it, which runs with every wave stopped. The pack is
+*twinned* (`PackFamily::Twinned`, `model_pack/twins.rs`): every projection the
+int8 matmul tiles is stored as its `Q8_KO` twin, converted once on the host
+at build, and the position table — a matrix the tower gathers rows from,
+never multiplies by — as its file's F16. Each pair's fingerprint is recorded,
+so a pack written by another converter is rebuilt. One pack,
+`mmproj-F16.precision.pack.gguf`, serves every card with the int8 matmul (an
+F16 projection's twin is `Q8_KO` in either int8 mode); the CPU reference
+reads the `off` pack, which twins nothing. The source is released once its
+pack is built. It is separate from the engine's own pack: the engine recipe,
+and the 190 GB pack built from it, stay as they are.
 
 **The guest.** `Guest::Vision` (`candle-conversation/src/guest/vision.rs`)
 serves a `VisionRequest` — images at their grid — with each image's rows on
 the host. Between waves it places its activation arena on the guest ground's
-widest run, places the GGUF's tensors in the ground beside it
-(`place_gguf`; GEMM weights at the card's int8 mode, and the position table
-— a matrix the tower dequantizes, never multiplies by — as its file bytes,
-`gguf_pick::Pick`), loads `VisionTower` (`qwen_vision/tower.rs`: plain candle
-ops, one forward that is both the CPU reference and the guest arena's run),
-runs each image, and gives the ground back. Its footprint is the weights plus
+widest run, places the pack's tensors in the ground beside it (`place_gguf`
+at `Int8Mode::Off`: every tensor, twins included, is one DMA of its stored
+bytes from the pinned staging buffers — no source upload, no repack kernel,
+no scratch off the ground), loads `VisionTower` (`qwen_vision/tower.rs`:
+plain candle ops, one forward that is both the CPU reference and the guest
+arena's run), runs each image, and gives the ground back. Its footprint is the weights plus
 the largest image's activations, stated per patch
 (`ACTIVATION_BYTES_PER_PATCH`; 88 KiB measured at 768 × 512 against 128
 priced). The arena is a bump, so what bounds it is the stages: the embedding,

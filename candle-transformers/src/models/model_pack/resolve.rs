@@ -438,6 +438,93 @@ mod tests {
         assert_eq!(ModelPack::open(&rebuilt).unwrap().tokenizer_rev, "t2");
     }
 
+    /// A hub stand-in whose checkpoint is two F16 `[32, 128]` matrices,
+    /// `w.weight` and `table.weight`, the values `i % 23` scaled.
+    struct HalfHub(Hub);
+
+    /// The F16 bytes of the stand-in's matrices.
+    fn half_matrix(salt: usize) -> Vec<u8> {
+        (0..32 * 128)
+            .flat_map(|i| half::f16::from_f32(((i + salt) % 23) as f32 * 0.01 - 0.1).to_le_bytes())
+            .collect()
+    }
+
+    impl SourceFetch for HalfHub {
+        fn fetch(&self, s: &SourceRef) -> Result<Fetched> {
+            std::fs::create_dir_all(&self.0.cache)?;
+            let path = self.0.cache.join(&s.file);
+            let mut plan = GgufPlan::new(32).unwrap();
+            for name in ["w.weight", "table.weight"] {
+                plan.push_tensor(PlannedTensor {
+                    name: name.into(),
+                    dtype: GgmlDType::F16,
+                    dims: vec![32, 128],
+                })
+                .unwrap();
+            }
+            let mut w = GgufStreamWriter::new(plan, File::create(&path).unwrap()).unwrap();
+            w.write_tensor_bytes(&half_matrix(0)).unwrap();
+            w.write_tensor_bytes(&half_matrix(5)).unwrap();
+            w.finish().unwrap();
+            Ok(Fetched { path, cached: true })
+        }
+        fn tokenizer_json(&self, repo: &str, rev: &str) -> Result<String> {
+            self.0.tokenizer_json(repo, rev)
+        }
+        fn release(&self, f: &Fetched) -> Result<()> {
+            self.0.release(f)
+        }
+    }
+
+    /// **A twinned pack stores its projection as the KO twin** — the bytes
+    /// `write_ko_twin` writes for it — and the table it names verbatim as its
+    /// file's bytes; the pack serves the next request without a build.
+    #[test]
+    fn a_twinned_pack_stores_twins_and_verbatim_tables() {
+        use candle::quantized::prepare::write_ko_twin;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("models");
+        let hub = HalfHub(hub(dir.path()));
+        let request = PackRequest::of(
+            PackFamily::Twinned(&["table.weight"]),
+            ("org/m", "r1", "m.gguf"),
+            ("org/tok", "t1"),
+            Some(Int8Mode::Precision),
+        );
+        let pack = model_pack(&request, &root, &Device::Cpu, &hub).unwrap();
+        assert_eq!(pack, root.join("org--m").join("m.precision.pack.gguf"));
+
+        let opened = ModelPack::open(&pack).unwrap();
+        let bytes_of = |name: &str| {
+            let info = &opened.content.tensor_infos[name];
+            let at = (opened.content.tensor_data_offset + info.offset) as usize;
+            let len = info.shape.elem_count() / info.ggml_dtype.block_size()
+                * info.ggml_dtype.type_size();
+            (info.ggml_dtype, opened.mmap[at..at + len].to_vec())
+        };
+        let mut twin = Vec::new();
+        write_ko_twin(
+            &half_matrix(0),
+            &[32, 128],
+            GgmlDType::F16,
+            GgmlDType::Q8_KO,
+            &mut twin,
+        )
+        .unwrap();
+        assert_eq!(twin.len(), 4 * 1056);
+        assert_eq!(bytes_of("w.weight"), (GgmlDType::Q8_KO, twin));
+        assert_eq!(bytes_of("table.weight"), (GgmlDType::F16, half_matrix(5)));
+
+        assert_eq!(
+            existing_pack(&request, &root, &Device::Cpu),
+            Some(pack.clone())
+        );
+        assert_eq!(
+            model_pack(&request, &root, &Device::Cpu, &hub).unwrap(),
+            pack
+        );
+    }
+
     /// A source that cannot be released after the build leaves its disk taken
     /// and nothing else: the pack is still the answer.
     #[test]

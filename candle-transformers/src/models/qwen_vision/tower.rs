@@ -317,25 +317,23 @@ impl VisionTower {
     }
 }
 
-// Under `cuda` for the pinned file's lookup alone, which lives with the
+// Under `cuda` for the pinned pack's lookup alone, which lives with the
 // model; the test runs on the CPU.
 #[cfg(all(test, feature = "cuda"))]
 mod cpu_tests {
     use super::*;
-    use crate::models::quantized_qwen38_moe::cached_vision_tower_file;
+    use crate::models::quantized_qwen38_moe::vision_tower_pack;
 
     /// **The real tower runs on the CPU**, the reference its card run is held
     /// to: a 256 × 256 image — 256 patches, one attention band — into one
-    /// finite 2 560-wide row per `<|image_pad|>`. Nothing to run on a machine
-    /// that has not fetched the tower.
+    /// finite 2 560-wide row per `<|image_pad|>`. Read from the tower's pack
+    /// with no twins, which a CPU load takes, built on first use.
     #[test]
     fn the_pinned_tower_reads_an_image_on_the_cpu() {
-        let Some(path) = cached_vision_tower_file() else {
-            return;
-        };
+        let path = vision_tower_pack(Int8Mode::Off).unwrap();
         let dev = Device::Cpu;
         let vb = VarBuilder::from_gguf(&path, &dev).unwrap();
-        let tower = VisionTower::load(&vb, Int8Mode::auto(&dev)).unwrap();
+        let tower = VisionTower::load(&vb, Int8Mode::Off).unwrap();
         let grid = Grid {
             height: 256,
             width: 256,
@@ -355,17 +353,18 @@ mod cpu_tests {
 mod tests {
     use super::*;
     use crate::models::gpu_test_lock::gpu_serial;
-    use crate::models::quantized_qwen38_moe::cached_vision_tower_file;
+    use crate::models::quantized_qwen38_moe::{vision_tower_pack, VISION_TOWER_MODE};
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_nn::kv_cache::{close_guest_arena, guest_domain_stats, open_guest_arena};
 
-    /// The pinned tower on the card, or `None` on a machine without a card or
-    /// without the tower fetched.
+    /// The pinned tower on the card, from its twinned pack — every projection
+    /// uploaded as the KO twin it is stored as — or `None` on a machine
+    /// without a card.
     fn tower() -> Option<(Device, VisionTower)> {
         let dev = Device::new_cuda(0).ok()?;
-        let path = cached_vision_tower_file()?;
+        let path = vision_tower_pack(VISION_TOWER_MODE).unwrap();
         let vb = VarBuilder::from_gguf(&path, &dev).unwrap();
-        let tower = VisionTower::load(&vb, Int8Mode::auto(&dev)).unwrap();
+        let tower = VisionTower::load(&vb, VISION_TOWER_MODE).unwrap();
         Some((dev, tower))
     }
 
@@ -396,9 +395,9 @@ mod tests {
         assert!(values.iter().any(|v| *v != 0.0), "every row is zero");
     }
 
-    /// **The real tower runs on the card**: Flash-Next's pinned mmproj reads
-    /// an image into its rows. On a machine that has not fetched the tower
-    /// there is nothing to run.
+    /// **The real tower runs on the card**: Flash-Next's pinned tower reads an
+    /// image into its rows. On a machine without a card there is nothing to
+    /// run.
     #[test]
     fn the_pinned_tower_reads_an_image_on_the_card() {
         let _gpu = gpu_serial();

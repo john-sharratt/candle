@@ -84,17 +84,27 @@ pub fn checkpoint_bytes_of(content: &Content) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackedTensor {
     pub name: String,
-    /// Index of the [`MappedSource`] its bytes are copied from.
+    /// Index of the [`MappedSource`] its bytes are read from.
     pub source: usize,
+    /// The type the pack stores it as.
     pub dtype: GgmlDType,
+    /// The type its source stores it as: `dtype`, for a tensor copied as it
+    /// is, or the source of the KO twin `dtype` names (`model_pack::twins`).
+    pub from: GgmlDType,
     pub dims: Vec<usize>,
     /// Absolute offset of its bytes in that source.
     pub offset: u64,
 }
 
 impl PackedTensor {
+    /// Bytes the pack stores.
     pub fn byte_len(&self) -> u64 {
         tensor_bytes(self.dtype, &self.dims)
+    }
+
+    /// Bytes read from the source.
+    pub fn source_len(&self) -> u64 {
+        tensor_bytes(self.from, &self.dims)
     }
 }
 
@@ -137,6 +147,7 @@ impl Composition {
                 name: name.clone(),
                 source: 0,
                 dtype: info.ggml_dtype,
+                from: info.ggml_dtype,
                 dims: info.shape.dims().to_vec(),
                 offset: src.content.tensor_data_offset + info.offset,
             })
@@ -159,6 +170,7 @@ impl Composition {
             name: name.to_string(),
             source,
             dtype: info.ggml_dtype,
+            from: info.ggml_dtype,
             dims: info.shape.dims().to_vec(),
             offset: src.content.tensor_data_offset + info.offset,
         };
