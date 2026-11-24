@@ -204,8 +204,12 @@ impl Qwen4ExpBatched {
         // An image's rows arrive under virtual ids: resolved here, the hash
         // side handed `<|image_pad|>` in their place, and their values the
         // gather's second table.
-        let mut images =
-            take_wave_images(&mut seq_tokens, m.embed.n_rows(), cfg.ple.image_token_id, n_embd)?;
+        let mut images = take_wave_images(
+            &mut seq_tokens,
+            m.embed.n_rows(),
+            cfg.ple.image_token_id,
+            n_embd,
+        )?;
         if fresh || head_embeds {
             // Uploaded by the window that gathers, and only by it
             // (`WaveBuffer::ImageRows`).
@@ -216,7 +220,12 @@ impl Qwen4ExpBatched {
                     let gather = std::mem::take(&mut w.gather_ids);
                     (
                         wave_from_vec_ticketed(gather, (total_rows,), dev, fwd_ticket)?,
-                        Some(wave_from_vec_ticketed(values, (k, n_embd), dev, fwd_ticket)?),
+                        Some(wave_from_vec_ticketed(
+                            values,
+                            (k, n_embd),
+                            dev,
+                            fwd_ticket,
+                        )?),
                     )
                 }
                 (None, Some(t)) => (t, None),

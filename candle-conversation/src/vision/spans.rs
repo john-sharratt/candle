@@ -188,9 +188,14 @@ mod tests {
         assert!(turn_spans(&ids, text, t, |_| Ok(None)).is_err());
         assert!(turn_spans(&ids, "no marker", t, |_| Ok(Some(rows(2)))).is_err());
         // A message that only quotes a marker holds no image.
-        assert!(turn_spans(&[2], "see [image 0123456789abcdef 64×32]\n", t, |_| unreachable!())
-            .unwrap()
-            .is_empty());
+        assert!(turn_spans(
+            &[2],
+            "see [image 0123456789abcdef 64×32]\n",
+            t,
+            |_| unreachable!()
+        )
+        .unwrap()
+        .is_empty());
         assert!(turn_spans(&[1, 2], "no image", t, |_| unreachable!())
             .unwrap()
             .is_empty());

@@ -95,7 +95,8 @@ pub fn turn_images(
     for (i, source) in sources.into_iter().enumerate() {
         match source {
             ImageSource::Kept(id) => {
-                let k = load_kept(substrate, &id)?.ok_or_else(|| format!("no image {id} is kept"))?;
+                let k =
+                    load_kept(substrate, &id)?.ok_or_else(|| format!("no image {id} is kept"))?;
                 known.push(Some((id, k.width, k.height, k.rows)));
             }
             ImageSource::Bytes(bytes) => {

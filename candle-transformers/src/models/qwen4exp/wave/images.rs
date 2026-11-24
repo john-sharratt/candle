@@ -120,10 +120,10 @@ pub(super) fn take_wave_images(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use candle::Device;
     use crate::models::qwen_vision::geometry::FACTOR;
     use crate::models::qwen_vision::registry::{ImageHandle, ImageRows};
     use crate::models::qwen_vision::Grid;
+    use candle::Device;
 
     fn image(merged_rows: usize, merged_cols: usize, seed: f32) -> ImageRows {
         let grid = Grid {

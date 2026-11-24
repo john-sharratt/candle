@@ -98,18 +98,28 @@ mod tests {
     /// the submitter put them together.
     #[test]
     fn a_turns_text_splits_into_its_images_and_its_message() {
-        let text = format!("{}\n{}\nwhat?", marker("0123456789abcdef", 2, 3), marker("fedcba9876543210", 4, 5));
+        let text = format!(
+            "{}\n{}\nwhat?",
+            marker("0123456789abcdef", 2, 3),
+            marker("fedcba9876543210", 4, 5)
+        );
         assert_eq!(
             split_markers(&text),
             (
-                vec!["0123456789abcdef".to_string(), "fedcba9876543210".to_string()],
+                vec![
+                    "0123456789abcdef".to_string(),
+                    "fedcba9876543210".to_string()
+                ],
                 "what?"
             )
         );
         assert_eq!(split_markers("what?"), (Vec::new(), "what?"));
         // An image alone: its message is empty.
         let alone = format!("{}\n", marker("0123456789abcdef", 2, 3));
-        assert_eq!(split_markers(&alone), (vec!["0123456789abcdef".to_string()], ""));
+        assert_eq!(
+            split_markers(&alone),
+            (vec!["0123456789abcdef".to_string()], "")
+        );
     }
 
     /// The blocks opening the ids, back to back; anything after the first
