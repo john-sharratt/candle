@@ -89,7 +89,9 @@ pub struct Plan<'a> {
     pub census_dir: &'a Path,
 }
 
-/// The `(arm, run, id)` of every answer `out` already records.
+/// The `(arm, run, id)` of every answer `out` already records with an
+/// answer. A line whose every try failed records no answer, so its question
+/// is asked again; the analysis reads only answered lines.
 pub fn recorded(out: &Path) -> anyhow::Result<Recorded> {
     let Ok(f) = File::open(out) else {
         return Ok(Recorded::new());
@@ -101,7 +103,9 @@ pub fn recorded(out: &Path) -> anyhow::Result<Recorded> {
             continue;
         }
         let l: Line = serde_json::from_str(&line).context("a recorded answer")?;
-        done.insert((l.arm, l.run, l.id));
+        if l.error.is_none() {
+            done.insert((l.arm, l.run, l.id));
+        }
     }
     Ok(done)
 }
@@ -199,12 +203,17 @@ async fn asked_line(
         retrieved.map_or("", |p| p.text.as_str()),
     );
     let mut last_error = String::new();
-    for attempt in 1..=TRIES {
+    // `asked_n` names each conversation, so no two asks share one; `attempt`
+    // counts only the tries that were the answer's own to fail.
+    let mut attempt = 1;
+    let mut asked_n = 0;
+    while attempt <= TRIES {
+        asked_n += 1;
         let conv = conv_id(
             plan_thread,
             job.arm,
             job.run,
-            &attempt_id(&q.id, tag, attempt),
+            &attempt_id(&q.id, tag, asked_n),
         );
         let asked = zend.ask(&conv, &prompt, job.arm).await;
         if let Err(e) = zend.delete(&conv).await {
@@ -230,6 +239,11 @@ async fn asked_line(
             Err(e) => {
                 last_error = format!("{e:#}");
                 tracing::warn!(conv, attempt, "the answer failed: {last_error}");
+                if zend.was_down().await {
+                    tracing::warn!(conv, "the member was down; asked again, no try spent");
+                } else {
+                    attempt += 1;
+                }
             }
         }
     }
@@ -379,6 +393,10 @@ pub fn lines(path: &Path) -> anyhow::Result<Vec<Line>> {
 
 #[cfg(test)]
 mod tests {
+    use std::env::temp_dir;
+    use std::fs;
+    use std::process;
+
     use super::*;
 
     fn question() -> Question {
@@ -512,5 +530,49 @@ mod tests {
         assert!(recorded(Path::new("no/such/results.jsonl"))
             .unwrap()
             .is_empty());
+    }
+
+    /// A line whose every try failed is not a recorded answer: its question
+    /// is asked again, and the answered line beside it is.
+    #[test]
+    fn a_failed_line_is_asked_again() {
+        let answered = scored(
+            &question(),
+            Arm::C1,
+            4,
+            "x",
+            &HashSet::new(),
+            1,
+            None,
+            Placement::default(),
+            1.0,
+        );
+        let mut failed = scored(
+            &question(),
+            Arm::B1,
+            4,
+            "",
+            &HashSet::new(),
+            0,
+            None,
+            Placement::default(),
+            0.0,
+        );
+        failed.error = Some("connection refused".to_string());
+        let path = temp_dir().join(format!("battery-recorded-{}.jsonl", process::id()));
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                serde_json::to_string(&answered).unwrap(),
+                serde_json::to_string(&failed).unwrap()
+            ),
+        )
+        .unwrap();
+        let done = recorded(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(done.contains(&("c1".to_string(), 4, "d1".to_string())));
+        assert!(!done.contains(&("b1".to_string(), 4, "d1".to_string())));
+        assert_eq!(done.len(), 1);
     }
 }

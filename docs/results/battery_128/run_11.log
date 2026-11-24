@@ -1,0 +1,1937 @@
+﻿cargo :    Compiling cluster v0.1.0 (D:\prog\candle\cluster)
+At line:1 char:331
++ ... rog\candle; cargo run -p zend --release --example dependency_battery  ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling cl...candle\cluster):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+   Compiling cluster-dial v0.1.0 (D:\prog\candle\cluster-dial)
+   Compiling web v0.1.0 (D:\prog\candle\web)
+   Compiling agent v0.1.0 (D:\prog\candle\agent)
+   Compiling substrate-git v0.1.0 (D:\prog\candle\substrate-git)
+   Compiling mcp-server v0.1.0 (D:\prog\candle\mcp-server)
+   Compiling host v0.1.0 (D:\prog\candle\host)
+   Compiling zend v0.1.0 (D:\prog\candle\zend)
+    Finished `release` profile [optimized] target(s) in 1m 31s
+     Running `target\release\examples\dependency_battery.exe run --zend http://192.168.1.2:8081 --node 
+223ebb209828d84c --repo D:\prog\candle --out docs/results/battery_128/answers.jsonl --arms r1,t1,c1:6,b1:6 --runs 3`
+R1 retrieves from 7059 files of D:\prog\candle
+1512 answers to ask (2712 already recorded), 16 at a time
+K/V census written to docs/results/battery_128\census_start.json
+this launch's conversations are tagged 6b0504ea
+2026-11-24T03:31:07.570248Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Fr1-r2-a08-6b0504ea-a1): client 
+error (SendRequest): connection error: An existing connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/r1-r2-a08-6b0504ea-a1"
+2026-11-24T03:31:07.570641Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/r1-r2-a08-6b0504ea-a1" attempt=1
+2026-11-24T03:31:07.571017Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Fc1-r5-a08-6b0504ea-a1): client 
+error (SendRequest): connection error: An existing connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/c1-r5-a08-6b0504ea-a1"
+2026-11-24T03:31:07.571139Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/c1-r5-a08-6b0504ea-a1" attempt=1
+2026-11-24T03:31:09.607994Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Fc1-r5-t23-6b0504ea-a1): client 
+error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os 
+error 10061) conv="mcp:685da41c19f7f5ff:battery-128/c1-r5-t23-6b0504ea-a1"
+2026-11-24T03:31:09.608000Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Fr1-r2-a19-6b0504ea-a1): client 
+error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os 
+error 10061) conv="mcp:685da41c19f7f5ff:battery-128/r1-r2-a19-6b0504ea-a1"
+2026-11-24T03:31:09.608077Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Ft1-r1-t23-6b0504ea-a1): client 
+error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os 
+error 10061) conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-t23-6b0504ea-a1"
+2026-11-24T03:31:09.608074Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/c1-r5-t23-6b0504ea-a1" attempt=1
+2026-11-24T03:31:09.608122Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/r1-r2-a19-6b0504ea-a1" attempt=1
+2026-11-24T03:31:09.608126Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-t23-6b0504ea-a1" attempt=1
+2026-11-24T03:31:09.607997Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Fc1-r5-d05-6b0504ea-a1): client 
+error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os 
+error 10061) conv="mcp:685da41c19f7f5ff:battery-128/c1-r5-d05-6b0504ea-a1"
+2026-11-24T03:31:09.608007Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Ft1-r1-a19-6b0504ea-a1): client 
+error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os 
+error 10061) conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-a19-6b0504ea-a1"
+2026-11-24T03:31:09.608267Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/c1-r5-d05-6b0504ea-a1" attempt=1
+2026-11-24T03:31:09.607998Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Ft1-r2-d05-6b0504ea-a1): client 
+error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os 
+error 10061) conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-d05-6b0504ea-a1"
+2026-11-24T03:31:09.608037Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Fb1-r5-d05-6b0504ea-a1): client 
+error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os 
+error 10061) conv="mcp:685da41c19f7f5ff:battery-128/b1-r5-d05-6b0504ea-a1"
+2026-11-24T03:31:09.608077Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Fc1-r5-a19-6b0504ea-a1): client 
+error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os 
+error 10061) conv="mcp:685da41c19f7f5ff:battery-128/c1-r5-a19-6b0504ea-a1"
+2026-11-24T03:31:09.608091Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Ft1-r2-a08-6b0504ea-a1): client 
+error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os 
+error 10061) conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-a08-6b0504ea-a1"
+2026-11-24T03:31:09.608292Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/b1-r5-d05-6b0504ea-a1" attempt=1
+2026-11-24T03:31:09.608098Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Fb1-r5-t23-6b0504ea-a1): client 
+error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os 
+error 10061) conv="mcp:685da41c19f7f5ff:battery-128/b1-r5-t23-6b0504ea-a1"
+2026-11-24T03:31:09.608188Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Fb1-r5-a19-6b0504ea-a1): client 
+error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os 
+error 10061) conv="mcp:685da41c19f7f5ff:battery-128/b1-r5-a19-6b0504ea-a1"
+2026-11-24T03:31:09.608335Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/b1-r5-t23-6b0504ea-a1" attempt=1
+2026-11-24T03:31:09.608273Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-a19-6b0504ea-a1" attempt=1
+2026-11-24T03:31:09.608302Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/c1-r5-a19-6b0504ea-a1" attempt=1
+2026-11-24T03:31:09.608301Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-d05-6b0504ea-a1" attempt=1
+2026-11-24T03:31:09.608314Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-a08-6b0504ea-a1" attempt=1
+2026-11-24T03:31:09.608047Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Fb1-r5-a08-6b0504ea-a1): client 
+error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os 
+error 10061) conv="mcp:685da41c19f7f5ff:battery-128/b1-r5-a08-6b0504ea-a1"
+2026-11-24T03:31:09.608398Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/b1-r5-a08-6b0504ea-a1" attempt=1
+2026-11-24T03:31:09.608345Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/b1-r5-a19-6b0504ea-a1" attempt=1
+2026-11-24T03:31:09.608206Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Fr1-r2-t23-6b0504ea-a1): client 
+error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os 
+error 10061) conv="mcp:685da41c19f7f5ff:battery-128/r1-r2-t23-6b0504ea-a1"
+2026-11-24T03:31:09.608120Z  WARN dependency_battery::run: the conversation was not deleted: error sending request for 
+url (http://192.168.1.2:8081/v1/conversations/mcp%3A685da41c19f7f5ff%3Abattery-128%2Fr1-r2-d05-6b0504ea-a1): client 
+error (Connect): tcp connect error: No connection could be made because the target machine actively refused it. (os 
+error 10061) conv="mcp:685da41c19f7f5ff:battery-128/r1-r2-d05-6b0504ea-a1"
+2026-11-24T03:31:09.608454Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/r1-r2-t23-6b0504ea-a1" attempt=1
+2026-11-24T03:31:09.608463Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): client error (SendRequest): connection error: An existing 
+connection was forcibly closed by the remote host. (os error 10054) 
+conv="mcp:685da41c19f7f5ff:battery-128/r1-r2-d05-6b0504ea-a1" attempt=1
+2026-11-24T03:34:24.723126Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/c1-r5-a08-6b0504ea-a1"
+2026-11-24T03:34:24.723305Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/r1-r2-a08-6b0504ea-a1"
+2026-11-24T03:34:26.734507Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/c1-r5-d05-6b0504ea-a1"
+2026-11-24T03:34:26.734677Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/b1-r5-d05-6b0504ea-a1"
+2026-11-24T03:34:26.734707Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/r1-r2-d05-6b0504ea-a1"
+2026-11-24T03:34:26.734777Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/r1-r2-a19-6b0504ea-a1"
+2026-11-24T03:34:26.734802Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/b1-r5-a08-6b0504ea-a1"
+2026-11-24T03:34:26.734821Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-d05-6b0504ea-a1"
+2026-11-24T03:34:26.734808Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/b1-r5-a19-6b0504ea-a1"
+2026-11-24T03:34:26.734839Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/b1-r5-t23-6b0504ea-a1"
+2026-11-24T03:34:26.735047Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-a08-6b0504ea-a1"
+2026-11-24T03:34:26.735146Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/c1-r5-t23-6b0504ea-a1"
+2026-11-24T03:34:26.735153Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/r1-r2-t23-6b0504ea-a1"
+2026-11-24T03:34:26.735250Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/c1-r5-a19-6b0504ea-a1"
+2026-11-24T03:34:26.735372Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-a19-6b0504ea-a1"
+2026-11-24T03:34:26.735393Z  WARN dependency_battery::run: the member was down; asked again, no try spent 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-t23-6b0504ea-a1"
+[1/1512] b1 r5 a08  recall 100.0%  opening false think-end false answer false  247 tokens
+[2/1512] c1 r5 a08  recall 100.0%  opening false think-end false answer false  347 tokens
+[3/1512] c1 r5 t23  recall 100.0%  opening true think-end true answer true  966 tokens
+[4/1512] b1 r5 d05  recall  50.0%  opening true think-end true answer true  1258 tokens
+[5/1512] c1 r5 a19  recall  75.0%  opening true think-end true answer true  1349 tokens
+[6/1512] b1 r5 t23  recall 100.0%  opening true think-end true answer true  423 tokens
+[7/1512] t1 r2 d05  recall 100.0%  opening false think-end false answer false  591 tokens
+[8/1512] b1 r5 a19  recall  50.0%  opening true think-end true answer true  1424 tokens
+[9/1512] r1 r2 d05  recall  50.0%  opening false think-end false answer false  409 tokens
+[10/1512] r1 r2 a08  recall 100.0%  opening false think-end false answer false  258 tokens
+[11/1512] t1 r2 a08  recall 100.0%  opening false think-end false answer false  543 tokens
+[12/1512] c1 r5 d05  recall   0.0%  opening true think-end true answer true  2906 tokens
+[13/1512] b1 r5 a31  recall   0.0%  opening false think-end false answer false  1327 tokens
+[14/1512] c1 r5 d17  recall  33.3%  opening false think-end true answer true  949 tokens
+[15/1512] b1 r5 d17  recall   0.0%  opening false think-end false answer false  1334 tokens
+[16/1512] t1 r1 a19  recall 100.0%  opening false think-end false answer false  1473 tokens
+[17/1512] r1 r2 t23  recall  50.0%  opening false think-end false answer false  1686 tokens
+[18/1512] t1 r2 d17  recall 100.0%  opening false think-end false answer false  875 tokens
+[19/1512] b1 r5 t13  recall  40.0%  opening true think-end true answer true  1171 tokens
+[20/1512] c1 r5 t13  recall  40.0%  opening true think-end true answer true  1833 tokens
+[21/1512] r1 r2 d17  recall  66.7%  opening false think-end false answer false  698 tokens
+[22/1512] c1 r5 a31  recall  25.0%  opening true think-end true answer true  3272 tokens
+[23/1512] c1 r5 t26  recall   0.0%  opening false think-end false answer false  2639 tokens
+[24/1512] c1 r4 d35  recall   0.0%  opening false think-end false answer false  375 tokens
+[25/1512] b1 r4 t26  recall  40.0%  opening true think-end true answer true  2153 tokens
+[26/1512] b1 r5 d35  recall   0.0%  opening false think-end false answer false  225 tokens
+[27/1512] r1 r2 a19  recall  25.0%  opening false think-end false answer false  1512 tokens
+[28/1512] r1 r1 t26  recall   0.0%  opening false think-end false answer false  1520 tokens
+[29/1512] r1 r1 d35  recall   0.0%  opening false think-end false answer false  305 tokens
+[30/1512] b1 r4 t30  recall   0.0%  opening false think-end false answer false  2346 tokens
+[31/1512] t1 r1 d35  recall 100.0%  opening false think-end false answer false  876 tokens
+[32/1512] r1 r1 t13  recall   0.0%  opening false think-end false answer false  2138 tokens
+[33/1512] c1 r4 t30  recall   0.0%  opening false think-end false answer false  2929 tokens
+[34/1512] c1 r4 d37  recall   0.0%  opening false think-end false answer false  580 tokens
+[35/1512] b1 r4 d37  recall   0.0%  opening false think-end false answer false  634 tokens
+[36/1512] t1 r1 d37  recall 100.0%  opening false think-end false answer false  443 tokens
+[37/1512] t1 r1 t23  recall 100.0%  opening false think-end false answer false  2787 tokens
+[38/1512] c1 r4 a38  recall  75.0%  opening true think-end true answer true  1096 tokens
+[39/1512] b1 r4 a38  recall  75.0%  opening true think-end true answer true  1698 tokens
+[40/1512] c1 r4 a37  recall   0.0%  opening true think-end true answer true  906 tokens
+[41/1512] r1 r1 a31  recall  75.0%  opening false think-end false answer false  3452 tokens
+[42/1512] b1 r4 a37  recall  25.0%  opening true think-end true answer true  2353 tokens
+[43/1512] r1 r1 t30  recall 100.0%  opening false think-end false answer false  2808 tokens
+[44/1512] r1 r1 d37  recall 100.0%  opening false think-end false answer false  792 tokens
+[45/1512] b1 r4 d26  recall   0.0%  opening false think-end false answer false  265 tokens
+2026-11-24T03:55:43.278358Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-a31-6b0504ea-a1" attempt=1
+[46/1512] r1 r1 a38  recall  75.0%  opening false think-end false answer false  1349 tokens
+[47/1512] c1 r4 d26  recall   0.0%  opening false think-end false answer false  434 tokens
+[48/1512] c1 r4 a15  recall  80.0%  opening true think-end true answer true  1375 tokens
+[49/1512] b1 r4 a15  recall 100.0%  opening true think-end true answer true  1365 tokens
+[50/1512] t1 r1 d26  recall 100.0%  opening false think-end false answer false  468 tokens
+[51/1512] t1 r1 t26  recall 100.0%  opening false think-end false answer false  3468 tokens
+[52/1512] b1 r4 d24  recall   0.0%  opening true think-end true answer true  568 tokens
+[53/1512] t1 r1 t13  recall 100.0%  opening false think-end false answer false  4065 tokens
+[54/1512] t1 r1 d24  recall 100.0%  opening false think-end false answer false  334 tokens
+[55/1512] r1 r1 a15  recall 100.0%  opening false think-end false answer false  1167 tokens
+[56/1512] c1 r4 d24  recall  50.0%  opening true think-end true answer true  1788 tokens
+[57/1512] c1 r4 a09  recall  60.0%  opening true think-end true answer true  1018 tokens
+[58/1512] b1 r4 a09  recall  20.0%  opening true think-end true answer true  1072 tokens
+[59/1512] r1 r1 d26  recall  50.0%  opening false think-end false answer false  722 tokens
+[60/1512] r1 r1 a37  recall   0.0%  opening false think-end false answer false  1017 tokens
+[61/1512] c1 r4 a17  recall  60.0%  opening true think-end true answer true  670 tokens
+[62/1512] c1 r4 a03  recall   0.0%  opening false think-end false answer false  1361 tokens
+[63/1512] r1 r1 d24  recall  50.0%  opening false think-end false answer false  661 tokens
+[64/1512] b1 r4 a03  recall   0.0%  opening false think-end false answer false  2041 tokens
+[65/1512] t1 r1 a38  recall 100.0%  opening false think-end false answer false  2887 tokens
+[66/1512] b1 r4 a17  recall  40.0%  opening true think-end true answer true  585 tokens
+2026-11-24T04:04:01.178735Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-t30-6b0504ea-a1" attempt=1
+[67/1512] r1 r1 a03  recall  66.7%  opening false think-end false answer false  895 tokens
+[68/1512] c1 r4 t08  recall  66.7%  opening true think-end true answer true  1483 tokens
+[69/1512] b1 r4 t08  recall  33.3%  opening true think-end true answer true  1760 tokens
+[70/1512] t1 r1 a37  recall 100.0%  opening false think-end false answer false  3346 tokens
+[71/1512] b1 r4 t40  recall  25.0%  opening true think-end true answer true  1783 tokens
+[72/1512] r1 r1 a09  recall  60.0%  opening false think-end false answer false  886 tokens
+[73/1512] t1 r1 a09  recall 100.0%  opening false think-end false answer false  2164 tokens
+[74/1512] r1 r1 t08  recall 100.0%  opening false think-end false answer false  1653 tokens
+[75/1512] c1 r4 t40  recall  25.0%  opening true think-end true answer true  4045 tokens
+[76/1512] r1 r1 a17  recall  80.0%  opening false think-end false answer false  677 tokens
+[77/1512] c1 r4 a06  recall 100.0%  opening true think-end true answer true  860 tokens
+2026-11-24T04:10:04.659243Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-a15-6b0504ea-a1" attempt=1
+[78/1512] t1 r1 a31  recall 100.0%  opening false think-end false answer false  2816 tokens
+[79/1512] b1 r4 a06  recall 100.0%  opening false think-end true answer true  1376 tokens
+[80/1512] b1 r4 a39  recall 100.0%  opening true think-end true answer true  1223 tokens
+[81/1512] t1 r1 a03  recall 100.0%  opening false think-end false answer false  2921 tokens
+[82/1512] c1 r4 a39  recall 100.0%  opening true think-end true answer true  1248 tokens
+[83/1512] t1 r1 t08  recall 100.0%  opening false think-end false answer false  1672 tokens
+[84/1512] r1 r1 a06  recall  50.0%  opening false think-end false answer false  739 tokens
+[85/1512] t1 r1 d38  recall 100.0%  opening false think-end false answer false  561 tokens
+[86/1512] c1 r4 d38  recall  50.0%  opening true think-end true answer true  1009 tokens
+[87/1512] b1 r4 d38  recall   0.0%  opening true think-end true answer true  2061 tokens
+[88/1512] t1 r1 a39  recall 100.0%  opening false think-end false answer false  1393 tokens
+[89/1512] c1 r4 d11  recall   0.0%  opening false think-end false answer false  1359 tokens
+[90/1512] t1 r1 a17  recall  60.0%  opening false think-end false answer false  2677 tokens
+[91/1512] b1 r4 d11  recall   0.0%  opening false think-end false answer false  2122 tokens
+[92/1512] t1 r1 a06  recall 100.0%  opening false think-end false answer false  1617 tokens
+[93/1512] r1 r1 t40  recall  25.0%  opening false think-end false answer false  2983 tokens
+[94/1512] r1 r1 d01  recall  50.0%  opening false think-end false answer false  387 tokens
+[95/1512] t1 r1 d11  recall 100.0%  opening false think-end false answer false  724 tokens
+[96/1512] b1 r4 a14  recall  50.0%  opening true think-end true answer true  544 tokens
+[97/1512] t1 r1 d01  recall 100.0%  opening false think-end false answer false  405 tokens
+[98/1512] r1 r1 a39  recall 100.0%  opening false think-end false answer false  1220 tokens
+[99/1512] b1 r4 d01  recall   0.0%  opening false think-end false answer false  1768 tokens
+[100/1512] c1 r4 a14  recall  25.0%  opening true think-end true answer true  1031 tokens
+[101/1512] c1 r4 d01  recall   0.0%  opening false think-end false answer false  3749 tokens
+[102/1512] r1 r1 d11  recall   0.0%  opening false think-end false answer false  674 tokens
+[103/1512] r1 r1 d38  recall  50.0%  opening false think-end false answer false  593 tokens
+[104/1512] b1 r4 d14  recall   0.0%  opening true think-end true answer true  628 tokens
+[105/1512] c1 r4 d28  recall   0.0%  opening false think-end false answer false  699 tokens
+[106/1512] t1 r1 t30  recall 100.0%  opening false think-end false answer false  2826 tokens
+[107/1512] t1 r1 d14  recall 100.0%  opening false think-end false answer false  582 tokens
+[108/1512] c1 r4 d14  recall   0.0%  opening true think-end true answer true  2445 tokens
+[109/1512] c1 r4 d20  recall   0.0%  opening true think-end false answer false  2352 tokens
+[110/1512] t1 r1 d20  recall 100.0%  opening false think-end false answer false  471 tokens
+[111/1512] r1 r1 a14  recall 100.0%  opening false think-end false answer false  798 tokens
+[112/1512] b1 r4 d20  recall   0.0%  opening true think-end true answer true  3404 tokens
+[113/1512] b1 r4 d28  recall   0.0%  opening false think-end false answer false  528 tokens
+[114/1512] r1 r1 d20  recall   0.0%  opening false think-end false answer false  358 tokens
+[115/1512] t1 r1 t40  recall 100.0%  opening false think-end false answer false  3705 tokens
+[116/1512] r1 r1 d28  recall 100.0%  opening false think-end false answer false  533 tokens
+[117/1512] c1 r4 a10  recall  80.0%  opening true think-end true answer true  1488 tokens
+[118/1512] t1 r1 d28  recall 100.0%  opening false think-end false answer false  670 tokens
+[119/1512] r1 r1 d14  recall 100.0%  opening false think-end false answer false  743 tokens
+[120/1512] b1 r4 a10  recall  40.0%  opening false think-end false answer false  919 tokens
+[121/1512] b1 r4 t36  recall  25.0%  opening false think-end false answer false  1048 tokens
+[122/1512] b1 r4 a04  recall  50.0%  opening false think-end false answer false  940 tokens
+[123/1512] c1 r4 a04  recall 100.0%  opening false think-end false answer false  1048 tokens
+[124/1512] c1 r4 t36  recall  75.0%  opening true think-end false answer false  1311 tokens
+[125/1512] t1 r1 a14  recall  75.0%  opening false think-end false answer false  1307 tokens
+[126/1512] r1 r1 a04  recall 100.0%  opening false think-end false answer false  993 tokens
+[127/1512] r1 r1 a10  recall   0.0%  opening false think-end false answer false  1363 tokens
+[128/1512] b1 r4 a34  recall  75.0%  opening true think-end true answer true  1288 tokens
+2026-11-24T04:30:04.679934Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-a15-6b0504ea-a2" attempt=2
+[129/1512] c1 r4 a34  recall  25.0%  opening true think-end true answer true  1688 tokens
+[130/1512] r1 r1 d40  recall   0.0%  opening false think-end false answer false  368 tokens
+[131/1512] b1 r4 d40  recall   0.0%  opening false think-end false answer false  3370 tokens
+[132/1512] c1 r4 d40  recall   0.0%  opening false think-end false answer false  3245 tokens
+[133/1512] b1 r4 d03  recall   0.0%  opening false think-end false answer false  316 tokens
+[134/1512] t1 r1 d40  recall 100.0%  opening false think-end false answer false  656 tokens
+[135/1512] c1 r4 d03  recall   0.0%  opening false think-end false answer false  585 tokens
+[136/1512] t1 r1 d42  recall 100.0%  opening false think-end false answer false  472 tokens
+[137/1512] c1 r4 d42  recall   0.0%  opening false think-end false answer false  927 tokens
+[138/1512] t1 r1 d03  recall 100.0%  opening false think-end false answer false  1860 tokens
+[139/1512] t1 r1 a10  recall  80.0%  opening false think-end false answer false  2412 tokens
+[140/1512] b1 r4 d42  recall   0.0%  opening false think-end false answer false  2262 tokens
+[141/1512] b1 r4 a27  recall  60.0%  opening true think-end true answer true  1203 tokens
+[142/1512] c1 r4 a27  recall  60.0%  opening true think-end true answer true  2217 tokens
+[143/1512] r1 r1 d03  recall   0.0%  opening false think-end false answer false  400 tokens
+[144/1512] t1 r1 t36  recall 100.0%  opening false think-end false answer false  1927 tokens
+[145/1512] c1 r4 t41  recall 100.0%  opening true think-end true answer true  831 tokens
+[146/1512] r1 r1 a27  recall  80.0%  opening false think-end false answer false  1232 tokens
+[147/1512] b1 r4 t41  recall 100.0%  opening true think-end true answer true  2154 tokens
+[148/1512] r1 r1 t36  recall  25.0%  opening false think-end false answer false  825 tokens
+[149/1512] t1 r1 a04  recall  50.0%  opening false think-end false answer false  3383 tokens
+[150/1512] c1 r4 d12  recall  50.0%  opening false think-end true answer true  1378 tokens
+[151/1512] r1 r1 d42  recall 100.0%  opening false think-end false answer false  375 tokens
+[152/1512] t1 r1 d12  recall 100.0%  opening false think-end false answer false  780 tokens
+[153/1512] c1 r4 a16  recall  50.0%  opening false think-end true answer true  2108 tokens
+[154/1512] c1 r4 a12  recall 100.0%  opening true think-end true answer true  534 tokens
+[155/1512] b1 r4 d12  recall   0.0%  opening false think-end false answer false  3833 tokens
+[156/1512] b1 r4 a12  recall 100.0%  opening true think-end true answer true  692 tokens
+[157/1512] b1 r4 a16  recall   0.0%  opening false think-end false answer false  3834 tokens
+[158/1512] t1 r1 t41  recall 100.0%  opening false think-end false answer false  1588 tokens
+[159/1512] c1 r4 d02  recall   0.0%  opening false think-end false answer false  973 tokens
+[160/1512] t1 r1 a34  recall  75.0%  opening false think-end false answer false  3599 tokens
+[161/1512] t1 r1 d02  recall 100.0%  opening false think-end false answer false  798 tokens
+[162/1512] c1 r4 t21  recall  75.0%  opening true think-end true answer true  2003 tokens
+[163/1512] r1 r1 a16  recall   0.0%  opening false think-end false answer false  1469 tokens
+2026-11-24T04:47:08.328642Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/r1-r1-a34-6b0504ea-a1" attempt=1
+[164/1512] r1 r1 t41  recall 100.0%  opening false think-end false answer false  1435 tokens
+[165/1512] t1 r1 a27  recall 100.0%  opening false think-end false answer false  2826 tokens
+[166/1512] t1 r1 a16  recall 100.0%  opening false think-end false answer false  2655 tokens
+[167/1512] b1 r4 t21  recall  50.0%  opening true think-end true answer true  1312 tokens
+[168/1512] r1 r1 d02  recall   0.0%  opening false think-end false answer false  267 tokens
+[169/1512] r1 r1 a12  recall   0.0%  opening false think-end false answer false  1879 tokens
+2026-11-24T04:50:04.842286Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-a15-6b0504ea-a3" attempt=3
+[170/1512] t1 r1 a15  recall   0.0%  opening false think-end false answer false  0 tokens  FAILED: the chat request: error sending request for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out
+[171/1512] b1 r4 d02  recall   0.0%  opening false think-end false answer false  5457 tokens
+[172/1512] c1 r4 d25  recall   0.0%  opening true think-end true answer true  557 tokens
+[173/1512] b1 r4 d25  recall   0.0%  opening true think-end true answer true  1069 tokens
+[174/1512] t1 r1 d25  recall 100.0%  opening false think-end false answer false  408 tokens
+[175/1512] c1 r4 t10  recall  75.0%  opening true think-end true answer true  965 tokens
+[176/1512] b1 r4 t10  recall  75.0%  opening true think-end true answer true  1821 tokens
+[177/1512] c1 r4 t11  recall  80.0%  opening true think-end true answer true  1039 tokens
+[178/1512] b1 r4 t11  recall  80.0%  opening true think-end true answer true  1132 tokens
+[179/1512] r1 r1 t21  recall   0.0%  opening false think-end false answer false  2236 tokens
+[180/1512] r1 r1 t11  recall  80.0%  opening false think-end false answer false  1110 tokens
+[181/1512] c1 r4 a28  recall  25.0%  opening false think-end true answer true  2132 tokens
+[182/1512] r1 r1 t10  recall  25.0%  opening false think-end false answer false  1387 tokens
+2026-11-24T04:56:22.961380Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/r1-r1-d12-6b0504ea-a1" attempt=1
+[183/1512] c1 r4 d33  recall  33.3%  opening true think-end true answer true  749 tokens
+[184/1512] b1 r4 a28  recall   0.0%  opening false think-end false answer false  3455 tokens
+[185/1512] b1 r4 d33  recall   0.0%  opening false think-end true answer true  808 tokens
+[186/1512] r1 r1 a28  recall 100.0%  opening false think-end false answer false  807 tokens
+[187/1512] t1 r1 a12  recall 100.0%  opening false think-end false answer false  2324 tokens
+[188/1512] r1 r1 a34  recall  50.0%  opening false think-end false answer false  1958 tokens
+[189/1512] t1 r1 d33  recall 100.0%  opening false think-end false answer false  850 tokens
+[190/1512] c1 r4 t32  recall  50.0%  opening true think-end true answer true  1351 tokens
+[191/1512] r1 r1 d25  recall 100.0%  opening false think-end false answer false  620 tokens
+[192/1512] r1 r1 d33  recall  33.3%  opening false think-end false answer false  1278 tokens
+[193/1512] b1 r4 t29  recall   0.0%  opening true think-end true answer true  1338 tokens
+[194/1512] b1 r4 d32  recall   0.0%  opening false think-end false answer false  429 tokens
+[195/1512] b1 r4 t32  recall  50.0%  opening true think-end true answer true  2007 tokens
+[196/1512] c1 r4 t29  recall 100.0%  opening true think-end true answer true  2460 tokens
+[197/1512] c1 r4 d32  recall   0.0%  opening false think-end false answer false  443 tokens
+[198/1512] t1 r1 a28  recall 100.0%  opening false think-end false answer false  1430 tokens
+[199/1512] t1 r1 t10  recall 100.0%  opening false think-end false answer false  2165 tokens
+[200/1512] t1 r1 d32  recall 100.0%  opening false think-end false answer false  785 tokens
+[201/1512] t1 r1 t11  recall  80.0%  opening false think-end false answer false  2487 tokens
+[202/1512] b1 r4 t31  recall  25.0%  opening false think-end false answer false  1514 tokens
+[203/1512] c1 r4 t31  recall  25.0%  opening false think-end false answer false  1792 tokens
+2026-11-24T05:04:41.774585Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-t21-6b0504ea-a1" attempt=1
+[204/1512] c1 r4 a25  recall 100.0%  opening true think-end true answer true  630 tokens
+[205/1512] r1 r1 t29  recall  80.0%  opening false think-end false answer false  2154 tokens
+[206/1512] b1 r4 a25  recall  80.0%  opening true think-end true answer true  1586 tokens
+[207/1512] c1 r4 t25  recall 100.0%  opening false think-end true answer true  1526 tokens
+[208/1512] b1 r4 t25  recall 100.0%  opening true think-end true answer true  1136 tokens
+[209/1512] t1 r1 t32  recall 100.0%  opening false think-end false answer false  2132 tokens
+[210/1512] r1 r1 t25  recall 100.0%  opening false think-end false answer false  878 tokens
+[211/1512] c1 r4 t06  recall   0.0%  opening true think-end true answer true  672 tokens
+[212/1512] r1 r1 d32  recall 100.0%  opening false think-end false answer false  530 tokens
+[213/1512] c1 r4 t09  recall 100.0%  opening true think-end true answer true  1168 tokens
+[214/1512] b1 r4 t09  recall 100.0%  opening true think-end true answer true  1195 tokens
+[215/1512] r1 r1 a25  recall  80.0%  opening false think-end false answer false  1010 tokens
+[216/1512] r1 r1 t31  recall  25.0%  opening false think-end false answer false  2626 tokens
+[217/1512] t1 r1 a25  recall 100.0%  opening false think-end false answer false  1910 tokens
+[218/1512] b1 r4 t06  recall 100.0%  opening true think-end true answer true  683 tokens
+[219/1512] b1 r4 d10  recall   0.0%  opening false think-end false answer false  1132 tokens
+[220/1512] t1 r1 d10  recall 100.0%  opening false think-end false answer false  695 tokens
+[221/1512] c1 r4 d10  recall   0.0%  opening false think-end false answer false  521 tokens
+[222/1512] r1 r1 t09  recall   0.0%  opening false think-end false answer false  1085 tokens
+[223/1512] t1 r1 t25  recall 100.0%  opening false think-end false answer false  2273 tokens
+[224/1512] c1 r4 d09  recall  33.3%  opening true think-end true answer true  814 tokens
+[225/1512] b1 r4 d09  recall  33.3%  opening true think-end true answer true  954 tokens
+[226/1512] t1 r1 t09  recall 100.0%  opening false think-end false answer false  1537 tokens
+[227/1512] t1 r1 t31  recall 100.0%  opening false think-end false answer false  2888 tokens
+[228/1512] t1 r1 d09  recall 100.0%  opening false think-end false answer false  1319 tokens
+[229/1512] r1 r1 d10  recall  33.3%  opening false think-end false answer false  489 tokens
+2026-11-24T05:16:23.008642Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/r1-r1-d12-6b0504ea-a2" attempt=2
+[230/1512] r1 r1 t06  recall 100.0%  opening false think-end false answer false  748 tokens
+[231/1512] t1 r1 t06  recall  50.0%  opening false think-end false answer false  1669 tokens
+2026-11-24T05:16:53.496582Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/r1-r1-t32-6b0504ea-a1" attempt=1
+2026-11-24T05:17:26.809134Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-t29-6b0504ea-a1" attempt=1
+[232/1512] b1 r4 d13  recall   0.0%  opening true think-end true answer true  731 tokens
+[233/1512] c1 r4 d13  recall  50.0%  opening true think-end true answer true  760 tokens
+[234/1512] t1 r1 t21  recall  75.0%  opening false think-end false answer false  3995 tokens
+[235/1512] b1 r4 t37  recall  50.0%  opening true think-end true answer true  1756 tokens
+[236/1512] c1 r4 t37  recall  50.0%  opening true think-end true answer true  1531 tokens
+[237/1512] t1 r1 d13  recall 100.0%  opening false think-end false answer false  749 tokens
+[238/1512] r1 r1 d13  recall  50.0%  opening false think-end false answer false  998 tokens
+[239/1512] c1 r4 t35  recall  50.0%  opening false think-end true answer true  1452 tokens
+[240/1512] r1 r1 t37  recall   0.0%  opening false think-end false answer false  1598 tokens
+[241/1512] r1 r1 d12  recall 100.0%  opening false think-end false answer false  446 tokens
+[242/1512] r1 r1 d09  recall 100.0%  opening false think-end false answer false  2260 tokens
+[243/1512] b1 r4 t35  recall   0.0%  opening false think-end false answer false  1396 tokens
+[244/1512] r1 r1 t35  recall   0.0%  opening false think-end false answer false  972 tokens
+[245/1512] b1 r4 a32  recall   0.0%  opening false think-end false answer false  2141 tokens
+[246/1512] c1 r4 a32  recall   0.0%  opening true think-end false answer false  1975 tokens
+[247/1512] c1 r4 t18  recall   0.0%  opening false think-end false answer false  2020 tokens
+[248/1512] r1 r1 a32  recall  50.0%  opening false think-end false answer false  1827 tokens
+[249/1512] b1 r4 t18  recall   0.0%  opening true think-end true answer true  2288 tokens
+[250/1512] r1 r1 t18  recall  20.0%  opening false think-end false answer false  1872 tokens
+[251/1512] c1 r4 d18  recall   0.0%  opening false think-end false answer false  357 tokens
+[252/1512] c1 r4 t04  recall 100.0%  opening true think-end true answer true  3054 tokens
+[253/1512] t1 r1 d18  recall 100.0%  opening false think-end false answer false  392 tokens
+[254/1512] t1 r1 t37  recall 100.0%  opening false think-end false answer false  3626 tokens
+[255/1512] b1 r4 d18  recall   0.0%  opening false think-end false answer false  1564 tokens
+[256/1512] c1 r4 d30  recall   0.0%  opening true think-end true answer true  537 tokens
+[257/1512] b1 r4 t04  recall 100.0%  opening true think-end true answer true  1719 tokens
+[258/1512] t1 r1 d30  recall 100.0%  opening false think-end false answer false  422 tokens
+[259/1512] b1 r4 a02  recall 100.0%  opening false think-end false answer false  456 tokens
+[260/1512] b1 r4 d30  recall   0.0%  opening true think-end true answer true  538 tokens
+[261/1512] c1 r4 a02  recall  50.0%  opening false think-end false answer false  1178 tokens
+[262/1512] c1 r4 t22  recall  60.0%  opening true think-end true answer true  1496 tokens
+[263/1512] r1 r1 d18  recall  50.0%  opening false think-end false answer false  675 tokens
+[264/1512] r1 r1 t04  recall 100.0%  opening false think-end false answer false  1124 tokens
+[265/1512] r1 r1 t32  recall  25.0%  opening false think-end false answer false  1557 tokens
+[266/1512] r1 r1 a02  recall 100.0%  opening false think-end false answer false  497 tokens
+[267/1512] b1 r4 t17  recall   0.0%  opening false think-end false answer false  961 tokens
+[268/1512] t1 r1 t35  recall 100.0%  opening false think-end false answer false  3800 tokens
+[269/1512] c1 r4 t17  recall   0.0%  opening false think-end false answer false  1189 tokens
+[270/1512] b1 r4 t22  recall  40.0%  opening true think-end true answer true  4135 tokens
+[271/1512] t1 r1 a32  recall 100.0%  opening false think-end false answer false  3667 tokens
+2026-11-24T05:37:26.830513Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-t29-6b0504ea-a2" attempt=2
+[272/1512] b1 r4 a11  recall  75.0%  opening true think-end true answer true  1813 tokens
+[273/1512] c1 r4 a13  recall  80.0%  opening true think-end true answer true  1184 tokens
+[274/1512] c1 r4 a11  recall 100.0%  opening true think-end true answer true  2000 tokens
+[275/1512] t1 r1 t04  recall 100.0%  opening false think-end false answer false  2718 tokens
+[276/1512] t1 r1 a02  recall 100.0%  opening false think-end false answer false  2127 tokens
+[277/1512] r1 r1 d30  recall 100.0%  opening false think-end false answer false  755 tokens
+[278/1512] b1 r4 a13  recall  60.0%  opening true think-end true answer true  2129 tokens
+2026-11-24T05:40:42.793295Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-t18-6b0504ea-a1" attempt=1
+[279/1512] b1 r4 t07  recall   0.0%  opening false think-end false answer false  1910 tokens
+[280/1512] r1 r1 t17  recall  80.0%  opening false think-end false answer false  1043 tokens
+[281/1512] r1 r1 t22  recall  20.0%  opening false think-end false answer false  1990 tokens
+[282/1512] t1 r1 t22  recall 100.0%  opening false think-end false answer false  2422 tokens
+[283/1512] c1 r4 t07  recall  66.7%  opening false think-end true answer true  1549 tokens
+[284/1512] t1 r1 a11  recall 100.0%  opening false think-end false answer false  1915 tokens
+[285/1512] b1 r4 t16  recall  60.0%  opening true think-end true answer true  1493 tokens
+[286/1512] c1 r4 t16  recall  60.0%  opening true think-end true answer true  2208 tokens
+[287/1512] b1 r4 d21  recall   0.0%  opening false think-end false answer false  532 tokens
+[288/1512] r1 r1 a13  recall  60.0%  opening false think-end false answer false  2329 tokens
+[289/1512] t1 r1 t07  recall 100.0%  opening false think-end false answer false  1109 tokens
+[290/1512] r1 r1 t07  recall   0.0%  opening false think-end false answer false  1315 tokens
+[291/1512] t1 r1 d21  recall 100.0%  opening false think-end false answer false  501 tokens
+[292/1512] c1 r4 d21  recall   0.0%  opening false think-end false answer false  621 tokens
+[293/1512] b1 r4 a01  recall 100.0%  opening true think-end true answer true  317 tokens
+[294/1512] r1 r1 a11  recall   0.0%  opening false think-end false answer false  803 tokens
+[295/1512] r1 r1 t16  recall  60.0%  opening false think-end false answer false  1132 tokens
+[296/1512] r1 r1 d21  recall   0.0%  opening false think-end false answer false  550 tokens
+[297/1512] c1 r4 a01  recall  33.3%  opening false think-end false answer false  970 tokens
+[298/1512] t1 r1 t17  recall  80.0%  opening false think-end false answer false  3139 tokens
+[299/1512] r1 r1 a01  recall 100.0%  opening false think-end false answer false  279 tokens
+[300/1512] t1 r1 a01  recall 100.0%  opening false think-end false answer false  629 tokens
+[301/1512] t1 r1 d19  recall 100.0%  opening false think-end false answer false  537 tokens
+[302/1512] b1 r4 a29  recall   0.0%  opening false think-end false answer false  1671 tokens
+[303/1512] b1 r4 d19  recall   0.0%  opening false think-end false answer false  466 tokens
+[304/1512] c1 r4 d19  recall   0.0%  opening false think-end false answer false  651 tokens
+[305/1512] b1 r4 a42  recall  50.0%  opening true think-end true answer true  894 tokens
+[306/1512] r1 r1 a29  recall 100.0%  opening false think-end false answer false  1065 tokens
+[307/1512] c1 r4 a42  recall  50.0%  opening true think-end true answer true  1371 tokens
+[308/1512] c1 r4 a29  recall  25.0%  opening false think-end false answer false  3770 tokens
+[309/1512] c1 r4 t42  recall  50.0%  opening false think-end true answer true  1091 tokens
+[310/1512] b1 r4 t05  recall  66.7%  opening false think-end false answer false  2229 tokens
+[311/1512] c1 r4 t05  recall  33.3%  opening false think-end false answer false  1472 tokens
+[312/1512] t1 r1 a13  recall  20.0%  opening false think-end false answer false  4708 tokens
+[313/1512] r1 r1 t05  recall  33.3%  opening false think-end false answer false  1565 tokens
+[314/1512] b1 r4 t42  recall  25.0%  opening true think-end true answer true  1620 tokens
+2026-11-24T05:57:26.838880Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-t29-6b0504ea-a3" attempt=3
+[315/1512] t1 r1 t29  recall   0.0%  opening false think-end false answer false  0 tokens  FAILED: the chat request: error sending request for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out
+[316/1512] c1 r4 d15  recall   0.0%  opening false think-end false answer false  435 tokens
+[317/1512] r1 r1 a42  recall 100.0%  opening false think-end false answer false  1226 tokens
+[318/1512] b1 r4 d15  recall   0.0%  opening false think-end false answer false  819 tokens
+[319/1512] t1 r1 t16  recall  60.0%  opening false think-end false answer false  2555 tokens
+[320/1512] r1 r1 d19  recall  66.7%  opening false think-end false answer false  685 tokens
+[321/1512] r1 r1 d15  recall   0.0%  opening false think-end false answer false  331 tokens
+[322/1512] t1 r1 d15  recall 100.0%  opening false think-end false answer false  629 tokens
+[323/1512] c1 r4 a05  recall 100.0%  opening false think-end false answer false  596 tokens
+[324/1512] c1 r4 a30  recall  25.0%  opening false think-end false answer false  865 tokens
+[325/1512] t1 r1 t18  recall 100.0%  opening false think-end false answer false  3855 tokens
+[326/1512] b1 r4 a05  recall  50.0%  opening false think-end false answer false  1233 tokens
+[327/1512] b1 r4 a30  recall   0.0%  opening false think-end false answer false  1100 tokens
+[328/1512] t1 r1 t05  recall  66.7%  opening false think-end false answer false  1870 tokens
+[329/1512] c1 r4 d39  recall   0.0%  opening false think-end false answer false  793 tokens
+[330/1512] b1 r4 d39  recall   0.0%  opening false think-end false answer false  1086 tokens
+[331/1512] t1 r1 d39  recall 100.0%  opening false think-end false answer false  641 tokens
+[332/1512] t1 r1 a05  recall 100.0%  opening false think-end false answer false  886 tokens
+[333/1512] r1 r1 t42  recall  75.0%  opening false think-end false answer false  1738 tokens
+[334/1512] t1 r1 d31  recall 100.0%  opening false think-end false answer false  602 tokens
+[335/1512] b1 r4 d31  recall   0.0%  opening false think-end false answer false  1622 tokens
+[336/1512] c1 r4 d31  recall   0.0%  opening false think-end false answer false  474 tokens
+[337/1512] t1 r1 a42  recall 100.0%  opening false think-end false answer false  2353 tokens
+[338/1512] r1 r1 a05  recall 100.0%  opening false think-end false answer false  593 tokens
+[339/1512] c1 r4 a36  recall  75.0%  opening true think-end true answer true  1269 tokens
+[340/1512] r1 r1 d31  recall   0.0%  opening false think-end false answer false  263 tokens
+[341/1512] r1 r1 a30  recall  75.0%  opening false think-end false answer false  1790 tokens
+2026-11-24T06:06:07.275815Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-a29-6b0504ea-a1" attempt=1
+[342/1512] b1 r4 a36  recall 100.0%  opening true think-end true answer true  1026 tokens
+[343/1512] b1 r4 a24  recall  20.0%  opening true think-end true answer true  1116 tokens
+[344/1512] c1 r4 a24  recall  20.0%  opening true think-end false answer false  1627 tokens
+[345/1512] t1 r1 t42  recall 100.0%  opening false think-end false answer false  2868 tokens
+[346/1512] c1 r4 a20  recall  33.3%  opening true think-end false answer false  1103 tokens
+[347/1512] t1 r1 d43  recall 100.0%  opening false think-end false answer false  589 tokens
+[348/1512] r1 r1 d39  recall  25.0%  opening false think-end false answer false  1177 tokens
+[349/1512] b1 r4 d43  recall   0.0%  opening false think-end false answer false  1828 tokens
+[350/1512] b1 r4 a20  recall  33.3%  opening true think-end true answer true  2887 tokens
+[351/1512] c1 r4 d06  recall   0.0%  opening false think-end false answer false  373 tokens
+[352/1512] t1 r1 a36  recall 100.0%  opening false think-end false answer false  1759 tokens
+[353/1512] c1 r4 d43  recall   0.0%  opening false think-end false answer false  2344 tokens
+[354/1512] t1 r1 a20  recall 100.0%  opening false think-end false answer false  1043 tokens
+[355/1512] t1 r1 a24  recall  80.0%  opening false think-end false answer false  1817 tokens
+[356/1512] r1 r1 a24  recall   0.0%  opening false think-end false answer false  1482 tokens
+[357/1512] r1 r1 d06  recall 100.0%  opening false think-end false answer false  698 tokens
+[358/1512] b1 r4 t12  recall  75.0%  opening true think-end true answer true  956 tokens
+[359/1512] c1 r4 t12  recall  75.0%  opening true think-end true answer true  1057 tokens
+[360/1512] t1 r1 d06  recall 100.0%  opening false think-end false answer false  1216 tokens
+[361/1512] r1 r1 a36  recall 100.0%  opening false think-end false answer false  1332 tokens
+[362/1512] b1 r4 a07  recall  33.3%  opening false think-end false answer false  699 tokens
+[363/1512] c1 r4 a07  recall   0.0%  opening false think-end false answer false  703 tokens
+[364/1512] r1 r1 a20  recall  66.7%  opening false think-end false answer false  2351 tokens
+[365/1512] t1 r1 a30  recall 100.0%  opening false think-end false answer false  4541 tokens
+[366/1512] b1 r4 d06  recall   0.0%  opening false think-end false answer false  2792 tokens
+[367/1512] c1 r4 t19  recall  20.0%  opening true think-end true answer true  2303 tokens
+[368/1512] r1 r1 d43  recall 100.0%  opening false think-end false answer false  653 tokens
+[369/1512] b1 r4 t19  recall  20.0%  opening true think-end true answer true  3459 tokens
+[370/1512] b1 r4 a41  recall  25.0%  opening false think-end true answer true  903 tokens
+[371/1512] c1 r4 a41  recall  50.0%  opening false think-end true answer true  1163 tokens
+[372/1512] r1 r1 t12  recall   0.0%  opening false think-end false answer false  711 tokens
+[373/1512] r1 r1 a07  recall  66.7%  opening false think-end false answer false  211 tokens
+[374/1512] b1 r4 t01  recall  50.0%  opening false think-end false answer false  4054 tokens
+[375/1512] c1 r4 t01  recall  75.0%  opening false think-end true answer true  4123 tokens
+[376/1512] t1 r1 t12  recall 100.0%  opening false think-end false answer false  1710 tokens
+[377/1512] t1 r1 a07  recall   0.0%  opening false think-end false answer false  2366 tokens
+[378/1512] r1 r1 t19  recall  60.0%  opening false think-end false answer false  1806 tokens
+[379/1512] b1 r4 t15  recall  80.0%  opening true think-end true answer true  1490 tokens
+[380/1512] c1 r4 t15  recall  80.0%  opening true think-end true answer true  2046 tokens
+[381/1512] r1 r1 a41  recall   0.0%  opening false think-end false answer false  1514 tokens
+2026-11-24T06:26:07.296346Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-a29-6b0504ea-a2" attempt=2
+[382/1512] r1 r1 t34  recall 100.0%  opening false think-end false answer false  928 tokens
+[383/1512] r1 r1 t01  recall  75.0%  opening false think-end false answer false  2310 tokens
+[384/1512] b1 r4 d07  recall   0.0%  opening false think-end false answer false  2752 tokens
+[385/1512] b1 r4 t34  recall   0.0%  opening true think-end true answer true  4039 tokens
+[386/1512] c1 r4 t34  recall   0.0%  opening true think-end true answer true  3503 tokens
+[387/1512] r1 r1 t15  recall  60.0%  opening false think-end false answer false  1262 tokens
+[388/1512] b1 r4 a23  recall  25.0%  opening false think-end false answer false  1302 tokens
+[389/1512] t1 r1 t01  recall  75.0%  opening false think-end false answer false  3953 tokens
+[390/1512] t1 r1 d07  recall 100.0%  opening false think-end false answer false  761 tokens
+[391/1512] c1 r4 d07  recall   0.0%  opening false think-end false answer false  2105 tokens
+[392/1512] t1 r1 t19  recall 100.0%  opening false think-end false answer false  2575 tokens
+[393/1512] c1 r4 t33  recall   0.0%  opening false think-end false answer false  1378 tokens
+[394/1512] c1 r4 a23  recall   0.0%  opening false think-end false answer false  2411 tokens
+[395/1512] r1 r1 d07  recall  33.3%  opening false think-end false answer false  895 tokens
+2026-11-24T06:35:19.559452Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-a41-6b0504ea-a1" attempt=1
+[396/1512] r1 r1 a23  recall  25.0%  opening false think-end false answer false  1293 tokens
+[397/1512] c1 r4 a22  recall   0.0%  opening false think-end true answer true  908 tokens
+[398/1512] c1 r4 a35  recall   0.0%  opening false think-end false answer false  1482 tokens
+[399/1512] t1 r1 t34  recall 100.0%  opening false think-end false answer false  1677 tokens
+[400/1512] b1 r4 a35  recall   0.0%  opening false think-end false answer false  2506 tokens
+[401/1512] t1 r1 a29  recall 100.0%  opening false think-end false answer false  1923 tokens
+[402/1512] b1 r4 t33  recall   0.0%  opening false think-end false answer false  3884 tokens
+2026-11-24T06:37:35.968284Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-t15-6b0504ea-a1" attempt=1
+[403/1512] r1 r1 t33  recall 100.0%  opening false think-end false answer false  953 tokens
+[404/1512] b1 r4 a22  recall  50.0%  opening true think-end true answer true  838 tokens
+[405/1512] b1 r4 t20  recall  40.0%  opening true think-end true answer true  942 tokens
+[406/1512] b1 r4 t14  recall   0.0%  opening true think-end true answer true  1524 tokens
+[407/1512] c1 r4 t20  recall  40.0%  opening true think-end true answer true  1365 tokens
+[408/1512] c1 r4 t14  recall  20.0%  opening true think-end true answer true  1455 tokens
+[409/1512] r1 r1 a22  recall  75.0%  opening false think-end false answer false  735 tokens
+[410/1512] t1 r1 t33  recall 100.0%  opening false think-end false answer false  1705 tokens
+[411/1512] b1 r4 d23  recall   0.0%  opening false think-end false answer false  579 tokens
+[412/1512] c1 r4 d23  recall  50.0%  opening false think-end false answer false  544 tokens
+[413/1512] t1 r1 d23  recall 100.0%  opening false think-end false answer false  591 tokens
+[414/1512] t1 r1 a23  recall 100.0%  opening false think-end false answer false  3580 tokens
+[415/1512] r1 r1 t14  recall   0.0%  opening false think-end false answer false  1812 tokens
+[416/1512] r1 r1 t20  recall  40.0%  opening false think-end false answer false  2272 tokens
+[417/1512] r1 r1 a35  recall  25.0%  opening false think-end false answer false  2343 tokens
+[418/1512] b1 r4 d36  recall   0.0%  opening true think-end true answer true  3262 tokens
+[419/1512] c1 r4 d36  recall   0.0%  opening true think-end false answer false  3500 tokens
+[420/1512] c1 r4 a21  recall  75.0%  opening true think-end true answer true  536 tokens
+[421/1512] c1 r4 d34  recall   0.0%  opening false think-end false answer false  1702 tokens
+[422/1512] t1 r1 d36  recall 100.0%  opening false think-end false answer false  1028 tokens
+[423/1512] r1 r1 d23  recall  50.0%  opening false think-end false answer false  374 tokens
+[424/1512] b1 r4 d34  recall   0.0%  opening false think-end false answer false  3294 tokens
+[425/1512] t1 r1 d34  recall 100.0%  opening false think-end false answer false  535 tokens
+[426/1512] t1 r1 a22  recall 100.0%  opening false think-end false answer false  3745 tokens
+[427/1512] b1 r4 t38  recall   0.0%  opening false think-end false answer false  719 tokens
+[428/1512] b1 r4 a21  recall  75.0%  opening true think-end true answer true  867 tokens
+[429/1512] t1 r1 a35  recall  75.0%  opening false think-end false answer false  3800 tokens
+[430/1512] r1 r1 d36  recall  50.0%  opening false think-end false answer false  490 tokens
+[431/1512] c1 r4 t38  recall   0.0%  opening false think-end false answer false  1492 tokens
+[432/1512] r1 r1 d34  recall   0.0%  opening false think-end false answer false  390 tokens
+[433/1512] b1 r4 a33  recall  50.0%  opening true think-end true answer true  959 tokens
+[434/1512] c1 r4 a33  recall  75.0%  opening true think-end true answer true  1188 tokens
+[435/1512] c1 r4 t03  recall   0.0%  opening false think-end false answer false  1157 tokens
+2026-11-24T06:55:19.578041Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-a41-6b0504ea-a2" attempt=2
+[436/1512] b1 r4 t03  recall  75.0%  opening false think-end false answer false  2137 tokens
+2026-11-24T06:56:01.025998Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-t14-6b0504ea-a1" attempt=1
+[437/1512] c1 r4 d16  recall   0.0%  opening false think-end false answer false  234 tokens
+[438/1512] t1 r1 d16  recall 100.0%  opening false think-end false answer false  621 tokens
+[439/1512] t1 r1 t20  recall 100.0%  opening false think-end false answer false  4147 tokens
+2026-11-24T06:57:35.995663Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-t15-6b0504ea-a2" attempt=2
+[440/1512] b1 r4 d16  recall   0.0%  opening false think-end false answer false  1441 tokens
+[441/1512] r1 r1 t03  recall 100.0%  opening false think-end false answer false  2254 tokens
+[442/1512] t1 r1 a21  recall 100.0%  opening false think-end false answer false  2597 tokens
+[443/1512] c1 r4 t24  recall 100.0%  opening true think-end true answer true  1766 tokens
+[444/1512] r1 r1 a33  recall  25.0%  opening false think-end false answer false  1267 tokens
+[445/1512] b1 r4 t24  recall 100.0%  opening true think-end true answer true  2945 tokens
+[446/1512] r1 r1 a21  recall  75.0%  opening false think-end false answer false  883 tokens
+[447/1512] c1 r4 d29  recall  50.0%  opening true think-end true answer true  781 tokens
+[448/1512] r1 r1 t38  recall  25.0%  opening false think-end false answer false  2762 tokens
+[449/1512] r1 r1 d16  recall  50.0%  opening false think-end false answer false  431 tokens
+[450/1512] t1 r1 t38  recall  75.0%  opening false think-end false answer false  2910 tokens
+[451/1512] b1 r4 d29  recall  50.0%  opening true think-end true answer true  752 tokens
+[452/1512] t1 r1 d22  recall 100.0%  opening false think-end false answer false  788 tokens
+[453/1512] b1 r4 d22  recall   0.0%  opening false think-end false answer false  702 tokens
+[454/1512] c1 r4 a26  recall  25.0%  opening false think-end true answer true  847 tokens
+[455/1512] c1 r4 d22  recall  50.0%  opening false think-end true answer true  834 tokens
+[456/1512] t1 r1 d29  recall 100.0%  opening false think-end false answer false  1043 tokens
+[457/1512] b1 r4 d04  recall  33.3%  opening true think-end true answer true  991 tokens
+[458/1512] r1 r1 t24  recall  20.0%  opening false think-end false answer false  2373 tokens
+[459/1512] r1 r1 d29  recall  50.0%  opening false think-end false answer false  595 tokens
+[460/1512] t1 r1 t03  recall 100.0%  opening false think-end false answer false  4322 tokens
+[461/1512] t1 r1 d04  recall 100.0%  opening false think-end false answer false  512 tokens
+[462/1512] t1 r1 t14  recall  80.0%  opening false think-end false answer false  2881 tokens
+[463/1512] r1 r1 d22  recall   0.0%  opening false think-end false answer false  735 tokens
+2026-11-24T07:09:45.245684Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-a33-6b0504ea-a1" attempt=1
+[464/1512] c1 r4 d04  recall  33.3%  opening true think-end true answer true  591 tokens
+[465/1512] b1 r4 a26  recall   0.0%  opening false think-end false answer false  3592 tokens
+[466/1512] c1 r4 d27  recall   0.0%  opening false think-end true answer true  657 tokens
+[467/1512] b1 r4 d27  recall   0.0%  opening false think-end true answer true  591 tokens
+[468/1512] t1 r1 a41  recall 100.0%  opening false think-end false answer false  2639 tokens
+[469/1512] r1 r1 a26  recall  75.0%  opening false think-end false answer false  716 tokens
+[470/1512] t1 r1 d27  recall 100.0%  opening false think-end false answer false  520 tokens
+[471/1512] r1 r1 d04  recall  33.3%  opening false think-end false answer false  747 tokens
+[472/1512] b1 r4 t02  recall  50.0%  opening true think-end true answer true  1701 tokens
+[473/1512] c1 r4 t02  recall  75.0%  opening true think-end true answer true  1906 tokens
+[474/1512] t1 r1 d41  recall 100.0%  opening false think-end false answer false  731 tokens
+[475/1512] b1 r4 d41  recall  25.0%  opening true think-end true answer true  512 tokens
+[476/1512] c1 r4 d41  recall  50.0%  opening true think-end true answer true  557 tokens
+[477/1512] r1 r1 t02  recall  25.0%  opening false think-end false answer false  1526 tokens
+[478/1512] b1 r4 t39  recall  25.0%  opening true think-end true answer true  934 tokens
+[479/1512] r1 r1 d27  recall 100.0%  opening false think-end false answer false  868 tokens
+[480/1512] t1 r1 a26  recall 100.0%  opening false think-end false answer false  2979 tokens
+[481/1512] b1 r4 t43  recall   0.0%  opening true think-end true answer true  753 tokens
+2026-11-24T07:16:53.105847Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-t24-6b0504ea-a1" attempt=1
+[482/1512] c1 r4 t43  recall 100.0%  opening true think-end true answer true  886 tokens
+2026-11-24T07:17:36.014215Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r1-t15-6b0504ea-a3" attempt=3
+[483/1512] t1 r1 t15  recall   0.0%  opening false think-end false answer false  0 tokens  FAILED: the chat request: error sending request for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out
+[484/1512] c1 r4 t39  recall 100.0%  opening true think-end true answer true  3583 tokens
+[485/1512] b1 r4 t28  recall  80.0%  opening true think-end true answer true  2065 tokens
+[486/1512] b1 r4 t27  recall   0.0%  opening false think-end false answer false  1910 tokens
+[487/1512] r1 r1 t39  recall  75.0%  opening false think-end false answer false  2820 tokens
+[488/1512] r1 r1 d41  recall 100.0%  opening false think-end false answer false  1295 tokens
+[489/1512] c1 r4 t27  recall   0.0%  opening false think-end false answer false  2707 tokens
+[490/1512] r1 r1 t43  recall 100.0%  opening false think-end false answer false  689 tokens
+[491/1512] c1 r4 t28  recall  80.0%  opening true think-end true answer true  1163 tokens
+[492/1512] t1 r1 a33  recall 100.0%  opening false think-end false answer false  2272 tokens
+[493/1512] c1 r4 a18  recall  50.0%  opening false think-end true answer true  1014 tokens
+[494/1512] r1 r1 t27  recall  60.0%  opening false think-end false answer false  2095 tokens
+[495/1512] b1 r4 a18  recall   0.0%  opening false think-end false answer false  1656 tokens
+[496/1512] r1 r1 t28  recall  80.0%  opening false think-end false answer false  1951 tokens
+[497/1512] b1 r4 d08  recall   0.0%  opening true think-end false answer false  639 tokens
+[498/1512] c1 r4 d08  recall   0.0%  opening true think-end false answer false  1793 tokens
+[499/1512] t1 r1 t02  recall 100.0%  opening false think-end false answer false  3755 tokens
+[500/1512] t1 r1 t24  recall 100.0%  opening false think-end false answer false  2244 tokens
+[501/1512] c1 r4 a40  recall 100.0%  opening true think-end true answer true  1477 tokens
+[502/1512] b1 r4 a40  recall 100.0%  opening true think-end true answer true  1868 tokens
+[503/1512] t1 r1 t39  recall 100.0%  opening false think-end false answer false  2862 tokens
+[504/1512] t1 r1 d08  recall 100.0%  opening false think-end false answer false  1514 tokens
+[505/1512] t1 r1 t43  recall 100.0%  opening false think-end false answer false  2492 tokens
+[506/1512] c1 r5 t14  recall  60.0%  opening true think-end true answer true  1692 tokens
+[507/1512] r1 r1 d08  recall 100.0%  opening false think-end false answer false  688 tokens
+[508/1512] r1 r1 a18  recall  25.0%  opening false think-end false answer false  1468 tokens
+[509/1512] t1 r1 t27  recall 100.0%  opening false think-end false answer false  3034 tokens
+[510/1512] b1 r5 t14  recall  60.0%  opening true think-end true answer true  1266 tokens
+[511/1512] r1 r1 a40  recall  75.0%  opening false think-end false answer false  1298 tokens
+[512/1512] b1 r5 t24  recall 100.0%  opening true think-end true answer true  2303 tokens
+[513/1512] t1 r1 a18  recall 100.0%  opening false think-end false answer false  2902 tokens
+[514/1512] c1 r5 t24  recall  80.0%  opening true think-end true answer true  2978 tokens
+[515/1512] r1 r2 t35  recall   0.0%  opening false think-end false answer false  923 tokens
+[516/1512] c1 r5 t35  recall  50.0%  opening false think-end false answer false  1831 tokens
+[517/1512] t1 r1 t28  recall 100.0%  opening false think-end false answer false  2474 tokens
+[518/1512] r1 r2 t24  recall  20.0%  opening false think-end false answer false  2723 tokens
+[519/1512] b1 r5 t35  recall   0.0%  opening false think-end false answer false  3269 tokens
+[520/1512] b1 r5 t37  recall  25.0%  opening true think-end true answer true  1875 tokens
+[521/1512] r1 r2 t14  recall   0.0%  opening false think-end false answer false  1863 tokens
+[522/1512] t1 r2 d38  recall 100.0%  opening false think-end false answer false  504 tokens
+[523/1512] t1 r1 a40  recall 100.0%  opening false think-end false answer false  1914 tokens
+[524/1512] c1 r5 t37  recall  25.0%  opening true think-end true answer true  3482 tokens
+[525/1512] b1 r5 d39  recall   0.0%  opening false think-end false answer false  227 tokens
+[526/1512] c1 r5 d38  recall   0.0%  opening true think-end true answer true  4407 tokens
+[527/1512] c1 r5 a33  recall  50.0%  opening true think-end true answer true  1128 tokens
+[528/1512] b1 r5 d38  recall   0.0%  opening true think-end true answer true  2200 tokens
+[529/1512] b1 r5 a33  recall  50.0%  opening true think-end true answer true  1312 tokens
+[530/1512] r1 r2 d38  recall  50.0%  opening false think-end false answer false  745 tokens
+[531/1512] r1 r2 t37  recall   0.0%  opening false think-end false answer false  1881 tokens
+[532/1512] t1 r2 d39  recall 100.0%  opening false think-end false answer false  541 tokens
+[533/1512] c1 r5 d39  recall   0.0%  opening false think-end false answer false  1377 tokens
+[534/1512] t1 r2 d34  recall 100.0%  opening false think-end false answer false  588 tokens
+[535/1512] b1 r5 a10  recall  20.0%  opening false think-end false answer false  1462 tokens
+2026-11-24T07:45:46.906042Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t14-6b0504ea-a1" attempt=1
+[536/1512] b1 r5 d26  recall   0.0%  opening false think-end false answer false  261 tokens
+[537/1512] c1 r5 d26  recall   0.0%  opening false think-end false answer false  315 tokens
+[538/1512] c1 r5 a10  recall 100.0%  opening true think-end true answer true  3641 tokens
+[539/1512] b1 r5 d34  recall   0.0%  opening false think-end false answer false  2037 tokens
+[540/1512] c1 r5 d34  recall   0.0%  opening false think-end false answer false  1938 tokens
+[541/1512] r1 r2 d39  recall  25.0%  opening false think-end false answer false  1206 tokens
+[542/1512] r1 r2 d34  recall   0.0%  opening false think-end false answer false  370 tokens
+[543/1512] r1 r2 a33  recall  25.0%  opening false think-end false answer false  1392 tokens
+[544/1512] t1 r2 d26  recall 100.0%  opening false think-end false answer false  443 tokens
+2026-11-24T07:49:24.946404Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t24-6b0504ea-a1" attempt=1
+[545/1512] r1 r2 a10  recall   0.0%  opening false think-end false answer false  753 tokens
+[546/1512] t1 r2 t37  recall 100.0%  opening false think-end false answer false  4738 tokens
+[547/1512] c1 r5 t20  recall  60.0%  opening true think-end true answer true  1848 tokens
+[548/1512] b1 r5 t20  recall  40.0%  opening true think-end true answer true  1863 tokens
+[549/1512] c1 r5 d28  recall   0.0%  opening false think-end false answer false  301 tokens
+[550/1512] b1 r5 d28  recall   0.0%  opening false think-end false answer false  346 tokens
+[551/1512] b1 r5 d31  recall   0.0%  opening false think-end false answer false  652 tokens
+2026-11-24T07:51:50.667703Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t35-6b0504ea-a1" attempt=1
+[552/1512] t1 r2 d31  recall 100.0%  opening false think-end false answer false  515 tokens
+[553/1512] r1 r2 d26  recall  50.0%  opening false think-end false answer false  822 tokens
+[554/1512] c1 r5 d31  recall   0.0%  opening false think-end false answer false  3781 tokens
+[555/1512] r1 r2 d31  recall   0.0%  opening false think-end false answer false  249 tokens
+[556/1512] c1 r6 d17  recall   0.0%  opening false think-end true answer true  1205 tokens
+[557/1512] b1 r6 d17  recall   0.0%  opening false think-end true answer true  1376 tokens
+2026-11-24T07:56:14.700893Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-a33-6b0504ea-a1" attempt=1
+[558/1512] t1 r2 d28  recall 100.0%  opening false think-end false answer false  723 tokens
+[559/1512] r1 r2 d28  recall 100.0%  opening false think-end false answer false  396 tokens
+[560/1512] t1 r3 d17  recall 100.0%  opening false think-end false answer false  758 tokens
+[561/1512] r1 r2 t20  recall  40.0%  opening false think-end false answer false  2300 tokens
+[562/1512] b1 r5 t43  recall  75.0%  opening true think-end true answer true  2106 tokens
+[563/1512] c1 r5 t43  recall 100.0%  opening true think-end true answer true  2036 tokens
+[564/1512] t1 r2 a10  recall 100.0%  opening false think-end false answer false  3652 tokens
+[565/1512] b1 r5 a18  recall  25.0%  opening false think-end false answer false  1419 tokens
+[566/1512] c1 r5 t31  recall   0.0%  opening false think-end false answer false  1239 tokens
+[567/1512] c1 r5 a18  recall   0.0%  opening false think-end false answer false  2413 tokens
+[568/1512] r1 r3 d17  recall  66.7%  opening false think-end false answer false  672 tokens
+[569/1512] b1 r5 t31  recall  25.0%  opening false think-end false answer false  1801 tokens
+[570/1512] r1 r2 a18  recall  25.0%  opening false think-end false answer false  972 tokens
+[571/1512] c1 r5 t10  recall  75.0%  opening true think-end true answer true  2655 tokens
+2026-11-24T08:05:47.048525Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t14-6b0504ea-a2" attempt=2
+[572/1512] t1 r2 t43  recall 100.0%  opening false think-end false answer false  1851 tokens
+[573/1512] c1 r5 a01  recall 100.0%  opening false think-end true answer true  485 tokens
+[574/1512] t1 r2 t24  recall 100.0%  opening false think-end false answer false  3095 tokens
+[575/1512] b1 r5 t10  recall 100.0%  opening true think-end true answer true  2170 tokens
+2026-11-24T08:06:48.494104Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t20-6b0504ea-a1" attempt=1
+[576/1512] t1 r2 a18  recall   0.0%  opening false think-end false answer false  1369 tokens
+[577/1512] t1 r2 t35  recall 100.0%  opening false think-end false answer false  3975 tokens
+[578/1512] r1 r2 t43  recall 100.0%  opening false think-end false answer false  981 tokens
+[579/1512] r1 r2 t31  recall  25.0%  opening false think-end false answer false  3210 tokens
+[580/1512] b1 r5 d19  recall   0.0%  opening false think-end false answer false  715 tokens
+[581/1512] c1 r5 d19  recall   0.0%  opening false think-end false answer false  671 tokens
+[582/1512] t1 r2 d19  recall 100.0%  opening false think-end false answer false  933 tokens
+[583/1512] r1 r2 t10  recall  25.0%  opening false think-end false answer false  2761 tokens
+[584/1512] b1 r5 a01  recall   0.0%  opening false think-end false answer false  1735 tokens
+[585/1512] b1 r5 d09  recall   0.0%  opening true think-end true answer true  806 tokens
+[586/1512] c1 r5 d09  recall   0.0%  opening true think-end true answer true  1398 tokens
+[587/1512] r1 r2 a01  recall 100.0%  opening false think-end false answer false  307 tokens
+[588/1512] t1 r2 d09  recall 100.0%  opening false think-end false answer false  1337 tokens
+[589/1512] t1 r2 t31  recall 100.0%  opening false think-end false answer false  2481 tokens
+[590/1512] r1 r2 d04  recall  33.3%  opening false think-end false answer false  472 tokens
+[591/1512] b1 r5 d04  recall   0.0%  opening true think-end true answer true  537 tokens
+[592/1512] c1 r5 t05  recall  66.7%  opening false think-end false answer false  2114 tokens
+2026-11-24T08:16:14.716840Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-a33-6b0504ea-a2" attempt=2
+[593/1512] c1 r5 d04  recall  33.3%  opening true think-end true answer true  2715 tokens
+[594/1512] r1 r2 t05  recall  33.3%  opening false think-end false answer false  1958 tokens
+[595/1512] b1 r5 d36  recall   0.0%  opening true think-end true answer true  1465 tokens
+[596/1512] t1 r2 d04  recall 100.0%  opening false think-end false answer false  776 tokens
+[597/1512] b1 r5 t05  recall  33.3%  opening false think-end false answer false  5251 tokens
+[598/1512] t1 r2 a01  recall 100.0%  opening false think-end false answer false  2129 tokens
+[599/1512] t1 r2 t14  recall  80.0%  opening false think-end false answer false  2552 tokens
+[600/1512] c1 r5 d02  recall   0.0%  opening false think-end false answer false  342 tokens
+[601/1512] t1 r2 d36  recall 100.0%  opening false think-end false answer false  1207 tokens
+[602/1512] r1 r2 d09  recall 100.0%  opening false think-end false answer false  912 tokens
+[603/1512] c1 r5 d36  recall   0.0%  opening true think-end false answer false  2715 tokens
+[604/1512] r1 r2 d19  recall  33.3%  opening false think-end false answer false  920 tokens
+2026-11-24T08:21:27.405412Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t10-6b0504ea-a1" attempt=1
+[605/1512] t1 r2 d02  recall 100.0%  opening false think-end false answer false  591 tokens
+[606/1512] c1 r5 a24  recall  20.0%  opening true think-end false answer false  780 tokens
+[607/1512] b1 r5 a24  recall  40.0%  opening true think-end false answer false  815 tokens
+[608/1512] c1 r5 d24  recall   0.0%  opening true think-end true answer true  1079 tokens
+[609/1512] r1 r2 d02  recall   0.0%  opening false think-end false answer false  263 tokens
+[610/1512] t1 r2 d24  recall 100.0%  opening false think-end false answer false  354 tokens
+[611/1512] b1 r5 d02  recall   0.0%  opening false think-end false answer false  3686 tokens
+[612/1512] b1 r5 d24  recall   0.0%  opening true think-end true answer true  2766 tokens
+[613/1512] t1 r2 t05  recall  66.7%  opening false think-end false answer false  2385 tokens
+[614/1512] c1 r5 t09  recall 100.0%  opening true think-end true answer true  596 tokens
+[615/1512] r1 r2 d36  recall  50.0%  opening false think-end false answer false  403 tokens
+[616/1512] r1 r2 d24  recall   0.0%  opening false think-end false answer false  456 tokens
+2026-11-24T08:26:48.509961Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t20-6b0504ea-a2" attempt=2
+[617/1512] c1 r5 d22  recall  50.0%  opening false think-end true answer true  587 tokens
+[618/1512] b1 r5 d22  recall   0.0%  opening false think-end false answer false  598 tokens
+[619/1512] b1 r5 t09  recall 100.0%  opening true think-end true answer true  1660 tokens
+[620/1512] t1 r2 d22  recall 100.0%  opening false think-end false answer false  698 tokens
+[621/1512] t1 r2 a33  recall 100.0%  opening false think-end false answer false  2140 tokens
+[622/1512] b1 r5 t21  recall  75.0%  opening true think-end true answer true  1368 tokens
+[623/1512] c1 r5 t21  recall  50.0%  opening true think-end true answer true  1488 tokens
+[624/1512] r1 r2 a24  recall   0.0%  opening false think-end false answer false  1827 tokens
+[625/1512] c1 r5 d40  recall   0.0%  opening false think-end false answer false  248 tokens
+[626/1512] b1 r5 d40  recall   0.0%  opening false think-end false answer false  493 tokens
+[627/1512] r1 r2 t21  recall   0.0%  opening false think-end false answer false  1640 tokens
+[628/1512] r1 r2 d22  recall   0.0%  opening false think-end false answer false  450 tokens
+[629/1512] b1 r5 t32  recall   0.0%  opening true think-end true answer true  1467 tokens
+[630/1512] r1 r2 t09  recall   0.0%  opening false think-end false answer false  492 tokens
+[631/1512] c1 r5 t32  recall   0.0%  opening true think-end true answer true  1614 tokens
+[632/1512] t1 r2 t10  recall 100.0%  opening false think-end false answer false  1538 tokens
+[633/1512] t1 r2 t09  recall 100.0%  opening false think-end false answer false  1337 tokens
+[634/1512] b1 r5 d18  recall   0.0%  opening false think-end false answer false  406 tokens
+[635/1512] c1 r5 d18  recall   0.0%  opening false think-end false answer false  481 tokens
+[636/1512] t1 r2 d40  recall 100.0%  opening false think-end false answer false  1215 tokens
+[637/1512] c1 r5 a05  recall 100.0%  opening false think-end false answer false  1000 tokens
+[638/1512] b1 r5 a05  recall  50.0%  opening false think-end false answer false  1080 tokens
+[639/1512] r1 r2 d40  recall   0.0%  opening false think-end false answer false  329 tokens
+[640/1512] t1 r2 a24  recall 100.0%  opening false think-end false answer false  3019 tokens
+[641/1512] t1 r2 d18  recall 100.0%  opening false think-end false answer false  555 tokens
+[642/1512] t1 r2 a05  recall 100.0%  opening false think-end false answer false  789 tokens
+[643/1512] b1 r5 t38  recall   0.0%  opening false think-end false answer false  913 tokens
+[644/1512] c1 r5 t38  recall   0.0%  opening false think-end false answer false  972 tokens
+[645/1512] c1 r5 a13  recall  80.0%  opening true think-end true answer true  1006 tokens
+[646/1512] r1 r2 a05  recall 100.0%  opening false think-end false answer false  432 tokens
+[647/1512] b1 r5 d27  recall   0.0%  opening false think-end false answer false  482 tokens
+[648/1512] r1 r2 d18  recall  50.0%  opening false think-end false answer false  783 tokens
+[649/1512] t1 r2 t21  recall  75.0%  opening false think-end false answer false  2324 tokens
+[650/1512] r1 r2 a13  recall  40.0%  opening false think-end false answer false  1039 tokens
+[651/1512] c1 r5 d27  recall   0.0%  opening false think-end true answer true  317 tokens
+[652/1512] c1 r5 a14  recall  50.0%  opening true think-end true answer true  605 tokens
+[653/1512] r1 r2 d27  recall 100.0%  opening false think-end false answer false  808 tokens
+[654/1512] b1 r5 a13  recall  40.0%  opening true think-end true answer true  2195 tokens
+[655/1512] t1 r2 d27  recall 100.0%  opening false think-end false answer false  790 tokens
+[656/1512] c1 r5 a37  recall  25.0%  opening true think-end true answer true  1250 tokens
+[657/1512] t1 r2 t32  recall 100.0%  opening false think-end false answer false  2657 tokens
+[658/1512] r1 r2 t38  recall  25.0%  opening false think-end false answer false  1957 tokens
+[659/1512] b1 r5 a27  recall  60.0%  opening true think-end true answer true  1618 tokens
+[660/1512] b1 r5 a37  recall  25.0%  opening true think-end true answer true  1584 tokens
+[661/1512] c1 r5 a27  recall  60.0%  opening true think-end true answer true  1882 tokens
+[662/1512] t1 r2 t20  recall 100.0%  opening false think-end false answer false  3072 tokens
+[663/1512] r1 r2 a14  recall  75.0%  opening false think-end false answer false  850 tokens
+[664/1512] b1 r5 t41  recall 100.0%  opening true think-end true answer true  1021 tokens
+[665/1512] b1 r5 a14  recall   0.0%  opening true think-end true answer true  5232 tokens
+[666/1512] r1 r2 a37  recall   0.0%  opening false think-end false answer false  1114 tokens
+[667/1512] t1 r2 t38  recall 100.0%  opening false think-end false answer false  2450 tokens
+[668/1512] c1 r5 t41  recall 100.0%  opening true think-end true answer true  849 tokens
+[669/1512] r1 r2 a27  recall  60.0%  opening false think-end false answer false  952 tokens
+[670/1512] r1 r2 t32  recall  25.0%  opening false think-end false answer false  1755 tokens
+[671/1512] c1 r5 d43  recall   0.0%  opening false think-end false answer false  447 tokens
+[672/1512] c1 r5 t15  recall  40.0%  opening true think-end true answer true  2389 tokens
+[673/1512] b1 r5 d43  recall   0.0%  opening false think-end false answer false  3204 tokens
+[674/1512] t1 r2 a14  recall  50.0%  opening false think-end false answer false  1595 tokens
+[675/1512] b1 r5 t15  recall 100.0%  opening true think-end true answer true  3290 tokens
+[676/1512] c1 r5 d35  recall   0.0%  opening false think-end false answer false  361 tokens
+[677/1512] t1 r2 d43  recall 100.0%  opening false think-end false answer false  624 tokens
+[678/1512] b1 r6 d35  recall   0.0%  opening false think-end false answer false  1028 tokens
+[679/1512] r1 r2 t41  recall 100.0%  opening false think-end false answer false  1501 tokens
+[680/1512] t1 r2 d35  recall 100.0%  opening false think-end false answer false  790 tokens
+[681/1512] t1 r2 t41  recall  75.0%  opening false think-end false answer false  1142 tokens
+[682/1512] t1 r2 a27  recall 100.0%  opening false think-end false answer false  1728 tokens
+2026-11-24T08:53:47.285304Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-a13-6b0504ea-a1" attempt=1
+[683/1512] b1 r5 t42  recall  25.0%  opening false think-end false answer false  1315 tokens
+[684/1512] r1 r2 t15  recall  60.0%  opening false think-end false answer false  1621 tokens
+[685/1512] c1 r5 t42  recall  75.0%  opening false think-end true answer true  1651 tokens
+[686/1512] r1 r2 d35  recall   0.0%  opening false think-end false answer false  364 tokens
+[687/1512] t1 r2 d32  recall 100.0%  opening false think-end false answer false  715 tokens
+[688/1512] b1 r5 d32  recall   0.0%  opening false think-end false answer false  770 tokens
+[689/1512] r1 r2 d43  recall 100.0%  opening false think-end false answer false  582 tokens
+2026-11-24T08:57:18.789855Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-a37-6b0504ea-a1" attempt=1
+[690/1512] b1 r5 d06  recall   0.0%  opening false think-end false answer false  862 tokens
+[691/1512] c1 r5 d32  recall   0.0%  opening false think-end false answer false  2942 tokens
+[692/1512] b1 r5 a16  recall  25.0%  opening false think-end false answer false  1811 tokens
+[693/1512] c1 r5 d06  recall   0.0%  opening false think-end false answer false  3289 tokens
+[694/1512] r1 r2 d06  recall 100.0%  opening false think-end false answer false  1019 tokens
+[695/1512] t1 r2 d06  recall 100.0%  opening false think-end false answer false  1312 tokens
+[696/1512] c1 r5 a16  recall   0.0%  opening false think-end false answer false  4121 tokens
+[697/1512] r1 r2 t42  recall  50.0%  opening false think-end false answer false  2626 tokens
+[698/1512] b1 r5 a28  recall  25.0%  opening false think-end false answer false  1856 tokens
+[699/1512] b1 r5 t26  recall   0.0%  opening true think-end true answer true  871 tokens
+[700/1512] c1 r5 a28  recall  25.0%  opening false think-end false answer false  2445 tokens
+[701/1512] b1 r5 d11  recall   0.0%  opening false think-end false answer false  321 tokens
+2026-11-24T09:04:45.944519Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t15-6b0504ea-a1" attempt=1
+[702/1512] t1 r2 a16  recall 100.0%  opening false think-end false answer false  1929 tokens
+[703/1512] c1 r6 t26  recall  60.0%  opening true think-end true answer true  1148 tokens
+[704/1512] r1 r2 t26  recall   0.0%  opening false think-end false answer false  819 tokens
+[705/1512] t1 r2 d11  recall 100.0%  opening false think-end false answer false  818 tokens
+[706/1512] t1 r2 t42  recall 100.0%  opening false think-end false answer false  2940 tokens
+[707/1512] c1 r5 d11  recall   0.0%  opening false think-end false answer false  1460 tokens
+[708/1512] r1 r2 d32  recall 100.0%  opening false think-end false answer false  662 tokens
+[709/1512] r1 r2 a28  recall 100.0%  opening false think-end false answer false  690 tokens
+[710/1512] c1 r5 a32  recall  25.0%  opening false think-end false answer false  2064 tokens
+[711/1512] t1 r2 a28  recall 100.0%  opening false think-end false answer false  1613 tokens
+[712/1512] r1 r2 a16  recall   0.0%  opening false think-end false answer false  1625 tokens
+[713/1512] b1 r5 a32  recall  50.0%  opening false think-end false answer false  1458 tokens
+[714/1512] r1 r2 d11  recall  33.3%  opening false think-end false answer false  569 tokens
+[715/1512] c1 r5 a12  recall 100.0%  opening true think-end true answer true  416 tokens
+[716/1512] c1 r5 a30  recall  25.0%  opening false think-end false answer false  824 tokens
+[717/1512] b1 r5 a30  recall   0.0%  opening false think-end false answer false  3257 tokens
+[718/1512] r1 r2 a32  recall  50.0%  opening false think-end false answer false  2458 tokens
+[719/1512] b1 r5 a12  recall  75.0%  opening true think-end true answer true  1690 tokens
+2026-11-24T09:13:47.384434Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-a13-6b0504ea-a2" attempt=2
+[720/1512] t1 r2 a37  recall  75.0%  opening false think-end false answer false  2936 tokens
+[721/1512] t1 r2 t26  recall 100.0%  opening false think-end false answer false  2755 tokens
+[722/1512] r1 r2 a30  recall  75.0%  opening false think-end false answer false  3176 tokens
+[723/1512] b1 r6 d05  recall  50.0%  opening true think-end true answer true  3351 tokens
+[724/1512] t1 r3 d05  recall 100.0%  opening false think-end false answer false  387 tokens
+[725/1512] c1 r5 t03  recall 100.0%  opening false think-end false answer false  3855 tokens
+[726/1512] b1 r5 t03  recall 100.0%  opening false think-end false answer false  4079 tokens
+[727/1512] r1 r2 a12  recall   0.0%  opening false think-end false answer false  490 tokens
+[728/1512] t1 r2 a32  recall 100.0%  opening false think-end false answer false  2068 tokens
+[729/1512] c1 r6 d05  recall   0.0%  opening true think-end true answer true  1424 tokens
+[730/1512] b1 r5 d33  recall   0.0%  opening false think-end false answer false  1151 tokens
+[731/1512] t1 r2 a30  recall 100.0%  opening false think-end false answer false  2914 tokens
+[732/1512] t1 r2 d33  recall 100.0%  opening false think-end false answer false  699 tokens
+[733/1512] c1 r5 t01  recall  50.0%  opening false think-end true answer true  1476 tokens
+[734/1512] c1 r5 d33  recall   0.0%  opening false think-end false answer false  1769 tokens
+[735/1512] r1 r3 d05  recall  50.0%  opening false think-end false answer false  394 tokens
+[736/1512] r1 r2 t03  recall 100.0%  opening false think-end false answer false  1054 tokens
+[737/1512] c1 r5 a02  recall 100.0%  opening false think-end true answer true  652 tokens
+[738/1512] b1 r5 a02  recall 100.0%  opening false think-end false answer false  980 tokens
+[739/1512] t1 r2 a12  recall 100.0%  opening false think-end false answer false  1612 tokens
+[740/1512] r1 r2 d33  recall  33.3%  opening false think-end false answer false  683 tokens
+[741/1512] b1 r5 t01  recall  75.0%  opening false think-end false answer false  1980 tokens
+[742/1512] t1 r2 t03  recall 100.0%  opening false think-end false answer false  2220 tokens
+2026-11-24T09:24:45.961119Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t15-6b0504ea-a2" attempt=2
+[743/1512] r1 r2 a02  recall 100.0%  opening false think-end false answer false  305 tokens
+[744/1512] t1 r2 a02  recall 100.0%  opening false think-end false answer false  1030 tokens
+[745/1512] c1 r5 t11  recall  80.0%  opening true think-end true answer true  1310 tokens
+[746/1512] b1 r5 t39  recall 100.0%  opening true think-end true answer true  2096 tokens
+[747/1512] c1 r5 t19  recall   0.0%  opening true think-end true answer true  3075 tokens
+[748/1512] b1 r5 t19  recall   0.0%  opening true think-end true answer true  5634 tokens
+[749/1512] r1 r2 t19  recall  60.0%  opening false think-end false answer false  2106 tokens
+[750/1512] c1 r5 t39  recall 100.0%  opening true think-end true answer true  4434 tokens
+[751/1512] c1 r5 a40  recall  75.0%  opening true think-end true answer true  1256 tokens
+[752/1512] r1 r2 t11  recall  80.0%  opening false think-end false answer false  1218 tokens
+[753/1512] b1 r5 a40  recall 100.0%  opening true think-end true answer true  1083 tokens
+[754/1512] b1 r5 t11  recall  80.0%  opening true think-end true answer true  1928 tokens
+2026-11-24T09:33:47.506518Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-a13-6b0504ea-a3" attempt=3
+[755/1512] t1 r2 a13  recall   0.0%  opening false think-end false answer false  0 tokens  FAILED: the chat request: error sending request for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out
+[756/1512] c1 r5 a11  recall 100.0%  opening true think-end true answer true  1802 tokens
+[757/1512] b1 r5 a11  recall  25.0%  opening true think-end true answer true  3386 tokens
+[758/1512] r1 r2 t39  recall  50.0%  opening false think-end false answer false  2055 tokens
+[759/1512] r1 r2 t01  recall  75.0%  opening false think-end false answer false  1052 tokens
+[760/1512] c1 r5 a29  recall  25.0%  opening false think-end false answer false  1246 tokens
+2026-11-24T09:37:54.394826Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t01-6b0504ea-a1" attempt=1
+[761/1512] b1 r5 a29  recall   0.0%  opening false think-end false answer false  1391 tokens
+[762/1512] t1 r2 t39  recall 100.0%  opening false think-end false answer false  2969 tokens
+[763/1512] r1 r2 a29  recall 100.0%  opening false think-end false answer false  1204 tokens
+[764/1512] t1 r2 t19  recall 100.0%  opening false think-end false answer false  3678 tokens
+[765/1512] t1 r2 t11  recall 100.0%  opening false think-end false answer false  2616 tokens
+[766/1512] r1 r2 a40  recall  75.0%  opening false think-end false answer false  1598 tokens
+[767/1512] t1 r2 a40  recall 100.0%  opening false think-end false answer false  1913 tokens
+[768/1512] c1 r5 a42  recall  50.0%  opening true think-end true answer true  1699 tokens
+[769/1512] c1 r5 t06  recall   0.0%  opening false think-end true answer true  970 tokens
+[770/1512] b1 r5 a42  recall  50.0%  opening true think-end true answer true  2689 tokens
+[771/1512] b1 r5 t06  recall   0.0%  opening false think-end false answer false  577 tokens
+[772/1512] c1 r5 d30  recall   0.0%  opening false think-end false answer false  1459 tokens
+[773/1512] b1 r5 d30  recall   0.0%  opening true think-end false answer false  700 tokens
+[774/1512] t1 r2 d30  recall 100.0%  opening false think-end false answer false  432 tokens
+2026-11-24T09:44:46.333452Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t15-6b0504ea-a3" attempt=3
+[775/1512] t1 r2 t15  recall   0.0%  opening false think-end false answer false  0 tokens  FAILED: the chat request: error sending request for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out
+[776/1512] r1 r2 a42  recall 100.0%  opening false think-end false answer false  1072 tokens
+[777/1512] r1 r2 a11  recall   0.0%  opening false think-end false answer false  758 tokens
+[778/1512] c1 r5 t22  recall  60.0%  opening true think-end true answer true  2037 tokens
+[779/1512] t1 r2 a29  recall 100.0%  opening false think-end false answer false  2231 tokens
+[780/1512] b1 r5 t12  recall  75.0%  opening true think-end true answer true  1126 tokens
+[781/1512] r1 r2 t06  recall  50.0%  opening false think-end false answer false  619 tokens
+[782/1512] t1 r2 t06  recall 100.0%  opening false think-end false answer false  2029 tokens
+[783/1512] c1 r6 t13  recall  40.0%  opening true think-end true answer true  1514 tokens
+[784/1512] b1 r5 t22  recall  60.0%  opening true think-end true answer true  3172 tokens
+[785/1512] c1 r5 t12  recall 100.0%  opening true think-end true answer true  1671 tokens
+[786/1512] t1 r2 a11  recall 100.0%  opening false think-end false answer false  3142 tokens
+[787/1512] t1 r2 t01  recall  75.0%  opening false think-end false answer false  3519 tokens
+[788/1512] b1 r6 t13  recall  40.0%  opening true think-end true answer true  1572 tokens
+[789/1512] c1 r5 d25  recall   0.0%  opening false think-end true answer true  717 tokens
+[790/1512] t1 r2 d25  recall 100.0%  opening false think-end false answer false  426 tokens
+[791/1512] b1 r5 t02  recall  50.0%  opening true think-end true answer true  875 tokens
+[792/1512] r1 r2 t22  recall  20.0%  opening false think-end false answer false  2093 tokens
+[793/1512] r1 r2 d30  recall 100.0%  opening false think-end false answer false  617 tokens
+[794/1512] b1 r5 d25  recall   0.0%  opening true think-end true answer true  3282 tokens
+[795/1512] c1 r5 t02  recall  50.0%  opening true think-end true answer true  1101 tokens
+[796/1512] b1 r5 a06  recall  50.0%  opening false think-end true answer true  557 tokens
+[797/1512] t1 r2 t12  recall 100.0%  opening false think-end false answer false  2013 tokens
+[798/1512] r1 r2 t12  recall   0.0%  opening false think-end false answer false  667 tokens
+[799/1512] c1 r5 a06  recall  50.0%  opening false think-end true answer true  1056 tokens
+2026-11-24T09:56:20.101532Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-a42-6b0504ea-a1" attempt=1
+[800/1512] b1 r5 d41  recall  75.0%  opening true think-end true answer true  938 tokens
+[801/1512] r1 r2 t02  recall  25.0%  opening false think-end false answer false  1575 tokens
+[802/1512] c1 r5 d41  recall  50.0%  opening true think-end true answer true  594 tokens
+[803/1512] t1 r2 d41  recall 100.0%  opening false think-end false answer false  607 tokens
+[804/1512] r1 r2 d25  recall 100.0%  opening false think-end false answer false  775 tokens
+[805/1512] r1 r2 t13  recall   0.0%  opening false think-end false answer false  2434 tokens
+[806/1512] r1 r2 a06  recall  50.0%  opening false think-end false answer false  742 tokens
+[807/1512] r1 r2 t18  recall  20.0%  opening false think-end false answer false  1947 tokens
+[808/1512] c1 r5 t18  recall   0.0%  opening false think-end false answer false  2242 tokens
+[809/1512] b1 r5 t18  recall   0.0%  opening false think-end false answer false  2409 tokens
+[810/1512] c1 r5 d08  recall   0.0%  opening true think-end false answer false  632 tokens
+2026-11-24T10:02:52.737522Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t22-6b0504ea-a1" attempt=1
+[811/1512] c1 r5 t40  recall  50.0%  opening true think-end true answer true  1718 tokens
+[812/1512] b1 r5 t40  recall  50.0%  opening true think-end true answer true  1967 tokens
+[813/1512] b1 r5 d08  recall   0.0%  opening true think-end true answer true  1465 tokens
+[814/1512] t1 r2 a06  recall 100.0%  opening false think-end false answer false  1758 tokens
+[815/1512] c1 r5 a17  recall  60.0%  opening true think-end true answer true  1544 tokens
+[816/1512] t1 r2 t02  recall  75.0%  opening false think-end false answer false  2631 tokens
+[817/1512] r1 r2 d41  recall 100.0%  opening false think-end false answer false  886 tokens
+[818/1512] b1 r5 a17  recall  60.0%  opening true think-end true answer true  885 tokens
+2026-11-24T10:06:37.124265Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t13-6b0504ea-a1" attempt=1
+[819/1512] r1 r2 d08  recall 100.0%  opening false think-end false answer false  448 tokens
+[820/1512] r1 r2 d21  recall   0.0%  opening false think-end false answer false  397 tokens
+[821/1512] t1 r2 d21  recall 100.0%  opening false think-end false answer false  472 tokens
+[822/1512] b1 r5 d21  recall   0.0%  opening false think-end false answer false  331 tokens
+[823/1512] c1 r5 d21  recall   0.0%  opening false think-end false answer false  515 tokens
+[824/1512] t1 r2 d08  recall 100.0%  opening false think-end false answer false  1293 tokens
+[825/1512] r1 r2 a17  recall  80.0%  opening false think-end false answer false  727 tokens
+[826/1512] r1 r2 t40  recall  25.0%  opening false think-end false answer false  2095 tokens
+[827/1512] c1 r5 a15  recall 100.0%  opening true think-end true answer true  1058 tokens
+[828/1512] b1 r5 a15  recall  80.0%  opening true think-end true answer true  1560 tokens
+[829/1512] t1 r2 d37  recall 100.0%  opening false think-end false answer false  483 tokens
+[830/1512] c1 r5 d37  recall   0.0%  opening false think-end false answer false  1409 tokens
+[831/1512] b1 r5 d37  recall   0.0%  opening false think-end false answer false  1714 tokens
+[832/1512] c1 r5 d14  recall   0.0%  opening true think-end true answer true  672 tokens
+[833/1512] t1 r2 d14  recall 100.0%  opening false think-end false answer false  593 tokens
+[834/1512] t1 r2 a42  recall 100.0%  opening false think-end false answer false  2822 tokens
+[835/1512] b1 r5 d29  recall   0.0%  opening true think-end true answer true  2080 tokens
+[836/1512] r1 r2 a15  recall 100.0%  opening false think-end false answer false  1331 tokens
+[837/1512] b1 r5 d14  recall   0.0%  opening true think-end true answer true  2832 tokens
+2026-11-24T10:15:24.999408Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t18-6b0504ea-a1" attempt=1
+[838/1512] c1 r5 d29  recall   0.0%  opening true think-end true answer true  3288 tokens
+[839/1512] r1 r2 d14  recall 100.0%  opening false think-end false answer false  1154 tokens
+[840/1512] c1 r5 t25  recall 100.0%  opening true think-end true answer true  1027 tokens
+[841/1512] t1 r2 d29  recall 100.0%  opening false think-end false answer false  1047 tokens
+[842/1512] r1 r2 t25  recall 100.0%  opening false think-end false answer false  626 tokens
+[843/1512] b1 r5 a25  recall  60.0%  opening true think-end true answer true  1718 tokens
+2026-11-24T10:19:05.273828Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t40-6b0504ea-a1" attempt=1
+[844/1512] b1 r5 t25  recall 100.0%  opening true think-end true answer true  2608 tokens
+[845/1512] t1 r2 a17  recall  80.0%  opening false think-end false answer false  3097 tokens
+[846/1512] c1 r5 a25  recall  60.0%  opening true think-end true answer true  1103 tokens
+[847/1512] b1 r5 t27  recall   0.0%  opening false think-end true answer true  731 tokens
+[848/1512] r1 r2 d29  recall  50.0%  opening false think-end false answer false  647 tokens
+2026-11-24T10:22:52.751197Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t22-6b0504ea-a2" attempt=2
+[849/1512] c1 r5 t27  recall  60.0%  opening false think-end true answer true  2296 tokens
+[850/1512] c1 r5 t36  recall   0.0%  opening false think-end false answer false  1819 tokens
+[851/1512] r1 r2 d37  recall 100.0%  opening false think-end false answer false  1093 tokens
+[852/1512] b1 r5 t36  recall   0.0%  opening false think-end false answer false  432 tokens
+[853/1512] r1 r2 a25  recall  80.0%  opening false think-end false answer false  976 tokens
+[854/1512] t1 r2 a25  recall  80.0%  opening false think-end false answer false  1596 tokens
+[855/1512] t1 r2 t13  recall 100.0%  opening false think-end false answer false  4548 tokens
+[856/1512] c1 r5 t17  recall   0.0%  opening false think-end false answer false  1201 tokens
+2026-11-24T10:27:32.737504Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-a15-6b0504ea-a1" attempt=1
+[857/1512] b1 r5 t17  recall   0.0%  opening false think-end false answer false  1073 tokens
+[858/1512] r1 r2 t27  recall  60.0%  opening false think-end false answer false  1780 tokens
+[859/1512] c1 r5 a09  recall  60.0%  opening true think-end true answer true  1333 tokens
+[860/1512] b1 r5 a09  recall  60.0%  opening true think-end true answer true  2186 tokens
+[861/1512] r1 r2 t17  recall  80.0%  opening false think-end false answer false  882 tokens
+[862/1512] r1 r2 t36  recall  25.0%  opening false think-end false answer false  1096 tokens
+[863/1512] c1 r6 a31  recall   0.0%  opening false think-end false answer false  827 tokens
+[864/1512] t1 r2 t25  recall 100.0%  opening false think-end false answer false  2868 tokens
+[865/1512] t1 r2 t36  recall 100.0%  opening false think-end false answer false  1574 tokens
+[866/1512] r1 r2 a09  recall  60.0%  opening false think-end false answer false  1553 tokens
+[867/1512] t1 r2 t18  recall 100.0%  opening false think-end false answer false  3066 tokens
+[868/1512] c1 r5 d13  recall   0.0%  opening true think-end true answer true  919 tokens
+[869/1512] t1 r2 d13  recall 100.0%  opening false think-end false answer false  592 tokens
+[870/1512] c1 r5 t16  recall   0.0%  opening true think-end true answer true  950 tokens
+[871/1512] t1 r2 t40  recall 100.0%  opening false think-end false answer false  3759 tokens
+[872/1512] b1 r5 d13  recall   0.0%  opening true think-end false answer false  2045 tokens
+[873/1512] b1 r5 t16  recall  60.0%  opening true think-end true answer true  1513 tokens
+[874/1512] b1 r6 a31  recall   0.0%  opening false think-end false answer false  3339 tokens
+[875/1512] r1 r2 d13  recall  50.0%  opening false think-end false answer false  696 tokens
+[876/1512] b1 r5 a35  recall  50.0%  opening false think-end false answer false  1488 tokens
+[877/1512] b1 r5 a39  recall  75.0%  opening true think-end true answer true  1740 tokens
+2026-11-24T10:38:47.555831Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t27-6b0504ea-a1" attempt=1
+[878/1512] c1 r5 a35  recall  50.0%  opening false think-end false answer false  2181 tokens
+[879/1512] r1 r2 t16  recall  60.0%  opening false think-end false answer false  1368 tokens
+[880/1512] t1 r2 a09  recall 100.0%  opening false think-end false answer false  2200 tokens
+[881/1512] r1 r2 a31  recall  25.0%  opening false think-end false answer false  2111 tokens
+[882/1512] t1 r2 a31  recall 100.0%  opening false think-end false answer false  2609 tokens
+[883/1512] c1 r5 a39  recall 100.0%  opening true think-end true answer true  1343 tokens
+[884/1512] t1 r2 t22  recall 100.0%  opening false think-end false answer false  3216 tokens
+[885/1512] b1 r6 a08  recall 100.0%  opening false think-end false answer false  419 tokens
+[886/1512] t1 r3 a08  recall 100.0%  opening false think-end false answer false  654 tokens
+[887/1512] c1 r6 a08  recall 100.0%  opening false think-end false answer false  175 tokens
+[888/1512] t1 r2 a39  recall 100.0%  opening false think-end false answer false  1211 tokens
+[889/1512] t1 r2 t17  recall 100.0%  opening false think-end false answer false  2916 tokens
+[890/1512] r1 r3 a08  recall 100.0%  opening false think-end false answer false  305 tokens
+[891/1512] t1 r2 d16  recall 100.0%  opening false think-end false answer false  516 tokens
+[892/1512] c1 r5 d16  recall   0.0%  opening false think-end false answer false  682 tokens
+[893/1512] c1 r5 a21  recall  75.0%  opening true think-end true answer true  1234 tokens
+[894/1512] b1 r5 a21  recall  75.0%  opening true think-end true answer true  512 tokens
+[895/1512] r1 r2 d16  recall  50.0%  opening false think-end false answer false  365 tokens
+[896/1512] b1 r5 d16  recall   0.0%  opening false think-end false answer false  3782 tokens
+[897/1512] r1 r2 a35  recall  25.0%  opening false think-end false answer false  1940 tokens
+[898/1512] t1 r2 t16  recall  80.0%  opening false think-end false answer false  1814 tokens
+2026-11-24T10:47:32.755228Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-a15-6b0504ea-a2" attempt=2
+[899/1512] b1 r5 a36  recall  75.0%  opening true think-end true answer true  1653 tokens
+[900/1512] c1 r5 a36  recall  75.0%  opening true think-end true answer true  1886 tokens
+[901/1512] b1 r5 t04  recall 100.0%  opening false think-end true answer true  1300 tokens
+[902/1512] r1 r2 a21  recall  75.0%  opening false think-end false answer false  1099 tokens
+[903/1512] r1 r2 a36  recall  75.0%  opening false think-end false answer false  1024 tokens
+[904/1512] t1 r2 a21  recall 100.0%  opening false think-end false answer false  1385 tokens
+[905/1512] c1 r5 t04  recall  66.7%  opening true think-end false answer false  2195 tokens
+[906/1512] t1 r2 a35  recall  75.0%  opening false think-end false answer false  3274 tokens
+[907/1512] t1 r2 d01  recall 100.0%  opening false think-end false answer false  454 tokens
+[908/1512] b1 r5 d01  recall   0.0%  opening false think-end false answer false  294 tokens
+[909/1512] c1 r5 d01  recall   0.0%  opening false think-end false answer false  390 tokens
+[910/1512] r1 r2 t04  recall 100.0%  opening false think-end false answer false  1079 tokens
+[911/1512] r1 r2 d01  recall  50.0%  opening false think-end false answer false  431 tokens
+[912/1512] r1 r2 a39  recall 100.0%  opening false think-end false answer false  2304 tokens
+[913/1512] c1 r5 d03  recall   0.0%  opening false think-end false answer false  282 tokens
+[914/1512] c1 r5 t07  recall   0.0%  opening false think-end false answer false  912 tokens
+[915/1512] b1 r5 t07  recall   0.0%  opening false think-end false answer false  1061 tokens
+[916/1512] c1 r5 a22  recall  25.0%  opening false think-end true answer true  2151 tokens
+[917/1512] b1 r5 a22  recall   0.0%  opening false think-end true answer true  2456 tokens
+[918/1512] b1 r5 d03  recall   0.0%  opening false think-end false answer false  3245 tokens
+[919/1512] r1 r2 a22  recall  75.0%  opening false think-end false answer false  1158 tokens
+[920/1512] b1 r5 a41  recall  25.0%  opening false think-end true answer true  553 tokens
+2026-11-24T10:58:47.570955Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t27-6b0504ea-a2" attempt=2
+[921/1512] c1 r5 a41  recall   0.0%  opening false think-end true answer true  1164 tokens
+[922/1512] b1 r5 a03  recall  33.3%  opening false think-end false answer false  1048 tokens
+[923/1512] t1 r2 d03  recall 100.0%  opening false think-end false answer false  1431 tokens
+[924/1512] t1 r2 a36  recall 100.0%  opening false think-end false answer false  2356 tokens
+[925/1512] t1 r2 a22  recall  75.0%  opening false think-end false answer false  2174 tokens
+[926/1512] c1 r5 a03  recall  33.3%  opening false think-end false answer false  974 tokens
+[927/1512] r1 r2 t07  recall   0.0%  opening false think-end false answer false  2029 tokens
+[928/1512] r1 r2 d03  recall   0.0%  opening false think-end false answer false  701 tokens
+[929/1512] b1 r5 a26  recall  75.0%  opening true think-end true answer true  1810 tokens
+[930/1512] t1 r2 t07  recall 100.0%  opening false think-end false answer false  1636 tokens
+[931/1512] c1 r5 a26  recall  75.0%  opening true think-end true answer true  2463 tokens
+[932/1512] c1 r5 d42  recall   0.0%  opening false think-end false answer false  408 tokens
+[933/1512] r1 r2 a03  recall 100.0%  opening false think-end false answer false  1042 tokens
+[934/1512] r1 r2 a26  recall  75.0%  opening false think-end false answer false  934 tokens
+2026-11-24T11:05:24.187305Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t04-6b0504ea-a1" attempt=1
+[935/1512] b1 r5 d42  recall   0.0%  opening false think-end false answer false  745 tokens
+[936/1512] b1 r5 d23  recall   0.0%  opening false think-end false answer false  528 tokens
+[937/1512] t1 r2 d42  recall 100.0%  opening false think-end false answer false  1379 tokens
+[938/1512] c1 r5 t29  recall 100.0%  opening true think-end true answer true  1130 tokens
+[939/1512] b1 r5 t29  recall 100.0%  opening true think-end true answer true  1196 tokens
+2026-11-24T11:07:32.776814Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-a15-6b0504ea-a3" attempt=3
+[940/1512] t1 r2 a15  recall   0.0%  opening false think-end false answer false  0 tokens  FAILED: the chat request: error sending request for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out
+[941/1512] r1 r2 a41  recall   0.0%  opening false think-end false answer false  1841 tokens
+[942/1512] t1 r2 d23  recall 100.0%  opening false think-end false answer false  537 tokens
+[943/1512] c1 r5 d23  recall   0.0%  opening false think-end false answer false  542 tokens
+[944/1512] c1 r5 a04  recall 100.0%  opening false think-end false answer false  1202 tokens
+[945/1512] t1 r2 a41  recall 100.0%  opening false think-end false answer false  2130 tokens
+[946/1512] r1 r2 t29  recall  60.0%  opening false think-end false answer false  1549 tokens
+[947/1512] b1 r5 a04  recall  50.0%  opening false think-end false answer false  1753 tokens
+[948/1512] b1 r6 a19  recall  75.0%  opening true think-end true answer true  3396 tokens
+[949/1512] t1 r2 a26  recall 100.0%  opening false think-end false answer false  1567 tokens
+[950/1512] r1 r2 d23  recall  50.0%  opening false think-end false answer false  573 tokens
+[951/1512] t1 r2 a03  recall  66.7%  opening false think-end false answer false  3323 tokens
+[952/1512] r1 r2 d42  recall 100.0%  opening false think-end false answer false  592 tokens
+[953/1512] c1 r5 t33  recall   0.0%  opening false think-end false answer false  1308 tokens
+[954/1512] c1 r6 a19  recall  50.0%  opening true think-end true answer true  4638 tokens
+[955/1512] b1 r5 t33  recall   0.0%  opening false think-end false answer false  1513 tokens
+[956/1512] b1 r5 t34  recall  50.0%  opening true think-end true answer true  1640 tokens
+[957/1512] t1 r2 a19  recall 100.0%  opening false think-end false answer false  1911 tokens
+[958/1512] r1 r2 a04  recall 100.0%  opening false think-end false answer false  863 tokens
+[959/1512] c1 r5 t34  recall   0.0%  opening true think-end true answer true  526 tokens
+[960/1512] t1 r2 t27  recall 100.0%  opening false think-end false answer false  3673 tokens
+[961/1512] r1 r2 t33  recall 100.0%  opening false think-end false answer false  1237 tokens
+[962/1512] r1 r3 a19  recall  25.0%  opening false think-end false answer false  1142 tokens
+[963/1512] t1 r2 t29  recall 100.0%  opening false think-end false answer false  2790 tokens
+[964/1512] r1 r2 t34  recall 100.0%  opening false think-end false answer false  778 tokens
+[965/1512] c1 r5 a20  recall  33.3%  opening false think-end true answer true  635 tokens
+[966/1512] b1 r5 a20  recall  33.3%  opening false think-end false answer false  1173 tokens
+[967/1512] b1 r5 d07  recall   0.0%  opening false think-end false answer false  2379 tokens
+[968/1512] c1 r5 d07  recall   0.0%  opening false think-end false answer false  2568 tokens
+[969/1512] c1 r6 t23  recall 100.0%  opening true think-end true answer true  815 tokens
+[970/1512] t1 r2 a20  recall 100.0%  opening false think-end false answer false  871 tokens
+[971/1512] t1 r2 t04  recall 100.0%  opening false think-end false answer false  3253 tokens
+[972/1512] b1 r6 t23  recall 100.0%  opening true think-end true answer true  1057 tokens
+[973/1512] t1 r2 d07  recall 100.0%  opening false think-end false answer false  1280 tokens
+[974/1512] r1 r2 d07  recall  33.3%  opening false think-end false answer false  931 tokens
+[975/1512] r1 r2 a20  recall  66.7%  opening false think-end false answer false  1808 tokens
+[976/1512] b1 r5 a23  recall   0.0%  opening false think-end false answer false  836 tokens
+[977/1512] b1 r5 t30  recall   0.0%  opening false think-end true answer true  1255 tokens
+[978/1512] t1 r2 t34  recall 100.0%  opening false think-end false answer false  2819 tokens
+[979/1512] r1 r2 t30  recall 100.0%  opening false think-end false answer false  2832 tokens
+[980/1512] b1 r5 a34  recall  75.0%  opening true think-end true answer true  1422 tokens
+[981/1512] c1 r5 a23  recall  50.0%  opening false think-end true answer true  1208 tokens
+[982/1512] c1 r5 t30  recall  25.0%  opening false think-end false answer false  2892 tokens
+[983/1512] c1 r5 a34  recall 100.0%  opening true think-end true answer true  2013 tokens
+[984/1512] r1 r3 t23  recall  50.0%  opening false think-end false answer false  2325 tokens
+2026-11-24T11:28:39.064902Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-a04-6b0504ea-a1" attempt=1
+[985/1512] t1 r2 t33  recall 100.0%  opening false think-end false answer false  2409 tokens
+[986/1512] c1 r5 d10  recall   0.0%  opening false think-end false answer false  344 tokens
+[987/1512] t1 r2 d10  recall 100.0%  opening false think-end false answer false  602 tokens
+[988/1512] b1 r5 d10  recall   0.0%  opening false think-end false answer false  614 tokens
+[989/1512] b1 r5 t28  recall  80.0%  opening true think-end true answer true  1324 tokens
+[990/1512] c1 r5 t28  recall  80.0%  opening true think-end true answer true  1692 tokens
+[991/1512] r1 r2 d10  recall  33.3%  opening false think-end false answer false  446 tokens
+[992/1512] r1 r2 a34  recall  50.0%  opening false think-end false answer false  2986 tokens
+[993/1512] t1 r2 d20  recall 100.0%  opening false think-end false answer false  390 tokens
+[994/1512] c1 r5 d12  recall   0.0%  opening true think-end true answer true  557 tokens
+[995/1512] r1 r2 a23  recall  25.0%  opening false think-end false answer false  1543 tokens
+[996/1512] c1 r5 d20  recall   0.0%  opening false think-end true answer true  1389 tokens
+[997/1512] b1 r5 d12  recall   0.0%  opening false think-end false answer false  828 tokens
+[998/1512] b1 r5 a07  recall   0.0%  opening false think-end false answer false  651 tokens
+[999/1512] b1 r5 d20  recall   0.0%  opening true think-end true answer true  3792 tokens
+[1000/1512] r1 r2 d20  recall   0.0%  opening false think-end false answer false  312 tokens
+[1001/1512] r1 r2 t28  recall  80.0%  opening false think-end false answer false  2284 tokens
+[1002/1512] t1 r2 d12  recall 100.0%  opening false think-end false answer false  579 tokens
+[1003/1512] c1 r5 a07  recall   0.0%  opening false think-end false answer false  832 tokens
+[1004/1512] t1 r2 a23  recall 100.0%  opening false think-end false answer false  1957 tokens
+2026-11-24T11:39:27.561818Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t23-6b0504ea-a1" attempt=1
+[1005/1512] b1 r5 d15  recall   0.0%  opening false think-end false answer false  684 tokens
+2026-11-24T11:40:30.939023Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t30-6b0504ea-a1" attempt=1
+[1006/1512] b1 r5 t08  recall   0.0%  opening true think-end true answer true  1314 tokens
+[1007/1512] c1 r5 d15  recall   0.0%  opening false think-end false answer false  393 tokens
+[1008/1512] t1 r2 d15  recall 100.0%  opening false think-end false answer false  640 tokens
+[1009/1512] c1 r5 t08  recall  66.7%  opening true think-end true answer true  1967 tokens
+[1010/1512] t1 r2 a04  recall 100.0%  opening false think-end false answer false  2467 tokens
+[1011/1512] c1 r5 a38  recall 100.0%  opening true think-end true answer true  1216 tokens
+[1012/1512] r1 r2 a07  recall   0.0%  opening false think-end false answer false  345 tokens
+2026-11-24T11:42:58.302682Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-a34-6b0504ea-a1" attempt=1
+[1013/1512] r1 r2 t08  recall 100.0%  opening false think-end false answer false  1126 tokens
+[1014/1512] t1 r2 t08  recall 100.0%  opening false think-end false answer false  1287 tokens
+[1015/1512] t1 r2 t28  recall 100.0%  opening false think-end false answer false  2685 tokens
+[1016/1512] t1 r2 a07  recall   0.0%  opening false think-end false answer false  2139 tokens
+[1017/1512] b1 r5 a38  recall  75.0%  opening true think-end true answer true  1420 tokens
+[1018/1512] b1 r6 t18  recall   0.0%  opening false think-end false answer false  1063 tokens
+[1019/1512] c1 r6 t18  recall   0.0%  opening false think-end false answer false  1156 tokens
+[1020/1512] r1 r2 d15  recall   0.0%  opening false think-end false answer false  773 tokens
+[1021/1512] c1 r6 a26  recall  50.0%  opening true think-end true answer true  1486 tokens
+[1022/1512] b1 r6 a26  recall   0.0%  opening false think-end true answer true  2482 tokens
+[1023/1512] b1 r6 d28  recall   0.0%  opening false think-end false answer false  623 tokens
+[1024/1512] c1 r6 d28  recall   0.0%  opening false think-end false answer false  1245 tokens
+[1025/1512] t1 r3 d28  recall 100.0%  opening false think-end false answer false  547 tokens
+[1026/1512] r1 r3 d28  recall 100.0%  opening false think-end false answer false  476 tokens
+[1027/1512] c1 r6 a20  recall  33.3%  opening true think-end true answer true  873 tokens
+[1028/1512] r1 r3 a26  recall  75.0%  opening false think-end false answer false  602 tokens
+2026-11-24T11:51:30.735962Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/r1-r2-d12-6b0504ea-a1" attempt=1
+[1029/1512] b1 r6 a20  recall  33.3%  opening true think-end true answer true  1107 tokens
+[1030/1512] r1 r3 t18  recall  20.0%  opening false think-end false answer false  2107 tokens
+[1031/1512] t1 r3 a20  recall 100.0%  opening false think-end false answer false  964 tokens
+[1032/1512] r1 r2 a38  recall  75.0%  opening false think-end false answer false  1526 tokens
+[1033/1512] c1 r6 t39  recall 100.0%  opening true think-end true answer true  2044 tokens
+[1034/1512] t1 r3 a26  recall 100.0%  opening false think-end false answer false  2261 tokens
+[1035/1512] b1 r6 t39  recall 100.0%  opening true think-end true answer true  2603 tokens
+[1036/1512] c1 r6 d07  recall   0.0%  opening false think-end false answer false  1053 tokens
+[1037/1512] t1 r2 t23  recall 100.0%  opening false think-end false answer false  2017 tokens
+[1038/1512] t1 r2 a38  recall 100.0%  opening false think-end false answer false  2318 tokens
+[1039/1512] b1 r6 d07  recall   0.0%  opening false think-end false answer false  453 tokens
+[1040/1512] t1 r3 d07  recall 100.0%  opening false think-end false answer false  559 tokens
+[1041/1512] c1 r6 d33  recall   0.0%  opening false think-end false answer false  1022 tokens
+[1042/1512] b1 r6 d33  recall   0.0%  opening false think-end false answer false  727 tokens
+[1043/1512] r1 r3 a20  recall  66.7%  opening false think-end false answer false  1894 tokens
+[1044/1512] t1 r2 a34  recall 100.0%  opening false think-end false answer false  3118 tokens
+[1045/1512] r1 r2 d12  recall 100.0%  opening false think-end false answer false  594 tokens
+[1046/1512] t1 r3 a19  recall 100.0%  opening false think-end false answer false  1409 tokens
+[1047/1512] t1 r3 d33  recall 100.0%  opening false think-end false answer false  1184 tokens
+2026-11-24T12:00:30.959614Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t30-6b0504ea-a2" attempt=2
+[1048/1512] b1 r6 t42  recall   0.0%  opening true think-end true answer true  691 tokens
+[1049/1512] r1 r3 d07  recall  33.3%  opening false think-end false answer false  987 tokens
+2026-11-24T12:01:21.958037Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-t18-6b0504ea-a1" attempt=1
+[1050/1512] c1 r6 t42  recall  50.0%  opening false think-end true answer true  1353 tokens
+[1051/1512] c1 r6 t30  recall   0.0%  opening false think-end true answer true  2206 tokens
+[1052/1512] r1 r3 t39  recall  50.0%  opening false think-end false answer false  2001 tokens
+[1053/1512] b1 r6 t29  recall  80.0%  opening true think-end true answer true  1690 tokens
+[1054/1512] b1 r6 t30  recall   0.0%  opening false think-end false answer false  1671 tokens
+[1055/1512] r1 r3 d33  recall  33.3%  opening false think-end false answer false  714 tokens
+[1056/1512] c1 r6 t29  recall   0.0%  opening true think-end true answer true  636 tokens
+[1057/1512] c1 r6 a12  recall 100.0%  opening true think-end true answer true  1159 tokens
+[1058/1512] b1 r6 a12  recall 100.0%  opening true think-end true answer true  1353 tokens
+[1059/1512] r1 r3 t42  recall  50.0%  opening false think-end false answer false  1869 tokens
+[1060/1512] r1 r3 t30  recall 100.0%  opening false think-end false answer false  3766 tokens
+[1061/1512] t1 r3 d22  recall 100.0%  opening false think-end false answer false  610 tokens
+[1062/1512] t1 r3 t39  recall 100.0%  opening false think-end false answer false  2432 tokens
+[1063/1512] r1 r3 t29  recall  80.0%  opening false think-end false answer false  1454 tokens
+[1064/1512] c1 r6 d22  recall  50.0%  opening true think-end true answer true  592 tokens
+[1065/1512] r1 r3 a12  recall   0.0%  opening false think-end false answer false  835 tokens
+[1066/1512] b1 r6 d22  recall   0.0%  opening false think-end false answer false  1569 tokens
+[1067/1512] c1 r6 a27  recall  60.0%  opening true think-end true answer true  1588 tokens
+[1068/1512] b1 r6 a27  recall  40.0%  opening true think-end true answer true  1794 tokens
+[1069/1512] c1 r6 t01  recall  25.0%  opening false think-end true answer true  2175 tokens
+[1070/1512] b1 r6 t20  recall   0.0%  opening true think-end true answer true  1060 tokens
+[1071/1512] b1 r6 t01  recall   0.0%  opening false think-end false answer false  3310 tokens
+[1072/1512] c1 r6 t20  recall  40.0%  opening true think-end true answer true  1432 tokens
+[1073/1512] r1 r3 a27  recall  80.0%  opening false think-end false answer false  1389 tokens
+[1074/1512] b1 r6 d02  recall   0.0%  opening false think-end false answer false  221 tokens
+[1075/1512] r1 r3 d22  recall   0.0%  opening false think-end false answer false  670 tokens
+[1076/1512] t1 r3 t42  recall 100.0%  opening false think-end false answer false  3034 tokens
+[1077/1512] t1 r3 a27  recall 100.0%  opening false think-end false answer false  1789 tokens
+[1078/1512] t1 r3 d02  recall 100.0%  opening false think-end false answer false  573 tokens
+[1079/1512] b1 r6 d13  recall   0.0%  opening false think-end false answer false  543 tokens
+[1080/1512] t1 r3 a12  recall 100.0%  opening false think-end false answer false  1920 tokens
+2026-11-24T12:17:59.843731Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-t30-6b0504ea-a1" attempt=1
+[1081/1512] c1 r6 d02  recall   0.0%  opening false think-end false answer false  1495 tokens
+[1082/1512] r1 r3 d02  recall   0.0%  opening false think-end false answer false  291 tokens
+2026-11-24T12:19:56.803906Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-t29-6b0504ea-a1" attempt=1
+[1083/1512] c1 r6 d13  recall   0.0%  opening false think-end false answer false  368 tokens
+[1084/1512] t1 r3 d13  recall 100.0%  opening false think-end false answer false  696 tokens
+2026-11-24T12:20:30.976342Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r2-t30-6b0504ea-a3" attempt=3
+[1085/1512] t1 r2 t30  recall   0.0%  opening false think-end false answer false  0 tokens  FAILED: the chat request: error sending request for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out
+[1086/1512] r1 r3 t01  recall  75.0%  opening false think-end false answer false  1335 tokens
+2026-11-24T12:21:21.971952Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-t18-6b0504ea-a2" attempt=2
+[1087/1512] c1 r6 t03  recall  75.0%  opening false think-end true answer true  1323 tokens
+[1088/1512] r1 r3 d13  recall  50.0%  opening false think-end false answer false  712 tokens
+[1089/1512] r1 r3 t20  recall  40.0%  opening false think-end false answer false  2408 tokens
+[1090/1512] b1 r6 t03  recall  75.0%  opening false think-end false answer false  2076 tokens
+[1091/1512] t1 r3 t01  recall  75.0%  opening false think-end false answer false  3214 tokens
+[1092/1512] b1 r6 d43  recall   0.0%  opening false think-end false answer false  490 tokens
+[1093/1512] t1 r3 d43  recall 100.0%  opening false think-end false answer false  660 tokens
+[1094/1512] b1 r6 t41  recall 100.0%  opening true think-end true answer true  914 tokens
+[1095/1512] c1 r6 d43  recall   0.0%  opening false think-end false answer false  1728 tokens
+[1096/1512] c1 r6 t41  recall 100.0%  opening true think-end true answer true  1737 tokens
+[1097/1512] c1 r6 d35  recall   0.0%  opening false think-end false answer false  498 tokens
+[1098/1512] r1 r3 t03  recall 100.0%  opening false think-end false answer false  1653 tokens
+[1099/1512] t1 r3 d35  recall 100.0%  opening false think-end false answer false  894 tokens
+[1100/1512] t1 r3 t20  recall 100.0%  opening false think-end false answer false  2804 tokens
+[1101/1512] t1 r3 t03  recall 100.0%  opening false think-end false answer false  3137 tokens
+[1102/1512] r1 r3 d43  recall 100.0%  opening false think-end false answer false  1124 tokens
+[1103/1512] b1 r6 a32  recall   0.0%  opening false think-end false answer false  1404 tokens
+[1104/1512] c1 r6 a32  recall  25.0%  opening false think-end false answer false  1702 tokens
+[1105/1512] r1 r3 d35  recall   0.0%  opening false think-end false answer false  314 tokens
+[1106/1512] r1 r3 t41  recall 100.0%  opening false think-end false answer false  1290 tokens
+[1107/1512] c1 r6 t25  recall 100.0%  opening true think-end true answer true  1257 tokens
+[1108/1512] t1 r3 t23  recall 100.0%  opening false think-end false answer false  2201 tokens
+[1109/1512] b1 r6 t25  recall 100.0%  opening true think-end true answer true  1182 tokens
+[1110/1512] r1 r3 t25  recall 100.0%  opening false think-end false answer false  505 tokens
+[1111/1512] t1 r3 t41  recall 100.0%  opening false think-end false answer false  1889 tokens
+[1112/1512] c1 r6 t22  recall 100.0%  opening true think-end true answer true  2672 tokens
+[1113/1512] c1 r6 a02  recall 100.0%  opening false think-end false answer false  380 tokens
+[1114/1512] b1 r6 a02  recall 100.0%  opening false think-end true answer true  406 tokens
+[1115/1512] b1 r6 t22  recall  40.0%  opening true think-end true answer true  2960 tokens
+[1116/1512] r1 r3 a32  recall  50.0%  opening false think-end false answer false  1866 tokens
+[1117/1512] r1 r3 a02  recall 100.0%  opening false think-end false answer false  458 tokens
+[1118/1512] t1 r3 d39  recall 100.0%  opening false think-end false answer false  640 tokens
+2026-11-24T12:37:59.863032Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-t30-6b0504ea-a2" attempt=2
+[1119/1512] b1 r6 d39  recall   0.0%  opening false think-end false answer false  3099 tokens
+[1120/1512] t1 r3 a02  recall 100.0%  opening false think-end false answer false  803 tokens
+[1121/1512] c1 r6 d39  recall   0.0%  opening false think-end false answer false  1808 tokens
+[1122/1512] b1 r6 t07  recall   0.0%  opening false think-end false answer false  1046 tokens
+2026-11-24T12:39:57.153811Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-t29-6b0504ea-a2" attempt=2
+[1123/1512] t1 r3 t18  recall 100.0%  opening false think-end false answer false  3847 tokens
+[1124/1512] r1 r3 t22  recall  40.0%  opening false think-end false answer false  2320 tokens
+[1125/1512] c1 r6 t07  recall 100.0%  opening false think-end true answer true  1888 tokens
+[1126/1512] t1 r3 t07  recall 100.0%  opening false think-end false answer false  658 tokens
+[1127/1512] b1 r6 a41  recall  25.0%  opening false think-end false answer false  531 tokens
+[1128/1512] c1 r6 a41  recall   0.0%  opening false think-end true answer true  1317 tokens
+[1129/1512] b1 r6 t12  recall  50.0%  opening true think-end true answer true  1205 tokens
+[1130/1512] r1 r3 d39  recall  25.0%  opening false think-end false answer false  897 tokens
+[1131/1512] c1 r6 t12  recall 100.0%  opening true think-end true answer true  1535 tokens
+[1132/1512] t1 r3 t25  recall 100.0%  opening false think-end false answer false  3060 tokens
+[1133/1512] t1 r3 a32  recall 100.0%  opening false think-end false answer false  2892 tokens
+[1134/1512] r1 r3 t07  recall  33.3%  opening false think-end false answer false  1516 tokens
+[1135/1512] r1 r3 t12  recall   0.0%  opening false think-end false answer false  605 tokens
+[1136/1512] t1 r3 t22  recall 100.0%  opening false think-end false answer false  2871 tokens
+[1137/1512] b1 r6 t32  recall  50.0%  opening true think-end true answer true  1431 tokens
+[1138/1512] c1 r6 t32  recall  25.0%  opening true think-end true answer true  1422 tokens
+[1139/1512] b1 r6 a16  recall  25.0%  opening true think-end true answer true  1480 tokens
+[1140/1512] c1 r6 a16  recall  50.0%  opening true think-end true answer true  2156 tokens
+[1141/1512] r1 r3 a41  recall   0.0%  opening false think-end false answer false  1540 tokens
+[1142/1512] t1 r3 t29  recall 100.0%  opening false think-end false answer false  1924 tokens
+[1143/1512] r1 r3 a16  recall   0.0%  opening false think-end false answer false  1981 tokens
+[1144/1512] c1 r6 a22  recall  50.0%  opening true think-end true answer true  771 tokens
+[1145/1512] b1 r6 a22  recall  25.0%  opening true think-end true answer true  917 tokens
+[1146/1512] c1 r6 a30  recall   0.0%  opening false think-end false answer false  400 tokens
+[1147/1512] t1 r3 a41  recall 100.0%  opening false think-end false answer false  2060 tokens
+[1148/1512] t1 r3 t12  recall 100.0%  opening false think-end false answer false  2504 tokens
+[1149/1512] r1 r3 a31  recall  75.0%  opening false think-end false answer false  3734 tokens
+[1150/1512] b1 r6 a30  recall   0.0%  opening false think-end false answer false  829 tokens
+[1151/1512] r1 r3 a22  recall  75.0%  opening false think-end false answer false  850 tokens
+[1152/1512] t1 r3 a16  recall 100.0%  opening false think-end false answer false  2104 tokens
+[1153/1512] r1 r3 t32  recall  25.0%  opening false think-end false answer false  1215 tokens
+[1154/1512] c1 r6 a28  recall   0.0%  opening false think-end false answer false  926 tokens
+[1155/1512] b1 r6 a04  recall   0.0%  opening false think-end false answer false  1183 tokens
+[1156/1512] b1 r6 a28  recall   0.0%  opening false think-end false answer false  1698 tokens
+[1157/1512] t1 r3 a31  recall 100.0%  opening false think-end false answer false  3809 tokens
+[1158/1512] r1 r3 a28  recall 100.0%  opening false think-end false answer false  714 tokens
+2026-11-24T12:57:59.881346Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-t30-6b0504ea-a3" attempt=3
+[1159/1512] t1 r3 t30  recall   0.0%  opening false think-end false answer false  0 tokens  FAILED: the chat request: error sending request for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out
+[1160/1512] t1 r3 a22  recall 100.0%  opening false think-end false answer false  2010 tokens
+[1161/1512] c1 r6 a04  recall   0.0%  opening false think-end false answer false  2750 tokens
+[1162/1512] r1 r3 a30  recall  75.0%  opening false think-end false answer false  3452 tokens
+[1163/1512] t1 r3 a28  recall 100.0%  opening false think-end false answer false  1472 tokens
+[1164/1512] t1 r3 t32  recall 100.0%  opening false think-end false answer false  2814 tokens
+[1165/1512] c1 r6 t24  recall 100.0%  opening true think-end true answer true  1707 tokens
+[1166/1512] b1 r6 t24  recall  20.0%  opening true think-end true answer true  1008 tokens
+[1167/1512] b1 r6 a09  recall   0.0%  opening true think-end true answer true  716 tokens
+[1168/1512] r1 r3 a04  recall 100.0%  opening false think-end false answer false  899 tokens
+[1169/1512] r1 r3 t24  recall  20.0%  opening false think-end false answer false  1705 tokens
+[1170/1512] c1 r6 a09  recall   0.0%  opening true think-end true answer true  3461 tokens
+[1171/1512] c1 r6 a15  recall 100.0%  opening true think-end true answer true  2390 tokens
+[1172/1512] b1 r6 d14  recall   0.0%  opening true think-end true answer true  439 tokens
+[1173/1512] b1 r6 a15  recall 100.0%  opening true think-end true answer true  3856 tokens
+[1174/1512] t1 r3 d14  recall 100.0%  opening false think-end false answer false  564 tokens
+[1175/1512] c1 r6 d14  recall   0.0%  opening true think-end true answer true  463 tokens
+[1176/1512] t1 r3 a30  recall 100.0%  opening false think-end false answer false  3453 tokens
+[1177/1512] c1 r6 d12  recall   0.0%  opening true think-end true answer true  558 tokens
+[1178/1512] t1 r3 a04  recall  50.0%  opening false think-end false answer false  2878 tokens
+[1179/1512] c1 r6 a24  recall  20.0%  opening false think-end false answer false  713 tokens
+[1180/1512] r1 r3 a09  recall  60.0%  opening false think-end false answer false  1132 tokens
+[1181/1512] r1 r3 a15  recall  80.0%  opening false think-end false answer false  1936 tokens
+[1182/1512] b1 r6 d12  recall   0.0%  opening true think-end true answer true  3190 tokens
+[1183/1512] r1 r3 d14  recall 100.0%  opening false think-end false answer false  694 tokens
+[1184/1512] b1 r6 a24  recall  40.0%  opening true think-end true answer true  1803 tokens
+[1185/1512] t1 r3 d12  recall 100.0%  opening false think-end false answer false  1082 tokens
+[1186/1512] c1 r6 a33  recall  25.0%  opening true think-end false answer false  3696 tokens
+[1187/1512] t1 r3 d24  recall 100.0%  opening false think-end false answer false  338 tokens
+[1188/1512] c1 r6 d24  recall  50.0%  opening true think-end true answer true  872 tokens
+[1189/1512] b1 r6 a33  recall  50.0%  opening true think-end true answer true  2730 tokens
+[1190/1512] r1 r3 a24  recall   0.0%  opening false think-end false answer false  1275 tokens
+[1191/1512] b1 r6 t37  recall  25.0%  opening false think-end true answer true  1252 tokens
+[1192/1512] b1 r6 d24  recall   0.0%  opening true think-end true answer true  3184 tokens
+[1193/1512] t1 r3 a24  recall  80.0%  opening false think-end false answer false  1725 tokens
+[1194/1512] r1 r3 a33  recall   0.0%  opening false think-end false answer false  868 tokens
+[1195/1512] c1 r6 t37  recall  50.0%  opening true think-end true answer true  1504 tokens
+[1196/1512] t1 r3 t24  recall 100.0%  opening false think-end false answer false  2646 tokens
+2026-11-24T13:16:57.676203Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-a09-6b0504ea-a1" attempt=1
+[1197/1512] b1 r6 t26  recall  40.0%  opening true think-end true answer true  1142 tokens
+[1198/1512] r1 r3 t13  recall   0.0%  opening false think-end false answer false  3734 tokens
+[1199/1512] r1 r3 d24  recall  50.0%  opening false think-end false answer false  492 tokens
+2026-11-24T13:18:22.617529Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-a15-6b0504ea-a1" attempt=1
+[1200/1512] b1 r6 a11  recall  75.0%  opening true think-end true answer true  2253 tokens
+[1201/1512] r1 r3 t26  recall   0.0%  opening false think-end false answer false  1320 tokens
+[1202/1512] c1 r6 a11  recall 100.0%  opening true think-end true answer true  1382 tokens
+[1203/1512] b1 r6 a34  recall  75.0%  opening true think-end true answer true  1460 tokens
+[1204/1512] c1 r6 a34  recall 100.0%  opening true think-end true answer true  1156 tokens
+[1205/1512] t1 r3 a33  recall 100.0%  opening false think-end false answer false  3257 tokens
+[1206/1512] t1 r3 t37  recall 100.0%  opening false think-end false answer false  2035 tokens
+[1207/1512] r1 r3 d12  recall  50.0%  opening false think-end false answer false  4399 tokens
+[1208/1512] r1 r3 t37  recall   0.0%  opening false think-end false answer false  1451 tokens
+[1209/1512] b1 r6 d06  recall   0.0%  opening false think-end false answer false  633 tokens
+[1210/1512] c1 r6 d06  recall   0.0%  opening false think-end false answer false  750 tokens
+[1211/1512] t1 r3 d38  recall 100.0%  opening false think-end false answer false  530 tokens
+[1212/1512] t1 r3 d06  recall 100.0%  opening false think-end false answer false  960 tokens
+2026-11-24T13:26:28.547515Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-t13-6b0504ea-a1" attempt=1
+[1213/1512] t1 r3 a09  recall 100.0%  opening false think-end false answer false  1891 tokens
+[1214/1512] c1 r6 d38  recall  50.0%  opening true think-end true answer true  2332 tokens
+[1215/1512] b1 r6 t15  recall  80.0%  opening true think-end true answer true  1596 tokens
+[1216/1512] r1 r3 d06  recall 100.0%  opening false think-end false answer false  838 tokens
+[1217/1512] c1 r6 t15  recall  40.0%  opening true think-end true answer true  3054 tokens
+[1218/1512] b1 r6 d38  recall   0.0%  opening true think-end true answer true  4881 tokens
+[1219/1512] t1 r3 a11  recall 100.0%  opening false think-end false answer false  2694 tokens
+[1220/1512] r1 r3 a34  recall  50.0%  opening false think-end false answer false  2121 tokens
+[1221/1512] r1 r3 a11  recall   0.0%  opening false think-end false answer false  1098 tokens
+[1222/1512] b1 r6 t08  recall 100.0%  opening true think-end true answer true  1963 tokens
+[1223/1512] c1 r6 t08  recall 100.0%  opening true think-end true answer true  1939 tokens
+2026-11-24T13:32:48.755203Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-t26-6b0504ea-a1" attempt=1
+[1224/1512] b1 r6 a35  recall   0.0%  opening false think-end false answer false  2069 tokens
+[1225/1512] r1 r3 t08  recall 100.0%  opening false think-end false answer false  1435 tokens
+[1226/1512] c1 r6 a35  recall  75.0%  opening false think-end true answer true  2947 tokens
+[1227/1512] r1 r3 d38  recall  50.0%  opening false think-end false answer false  797 tokens
+[1228/1512] b1 r6 a37  recall  75.0%  opening true think-end true answer true  1810 tokens
+[1229/1512] r1 r3 t15  recall  60.0%  opening false think-end false answer false  1799 tokens
+[1230/1512] c1 r6 a37  recall   0.0%  opening true think-end true answer true  1220 tokens
+[1231/1512] t1 r3 d09  recall 100.0%  opening false think-end false answer false  985 tokens
+[1232/1512] c1 r6 d09  recall   0.0%  opening true think-end true answer true  838 tokens
+[1233/1512] b1 r6 d09  recall  33.3%  opening true think-end true answer true  876 tokens
+[1234/1512] t1 r3 a34  recall 100.0%  opening false think-end false answer false  3157 tokens
+2026-11-24T13:38:22.626655Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-a15-6b0504ea-a2" attempt=2
+[1235/1512] b1 r6 a29  recall  75.0%  opening false think-end true answer true  1163 tokens
+[1236/1512] r1 r3 a37  recall   0.0%  opening false think-end false answer false  1137 tokens
+[1237/1512] t1 r3 t08  recall 100.0%  opening false think-end false answer false  1841 tokens
+[1238/1512] b1 r6 t43  recall 100.0%  opening true think-end true answer true  890 tokens
+[1239/1512] r1 r3 d09  recall 100.0%  opening false think-end false answer false  1639 tokens
+[1240/1512] c1 r6 a29  recall  75.0%  opening false think-end true answer true  1925 tokens
+[1241/1512] c1 r6 t43  recall 100.0%  opening true think-end true answer true  910 tokens
+[1242/1512] r1 r3 a29  recall 100.0%  opening false think-end false answer false  1605 tokens
+[1243/1512] t1 r3 t13  recall  20.0%  opening false think-end false answer false  2984 tokens
+[1244/1512] r1 r3 a35  recall  25.0%  opening false think-end false answer false  3571 tokens
+[1245/1512] c1 r6 t19  recall  40.0%  opening true think-end true answer true  2417 tokens
+2026-11-24T13:45:25.132758Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-t15-6b0504ea-a1" attempt=1
+[1246/1512] t1 r3 d26  recall 100.0%  opening false think-end false answer false  416 tokens
+[1247/1512] c1 r6 d26  recall   0.0%  opening false think-end false answer false  397 tokens
+[1248/1512] b1 r6 t19  recall  40.0%  opening true think-end true answer true  3308 tokens
+[1249/1512] b1 r6 d18  recall   0.0%  opening false think-end false answer false  528 tokens
+[1250/1512] t1 r3 t43  recall 100.0%  opening false think-end false answer false  1686 tokens
+[1251/1512] b1 r6 d26  recall   0.0%  opening false think-end false answer false  1185 tokens
+[1252/1512] r1 r3 t43  recall 100.0%  opening false think-end false answer false  866 tokens
+[1253/1512] t1 r3 a37  recall 100.0%  opening false think-end false answer false  2455 tokens
+2026-11-24T13:49:03.641120Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-a35-6b0504ea-a1" attempt=1
+[1254/1512] t1 r3 a29  recall 100.0%  opening false think-end false answer false  2193 tokens
+[1255/1512] b1 r6 d25  recall   0.0%  opening true think-end true answer true  1004 tokens
+[1256/1512] r1 r3 t19  recall  60.0%  opening false think-end false answer false  1396 tokens
+[1257/1512] t1 r3 d18  recall 100.0%  opening false think-end false answer false  374 tokens
+[1258/1512] t1 r3 t26  recall 100.0%  opening false think-end false answer false  2687 tokens
+[1259/1512] c1 r6 d25  recall  50.0%  opening true think-end true answer true  2445 tokens
+[1260/1512] r1 r3 d26  recall  50.0%  opening false think-end false answer false  512 tokens
+[1261/1512] t1 r3 d25  recall 100.0%  opening false think-end false answer false  554 tokens
+[1262/1512] c1 r6 d18  recall   0.0%  opening false think-end false answer false  3748 tokens
+[1263/1512] c1 r6 d36  recall   0.0%  opening true think-end false answer false  1556 tokens
+[1264/1512] t1 r3 d36  recall 100.0%  opening false think-end false answer false  1182 tokens
+[1265/1512] b1 r6 t36  recall  75.0%  opening true think-end true answer true  767 tokens
+[1266/1512] r1 r3 d18  recall  50.0%  opening false think-end false answer false  639 tokens
+[1267/1512] r1 r3 d25  recall 100.0%  opening false think-end false answer false  594 tokens
+[1268/1512] b1 r6 a03  recall  66.7%  opening false think-end false answer false  2390 tokens
+[1269/1512] c1 r6 a03  recall  66.7%  opening false think-end false answer false  2760 tokens
+[1270/1512] b1 r6 d36  recall  50.0%  opening true think-end true answer true  3341 tokens
+[1271/1512] t1 r3 t19  recall 100.0%  opening false think-end false answer false  3102 tokens
+2026-11-24T13:58:22.648233Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-a15-6b0504ea-a3" attempt=3
+[1272/1512] t1 r3 a15  recall   0.0%  opening false think-end false answer false  0 tokens  FAILED: the chat request: error sending request for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out
+[1273/1512] r1 r3 d36  recall  50.0%  opening false think-end false answer false  589 tokens
+[1274/1512] c1 r6 d23  recall   0.0%  opening false think-end false answer false  347 tokens
+[1275/1512] t1 r3 a35  recall 100.0%  opening false think-end false answer false  1579 tokens
+[1276/1512] c1 r6 t36  recall  75.0%  opening false think-end false answer false  1364 tokens
+[1277/1512] c1 r6 t33  recall   0.0%  opening false think-end false answer false  1253 tokens
+[1278/1512] b1 r6 t33  recall   0.0%  opening false think-end false answer false  1898 tokens
+[1279/1512] r1 r3 a03  recall  66.7%  opening false think-end false answer false  953 tokens
+[1280/1512] t1 r3 d23  recall 100.0%  opening false think-end false answer false  497 tokens
+[1281/1512] b1 r6 d23  recall   0.0%  opening false think-end false answer false  1643 tokens
+[1282/1512] b1 r6 d15  recall   0.0%  opening false think-end false answer false  472 tokens
+[1283/1512] t1 r3 t15  recall 100.0%  opening false think-end false answer false  5539 tokens
+[1284/1512] r1 r3 t36  recall  25.0%  opening false think-end false answer false  1505 tokens
+[1285/1512] t1 r3 d15  recall 100.0%  opening false think-end false answer false  655 tokens
+[1286/1512] r1 r3 t33  recall 100.0%  opening false think-end false answer false  1571 tokens
+[1287/1512] c1 r6 d11  recall   0.0%  opening false think-end false answer false  561 tokens
+[1288/1512] b1 r6 d11  recall   0.0%  opening false think-end false answer false  644 tokens
+[1289/1512] r1 r3 d23  recall  50.0%  opening false think-end false answer false  528 tokens
+[1290/1512] c1 r6 d15  recall   0.0%  opening false think-end false answer false  2728 tokens
+[1291/1512] b1 r6 d16  recall   0.0%  opening false think-end false answer false  221 tokens
+[1292/1512] r1 r3 d15  recall   0.0%  opening false think-end false answer false  660 tokens
+[1293/1512] c1 r6 d16  recall   0.0%  opening false think-end false answer false  584 tokens
+[1294/1512] b1 r6 d30  recall   0.0%  opening true think-end false answer false  556 tokens
+[1295/1512] t1 r3 d11  recall 100.0%  opening false think-end false answer false  852 tokens
+[1296/1512] t1 r3 t33  recall 100.0%  opening false think-end false answer false  1646 tokens
+[1297/1512] t1 r3 t36  recall 100.0%  opening false think-end false answer false  1745 tokens
+[1298/1512] t1 r3 a03  recall 100.0%  opening false think-end false answer false  3176 tokens
+[1299/1512] t1 r3 d30  recall 100.0%  opening false think-end false answer false  430 tokens
+[1300/1512] t1 r3 d16  recall 100.0%  opening false think-end false answer false  650 tokens
+[1301/1512] c1 r6 d30  recall   0.0%  opening false think-end false answer false  706 tokens
+[1302/1512] r1 r3 d16  recall  50.0%  opening false think-end false answer false  392 tokens
+[1303/1512] c1 r6 d31  recall   0.0%  opening false think-end false answer false  490 tokens
+[1304/1512] b1 r6 t16  recall   0.0%  opening true think-end true answer true  908 tokens
+[1305/1512] r1 r3 d11  recall   0.0%  opening false think-end false answer false  576 tokens
+[1306/1512] t1 r3 d31  recall 100.0%  opening false think-end false answer false  576 tokens
+[1307/1512] b1 r6 a40  recall   0.0%  opening true think-end true answer true  712 tokens
+[1308/1512] c1 r6 a40  recall 100.0%  opening true think-end true answer true  1377 tokens
+[1309/1512] b1 r6 a07  recall   0.0%  opening false think-end false answer false  1151 tokens
+[1310/1512] c1 r6 t16  recall  60.0%  opening true think-end true answer true  3156 tokens
+[1311/1512] r1 r3 d31  recall   0.0%  opening false think-end false answer false  299 tokens
+[1312/1512] c1 r6 a07  recall   0.0%  opening false think-end false answer false  2041 tokens
+[1313/1512] b1 r6 d31  recall   0.0%  opening false think-end false answer false  2485 tokens
+[1314/1512] c1 r6 a39  recall 100.0%  opening true think-end true answer true  763 tokens
+[1315/1512] r1 r3 d30  recall 100.0%  opening false think-end false answer false  548 tokens
+[1316/1512] r1 r3 t16  recall  60.0%  opening false think-end false answer false  1485 tokens
+[1317/1512] b1 r6 a39  recall 100.0%  opening true think-end true answer true  1214 tokens
+[1318/1512] b1 r6 a42  recall  25.0%  opening true think-end true answer true  2331 tokens
+[1319/1512] r1 r3 a42  recall 100.0%  opening false think-end false answer false  1231 tokens
+[1320/1512] r1 r3 a40  recall  50.0%  opening false think-end false answer false  1501 tokens
+[1321/1512] c1 r6 a42  recall  50.0%  opening true think-end true answer true  2781 tokens
+[1322/1512] r1 r3 a07  recall   0.0%  opening false think-end false answer false  736 tokens
+[1323/1512] c1 r6 t11  recall  80.0%  opening true think-end true answer true  924 tokens
+[1324/1512] t1 r3 a39  recall 100.0%  opening false think-end false answer false  1433 tokens
+[1325/1512] b1 r6 t11  recall  80.0%  opening true think-end true answer true  1525 tokens
+[1326/1512] c1 r6 a17  recall  80.0%  opening true think-end true answer true  698 tokens
+[1327/1512] r1 r3 t11  recall  80.0%  opening false think-end false answer false  1297 tokens
+[1328/1512] b1 r6 a17  recall  60.0%  opening true think-end true answer true  910 tokens
+[1329/1512] b1 r6 t40  recall  25.0%  opening true think-end true answer true  1052 tokens
+[1330/1512] t1 r3 a07  recall  66.7%  opening false think-end false answer false  2428 tokens
+[1331/1512] c1 r6 t40  recall   0.0%  opening true think-end true answer true  1954 tokens
+[1332/1512] t1 r3 t16  recall  60.0%  opening false think-end false answer false  2615 tokens
+[1333/1512] r1 r3 a17  recall  80.0%  opening false think-end false answer false  715 tokens
+[1334/1512] c1 r6 t17  recall   0.0%  opening false think-end true answer true  804 tokens
+[1335/1512] t1 r3 a40  recall 100.0%  opening false think-end false answer false  2674 tokens
+[1336/1512] r1 r3 a39  recall 100.0%  opening false think-end false answer false  1940 tokens
+[1337/1512] b1 r6 d34  recall   0.0%  opening false think-end false answer false  613 tokens
+[1338/1512] c1 r6 d34  recall   0.0%  opening false think-end false answer false  396 tokens
+[1339/1512] b1 r6 t17  recall   0.0%  opening false think-end false answer false  1188 tokens
+[1340/1512] t1 r3 a17  recall  80.0%  opening false think-end false answer false  1221 tokens
+[1341/1512] b1 r6 t06  recall   0.0%  opening true think-end true answer true  1268 tokens
+[1342/1512] c1 r6 a05  recall 100.0%  opening false think-end false answer false  569 tokens
+[1343/1512] b1 r6 a05  recall 100.0%  opening false think-end false answer false  365 tokens
+[1344/1512] r1 r3 t17  recall  80.0%  opening false think-end false answer false  1309 tokens
+[1345/1512] r1 r3 d34  recall   0.0%  opening false think-end false answer false  336 tokens
+[1346/1512] r1 r3 t40  recall  25.0%  opening false think-end false answer false  3493 tokens
+[1347/1512] t1 r3 d34  recall 100.0%  opening false think-end false answer false  1003 tokens
+[1348/1512] c1 r6 t21  recall  25.0%  opening false think-end true answer true  746 tokens
+[1349/1512] c1 r6 t06  recall 100.0%  opening true think-end true answer true  3535 tokens
+[1350/1512] t1 r3 a05  recall  50.0%  opening false think-end false answer false  543 tokens
+[1351/1512] t1 r3 t11  recall 100.0%  opening false think-end false answer false  2882 tokens
+[1352/1512] b1 r6 t21  recall  50.0%  opening true think-end true answer true  1964 tokens
+[1353/1512] t1 r3 a42  recall 100.0%  opening false think-end false answer false  3260 tokens
+[1354/1512] c1 r6 t02  recall  75.0%  opening true think-end true answer true  1886 tokens
+[1355/1512] t1 r3 t40  recall 100.0%  opening false think-end false answer false  2737 tokens
+[1356/1512] r1 r3 t06  recall  50.0%  opening false think-end false answer false  523 tokens
+[1357/1512] b1 r6 t02  recall  50.0%  opening true think-end true answer true  1274 tokens
+[1358/1512] t1 r3 t06  recall  50.0%  opening false think-end false answer false  1882 tokens
+[1359/1512] b1 r6 t05  recall  66.7%  opening false think-end false answer false  946 tokens
+[1360/1512] c1 r6 t35  recall   0.0%  opening false think-end false answer false  902 tokens
+[1361/1512] r1 r3 t21  recall   0.0%  opening false think-end false answer false  1296 tokens
+[1362/1512] c1 r6 t05  recall  66.7%  opening false think-end false answer false  2691 tokens
+[1363/1512] r1 r3 a05  recall 100.0%  opening false think-end false answer false  466 tokens
+[1364/1512] b1 r6 t35  recall   0.0%  opening false think-end false answer false  2188 tokens
+[1365/1512] r1 r3 t02  recall  25.0%  opening false think-end false answer false  1889 tokens
+[1366/1512] c1 r6 a25  recall   0.0%  opening true think-end true answer true  1351 tokens
+[1367/1512] r1 r3 t05  recall  33.3%  opening false think-end false answer false  1495 tokens
+[1368/1512] b1 r6 t31  recall   0.0%  opening false think-end false answer false  1515 tokens
+2026-11-24T14:38:30.277461Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-t17-6b0504ea-a1" attempt=1
+[1369/1512] r1 r3 a25  recall  80.0%  opening false think-end false answer false  1034 tokens
+[1370/1512] b1 r6 a25  recall 100.0%  opening true think-end true answer true  1801 tokens
+[1371/1512] r1 r3 t35  recall   0.0%  opening false think-end false answer false  916 tokens
+[1372/1512] b1 r6 d19  recall   0.0%  opening false think-end false answer false  900 tokens
+[1373/1512] c1 r6 t31  recall  25.0%  opening false think-end false answer false  1537 tokens
+[1374/1512] c1 r6 d19  recall   0.0%  opening false think-end false answer false  1026 tokens
+[1375/1512] t1 r3 d19  recall 100.0%  opening false think-end false answer false  711 tokens
+[1376/1512] t1 r3 t21  recall 100.0%  opening false think-end false answer false  2830 tokens
+[1377/1512] c1 r6 d29  recall 100.0%  opening true think-end true answer true  1013 tokens
+[1378/1512] b1 r6 d29  recall   0.0%  opening true think-end true answer true  540 tokens
+[1379/1512] t1 r3 d29  recall 100.0%  opening false think-end false answer false  923 tokens
+[1380/1512] c1 r6 a36  recall   0.0%  opening true think-end true answer true  1878 tokens
+[1381/1512] r1 r3 t31  recall  25.0%  opening false think-end false answer false  3612 tokens
+[1382/1512] b1 r6 a36  recall  75.0%  opening true think-end true answer true  1027 tokens
+[1383/1512] b1 r6 a21  recall  75.0%  opening true think-end true answer true  1205 tokens
+[1384/1512] r1 r3 d29  recall  50.0%  opening false think-end false answer false  651 tokens
+[1385/1512] t1 r3 a25  recall 100.0%  opening false think-end false answer false  1612 tokens
+[1386/1512] t1 r3 t31  recall 100.0%  opening false think-end false answer false  1729 tokens
+[1387/1512] t1 r3 t02  recall 100.0%  opening false think-end false answer false  3872 tokens
+[1388/1512] r1 r3 d19  recall  66.7%  opening false think-end false answer false  615 tokens
+[1389/1512] b1 r6 t27  recall   0.0%  opening false think-end false answer false  772 tokens
+[1390/1512] r1 r3 a36  recall  75.0%  opening false think-end false answer false  1103 tokens
+2026-11-24T14:49:07.709252Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-t05-6b0504ea-a1" attempt=1
+[1391/1512] b1 r6 d01  recall   0.0%  opening false think-end false answer false  512 tokens
+[1392/1512] c1 r6 a21  recall  75.0%  opening true think-end true answer true  3273 tokens
+[1393/1512] c1 r6 d01  recall   0.0%  opening false think-end false answer false  2185 tokens
+[1394/1512] t1 r3 d01  recall 100.0%  opening false think-end false answer false  511 tokens
+[1395/1512] c1 r6 t27  recall  20.0%  opening false think-end true answer true  3030 tokens
+[1396/1512] r1 r3 d01  recall  50.0%  opening false think-end false answer false  346 tokens
+2026-11-24T14:52:30.360197Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-t35-6b0504ea-a1" attempt=1
+[1397/1512] c1 r6 t14  recall   0.0%  opening true think-end true answer true  653 tokens
+[1398/1512] t1 r3 a21  recall 100.0%  opening false think-end false answer false  1725 tokens
+[1399/1512] b1 r6 t14  recall  80.0%  opening true think-end true answer true  1176 tokens
+[1400/1512] b1 r6 t04  recall  66.7%  opening true think-end true answer true  2276 tokens
+[1401/1512] c1 r6 t04  recall 100.0%  opening true think-end true answer true  2432 tokens
+[1402/1512] r1 r3 t27  recall  60.0%  opening false think-end false answer false  2045 tokens
+[1403/1512] t1 r3 a36  recall 100.0%  opening false think-end false answer false  2599 tokens
+[1404/1512] r1 r3 a21  recall  75.0%  opening false think-end false answer false  1418 tokens
+[1405/1512] b1 r6 t10  recall  50.0%  opening true think-end true answer true  1113 tokens
+2026-11-24T14:58:30.297723Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-t17-6b0504ea-a2" attempt=2
+[1406/1512] r1 r3 t14  recall   0.0%  opening false think-end false answer false  1433 tokens
+[1407/1512] b1 r6 a38  recall  75.0%  opening true think-end true answer true  1407 tokens
+[1408/1512] c1 r6 t10  recall  75.0%  opening true think-end true answer true  2796 tokens
+[1409/1512] b1 r6 d10  recall   0.0%  opening false think-end false answer false  299 tokens
+[1410/1512] t1 r3 d10  recall 100.0%  opening false think-end false answer false  597 tokens
+[1411/1512] c1 r6 a38  recall 100.0%  opening true think-end true answer true  1043 tokens
+[1412/1512] c1 r6 d10  recall   0.0%  opening false think-end false answer false  346 tokens
+[1413/1512] c1 r6 d03  recall   0.0%  opening false think-end false answer false  647 tokens
+[1414/1512] t1 r3 t27  recall 100.0%  opening false think-end false answer false  2627 tokens
+[1415/1512] b1 r6 d03  recall   0.0%  opening false think-end false answer false  1114 tokens
+[1416/1512] t1 r3 t05  recall  66.7%  opening false think-end false answer false  2222 tokens
+[1417/1512] t1 r3 d03  recall 100.0%  opening false think-end false answer false  1183 tokens
+[1418/1512] t1 r3 t10  recall 100.0%  opening false think-end false answer false  2103 tokens
+[1419/1512] t1 r3 t04  recall 100.0%  opening false think-end false answer false  3194 tokens
+[1420/1512] r1 r3 d10  recall  33.3%  opening false think-end false answer false  590 tokens
+[1421/1512] b1 r6 t34  recall   0.0%  opening true think-end true answer true  2344 tokens
+[1422/1512] r1 r3 t10  recall  25.0%  opening false think-end false answer false  950 tokens
+[1423/1512] c1 r6 t34  recall  50.0%  opening true think-end true answer true  1211 tokens
+[1424/1512] t1 r3 t35  recall 100.0%  opening false think-end false answer false  3699 tokens
+[1425/1512] b1 r6 d41  recall   0.0%  opening true think-end true answer true  472 tokens
+[1426/1512] c1 r6 d41  recall  50.0%  opening true think-end true answer true  1104 tokens
+[1427/1512] r1 r3 d03  recall   0.0%  opening false think-end false answer false  784 tokens
+[1428/1512] t1 r3 d41  recall 100.0%  opening false think-end false answer false  755 tokens
+[1429/1512] c1 r6 d04  recall  33.3%  opening true think-end true answer true  616 tokens
+[1430/1512] b1 r6 d04  recall  33.3%  opening true think-end true answer true  678 tokens
+[1431/1512] r1 r3 t34  recall 100.0%  opening false think-end false answer false  969 tokens
+2026-11-24T15:09:22.497868Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-t14-6b0504ea-a1" attempt=1
+[1432/1512] t1 r3 a38  recall 100.0%  opening false think-end false answer false  2154 tokens
+[1433/1512] t1 r3 t34  recall 100.0%  opening false think-end false answer false  1902 tokens
+[1434/1512] r1 r3 t04  recall 100.0%  opening false think-end false answer false  1490 tokens
+[1435/1512] b1 r6 a06  recall  50.0%  opening true think-end true answer true  1031 tokens
+[1436/1512] c1 r6 a06  recall  50.0%  opening true think-end true answer true  1105 tokens
+[1437/1512] r1 r3 d04  recall  33.3%  opening false think-end false answer false  605 tokens
+[1438/1512] t1 r3 d04  recall 100.0%  opening false think-end false answer false  839 tokens
+[1439/1512] c1 r6 d40  recall   0.0%  opening false think-end false answer false  2031 tokens
+[1440/1512] r1 r3 d40  recall   0.0%  opening false think-end false answer false  285 tokens
+[1441/1512] r1 r3 d41  recall 100.0%  opening false think-end false answer false  922 tokens
+[1442/1512] b1 r6 d27  recall   0.0%  opening false think-end false answer false  322 tokens
+[1443/1512] c1 r6 d27  recall   0.0%  opening false think-end true answer true  565 tokens
+[1444/1512] r1 r3 a38  recall  75.0%  opening false think-end false answer false  1140 tokens
+[1445/1512] t1 r3 t17  recall 100.0%  opening false think-end false answer false  2868 tokens
+[1446/1512] b1 r6 d40  recall   0.0%  opening false think-end false answer false  3130 tokens
+[1447/1512] c1 r6 a18  recall  50.0%  opening false think-end true answer true  911 tokens
+[1448/1512] b1 r6 a18  recall  25.0%  opening false think-end false answer false  881 tokens
+[1449/1512] r1 r3 a06  recall  50.0%  opening false think-end false answer false  817 tokens
+[1450/1512] c1 r6 a13  recall  80.0%  opening true think-end true answer true  1459 tokens
+[1451/1512] t1 r3 d40  recall 100.0%  opening false think-end false answer false  1334 tokens
+[1452/1512] b1 r6 a13  recall  40.0%  opening true think-end true answer true  2002 tokens
+[1453/1512] c1 r6 d08  recall   0.0%  opening true think-end false answer false  860 tokens
+[1454/1512] t1 r3 d27  recall 100.0%  opening false think-end false answer false  1498 tokens
+[1455/1512] b1 r6 d08  recall   0.0%  opening true think-end false answer false  639 tokens
+[1456/1512] r1 r3 d27  recall 100.0%  opening false think-end false answer false  946 tokens
+[1457/1512] t1 r3 a06  recall  50.0%  opening false think-end false answer false  1473 tokens
+[1458/1512] t1 r3 d08  recall 100.0%  opening false think-end false answer false  722 tokens
+[1459/1512] c1 r6 d32  recall   0.0%  opening false think-end false answer false  759 tokens
+[1460/1512] r1 r3 a18  recall  25.0%  opening false think-end false answer false  1403 tokens
+[1461/1512] b1 r6 d32  recall   0.0%  opening false think-end false answer false  1717 tokens
+[1462/1512] b1 r6 t38  recall   0.0%  opening false think-end false answer false  1054 tokens
+[1463/1512] b1 r6 a23  recall   0.0%  opening false think-end false answer false  1284 tokens
+[1464/1512] t1 r3 d32  recall 100.0%  opening false think-end false answer false  1288 tokens
+[1465/1512] r1 r3 a13  recall  60.0%  opening false think-end false answer false  1729 tokens
+[1466/1512] c1 r6 t38  recall   0.0%  opening false think-end false answer false  635 tokens
+[1467/1512] c1 r6 a23  recall   0.0%  opening false think-end true answer true  3371 tokens
+[1468/1512] r1 r3 d08  recall 100.0%  opening false think-end false answer false  543 tokens
+[1469/1512] t1 r3 a18  recall 100.0%  opening false think-end false answer false  1548 tokens
+[1470/1512] c1 r6 a01  recall 100.0%  opening false think-end true answer true  504 tokens
+[1471/1512] b1 r6 a01  recall 100.0%  opening false think-end false answer false  313 tokens
+[1472/1512] c1 r6 d42  recall   0.0%  opening false think-end false answer false  329 tokens
+[1473/1512] r1 r3 d32  recall 100.0%  opening false think-end false answer false  683 tokens
+[1474/1512] t1 r3 d42  recall 100.0%  opening false think-end false answer false  709 tokens
+[1475/1512] b1 r6 t28  recall 100.0%  opening true think-end true answer true  966 tokens
+[1476/1512] t1 r3 t14  recall  80.0%  opening false think-end false answer false  2914 tokens
+[1477/1512] r1 r3 a23  recall  25.0%  opening false think-end false answer false  1588 tokens
+[1478/1512] r1 r3 t38  recall  25.0%  opening false think-end false answer false  1513 tokens
+[1479/1512] b1 r6 d42  recall   0.0%  opening false think-end false answer false  3217 tokens
+[1480/1512] r1 r3 d42  recall 100.0%  opening false think-end false answer false  537 tokens
+[1481/1512] r1 r3 a01  recall 100.0%  opening false think-end false answer false  283 tokens
+[1482/1512] c1 r6 t28  recall  80.0%  opening true think-end true answer true  2493 tokens
+[1483/1512] t1 r3 a01  recall 100.0%  opening false think-end false answer false  948 tokens
+[1484/1512] b1 r6 a10  recall  80.0%  opening true think-end true answer true  1352 tokens
+[1485/1512] b1 r6 a14  recall  25.0%  opening true think-end true answer true  1007 tokens
+[1486/1512] c1 r6 a10  recall  20.0%  opening true think-end true answer true  1919 tokens
+[1487/1512] c1 r6 a14  recall  75.0%  opening true think-end true answer true  759 tokens
+[1488/1512] r1 r3 t28  recall  80.0%  opening false think-end false answer false  2098 tokens
+[1489/1512] c1 r6 t09  recall  75.0%  opening true think-end true answer true  1695 tokens
+[1490/1512] r1 r3 a14  recall 100.0%  opening false think-end false answer false  991 tokens
+2026-11-24T15:33:34.231685Z  WARN dependency_battery::run: the answer failed: the chat request: error sending request 
+for url (http://192.168.1.2:8081/v1/chat/completions): operation timed out 
+conv="mcp:685da41c19f7f5ff:battery-128/t1-r3-a13-6b0504ea-a1" attempt=1
+[1491/1512] b1 r6 d37  recall   0.0%  opening false think-end false answer false  541 tokens
+[1492/1512] t1 r3 a23  recall 100.0%  opening false think-end false answer false  2372 tokens
+[1493/1512] r1 r3 t09  recall   0.0%  opening false think-end false answer false  624 tokens
+[1494/1512] t1 r3 d37  recall 100.0%  opening false think-end false answer false  542 tokens
+[1495/1512] b1 r6 t09  recall 100.0%  opening true think-end true answer true  3826 tokens
+[1496/1512] c1 r6 d37  recall   0.0%  opening false think-end false answer false  2018 tokens
+[1497/1512] r1 r3 a10  recall   0.0%  opening false think-end false answer false  2277 tokens
+[1498/1512] c1 r6 d20  recall   0.0%  opening true think-end false answer false  1563 tokens
+[1499/1512] t1 r3 t38  recall 100.0%  opening false think-end false answer false  3275 tokens
+[1500/1512] t1 r3 t28  recall 100.0%  opening false think-end false answer false  3074 tokens
+[1501/1512] t1 r3 d20  recall 100.0%  opening false think-end false answer false  509 tokens
+[1502/1512] c1 r6 d21  recall   0.0%  opening false think-end false answer false  426 tokens
+[1503/1512] t1 r3 t09  recall 100.0%  opening false think-end false answer false  1512 tokens
+[1504/1512] t1 r3 a14  recall  75.0%  opening false think-end false answer false  1730 tokens
+[1505/1512] b1 r6 d21  recall   0.0%  opening false think-end false answer false  242 tokens
+[1506/1512] t1 r3 d21  recall 100.0%  opening false think-end false answer false  491 tokens
+[1507/1512] r1 r3 d20  recall   0.0%  opening false think-end false answer false  266 tokens
+[1508/1512] r1 r3 d21  recall   0.0%  opening false think-end false answer false  341 tokens
+[1509/1512] b1 r6 d20  recall   0.0%  opening false think-end false answer false  5932 tokens
+[1510/1512] t1 r3 a10  recall  80.0%  opening false think-end false answer false  2866 tokens
+[1511/1512] r1 r3 d37  recall 100.0%  opening false think-end false answer false  1068 tokens
+[1512/1512] t1 r3 a13  recall  80.0%  opening false think-end false answer false  3326 tokens
+K/V census written to docs/results/battery_128\census_end.json

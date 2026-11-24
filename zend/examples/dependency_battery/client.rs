@@ -23,6 +23,7 @@ use anyhow::{bail, Context};
 use reqwest::Client;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tokio::time::sleep;
 
 use cluster::gateway::NODE_HEADER;
 
@@ -195,6 +196,43 @@ impl Zend {
     pub async fn sample(&self, path: &str) -> anyhow::Result<Value> {
         self.get_json(&format!("{}{path}", self.base)).await
     }
+
+    /// Whether the member reports itself ready to serve.
+    async fn ready(&self) -> bool {
+        self.sample("/v1/status")
+            .await
+            .is_ok_and(|s| status_is_ready(&s))
+    }
+
+    /// After a failed answer: whether the member was down, waiting until it
+    /// serves again, for at most [`READY_WAIT`]. A failure while the member
+    /// restarts is the deploy's, not the answer's, so it costs the answer no
+    /// try; a member that never comes back within the wait answers `false`,
+    /// and the try counts.
+    pub async fn was_down(&self) -> bool {
+        if self.ready().await {
+            return false;
+        }
+        let since = Instant::now();
+        while since.elapsed() < READY_WAIT {
+            sleep(READY_POLL).await;
+            if self.ready().await {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// How often a down member is asked whether it serves again.
+pub const READY_POLL: Duration = Duration::from_secs(15);
+
+/// The longest the battery waits for a member to come back.
+pub const READY_WAIT: Duration = Duration::from_secs(3_600);
+
+/// Whether a `/v1/status` answer says the member serves.
+pub fn status_is_ready(status: &Value) -> bool {
+    status.get("state").and_then(Value::as_str) == Some("ready")
 }
 
 /// Whether a reply is no answer at all: nothing said and nothing decoded — a
@@ -317,6 +355,15 @@ mod tests {
         assert!(answered_nothing("  \n", 0));
         assert!(!answered_nothing("", 12), "decoded tokens are an answer");
         assert!(!answered_nothing("I do not remember.", 5));
+    }
+
+    /// Only a member that says `ready` serves; loading, draining or a body
+    /// with no state is down.
+    #[test]
+    fn a_member_serves_only_when_it_says_ready() {
+        assert!(status_is_ready(&json!({"state": "ready"})));
+        assert!(!status_is_ready(&json!({"state": "loading"})));
+        assert!(!status_is_ready(&json!({})));
     }
 
     #[test]
