@@ -56,13 +56,13 @@ const MERGED_VALUES: usize = HIDDEN * MERGE * MERGE;
 /// (16 384 patches) — against twice that at z_image's 1 024, for one more
 /// launch pair per band on an image the size of a screen.
 pub const ATTN_BAND: usize = 512;
-/// Activation bytes per patch a forward needs at its peak: one block's
-/// intermediates (the residual, its norm, `qkv`, the rotated heads and the
-/// context, about 13 hidden widths; the MLP's 4 304, twice), one band's scores
-/// and probabilities — each band a stage of its own, so they never sum — and
-/// the chain's two carried hidden states: about 100 KiB in bf16, with the
-/// margin a carve's alignment and the merger's tail take. The embedding is a
-/// stage before the chain, so its patch rows are gone by the first block.
+/// Activation bytes per patch a forward needs at its peak: the larger half of
+/// one block — the attention's norm, `qkv`, rotated heads and context, with
+/// one band's scores and probabilities, each band a stage of its own so they
+/// never sum; the MLP's 4 304 twice is the smaller — and the hidden states
+/// carried at the top of the arena: the chain's two, the embedding's, and the
+/// half's own. The embedding and each block half are stages, so no two of
+/// them hold intermediates at once.
 pub const ACTIVATION_BYTES_PER_PATCH: usize = 128 * 1024;
 
 /// One image, resized to its grid: RGB8, row-major, `grid.height · grid.width · 3`
@@ -129,7 +129,17 @@ impl Block {
     }
 
     /// `x += attn(ln1(x)); x += mlp(ln2(x))` over one image's `[n, 1152]`.
+    ///
+    /// Each half is a guest stage, so on a guest arena the attention's
+    /// intermediates are gone before the MLP's are carved, and the arena holds
+    /// the larger half rather than their sum.
     fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+        let x = guest_stage(x, |x| self.attend(x, cos, sin))?;
+        guest_stage(&x, |x| self.mlp(x))
+    }
+
+    /// `x + attn(ln1(x))`.
+    fn attend(&self, x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
         let n = x.dim(0)?;
         let qkv = self
             .qkv
@@ -150,8 +160,12 @@ impl Block {
             .transpose(0, 1)?
             .contiguous()?
             .reshape((n, HIDDEN))?;
-        let x = (x + self.proj.forward(&ctx)?)?;
-        let h = self.up.forward(&self.ln2.forward(&x)?)?.gelu()?;
+        x + self.proj.forward(&ctx)?
+    }
+
+    /// `x + mlp(ln2(x))`.
+    fn mlp(&self, x: &Tensor) -> Result<Tensor> {
+        let h = self.up.forward(&self.ln2.forward(x)?)?.gelu()?;
         x + self.down.forward(&h)?
     }
 }
