@@ -89,7 +89,11 @@ pub fn banded(q: &Tensor, kt: &Tensor, v: &Tensor, band: usize) -> Result<Tensor
     let mut bands = Vec::with_capacity(seq.div_ceil(band));
     for start in (0..seq).step_by(band) {
         let rows = band.min(seq - start);
-        bands.push(guest_stage(&q.narrow(2, start, rows)?, |q| {
+        // A band of rows is a strided view of `q` across its heads; a stage
+        // copies its input in whole, which takes it contiguous — one band of
+        // `q`, beside the band's scores.
+        let q_band = q.narrow(2, start, rows)?.contiguous()?;
+        bands.push(guest_stage(&q_band, |q| {
             let scores = q.matmul(kt)?;
             let probs = softmax_last_dim(&scores)?;
             probs.matmul(v)
