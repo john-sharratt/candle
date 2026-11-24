@@ -82,6 +82,9 @@ pub(super) mod tests {
         /// rows add to the forward.
         pub(in super::super) store: u64,
         pub(in super::super) tier: u64,
+        /// Every prefill or section offered takes the whole of its turn
+        /// (`Cost::finishes`).
+        pub(in super::super) finishes: bool,
     }
 
     impl Fake {
@@ -111,6 +114,7 @@ pub(super) mod tests {
                 streams: false,
                 store: 0,
                 tier: 0,
+                finishes: false,
             }
         }
         pub(in super::super) fn queue(&mut self, kind: Kind) -> &mut Vec<u64> {
@@ -190,6 +194,7 @@ pub(super) mod tests {
                 Kind::Decode => (0, 0),
                 _ => (self.store, self.tier),
             };
+            let finishes = kind != Kind::Decode && rows > 0 && self.finishes;
             self.queue(kind).first().map(|&kv| Cost {
                 kv,
                 recurrent,
@@ -197,6 +202,7 @@ pub(super) mod tests {
                 rows,
                 decodes_after,
                 ahead,
+                finishes,
                 ..Default::default()
             })
         }
@@ -480,9 +486,14 @@ pub(super) mod tests {
     /// a card that holds its experts takes either. With nothing waiting for
     /// rows, the first turn is the wave's work and is admitted whatever its
     /// store, and the one behind it is judged against it.
+    ///
+    /// **The rule is for turns the forward cannot take whole.** A turn whose
+    /// rows are its whole prefill claims its store for its decode in whatever
+    /// wave it runs, so it is admitted beside the others however small its
+    /// rows: three short turns queued behind standing rows all join.
     #[test]
     fn a_streaming_cards_new_store_must_buy_its_ground_in_rows() {
-        let offer = |streams: bool, standing: usize, tier: u64, queued: usize| {
+        let offer = |streams: bool, standing: usize, tier: u64, queued: usize, finishes: bool| {
             let mut f = Fake::new(Vec::new(), vec![REGION; queued], 12 << 30);
             f.active = 4;
             f.standing = standing;
@@ -490,28 +501,39 @@ pub(super) mod tests {
             f.prefill_prio = DecodePriority::High;
             f.store = 4 * REGION;
             f.tier = tier;
+            f.finishes = finishes;
             let got = fill_once(&mut f);
             (got.prefills, got.stopped_on_rate)
         };
         assert_eq!(
-            offer(true, 512, REGION, 1),
+            offer(true, 512, REGION, 1, false),
             (0, true),
             "its rows buy a quarter of its store: refused"
         );
         assert_eq!(
-            offer(true, 512, 4 * REGION, 1),
+            offer(true, 512, 4 * REGION, 1, false),
             (1, false),
             "its rows buy its store: admitted"
         );
         assert_eq!(
-            offer(false, 512, REGION, 1),
+            offer(false, 512, REGION, 1, false),
             (1, false),
             "a card holding its experts trades it as before"
         );
         assert_eq!(
-            offer(true, 0, REGION, 2),
+            offer(true, 0, REGION, 2, false),
             (1, true),
             "nothing waiting: the first is admitted, the second crowds it"
+        );
+        assert_eq!(
+            offer(true, 512, REGION, 1, true),
+            (1, false),
+            "a turn that finishes in this forward joins beside standing rows"
+        );
+        assert_eq!(
+            offer(true, 0, REGION, 3, true),
+            (3, false),
+            "short turns queued together all join the one forward"
         );
     }
 

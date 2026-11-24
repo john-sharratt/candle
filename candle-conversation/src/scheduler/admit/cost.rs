@@ -98,6 +98,15 @@ pub(crate) struct Cost {
     /// refusal neither closes the forward's rows nor says the wave is full for
     /// the bands after it.
     pub ahead: bool,
+    /// This admission's rows are the whole of its turn's prefill: it finishes
+    /// prefilling in the forward it joins, rather than holding its store across
+    /// the narrow forwards of a turn the forward cannot take whole.
+    ///
+    /// Read by the streaming card's store rule (`admit::fill`): a turn that
+    /// finishes in one forward claims its store for the decode it becomes
+    /// whichever wave it runs in, so refusing it saves no residency and only
+    /// moves it to a later wave, where it is carried as that wave's head.
+    pub finishes: bool,
 }
 
 impl Cost {
@@ -247,6 +256,7 @@ mod tests {
             rows: 128,
             decodes_after: false,
             ahead: false,
+            finishes: false,
         };
         assert_eq!(c.total(), 3_210);
         assert_eq!(Cost::default().total(), 0);
@@ -270,6 +280,7 @@ mod tests {
             rows: 128,
             decodes_after: false,
             ahead: false,
+            finishes: false,
         };
         assert_eq!(c.claimed_bytes(), 2 * region, "rounded up, tier excluded");
         assert_eq!(Cost::default().claimed_bytes(), 0);
@@ -305,6 +316,7 @@ mod tests {
             rows: 8,
             decodes_after: false,
             ahead: false,
+            finishes: false,
         };
         assert_eq!(step.claimed_bytes(), 0);
         assert_eq!(step.dislodged_bytes(), 3 * region);
@@ -337,6 +349,7 @@ mod tests {
             rows: 3,
             decodes_after: false,
             ahead: false,
+            finishes: false,
         };
         assert_eq!(step.claimed_bytes(), 0);
     }

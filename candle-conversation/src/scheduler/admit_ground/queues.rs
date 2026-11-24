@@ -122,6 +122,7 @@ impl AdmitPass<'_> {
             rows,
             decodes_after: false,
             ahead,
+            finishes: finishes_whole(rows, turn),
         }))
     }
 
@@ -242,6 +243,7 @@ impl AdmitPass<'_> {
             // the decode model's judgement in play beside the prefill one.
             decodes_after: true,
             ahead,
+            finishes: finishes_whole(rows, turn),
         }))
     }
 
@@ -280,6 +282,7 @@ impl AdmitPass<'_> {
             rows,
             decodes_after: true,
             ahead,
+            finishes: finishes_whole(rows, turn),
         }))
     }
 
@@ -405,5 +408,28 @@ impl AdmitPass<'_> {
             .committed
             .saturating_add(cost.dislodged_bytes().saturating_sub(carved));
         true
+    }
+}
+
+/// Whether an offer of `rows` takes the whole of a `turn`-token prefill — it
+/// finishes in the forward it joins (`Cost::finishes`). A join of no rows
+/// advances nothing, so it finishes nothing.
+fn finishes_whole(rows: usize, turn: usize) -> bool {
+    rows > 0 && rows >= turn
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finishes_whole;
+
+    /// A turn finishes when its offer takes every token it has; a turn clipped
+    /// to the forward's free rows, or a join of none, does not.
+    #[test]
+    fn an_offer_finishes_its_turn_only_when_it_takes_all_of_it() {
+        assert!(finishes_whole(18, 18), "an NPC turn taken whole");
+        assert!(finishes_whole(512, 18), "room to spare");
+        assert!(!finishes_whole(128, 5_000), "clipped to the forward's rows");
+        assert!(!finishes_whole(0, 18), "a join advances nothing");
+        assert!(!finishes_whole(0, 0), "nothing to take is not finishing");
     }
 }

@@ -60,6 +60,7 @@ use candle_transformers::models::z_image::{
     model as zi, quantized_model as zq, sampling, TextEncoder,
 };
 
+use super::gguf_pick::Pick;
 use super::ground::GuestGround;
 use super::groundgguf::{ground_bytes, place_gguf};
 use super::model::GuestModel;
@@ -84,6 +85,12 @@ const VAE_SHIFT: f64 = 0.1159;
 /// the last, un-normed. The final layer is specialised toward predicting a
 /// token, which is not what conditioning wants.
 const ENCODER_SKIP_LAST: usize = 1;
+
+/// The text encoder's tensors: all but its embedding table, which is read on
+/// the host ([`EmbedTable`]) and never placed.
+const ENCODER_PICK: Pick = Pick {
+    skip: &[EMBED_TOKENS],
+};
 
 /// The width the autoencoder holds its weights and runs its decode at.
 ///
@@ -242,8 +249,8 @@ impl ImageGuest {
     /// [`super::groundgguf::ground_bytes`]. A claim that is short fails at the
     /// last tensor, after the engine has already been evicted for it.
     fn weight_bytes(&self, mode: Int8Mode, transformer: &Path) -> usize {
-        let t = ground_bytes(transformer, mode, &[]).unwrap_or(0);
-        let e = ground_bytes(&self.spec.text_encoder, mode, &[EMBED_TOKENS]).unwrap_or(0);
+        let t = ground_bytes(transformer, mode, Pick::default()).unwrap_or(0);
+        let e = ground_bytes(&self.spec.text_encoder, mode, ENCODER_PICK).unwrap_or(0);
         staged(e, t + vae_bytes(&self.spec.vae))
     }
 }
@@ -384,13 +391,7 @@ impl GuestModel for ImageGuest {
             let table = EmbedTable::from_gguf(&self.spec.text_encoder, &cfg)
                 .map_err(|e| format!("image guest: the embedding table: {e}"))?;
             stage("placing the text encoder");
-            let vb = place_gguf(
-                &self.spec.text_encoder,
-                device,
-                ground,
-                mode,
-                &[EMBED_TOKENS],
-            )?;
+            let vb = place_gguf(&self.spec.text_encoder, device, ground, mode, ENCODER_PICK)?;
             stage("building the text encoder");
             let encoder = TextEncoder::new(&cfg, ENCODER_SKIP_LAST, mode, vb)
                 .map_err(|e| format!("image guest: the text encoder: {e}"))?;
@@ -447,7 +448,7 @@ impl GuestModel for ImageGuest {
             path = ?transformer_path,
             "image guest: transformer variant"
         );
-        let vb = place_gguf(&transformer_path, device, ground, mode, &[])?;
+        let vb = place_gguf(&transformer_path, device, ground, mode, Pick::default())?;
         stage("building the transformer");
         let transformer = zq::ZImageTransformer::new(zi::Config::turbo(), mode, vb)
             .map_err(|e| format!("image guest: the transformer: {e}"))?;

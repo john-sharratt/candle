@@ -161,25 +161,21 @@ pub(crate) enum ZoneFloor {
 
 /// Where an evicted expert's next miss is served from.
 ///
-/// The warm tier and the NVMe pack hold disjoint experts, and the model's
-/// routing is trained balanced, so which experts VRAM holds barely moves its
-/// hit rate — it decides where the misses land. Every slot VRAM spends on a
-/// warm-backed expert leaves one more pack-only expert to miss on disk (a
-/// 2.9 MB page-cache-bypassing read near a millisecond, against ~116 µs H2D
-/// from pinned host memory). So every eviction runs its policy one reload tier
-/// at a time — warm-backed first by default ([`EVICTION_PASSES`]), and in the
-/// order of each class's measured expected miss cost once that is known
-/// ([`ExpertCacheInner::set_eviction_costs`]), which prices exactly this
-/// difference in restore cost.
+/// A pack-only expert costs a drive read and a copy to bring back (a 2.9 MB
+/// page-cache-bypassing read near a millisecond), a warm-backed one the copy
+/// alone (~116 µs H2D from pinned host memory). Eviction weighs that as a
+/// **tilt, not a pass**: a pack-only resident's key is scaled by
+/// [`PACK_ONLY_PROTECTION`] and it competes with every warm-backed one on the
+/// same least-used order ([`tier_protection`]).
 ///
-/// Measured on Flash-Next at 16 GB against the single-pass policy: pack share
-/// of loads 68 % → 61 / 63 / 50 % (BF16×1 / BF16×8 / C5×2), decode 16.2 /
-/// 72.1 / 30.1 → 16.2 / 74.4 / 32.1 t/s, for a hit rate 2–3 points lower.
-/// Protecting the hottest 20 % or 40 % of residents from the first pass
-/// recovered under a point of that hit rate, gave back the pack saving about
-/// as fast, and decoded no faster — the frequency signal is spread across the
-/// warm-backed experts, not concentrated at the top, and a warm miss is cheap
-/// enough that the extra ones cost less than the pack reads they replace.
+/// A pass — every warm-backed resident before any pack-only one — let the tier
+/// decide alone wherever the two disagreed, and the startup fill made that
+/// permanent. The experts VRAM holds at startup are exactly the ones the warm
+/// draw skips first, so they were all pack-only; behind a hard pass they never
+/// turned over, however little decode routed them. Measured on WhiteWorld
+/// (Flash-Next, RTX 3090, build 5482): layers 2–10 held all 512 experts each on
+/// the card — ~4,600 slots for a decode that routes ten a layer — while layers
+/// 11–47 churned through the ~1,100 slots left and decoded 6.6 of 10 from VRAM.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum ReloadTier {
     /// A warm (host) copy exists — the cheap reload.
@@ -188,10 +184,30 @@ pub(super) enum ReloadTier {
     Nvme,
 }
 
-/// The order eviction passes visit residents in until their costs are measured
-/// ([`ExpertCacheInner::set_eviction_costs`]): each reload tier, and within it
-/// first the experts their row did **not** route on its last visit, then the
-/// ones it did (`hit_last`).
+/// How much more a pack-only resident's key is worth than a warm-backed one's
+/// at the same score: twice.
+///
+/// Small on purpose. It sits inside the same order as frequency and distance
+/// rather than above them: a pack-only expert decode has stopped routing still
+/// goes before a warm-backed one it keeps routing, and among never-used
+/// residents (score zero, where no factor separates anything) the tier only
+/// breaks a tie of distance ([`VictimKey::order`]). Twice is well inside the
+/// ~4× span of [`behind_protection`], so position still steers churn behind
+/// the wave across both tiers.
+pub(super) const PACK_ONLY_PROTECTION: f32 = 2.0;
+
+/// The reload-cost factor a resident's key is scaled by: 1 for a warm-backed
+/// expert, [`PACK_ONLY_PROTECTION`] for a pack-only one.
+pub(super) fn tier_protection(tier: ReloadTier) -> f32 {
+    match tier {
+        ReloadTier::Warm => 1.0,
+        ReloadTier::Nvme => PACK_ONLY_PROTECTION,
+    }
+}
+
+/// The order eviction passes visit residents in: first the experts their row
+/// did **not** route on its last visit, then the ones it did (`hit_last`) —
+/// each pass over both reload tiers.
 ///
 /// **Recency is a pass, not a weight.** Decode routing carries over from one
 /// step to the next: of the experts a row routed on its last visit, 37–63% are
@@ -201,43 +217,31 @@ pub(super) enum ReloadTier {
 /// passes ago still 2–3 — so ranked by score alone those just-hit experts were
 /// 54% of the victims at ×1 and 82% at ×8, and accounted for most of the
 /// evictions their rows then missed. As a pass they go only once every other
-/// resident of the tier has.
-///
-/// **Inside the reload tier, not above it**, because the costs say so: a warm
-/// miss reloads in ~116 µs and a pack-only one in ~1 ms, so a warm just-hit
-/// victim (37–63% back × 116 µs) is still cheaper than a pack-only cold one
-/// (10–21% × 1 ms).
-pub(super) const EVICTION_PASSES: [(ReloadTier, bool); 4] = [
-    (ReloadTier::Warm, false),
-    (ReloadTier::Warm, true),
-    (ReloadTier::Nvme, false),
-    (ReloadTier::Nvme, true),
-];
-
-/// A pass's eviction class, as the ledger indexes them (`regret`).
-pub(super) fn pass_class((tier, hit): (ReloadTier, bool)) -> usize {
-    class_index(hit, tier == ReloadTier::Warm)
-}
+/// resident has.
+pub(super) const RECENCY_PASSES: [bool; 2] = [false, true];
 
 /// One eviction candidate as the batch scans rank it within a pass.
 #[derive(Clone, Copy)]
 pub(super) struct VictimKey {
     pub(super) slot: usize,
-    /// Frequency, with whatever positional factor the scan applies.
+    /// Frequency, with the positional and reload-cost factors the scan applies.
     pub(super) score: f32,
     /// Wrapped forward distance from the current layer.
     pub(super) dist: usize,
+    /// A warm copy backs it: among exact ties, the cheaper reload goes first.
+    pub(super) warm: bool,
     pub(super) lru: u32,
 }
 
 impl VictimKey {
-    /// Best victim first: lowest score, then farthest, then least recently
-    /// used.
+    /// Best victim first: lowest score, then farthest, then warm-backed, then
+    /// least recently used.
     pub(super) fn order(a: &Self, b: &Self) -> Ordering {
         a.score
             .partial_cmp(&b.score)
             .unwrap_or(Ordering::Equal)
             .then(b.dist.cmp(&a.dist))
+            .then(b.warm.cmp(&a.warm))
             .then(a.lru.cmp(&b.lru))
     }
 }

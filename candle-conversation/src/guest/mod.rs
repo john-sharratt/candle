@@ -52,6 +52,7 @@
 pub mod checkpoint;
 pub mod drain;
 pub mod foreground;
+pub mod gguf_pick;
 pub mod ground;
 pub mod groundgguf;
 pub mod image;

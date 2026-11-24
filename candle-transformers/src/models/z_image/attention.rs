@@ -28,6 +28,8 @@
 //! between bands. What it buys is peak memory, not time.
 
 use candle::{DType, Result, Tensor, D};
+use candle_nn::kv_cache::guest_stage;
+use candle_nn::ops::softmax_last_dim;
 
 /// How many query rows one attention band covers.
 ///
@@ -64,7 +66,7 @@ pub fn reference(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     // max and its exponent sum in f32 (`SOFTMAX_OP(__nv_bfloat16, float, …)` in
     // `reduce.cu`), so widening first would buy nothing and cost two full passes
     // over a tensor that is 1 GiB at 1024×1024.
-    let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+    let probs = softmax_last_dim(&scores)?;
     probs.matmul(v)
 }
 
@@ -73,6 +75,12 @@ pub fn reference(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
 /// `q` is expected pre-scaled. `kt` is `k` already transposed to `[b, h, d, s]`
 /// and made contiguous — taken as an argument because it is loop-invariant and
 /// transposing it inside would be a copy per band.
+///
+/// Each band is a guest stage: on a guest arena its scores and probabilities
+/// rewind as the band closes and only its `[b, h, rows, d]` result is carried,
+/// so the arena holds one band's scores, never the sum of every band's — which
+/// would grow with the square of the sequence. With no arena open the stage is
+/// the identity.
 pub fn banded(q: &Tensor, kt: &Tensor, v: &Tensor, band: usize) -> Result<Tensor> {
     let seq = q.dim(2)?;
     if band == 0 {
@@ -81,9 +89,15 @@ pub fn banded(q: &Tensor, kt: &Tensor, v: &Tensor, band: usize) -> Result<Tensor
     let mut bands = Vec::with_capacity(seq.div_ceil(band));
     for start in (0..seq).step_by(band) {
         let rows = band.min(seq - start);
-        let scores = q.narrow(2, start, rows)?.matmul(kt)?;
-        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        bands.push(probs.matmul(v)?);
+        // A band of rows is a strided view of `q` across its heads; a stage
+        // copies its input in whole, which takes it contiguous — one band of
+        // `q`, beside the band's scores.
+        let q_band = q.narrow(2, start, rows)?.contiguous()?;
+        bands.push(guest_stage(&q_band, |q| {
+            let scores = q.matmul(kt)?;
+            let probs = softmax_last_dim(&scores)?;
+            probs.matmul(v)
+        })?);
     }
     if bands.len() == 1 {
         return Ok(bands.remove(0));

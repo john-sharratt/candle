@@ -2231,7 +2231,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // ── images (docs/flash_next_vision.md §6.1) ──────────────────────────────
   // An image a message shows travels with it, as a data: URL in an image part.
   // Once the turn is stored its text names each image by a marker the daemon
-  // wrote, and the bubble draws it from GET /v1/images/{id}.
+  // wrote, and the bubble draws its thumbnail from GET /v1/images/{id}/thumb;
+  // a click opens the original, GET /v1/images/{id}, over the page.
   const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|tiff?)$/i;
   const MAX_PENDING_IMAGES = 4;
   const IMAGE_MARKER = /^\[image ([0-9a-f]{16}) \d+×\d+\]\n/;
@@ -2252,24 +2253,40 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     S.pendingImages = (S.pendingImages || []).filter((_, j) => j !== i);
     render();
   }
+  // An image as a message draws it: the picture shown in the strip, and the
+  // one opened over the page. A data: URL is both.
+  function imageOf(url) { return { thumb: url, full: url }; }
   // A user message's images and its text: the images it was sent with, or the
-  // ones its stored text names.
+  // ones its stored text names — each its thumbnail, opening to its original.
   function userParts(m) {
-    if (m.images && m.images.length) return { images: m.images, text: m.content };
+    if (m.images && m.images.length) return { images: m.images.map(imageOf), text: m.content };
     let text = m.content || '';
     const images = [];
     let hit;
     while ((hit = IMAGE_MARKER.exec(text))) {
-      images.push('/v1/images/' + hit[1]);
+      images.push({ thumb: '/v1/images/' + hit[1] + '/thumb', full: '/v1/images/' + hit[1] });
       text = text.slice(hit[0].length);
     }
     return { images, text };
   }
-  function imageStrip(srcs, size, onRemove) {
+  // A row of images at `size` px high. With `onRemove` they are the composer's,
+  // each with its remove button; without, each opens its original on a click.
+  function imageStrip(images, size, onRemove) {
     return h('div', { style: 'display:flex; flex-wrap:wrap; gap:6px; margin-bottom:0.45rem;' },
-      ...srcs.map((src, i) => h('div', { style: 'position:relative;' },
-        h('img', { src, alt: 'image ' + (i + 1), style: 'display:block; max-height:' + size + 'px; max-width:100%; border-radius:8px; border:1px solid #38342f;' }),
+      ...images.map((im, i) => h('div', { style: 'position:relative;' },
+        h('img', {
+          src: im.thumb, alt: 'image ' + (i + 1),
+          title: onRemove ? null : 'Open the image',
+          onClick: onRemove ? null : () => setState({ imageView: im.full }),
+          style: 'display:block; max-height:' + size + 'px; max-width:100%; border-radius:8px; border:1px solid #38342f;' + (onRemove ? '' : ' cursor:zoom-in;'),
+        }),
         onRemove ? h('button', { 'aria-label': 'Remove image', title: 'Remove', onClick: () => onRemove(i), style: 'position:absolute; top:3px; right:3px; width:20px; height:20px; border-radius:10px; border:none; background:rgba(0,0,0,0.65); color:#ece8e4; cursor:pointer; font-size:12px; line-height:20px; padding:0;' }, '×') : null)));
+  }
+  // The opened image, over the page at the largest size that fits it; a click
+  // anywhere or Escape closes it.
+  function buildImageViewer() {
+    return h('div', { class: 'z-modal-ov', onClick: () => setState({ imageView: null }), style: 'position:fixed; inset:0; z-index:480; background:rgba(0,0,0,0.85); display:flex; align-items:center; justify-content:center; padding:24px; cursor:zoom-out;' },
+      h('img', { src: S.imageView, alt: 'image', style: 'display:block; max-width:100%; max-height:100%; object-fit:contain; border-radius:6px;' }));
   }
 
   // ── files / upload ───────────────────────────────────────────────────────
@@ -2601,6 +2618,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       overlays.push(buildSidebarExpanded(true));
     }
     if (S.fileView) overlays.push(buildFileViewer());
+    if (S.imageView) overlays.push(buildImageViewer());
     if (S.journalEntry && S.journalEntry.convId === S.activeId) overlays.push(buildJournalModal());
     const kept = S.substrateOpen ? substrateOverlay() : null;
     if (kept) overlays.push(kept);
@@ -3424,7 +3442,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     const attachBtn = h('button', { 'aria-label': 'Attach files', title: 'Attach files', onClick: () => fileInput.click(), style: 'flex-shrink:0; width:32px; height:32px; border-radius:9px; border:1px solid #38342f; background:#232120; color:#8a8074; cursor:pointer; display:flex; align-items:center; justify-content:center; padding:0;', html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="width:15px;height:15px;"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>' });
 
     const box = h('div', { class: 'z-composer', style: 'display:flex; flex-direction:column; background:#232120; border:1px solid #38342f; border-radius:16px; padding:0.7rem 0.7rem 0.55rem 1rem; box-shadow:0 2px 14px rgba(0,0,0,0.28);' },
-      pending.length ? imageStrip(pending.map((p) => p.url), 72, dropPendingImage) : null,
+      pending.length ? imageStrip(pending.map((p) => imageOf(p.url)), 72, dropPendingImage) : null,
       ta,
       h('div', { style: 'display:flex; align-items:center; justify-content:space-between; gap:0.5rem; margin-top:0.3rem;' },
         h('div', { style: 'display:flex; align-items:center; gap:0.4rem; flex-wrap:wrap;' },
@@ -4732,7 +4750,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   // ── global handlers ──────────────────────────────────────────────────────
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
-    if (S.themeMenuOpen) setState({ themeMenuOpen: false });
+    if (S.imageView) setState({ imageView: null });
+    else if (S.themeMenuOpen) setState({ themeMenuOpen: false });
     else if (S.convMenuOpen) setState({ convMenuOpen: false });
     else if (S.topMenuOpen) setState({ topMenuOpen: false });
     else if (S.openMenu) setState({ openMenu: null });

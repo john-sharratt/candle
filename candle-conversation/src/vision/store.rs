@@ -1,6 +1,7 @@
-//! An image in the substrate: its original bytes and its rows, each a
-//! content-addressed blob, and a keyed record naming both by the image's id —
-//! `vision/image/<id>` — so whatever holds a turn's text finds its rows.
+//! An image in the substrate: its original bytes, its thumbnail and its rows,
+//! each a content-addressed blob, and a keyed record naming all three by the
+//! image's id — `vision/image/<id>` — so whatever holds a turn's text finds its
+//! rows, and whatever draws it finds its thumbnail.
 //!
 //! Blobs replicate with the substrate, so a member that adopts the turn finds
 //! the image too; the rows mean no path that rebuilds a turn has to run the
@@ -23,7 +24,7 @@ fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn unhex(text: &str) -> Option<[u8; 32]> {
+pub(super) fn unhex(text: &str) -> Option<[u8; 32]> {
     if text.len() != 64 {
         return None;
     }
@@ -34,14 +35,20 @@ fn unhex(text: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Keep `image`'s original bytes and `rows`, and name them by its id.
+/// Keep `image`'s original bytes and `rows`, and name them by its id, kept at
+/// `kept_ms` (Unix milliseconds) — the age an image no conversation uses is
+/// retired by (`vision::tenancy`).
 pub fn store_image(
     substrate: &SharedSubstrate,
     image: &PreparedImage,
     original: Vec<u8>,
     rows: &ImageRows,
+    kept_ms: u64,
 ) -> Result<(), String> {
     let original = substrate.put_blob(original).map_err(|e| e.to_string())?;
+    let thumb = substrate
+        .put_blob(image.thumb.clone())
+        .map_err(|e| e.to_string())?;
     let rows = substrate
         .put_blob(encode_rows(rows))
         .map_err(|e| e.to_string())?;
@@ -50,23 +57,40 @@ pub fn store_image(
             image_key(&image.id),
             json!({
                 "sha256": hex(&original),
+                "thumb": hex(&thumb),
                 "rows": hex(&rows),
                 "width": image.width,
                 "height": image.height,
+                "kept_ms": kept_ms,
             }),
         ))
         .map_err(|e| e.to_string())
 }
 
-/// The original bytes of the image `id`, when the substrate holds it.
-pub fn load_original(substrate: &SharedSubstrate, id: &str) -> Result<Option<Vec<u8>>, String> {
+/// The blob the record of image `id` names under `field`, when the substrate
+/// holds the image.
+fn load_named(
+    substrate: &SharedSubstrate,
+    id: &str,
+    field: &str,
+) -> Result<Option<Vec<u8>>, String> {
     let Some(obj) = substrate.custom_object(&image_key(id)) else {
         return Ok(None);
     };
-    let Some(sha) = obj.blob["sha256"].as_str().and_then(unhex) else {
-        return Err(format!("{}: no original named", image_key(id)));
+    let Some(sha) = obj.blob[field].as_str().and_then(unhex) else {
+        return Err(format!("{}: no {field} named", image_key(id)));
     };
     substrate.blob(&sha).map_err(|e| e.to_string())
+}
+
+/// The original bytes of the image `id`, when the substrate holds it.
+pub fn load_original(substrate: &SharedSubstrate, id: &str) -> Result<Option<Vec<u8>>, String> {
+    load_named(substrate, id, "sha256")
+}
+
+/// The thumbnail of the image `id`, a JPEG, when the substrate holds it.
+pub fn load_thumb(substrate: &SharedSubstrate, id: &str) -> Result<Option<Vec<u8>>, String> {
+    load_named(substrate, id, "thumb")
 }
 
 /// The rows of the image `id`, when the substrate holds them.

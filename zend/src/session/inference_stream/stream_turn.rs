@@ -72,9 +72,16 @@ pub(in super::super) fn run_inference_stream(
                 .send(Ok(StreamItem::Status("Reading the images…".into())))
                 .await;
             let (reader, refs) = (Arc::clone(&state), std::mem::take(&mut start.images));
+            let using = conv_id.clone();
+            // Each image the conversation reads is kept while it lasts
+            // (`vision::tenancy`).
             let read = tokio::task::spawn_blocking(move || {
                 let substrate = reader.engine.conversation().shared();
-                images::resolve(&reader.engine, &substrate, refs)
+                let read = images::resolve(&reader.engine, &substrate, refs)?;
+                for image in &read {
+                    note_use(&substrate, &image.id, &using)?;
+                }
+                Ok::<_, String>(read)
             })
             .await;
             match read {

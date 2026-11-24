@@ -27,15 +27,22 @@ pub enum PackFamily {
     /// The Qwen3.5 lineage: an expert section when it routes, a layer section
     /// when it is dense; a draft head, gate donor or tensor overrides fold in.
     Qwen35,
+    /// No section, every matmul weight stored as its KO twin
+    /// ([`super::twins`]) but the tensors named — ones the model reads densely,
+    /// such as a table it gathers rows from. For a loader that copies each
+    /// tensor straight to the card: a guest's weights.
+    Twinned(&'static [&'static str]),
 }
 
-/// Families are equal by kind, and a sparse-latent one by its arch's id — an
-/// `Arch` is a model, and two references to it are the same model.
+/// Families are equal by kind, a sparse-latent one by its arch's id — an
+/// `Arch` is a model, and two references to it are the same model — and a
+/// twinned one by the tensors it keeps verbatim.
 impl PartialEq for PackFamily {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             #[cfg(feature = "cuda")]
             (Self::Latent(a), Self::Latent(b)) => a.id() == b.id(),
+            (Self::Twinned(a), Self::Twinned(b)) => a == b,
             (a, b) => discriminant(a) == discriminant(b),
         }
     }

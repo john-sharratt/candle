@@ -151,24 +151,42 @@ tower's first ops (§3). Reference sizes:
 
 ## 3. The tower: a guest, its rows kept
 
-**The weights.** `mmproj-F16.gguf` at the pinned revision
-(`quantized_qwen38_moe/checkpoint_pins.rs`, `QWEN4EXP_MMPROJ_FILE` with its
-length and SHA-256), fetched from the hub into its cache by the caller that
-is about to need it (`vision_tower_file`, which checks the length every call
-and the digest once a process) — never by the drain that reads it, which runs
-with every wave stopped. It is not a pack source: the engine recipe, and the
-190 GB pack built from it, stay as they are.
+**The weights.** A model pack of its own
+(`docs/self_contained_model_packs.md`), built from `mmproj-F16.gguf` at the
+pinned revision (`quantized_qwen38_moe/checkpoint_pins.rs`,
+`QWEN4EXP_MMPROJ_FILE` with its length and SHA-256, checked before the build)
+by the caller that is about to need it (`vision_tower_pack`) — never by the
+drain that reads it, which runs with every wave stopped. The pack is
+*twinned* (`PackFamily::Twinned`, `model_pack/twins.rs`): every projection the
+int8 matmul tiles is stored as its `Q8_KO` twin, converted once on the host
+at build, and the position table — a matrix the tower gathers rows from,
+never multiplies by — as its file's F16. Each pair's fingerprint is recorded,
+so a pack written by another converter is rebuilt. One pack,
+`mmproj-F16.precision.pack.gguf`, serves every card with the int8 matmul (an
+F16 projection's twin is `Q8_KO` in either int8 mode); the CPU reference
+reads the `off` pack, which twins nothing. The source is released once its
+pack is built. It is separate from the engine's own pack: the engine recipe,
+and the 190 GB pack built from it, stay as they are.
 
 **The guest.** `Guest::Vision` (`candle-conversation/src/guest/vision.rs`)
 serves a `VisionRequest` — images at their grid — with each image's rows on
 the host. Between waves it places its activation arena on the guest ground's
-widest run, places the GGUF's tensors in the ground beside it
-(`place_gguf`; GEMM weights at the card's int8 mode), loads `VisionTower`
-(`qwen_vision/tower.rs`: plain candle ops, one forward that is both the CPU
-reference and the guest arena's run), runs each image, and gives the ground
-back. Its footprint is the weights plus the largest image's activations,
-stated per patch (`ACTIVATION_BYTES_PER_PATCH`); the tower attends in
-512-row bands so a 16 384-patch image never materialises `N × N` scores.
+widest run, places the pack's tensors in the ground beside it (`place_gguf`
+at `Int8Mode::Off`: every tensor, twins included, is one DMA of its stored
+bytes from the pinned staging buffers — no source upload, no repack kernel,
+no scratch off the ground), loads `VisionTower` (`qwen_vision/tower.rs`:
+plain candle ops, one forward that is both the CPU reference and the guest
+arena's run), runs each image, and gives the ground back. The arena is opened
+before the tower loads, so the load's own conversions — the patch embedding,
+the position table, the norms and biases into bf16, with the f32 each passes
+through, 32.7 MiB (`LOAD_BYTES`) — carve from the ground and none from the
+pool the span leaves. Its footprint is the weights, the load's conversions and
+the largest image's activations, stated per patch
+(`ACTIVATION_BYTES_PER_PATCH`; 88 KiB measured at 768 × 512 against 128
+priced). The arena is a bump, so what bounds it is the stages: the embedding,
+each block's attention half and MLP half, and each 512-row attention band are
+guest stages of their own, so a 16 384-patch image never holds `N × N`
+scores, nor more than one band's.
 Flash-Next's engine registers the guest itself
 (`models/builder/model_guests.rs`): the tower ships with the model, so it is
 not named in a deployment's `guests.yaml`.
@@ -431,7 +449,29 @@ tail prefills prefill text the engine wrote itself and need nothing.
   body is the file, read by the tower once on the member that takes it, kept
   and replicated, answered with its id, size and row count.
   **`GET /v1/images/{id}`** serves the bytes it arrived as, typed by their
-  format (`zend/src/api/images.rs`).
+  format, and **`GET /v1/images/{id}/thumb`** its thumbnail
+  (`zend/src/api/images.rs`): a JPEG at most 480 px on its longest side
+  (`vision/thumb.rs`), made once when the image is prepared and kept as a
+  third blob of its record beside the original and the rows, so a
+  conversation of photographs loads in kilobytes. Both are cached by the
+  browser (`private`, a day): an id is its content's digest, so its bytes
+  never change.
+- **Whose an image is, and how long it is kept** (`vision/tenancy.rs`). An
+  image is its sender's: a file sent — a `data:` part, `POST /v1/images`, a
+  `zen_chat_send` picture — records its sender as a holder
+  (`vision/held/<id>/<holder>`, the caller's account key), and the GET, or a
+  turn naming the image by id, answers a holder or an admin and no one else:
+  a stranger's GET is the `404` an unkept id gets, and their turn the `400`
+  (`images::claim`). An id learned is not an image shared. A turn records
+  that its conversation reads each image (`vision/used/<id>/<conv>`, and
+  `vision/conv/<conv>/<id>` to find them from the conversation); deleting a
+  conversation — the user's delete, or a chat closed — forgets its uses and
+  retires every image no other conversation reads: its three blobs tombstoned,
+  the record and its holders ceased. An archived conversation keeps its
+  images, as it keeps its text. An image no conversation ever read is
+  retired a day after it was kept (`kept_ms` on its record; the sweep runs
+  whenever an image is kept). Each fact is a key of its own, so two members
+  adding a holder or a use at once never overwrite each other.
 - **The turn.** The session parses the last user message's images into
   `TurnStart.images`, and the turn reads them before its first round
   (`images::resolve` on the blocking pool, under a "Reading the images…"
@@ -451,7 +491,9 @@ tail prefills prefill text the engine wrote itself and need nothing.
   there as a thumbnail instead of uploading as a file, and goes with the
   next message as an image part (`zend/web/index.html`,
   `zend-api.live.js`); a stored user turn draws its images from the markers
-  in its text through `GET /v1/images/{id}`.
+  in its text, each its thumbnail (`GET /v1/images/{id}/thumb`), and a click
+  opens the original (`GET /v1/images/{id}`) over the page, closed by a
+  click or Escape.
 
 ### 6.2 Turns
 

@@ -339,6 +339,7 @@ with the temp-file pack it chose between.
 | Flash-Next | `Qwen4ExpGpu::load` (`qwen4exp/engine.rs`) | the PLE table is a dense tensor of the pack, read through the same row cache (`loader::open_cached_ple`) |
 | DeepSeek-V4-Flash | `Engine::load` / `load_with_drafter` (`latent_moe/engine.rs`) | as the 30B; the drafter is its own plain model pack |
 | Qwen2, Llama, Qwen3-8B | their `from_gguf` | the pack is the GGUF plus tokenizer and provenance, opened as a GGUF |
+| Flash-Next's vision tower | `place_gguf` (`candle-conversation/src/guest/groundgguf.rs`), `VisionTower::load` | `PackFamily::Twinned` (`model_pack/twins.rs`): no section, every int8-tileable matrix stored as its KO twin — converted on the host at build, each `(source → twin)` pair's fingerprint recorded and re-checked at open as the sections' are (§4.2) — but the tensors the family names verbatim. A guest places each tensor as it is stored (`docs/flash_next_vision.md` §3) |
 
 Every loader keeps reading metadata and dense tensors through `gguf_file::Content`
 over the pack. The expert and layer caches have no `mmap` input for the records:

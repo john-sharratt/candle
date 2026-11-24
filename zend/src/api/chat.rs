@@ -103,8 +103,25 @@ pub async fn completions(
         .rev()
         .find(|m| m.role == Role::User)
         .map_or(&[][..], |m| &m.images[..]);
-    if let Err(why) = images::parse_all(last_images) {
-        return invalid_image(&why);
+    let sources = match images::parse_all(last_images) {
+        Ok(sources) => sources,
+        Err(why) => return invalid_image(&why),
+    };
+    // A file sent is the sender's; an image named by id must be theirs.
+    if !sources.is_empty() {
+        let Some(caller) = Caller::of(&headers, session.roles()) else {
+            return invalid_image("an image is sent by a person signed in");
+        };
+        let Some(substrate) = session.shared_substrate() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let claimed =
+            tokio::task::spawn_blocking(move || images::claim(&substrate, &sources, &caller)).await;
+        match claimed {
+            Ok(Ok(())) => {}
+            Ok(Err(why)) => return invalid_image(&why),
+            Err(e) => return invalid_image(&format!("settling the images panicked: {e}")),
+        }
     }
 
     let max_tokens = req.max_tokens.map(|n| n as usize);

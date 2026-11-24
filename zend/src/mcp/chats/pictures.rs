@@ -100,19 +100,20 @@ pub async fn fetch(
     Ok(fetched)
 }
 
-/// `pictures` kept as images on this member, read by the tower here in one
-/// job, in order. For a turn that runs on this member — one the gateway
-/// places may land where the kept image has not yet replicated, and takes the
-/// bytes instead ([`data_url`]).
+/// `pictures` kept as images `caller` sent, on this member, read by the tower
+/// here in one job, in order. For a turn that runs on this member — one the
+/// gateway places may land where the kept image has not yet replicated, and
+/// takes the bytes instead ([`data_url`]).
 pub async fn keep(
     session: &Arc<ZendSession>,
+    caller: &Caller,
     pictures: Vec<Vec<u8>>,
 ) -> Result<Vec<KeptImage>, String> {
     if pictures.is_empty() {
         return Ok(Vec::new());
     }
-    let keeper = Arc::clone(session);
-    tokio::task::spawn_blocking(move || keeper.keep_images(pictures))
+    let (keeper, caller) = (Arc::clone(session), caller.clone());
+    tokio::task::spawn_blocking(move || keeper.keep_images(pictures, &caller))
         .await
         .map_err(|e| format!("reading the pictures panicked: {e}"))?
         .ok_or_else(loading)?

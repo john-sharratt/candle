@@ -22,7 +22,7 @@ impl PipelineState {
             if self.pass.is_some() {
                 self.transition_matrix.reset_pass();
                 self.set_read_ahead_window();
-                self.set_eviction_order();
+                self.publish_eviction_costs();
                 self.decide_read_ahead();
             }
             self.pass = Some(msg.pass);
@@ -108,8 +108,8 @@ impl PipelineState {
         // Claims are judged, and the row's visit recorded, by decode routing
         // alone: a prompt launch routes most of the row, so it would count
         // nearly every victim routed again and mark nearly every resident just
-        // hit — the regret rates that order eviction (`set_eviction_order`)
-        // and the recency passes would learn the prompt, not decode.
+        // hit — the regret rates (`publish_eviction_costs`) and the recency
+        // passes would learn the prompt, not decode.
         if !msg.prefill_width {
             let v = self.regret.judge(row, msg.ticket, &expert_ids);
             if let Ok(mut s) = self.stats.lock() {

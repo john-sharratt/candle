@@ -3,9 +3,10 @@
 //! prefill that reads them.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "hub")]
-use candle_transformers::models::quantized_qwen38_moe::vision_tower_file;
+use candle_transformers::models::quantized_qwen38_moe::{vision_tower_pack, VISION_TOWER_MODE};
 use candle_transformers::models::qwen_vision::tower::OUT_HIDDEN;
 use candle_transformers::models::qwen_vision::{Grid, ImageHandle, ImageRows};
 
@@ -30,9 +31,11 @@ pub fn encode(
     engine: &ConversationEngine,
     images: &[PreparedImage],
 ) -> Result<Vec<ImageRows>, String> {
-    // Fetched here, on the caller's thread: the drain only reads the cache.
+    // Fetched and packed here, on the caller's thread — the first time, a
+    // download and a few seconds of host conversion — so the drain only reads
+    // the pack.
     #[cfg(feature = "hub")]
-    vision_tower_file().map_err(|e| format!("the vision tower: {e}"))?;
+    vision_tower_pack(VISION_TOWER_MODE).map_err(|e| format!("the vision tower: {e}"))?;
     let request = GuestRequest::Vision(VisionRequest {
         images: images.iter().map(|i| i.image.clone()).collect(),
     });
@@ -114,8 +117,11 @@ pub fn turn_images(
     if !unread.is_empty() {
         let prepared: Vec<PreparedImage> = unread.iter().map(|(_, p, _)| p.clone()).collect();
         let fresh = encode(engine, &prepared)?;
+        let kept_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
         for ((i, p, bytes), rows) in unread.into_iter().zip(fresh) {
-            store_image(substrate, &p, bytes, &rows)?;
+            store_image(substrate, &p, bytes, &rows, kept_ms)?;
             known[i] = Some((p.id, p.width, p.height, rows));
         }
     }

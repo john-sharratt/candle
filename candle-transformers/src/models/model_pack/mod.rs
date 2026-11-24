@@ -9,6 +9,9 @@
 //! layers      the layer section, every layer's records      (dense, streamed)
 //! ```
 //!
+//! A twinned pack has no section: its GGUF part stores each matmul weight as
+//! its KO twin ([`twins`]), so a loader copies every tensor as it is.
+//!
 //! A GGUF reader opens the file as an ordinary GGUF and never sees the sections
 //! after it. The loaders read the GGUF part through a mapping and the sections
 //! through direct I/O, at offsets the metadata records.
@@ -34,6 +37,7 @@ pub mod provenance;
 pub mod request;
 #[cfg(feature = "cuda")]
 pub mod resolve;
+pub mod twins;
 
 pub use cache::cache_root;
 #[cfg(all(feature = "cuda", any(test, feature = "hub")))]

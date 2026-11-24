@@ -6,6 +6,7 @@ use super::experts::{expert_refs, latent_expert_blocks, qwen_expert_blocks, Expe
 use super::open::ModelPack;
 use super::provenance::Provenance;
 use super::request::{PackFamily, PackRequest};
+use super::twins::{check_twins, twin_tensors};
 use crate::models::expert_lre::pack::section_len;
 use crate::models::expert_lre::section::{
     geometries_of, open_section, section_header, write_section,
@@ -133,6 +134,26 @@ pub(crate) fn build_pack(
         PackFamily::Qwen35 => {
             build_qwen35(request, mode, sources, provenance, tokenizer, device, dir)
         }
+        PackFamily::Twinned(verbatim) => {
+            let mut composition = Composition::from_checkpoint(sources, &|_| true);
+            twin_tensors(&mut composition, mode, verbatim);
+            let out = dir.join(request.file_name(mode, None));
+            write_pack(
+                PackBuild {
+                    sources,
+                    provenance,
+                    composition,
+                    int8_mode: mode,
+                    narrow: None,
+                    checkpoint_bytes: checkpoint,
+                    tokenizer,
+                    experts: None,
+                    layers: None,
+                },
+                &out,
+            )?;
+            Ok(out)
+        }
     }
 }
 
@@ -145,7 +166,9 @@ pub(crate) fn narrowing(
     device: &Device,
 ) -> Result<Option<usize>> {
     match family {
-        PackFamily::Plain | PackFamily::Routed | PackFamily::Latent(_) => Ok(None),
+        PackFamily::Plain | PackFamily::Routed | PackFamily::Latent(_) | PackFamily::Twinned(_) => {
+            Ok(None)
+        }
         PackFamily::Qwen35 => qwen35_narrowing(content, checkpoint_bytes, device),
     }
 }
@@ -157,6 +180,9 @@ pub(crate) fn validate(family: PackFamily, pack: &ModelPack, device: &Device) ->
     let routed = matches!(family, PackFamily::Routed | PackFamily::Latent(_));
     if routed && pack.experts.is_none() {
         candle::bail!("model pack: a routed model's pack has no expert section");
+    }
+    if let PackFamily::Twinned(_) = family {
+        check_twins(&pack.content.metadata)?;
     }
     if let Some(s) = pack.experts {
         let section = open_section(&pack.path, s.offset, cuda_of(device)?)?;

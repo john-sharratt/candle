@@ -37,6 +37,17 @@ pub const TOKENIZER_JSON: &str = "zen.tokenizer.json";
 pub const TOKENIZER_REPO: &str = "zen.tokenizer.repo";
 pub const TOKENIZER_REV: &str = "zen.tokenizer.rev";
 
+/// The KO twins a twinned pack's GGUF part stores: `zen.pack.twins.count`,
+/// then `zen.pack.twins.{i}.{src,dst,fp}` for each `(source → twin)` pair —
+/// the two dtypes as `GgmlDType::to_u32`, and the pair's fingerprint
+/// (`model_pack::twins`).
+pub const TWIN_COUNT: &str = "zen.pack.twins.count";
+
+/// The key of twin pair `i`'s `field`.
+pub fn twin_key(i: usize, field: &str) -> String {
+    format!("zen.pack.twins.{i}.{field}")
+}
+
 /// The source files the pack was built from: `zen.source.count`, then
 /// `zen.source.{i}.{role,repo,rev,file,len,sha256}` for each.
 pub const SOURCE_COUNT: &str = "zen.source.count";

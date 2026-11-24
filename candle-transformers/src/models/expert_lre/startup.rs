@@ -25,6 +25,8 @@ pub(crate) struct StartupTargets<'a> {
     pub residency: &'a mut [Vec<ExpertResidency>],
     /// Warm slot `i` holds `membership[i]`, decided once by the stratified draw.
     pub membership: &'a [(usize, usize)],
+    /// The experts VRAM takes, in fill order (`pinned::vram_startup_set`).
+    pub vram: &'a [(usize, usize)],
     pub geoms: &'a [LayerGeometry],
     pub layouts: &'a [RecordLayout],
     pub stride: usize,
@@ -150,9 +152,10 @@ unsafe fn upload_from_ring(
 /// Fill both resident tiers from the expert section.
 ///
 /// Only the experts that land somewhere are read — the rest stay on disk until
-/// something asks for them. VRAM fills in layer order, so the permanently
-/// resident leading layers (`cache::PINNED_LAYERS`) take the first slots: the
-/// zone's floor prices them, so they always fit.
+/// something asks for them. VRAM fills in the order of `t.vram`, which puts the
+/// permanently resident leading layers (`cache::PINNED_LAYERS`) in the first
+/// slots — the zone's floor prices them, so they always fit — and spreads the
+/// rest level across the evictable layers.
 pub(crate) fn startup_from_pack(
     t: StartupTargets<'_>,
     pack: &ExpertPack,
@@ -216,82 +219,76 @@ pub(crate) fn startup_from_pack(
         "startup: warm tier filled from the pack"
     );
 
-    // ── Hot tier: fill VRAM in layer order, from warm where possible ──
+    // ── Hot tier: fill VRAM with the startup set, from warm where possible ──
     let stream = cuda_dev.cuda_stream();
     let mut vram_count = 0usize;
     let mut cold_reads = 0usize;
-    // The indices address four parallel collections and identify the expert in
-    // the progress callback and the slot install, so they are the subject here
-    // rather than an artefact of iterating one of them.
-    #[allow(clippy::needless_range_loop)]
-    'fill: for moe_idx in 0..num_moe_layers {
+    for &(moe_idx, expert_idx) in t.vram {
         let geom = &t.geoms[moe_idx];
         let layout = t.layouts[moe_idx];
-        for expert_idx in 0..num_experts {
-            let Some(slot_idx) = t.inner.take_free() else {
-                break 'fill;
-            };
-            let slot_base = t.inner.slot_base(slot_idx);
-            // Names the upload that failed: which expert, which source, how far
-            // the fill had got, and the memory state at the moment it failed.
-            let at = |source: &'static str| {
-                move |e: candle::Error| {
-                    e.context(format!(
-                        "startup fill: L{moe_idx}E{expert_idx} from {source} into VRAM slot \
-                         {slot_idx} ({vram_count} resident so far; {})",
-                        memory_state(cuda_dev)
-                    ))
-                }
-            };
-            // SAFETY (every arm): `slot_idx` was just handed out by the zone and
-            // is not reclaimed while this runs.
-            let slot = match t.residency[moe_idx][expert_idx].ram {
-                // A pinned warm slot is written once and never again, so it is a
-                // source no later write can race — no event, no wait.
-                Some(warm_slot) if t.warm.is_pinned(warm_slot) => unsafe {
-                    build_slot_from_record_on_stream(
-                        t.warm.slot_ref(warm_slot, t.stride),
-                        layout,
-                        geom,
-                        cuda_dev,
-                        &stream,
-                        slot_base,
-                    )
-                    .map_err(at("a pinned warm slot"))?
-                },
-                // A pageable one is never an upload source: through the ring.
-                Some(warm_slot) => {
-                    let idx = ring.acquire()?;
-                    ring.buffer(idx)
-                        .copy_from_slice(t.warm.slot_ref(warm_slot, t.stride));
-                    unsafe { upload_from_ring(ring, idx, layout, geom, cuda_dev, slot_base) }
-                        .map_err(at("a pageable warm slot"))?
-                }
-                None => {
-                    let idx = ring.acquire()?;
-                    pack.read_into(moe_idx, expert_idx, ring.buffer(idx))?;
-                    cold_reads += 1;
-                    unsafe { upload_from_ring(ring, idx, layout, geom, cuda_dev, slot_base) }
-                        .map_err(at("the pack"))?
-                }
-            };
-            t.inner.install(slot_idx, moe_idx, expert_idx, slot);
-            t.residency[moe_idx][expert_idx].vram = Some(slot_idx);
-            vram_count += 1;
-            if let Some(report) = progress {
-                report(
-                    LoadPhase::FillVram,
-                    moe_idx * num_experts + expert_idx + 1,
-                    total_experts + PACK_TAIL_STEPS,
-                );
+        let Some(slot_idx) = t.inner.take_free() else {
+            break;
+        };
+        let slot_base = t.inner.slot_base(slot_idx);
+        // Names the upload that failed: which expert, which source, how far
+        // the fill had got, and the memory state at the moment it failed.
+        let at = |source: &'static str| {
+            move |e: candle::Error| {
+                e.context(format!(
+                    "startup fill: L{moe_idx}E{expert_idx} from {source} into VRAM slot \
+                     {slot_idx} ({vram_count} resident so far; {})",
+                    memory_state(cuda_dev)
+                ))
             }
+        };
+        // SAFETY (every arm): `slot_idx` was just handed out by the zone and
+        // is not reclaimed while this runs.
+        let slot = match t.residency[moe_idx][expert_idx].ram {
+            // A pinned warm slot is written once and never again, so it is a
+            // source no later write can race — no event, no wait.
+            Some(warm_slot) if t.warm.is_pinned(warm_slot) => unsafe {
+                build_slot_from_record_on_stream(
+                    t.warm.slot_ref(warm_slot, t.stride),
+                    layout,
+                    geom,
+                    cuda_dev,
+                    &stream,
+                    slot_base,
+                )
+                .map_err(at("a pinned warm slot"))?
+            },
+            // A pageable one is never an upload source: through the ring.
+            Some(warm_slot) => {
+                let idx = ring.acquire()?;
+                ring.buffer(idx)
+                    .copy_from_slice(t.warm.slot_ref(warm_slot, t.stride));
+                unsafe { upload_from_ring(ring, idx, layout, geom, cuda_dev, slot_base) }
+                    .map_err(at("a pageable warm slot"))?
+            }
+            None => {
+                let idx = ring.acquire()?;
+                pack.read_into(moe_idx, expert_idx, ring.buffer(idx))?;
+                cold_reads += 1;
+                unsafe { upload_from_ring(ring, idx, layout, geom, cuda_dev, slot_base) }
+                    .map_err(at("the pack"))?
+            }
+        };
+        t.inner.install(slot_idx, moe_idx, expert_idx, slot);
+        t.residency[moe_idx][expert_idx].vram = Some(slot_idx);
+        vram_count += 1;
+        if let Some(report) = progress {
+            report(
+                LoadPhase::FillVram,
+                vram_count,
+                total_experts + PACK_TAIL_STEPS,
+            );
         }
     }
     // The uploads above are asynchronous; the resident tier must be complete
     // before the pipeline takes it over.
     stream.synchronize().map_err(candle::Error::wrap)?;
-    // The fill stops as soon as VRAM is full, so the remaining experts never
-    // reach the progress callback. Land it on the experts, leaving the tail.
+    // The fill covers only the experts VRAM holds, so the bar has not reached
+    // the model's total. Land it on the experts, leaving the tail.
     if let Some(report) = progress {
         report(
             LoadPhase::FillVram,

@@ -2,7 +2,8 @@
 //!
 //! An image part's `url` is a `data:` URL carrying the file, or the id
 //! `POST /v1/images` answered with for one already kept. Nothing on the
-//! request path fetches from the network; a client sends the bytes.
+//! request path fetches from the network; a client sends the bytes. Who may
+//! name a kept image is [`claim`]'s to say.
 //!
 //! Design: `docs/flash_next_vision.md` §6.1.
 
@@ -10,9 +11,12 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 
 use candle_conversation::persistence::SharedSubstrate;
-use candle_conversation::vision::prepare::ID_HEX;
+use candle_conversation::vision::prepare::{image_id, ID_HEX};
+use candle_conversation::vision::tenancy::{hold, holds};
 use candle_conversation::vision::{turn_images, ImageSource, TurnImage};
 use candle_conversation::ConversationEngine;
+
+use crate::mcp::caller::Caller;
 
 /// What `url` names, or why it names nothing this daemon reads.
 pub fn parse(url: &str) -> Result<ImageSource, String> {
@@ -43,6 +47,26 @@ pub fn parse_all(urls: &[String]) -> Result<Vec<ImageSource>, String> {
     urls.iter().map(|u| parse(u)).collect()
 }
 
+/// Settle `sources` for `caller` before a turn reads them: a file they send is
+/// theirs from now on; an image named by its id must be one they sent, or the
+/// turn is refused as though no such image were kept — an id learned is not an
+/// image shared. An admin reads any. `vision::tenancy` is the rule.
+pub fn claim(
+    substrate: &SharedSubstrate,
+    sources: &[ImageSource],
+    caller: &Caller,
+) -> Result<(), String> {
+    let holder = caller.key();
+    for source in sources {
+        match source {
+            ImageSource::Bytes(bytes) => hold(substrate, &image_id(bytes), &holder)?,
+            ImageSource::Kept(id) if caller.is_admin() || holds(substrate, id, &holder) => {}
+            ImageSource::Kept(id) => return Err(format!("no image {id} is kept")),
+        }
+    }
+    Ok(())
+}
+
 /// `sources` as a turn's images, in order: a kept one read back as it was
 /// kept, the files read by the tower in one job unless an earlier turn read
 /// them. Blocking: the tower runs as a guest between waves, and this waits for
@@ -58,6 +82,9 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::caller::Person;
+    use candle_conversation::persistence::Admit;
+    use web::auth::Role;
 
     #[test]
     fn a_data_url_carries_its_bytes() {
@@ -73,6 +100,41 @@ mod tests {
             parse("0123456789abcdef"),
             Ok(ImageSource::Kept("0123456789abcdef".into()))
         );
+    }
+
+    fn caller(sub: &str, role: Role) -> Caller {
+        Caller {
+            person: Person {
+                provider: "google".into(),
+                sub: sub.into(),
+                email: String::new(),
+                name: String::new(),
+            },
+            role,
+        }
+    }
+
+    /// **An image is its sender's**: a file sent makes the sender its holder,
+    /// so they may name it by id after; someone else naming the same id is
+    /// refused as though nothing were kept under it, and an admin is not.
+    #[test]
+    fn an_image_named_by_id_must_be_the_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let substrate = SharedSubstrate::open_in(dir.path(), Admit::Unbound).unwrap();
+        let (sender, stranger) = (caller("a", Role::User), caller("b", Role::User));
+        let file = b"a picture".to_vec();
+        let id = image_id(&file);
+
+        claim(&substrate, &[ImageSource::Bytes(file)], &sender).unwrap();
+        assert!(holds(&substrate, &id, &sender.key()));
+        let named = [ImageSource::Kept(id.clone())];
+        assert_eq!(claim(&substrate, &named, &sender), Ok(()));
+        assert_eq!(
+            claim(&substrate, &named, &stranger),
+            Err(format!("no image {id} is kept"))
+        );
+        assert!(!holds(&substrate, &id, &stranger.key()));
+        assert_eq!(claim(&substrate, &named, &caller("c", Role::Admin)), Ok(()));
     }
 
     /// A url that names nothing readable is refused, never fetched.

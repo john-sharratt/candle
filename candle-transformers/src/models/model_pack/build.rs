@@ -17,6 +17,7 @@ use super::provenance::{to_metadata, Provenance};
 use candle::direct_io::round_up_sector;
 use candle::quantized::gguf_file::Value;
 use candle::quantized::gguf_writer::{GgufPlan, GgufStreamWriter, PlannedTensor};
+use candle::quantized::prepare::write_ko_twin;
 use candle::quantized::Int8Mode;
 use candle::Result;
 use std::fs::File;
@@ -165,14 +166,21 @@ pub fn write_pack(build: PackBuild<'_>, out: &Path) -> Result<()> {
     let mut w = GgufStreamWriter::new(plan, BufWriter::with_capacity(16 << 20, file))?;
     for t in &build.composition.tensors {
         let src = &build.sources[t.source].mmap;
-        let (at, len) = (t.offset as usize, t.byte_len() as usize);
+        let (at, len) = (t.offset as usize, t.source_len() as usize);
         let bytes = src.get(at..at + len).ok_or_else(|| {
             candle::Error::Msg(format!(
                 "model pack: {} runs past the end of its source",
                 t.name
             ))
         })?;
-        w.write_tensor_bytes(bytes)?;
+        if t.from == t.dtype {
+            w.write_tensor_bytes(bytes)?;
+        } else {
+            let mut twin = Vec::with_capacity(t.byte_len() as usize);
+            write_ko_twin(bytes, &t.dims, t.from, t.dtype, &mut twin)
+                .map_err(|e| candle::Error::Msg(format!("model pack: {}: {e}", t.name)))?;
+            w.write_tensor_bytes(&twin)?;
+        }
     }
     let mut out_w = w.finish()?;
     let mut written = gguf_len;

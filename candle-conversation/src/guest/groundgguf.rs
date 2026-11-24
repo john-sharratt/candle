@@ -38,13 +38,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use candle::quantized::cuda::{ko_repacked_bytes, QCudaStorage, MATRIX_ROW_PADDING};
-use candle::quantized::ko_quant::ko_tileable;
 use candle::quantized::{GgmlDType, Int8Mode, QStorage, QTensor};
 use candle::{Device, Shape};
 use candle_transformers::quantized_var_builder::VarBuilder;
 use cudarc::driver::result::{memcpy_htod_async, memset_d8_async};
 
 use super::checkpoint;
+use super::gguf_pick::Pick;
 use super::ground::GuestGround;
 use super::staging::Staging;
 use super::windowed::{window_bytes, Windowed};
@@ -85,16 +85,20 @@ const PLACE_ALIGN: usize = 256;
 /// disk and the card took turns: on BlackWorld (2026-10-27) the transformer's
 /// 7.2 GB placed in 2.19 s and the encoder's in 1.14 s, each about 3.3 GB/s.
 ///
-/// `skip` names tensors the model will never ask for, so they are not placed.
-/// Ground is the KV side's, taken for the length of a drain, and a tensor
-/// nothing reads is that much of the engine's working set evicted for nothing —
-/// a text encoder's embedding table is 414 MiB of a 4 GiB checkpoint.
+/// `pick.skip` names tensors the model will never ask for, so they are not
+/// placed. Ground is the KV side's, taken for the length of a drain, and a
+/// tensor nothing reads is that much of the engine's working set evicted for
+/// nothing — a text encoder's embedding table is 414 MiB of a 4 GiB checkpoint.
+///
+/// A twinned model pack (`model_pack::twins`) already stores its twins, so it
+/// is placed under `Int8Mode::Off`: every tensor goes down as its file bytes,
+/// the twins among them, one DMA each and no repack.
 pub fn place_gguf(
     path: &Path,
     device: &Device,
     ground: &Arc<Mutex<GuestGround>>,
     mode: Int8Mode,
-    skip: &[&str],
+    pick: Pick,
 ) -> Result<VarBuilder, String> {
     let began = Instant::now();
     let header = checkpoint::gguf_header(path).map_err(|e| format!("{path:?}: {e}"))?;
@@ -106,7 +110,7 @@ pub fn place_gguf(
     let mut wanted: Vec<(&String, Shape, GgmlDType, u64, u64)> = header
         .tensor_infos
         .iter()
-        .filter(|(name, _)| !skip.contains(&name.as_str()))
+        .filter(|(name, _)| !pick.skip.contains(&name.as_str()))
         .map(|(name, info)| {
             let shape = Shape::from(info.shape.dims().to_vec());
             let dtype = info.ggml_dtype;
@@ -148,11 +152,7 @@ pub fn place_gguf(
             let (shape, dtype) = (shape, *dtype);
             let raw = &window[(start - from) as usize..(end - from) as usize];
 
-            let twin = mode.is_int8()
-                && match shape.dims() {
-                    [nrows, ncols] => ko_tileable(*nrows, *ncols),
-                    _ => false,
-                };
+            let twin = pick.twins(shape.dims(), dtype, mode);
             // Named before it is placed, not after: a placement that faults
             // takes the process with it, and the last line written is then the
             // only evidence of which tensor did it.
@@ -338,20 +338,16 @@ fn place_verbatim(
 /// — Q6_K → Q6_KO is the same width but not the same layout, and a float source
 /// becomes Q8_KO and *shrinks*. Guessing from the file would under-claim, and a
 /// short claim is discovered after the engine has already been evicted for it.
-pub fn ground_bytes(path: &Path, mode: Int8Mode, skip: &[&str]) -> Result<usize, String> {
+pub fn ground_bytes(path: &Path, mode: Int8Mode, pick: Pick) -> Result<usize, String> {
     let header = checkpoint::gguf_header(path).map_err(|e| format!("{path:?}: {e}"))?;
     let mut total = 0usize;
     for (name, info) in header.tensor_infos.iter() {
-        if skip.contains(&name.as_str()) {
+        if pick.skip.contains(&name.as_str()) {
             continue;
         }
         let shape = Shape::from(info.shape.dims().to_vec());
         let dtype = info.ggml_dtype;
-        let twin = mode.is_int8()
-            && match shape.dims() {
-                [nrows, ncols] => ko_tileable(*nrows, *ncols),
-                _ => false,
-            };
+        let twin = pick.twins(shape.dims(), dtype, mode);
         let bytes = if twin {
             let ko = dtype
                 .to_ko(mode)

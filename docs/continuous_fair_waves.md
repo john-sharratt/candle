@@ -266,6 +266,18 @@ prefill phase. A card whose zone holds its experts judges prefills on their
 trade alone, as before; each member's `learned rates published` line says which
 (`streams`).
 
+**The rule binds only a turn the forward cannot take whole.** A turn whose rows
+are the whole of its prefill (`Cost::finishes`) holds no store across narrow
+forwards: it finishes in the forward it joins and its store serves the decode it
+becomes, in whatever wave the prefill runs. Refusing it saves no residency — it
+returns as a later wave's head, which is carried, and claims the same store there
+— so it is admitted beside the others on the rules above. Without this the rule
+serialised every short turn: on WhiteWorld (2026-11-24, seven NPC missions) turns
+of 10–30 tokens, whose rows add a few tens of MB of tier against a ~66 MB store,
+were refused behind each wave's first, the prefill width stood at 1 with 16
+queued, and residency stood at 13–15 GB against a 7.4 GB hold with no refusal on
+the floor.
+
 **A short prompt rides as a stencil run does, a short span a step.** A prompt of
 at most four of the model's short spans (`ManagedBatchedModel::short_span_rows`,
 eight rows on a recurrent stack; `creep_slice::short_piece`, `SHORT_PIECES`) is
