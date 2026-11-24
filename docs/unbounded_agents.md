@@ -6,7 +6,7 @@
 
 Persistent agents need context that grows without bound. Under full attention every cached token takes part in every later step, so the stored error a step is exposed to grows with context depth, and more VRAM only defers the point where tokens must be compressed or evicted. We argue the coupling is architectural, and that decoupling the working set from context depth is sufficient to bound the exposure.
 
-**Theorem (§11.2).** Under provenance-selected attention over a tiered context, the change stored K/V error makes to each attention head's output, and the summed stored error of the tokens entering a generation step, are both bounded by constants independent of context depth N; under full attention in fixed memory, the per-token error the first bound is made of grows with N, and the second grows linearly in N.
+**Theorem (§11.2).** Under provenance-selected attention over a tiered context, the change stored K/V error makes to each attention head's output is bounded by a constant, and a token the step needs keeps an attention weight bounded below by a constant, both independent of context depth N, so the step's signal-to-perturbation ratio is bounded at any depth. Under full attention the needed token's weight falls as 1/N against the same perturbation, and the summed stored error a step reads grows linearly in N.
 
 The system combines (1) online Markov expert prediction with wave-batched grouped GEMM for MoE inference under partial VRAM residency; (2) per-block adaptive KV quantization across eleven levels (C0–C10) with asymmetric K/V error metrics and a prefill refresh at every turn seal, compressing the KV cache 4.1–7.6× at the top level across the fleet's compressing models; (3) attentional provenance indexing — Q-vector sign signatures scanned on the GPU, re-selecting the working set during decode; and (4) an unbounded three-tier context, VRAM-hot, RAM-warm and disk-cold.
 
@@ -20,7 +20,7 @@ On the system's own 2.2M-line codebase, retrieval ranks one of a question's answ
 
 Long-running assistants and autonomous agents need context that grows without bound, and under full attention every token held grows the set of stored, compressed or rounded values every later step reads. More VRAM defers the threshold; it does not remove the coupling. RAG externalises memory and loses attentional continuity; longer native windows are a hardware investment against an architectural ceiling; summarization and eviction discard the verbatim detail persistent memory exists to keep.
 
-The fix here is to decouple the tokens that take part in a step from the tokens in the context. §11.2 shows the decoupling bounds, at any depth, both what a step is exposed to and how far stored error moves each attention head's output, and a full-attention system cannot offer the same bounds, because their terms are the tokens it attends and the precision it can hold them at.
+The fix here is to decouple the tokens that take part in a step from the tokens in the context. §11.2 shows the decoupling bounds, at any depth, how far stored error moves each attention head's output against the weight a needed token keeps, and what a step is exposed to; a full-attention system cannot offer the same bounds, because its attended set is the whole context.
 
 The system came from two constraints held together: persistent agent conversations, the hardest form of the memory problem (verbatim recall across unbounded sessions, many agents at once), and a single 16 GB consumer GPU. Each constraint closed the standard solution: GEMM dequantisation OOMed, so the matmul kernels read quantized weights natively; full context could not be held hot, so attention became provenance-selected; materialising turns at F16 OOMed, so quantization became two-phase (§11.5). The result, on that card and two larger ones:
 
@@ -462,7 +462,7 @@ Twelve models, spanning dense, mixture-of-experts, DeltaNet-hybrid and native-sp
 | Model | Size | Architecture | Weights |
 |---|---|---|---|
 | DeepSeek-V4-Flash-0731 | 284B / 13B active | native-sparse latent attention, MoE | MXFP4_KO |
-| Qwen3.8-Flash-Next | 180B / 6B active | hybrid + QSA + MoE, MTP drafter | Q4_KOEXP (72 GB); Q2_KO experts (16 GB) |
+| Qwen3.8-Flash-Next | 180B / 6B active: a 125B trunk, a 51B n-gram table, a 4B MTP head | hybrid + QSA + MoE, MTP drafter | Q4_KOEXP (72 GB); Q2_KO experts (16 GB) |
 | Qwen3.5-35B-A3B, Qwen3.6-35B-A3B | 35B / 3B active | DeltaNet hybrid + MoE | Q6_K |
 | Qwen3-30B-A3B | 30B / 3B active | MoE, 48 layers × 128 experts, top-8 | Q4_K_M |
 | Qwen3.8-27B | 27B dense | hybrid | Q6_K/Q8 |
@@ -608,11 +608,11 @@ At 8K the top level costs **2–8% of decode for 4.6–6.3×**. At 32K the large
 Figure 9.6-2 sets our aggregate decode, serving concurrent sessions, against the best published llama.cpp single-stream decode for the same model on the same class of card; the Blackwell rows compare our RTX PRO 5000, each at its best validated row of §9.6.1, with published RTX 5090 figures. Aggregate against single-stream is the comparison the llama.cpp record allows, and it answers how much work one card does. The published aggregates are larger engines on larger cards: vLLM serves Qwen3.6-35B-A3B at 449.0 t/s across five concurrent requests on a 96 GB RTX PRO 6000 [41], where this engine serves it at 2,761.0 across sixty-four on a 72 GB card, 6.1×; Strata serves Flash-Next at 63.1 t/s across four on a 12 GB card [49], where the 16 GB laptop serves eight at 108.5. Published single-card serving of the 35B models stops at 5–10 concurrent requests [40, 41]; this engine runs them at 64, and Qwen3.5-0.8B at 256.
 
 <figure class="fig">
-<svg viewBox="0 0 640 494" role="img" aria-label="Figure 9.6-2. Our aggregate decode against the best published llama.cpp single-stream decode, same model and card class, on a log scale. RTX 3090: Qwen3.5-35B-A3B 11.1 times, Qwen3.6-35B-A3B 8.5, Llama-2-7B 5.8, Qwen3-8B 3.3, Qwen3.8-27B 5.5, Qwen3-30B-A3B 2.6, Flash-Next 36.3. 16 GB: Qwen3.6-35B-A3B 1.4 to 1.8, Qwen3-8B 3.0, Flash-Next 3.7. Blackwell: Qwen3.5-35B-A3B 14.8, Qwen3.6-35B-A3B 8.3, Flash-Next 37.9, Llama-2-7B 5.6, Qwen3-30B-A3B 4.4, Qwen3-8B 3.2.">
+<svg viewBox="0 0 640 468" role="img" aria-label="Figure 9.6-2. Our aggregate decode against the best published llama.cpp single-stream decode, same model and card class, on a log scale. RTX 3090: Qwen3.5-35B-A3B 11.1 times, Qwen3.6-35B-A3B 8.5, Llama-2-7B 5.8, Qwen3-8B 3.3, Qwen3.8-27B 5.5, Qwen3-30B-A3B 2.6. 16 GB: Qwen3.6-35B-A3B 1.4 to 1.8, Qwen3-8B 3.0, Flash-Next 3.7. Blackwell: Qwen3.5-35B-A3B 14.8, Qwen3.6-35B-A3B 8.3, Flash-Next 37.9, Llama-2-7B 5.6, Qwen3-30B-A3B 4.4, Qwen3-8B 3.2.">
   <text class="ttl" x="16" y="20">Figure 9.6-2 · One card's aggregate decode, against the published record</text>
   <text class="ttl-sub" x="16" y="36">× the best published llama.cpp single-stream decode, same model and card · log scale</text>
-  <path class="grid" d="M313.8 46 V466 M398.1 46 V466 M461.9 46 V466 M525.7 46 V466 M610 46 V466"/>
-  <path class="parity" d="M250 46 V466"/>
+  <path class="grid" d="M313.8 46 V440 M398.1 46 V440 M461.9 46 V440 M525.7 46 V440 M610 46 V440"/>
+  <path class="parity" d="M250 46 V440"/>
   <text class="cat" x="16" y="62">Qwen3.5-35B-A3B, C10 ×16</text><text class="cat-sub" x="16" y="74">RTX 3090 · 1,228.8 vs 111.2 [28]</text>
   <path class="line-us" d="M250 64 H471.5"/><circle class="dot-us" cx="471.5" cy="64" r="5"/><text class="v-us" x="481.5" y="69">11.1×</text>
   <text class="cat" x="16" y="88">Qwen3.6-35B-A3B, C10 ×16</text><text class="cat-sub" x="16" y="100">RTX 3090 · 1,346.3 vs 157.66 [33]</text>
@@ -625,36 +625,34 @@ Figure 9.6-2 sets our aggregate decode, serving concurrent sessions, against the
   <path class="line-us" d="M250 168 H406.9"/><circle class="dot-us" cx="406.9" cy="168" r="5"/><text class="v-us" x="416.9" y="173">5.5×</text>
   <text class="cat" x="16" y="192">Qwen3-30B-A3B, BF16 ×10</text><text class="cat-sub" x="16" y="204">RTX 3090 · 400.5 vs 153.6 [28]</text>
   <path class="line-us" d="M250 194 H337.9"/><circle class="dot-us" cx="337.9" cy="194" r="5"/><text class="v-us" x="347.9" y="199">2.6×</text>
-  <text class="cat" x="16" y="218">Flash-Next, BF16 ×16</text><text class="cat-sub" x="16" y="230">RTX 3090 · 543.8 vs 15 at ~130K [32]</text>
-  <path class="line-us" d="M250 220 H580.5"/><circle class="dot-us" cx="580.5" cy="220" r="5"/><text class="v-us" x="570.5" y="214" text-anchor="end">36.3×</text>
-  <text class="cat" x="16" y="244">Qwen3.6-35B-A3B, C10 ×16</text><text class="cat-sub" x="16" y="256">16 GB · 336.7 vs 183.3 / 249.3 MTP [38]</text>
-  <path class="line-us" d="M250 246 H304.1"/><circle class="dot-us" cx="274.1" cy="246" r="4"/><circle class="dot-us" cx="304.1" cy="246" r="5"/><text class="v-us" x="314.1" y="251">1.4–1.8×</text>
-  <text class="cat" x="16" y="270">Qwen3-8B, C8 ×10</text><text class="cat-sub" x="16" y="282">16 GB · 308.4 vs 102.7, RTX 4080 [29]</text>
-  <path class="line-us" d="M250 272 H351.1"/><circle class="dot-us" cx="351.1" cy="272" r="5"/><text class="v-us" x="361.1" y="277">3.0×</text>
-  <text class="cat" x="16" y="296">Flash-Next, BF16 ×8</text><text class="cat-sub" x="16" y="308">16 GB · 108.5 vs 27.5–29, RTX 5080 [32]</text>
-  <path class="line-us" d="M250 298 H370.4"/><circle class="dot-us" cx="370.4" cy="298" r="5"/><text class="v-us" x="380.4" y="303">3.7×</text>
-  <text class="cat" x="16" y="322">Qwen3.5-35B-A3B, C10 ×64</text><text class="cat-sub" x="16" y="334">Blackwell · 2,869.9 vs 194.0 [34]</text>
-  <path class="line-us" d="M250 324 H498"/><circle class="dot-us" cx="498" cy="324" r="5"/><text class="v-us" x="508" y="329">14.8×</text>
-  <text class="cat" x="16" y="348">Qwen3.6-35B-A3B, C10 ×64</text><text class="cat-sub" x="16" y="360">Blackwell · 2,761.0 vs 333.6 MTP [38]</text>
-  <path class="line-us" d="M250 350 H444.8"/><circle class="dot-us" cx="444.8" cy="350" r="5"/><text class="v-us" x="454.8" y="355">8.3×</text>
-  <text class="cat" x="16" y="374">Flash-Next, BF16 ×16, TCC</text><text class="cat-sub" x="16" y="386">Blackwell · 1,819.3 vs 48.02 [42]</text>
-  <path class="line-us" d="M250 376 H584.5"/><circle class="dot-us" cx="584.5" cy="376" r="5"/><text class="v-us" x="574.5" y="370" text-anchor="end">37.9×</text>
-  <text class="cat" x="16" y="400">Llama-2-7B, BF16 ×48</text><text class="cat-sub" x="16" y="412">Blackwell · 1,675.0 vs 300.40 [27]</text>
-  <path class="line-us" d="M250 402 H408.5"/><circle class="dot-us" cx="408.5" cy="402" r="5"/><text class="v-us" x="418.5" y="407">5.6×</text>
-  <text class="cat" x="16" y="426">Qwen3-30B-A3B, BF16 ×10</text><text class="cat-sub" x="16" y="438">Blackwell · 997.4 vs 226.1 [39]</text>
-  <path class="line-us" d="M250 428 H386.4"/><circle class="dot-us" cx="386.4" cy="428" r="5"/><text class="v-us" x="396.4" y="433">4.4×</text>
-  <text class="cat" x="16" y="452">Qwen3-8B, C8 ×10</text><text class="cat-sub" x="16" y="464">Blackwell · 632.9 vs 200.4 [39]</text>
-  <path class="line-us" d="M250 454 H357"/><circle class="dot-us" cx="357" cy="454" r="5"/><text class="v-us" x="367" y="459">3.2×</text>
-  <text class="tick mid" x="250" y="484">1×</text>
-  <text class="tick mid" x="313.8" y="484">2×</text>
-  <text class="tick mid" x="398.1" y="484">5×</text>
-  <text class="tick mid" x="461.9" y="484">10×</text>
-  <text class="tick mid" x="525.7" y="484">20×</text>
-  <text class="tick mid" x="610" y="484">50×</text>
+  <text class="cat" x="16" y="218">Qwen3.6-35B-A3B, C10 ×16</text><text class="cat-sub" x="16" y="230">16 GB · 336.7 vs 183.3 / 249.3 MTP [38]</text>
+  <path class="line-us" d="M250 220 H304.1"/><circle class="dot-us" cx="274.1" cy="220" r="4"/><circle class="dot-us" cx="304.1" cy="220" r="5"/><text class="v-us" x="314.1" y="225">1.4–1.8×</text>
+  <text class="cat" x="16" y="244">Qwen3-8B, C8 ×10</text><text class="cat-sub" x="16" y="256">16 GB · 308.4 vs 102.7, RTX 4080 [29]</text>
+  <path class="line-us" d="M250 246 H351.1"/><circle class="dot-us" cx="351.1" cy="246" r="5"/><text class="v-us" x="361.1" y="251">3.0×</text>
+  <text class="cat" x="16" y="270">Flash-Next, BF16 ×8</text><text class="cat-sub" x="16" y="282">16 GB · 108.5 vs 27.5–29, RTX 5080 [32]</text>
+  <path class="line-us" d="M250 272 H370.4"/><circle class="dot-us" cx="370.4" cy="272" r="5"/><text class="v-us" x="380.4" y="277">3.7×</text>
+  <text class="cat" x="16" y="296">Qwen3.5-35B-A3B, C10 ×64</text><text class="cat-sub" x="16" y="308">Blackwell · 2,869.9 vs 194.0 [34]</text>
+  <path class="line-us" d="M250 298 H498"/><circle class="dot-us" cx="498" cy="298" r="5"/><text class="v-us" x="508" y="303">14.8×</text>
+  <text class="cat" x="16" y="322">Qwen3.6-35B-A3B, C10 ×64</text><text class="cat-sub" x="16" y="334">Blackwell · 2,761.0 vs 333.6 MTP [38]</text>
+  <path class="line-us" d="M250 324 H444.8"/><circle class="dot-us" cx="444.8" cy="324" r="5"/><text class="v-us" x="454.8" y="329">8.3×</text>
+  <text class="cat" x="16" y="348">Flash-Next, BF16 ×16, TCC</text><text class="cat-sub" x="16" y="360">Blackwell · 1,819.3 vs 48.02 [42]</text>
+  <path class="line-us" d="M250 350 H584.5"/><circle class="dot-us" cx="584.5" cy="350" r="5"/><text class="v-us" x="574.5" y="344" text-anchor="end">37.9×</text>
+  <text class="cat" x="16" y="374">Llama-2-7B, BF16 ×48</text><text class="cat-sub" x="16" y="386">Blackwell · 1,675.0 vs 300.40 [27]</text>
+  <path class="line-us" d="M250 376 H408.5"/><circle class="dot-us" cx="408.5" cy="376" r="5"/><text class="v-us" x="418.5" y="381">5.6×</text>
+  <text class="cat" x="16" y="400">Qwen3-30B-A3B, BF16 ×10</text><text class="cat-sub" x="16" y="412">Blackwell · 997.4 vs 226.1 [39]</text>
+  <path class="line-us" d="M250 402 H386.4"/><circle class="dot-us" cx="386.4" cy="402" r="5"/><text class="v-us" x="396.4" y="407">4.4×</text>
+  <text class="cat" x="16" y="426">Qwen3-8B, C8 ×10</text><text class="cat-sub" x="16" y="438">Blackwell · 632.9 vs 200.4 [39]</text>
+  <path class="line-us" d="M250 428 H357"/><circle class="dot-us" cx="357" cy="428" r="5"/><text class="v-us" x="367" y="433">3.2×</text>
+  <text class="tick mid" x="250" y="458">1×</text>
+  <text class="tick mid" x="313.8" y="458">2×</text>
+  <text class="tick mid" x="398.1" y="458">5×</text>
+  <text class="tick mid" x="461.9" y="458">10×</text>
+  <text class="tick mid" x="525.7" y="458">20×</text>
+  <text class="tick mid" x="610" y="458">50×</text>
 </svg>
 </figure>
 
-Two rows are not like-for-like. The RTX 3090 Flash-Next row is against a published run at ~130K context on UD-Q4_K_XL, where ours is a ~700-token prompt on Q2_KO experts; at a matched short prompt it is 37.9× on Blackwell and 3.7× at 16 GB. The 16 GB Qwen3.6-35B row is the weakest on purpose: a 3-bit quant that fits wholly in VRAM decodes one stream faster than streamed Q6_K experts can, so the honest multiple there is 1.4–1.8×.
+The 16 GB Qwen3.6-35B row sets our streamed Q6_K experts against a 3-bit quant that fits wholly in VRAM, which decodes one stream faster: 1.4–1.8×.
 
 #### 9.6.5 The 16GB laptop
 
@@ -988,7 +986,7 @@ Is the bounded working set delivered when the history is many times larger than 
 
 **Selection holds at depth.** Mid-decode reprojection brought every needle turn into the working set at 131K and 393K — from 64 and 195 turns into 15–18, a history twelve times the slot — at C10 and C0 alike, while the arms without it selected none past 30K, both filling from the oldest turns. Compression does not change what is selected.
 
-**Reading a selected turn needs its sealing context.** Past 30K the model holds the needle turns and still answers that no codes were given. The same test's diagnosis isolates why, by elimination: QSA reads the needle pieces at rank 0 on 77–85% of queries; dense attention, fresh placement and moving the needles beside the question all fail the same way; and the failing projection's own 17 turns, re-prefilled into a fresh slot at the same positions and the same C10, recall every code they hold. What differs is the context the K/V was computed in. Moving the needles through the history shows a cliff — 4/4 with up to 18K tokens of conversation behind them at their seal, 1/4 at 31K, 0/4 from 44K — and a 2×2 of sealing against reading context recalls 4/4 exactly where the two match, in either direction: a sealed turn carries its context in its residual stream, and its K/V is read as what it was in that context and not in another. How far a model reads K/V sealed in another context is a property of the model, and it has grown with every model this system has been upgraded to.
+**Reading a selected turn needs its sealing context.** Past 30K the model holds the needle turns and still answers that no codes were given. The same test's diagnosis isolates why, by elimination: QSA reads the needle pieces at rank 0 on 77–85% of queries; dense attention, fresh placement and moving the needles beside the question all fail the same way; and the failing projection's own 17 turns, re-prefilled into a fresh slot at the same positions and the same C10, recall every code they hold. What differs is the context the K/V was computed in. Moving the needles through the history shows a cliff — 4/4 with up to 18K tokens of conversation behind them at their seal, 1/4 at 31K, 0/4 from 44K — and a 2×2 of sealing against reading context recalls 4/4 exactly where the two match, in either direction: a sealed turn carries its context in its residual stream, and its K/V is read as what it was in that context and not in another. This is the cross-context reuse problem of position-independent KV caching: CacheBlend [50] and EPIC [51] repair a reused chunk by recomputing a few of its tokens, and Block-Attention [52] and APE [53] by training or rescaling the model to read blocks encoded apart; production's arrangement, each file sealed behind the system prompt alone, is Block-Attention's independent block. How far a model reads K/V sealed in another context is a property of the model, and it has grown with every model this system has been upgraded to.
 
 **Production memory is built so the contexts match.** Every ingested file is its own conversation, sealed behind the system prompt alone and never parented on the priming chain (`zend/src/code_read/process.rs`); only the chain's own links are read behind it, and every dialogue opens on that chain. Measured directly, four turns sealed behind the 32K chain recall 4/4 when read with the chain ahead and 0/4 without it; sealed alone and read behind the chain — production's arrangement — 4/4 (`recall_with_and_without_the_priming_prefix`). The 128-question battery measures that arrangement end to end: an answer decoded with its answer file placed recalls **51.4%**, without it 13.7% (§9.12, Figure 9.12-6). The needle test's failure is the one arrangement production does not use — turns sealed 60–100K tokens deep inside one long conversation and read out of it.
 
@@ -1620,19 +1618,11 @@ $$\sum_{t \in W_{\text{warm}} \cap \mathcal{W}} \varepsilon(t) \leq k_{\text{war
 
 a constant independent of N. As N grows and the warm corpus expands, more candidates compete for W_warm_max slots, but the aggregate contribution is bounded by the budget.
 
-*Cold tier* (C): all remaining tokens. As N → ∞, |C| → ∞ while the retrieval budget W_warm_max stays fixed. Summed over the cold tier, the selection probabilities are bounded by the budget:
-
-$$\sum_{t \in C} p_{\text{cold}}(t, N) = E[k_{\text{cold}}] \leq W_{\text{warm\_max}}$$
-
-so the *mean* per-token selection probability, at most W_warm_max / |C|, tends to zero. The mean does not bound any specific token. Selection is relevance-driven: a cold token relevant to the current step is selected with high probability at any depth — that is the purpose of retrieval — and it then contributes its full per-token error. Depth dilutes the cold tier's selection probability only on average; it does not dilute the error of what is selected.
-
-Boundary tokens fall under the same per-token bound: on the attention-only models their K/V is constructed against the current assembly (§5), and on the recurrent lineage they are sealed like interior ones (§5).
-
-The cold tier's aggregate error contribution per step is bounded by the tokens it can take from the shared budget, not by depth:
+*Cold tier* (C): all remaining tokens. As N → ∞, |C| → ∞ while the retrieval budget W_warm_max stays fixed. A cold token is read only when a step selects it, and then within the budget, so the cold tier's contribution per step is at most:
 
 $$\sum_{t \in C \cap \mathcal{W}} \varepsilon(t) \leq k_{\text{cold}} \cdot \varepsilon_{\text{cold}}$$
 
-It does not vanish as N grows. A bound that decays as O(1/N) would follow only if every cold token were equally likely to be selected — the opposite of relevance-driven selection.
+Boundary tokens fall under the same per-token bound: on the attention-only models their K/V is constructed against the current assembly (§5), and on the recurrent lineage they are sealed like interior ones (§5).
 
 Summing across tiers, with k_warm + k_cold ≤ W_warm_max at every step — the budget is enforced per step, not on average, so the bound holds for each step and not only in expectation:
 
@@ -1642,21 +1632,33 @@ $$\sum_{t \in \mathcal{W}} \varepsilon(t) \leq \varepsilon_{\text{hot}} + k_{\te
 
 ---
 
-**Theorem (Asymptotic Numerical Stability).** *Take one attention head of one layer at one step: query q, scale 1/√d, and attended set 𝒲 of any size. Let each attended token's stored key and value differ from their exact values by δk_t and δv_t, with ‖δv_t‖ ≤ ε_V and a logit perturbation |q · δk_t| / √d ≤ η for every t ∈ 𝒲, and let R_V = max_t ‖v_t − c‖ be the radius of the exact values about any centre c. The head's output o = Σ_t p_t v_t, with p = softmax(q · k / √d), then moves by at most*
+**Theorem (Asymptotic Numerical Stability).** *Take one attention head of one layer at one step: query q, scale 1/√d, an attended set 𝒲 of n tokens, logits s_t = q · k_t / √d and weights p = softmax(s). Let each attended token's stored key and value differ from their exact values by δk_t and δv_t, with ‖δv_t‖ ≤ ε_V and a logit perturbation |q · δk_t| / √d ≤ η for every t ∈ 𝒲, and let R_V = max_t ‖v_t − c‖ be the radius of the exact values about any centre c.*
+
+*(a) Bounded perturbation. The head's output o = Σ_t p_t v_t moves by at most*
 
 $$‖\tilde{o} - o‖ \leq \varepsilon_V + \left(e^{2\eta} - 1\right) R_V \approx \varepsilon_V + 2\eta R_V$$
 
-*— a bound that names neither N nor |𝒲|, so it is set entirely by the precision of the tokens attended. Under provenance selection every attended token was sealed at the selector's threshold (Corollary 1), so ε_V and η, and with them the bound, are constants at any depth. Under full attention over a context held in fixed memory M, the attended set is all N tokens in M bytes: each token's share shrinks as M/N, so past the depth at which the threshold's format no longer fits, ε_V and η grow with N, or tokens are evicted, and the bound grows with them.*
+*(b) Bounded dilution. Let r ∈ 𝒲 be a token the step needs, its logit ahead of every other attended token's by a margin of at least Δ. Its weight, read from the stored K/V, keeps*
 
-**Proof.** Write s_t = q · k_t / √d and s̃_t = s_t + δ_t, with |δ_t| ≤ η. For each t,
+$$\tilde{p}_r \geq \frac{1}{1 + (n - 1)\, e^{-(\Delta - 2\eta)}}$$
+
+*and if every other attended token's logit lies within Δ_max of r's, its exact weight is at most* $1 / (1 + (n - 1) e^{-\Delta_{max}})$.
+
+*(c) Under provenance selection, n ≤ B at any depth and every attended token was sealed at the selector's threshold (Corollary 1): the perturbation of (a) is bounded by a constant, and a needed token's weight is bounded below by a constant, so the ratio of the signal a step needs to the perturbation it carries is bounded below independently of N. Under full attention n = N: the perturbation bound of (a) is the same, but among distractors within Δ_max of it the needed token's weight falls as Θ(1/N), so the signal the perturbation is measured against vanishes with depth — and in fixed memory M each token's share falls as M/N, so past the depth at which the threshold's format no longer fits, ε_V and η grow with N as well.*
+
+**Proof.** Write s̃_t = s_t + δ_t, with |δ_t| ≤ η. For (a), for each t,
 
 $$\frac{\tilde p_t}{p_t} \;=\; e^{\delta_t}\,\frac{\sum_u e^{s_u}}{\sum_u e^{s_u + \delta_u}} \;\in\; \left[e^{-2\eta},\, e^{2\eta}\right],$$
 
-so |p̃_t − p_t| ≤ p_t (e^{2η} − 1), and summing, ‖p̃ − p‖₁ ≤ e^{2η} − 1. The output changes by
+so $|\tilde{p}_t - p_t| \leq p_t (e^{2\eta} - 1)$, and summing, $‖\tilde{p} - p‖_1 \leq e^{2\eta} - 1$. The output changes by
 
 $$\tilde o - o \;=\; \sum_t \tilde p_t\, \delta v_t \;+\; \sum_t (\tilde p_t - p_t)\, v_t .$$
 
-The first term is a convex combination of the δv_t, so its norm is at most ε_V. In the second, Σ_t (p̃_t − p_t) = 0, so each v_t may be replaced by v_t − c, and its norm is at most ‖p̃ − p‖₁ · R_V ≤ (e^{2η} − 1) R_V. □
+The first term is a convex combination of the δv_t, so its norm is at most ε_V. In the second, Σ_t (p̃_t − p_t) = 0, so each v_t may be replaced by v_t − c, and its norm is at most $‖\tilde{p} - p‖_1 R_V \leq (e^{2\eta} - 1) R_V$.
+
+For (b), $\tilde{p}_r = 1 / (1 + \sum_{t \neq r} e^{\tilde{s}_t - \tilde{s}_r})$, and s̃_r − s̃_t ≥ Δ − 2η for each of the n − 1 other tokens, so each term of the sum is at most $e^{-(\Delta - 2\eta)}$. The upper bound on the exact weight is the same sum with each term at least $e^{-\Delta_{max}}$.
+
+(c) is (a) and (b) with n ≤ B under selection and n = N under full attention: under selection the ratio of the needed token's weight to the perturbation is at least $1 / [(1 + (B - 1) e^{-(\Delta - 2\eta)}) (\varepsilon_V + (e^{2\eta} - 1) R_V)]$, which names no N. □
 
 **Recurrent layers.** On the DeltaNet-hybrid models — Flash-Next is 36 Gated DeltaNet layers and 12 attention layers — the recurrent layers store no per-token K/V and read no working set: each holds one fixed-size state per sequence, `[h_v, d_v, d_k]`, kept in F32 and never quantized by the ladder, so what a step reads from them is the same size at any N. Each update is non-expansive — S ← e^g · S, g ≤ 0, then S ← S + β(v − Sk)kᵀ with k l2-normed and β ∈ (0, 1), so S(I − βkkᵀ) has operator norm at most ‖S‖ — and adds one F32 rounding (`candle-kernels/src/delta-net/delta_net_decode_kernel.cuh`). An error already in the state is therefore never amplified and decays wherever the gate is below one; the arithmetic is the reference model's own, and the bound neither adds to it nor relies on it. Measured with all 36 recurrent layers in the path, Flash-Next's divergence from BF16 is flat from 4K to 124K at C0 (2.2e-4 → 1.4e-4 nats) and at C5 (9.8e-3 → 7.6e-3) (§9.6.8).
 
@@ -1672,7 +1674,7 @@ $$\sum_{t \in \mathcal{W}} \varepsilon(t) \leq B \cdot \theta, \qquad \text{ever
 
 ---
 
-**The contrast is between bounds** (Figure 11-1). Under full attention a step's exposure is Θ(N · ε̄), and in fixed memory the per-token precision the theorem's bound is made of falls as N grows; under provenance selection both are constants of the system. Neither bound names VRAM: a larger card moves the depth at which full attention must compress or evict, and does not remove it, while B and the thresholds are the same on every card.
+**The contrast is between bounds** (Figure 11-1). Both architectures bound how far stored error moves a head's output; what depth changes is the signal that perturbation competes with. Under provenance selection the attended set is at most B tokens, so a needed token's weight, and with it the signal-to-perturbation ratio, is bounded below at any depth. Under full attention the attended set is the whole context: a needed token's weight falls as Θ(1/N) among comparable distractors, the summed exposure of Lemma 1 grows as Θ(N · ε̄), and in fixed memory the per-token precision falls too. Neither bound names VRAM: a larger card moves the depth at which full attention must compress or evict, and does not remove it, while B and the thresholds are the same on every card.
 
 **Empirical status.** The premises — a fixed budget, a fixed hot tier, a per-block threshold on everything sealed — hold by construction. Throughput is flat in depth from 32K to 128K (§9.6.2), and the live session of §9.13.1 keeps decode flat from 48K to 321K. The direct test of the premise is §9.11.2: with the slot capped at 32K and a history twelve times that, reprojection selected every planted turn at C10 and C0 alike, where one-shot and rolling-window arms selected none. §9.12 tests what the model does with the selected set; the theorem does not rest on it.
 
@@ -1708,7 +1710,7 @@ The four contributions — online Markov expert prediction with wave-batched GEM
 
 Together they run a 180B MoE model for eight sessions on a 16 GB laptop GPU, above every published llama.cpp run of it, on hosts with two to four times the memory; keep throughput flat from 32K to 128K; compress the KV cache up to 7.6× inline, nearly 4× llama.cpp's q8_0 for less decode at 32K, with every session of every width row reproducing its reference; and serve concurrent sessions at 1.4–37.9× the best published single-stream rate for the same model and card class, up to 2,869.9 t/s across 64 sessions, with a 284B model at sixteen sessions on one GPU at 4.1× the best published single-GPU decode. The memory behind it is a 42M-token substrate held at C5, its code gallery 36.1M tokens; under sixteen concurrent answers the card's resident context peaks at 945 thousand tokens, 21.9 GiB at full precision, while the expert zone streams the rest of the model. The most comparable published study found standard frameworks degrade beyond two concurrent users on an RTX 5090 [Herz et al., arXiv:2512.23029].
 
-The Asymptotic Numerical Stability theorem bounds how far stored error moves each attention head's output, and its lemma the summed stored error entering a step, by constants independent of depth, where full attention in fixed memory loses both as the context grows. What it changes is the question the KV quantization literature asks — not how small each token's error can be made inside the full-attention regime, but whether the regime can be left. Provenance selection leaves it, and §9.11.2 shows the premise holds: every planted turn selected from a history twelve times the working set, at the top compression level as at near-lossless.
+The Asymptotic Numerical Stability theorem bounds a step's signal-to-perturbation ratio below, and its lemma the summed stored error entering a step above, independently of depth, where under full attention a needed token's weight falls as 1/N and the exposure grows linearly. What it changes is the question the KV quantization literature asks — not how small each token's error can be made inside the full-attention regime, but whether the regime can be left. Provenance selection leaves it, and §9.11.2 shows the premise holds: every planted turn selected from a history twelve times the working set, at the top compression level as at near-lossless.
 
 On the system's own codebase, retrieval ranks an answer file first among 7,943 on 49% of 121 questions by sign agreement alone, and answering 128 questions from memory with tools forbidden, the memory is worth 37.0 points of recall, re-selection during reasoning 5.3, and continuous re-selection 6.9 over a single retrieval, each clear of zero after Holm correction; the gain falls on the questions that do not name their answer's file, the ones only the reasoning can reach. Attention is retrieval: this system runs it hierarchically, approximate over the unbounded context and exact over what it selects, preserving the mechanism RAG replaces and removing the scaling constraint on exact attention. The deeper lesson is methodological: constraints accepted as design requirements forced decisions more efficient in the dimension they bound, measured here on three cards from 16 GB to 72 GB, with a bound that carries to any card.
 
@@ -1817,6 +1819,14 @@ On the system's own codebase, retrieval ranks an answer file first among 7,943 o
 [48] Bai, L., Huang, Z., Wang, X., et al. (2026). **How Do AI Agents Spend Your Money? Analyzing and Predicting Token Consumption in Agentic Coding Tasks.** arXiv:2604.22750. https://arxiv.org/abs/2604.22750
 
 [49] Niko1221 and contributors. (2026). **Strata.** Community RTX 5090 run, Strata 0.1.29 (d6708a4), IQ2_XS, MTP, median of 3, https://github.com/Niko1221/Strata/tree/main/bench/results/2026-09-30-community-rtx-5090; batching, RTX 5070 12 GB, https://github.com/Niko1221/Strata/blob/main/docs/BATCHING.md
+
+[50] Yao, J., Li, H., Liu, Y., et al. (2025). **CacheBlend: Fast Large Language Model Serving for RAG with Cached Knowledge Fusion.** EuroSys 2025. https://arxiv.org/abs/2405.16444
+
+[51] Hu, J., Huang, W., Wang, W., et al. (2025). **EPIC: Efficient Position-Independent Caching for Serving Large Language Models.** ICML 2025. https://arxiv.org/abs/2410.15332
+
+[52] Ma, D., Wang, Y., et al. (2025). **Block-Attention for Efficient Prefilling.** ICLR 2025. https://arxiv.org/abs/2409.15355
+
+[53] Yang, X., Chen, T., Chen, B. (2025). **APE: Faster and Longer Context-Augmented Generation via Adaptive Parallel Encoding.** ICLR 2025. https://arxiv.org/abs/2502.05431
 
 [17] and [19]–[23] are background reading and are not cited in the text.
 
