@@ -15,11 +15,11 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use candle::Result;
-use hf_hub::{Cache, Repo, RepoType};
+use hf_hub::{Repo, RepoType};
 use sha2::{Digest, Sha256};
 
 use super::checkpoint_pins::{QWEN4EXP_MMPROJ_FILE, QWEN4EXP_MMPROJ_REV, QWEN4EXP_REPO};
-use crate::models::hub_download::{cached, repo_file};
+use crate::models::hub_download::{local_file, repo_file};
 
 fn repo() -> Repo {
     Repo::with_revision(
@@ -29,9 +29,10 @@ fn repo() -> Repo {
     )
 }
 
-/// The tower's file, if it is already in the hub cache — no network.
+/// The tower's file, if this machine already holds it — in the hub cache, or
+/// where [`vision_tower_file`] downloaded it — with no network.
 pub fn cached_vision_tower_file() -> Option<PathBuf> {
-    cached(&Cache::default(), &repo(), QWEN4EXP_MMPROJ_FILE.0)
+    local_file(&repo(), QWEN4EXP_MMPROJ_FILE.0)
 }
 
 /// The path whose digest matched the pin, and its modification time then.

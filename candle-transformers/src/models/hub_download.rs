@@ -226,6 +226,15 @@ pub fn cached(cache: &Cache, repo: &Repo, filename: &str) -> Option<PathBuf> {
     snapshot.is_file().then_some(snapshot)
 }
 
+/// `repo`'s `filename` on this machine, with no network: the hub cache, or
+/// the file a [`download`] here left. `None` when neither holds it.
+pub fn local_file(repo: &Repo, filename: &str) -> Option<PathBuf> {
+    cached(&Cache::default(), repo, filename).or_else(|| {
+        let downloaded = download_path(repo, filename);
+        downloaded.is_file().then_some(downloaded)
+    })
+}
+
 /// `repo`'s `filename`, local: the hub cache, a file an earlier download left,
 /// or a [`download`] now.
 ///
@@ -247,7 +256,7 @@ pub fn repo_file(repo: &Repo, filename: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{cached, retryable};
+    use super::{cached, download_path, local_file, retryable};
 
     #[test]
     fn only_a_transient_status_is_retried() {
@@ -309,5 +318,25 @@ mod tests {
             cached(&cache, &pinned(repo, "cafebabe"), "widget.gguf").is_none(),
             "a revision the cache does not hold reported a hit — the pin is being ignored"
         );
+    }
+
+    /// **A file this machine downloaded is local** — it lands beside the hub
+    /// cache, not in it, and a caller that may not touch the network finds it
+    /// there.
+    #[test]
+    fn a_downloaded_file_is_local() {
+        let repo = pinned(
+            "acme/local-file-test-GGUF",
+            "fedcba9876543210fedcba9876543210fedcba98",
+        );
+        let name = "local-file-test.gguf";
+        let at = download_path(&repo, name);
+        let _ = std::fs::remove_file(&at);
+        assert_eq!(local_file(&repo, name), None);
+        std::fs::create_dir_all(at.parent().unwrap()).expect("mkdir");
+        std::fs::write(&at, b"weights").expect("write");
+        let found = local_file(&repo, name);
+        let _ = std::fs::remove_dir_all(at.parent().unwrap());
+        assert_eq!(found, Some(at));
     }
 }
