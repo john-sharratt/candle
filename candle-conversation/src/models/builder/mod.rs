@@ -537,6 +537,8 @@ impl ModelBuilder {
             default_sampling: info.sampling.clone(),
             supports_thinking: info.has_thinking,
             non_thinking_sampling: info.non_thinking.clone(),
+            // A local GGUF names no tower; a caller with one builds a spec that does.
+            vision: None,
         };
 
         let mut builder = Self::from_spec(spec);

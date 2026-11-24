@@ -75,6 +75,8 @@ pub(super) fn qwen36_35b_a3b_q4() -> ModelSpec {
         default_sampling: SamplingConfig::for_gguf_architecture("qwen2moe"),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen2moe"),
+        // The release's own tower, at the checkpoint's own pinned commit.
+        vision: Some(&quantized_qwen36_moe::QWEN36_VISION),
     }
 }
 
@@ -165,6 +167,9 @@ pub(super) fn qwen36_35b_a3b_antiloop_styletune() -> ModelSpec {
         // The think-off config keeps its mode, so taking the pair adopts the instruct half.
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture(ARCH)
             .map(|s| s.with_mode_sampling(modes)),
+        // Both halves are fine-tunes of the stock checkpoint's trunk, which
+        // keeps its embedding geometry, so the release's tower reads for it.
+        vision: Some(&quantized_qwen36_moe::QWEN36_VISION),
     }
 }
 

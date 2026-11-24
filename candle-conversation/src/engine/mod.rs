@@ -71,6 +71,7 @@ use candle_nn::kv_cache::{ChunkedKvBacking, CompressionPolicy};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{ManagedBatchedModel, ModelCoreProperties};
 use candle_transformers::models::delta_net::release_recurrent_host_buffers;
+use candle_transformers::models::qwen_vision::VisionTowerSource;
 use flume::{Receiver, Sender};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};

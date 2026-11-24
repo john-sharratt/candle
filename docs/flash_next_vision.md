@@ -154,8 +154,9 @@ tower's first ops (§3). Reference sizes:
 **The weights.** A model pack of its own
 (`docs/self_contained_model_packs.md`), built from `mmproj-F16.gguf` at the
 pinned revision (`quantized_qwen38_moe/checkpoint_pins.rs`,
-`QWEN4EXP_MMPROJ_FILE` with its length and SHA-256, checked before the build)
-by the caller that is about to need it (`vision_tower_pack`) — never by the
+`QWEN4EXP_MMPROJ_FILE` with its length and SHA-256, checked before the build,
+named as `FLASH_NEXT_VISION` — a `VisionTowerSource`, `docs/vision_models.md`
+§2.1) by the caller that is about to need it (`VisionTowerSource::pack`) — never by the
 drain that reads it, which runs with every wave stopped. The pack is
 *twinned* (`PackFamily::Twinned`, `model_pack/twins.rs`): every projection the
 int8 matmul tiles is stored as its `Q8_KO` twin, converted once on the host
@@ -187,9 +188,9 @@ priced). The arena is a bump, so what bounds it is the stages: the embedding,
 each block's attention half and MLP half, and each 512-row attention band are
 guest stages of their own, so a 16 384-patch image never holds `N × N`
 scores, nor more than one band's.
-Flash-Next's engine registers the guest itself
-(`models/builder/model_guests.rs`): the tower ships with the model, so it is
-not named in a deployment's `guests.yaml`.
+Flash-Next's spec names its tower (`ModelSpec::vision`), so its engine
+registers the guest itself (`models/builder/model_guests.rs`): the tower ships
+with the model, so it is not named in a deployment's `guests.yaml`.
 
 **Why a guest, not resident weights in the wave.** An image is read once:
 its rows are a function of its bytes alone, so they are kept (§6.2) and no
@@ -518,9 +519,10 @@ tail prefills prefill text the engine wrote itself and need nothing.
 
 ### 6.3 Which engines read images
 
-Flash-Next's engine registers the vision guest itself (§3). An engine without
-one answers an image's guest job with `Unavailable(Vision)`, which the turn
-reports as its error. An image whose rows are already kept needs no guest.
+An engine whose spec names a vision tower registers the guest that runs it
+(§3) — Flash-Next's and Qwen3.6-35B-A3B's (`docs/vision_models.md`). An engine
+whose spec names none refuses an image turn before any guest is asked. An
+image whose rows its tower already kept needs no guest.
 
 ### 6.4 Text views and penalties
 
@@ -537,8 +539,8 @@ reports as its error. An image whose rows are already kept needs no guest.
 | Where | Change |
 |---|---|
 | `qwen_vision/` (new: `geometry.rs`, `registry.rs`, `tower.rs`, `rotation.rs`) | grid and positions; `ImageHandle` and virtual ids; `VisionTower`; `ImageRotation` |
-| `quantized_qwen38_moe/checkpoint_pins.rs`, `vision_tower.rs` | the pinned `mmproj`, fetched and checked |
-| `qwen4exp/wave/images.rs`, `layers.rs`, `wave_sweep.rs` | after `host_token_ids`: rows uploaded, ids rewritten, PLE ids; second table to `gather_into`; the turn to attention; `WaveWidth::image_rows` |
+| `quantized_qwen38_moe/checkpoint_pins.rs`, `qwen_vision/source.rs` | the pinned `mmproj` (`FLASH_NEXT_VISION`), fetched, checked and packed |
+| `qwen_vision/wave_images.rs`, `qwen4exp/wave/layers.rs`, `wave_sweep.rs` | after `host_token_ids`: rows uploaded, ids rewritten, PLE ids; second table to `gather_into`; the turn to attention; `WaveWidth::image_rows` |
 | `models/device_embedding.rs`, `simple/embed_gather_dequant.cu` | the second F32 table |
 | `simple/image_rope_rows.cu` (new) | the in-place turn |
 | `batched_layer/prefill_attn.rs`, `mod.rs` | `BatchedAttentionParams.image_rotation`, applied to `q`, `k` |

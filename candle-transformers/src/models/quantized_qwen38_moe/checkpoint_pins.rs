@@ -7,6 +7,8 @@
 //! Q8_0 shard objects as the earlier pin, so moving to it changed no weight. The
 //! tokenizer is pinned to the canonical base repository.
 
+use crate::models::qwen_vision::source::VisionTowerSource;
+
 /// The tokenizer, pinned to the canonical base repo.
 pub const TOKENIZER_REPO: &str = "Qwen/Qwen3.8-Flash-Next";
 
@@ -87,6 +89,16 @@ pub const QWEN4EXP_MMPROJ_FILE: (&str, u64, &str) = (
     904_004_000,
     "1f7b7f0b984cf065c604360c29c8098362ed61b290db0ff12c6f360bb1a8a980",
 );
+
+/// Flash-Next's vision tower (`docs/vision_models.md` §2.1): the pinned
+/// `mmproj`, its rows standing for this tokenizer's `<|image_pad|>`s.
+pub const FLASH_NEXT_VISION: VisionTowerSource = VisionTowerSource {
+    name: "qwen3.8-flash-next",
+    repo: QWEN4EXP_REPO,
+    rev: QWEN4EXP_MMPROJ_REV,
+    file: QWEN4EXP_MMPROJ_FILE,
+    tokenizer: (TOKENIZER_REPO, TOKENIZER_REV),
+};
 
 /// Shard `i` (1-based) of the pinned Q8_0 split.
 pub fn q8_0_shard_name(i: usize) -> String {

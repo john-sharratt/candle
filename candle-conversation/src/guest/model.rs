@@ -17,6 +17,7 @@
 use std::sync::{Arc, Mutex};
 
 use candle::Device;
+use candle_transformers::models::qwen_vision::VisionTowerSource;
 
 use super::ground::GuestGround;
 use super::progress::GuestSink;
@@ -167,6 +168,9 @@ impl std::fmt::Debug for GuestSlot {
 #[derive(Clone, Debug, Default)]
 pub struct GuestRegistry {
     slots: Vec<GuestSlot>,
+    /// The tower the vision guest runs, when one is registered: what names
+    /// the rows it writes (`docs/vision_models.md` §3).
+    vision: Option<&'static VisionTowerSource>,
 }
 
 impl GuestRegistry {
@@ -189,6 +193,22 @@ impl GuestRegistry {
             guest,
             build: Arc::new(build),
         });
+    }
+
+    /// Register the vision guest that runs `source`'s tower.
+    pub fn register_vision(
+        &mut self,
+        source: &'static VisionTowerSource,
+        build: impl Fn() -> Box<dyn GuestModel> + Send + Sync + 'static,
+    ) {
+        self.register(Guest::Vision, build);
+        self.vision = Some(source);
+    }
+
+    /// The tower the vision guest runs, or `None` when there is no vision
+    /// guest — a model that reads no images.
+    pub fn vision(&self) -> Option<&'static VisionTowerSource> {
+        self.vision
     }
 
     /// Build a fresh instance of `guest`, or `None` if none is configured.
@@ -220,6 +240,9 @@ impl GuestRegistry {
         for slot in other.slots {
             self.slots.retain(|s| s.guest != slot.guest);
             self.slots.push(slot);
+        }
+        if other.vision.is_some() {
+            self.vision = other.vision;
         }
     }
 }
@@ -308,6 +331,7 @@ pub(crate) mod testing {
                     alpha: vec![128],
                 }),
                 GuestRequest::Vision(r) => GuestOutcome::Vision(VisionRows {
+                    width: 1,
                     rows: r.images.iter().map(|_| vec![0.0]).collect(),
                 }),
             })

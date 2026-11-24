@@ -307,24 +307,14 @@ impl Qwen4ExpBatched {
         // The prefill group's image rows, by their row in the group: image ids
         // arrive in prompts, which are prefill rows, after the decode group.
         let image_rotation = match &images {
-            Some(w) => {
-                let runs: Vec<ImageRun> = w
-                    .runs
-                    .iter()
-                    .map(|r| ImageRun {
-                        row: r.row - n_decode,
-                        ..*r
-                    })
-                    .collect();
-                let t = rotation_tables(&runs, cfg.rope_dim, f64::from(theta));
-                let n = t.rows.len();
-                Some(ImageRotation::from_tables(
-                    wave_from_vec_ticketed(t.rows, n, dev, fwd_ticket)?,
-                    t.rows_end,
-                    wave_from_vec_ticketed(t.cos, (n, t.pairs), dev, fwd_ticket)?,
-                    wave_from_vec_ticketed(t.sin, (n, t.pairs), dev, fwd_ticket)?,
-                )?)
-            }
+            Some(w) => Some(image_rotation(
+                w,
+                n_decode,
+                cfg.rope_dim,
+                f64::from(theta),
+                dev,
+                fwd_ticket,
+            )?),
             None => None,
         };
         let pre_params = BatchedAttentionParams::new(

@@ -1,8 +1,10 @@
 //! The Qwen3-VL vision tower: an image's patches in, one row per
 //! `<|image_pad|>` out, at the text trunk's width.
 //!
-//! Read from the llama.cpp `mmproj` GGUF (`clip.projector_type =
-//! qwen3vl_merger`), by its tensor names:
+//! One tower for every model whose release carries it — Flash-Next's and
+//! Qwen3.6-35B-A3B's differ only in the merger's output width, read from
+//! `mm.2` (`docs/vision_models.md` §1). Read from the llama.cpp `mmproj` GGUF
+//! (`clip.projector_type = qwen3vl_merger`), by its tensor names:
 //!
 //! | step | tensors |
 //! |---|---|
@@ -43,8 +45,10 @@ pub const HEAD_DIM: usize = HIDDEN / HEADS;
 pub const INTERMEDIATE: usize = 4304;
 /// Blocks.
 pub const DEPTH: usize = 27;
-/// The rows the merger writes: the text trunk's width.
-pub const OUT_HIDDEN: usize = 2560;
+/// The merger's last projection, whose output width is the text trunk's —
+/// the one number two releases of this tower differ in, read from it
+/// (`docs/vision_models.md` §1).
+const MERGER_OUT: &str = "mm.2";
 /// Every LayerNorm's epsilon.
 pub const EPS: f64 = 1e-6;
 /// The learned position table: a matrix the tower dequantizes and gathers
@@ -202,6 +206,8 @@ pub struct VisionTower {
     post_ln: LayerNorm,
     fc1: Linear,
     fc2: Linear,
+    /// The rows' width: the text trunk's.
+    out_hidden: usize,
     dtype: DType,
 }
 
@@ -241,6 +247,10 @@ impl VisionTower {
         let blocks = (0..DEPTH)
             .map(|i| Block::load(vb.pp(format!("v.blk.{i}")), mode, dtype))
             .collect::<Result<Vec<_>>>()?;
+        let (out_hidden, _) = vb
+            .get_no_shape(&format!("{MERGER_OUT}.weight"))?
+            .shape()
+            .dims2()?;
         Ok(Self {
             patch_w,
             patch_b,
@@ -255,13 +265,26 @@ impl VisionTower {
                 dtype,
                 vb.pp("mm.0"),
             )?,
-            fc2: linear_b_mode(MERGED_VALUES, OUT_HIDDEN, true, mode, dtype, vb.pp("mm.2"))?,
+            fc2: linear_b_mode(
+                MERGED_VALUES,
+                out_hidden,
+                true,
+                mode,
+                dtype,
+                vb.pp(MERGER_OUT),
+            )?,
+            out_hidden,
             dtype,
         })
     }
 
-    /// One image's rows, `[tokens, 2560]` in the activations' type, in raster
-    /// order over the merged grid — the order of its `<|image_pad|>`s.
+    /// The width of the rows [`Self::forward`] returns: the text trunk's.
+    pub fn out_hidden(&self) -> usize {
+        self.out_hidden
+    }
+
+    /// One image's rows, `[tokens, out_hidden]` in the activations' type, in
+    /// raster order over the merged grid — the order of its `<|image_pad|>`s.
     pub fn forward(&self, image: &VisionInput) -> Result<Tensor> {
         image.check().map_err(candle::Error::Msg)?;
         let dev = self.pos.device().clone();
@@ -333,35 +356,58 @@ impl VisionTower {
     }
 }
 
-// Under `cuda` for the pinned pack's lookup alone, which lives with the
-// model; the test runs on the CPU.
+#[cfg(all(test, feature = "cuda"))]
+use super::source::{VisionTowerSource, VISION_TOWER_MODE};
+#[cfg(all(test, feature = "cuda"))]
+use crate::models::quantized_qwen36_moe::QWEN36_VISION;
+#[cfg(all(test, feature = "cuda"))]
+use crate::models::quantized_qwen38_moe::FLASH_NEXT_VISION;
+
+/// Every model's pinned tower, and the width its rows must be: the trunk's.
+#[cfg(all(test, feature = "cuda"))]
+fn pinned_towers() -> [(&'static VisionTowerSource, usize); 2] {
+    [(&FLASH_NEXT_VISION, 2560), (&QWEN36_VISION, 2048)]
+}
+
+// Under `cuda` for the pinned packs' lookup alone, which live with the models;
+// the test runs on the CPU.
 #[cfg(all(test, feature = "cuda"))]
 mod cpu_tests {
     use super::*;
-    use crate::models::quantized_qwen38_moe::vision_tower_pack;
 
-    /// **The real tower runs on the CPU**, the reference its card run is held
+    /// **Each real tower runs on the CPU**, the reference its card run is held
     /// to: a 256 × 256 image — 256 patches, one attention band — into one
-    /// finite 2 560-wide row per `<|image_pad|>`. Read from the tower's pack
-    /// with no twins, which a CPU load takes, built on first use.
+    /// finite row per `<|image_pad|>`, as wide as its trunk. Read from the
+    /// tower's pack with no twins, which a CPU load takes, built on first use.
     #[test]
-    fn the_pinned_tower_reads_an_image_on_the_cpu() {
-        let path = vision_tower_pack(Int8Mode::Off).unwrap();
-        let dev = Device::Cpu;
-        let vb = VarBuilder::from_gguf(&path, &dev).unwrap();
-        let tower = VisionTower::load(&vb, Int8Mode::Off).unwrap();
-        let grid = Grid {
-            height: 256,
-            width: 256,
-        };
-        let rgb = (0..grid.height * grid.width * 3)
-            .map(|i| (i * 31 % 251) as u8)
-            .collect();
-        let rows = tower.forward(&VisionInput { rgb, grid }).unwrap();
-        assert_eq!(rows.dims(), [grid.tokens(), OUT_HIDDEN]);
-        let values = rows.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert!(values.iter().all(|v| v.is_finite()), "a row is not finite");
-        assert!(values.iter().any(|v| *v != 0.0), "every row is zero");
+    fn each_pinned_tower_reads_an_image_on_the_cpu() {
+        for (source, width) in pinned_towers() {
+            let path = source.pack(Int8Mode::Off).unwrap();
+            let dev = Device::Cpu;
+            let vb = VarBuilder::from_gguf(&path, &dev).unwrap();
+            let tower = VisionTower::load(&vb, Int8Mode::Off).unwrap();
+            assert_eq!(tower.out_hidden(), width, "{}", source.name);
+            let grid = Grid {
+                height: 256,
+                width: 256,
+            };
+            let rgb = (0..grid.height * grid.width * 3)
+                .map(|i| (i * 31 % 251) as u8)
+                .collect();
+            let rows = tower.forward(&VisionInput { rgb, grid }).unwrap();
+            assert_eq!(rows.dims(), [grid.tokens(), width], "{}", source.name);
+            let values = rows.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert!(
+                values.iter().all(|v| v.is_finite()),
+                "{}: a row is not finite",
+                source.name
+            );
+            assert!(
+                values.iter().any(|v| *v != 0.0),
+                "{}: every row is zero",
+                source.name
+            );
+        }
     }
 }
 
@@ -369,16 +415,15 @@ mod cpu_tests {
 mod tests {
     use super::*;
     use crate::models::gpu_test_lock::gpu_serial;
-    use crate::models::quantized_qwen38_moe::{vision_tower_pack, VISION_TOWER_MODE};
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_nn::kv_cache::{close_guest_arena, guest_domain_stats, open_guest_arena};
 
-    /// The pinned tower on the card, from its twinned pack — every projection
+    /// `source`'s tower on the card, from its twinned pack — every projection
     /// uploaded as the KO twin it is stored as — or `None` on a machine
     /// without a card.
-    fn tower() -> Option<(Device, VisionTower)> {
+    fn tower(source: &'static VisionTowerSource) -> Option<(Device, VisionTower)> {
         let dev = Device::new_cuda(0).ok()?;
-        let path = vision_tower_pack(VISION_TOWER_MODE).unwrap();
+        let path = source.pack(VISION_TOWER_MODE).unwrap();
         let vb = VarBuilder::from_gguf(&path, &dev).unwrap();
         let tower = VisionTower::load(&vb, VISION_TOWER_MODE).unwrap();
         Some((dev, tower))
@@ -397,9 +442,9 @@ mod tests {
         VisionInput { rgb, grid }
     }
 
-    /// One finite, non-zero 2 560-wide row per `<|image_pad|>`.
-    fn assert_rows(rows: &Tensor, grid: Grid) {
-        assert_eq!(rows.dims(), [grid.tokens(), OUT_HIDDEN]);
+    /// One finite, non-zero `width`-wide row per `<|image_pad|>`.
+    fn assert_rows(rows: &Tensor, grid: Grid, width: usize) {
+        assert_eq!(rows.dims(), [grid.tokens(), width]);
         let values = rows
             .to_dtype(DType::F32)
             .unwrap()
@@ -411,43 +456,52 @@ mod tests {
         assert!(values.iter().any(|v| *v != 0.0), "every row is zero");
     }
 
-    /// **The real tower runs on the card**: Flash-Next's pinned tower reads an
-    /// image into its rows. On a machine without a card there is nothing to
-    /// run.
+    /// **Each real tower runs on the card**: every model's pinned tower reads
+    /// an image into its trunk's rows. On a machine without a card there is
+    /// nothing to run.
     #[test]
-    fn the_pinned_tower_reads_an_image_on_the_card() {
+    fn each_pinned_tower_reads_an_image_on_the_card() {
         let _gpu = gpu_serial();
-        let Some((_, tower)) = tower() else { return };
-        let input = image();
-        let grid = input.grid;
-        assert_rows(&tower.forward(&input).unwrap(), grid);
+        for (source, width) in pinned_towers() {
+            let Some((_, tower)) = tower(source) else {
+                return;
+            };
+            let input = image();
+            let grid = input.grid;
+            assert_rows(&tower.forward(&input).unwrap(), grid, width);
+        }
     }
 
     /// **And on a guest arena**, sized as the vision guest sizes it: the
     /// image's patches at [`ACTIVATION_BYTES_PER_PATCH`] — the way the drain
     /// runs it, every stage and block carving from that one stretch.
     #[test]
-    fn the_pinned_tower_reads_an_image_on_a_guest_arena() {
+    fn each_pinned_tower_reads_an_image_on_a_guest_arena() {
         let _gpu = gpu_serial();
-        let Some((dev, tower)) = tower() else { return };
-        let input = image();
-        let grid = input.grid;
-        let bytes = grid.patches() * ACTIVATION_BYTES_PER_PATCH;
-        let Device::Cuda(cuda) = &dev else {
-            unreachable!()
-        };
-        let stream = cuda.cuda_stream();
-        let ground = stream.alloc_zeros::<u8>(bytes).unwrap();
-        let (base, _guard) = ground.device_ptr(&stream);
-        open_guest_arena(&stream, base, bytes);
-        let rows = tower.forward(&input);
-        let (_, peak, _) = guest_domain_stats(stream.context().ordinal()).unwrap();
-        close_guest_arena(&stream);
-        println!(
-            "guest arena peak: {} KiB a patch of {} priced",
-            peak / grid.patches() / 1024,
-            ACTIVATION_BYTES_PER_PATCH / 1024
-        );
-        assert_rows(&rows.unwrap(), grid);
+        for (source, width) in pinned_towers() {
+            let Some((dev, tower)) = tower(source) else {
+                return;
+            };
+            let input = image();
+            let grid = input.grid;
+            let bytes = grid.patches() * ACTIVATION_BYTES_PER_PATCH;
+            let Device::Cuda(cuda) = &dev else {
+                unreachable!()
+            };
+            let stream = cuda.cuda_stream();
+            let ground = stream.alloc_zeros::<u8>(bytes).unwrap();
+            let (base, _guard) = ground.device_ptr(&stream);
+            open_guest_arena(&stream, base, bytes);
+            let rows = tower.forward(&input);
+            let (_, peak, _) = guest_domain_stats(stream.context().ordinal()).unwrap();
+            close_guest_arena(&stream);
+            println!(
+                "{}: guest arena peak {} KiB a patch of {} priced",
+                source.name,
+                peak / grid.patches() / 1024,
+                ACTIVATION_BYTES_PER_PATCH / 1024
+            );
+            assert_rows(&rows.unwrap(), grid, width);
+        }
     }
 }

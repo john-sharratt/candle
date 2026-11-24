@@ -68,6 +68,7 @@ use crate::models::lazy_rope::LazyRope;
 use crate::models::lora::LayerLora;
 use crate::models::operand_guard::expect_dtype;
 use crate::models::prefill_utils::SharedPm;
+use crate::models::qwen_vision::wave_images::{place_image_rows, WaveImages};
 use crate::models::tensor_cat::TensorCat;
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_root};
 
@@ -97,6 +98,11 @@ pub struct HeadWave<'a> {
     /// The forward span's ticket — where the rows' embeddings are gathered
     /// (`WaveBuffer::MtpRowEmbeds`). `None` when no tier was placed.
     pub forward: Option<WaveTicket>,
+    /// The wave's image rows, in the activation's type, and where they go:
+    /// copied over the placeholders the head's embedding gathered, as the
+    /// trunk's were — HF's head reads `inputs_embeds`, which hold the image
+    /// there (`docs/vision_models.md` §2.3). `None` for a text wave.
+    pub images: Option<(&'a Tensor, &'a WaveImages)>,
 }
 
 /// Run the head over this wave's rows, filling its KV layer, and hand back each
@@ -139,13 +145,17 @@ pub fn head_wave_pass(
             Device::Cuda(d) => Some(begin_wave(&d.cuda_stream(), LayerPhase::Attention)?),
             _ => None,
         };
-        q.embed.rows(
+        let rows = q.embed.rows(
             ids,
             dev,
             wave_root(staging.as_ref()),
             w.act_dtype,
             w.forward,
-        )?
+        )?;
+        if let Some((image, images)) = w.images {
+            place_image_rows(&rows, image, images, 0)?;
+        }
+        rows
     };
 
     // **The head's pass is one attention generation**, priced as

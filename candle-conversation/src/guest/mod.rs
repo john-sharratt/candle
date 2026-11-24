@@ -65,6 +65,9 @@ pub mod seed;
 pub mod staging;
 pub mod tiled;
 pub mod varground;
+// A model's tower resolves its pack through the hub; without it no model can
+// register one.
+#[cfg(feature = "hub")]
 pub mod vision;
 pub mod windowed;
 pub mod work;
@@ -78,6 +81,7 @@ pub use progress::{GuestEvent, GuestSink};
 pub use queue::{GuestQueue, GuestReceipt};
 pub use seed::{resolve_seed, Seeded, EXACT_IN_JSON};
 pub use varground::GroundVars;
+#[cfg(feature = "hub")]
 pub use vision::VisionGuest;
 pub use work::{
     Guest, GuestError, GuestImage, GuestMatte, GuestOutcome, GuestRequest, ImageLora,

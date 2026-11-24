@@ -41,6 +41,7 @@ pub(super) fn qwen3_8b_q4() -> ModelSpec {
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),
+        vision: None,
     }
 }
 
@@ -72,6 +73,7 @@ pub(super) fn qwen3_8b_q6() -> ModelSpec {
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),
+        vision: None,
     }
 }
 
@@ -104,6 +106,7 @@ pub(super) fn qwen3_14b_q4() -> ModelSpec {
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),
+        vision: None,
     }
 }
 
@@ -132,6 +135,7 @@ pub(super) fn qwen3_14b_q5() -> ModelSpec {
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),
+        vision: None,
     }
 }
 
@@ -160,5 +164,6 @@ pub(super) fn qwen3_14b_q6() -> ModelSpec {
         default_sampling: SamplingConfig::for_gguf_architecture("qwen3"),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen3"),
+        vision: None,
     }
 }

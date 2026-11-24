@@ -50,6 +50,7 @@ pub(super) fn qwen3_30b_a3b_q6() -> ModelSpec {
         // Sampling params for a thinking-off turn (effort=Off / `/no_think`); the
         // empty `<think></think>` itself comes from the glue + Off steering.
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen2moe"),
+        vision: None,
     }
 }
 
