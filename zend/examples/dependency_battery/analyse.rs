@@ -3,17 +3,19 @@
 //! computed from the answers' lines alone.
 //!
 //! A question's score in an arm is its recall averaged over the runs that
-//! answered it. Intervals are 95% percentile-bootstrap intervals over
-//! questions — for a difference, over the per-question paired differences —
-//! from [`RESAMPLES`] resamples of a fixed seed, so the figures reproduce
-//! exactly. Contrasts are tested by Wilcoxon signed-rank on the paired
-//! differences and Holm-corrected across the five.
+//! answered it, however many that arm has. Intervals are 95%
+//! percentile-bootstrap intervals over questions — for a difference, over the
+//! per-question paired differences — from [`RESAMPLES`] resamples of a fixed
+//! seed, so the figures reproduce exactly. Contrasts are tested by Wilcoxon
+//! signed-rank on the paired differences and Holm-corrected within their
+//! family: the five pre-registered ones together, and the memory against the
+//! baselines (`arms::SECONDARY`) apart from them.
 
 use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::arms::{Arm, ARMS, CONTRASTS};
+use crate::arms::{Arm, Contrast, ARMS, CONTRASTS, SECONDARY};
 use crate::placement::placed_at;
 use crate::run::Line;
 use crate::stats::{bootstrap_mean_interval, holm, mean, wilcoxon};
@@ -112,37 +114,56 @@ pub struct ContrastRow {
     pub p_holm: f64,
 }
 
-pub fn contrasts(scores: &Scores) -> Vec<ContrastRow> {
-    let mut rows: Vec<ContrastRow> = CONTRASTS
-        .iter()
-        .map(|&(name, arm, against)| {
-            let d: Vec<f64> = paired(scores, arm, against)
-                .into_iter()
-                .map(|(_, d)| d)
-                .collect();
-            let (lo, hi) = if d.is_empty() {
-                (f64::NAN, f64::NAN)
-            } else {
-                bootstrap_mean_interval(&d, RESAMPLES, SEED)
-            };
-            ContrastRow {
-                name,
-                arm,
-                against,
-                questions: d.len(),
-                effect: mean(&d),
-                lo,
-                hi,
-                p: wilcoxon(&d).p,
-                p_holm: 0.0,
-            }
-        })
+/// One contrast's row, its Holm p left for its family to set.
+pub fn contrast_row(scores: &Scores, &(name, arm, against): &Contrast) -> ContrastRow {
+    let d: Vec<f64> = paired(scores, arm, against)
+        .into_iter()
+        .map(|(_, d)| d)
         .collect();
+    let (lo, hi) = if d.is_empty() {
+        (f64::NAN, f64::NAN)
+    } else {
+        bootstrap_mean_interval(&d, RESAMPLES, SEED)
+    };
+    ContrastRow {
+        name,
+        arm,
+        against,
+        questions: d.len(),
+        effect: mean(&d),
+        lo,
+        hi,
+        p: wilcoxon(&d).p,
+        p_holm: 0.0,
+    }
+}
+
+/// `rows` Holm-corrected as one family.
+fn holm_family(mut rows: Vec<ContrastRow>) -> Vec<ContrastRow> {
     let adjusted = holm(&rows.iter().map(|r| r.p).collect::<Vec<_>>());
     for (r, p) in rows.iter_mut().zip(adjusted) {
         r.p_holm = p;
     }
     rows
+}
+
+/// The primary family: the five pre-registered contrasts, Holm-corrected
+/// across all five whatever the answers hold.
+pub fn contrasts(scores: &Scores) -> Vec<ContrastRow> {
+    holm_family(CONTRASTS.iter().map(|c| contrast_row(scores, c)).collect())
+}
+
+/// The secondary family: the memory against the baselines, Holm-corrected
+/// across the contrasts the answers can test — one whose arms share no
+/// question is left out rather than counted as a p of one.
+pub fn secondary(scores: &Scores) -> Vec<ContrastRow> {
+    holm_family(
+        SECONDARY
+            .iter()
+            .map(|c| contrast_row(scores, c))
+            .filter(|r| r.questions > 0)
+            .collect(),
+    )
 }
 
 /// Figure 9.12-4: the gain `a − b` with its interval, for the questions that
@@ -362,7 +383,54 @@ mod tests {
             secs: 0.0,
             answer: String::new(),
             error: None,
+            retrieved: Vec::new(),
+            retrieval_hit: None,
+            tool_calls: None,
         }
+    }
+
+    /// **The secondary family is corrected apart from the primary**: adding
+    /// R1 and T1 changes no primary p, the secondary family holds only the
+    /// contrasts its arms can test, and with six runs of C1 against three of
+    /// R1 each question's score is its own arm's runs' mean.
+    #[test]
+    fn the_secondary_family_is_its_own() {
+        let mut lines = Vec::new();
+        for i in 0..20 {
+            let id = format!("q{i}");
+            for run in 1..=3 {
+                lines.push(line(Arm::C1, run, &id, 1.0));
+                lines.push(line(Arm::B1, run, &id, 0.0));
+            }
+            for run in 4..=6 {
+                lines.push(line(Arm::C1, run, &id, 0.5));
+            }
+        }
+        let tested = |rows: Vec<ContrastRow>| -> Vec<(&'static str, usize, f64, f64)> {
+            rows.into_iter()
+                .map(|r| (r.name, r.questions, r.p, r.p_holm))
+                .collect()
+        };
+        let before = tested(contrasts(&scores(&lines)));
+        assert!(secondary(&scores(&lines)).is_empty());
+        for i in 0..20 {
+            let id = format!("q{i}");
+            for run in 1..=3 {
+                lines.push(line(Arm::R1, run, &id, if i < 10 { 0.25 } else { 0.0 }));
+            }
+        }
+        let s = scores(&lines);
+        assert_eq!(s[&Arm::C1]["q0"], 0.75);
+        assert_eq!(tested(contrasts(&s)), before);
+        let rows = secondary(&s);
+        assert_eq!(
+            rows.iter().map(|r| (r.arm, r.against)).collect::<Vec<_>>(),
+            vec![(Arm::C1, Arm::R1)],
+            "T1 and A1 are absent, so their contrasts are not in the family"
+        );
+        let r = &rows[0];
+        assert_eq!((r.questions, r.effect), (20, 0.75 - 0.125));
+        assert_eq!(r.p_holm, r.p, "a family of one is not corrected");
     }
 
     /// **A question's score is its runs' mean**, and a failed answer counts

@@ -11,12 +11,19 @@
 
 use std::collections::HashSet;
 
-/// The text after the reasoning block.
+/// What closes a reasoning block and what closes a tool call.
+const CLOSERS: [&str; 2] = ["</think>", "</tool_call>"];
+
+/// The text after the last reasoning block or tool call: a turn that read
+/// the repository with its tools answers after its last call, and the paths
+/// its calls named are not its answer.
 pub fn answer(text: &str) -> &str {
-    match text.rfind("</think>") {
-        Some(i) => text[i + "</think>".len()..].trim(),
-        None => text.trim(),
-    }
+    let after = CLOSERS
+        .iter()
+        .filter_map(|c| text.rfind(c).map(|i| i + c.len()))
+        .max()
+        .unwrap_or(0);
+    text[after..].trim()
 }
 
 /// Whether `answer` names one `expect` item.
@@ -82,6 +89,23 @@ mod tests {
             "It is in gpu.rs."
         );
         assert_eq!(answer(" plain "), "plain");
+    }
+
+    /// **A turn that called tools answers after its last call**: the path a
+    /// call read names nothing.
+    #[test]
+    fn the_answer_follows_the_last_tool_call() {
+        assert_eq!(
+            answer(
+                "<think>look</think><tool_call>{\"path\": \"scan.rs\"}</tool_call>\
+                 <think>found</think>It is in gpu.rs."
+            ),
+            "It is in gpu.rs."
+        );
+        assert_eq!(
+            answer("<think>a</think><tool_call>{\"path\": \"scan.rs\"}</tool_call>\nIn gpu.rs."),
+            "In gpu.rs."
+        );
     }
 
     /// Any spelling names the item, case-insensitively, inside a longer path.
