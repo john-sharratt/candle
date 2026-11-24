@@ -36,7 +36,7 @@ pub fn definition() -> Value {
             "type": "object",
             "properties": {
                 "text": {"type": "string", "description": "The message."},
-                "images": {"type": "array", "items": {"type": "string"}, "maxItems": 4, "description": "Pictures of the user's own for Zen to look at with the message: each the id (or the link) `image_upload` answered once the picture was sent. Zen reads them and answers about them."},
+                "images": {"type": "array", "items": {"type": "string"}, "maxItems": 4, "description": "Pictures for Zen to look at with the message: each the id (`<hash>.jpg`) or the link that `image_upload` answered once the user's picture was sent, or that `image_generate` or `image_edit` answered. Zen reads them and answers about them."},
                 "chat": {"type": "string", "description": "The chat to send on: the id an earlier `zen_chat_send` answered with, or a web UI conversation's id when the user asked you to speak in it. Leave it out to open a new chat."},
                 "effort": {"type": "string", "enum": ["balanced", "deep", "exhaustive"], "description": "How hard Zen thinks about its answer: on a chat `balanced` by default, which answers soonest; on a conversation, its own dial unless named. `deep` or `exhaustive` for a question that must weigh evidence."},
                 "wait_s": {"type": "integer", "minimum": 0, "description": "How long to wait for the answer (45 by default)."}

@@ -37,11 +37,15 @@ pub fn picture_id(named: &str) -> Result<String, String> {
         }
         None => named,
     };
+    // npcd names a picture by its hash and format, `<64 hex>.jpg`: one dot,
+    // never a path.
     let fits = !id.is_empty()
-        && id.len() <= 64
+        && id.len() <= 80
+        && !id.starts_with('.')
+        && !id.contains("..")
         && id
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
     if fits {
         Ok(id.to_string())
     } else {
@@ -126,6 +130,15 @@ mod tests {
 
     #[test]
     fn a_picture_is_named_by_its_id_or_its_link() {
+        let hash = "f10974ef443d2b7bca57bef7d4cde275bdbf01cfc4ef459d11bd4f4eff8ecc68";
+        let id = format!("{hash}.jpg");
+        assert_eq!(picture_id(&id), Ok(id.clone()));
+        assert_eq!(
+            picture_id(&format!(
+                "https://bot.tokera.com/v1/image/link/{id}?exp=1795573401&sig=451a"
+            )),
+            Ok(id)
+        );
         assert_eq!(picture_id("a1b2c3"), Ok("a1b2c3".into()));
         assert_eq!(picture_id(" a1b2c3 "), Ok("a1b2c3".into()));
         assert_eq!(
@@ -151,6 +164,8 @@ mod tests {
     fn anything_else_is_refused() {
         assert!(picture_id("").is_err());
         assert!(picture_id("../etc/passwd").is_err());
+        assert!(picture_id("..").is_err());
+        assert!(picture_id(".hidden").is_err());
         assert!(picture_id("https://example.com/cat.png").is_err());
     }
 }
