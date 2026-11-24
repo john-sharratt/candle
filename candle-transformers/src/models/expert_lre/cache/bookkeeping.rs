@@ -5,10 +5,10 @@
 //! free list, and an eviction only drops the tables and the views, because the
 //! cold pack holds a valid copy of every expert and nothing needs writing back.
 //! A victim is ranked by its frequency scaled by how far behind the wave its
-//! layer lies, but the reload tier and whether its row routed it last time run
-//! as ordered passes ahead of that score, so the cheapest expected miss is paid
-//! first. Free slots are taken rightmost, which keeps live experts packed away
-//! from the boundary the KV side pushes against.
+//! layer lies and by a small protection for a pack-only reload, all in one key;
+//! only whether its row routed it last time runs as a pass ahead of that key.
+//! Free slots are taken rightmost, which keeps live experts packed away from the
+//! boundary the KV side pushes against.
 
 use super::*;
 
@@ -33,7 +33,6 @@ impl ExpertCacheInner {
             pinned_layers: pinned_layer_count(num_moe_layers),
             warm_backed: Arc::new(HostBacked::new(num_moe_layers, experts_per_layer)),
             hit_last: vec![false; num_moe_layers * experts_per_layer],
-            passes: EVICTION_PASSES,
             #[cfg(feature = "tensor-assert")]
             owners: None,
         }
@@ -79,23 +78,6 @@ impl ExpertCacheInner {
         }
     }
 
-    /// Order the eviction passes by each class's expected miss cost, cheapest
-    /// first: `cost[hit * 2 + warm]` is how often a victim of that class is
-    /// routed again at its row's next visit times what restoring it costs.
-    /// Ties keep [`EVICTION_PASSES`]'s order, which takes the warm-backed
-    /// first.
-    ///
-    /// Restoring a pack-only expert costs the drive read *and* the copy that
-    /// follows, against the copy alone for a warm-backed one, so pack-only
-    /// classes are protected by that ratio — about an order of magnitude on an
-    /// NVMe pack — and an eviction takes one only when it is that much less
-    /// likely to be wanted back.
-    pub(crate) fn set_eviction_costs(&mut self, cost: [f64; 4]) {
-        let mut passes = EVICTION_PASSES;
-        passes.sort_by(|&a, &b| cost[pass_class(a)].total_cmp(&cost[pass_class(b)]));
-        self.passes = passes;
-    }
-
     /// Whether `layer`'s row routed `expert` on its last visit.
     #[inline]
     pub(crate) fn hit_last_visit(&self, layer: usize, expert: usize) -> bool {
@@ -109,7 +91,7 @@ impl ExpertCacheInner {
     }
 
     /// Where `(layer, expert)` reloads from after an eviction — see
-    /// [`ReloadTier`] for why eviction passes split by tier.
+    /// [`ReloadTier`] for how eviction weighs it.
     #[inline]
     pub(super) fn reload_tier(&self, layer: usize, expert: usize) -> ReloadTier {
         if self.warm_backed.get(layer, expert) {
@@ -134,7 +116,7 @@ impl ExpertCacheInner {
     /// tier: whatever its protection, an elevated expert still sorts below every
     /// scored one in its pass, which is the separation
     /// [`PREFILL_ELEVATE_PENALTY`] exists to create. `protect` is always in
-    /// `[FADE_FLOOR, 1]`, so this never divides by zero.
+    /// `[FADE_FLOOR, PACK_ONLY_PROTECTION]`, so this never divides by zero.
     #[inline]
     pub(super) fn protected_by(base: f32, protect: f32) -> f32 {
         if base < 0.0 {
@@ -236,18 +218,21 @@ impl ExpertCacheInner {
         );
         // Keep key: a pinned-layer expert above everything — it has nowhere to
         // reload from, and a zone retracted to the pinned set holds exactly it —
-        // then pack-only experts ahead of warm-backed ones, then the hotter
-        // within each tier: the eviction passes, inverted. The same key decides
-        // which survivor below the frontier a hotter doomed expert displaces; a
-        // pinned-layer expert is never displaced.
+        // then the eviction key without its position: the score scaled by the
+        // reload-cost tilt, so a hot warm-backed expert outlasts a pack-only one
+        // nobody routes. The same key decides which survivor below the frontier
+        // a hotter doomed expert displaces; a pinned-layer expert is never
+        // displaced.
         let pinned_layers = self.pinned_layers;
-        let keep: Vec<(bool, bool, f32)> = (0..self.zone.capacity())
+        let keep: Vec<(bool, f32)> = (0..self.zone.capacity())
             .map(|i| {
-                self.slot_to_key[i].map_or((false, false, 0.0), |(layer, expert)| {
+                self.slot_to_key[i].map_or((false, 0.0), |(layer, expert)| {
                     (
                         layer < pinned_layers,
-                        self.reload_tier(layer, expert) == ReloadTier::Nvme,
-                        self.score(layer, expert),
+                        Self::protected_by(
+                            self.score(layer, expert),
+                            tier_protection(self.reload_tier(layer, expert)),
+                        ),
                     )
                 })
             })
@@ -421,13 +406,14 @@ impl ExpertCacheInner {
     }
 
     /// Up to `count` batch victims, ranked by [`VictimKey::order`] within each
-    /// [`EVICTION_PASSES`] pass: a later pass only for what the earlier ones
+    /// [`RECENCY_PASSES`] pass: a later pass only for what the earlier ones
     /// could not supply. Best victim first.
     ///
     /// `weight(slot_idx, moe_layer, dist)` admits a non-pinned occupied slot
-    /// by returning the protection factor its frequency is scaled by (through
-    /// [`Self::protected_by`], so an elevated expert's negative score is not
-    /// inverted), or `None` to skip it.
+    /// by returning the protection factor its frequency is scaled by, or `None`
+    /// to skip it. The reload tier's factor ([`tier_protection`]) multiplies
+    /// in, and the product goes through [`Self::protected_by`], so an elevated
+    /// expert's negative score is not inverted.
     pub(super) fn batch_victims(
         &self,
         current_layer: usize,
@@ -435,7 +421,7 @@ impl ExpertCacheInner {
         weight: impl Fn(usize, usize, usize) -> Option<f32>,
     ) -> Vec<usize> {
         let mut victims = Vec::with_capacity(count);
-        for (tier, hit) in self.passes {
+        for hit in RECENCY_PASSES {
             let need = count - victims.len();
             if need == 0 {
                 break;
@@ -446,18 +432,17 @@ impl ExpertCacheInner {
                 .enumerate()
                 .filter_map(|(idx, key)| {
                     let (layer, expert) = (*key)?;
-                    if layer < self.pinned_layers
-                        || self.reload_tier(layer, expert) != tier
-                        || self.hit_last_visit(layer, expert) != hit
-                    {
+                    if layer < self.pinned_layers || self.hit_last_visit(layer, expert) != hit {
                         return None;
                     }
                     let dist = self.forward_distance(layer, current_layer);
-                    let factor = weight(idx, layer, dist)?;
+                    let tier = self.reload_tier(layer, expert);
+                    let factor = weight(idx, layer, dist)? * tier_protection(tier);
                     Some(VictimKey {
                         slot: idx,
                         score: Self::protected_by(self.score(layer, expert), factor),
                         dist,
+                        warm: tier == ReloadTier::Warm,
                         lru: self.last_used[idx],
                     })
                 })
@@ -478,7 +463,7 @@ impl ExpertCacheInner {
     /// rule: an expert whose row is still being computed cannot give up its
     /// slot) and evicts the ones it takes with [`Self::evict`].
     ///
-    /// ## Victim key: `frequency × behind_protection`, per reload tier
+    /// ## Victim key: `frequency × behind_protection × tier_protection`
     ///
     /// Lowest key first. The protection fades with how far behind the wave a
     /// layer is ([`behind_protection`]): L−1 is scaled by [`FADE_FLOOR`] and
@@ -489,26 +474,25 @@ impl ExpertCacheInner {
     /// score — enough to steer churn behind the wave, not enough to evict a hot
     /// expert the next pass needs for a cold one ahead.
     ///
+    /// A pack-only expert's key is doubled ([`PACK_ONLY_PROTECTION`]) for the
+    /// drive read its reload costs. That is a tilt inside the one order, not a
+    /// pass above it, so every resident of either tier competes on how much it
+    /// is used: a pack-only expert decode no longer routes goes before a
+    /// warm-backed one it keeps routing.
+    ///
     /// Demand and read-ahead claims spend the same ranked offers, so a read-ahead
     /// copy for a row ahead is bought from the layers the wave has left, not
     /// from the ones it is about to route.
     ///
-    /// The policy runs once per eviction pass — a reload tier × whether the
-    /// row routed the expert on its last visit — cheapest expected miss cost
-    /// first ([`Self::set_eviction_costs`]), and a later pass only for the
-    /// shortfall. So neither distance nor frequency outranks a pass: a
-    /// warm-backed expert ahead of the wave goes before a pack-only one just
-    /// behind it, and a stale hot expert before one its row just routed,
-    /// whenever the measured costs order the passes that way. A hard
-    /// distance tier across the reload tiers was measured here and tripled cold
-    /// pack reads (2.8k→8.2k at config-8, bulk −9%) precisely because it let
-    /// position override the cold shield.
+    /// The policy runs once per recency pass ([`RECENCY_PASSES`]) — the experts
+    /// the row did not route on its last visit, then the ones it did — and the
+    /// second only for the shortfall.
     ///
-    /// Ties break farther-first then LRU, so a never-used expert goes from the
-    /// layer just behind first. Pinned layers are never candidates.
-    /// `admit(slot, layer)` refuses a slot outright.
+    /// Ties break farther-first, then warm-backed, then LRU, so a never-used
+    /// expert goes from the layer just behind first. Pinned layers are never
+    /// candidates. `admit(slot, layer)` refuses a slot outright.
     ///
-    /// One O(slots) scan + an O(n) `select_nth` partition per tier pass.
+    /// One O(slots) scan + an O(n) `select_nth` partition per recency pass.
     pub(crate) fn rank_victims(
         &self,
         current_layer: usize,

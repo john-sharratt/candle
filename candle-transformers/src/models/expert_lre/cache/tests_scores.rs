@@ -235,8 +235,8 @@ pub(super) mod tests {
     /// elevated expert ahead of the wave must still be taken before one with a
     /// single decode hit behind it: −0.1 / 0.922 against 1.0 × 0.328. This is
     /// what `protected_by`'s divide preserves and what a shift-then-multiply
-    /// scheme would lose. Both are pack-only, so the two share a pass and only
-    /// the key decides.
+    /// scheme would lose. Both are pack-only, so the reload tilt is the same for
+    /// both and only the key decides.
     #[test]
     fn an_elevated_expert_outranks_nothing_scored_in_a_demand_batch() {
         let mut inner = cache(2);

@@ -41,7 +41,7 @@ use super::pack::RecordLayout;
 #[cfg(feature = "cuda")]
 use super::pad::Pad;
 #[cfg(feature = "cuda")]
-use super::pinned::{can_go_cold, stratified_membership, ExpertResidency};
+use super::pinned::{can_go_cold, stratified_membership, vram_startup_set, ExpertResidency};
 #[cfg(feature = "cuda")]
 use super::pipeline::{spawn_pipeline_thread, PipelineState};
 #[cfg(feature = "cuda")]
@@ -98,6 +98,11 @@ const STARTUP_RING_SLOTS: usize = 64;
 /// warm the same experts: a change in expert-cache hit rate is then attributable
 /// to the change under test, not to which experts got lucky at startup.
 const WARM_DRAW_SEED: u64 = 0x5745_524D_5F53_4545;
+
+/// The seed for the startup VRAM fill's per-layer draw
+/// (`pinned::vram_startup_set`), fixed for the same reason as
+/// [`WARM_DRAW_SEED`] and distinct from it, so the two draws are independent.
+const VRAM_DRAW_SEED: u64 = 0x5652_414D_5F53_4545;
 
 use candle::vram::{gpu_addressable_room, host_ram_budget, total_physical_ram, PAGEABLE_RESERVE};
 

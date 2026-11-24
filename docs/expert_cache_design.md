@@ -421,10 +421,11 @@ build got it wrong.** If VRAM has already skimmed the skew, then the experts VRA
 nothing until that expert is evicted. Drawing uniformly over all 6,144 spent 36 %
 of the tier on guaranteed hits.
 
-The startup fill takes the first `vram_slots` experts in flat `(layer, expert)`
-order, so the pool the draw should run over is everything past that prefix — and
-the tier only has to be the size of VRAM's *complement*, not of the model, to
-cover every miss. On Qwen3-30B-A3B that is 3,767 experts rather than 6,144: it
+The startup fill puts the pinned layers on the card whole and spreads the rest
+of the zone level across the evictable layers, one slot per layer per round, each
+layer's share drawn at random (`pinned::vram_startup_set`). So the pool the warm
+draw should run over is everything outside that set — and the tier only has to
+be the size of VRAM's *complement*, not of the model, to cover every miss. On Qwen3-30B-A3B that is 3,767 experts rather than 6,144: it
 turns "hold the whole model in RAM" from a requirement into a nicety. The
 two-tier cache had this property for free, by construction, because pinned *was*
 the complement; this is the one thing the exclusive-or was buying, and it has to
@@ -432,6 +433,19 @@ be re-bought deliberately.
 
 Slots past the complement are not wasted — they insure VRAM-resident experts
 against eviction — but they are the second call on the tier, not the first.
+
+**Why the VRAM set is spread rather than a prefix.** The fill used to take the
+first `vram_slots` experts in flat `(layer, expert)` order. The routers are
+trained balanced, so no layer is a better use of a slot than another, and the
+prefix bought nothing for its shape — but it set one. On Flash-Next at 5,713
+slots it put layers 0–10 on the card whole and none of layers 11–47, so every
+miss of a sweep landed on the deep layers' link time, while layers 2–10 held all
+512 experts each for a decode that routes ten. And because the warm draw skips
+the VRAM set first and ran out before the second pass, every one of those
+experts was pack-only, which the eviction policy then protected
+(`docs/moe_live_dispatch_design.md` §0.7.1). Spread, every layer starts with the
+same share on the card, the same share in RAM and the same share on disk alone,
+so the misses — and the link they use — are spread with them.
 
 ### 6.2 Why the sample is stratified per layer
 

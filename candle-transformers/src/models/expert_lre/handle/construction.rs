@@ -185,15 +185,23 @@ impl ExpertCache {
                 } else {
                     warm_slots_for(stride, evictable)
                 };
-                // `num_slots` is exactly what the startup fill will take into
-                // VRAM, in flat order, so it is the prefix the draw skips over.
+                // What the startup fill takes into VRAM: the pinned layers,
+                // then the rest of the zone spread level across the evictable
+                // layers. The warm draw covers the experts it leaves out first.
                 // Drawn over every evictable expert: the startup tier is its
                 // prefix, and the elastic tier grows into the rest in order.
+                let vram = vram_startup_set(
+                    num_moe_layers,
+                    experts_per_layer,
+                    num_slots,
+                    pinned,
+                    VRAM_DRAW_SEED,
+                );
                 let order = stratified_membership(
                     num_moe_layers,
                     experts_per_layer,
                     evictable,
-                    num_slots,
+                    &vram,
                     pinned,
                     WARM_DRAW_SEED,
                 );
@@ -230,6 +238,7 @@ impl ExpertCache {
                     warm: &mut warm,
                     residency: &mut residency,
                     membership,
+                    vram: &vram,
                     geoms: &geoms,
                     layouts: &layouts,
                     stride,

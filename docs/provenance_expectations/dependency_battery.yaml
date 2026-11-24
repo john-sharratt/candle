@@ -43,10 +43,10 @@ messages:
       - candle/candle-kernels/src/simple/moe_bucketize.cu
       - candle/candle-transformers/src/models/expert_lre/dispatch/launch.rs
     should_not: ["candle/docs/results/*"]
-  - starts: "In the expert cache, where is `set_eviction_costs` defined"
+  - starts: "In the expert cache, where is `publish_eviction_costs` defined"
     should:
-      - candle/candle-transformers/src/models/expert_lre/cache/bookkeeping.rs
       - candle/candle-transformers/src/models/expert_lre/pipeline/ring.rs
+      - candle/candle-transformers/src/models/expert_lre/pipeline/routing.rs
     should_not: ["candle/docs/results/*"]
   - starts: "What is the value of `PINNED_LAYERS`"
     should:

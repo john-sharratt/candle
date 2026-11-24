@@ -620,35 +620,45 @@ ranking (`ExpertCacheInner::rank_victims`) supersedes revision 1's Rule S
   pass needs it. The full fade (`f = 0`, `n×`) evicted exactly those and raised
   the share of victims routed again at their next visit by 3–4 points at ×8
   (`FADE_FLOOR` records the measurement).
-- **Passes by eviction class.** The residents fall into four classes — reload
-  tier (warm-backed or pack-only) × whether the row routed the expert on its
-  last decode visit (`ExpertCacheInner::mark_visit`) — and the ranking runs
-  over one class at a time, a later class only for the shortfall. Decode
-  routing carries over step to step — 37–63% of a row's just-routed experts are
-  routed on its next visit, against 10–21% of the rest — which a decayed
-  frequency score cannot see: ranked by it, just-routed experts were 54–82% of
-  all victims.
-- **Cheapest expected miss cost first** (`ExpertCacheInner::set_eviction_costs`):
-  each class's running regret rate (`regret::ClassRates`, the share of its
-  victims routed again at their row's next decode visit) times its restore
-  cost — the copy over the link for a warm-backed expert, and the measured
-  pack read the layer then waits on plus that copy for a pack-only one.
-  Restoring a pack-only expert costs about an order of magnitude more, so
-  pack-only classes are protected by that ratio and evicted only when that
-  much less likely to come back. Putting recency above the reload tier
-  outright halved regret at ×1–×4 (25 → 15%, 37 → 18%) but turned cheap warm
-  misses into pack reads (+23–58%) and decoded no faster; the measured costs
-  decide that trade per class, per width, per drive. Repriced at every pass
-  boundary; until a pack read is measured the passes run warm-backed first,
-  stale before just-routed. The pinned head layers are never candidates.
+- **Passes by recency** (`RECENCY_PASSES`). The ranking runs first over the
+  residents the row did not route on its last decode visit
+  (`ExpertCacheInner::mark_visit`), then over the ones it did, the second only
+  for the shortfall. Decode routing carries over step to step — 37–63% of a
+  row's just-routed experts are routed on its next visit, against 10–21% of
+  the rest — which a decayed frequency score cannot see: ranked by it,
+  just-routed experts were 54–82% of all victims. Putting recency above the
+  reload tier halved regret at ×1–×4 (25 → 15%, 37 → 18%).
+- **The reload tier is a tilt, not a pass** (`PACK_ONLY_PROTECTION`,
+  `tier_protection`). A pack-only resident's key is doubled for the drive read
+  its reload costs, and it competes with every warm-backed resident in the same
+  least-used order; among exact ties (never-used experts at score zero) the
+  warm-backed one goes first. The reload tier used to be a pass of its own,
+  ordered by each class's measured expected miss cost — about 10× for a
+  pack-only class — and the startup fill made that permanent: the experts VRAM
+  held at startup were exactly the ones the warm draw skipped, so all
+  pack-only, and they never turned over. On WhiteWorld (Flash-Next, RTX 3090,
+  build 5482) layers 2–10 held all 512 experts each on the card while layers
+  11–47 churned through the ~1,100 slots left and decoded 6.6 of 10 from VRAM.
+  The startup set is now spread level across the layers
+  (`pinned::vram_startup_set`, `docs/expert_cache_design.md` §6.1) and the
+  tilt lets a pack-only expert decode no longer routes go before a warm-backed
+  one it does. The cost of a tilt is more pack reads where the pass would have
+  taken a warm-backed victim instead — the pass ordering measured +23–58%
+  more pack reads with recency above the tier and decoded no faster, on a
+  card whose startup set was still the flat prefix. Each class's expected miss
+  cost is still measured (`regret::ClassRates` times the restore cost) and
+  published as `eviction_cost_us` (`PipelineState::publish_eviction_costs`),
+  so the trade is read against the tilt. The pinned head layers are never
+  candidates.
 - **Learned from decode only.** A prompt launch routes most of a row, so it
   neither judges claims nor marks a visit: it would count nearly every victim
   routed again and mark nearly every resident just hit.
 
 Tests: `cache/tests_scores.rs` (`protection_fades_from_the_layer_just_behind`),
 `cache/tests_distance.rs` (the walk backwards from L−1, the front wrapping with
-the wave, frequency within the fade, recency within the reload tier,
-cost-ordered passes), `regret.rs` (judging by ticket, class rates, pricing, tags).
+the wave, frequency within the fade, recency above the reload tier, each
+recency pass spanning both tiers), `cache/tests_warm.rs` (the reload tilt),
+`regret.rs` (judging by ticket, class rates, pricing, tags).
 Measured (`regret`'s counters in the gate's decode table): regret at ×8 55 →
 50% with the recency passes, BF16×8 decode ~+7%.
 
