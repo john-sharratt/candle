@@ -6,19 +6,20 @@
 //! row being served, and the caller decides for each one whether it may be
 //! taken, so an expert whose row is still being computed keeps its slot. Victims
 //! are taken behind the wave first, and the first MoE layers are never evicted.
-//! Residents fall into classes by reload tier and by whether their row routed
-//! them last time, and the classes run cheapest expected miss first. The
-//! eviction score is a decaying recency frequency plus a slower decode-reuse
-//! term, so the experts that decode keeps coming back to outlast a quiet step.
+//! The experts their row did not route last time go before the ones it did, and
+//! within each group every resident competes on one key: least used first, with
+//! a pack-only expert's small reload-cost protection blended in rather than run
+//! as a pass of its own. The eviction score is a decaying recency frequency plus
+//! a slower decode-reuse term, so the experts that decode keeps coming back to
+//! outlast a quiet step.
 //!
 //! - `bookkeeping`: slot and score tables, and the ranked victim scan.
 //! - `policy`: the pinned depth, decay constants and the zone floor.
 //! - `tests_distance`: tests of the order by distance behind the wave.
 //! - `tests_floor`: tests of the zone floor and concessions.
 //! - `tests_scores`: tests of score updates and protection.
-//! - `tests_warm`: tests of the reload-tier passes.
+//! - `tests_warm`: tests of the reload-tier blend.
 
-use super::regret::class_index;
 use super::resident::HostBacked;
 #[cfg(feature = "tensor-assert")]
 use super::slot_owners::SlotOwners;
@@ -95,11 +96,8 @@ pub struct ExpertCacheInner {
     pub(crate) warm_backed: Arc<HostBacked>,
     /// Flat `layer * experts_per_layer + expert` → did this expert's row route
     /// it on the row's last visit? Rewritten per row as each is served
-    /// ([`Self::mark_visit`]); the recency half of [`EVICTION_PASSES`].
+    /// ([`Self::mark_visit`]); what [`RECENCY_PASSES`] splits residents by.
     hit_last: Vec<bool>,
-    /// The order the eviction passes run in: [`EVICTION_PASSES`] until
-    /// [`Self::set_eviction_costs`] orders them by expected miss cost.
-    passes: [(ReloadTier, bool); 4],
     /// The slot-tenancy tags bucketize's owner check reads, once a device
     /// cache has attached them ([`Self::attach_owners`]); every tenant a slot
     /// gains after that is written through.

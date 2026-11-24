@@ -185,7 +185,8 @@ pub struct PipelineStats {
     pub claim_paid: [usize; 2],
     /// **Gauge**: each eviction class's expected miss cost in µs — its running
     /// regret rate times its restore cost — in class order `[stale pack, stale
-    /// warm, hit pack, hit warm]`; the passes run cheapest first (`cache`).
+    /// warm, hit pack, hit warm]`; read against the fixed reload tilt the
+    /// eviction key applies (`cache::PACK_ONLY_PROTECTION`).
     pub eviction_cost_us: [f64; 4],
     /// The victims of both kinds by what was known of them when evicted
     /// (`regret::VictimTag`), and of them the ones routed again.

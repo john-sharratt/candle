@@ -45,9 +45,9 @@ pub(crate) struct VictimTag {
 /// warm or pack-only.
 pub const TAGS: usize = 24;
 
-/// Eviction classes — what the ranking orders its passes by
-/// (`cache::ExpertCacheInner::set_eviction_costs`): whether the row routed the
-/// victim on its last visit × whether a warm copy backs it, as
+/// Eviction classes — what the published expected miss costs are split by
+/// (`pipeline::PipelineState::publish_eviction_costs`): whether the row routed
+/// the victim on its last visit × whether a warm copy backs it, as
 /// `hit * 2 + warm`.
 pub(crate) const CLASSES: usize = 4;
 
@@ -126,7 +126,7 @@ const RATE_MEMORY: f64 = 0.999;
 
 /// The prior every class starts from: [`PRIOR_RATE`] over [`PRIOR_VICTIMS`]
 /// judged victims — equal across classes, so until the ledger has measured
-/// them the reload costs alone order the passes.
+/// them the reload costs alone separate the published costs.
 const PRIOR_VICTIMS: f64 = 10.0;
 const PRIOR_RATE: f64 = 0.25;
 

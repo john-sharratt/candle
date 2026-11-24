@@ -4,7 +4,7 @@
 //! A cache at or above the floor must always have an evictable slot, because a
 //! cache that fills with pinned-layer experts can never free one again. The
 //! pinned depth is checked to stay fixed at every capacity. A concession is
-//! checked to drop warm-backed experts before pack-only ones, to keep exactly
+//! checked to keep the hotter expert whatever its reload tier, to keep exactly
 //! the pinned set while the engine is paused, and to displace the coldest
 //! unpinned survivor when a full zone gives up a hot doomed expert.
 
@@ -169,10 +169,11 @@ pub(super) mod tests {
         assert_eq!(minimum_resident_slots(256), 769); // Qwen3.5/3.6-35B-A3B
     }
 
-    /// A concession inverts the passes: a warm-backed expert is dropped before
-    /// a pack-only one, even a colder one.
+    /// A concession keeps by the eviction key without its position: a hot
+    /// warm-backed expert (9.0) is relocated and a cold pack-only one (0.5,
+    /// doubled to 1.0 by its reload tilt) dropped.
     #[test]
-    fn a_concession_relocates_the_pack_only_expert() {
+    fn a_concession_relocates_the_hotter_expert_whatever_its_tier() {
         let mut inner = sized_cache(6, 1);
         for slot in 0..6 {
             occupy(&mut inner, slot, 10 + slot, 0, slot as u32, 1.0);
@@ -185,8 +186,8 @@ pub(super) mod tests {
         inner.set_warm_backed(&[(14, 0)]);
 
         let plan = inner.retract_zone(4, ZoneFloor::Serving);
-        assert_eq!(plan.relocate, vec![(5, 0)]);
-        assert_eq!(plan.evict, vec![4]);
+        assert_eq!(plan.relocate, vec![(4, 0)]);
+        assert_eq!(plan.evict, vec![5]);
     }
 
     /// **Paused, the zone goes to the pinned set, and every pinned expert

@@ -3,9 +3,9 @@
 //!
 //! Each case fixes the wave's position and the scores, then checks which expert
 //! the ranking takes first. The layers just behind the wave go before those
-//! further back, a warm expert just behind goes before a cold one, and an expert
-//! its row routed on the last visit goes only after the stale ones of its tier.
-//! A pinned-layer expert is never a candidate, and ranking alone evicts nothing.
+//! further back, distance outweighs the small reload-cost tilt, and an expert
+//! its row routed on the last visit goes only after every stale one. A
+//! pinned-layer expert is never a candidate, and ranking alone evicts nothing.
 
 use super::*;
 
@@ -73,23 +73,18 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn demand_eviction_cold_shield_outranks_distance() {
-        // The reload tier dominates the distance: a warm-backed expert AHEAD of
-        // the wave (cheap RAM reload) is evicted before an equally-used
-        // cold-only one just behind it (whose reload is a pack read), because
-        // the warm pass runs first. A hard distance tier across the reload
-        // tiers inverted this trade and tripled cold pack reads.
+    fn distance_outweighs_the_reload_tilt() {
+        // Equally used, the pack-only expert just behind the wave (1.0 × 0.297
+        // × 2 = 0.594) goes before the warm-backed one about to run (1.0 ×
+        // 0.922): the tilt halves the gap a pack read costs, it does not
+        // overrule the layer the wave needs next.
         let mut inner = cache(2);
-        occupy(&mut inner, 0, 32, 100, 1, 1.0); // just behind, cold-only
+        occupy(&mut inner, 0, 32, 100, 1, 1.0); // just behind, pack-only
         occupy(&mut inner, 1, 40, 101, 2, 1.0); // ahead, warm-backed
         inner.set_warm_backed(&[(40, 101)]);
         let evicted = demand_eviction(&mut inner, 35, 1, &[]);
-        assert_eq!(
-            evicted,
-            vec![(40, 101)],
-            "warm reload chosen over pack read"
-        );
-        assert!(inner.key_to_slot.contains_key(&(32, 100)));
+        assert_eq!(evicted, vec![(32, 100)], "the expert just behind goes");
+        assert!(inner.key_to_slot.contains_key(&(40, 101)));
     }
 
     #[test]
@@ -216,7 +211,7 @@ pub(super) mod tests {
     /// whatever their scores: here a just-hit expert scored 1.0 outlasts a
     /// stale one at 3.0, until the row's next visit routes it no more.
     #[test]
-    fn a_just_hit_expert_outlasts_every_stale_one_of_its_tier() {
+    fn a_just_hit_expert_outlasts_every_stale_one() {
         let mut inner = cache(3);
         occupy(&mut inner, 0, 10, 50, 1, 1.0); // just hit
         occupy(&mut inner, 1, 10, 51, 2, 3.0); // stale, hot
@@ -227,25 +222,23 @@ pub(super) mod tests {
         assert_eq!(inner.rank_victims(30, 1, |_, _| true), vec![0]);
     }
 
-    /// The reload tier still comes first: a warm-backed expert just hit goes
-    /// before a pack-only stale one.
+    /// Recency runs above the reload tier: a pack-only stale expert goes before
+    /// a warm-backed one its row just routed.
     #[test]
-    fn recency_sits_inside_the_reload_tier() {
+    fn recency_outranks_the_reload_tier() {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 10, 50, 1, 1.0); // warm, just hit
         occupy(&mut inner, 1, 10, 51, 2, 0.0); // pack-only, stale
         inner.set_warm_backed(&[(10, 50)]);
         inner.mark_visit(10, &[50]);
-        assert_eq!(inner.rank_victims(30, 2, |_, _| true), vec![0, 1]);
+        assert_eq!(inner.rank_victims(30, 2, |_, _| true), vec![1, 0]);
     }
 
-    /// **Measured costs order the passes.** Classes, `hit * 2 + warm`: a
-    /// pack-only stale expert (6% back × 2.2 ms) costs more to evict than a
-    /// warm just-hit one (37% × 0.2 ms), so the warm just-hit one goes first;
-    /// where a pack-only class is the cheaper, it goes first; ties keep the
-    /// warm-backed ahead.
+    /// Within each recency pass both tiers share one order: of four equally
+    /// unused experts in one layer, the stale pair goes before the just-hit
+    /// pair, and within each pair the warm-backed one goes first on the tie.
     #[test]
-    fn measured_costs_order_the_eviction_passes() {
+    fn each_recency_pass_spans_both_tiers() {
         let mut inner = cache(4);
         occupy(&mut inner, 0, 10, 50, 1, 0.0); // warm, stale
         occupy(&mut inner, 1, 10, 51, 2, 0.0); // warm, just hit
@@ -253,15 +246,7 @@ pub(super) mod tests {
         occupy(&mut inner, 3, 10, 53, 4, 0.0); // pack, just hit
         inner.set_warm_backed(&[(10, 50), (10, 51)]);
         inner.mark_visit(10, &[51, 53]);
-        // [cold pack, cold warm, hit pack, hit warm]
-        inner.set_eviction_costs([0.06 * 2.2, 0.16 * 0.2, 0.05 * 2.2, 0.37 * 0.2]);
-        assert_eq!(inner.rank_victims(30, 4, |_, _| true), vec![0, 1, 3, 2]);
-        // A pack-only class cheap enough goes first.
-        inner.set_eviction_costs([0.01, 0.5, 0.9, 0.9]);
-        assert_eq!(inner.rank_victims(30, 4, |_, _| true), vec![2, 0, 1, 3]);
-        // Equal costs keep the default: warm stale, warm hit, pack stale, pack hit.
-        inner.set_eviction_costs([1.0; 4]);
-        assert_eq!(inner.rank_victims(30, 4, |_, _| true), vec![0, 1, 2, 3]);
+        assert_eq!(inner.rank_victims(30, 4, |_, _| true), vec![0, 2, 1, 3]);
     }
 
     /// A visit marks exactly the experts it routed in its row, clearing the

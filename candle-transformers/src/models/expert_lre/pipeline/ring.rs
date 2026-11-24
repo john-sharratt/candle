@@ -361,15 +361,17 @@ impl PipelineState {
         }
     }
 
-    /// Order the eviction passes by each class's expected miss cost — its
-    /// running regret rate (`regret`) times what restoring one costs, priced by
-    /// its backing (`SplitParams::refill_secs`, `docs/cpu_expert_compute.md`
-    /// §5.11): for a warm-backed expert the copy over the link (one image at
-    /// the measured link rate), or the CPU pool's path where that is cheaper;
-    /// for a pack-only one the pack read the layer then waits on (the stager's
-    /// mean, latest measured), weighted by `cold_bias`, plus that copy. Before
-    /// the first pack read is measured the default order stands.
-    pub(super) fn set_eviction_order(&mut self) {
+    /// Publish each eviction class's expected miss cost — its running regret
+    /// rate (`regret`) times what restoring one costs, priced by its backing
+    /// (`SplitParams::refill_secs`, `docs/cpu_expert_compute.md` §5.11): for a
+    /// warm-backed expert the copy over the link (one image at the measured
+    /// link rate), or the CPU pool's path where that is cheaper; for a
+    /// pack-only one the pack read the layer then waits on (the stager's mean,
+    /// latest measured), weighted by `cold_bias`, plus that copy. Reported, so
+    /// the cost of each class is read against the fixed reload-cost tilt the
+    /// eviction key applies (`cache::PACK_ONLY_PROTECTION`). Nothing is
+    /// published before the first pack read is measured.
+    pub(super) fn publish_eviction_costs(&mut self) {
         if let Ok(s) = self.stats.lock() {
             if let Some(read) = s.pack_reads.mean_secs() {
                 self.pack_read_secs = Some(read);
@@ -387,7 +389,6 @@ impl PipelineState {
             .map(|p| p.refill_secs(copy, read))
             .unwrap_or((copy, read + copy));
         let cost = eviction_costs(self.regret.class_rates(), warm, pack);
-        self.inner.set_eviction_costs(cost);
         if let Ok(mut s) = self.stats.lock() {
             s.eviction_cost_us = cost.map(|c| c * 1e6);
         }
