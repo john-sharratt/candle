@@ -55,18 +55,29 @@ fn effort_of(args: &Value) -> Result<Option<Effort>, String> {
     }
 }
 
-/// The pictures a send shows, as it names them.
+/// The pictures a send shows, as it names them: a list of ids or links. A
+/// client that sends a list argument as its JSON text, as some do for a
+/// property their copy of the schema lacks, is read the same; a lone string is
+/// one picture.
 fn pictures_of(args: &Value) -> Result<Vec<String>, String> {
-    match args.get("images") {
-        None => Ok(Vec::new()),
-        Some(Value::Array(items)) => items
+    let list = |items: &[Value]| -> Result<Vec<String>, String> {
+        items
             .iter()
             .map(|i| {
                 i.as_str()
                     .map(str::to_string)
                     .ok_or_else(|| "each of `images` is a picture's id or link".to_string())
             })
-            .collect(),
+            .collect()
+    };
+    match args.get("images") {
+        None => Ok(Vec::new()),
+        Some(Value::Array(items)) => list(items),
+        Some(Value::String(s)) => match serde_json::from_str::<Value>(s) {
+            Ok(Value::Array(items)) => list(&items),
+            _ if s.trim().is_empty() => Ok(Vec::new()),
+            _ => Ok(vec![s.trim().to_string()]),
+        },
         Some(_) => Err("`images` is a list of pictures' ids or links".into()),
     }
 }
@@ -206,8 +217,18 @@ mod tests {
             pictures_of(&json!({"text": "hi", "images": ["a1", "b2"]})),
             Ok(vec!["a1".to_string(), "b2".to_string()])
         );
-        assert!(pictures_of(&json!({"images": "a1"})).is_err());
+        // A list sent as its JSON text, and a lone id, are read too.
+        assert_eq!(
+            pictures_of(&json!({"images": "[\"a1\", \"b2\"]"})),
+            Ok(vec!["a1".to_string(), "b2".to_string()])
+        );
+        assert_eq!(
+            pictures_of(&json!({"images": " a1 "})),
+            Ok(vec!["a1".to_string()])
+        );
+        assert_eq!(pictures_of(&json!({"images": ""})), Ok(Vec::new()));
         assert!(pictures_of(&json!({"images": [1]})).is_err());
+        assert!(pictures_of(&json!({"images": 7})).is_err());
     }
 
     #[test]
