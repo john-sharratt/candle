@@ -20,6 +20,7 @@ use crate::models::batch_test::utils::{TestConfig, TestMode};
 #[cfg(all(feature = "cuda", any(test, feature = "ruler-bench")))]
 use crate::models::batched_inference::InferenceMode;
 use crate::models::draft_ladder::QWEN36_35B_A3B_DRAFT;
+use crate::models::qwen_vision::source::VisionTowerSource;
 
 use super::qwen35::{load_hybrid_pack, HybridBatched};
 
@@ -42,6 +43,22 @@ pub const QWEN36_35B_A3B: (&str, &str, &str) = (
     "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",
     "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
 );
+
+/// The 3.6's vision tower (`docs/vision_models.md` §2.1): the F16 `mmproj` the
+/// checkpoint's own repo publishes at the same pinned commit — an unmodified
+/// Qwen3-VL ViT whose merger writes the trunk's 2048-wide rows. Its rows stand
+/// for this release's tokenizer's `<|image_pad|>`s.
+pub const QWEN36_VISION: VisionTowerSource = VisionTowerSource {
+    name: "qwen3.6-35b-a3b",
+    repo: QWEN36_35B_A3B.0,
+    rev: QWEN36_35B_A3B.1,
+    file: (
+        "mmproj-F16.gguf",
+        899_283_584,
+        "71f3cbc1f7cc0f30d09d41cfa924c0060827ebc33bf15ace7e86661e856f0160",
+    ),
+    tokenizer: (TOKENIZER_REPO, TOKENIZER_REV),
+};
 
 /// **AntiLoop** — a fine-tune of the 3.6-35B-A3B trained against repetition loops, and the
 /// trunk of the hybrid below. mradermacher's static `Q4_K_M`, revision-pinned.

@@ -122,6 +122,7 @@ pub(super) fn qwen35_9b_q6() -> ModelSpec {
         default_sampling: SamplingConfig::for_gguf_architecture(ARCH),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture(ARCH),
+        vision: None,
     }
 }
 
@@ -154,6 +155,7 @@ pub(super) fn qwen35_0_8b_q8() -> ModelSpec {
         default_sampling: SamplingConfig::for_gguf_architecture(ARCH),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture(ARCH),
+        vision: None,
     }
 }
 

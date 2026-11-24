@@ -102,6 +102,7 @@ pub(super) fn qwen38_flash_next() -> ModelSpec {
         default_sampling: SamplingConfig::for_gguf_architecture("qwen2moe"),
         supports_thinking: true,
         non_thinking_sampling: SamplingConfig::non_thinking_for_gguf_architecture("qwen2moe"),
+        vision: Some(&quantized_qwen38_moe::FLASH_NEXT_VISION),
     }
 }
 

@@ -10,6 +10,7 @@
 //! the gap-fill kernel is built for head dimension 128 and this family attends at
 //! 256.
 //!
+//! - `images`: a wave's image rows, gathered as placeholders and copied over them.
 //! - `layer_sweep`: the sweep over one layer range, with its checkpoints.
 //! - `managed_model`: the scheduler-facing hooks for pricing, drafting and rewinding.
 //! - `tests_wave`: oracle tests against the F32 reference and split-forward tests.
@@ -59,6 +60,9 @@ use crate::models::expert_lre::{PipelineStats, ProfileSnapshot, WeightPlan, Weig
 use crate::models::head_rows::select_head_rows;
 use crate::models::lazy_rope::LazyRope;
 use crate::models::prefill_utils::SharedPm;
+use crate::models::qwen_vision::wave_images::{
+    image_rotation, place_image_rows, upload_image_rows,
+};
 use crate::models::residency_rows::residency_decode_rows;
 use crate::models::residual_rows::CreepResidual;
 use crate::models::rope_schedule::RungSelect;
@@ -70,6 +74,7 @@ use crate::models::wave_driver::{
     WaveSweep,
 };
 use crate::models::wave_token_ids::device_token_ids;
+use images::wave_image_inputs;
 
 // A verify block is the drafts plus the row they follow, and it must fit the
 // DeltaNet timeline to be partially acceptable.
@@ -160,6 +165,7 @@ fn embed_rows(
     rows.reshape((1, n, model.cfg.hidden_size))
 }
 
+mod images;
 mod layer_sweep;
 mod managed_model;
 #[cfg(test)]
