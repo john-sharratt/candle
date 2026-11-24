@@ -162,3 +162,56 @@ impl GuestModel for VisionGuest {
         self.loaded = None;
     }
 }
+
+#[cfg(all(test, feature = "hub"))]
+mod tests {
+    use super::*;
+    use crate::guest::progress::GuestSink;
+    use crate::guest::work::{VisionImage, VisionRequest};
+    use candle_transformers::models::quantized_qwen38_moe::cached_vision_tower_file;
+    use cudarc::driver::DevicePtr;
+
+    /// **The guest reads an image from its own ground**, as a drain runs it:
+    /// the footprint it asks for, the tower placed into that ground with its
+    /// int8 twins, the arena opened on it, one 768 × 512 image run, and the
+    /// guest unloaded — one finite 2 560-wide row per `<|image_pad|>`. Nothing
+    /// to run on a machine without a card or without the tower fetched.
+    #[test]
+    fn the_vision_guest_reads_an_image_from_its_ground() {
+        let Ok(device) = Device::new_cuda(0) else {
+            return;
+        };
+        if cached_vision_tower_file().is_none() {
+            return;
+        }
+        let (width, height) = (768u32, 512u32);
+        let rgb = (0..(width * height * 3) as usize)
+            .map(|i| (i * 31 % 251) as u8)
+            .collect();
+        let jobs = vec![GuestRequest::Vision(VisionRequest {
+            images: vec![VisionImage { rgb, height, width }],
+        })];
+        let mut guest = VisionGuest::new(cached_vision_tower_file);
+        let bytes = guest.footprint_bytes(&jobs);
+        let Device::Cuda(cuda) = &device else {
+            unreachable!()
+        };
+        let stream = cuda.cuda_stream();
+        let held = stream.alloc_zeros::<u8>(bytes).unwrap();
+        let (base, _guard) = held.device_ptr(&stream);
+        let ground = Arc::new(Mutex::new(GuestGround::for_test(vec![base], bytes)));
+
+        guest.load(&device, &ground, &jobs).unwrap();
+        let out = guest.run(&jobs[0], &GuestSink::none());
+        guest.unload();
+
+        let GuestOutcome::Vision(rows) = out.unwrap() else {
+            panic!("the vision guest answered another guest's outcome")
+        };
+        let tokens = (width as usize / 32) * (height as usize / 32);
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0].len(), tokens * 2560);
+        assert!(rows.rows[0].iter().all(|v| v.is_finite()), "a row is not finite");
+        assert!(rows.rows[0].iter().any(|v| *v != 0.0), "every row is zero");
+    }
+}
