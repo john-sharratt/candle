@@ -19,6 +19,8 @@
 //!
 //! Design: `docs/flash_next_vision.md` §1.
 
+use std::result::Result as StdResult;
+
 use candle::quantized::Int8Mode;
 use candle::{DType, Device, IndexOp, Module, Result, Tensor};
 use candle_nn::kv_cache::{guest_chain, guest_stage};
@@ -72,7 +74,7 @@ pub struct VisionInput {
 impl VisionInput {
     /// Refuse pixels that do not fill the grid — the one malformed input that
     /// would otherwise reach the card, after a drain had evicted for it.
-    pub fn check(&self) -> std::result::Result<(), String> {
+    pub fn check(&self) -> StdResult<(), String> {
         let want = self.grid.height * self.grid.width * 3;
         if self.rgb.len() != want {
             return Err(format!(

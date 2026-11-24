@@ -135,7 +135,8 @@ pub async fn call(ctx: &Ctx, args: &Value) -> Answer {
         Some(Target::Chat(id)) => Some(id),
         None => None,
     };
-    // A chat's turn begins on this member: its pictures are read here, once.
+    // A chat's turn begins on this member: its pictures are read here, in one
+    // job.
     let images = match pictures::keep(&ctx.session, fetched).await {
         Ok(kept) => kept,
         Err(e) => return Answer::error(e),

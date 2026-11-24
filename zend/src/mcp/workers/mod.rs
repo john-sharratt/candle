@@ -29,6 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderName, HeaderValue, Method};
 use candle_conversation::persistence::SharedSubstrate;
+use candle_conversation::vision::split_markers;
 use futures::StreamExt;
 use host::cluster::up::send_up;
 use host::substrate_views::TimelineDetail;

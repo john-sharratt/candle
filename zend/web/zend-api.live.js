@@ -214,15 +214,17 @@
       // the handler runs, so the send silently no-ops: the exact "type a message
       // after uploading and nothing happens" failure.
       const CHAT_ROLES = { user: 1, assistant: 1, system: 1 };
-      // A message sent with images carries them as image parts before its
-      // text, each a data: URL; the daemon reads the last user message's.
-      const contentOf = (m) => (m.images && m.images.length)
+      // The message being sent carries its images as image parts before its
+      // text, each a data: URL. The daemon reads only the last user message's,
+      // so no earlier message's travel again.
+      const turns = (conv.history || []).filter((m) => !m.streaming && CHAT_ROLES[m.role]);
+      let last = -1;
+      turns.forEach((m, i) => { if (m.role === 'user') last = i; });
+      const contentOf = (m, i) => (i === last && m.images && m.images.length)
         ? m.images.map((url) => ({ type: 'image_url', image_url: { url } }))
           .concat([{ type: 'text', text: m.content }])
         : m.content;
-      const messages = (conv.history || [])
-        .filter((m) => !m.streaming && CHAT_ROLES[m.role])
-        .map((m) => ({ role: m.role, content: contentOf(m) }));
+      const messages = turns.map((m, i) => ({ role: m.role, content: contentOf(m, i) }));
       const controller = new AbortController();
       const payload = {
         model: 'zen-code',

@@ -20,9 +20,9 @@ pub mod spans;
 pub mod store;
 pub mod stored;
 
-pub use encode::{encode, turn_images, TurnImage};
-pub use marker::marker;
+pub use encode::{encode, turn_images, ImageSource, TurnImage};
+pub use marker::{marker, split_markers};
 pub use prepare::{prepare, PreparedImage};
 pub use spans::{engine_ids, turn_spans, ImageSpan, VisionTokens};
-pub use store::{load_original, load_rows, store_image};
+pub use store::{load_kept, load_original, load_rows, store_image, KeptRows};
 pub use stored::stored_spans;

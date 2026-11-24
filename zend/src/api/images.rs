@@ -30,9 +30,14 @@ pub const CHAT_BODY_LIMIT: usize = 4 * IMAGE_BYTES;
 /// POST — keep the body as an image.
 pub async fn keep(State(session): State<Arc<ZendSession>>, body: Bytes) -> Response {
     let bytes = body.to_vec();
-    let kept = tokio::task::spawn_blocking(move || session.keep_image(bytes)).await;
+    let kept = tokio::task::spawn_blocking(move || session.keep_images(vec![bytes])).await;
     match kept {
-        Ok(Some(Ok(image))) => Json(image).into_response(),
+        Ok(Some(Ok(mut images))) if images.len() == 1 => Json(images.remove(0)).into_response(),
+        Ok(Some(Ok(images))) => refused(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "image_failed",
+            &format!("one image kept as {}", images.len()),
+        ),
         Ok(Some(Err(why))) => refused(StatusCode::BAD_REQUEST, "invalid_image", &why),
         Ok(None) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(e) => refused(
@@ -43,13 +48,22 @@ pub async fn keep(State(session): State<Arc<ZendSession>>, body: Bytes) -> Respo
     }
 }
 
-/// GET — the bytes image `id` arrived as, typed by their format.
+/// GET — the bytes image `id` arrived as, typed by their format. The blob is
+/// read on the blocking pool.
 pub async fn original(State(session): State<Arc<ZendSession>>, Path(id): Path<String>) -> Response {
-    match session.kept_image(&id) {
-        Some(Ok(Some(bytes))) => ([(header::CONTENT_TYPE, mime_of(&bytes))], bytes).into_response(),
-        Some(Ok(None)) => StatusCode::NOT_FOUND.into_response(),
-        Some(Err(why)) => refused(StatusCode::INTERNAL_SERVER_ERROR, "image_failed", &why),
-        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    let read = tokio::task::spawn_blocking(move || session.kept_image(&id)).await;
+    match read {
+        Ok(Some(Ok(Some(bytes)))) => {
+            ([(header::CONTENT_TYPE, mime_of(&bytes))], bytes).into_response()
+        }
+        Ok(Some(Ok(None))) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Some(Err(why))) => refused(StatusCode::INTERNAL_SERVER_ERROR, "image_failed", &why),
+        Ok(None) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(e) => refused(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "image_failed",
+            &format!("reading the image panicked: {e}"),
+        ),
     }
 }
 

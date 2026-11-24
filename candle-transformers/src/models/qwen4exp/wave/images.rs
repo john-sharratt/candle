@@ -2,29 +2,29 @@
 //! image registered with the vision registry, and what the wave does with them.
 //!
 //! The wave reads its ids to the host once, for the PLE hash; there, every
-//! virtual id is resolved against the registry. Its row's values go into one
-//! upload — the embedding gather's second table — and the id becomes that
-//! table's row, `n_vocab + k`; the PLE hash sees `<|image_pad|>` in its place,
-//! as the reference hashes its input ids. Each maximal run of one image's
-//! consecutive rows is kept for the attention layers, which turn those rows'
-//! queries and keys by their place in the image (`docs/flash_next_vision.md`
-//! §4.4).
+//! virtual id is resolved against the registry. Its row's values are laid
+//! back to back — the embedding gather's second table, uploaded by a window
+//! that gathers — and the id becomes that table's row, `n_vocab + k`; the PLE
+//! hash sees `<|image_pad|>` in its place, as the reference hashes its input
+//! ids. Each maximal run of one image's consecutive rows is kept for the
+//! attention layers, which turn those rows' queries and keys by their place in
+//! the image (`docs/flash_next_vision.md` §4.4).
 
-use candle::cuda_backend::wave_provenance::WaveTicket;
-use candle::{DType, Device, Result, Tensor};
+use std::sync::Arc;
+
+use candle::{DType, Result, Tensor};
 
 use crate::models::qwen_vision::registry::{is_virtual, lookup};
 use crate::models::qwen_vision::ImageRun;
-use crate::models::wave_buffers::wave_from_vec_ticketed;
 
 /// What a wave with images feeds its gather and its attention. Each run's
 /// `row` is its first row in the wave.
 pub(super) struct WaveImages {
-    /// Every row's id, with each virtual id replaced by its row of `extra`
-    /// (`n_vocab + k`).
+    /// Every row's id, with each virtual id replaced by its row of the second
+    /// table (`n_vocab + k`).
     pub gather_ids: Vec<u32>,
-    /// `[k, width]` F32 on the forward span: the rows the virtual ids name.
-    pub extra: Tensor,
+    /// The second table, `[k, width]` row-major: the rows the virtual ids name.
+    pub values: Vec<f32>,
     pub runs: Vec<ImageRun>,
 }
 
@@ -57,8 +57,6 @@ pub(super) fn take_wave_images(
     n_vocab: usize,
     image_pad: u32,
     width: usize,
-    dev: &Device,
-    ticket: Option<WaveTicket>,
 ) -> Result<Option<WaveImages>> {
     if !seq_tokens.iter().flatten().any(|&id| is_virtual(id)) {
         return Ok(None);
@@ -92,7 +90,7 @@ pub(super) fn take_wave_images(
             let k = values.len() / width;
             gather_ids.push((n_vocab + k) as u32);
             values.extend_from_slice(rows.row(i));
-            let ptr = std::sync::Arc::as_ptr(&rows) as usize;
+            let ptr = Arc::as_ptr(&rows) as usize;
             match open {
                 Some((r, p, next)) if p == ptr && next == i => {
                     runs[r].len += 1;
@@ -112,11 +110,9 @@ pub(super) fn take_wave_images(
             row += 1;
         }
     }
-    let k = values.len() / width;
-    let extra = wave_from_vec_ticketed(values, (k, width), dev, ticket)?;
     Ok(Some(WaveImages {
         gather_ids,
-        extra,
+        values,
         runs,
     }))
 }
@@ -124,6 +120,7 @@ pub(super) fn take_wave_images(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle::Device;
     use crate::models::qwen_vision::geometry::FACTOR;
     use crate::models::qwen_vision::registry::{ImageHandle, ImageRows};
     use crate::models::qwen_vision::Grid;
@@ -147,15 +144,10 @@ mod tests {
         let a = ImageHandle::register(image(1, 3, 10.0)).unwrap();
         let b = ImageHandle::register(image(1, 2, 50.0)).unwrap();
         let mut seq = vec![vec![7, a.id(1), a.id(2), 8], vec![b.id(0), b.id(1)]];
-        let got = take_wave_images(&mut seq, 100, 9, 2, &Device::Cpu, None)
-            .unwrap()
-            .unwrap();
+        let got = take_wave_images(&mut seq, 100, 9, 2).unwrap().unwrap();
         assert_eq!(got.gather_ids, [7, 100, 101, 8, 102, 103]);
         assert_eq!(seq, [vec![7, 9, 9, 8], vec![9, 9]]);
-        assert_eq!(
-            got.extra.to_vec2::<f32>().unwrap(),
-            [[12.0, 13.0], [14.0, 15.0], [50.0, 51.0], [52.0, 53.0]]
-        );
+        assert_eq!(got.values, [12.0, 13.0, 14.0, 15.0, 50.0, 51.0, 52.0, 53.0]);
         assert_eq!(got.runs.len(), 2);
         assert_eq!(
             (got.runs[0].row, got.runs[0].len, got.runs[0].first),
@@ -171,9 +163,7 @@ mod tests {
     #[test]
     fn a_wave_without_images_takes_nothing() {
         let mut seq = vec![vec![1, 2, 3]];
-        assert!(take_wave_images(&mut seq, 100, 9, 2, &Device::Cpu, None)
-            .unwrap()
-            .is_none());
+        assert!(take_wave_images(&mut seq, 100, 9, 2).unwrap().is_none());
         assert_eq!(seq, [vec![1, 2, 3]]);
     }
 
@@ -184,7 +174,7 @@ mod tests {
         let id = a.id(0);
         drop(a);
         let mut seq = vec![vec![id]];
-        assert!(take_wave_images(&mut seq, 100, 9, 2, &Device::Cpu, None).is_err());
+        assert!(take_wave_images(&mut seq, 100, 9, 2).is_err());
     }
 
     #[test]

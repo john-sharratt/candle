@@ -139,7 +139,7 @@ pub struct TurnStart {
     /// its own turn, and a turn the boot scan finishes has nobody to hand to.
     pub may_hand: bool,
     /// The images the message carries, read before its first round.
-    pub images: Vec<ImageRef>,
+    pub images: Vec<ImageSource>,
 }
 
 /// [`StreamItem::Closing`]'s reason when the repeat guard closed the loop.

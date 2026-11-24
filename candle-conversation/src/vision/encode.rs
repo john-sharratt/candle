@@ -10,7 +10,7 @@ use candle_transformers::models::qwen_vision::tower::OUT_HIDDEN;
 use candle_transformers::models::qwen_vision::{Grid, ImageHandle, ImageRows};
 
 use super::prepare::{prepare, PreparedImage};
-use super::store::{load_rows, store_image};
+use super::store::{load_kept, store_image};
 use crate::guest::{GuestOutcome, GuestRequest, VisionRequest};
 use crate::persistence::SharedSubstrate;
 use crate::ConversationEngine;
@@ -71,46 +71,63 @@ pub fn encode(
         .collect()
 }
 
-/// `uploads` as a turn's images: each decoded and sized, its rows taken from
-/// the substrate when an earlier turn already read it and made by the tower
-/// otherwise (and kept), then registered for the prefill.
+/// An image a turn is given: the file itself, or the id of one the substrate
+/// keeps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImageSource {
+    Bytes(Vec<u8>),
+    Kept(String),
+}
+
+/// `sources` as a turn's images, in order. A kept image is read from the
+/// substrate as it was kept. A file is decoded and sized; its rows are taken
+/// from the substrate when an earlier turn already read it, and the rest are
+/// read by the tower in one job and kept. Each is registered for the prefill.
 pub fn turn_images(
     engine: &ConversationEngine,
     substrate: &SharedSubstrate,
-    uploads: Vec<Vec<u8>>,
+    sources: Vec<ImageSource>,
 ) -> Result<Vec<TurnImage>, String> {
-    let prepared: Vec<PreparedImage> = uploads
-        .iter()
-        .map(|b| prepare(b))
-        .collect::<Result<_, _>>()?;
-    let mut rows: Vec<Option<ImageRows>> = prepared
-        .iter()
-        .map(|p| load_rows(substrate, &p.id))
-        .collect::<Result<_, _>>()?;
-    let missing: Vec<usize> = (0..prepared.len()).filter(|&i| rows[i].is_none()).collect();
-    if !missing.is_empty() {
-        let fresh = encode(
-            engine,
-            &missing
-                .iter()
-                .map(|&i| prepared[i].clone())
-                .collect::<Vec<_>>(),
-        )?;
-        for (&i, r) in missing.iter().zip(fresh) {
-            store_image(substrate, &prepared[i], uploads[i].clone(), &r)?;
-            rows[i] = Some(r);
+    // Each source's image, once known: (id, width, height, rows).
+    let mut known: Vec<Option<(String, u32, u32, ImageRows)>> = Vec::with_capacity(sources.len());
+    // The files the tower still has to read, by their place in `sources`.
+    let mut unread: Vec<(usize, PreparedImage, Vec<u8>)> = Vec::new();
+    for (i, source) in sources.into_iter().enumerate() {
+        match source {
+            ImageSource::Kept(id) => {
+                let k = load_kept(substrate, &id)?.ok_or_else(|| format!("no image {id} is kept"))?;
+                known.push(Some((id, k.width, k.height, k.rows)));
+            }
+            ImageSource::Bytes(bytes) => {
+                let p = prepare(&bytes)?;
+                match load_kept(substrate, &p.id)? {
+                    Some(k) => known.push(Some((p.id, p.width, p.height, k.rows))),
+                    None => {
+                        known.push(None);
+                        unread.push((i, p, bytes));
+                    }
+                }
+            }
         }
     }
-    prepared
+    if !unread.is_empty() {
+        let prepared: Vec<PreparedImage> = unread.iter().map(|(_, p, _)| p.clone()).collect();
+        let fresh = encode(engine, &prepared)?;
+        for ((i, p, bytes), rows) in unread.into_iter().zip(fresh) {
+            store_image(substrate, &p, bytes, &rows)?;
+            known[i] = Some((p.id, p.width, p.height, rows));
+        }
+    }
+    known
         .into_iter()
-        .zip(rows)
-        .map(|(p, r)| {
-            let handle = ImageHandle::register(r.expect("filled above"))?;
+        .map(|k| {
+            let (id, width, height, rows) =
+                k.ok_or_else(|| "an image was neither kept nor read".to_string())?;
             Ok(TurnImage {
-                id: p.id,
-                width: p.width,
-                height: p.height,
-                handle,
+                id,
+                width,
+                height,
+                handle: ImageHandle::register(rows)?,
             })
         })
         .collect()

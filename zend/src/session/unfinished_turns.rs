@@ -443,8 +443,16 @@ pub(super) async fn resume_conversation(
                 images: Vec::new(),
             },
         ),
-        // The first round never sealed: its message is asked again.
-        Unfinished::Message(text) => (text.clone(), Some(text), TurnStart::default()),
+        // The first round never sealed: its message is asked again, its images
+        // read back by the ids its record names them by.
+        Unfinished::Message(text) => {
+            let (ids, message) = split_markers(&text);
+            let start = TurnStart {
+                images: ids.into_iter().map(ImageSource::Kept).collect(),
+                ..TurnStart::default()
+            };
+            (message.to_string(), Some(message.to_string()), start)
+        }
     };
     tracing::info!(conv_id = %conv_id, resumes_round = asked.is_none(), "resume: resuming the request");
 

@@ -110,6 +110,30 @@ pub(super) mod tests {
         );
     }
 
+    /// A wave's image rows ride the forward span as the gather's second table,
+    /// `rows × hidden` F32, and their turn as a row id and `head_dim` table
+    /// words a row in three carves; a wave with no image prices neither.
+    #[test]
+    fn a_waves_images_are_priced_on_its_forward_span() {
+        let g = hyper_moe_full();
+        let images = WaveWidth {
+            prefill_rows: 100,
+            image_rows: 10,
+            ..WaveWidth::default()
+        };
+        assert_eq!(WaveBuffer::ImageRows.bytes(&g, images), 10 * g.hidden * 4);
+        assert_eq!(
+            WaveBuffer::ImageTurns.bytes(&g, images),
+            10 * (1 + g.head_dim) * 4 + 3 * BUMP_ALIGNMENT
+        );
+        let text = WaveWidth {
+            image_rows: 0,
+            ..images
+        };
+        assert_eq!(WaveBuffer::ImageRows.bytes(&g, text), 0);
+        assert_eq!(WaveBuffer::ImageTurns.bytes(&g, text), 0);
+    }
+
     /// **The forward phase against its measured generation, and against the
     /// constant it replaces.**
     ///

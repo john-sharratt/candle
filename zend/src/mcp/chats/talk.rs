@@ -24,7 +24,8 @@ use crate::mcp::roles::WorkerKind;
 use crate::mcp::threads::{self, Effort, Priority, State, Worker};
 use crate::mcp::workers::{self, now_ms};
 use crate::retrieval_dials::RetrievalDials;
-use crate::session::ZendSession;
+use crate::session::{KeptImage, ZendSession};
+use candle_conversation::vision::marker;
 
 use super::dispose::{dispose, tombstone_with, When};
 use super::naming::{id_of, new_id, thread_of, ZEN};
@@ -173,18 +174,27 @@ fn continued(
 /// `on`, or on a new chat when `on` is `None`; Zen's answer runs at `effort`,
 /// retrieving as `dials` say. A chat that is closing or no longer kept takes
 /// no message: [`not_open`].
+///
+/// The worker's prompt opens with a marker line per image, as a turn's text
+/// does, so a worker resumed after its member stopped shows Zen the images
+/// again ([`crate::mcp::workers`]).
 pub fn send(
     session: &Arc<ZendSession>,
     caller: &Caller,
     on: Option<&str>,
     text: &str,
-    images: Vec<String>,
+    images: Vec<KeptImage>,
     (effort, dials): (Effort, RetrievalDials),
 ) -> Result<Sent, String> {
     let records = session.shared_substrate().ok_or_else(workers::loading)?;
     if text.trim().is_empty() {
         return Err("the `text` is empty: say what to tell Zen".into());
     }
+    let markers: String = images
+        .iter()
+        .map(|i| format!("{}\n", marker(&i.id, i.width, i.height)))
+        .collect();
+    let image_ids: Vec<String> = images.into_iter().map(|i| i.id).collect();
     let owner = caller.key();
     let now = now_ms();
     let _held = workers::holding();
@@ -248,7 +258,9 @@ pub fn send(
         failed: false,
     };
     record::say(&records, &owner, &chat.id, &said).map_err(|e| e.to_string())?;
-    let worker = workers::begin(session, &records, &owner, worker, message, images)?;
+    let mut worker = worker;
+    worker.prompt = format!("{markers}{text}");
+    let worker = workers::begin(session, &records, &owner, worker, message, image_ids)?;
     Ok(Sent {
         chat,
         worker,

@@ -2,11 +2,17 @@
 //! fetched from the hub into its cache and checked against its published
 //! length and digest.
 //!
+//! The digest is a 900 MB read, so a file once verified is not hashed again
+//! while its path and modification time stay the same.
+//!
 //! Fetched by whoever is about to need it, on that caller's thread — never by
 //! the guest drain that reads it, which runs with every wave stopped.
 
+use std::fs::{self, File};
+use std::io;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use candle::Result;
 use hf_hub::{Cache, Repo, RepoType};
@@ -28,28 +34,32 @@ pub fn cached_vision_tower_file() -> Option<PathBuf> {
     cached(&Cache::default(), &repo(), QWEN4EXP_MMPROJ_FILE.0)
 }
 
+/// The path whose digest matched the pin, and its modification time then.
+static VERIFIED: Mutex<Option<(PathBuf, SystemTime)>> = Mutex::new(None);
+
 /// The tower's file, fetched when it is not cached, its length checked every
-/// call and its SHA-256 once per process.
+/// call and its SHA-256 whenever the file is not the one last verified. Only a
+/// match is remembered, so a file fetched again after a failure is checked
+/// again.
 pub fn vision_tower_file() -> Result<PathBuf> {
     let (name, bytes, sha) = QWEN4EXP_MMPROJ_FILE;
     let path = repo_file(&repo(), name)?;
-    let len = std::fs::metadata(&path)?.len();
-    if len != bytes {
-        candle::bail!("{path:?} is {len} bytes, the pin is {bytes}");
+    let meta = fs::metadata(&path)?;
+    if meta.len() != bytes {
+        candle::bail!("{path:?} is {} bytes, the pin is {bytes}", meta.len());
     }
-    static CHECKED: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-    CHECKED
-        .get_or_init(|| {
-            let mut f = std::fs::File::open(&path).map_err(|e| format!("{path:?}: {e}"))?;
-            let mut h = Sha256::new();
-            std::io::copy(&mut f, &mut h).map_err(|e| format!("{path:?}: {e}"))?;
-            let got: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-            if got != sha {
-                return Err(format!("{path:?} has SHA-256 {got}, the pin is {sha}"));
-            }
-            Ok(())
-        })
-        .clone()
-        .map_err(candle::Error::Msg)?;
+    let modified = meta.modified()?;
+    let mut verified = VERIFIED.lock().unwrap_or_else(|e| e.into_inner());
+    if verified.as_ref() == Some(&(path.clone(), modified)) {
+        return Ok(path);
+    }
+    let mut f = File::open(&path)?;
+    let mut h = Sha256::new();
+    io::copy(&mut f, &mut h)?;
+    let got: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    if got != sha {
+        candle::bail!("{path:?} has SHA-256 {got}, the pin is {sha}");
+    }
+    *verified = Some((path.clone(), modified));
     Ok(path)
 }

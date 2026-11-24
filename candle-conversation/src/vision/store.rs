@@ -71,14 +71,37 @@ pub fn load_original(substrate: &SharedSubstrate, id: &str) -> Result<Option<Vec
 
 /// The rows of the image `id`, when the substrate holds them.
 pub fn load_rows(substrate: &SharedSubstrate, id: &str) -> Result<Option<ImageRows>, String> {
+    Ok(load_kept(substrate, id)?.map(|k| k.rows))
+}
+
+/// An image the substrate keeps: the size it arrived at, and its rows.
+pub struct KeptRows {
+    pub width: u32,
+    pub height: u32,
+    pub rows: ImageRows,
+}
+
+/// The image `id` as the substrate keeps it, when it does.
+pub fn load_kept(substrate: &SharedSubstrate, id: &str) -> Result<Option<KeptRows>, String> {
     let Some(obj) = substrate.custom_object(&image_key(id)) else {
         return Ok(None);
     };
     let Some(sha) = obj.blob["rows"].as_str().and_then(unhex) else {
         return Err(format!("{}: no rows named", image_key(id)));
     };
+    let side = |k: &str| {
+        obj.blob[k]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| format!("{}: no {k}", image_key(id)))
+    };
+    let (width, height) = (side("width")?, side("height")?);
     match substrate.blob(&sha).map_err(|e| e.to_string())? {
-        Some(bytes) => decode_rows(&bytes).map(Some),
+        Some(bytes) => Ok(Some(KeptRows {
+            width,
+            height,
+            rows: decode_rows(&bytes)?,
+        })),
         None => Ok(None),
     }
 }

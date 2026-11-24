@@ -14,11 +14,15 @@ use super::*;
 /// else keeps the task in front of it: told only to finish "the task you were
 /// given", a worker 88 turns in took up something else it could see, reported
 /// that done, and the task it had was never finished (2026-10-31).
+///
+/// A chat's message opens with a marker line per image it showed
+/// (`chats::talk::send`); those images are shown again with the message
+/// ([`resumed_images`]), and the marker lines stay out of what it is told.
 pub(super) fn resumed_message(worker: &Worker) -> String {
     if worker.kind.is_chat() {
         return format!(
             "{CHAT_RESUMED}\n\nThe message you were answering:\n{}",
-            worker.prompt
+            split_markers(&worker.prompt).1
         );
     }
     let mut message = format!("{RESUMED}\n\nYour task:\n{}", worker.prompt);
@@ -32,6 +36,16 @@ pub(super) fn resumed_message(worker: &Worker) -> String {
         }
     }
     message
+}
+
+/// The kept images `worker`'s message showed: a chat's, named by the marker
+/// lines its prompt opens with. A task shows none.
+pub(super) fn resumed_images(worker: &Worker) -> Vec<String> {
+    if worker.kind.is_chat() {
+        split_markers(&worker.prompt).0
+    } else {
+        Vec::new()
+    }
 }
 
 /// Make `worker`, cut off, run again from `now`, the try entered on its thread.
@@ -104,7 +118,10 @@ pub fn resume(
                 .map_err(|e| e.to_string())?;
             First::Interrupted { call_turn }
         }
-        None => First::Message(format!("{told}{}", closing_of(worker.kind)), Vec::new()),
+        None => First::Message(
+            format!("{told}{}", closing_of(worker.kind)),
+            resumed_images(&worker),
+        ),
     };
     begin_held(session, &records, owner, worker, first, Some(lease))?;
     Ok(true)

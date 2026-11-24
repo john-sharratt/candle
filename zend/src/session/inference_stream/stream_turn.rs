@@ -539,9 +539,17 @@ pub(in super::super) fn run_inference_stream(
         // submitted, so a round cut off before it seals is asked again on the
         // member that resumes it (`crate::resume`, `docs/turn_handover.md` §3).
         // A resumed round's input is its call turn's, named by its own entry.
-        let pending_message = start_iteration == 0 && !original_user_message.is_empty();
+        // Its images go in the record as the turn's text holds them — a marker
+        // line each ahead of the message — and were kept when they were read,
+        // so the member that asks it again reads them back by their ids.
+        let recorded: String = turn_images
+            .iter()
+            .map(|i| format!("{}\n", marker(&i.id, i.width, i.height)))
+            .chain(std::iter::once(original_user_message.clone()))
+            .collect();
+        let pending_message = start_iteration == 0 && !recorded.is_empty();
         if pending_message {
-            resume::mark_message(&state.engine, timeline, &original_user_message);
+            resume::mark_message(&state.engine, timeline, &recorded);
         }
         // Set when the turn stops at a round boundary to move to a faster
         // member: that member finishes the round, so its entry stays.

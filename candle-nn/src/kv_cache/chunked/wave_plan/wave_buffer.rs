@@ -497,6 +497,12 @@ pub enum WaveBuffer {
     /// embedding gather's second table, uploaded once per forward beside the
     /// ids that index it (`WaveWidth::image_rows`). Zero on a wave with no image.
     ImageRows,
+    /// The turn of the wave's image rows' queries and keys, built once per
+    /// forward and read by every attention layer: the listed rows, U32, and
+    /// a `(cos, sin)` per row and rotary pair, F32 — three carves, priced at
+    /// the most pairs a head holds, `head_dim / 2`. Zero on a wave with no
+    /// image.
+    ImageTurns,
     /// One attention layer's sparse selection, as the model states it — see
     /// [`WaveWidth::qsa_bytes`] for why the width cannot say it alone. Carved
     /// on the attention phase, after the pre-mix and ahead of the projections.

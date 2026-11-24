@@ -204,31 +204,32 @@ impl Qwen4ExpBatched {
         // An image's rows arrive under virtual ids: resolved here, the hash
         // side handed `<|image_pad|>` in their place, and their values the
         // gather's second table.
-        let images = take_wave_images(
-            &mut seq_tokens,
-            m.embed.n_rows(),
-            cfg.ple.image_token_id,
-            n_embd,
-            dev,
-            fwd_ticket,
-        )?;
+        let mut images =
+            take_wave_images(&mut seq_tokens, m.embed.n_rows(), cfg.ple.image_token_id, n_embd)?;
         if fresh || head_embeds {
-            let ids = match (&images, ids.device) {
+            // Uploaded by the window that gathers, and only by it
+            // (`WaveBuffer::ImageRows`).
+            let (ids, extra) = match (images.as_mut(), ids.device) {
                 (Some(w), _) => {
-                    wave_from_vec_ticketed(w.gather_ids.clone(), (total_rows,), dev, fwd_ticket)?
+                    let k = w.values.len() / n_embd;
+                    let values = std::mem::take(&mut w.values);
+                    let gather = std::mem::take(&mut w.gather_ids);
+                    (
+                        wave_from_vec_ticketed(gather, (total_rows,), dev, fwd_ticket)?,
+                        Some(wave_from_vec_ticketed(values, (k, n_embd), dev, fwd_ticket)?),
+                    )
                 }
-                (None, Some(t)) => t,
+                (None, Some(t)) => (t, None),
                 (None, None) => {
                     let flat_ids: Vec<u32> = seq_tokens.iter().flatten().copied().collect();
-                    wave_from_vec_ticketed(flat_ids, (total_rows,), dev, fwd_ticket)?
+                    (
+                        wave_from_vec_ticketed(flat_ids, (total_rows,), dev, fwd_ticket)?,
+                        None,
+                    )
                 }
             };
-            m.embed.gather_into(
-                &ids,
-                images.as_ref().map(|w| &w.extra),
-                entry.as_ref(),
-                row_embeds.as_ref(),
-            )?;
+            m.embed
+                .gather_into(&ids, extra.as_ref(), entry.as_ref(), row_embeds.as_ref())?;
         }
 
         // ── Residual: the fresh rows as gathered, or resume. ──

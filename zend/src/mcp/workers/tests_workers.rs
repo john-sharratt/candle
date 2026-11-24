@@ -436,6 +436,31 @@ pub(super) mod tests {
             resumed_message(&chat()),
             format!("{CHAT_RESUMED}\n\nThe message you were answering:\nhow big is the arena?")
         );
+        assert!(resumed_images(&chat()).is_empty());
+    }
+
+    /// **A resumed chat shows its images again**: the marker lines its prompt
+    /// opens with name them, and stay out of what it is told. A task's prompt
+    /// shows none, whatever it holds.
+    #[test]
+    fn a_resumed_chat_shows_its_images_again() {
+        let chat = Worker {
+            thread: "~0123456789abcdef".into(),
+            name: "zen".into(),
+            kind: WorkerKind::Chat,
+            prompt: "[image 0123456789abcdef 640×480]\nwhat is this?".into(),
+            ..worker()
+        };
+        assert_eq!(resumed_images(&chat), ["0123456789abcdef"]);
+        assert_eq!(
+            resumed_message(&chat),
+            format!("{CHAT_RESUMED}\n\nThe message you were answering:\nwhat is this?")
+        );
+        let task = Worker {
+            prompt: chat.prompt.clone(),
+            ..worker()
+        };
+        assert!(resumed_images(&task).is_empty());
     }
 
     /// **A chat's thread keeps no journal line**; a task's thread does.

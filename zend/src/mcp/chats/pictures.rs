@@ -4,7 +4,7 @@
 //! A conversation cannot carry a picture to a tool, so the picture is fetched
 //! up the cluster as the caller (`GET /v1/image/{id}`), as their browser would
 //! fetch it. A chat's turn runs here and reads it kept
-//! ([`ZendSession::keep_image`]); a conversation's turn runs where the gateway
+//! ([`ZendSession::keep_images`]); a conversation's turn runs where the gateway
 //! places it and takes its bytes along.
 
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use candle_conversation::vision::prepare::mime_of;
 use crate::mcp::caller::Caller;
 use crate::mcp::ops;
 use crate::mcp::workers::loading;
-use crate::session::ZendSession;
+use crate::session::{KeptImage, ZendSession};
 
 /// The most pictures one message shows.
 pub const MAX_PICTURES: usize = 4;
@@ -96,25 +96,23 @@ pub async fn fetch(
     Ok(fetched)
 }
 
-/// `pictures` kept as images on this member, each read by the tower here:
-/// their kept ids, in order. For a turn that runs on this member — one the
-/// gateway places may land where the kept image has not yet replicated, and
-/// takes the bytes instead ([`data_url`]).
+/// `pictures` kept as images on this member, read by the tower here in one
+/// job, in order. For a turn that runs on this member — one the gateway
+/// places may land where the kept image has not yet replicated, and takes the
+/// bytes instead ([`data_url`]).
 pub async fn keep(
     session: &Arc<ZendSession>,
     pictures: Vec<Vec<u8>>,
-) -> Result<Vec<String>, String> {
-    let mut kept = Vec::with_capacity(pictures.len());
-    for (i, bytes) in pictures.into_iter().enumerate() {
-        let keeper = Arc::clone(session);
-        let image = tokio::task::spawn_blocking(move || keeper.keep_image(bytes))
-            .await
-            .map_err(|e| format!("reading picture {} panicked: {e}", i + 1))?
-            .ok_or_else(loading)?
-            .map_err(|e| format!("picture {}: {e}", i + 1))?;
-        kept.push(image.id);
+) -> Result<Vec<KeptImage>, String> {
+    if pictures.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(kept)
+    let keeper = Arc::clone(session);
+    tokio::task::spawn_blocking(move || keeper.keep_images(pictures))
+        .await
+        .map_err(|e| format!("reading the pictures panicked: {e}"))?
+        .ok_or_else(loading)?
+        .map_err(|e| format!("the pictures: {e}"))
 }
 
 /// `bytes` as a `data:` URL, typed by their format.

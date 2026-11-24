@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use candle_transformers::models::qwen_vision::{ImageHandle, ImageRows};
+use tokenizers::Tokenizer;
 
 use super::marker::{image_blocks, marker_ids};
 
@@ -41,7 +42,7 @@ pub struct VisionTokens {
 impl VisionTokens {
     /// The ids `tokenizer` gives `<|vision_start|>`, `<|image_pad|>` and
     /// `<|vision_end|>`, when it has all three.
-    pub fn of(tokenizer: &tokenizers::Tokenizer) -> Option<Self> {
+    pub fn of(tokenizer: &Tokenizer) -> Option<Self> {
         Some(Self {
             start: tokenizer.token_to_id("<|vision_start|>")?,
             pad: tokenizer.token_to_id("<|image_pad|>")?,
@@ -172,20 +173,24 @@ mod tests {
             pad: 8,
             end: 9,
         };
-        let mut ids = vec![1];
-        ids.extend(t.block(2));
+        // The user half as the submitter lays it: the block, then the message.
+        let mut ids = t.block(2);
         ids.push(2);
-        let text = "[image 0123456789abcdef 64×32] what?";
+        let text = "[image 0123456789abcdef 64×32]\nwhat?";
         let found = turn_spans(&ids, text, t, |id| {
             assert_eq!(id, "0123456789abcdef");
             Ok(Some(rows(2)))
         })
         .unwrap();
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].start, 2);
+        assert_eq!(found[0].start, 1);
         assert_eq!(found[0].handle.len(), 2);
         assert!(turn_spans(&ids, text, t, |_| Ok(None)).is_err());
         assert!(turn_spans(&ids, "no marker", t, |_| Ok(Some(rows(2)))).is_err());
+        // A message that only quotes a marker holds no image.
+        assert!(turn_spans(&[2], "see [image 0123456789abcdef 64×32]\n", t, |_| unreachable!())
+            .unwrap()
+            .is_empty());
         assert!(turn_spans(&[1, 2], "no image", t, |_| unreachable!())
             .unwrap()
             .is_empty());

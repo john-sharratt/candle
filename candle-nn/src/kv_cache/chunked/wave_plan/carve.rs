@@ -510,6 +510,14 @@ impl WaveBuffer {
             // Two carves at most, so one bump alignment between them as well.
             Self::RowTokenIds => dense(2 * rows + BUMP_ALIGNMENT / 4, 1, DType::U32),
             Self::ImageRows => dense(w.image_rows, g.hidden, DType::F32),
+            // A row id and `2 · pairs ≤ head_dim` table values a row, each a
+            // word, in three carves one bump alignment apart.
+            Self::ImageTurns if w.image_rows == 0 => dense(0, 0, DType::F32),
+            Self::ImageTurns => dense(
+                w.image_rows * (1 + g.head_dim) + 3 * (BUMP_ALIGNMENT / 4),
+                1,
+                DType::F32,
+            ),
             // The draft head's input assembly, over every row of the wave.
             Self::HeadShift
             | Self::HeadHiddenNorm

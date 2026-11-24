@@ -158,7 +158,7 @@ use crate::engine_asks;
 use crate::guidance;
 use crate::hand_records::{self, Carrying};
 use crate::held_values::FilesSeen;
-use crate::images::{self, ImageRef};
+use crate::images;
 use crate::ingest::{IngestConv, IngestLayer, IngestMode};
 use crate::ingest_cancel;
 use crate::ingest_lease;
@@ -223,7 +223,7 @@ use crate::working_set::coverage::Coverage;
 use crate::working_set::seeds::Seeding;
 use crate::working_set::{corpus, dialogue_config};
 use crate::workspace::UPLOADS_REPO;
-use candle_conversation::vision::load_original;
+use candle_conversation::vision::{load_original, marker, split_markers, ImageSource};
 
 pub mod diag;
 mod kv_census;
