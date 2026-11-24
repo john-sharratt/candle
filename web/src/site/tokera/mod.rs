@@ -396,6 +396,44 @@ mod tests {
         }
     }
 
+    /// A paper's figures are raw inline SVG, like a post's, and break the same
+    /// way: a blank line inside one closes its HTML block, and the remainder is
+    /// re-parsed as an escaped code block or as `<p>` paragraphs inside the
+    /// `<svg>`. Every figure of every published paper must come through whole.
+    #[tokio::test]
+    async fn every_published_paper_keeps_its_figures_whole() {
+        let manifest = papers::Manifest::parse(
+            &std::fs::read_to_string(content_root().join("tokera").join("papers.yaml")).unwrap(),
+        )
+        .expect("papers.yaml parses");
+
+        for paper in &manifest.papers {
+            let (_, html) = get(&format!("/papers/{}", paper.slug)).await;
+            for tag in [
+                "&lt;svg",
+                "&lt;rect",
+                "&lt;path",
+                "&lt;text",
+                "&lt;circle",
+                "&lt;g ",
+            ] {
+                assert!(
+                    !html.contains(tag),
+                    "{}: `{tag}` was escaped — a blank line closed a figure's HTML block",
+                    paper.slug
+                );
+            }
+            for figure in html.split("<svg").skip(1) {
+                let body = figure.split("</svg>").next().unwrap_or_default();
+                assert!(
+                    !body.contains("<p>"),
+                    "{}: a `<p>` is inside an `<svg>` — a figure's HTML block closed early",
+                    paper.slug
+                );
+            }
+        }
+    }
+
     /// Every paper the manifest names, rendered from the working document in
     /// `docs/`. Driven off the manifest rather than a hard-coded list, so
     /// publishing a paper cannot skip this check.
@@ -413,6 +451,11 @@ mod tests {
             assert!(
                 html.contains(&page::esc(&paper.title)),
                 "{}: no title",
+                paper.slug
+            );
+            assert!(
+                html.contains("<article class=\"prose paper\"><header class=\"paper-head\"><h1>"),
+                "{}: the sheet does not open on the paper's title",
                 paper.slug
             );
             assert!(html.contains("<table"), "{}: no tables", paper.slug);

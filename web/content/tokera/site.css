@@ -1176,6 +1176,19 @@ html, body, .pane-view, .pane-index {
   hyphens: none;
 }
 .prose.paper h2 { border-top: 1px solid #d5d5d5; }
+/* The sheet opens on the paper's own title, as a printed paper does. */
+.prose.paper .paper-head { text-align: center; margin: 0 0 2.4rem; }
+.prose.paper .paper-head h1 {
+  text-align: center;
+  font-size: 1.75rem;
+  line-height: 1.3;
+  font-weight: 700;
+  letter-spacing: -.2px;
+  margin: 0 auto .9rem;
+  max-width: 40rem;
+  text-wrap: balance;
+}
+.prose.paper .paper-by { color: #333; font-size: .95rem; margin: 0; }
 .prose.paper code, .prose.paper pre { background: #f4f4f4; color: #000; border-color: #ddd; }
 .prose.paper pre { text-align: left; hyphens: none; }
 .prose.paper table { color: #000; }

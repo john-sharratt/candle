@@ -1,70 +1,45 @@
 # One Card, One Stack: Constraint-Driven Architecture for Asymptotically Stable Inference over Unbounded Agent Memory
 
-> **Version 2.** v1 was published on 13 May 2026 ([10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) and is archived unchanged, with an erratum, at `docs/unbounded_agents_v1.md`. v2 replaces v1's single-machine throughput section with a measured evaluation across three machines (RTX 4090 Laptop GPU 16 GB, RTX 3090 24 GB, RTX PRO 5000 Blackwell 72 GB) and twelve models from 0.5B to 284B parameters, including context-depth sweeps to 128K tokens and a comparison against every published figure for the same models on the same classes of card (§9.6). Every number in §9.6 is produced by a test in this repository and recorded, with its source row, in `docs/performance.md`; the raw rows are in `docs/results/`. v1's headline figures of "509 t/s single-session" and "2,446 t/s across 64 sessions" were prefill rates at one and twenty contexts and are withdrawn (see the v1 erratum). Kernel benchmarks (§9.4–§9.5) are carried over from v1, and v1's provenance calibration is summarised in §9.10 for the principle it established. Sections that describe the v1 design on Qwen3-30B-A3B rather than the production system are marked where they begin (§4.1–§4.5); provenance as production runs it — signature, scoring, normalization, the pool and slot, and reprojection — is §6.
->
-> **The system runs in production, not in prototype.** The substrate, the provenance index and the gateway are live: the retrieval gates in §9.11 run against the daemon's resident gallery over HTTP (`POST /v1/substrate/zend/scan`), and the journals, the tool catalog and the code-reading ingest described in §9.13 are the same store those gates read. The assistant that reads and writes that store is served by whichever model is attached to the gateway — the local engine for ingestion and for the fleet measurements in §9.6, external models for some reasoning passes — and this paper does not claim otherwise. The dependency battery of §9.12 is run on production as seven arms over 128 questions, each part of provenance retrieval switched off in turn, and the theorem's direct test — selection from a history twelve times the working set — is §9.11.2.
+> **Version 2.** v1 (13 May 2026, [10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) is archived with an erratum at `docs/unbounded_agents_v1.md`; its "509 t/s" and "2,446 t/s" headlines were prefill rates and are withdrawn. v2 adds a measured evaluation across three machines and twelve models from 0.5B to 284B parameters (§9.6), every number produced by a test in this repository and recorded in `docs/performance.md`, and runs the retrieval evaluation on the production system (§9.11–§9.12). §4.1–§4.5 describe the v1 design on Qwen3-30B-A3B; provenance as production runs it is §6.
 
 **Abstract**
 
-Persistent agentic systems require context that grows without bound. Under standard full attention every cached token takes part in every subsequent step, so the stored error that can reach a step's output — and the number of perturbed scores competing with the relevant tokens for attention mass — grows with context depth. More VRAM defers the point at which tokens must be compressed or evicted; it does not change that coupling. We argue that the coupling is architectural rather than representational, and show that decoupling the working set from context depth is sufficient to bound that exposure. We present a complete system built around that decoupling.
+Persistent agents need context that grows without bound. Under full attention every cached token takes part in every later step, so the stored error a step is exposed to grows with context depth, and more VRAM only defers the point where tokens must be compressed or evicted. We argue the coupling is architectural, and that decoupling the working set from context depth is sufficient to bound the exposure.
 
-The theoretical result (**Theorem §11.2 — Asymptotic Numerical Stability**): under provenance-selected attention over a tiered context, the summed stored error of the tokens that enter a generation step — from any source, including floating-point rounding — is bounded by a constant independent of context depth N, where the same bound under full attention grows linearly in N. When retrieved blocks were sealed from prefill-refreshed activations under a per-block threshold, the constant is small. The theorem bounds what a step is exposed to, not the error in its output; it does not show that full-attention output error grows, and §11.2 says what it does and does not establish.
+**Theorem (§11.2).** Under provenance-selected attention over a tiered context, the summed stored error of the tokens entering a generation step is bounded by a constant independent of context depth N; under full attention the same bound grows linearly in N. The theorem bounds exposure, not output error, and §11.2 states what it does not establish.
 
-The system is built on four integrated contributions: (1) an online self-learning Markov expert prediction system with DMA offload and wave-batched grouped GEMM for MoE inference under partial VRAM residency; (2) an adaptive per-block KV quantization family spanning FP16 down to sub-2-bit formats, with boundary-aware sub-block structure, two-phase prefill refresh replacing decode-drifted K/V at every turn seal, and per-block selection across eleven compression levels (C0–C10) with asymmetric K/V error metrics matched to the softmax-amplified K and linear-bounded V error propagation paths — the top level compressing the KV cache 4.1×–7.6× across twelve models with every session's output validated; (3) attentional provenance indexing via Q-vector cognitive-state fingerprints, re-selecting the working set during decode — every 64 decoded tokens or at a line break, from the signatures of the last 128 decoded tokens — over a GPU tensor-core scan of a VRAM-resident gallery (~9.5 ms on a 16 GB laptop GPU) whose result feeds the next reprojection rather than blocking the current forward; and (4) an unbounded three-tier paged context (VRAM-hot, CPU RAM-warm, disk-cold) with adaptive quantization calibrated to the bound. Each contribution originated from a hard constraint that closed the standard solution and forced an architectural choice that, we argue in §11.5, also holds on unconstrained hardware.
+The system combines (1) online Markov expert prediction with wave-batched grouped GEMM for MoE inference under partial VRAM residency; (2) per-block adaptive KV quantization across eleven levels (C0–C10) with asymmetric K/V error metrics and a prefill refresh at every turn seal, compressing the KV cache 4.1–7.6× at the top level; (3) attentional provenance indexing — Q-vector sign signatures scanned on the GPU, re-selecting the working set during decode; and (4) an unbounded three-tier context, VRAM-hot, RAM-warm and disk-cold.
 
-Implemented in Rust on a custom Candle fork with native quantized matmul kernels that never materialise a full-precision weight copy, the system runs a **180B-parameter mixture-of-experts model (Qwen3.8-Flash-Next) on a 16 GB laptop GPU with 32 GB of host RAM**, serving eight concurrent sessions at 108.5 t/s aggregate decode — above every published single-GPU run of the model, each on a machine with 64–128 GB of RAM. Its throughput is flat in context depth: from 32K to 128K tokens it keeps **99% of its prefill and 111% of its decode**, because the model's own trained sparse-attention indexer bounds the positions each token attends — the bounded-working-set principle this paper builds on, applied inside one context by the checkpoint rather than across contexts by provenance. The top compression level holds the KV cache at **up to 7.6×**, written inline as each block is sealed, at nearly 4× the compression of llama.cpp's q8_0 cache while slowing decode less. Serving concurrent conversations, one card's aggregate decode exceeds the best published llama.cpp single-stream rate for the same model and card class by **1.3–37.9×**, reaching **2,869.9 t/s across 64 sessions** of Qwen3.5-35B-A3B on one 72 GB card; and a **284B model (DeepSeek-V4-Flash) serves sixteen concurrent sessions from a single GPU** at 1,177.1 t/s prefill and 114.4 t/s aggregate decode, 4.1× the best published single-GPU decode (§9.6).
+Implemented in Rust on a Candle fork, the system runs a **180B-parameter MoE model on a 16 GB laptop GPU**, serving eight sessions at 108.5 t/s aggregate decode, above every published single-GPU run of the model. From 32K to 128K tokens it keeps **99% of its prefill and 111% of its decode**. One card's aggregate decode is **1.3–37.9×** the best published llama.cpp single-stream rate for the same model and card class, reaching **2,869.9 t/s across 64 sessions**, and a **284B model serves sixteen sessions from one GPU** at 4.1× the best published single-GPU decode.
 
-An evaluation protocol is specified in §9.12 using the system's own 2.2M-line Rust/CUDA Candle fork as the test subject: the codebase is ingested into unbounded context, then queried by iterative multi-hop retrieval during decode. Retrieval finds needles in a large haystack: probed with a question and the first stretch of the model's reasoning about it, the answer file ranks first of 6,854 files — 40M signature tokens — on 65% of questions and in the top five on 83%, by Q-signature agreement alone. Run on production with tools forbidden, a 24-question pilot is answered from memory at 57.3% recall over three runs, and **holding the working set fixed while the model reasons drops it to 38.8%** — every held run below every reprojecting one (p = 0.05; per question 14 wins to 4, p = 0.031) — with the loss concentrated where the answer lives in a file the question does not name: the reasoning is what moves retrieval to the files that answer it. Over 128 questions, seven arms and three runs, the memory is worth 36.7 points of recall, reprojection during reasoning 4.6, and continuous reprojection 6.5 over a single retrieval, every interval clear of zero. Testing the theorem directly, mid-decode reprojection selects every fact planted in the middle of a history twelve times the working set, at the top compression level as at near-lossless, where a single projection and a rolling window select none (§9.11.2): the bounded working set is delivered at depth. The source and the raw measurement rows are public, and the live system is open to signed-in users (Appendix A).
+On the system's own 2.2M-line codebase, retrieval ranks a question's answer file first among 7,943 files on 49% of 121 questions and in the top five on 69%, by Q-signature agreement alone. Answering 128 questions from memory with tools forbidden, over seven arms and three runs, the memory is worth **36.7 points of recall**, re-selection during reasoning 4.6, and continuous re-selection 6.5 over a single retrieval, every interval clear of zero (§9.12). Mid-decode reprojection selects every fact planted in a history twelve times the working set, at the top compression level as at near-lossless, where a single projection and a rolling window select none (§9.11.2).
 
 ---
 
 ## 1. Introduction
 
-The persistent agentic systems that every major AI lab is building toward — long-running assistants, autonomous agents, enterprise systems accumulating institutional knowledge — all face the same unsolved problem: context must grow without bound, and under standard full attention every token held grows the set of stored, compressed or rounded values that every later step reads. This is not a hardware problem. It is an architectural one. More VRAM defers the threshold; it does not eliminate the structural problem. The industry's current responses confirm this: RAG externalises memory into retrieval, losing the attentional continuity that makes genuine persistent memory different from keyword search; longer native context windows are a hardware investment against an architectural ceiling — at 100 million tokens across months of operation, no finite hardware holds the context at full precision, and summarization and eviction are lossy by definition, destroying the precise factual recall that makes persistent memory genuinely useful.
+Long-running assistants and autonomous agents need context that grows without bound, and under full attention every token held grows the set of stored, compressed or rounded values every later step reads. More VRAM defers the threshold; it does not remove the coupling. RAG externalises memory and loses attentional continuity; longer native windows are a hardware investment against an architectural ceiling; summarization and eviction discard the verbatim detail persistent memory exists to keep.
 
-This paper names the cause and builds a fix. The cause is structural: under standard full attention, every token at every position takes part in every subsequent step, so the error a step is exposed to grows with the context. The fix is architectural: decouple the set of tokens that take part in any given generation step from the total number of tokens in the context. The theorem in §11.2 shows that this decoupling is sufficient to bound the exposure at any depth. We do not prove it necessary — full attention's output is a convex combination of its values, and whether its error grows in practice depends on the attention distribution — but a full-attention system cannot offer the same bound, because the bound's terms are the tokens it attends.
+The fix here is to decouple the tokens that take part in a step from the tokens in the context. §11.2 shows the decoupling is sufficient to bound a step's exposure at any depth. We do not prove it necessary — full attention's output is a convex combination of its values, and whether its error grows depends on the attention distribution — but a full-attention system cannot offer the same bound, because the bound's terms are the tokens it attends.
 
-This system did not originate from a theoretical observation. It originated from two constraints accepted simultaneously and without compromise: a demanding application requiring the hardest possible form of persistent memory, and a hard VRAM ceiling that could not be exceeded. The demanding application is persistent agent conversations — chosen because autonomous agents represent the worst-case instantiation of the persistent-memory problem. They require verbatim factual recall across sessions that grow indefinitely, semantic coherence across arbitrary time gaps, high concurrency across many simultaneous agents, and deployment on hardware with no datacenter budget. Any system that works for this use case works for any less-demanding persistent-memory deployment. The constraints forced architectural choices that address the problem at the level of principle: native quantized matmul kernels written because standard GEMM dequantisation OOMed — which also save the dequantised copy's memory traffic on unconstrained hardware; provenance-selected attention implemented because VRAM is finite and full context cannot be held hot — the mechanism behind the hardware-independent bound; two-phase quantisation designed because materialising full turns at F16 across many sessions OOMs — the design that correctly separates two independent error sources prior work conflated. Section §11.5 documents this pattern in full.
+The system came from two constraints held together: persistent agent conversations, the hardest form of the memory problem (verbatim recall across unbounded sessions, many agents at once), and a single 16 GB consumer GPU. Each constraint closed the standard solution: GEMM dequantisation OOMed, so the matmul kernels read quantized weights natively; full context could not be held hot, so attention became provenance-selected; materialising turns at F16 OOMed, so quantization became two-phase (§11.5). The result, on that card and two larger ones:
 
-We present an inference system designed to implement this architectural requirement — deliberately constrained to a single 16GB consumer GPU so that every architectural choice falls out of the constraint rather than being imposed on top of it, and validated empirically on that hardware and on two larger cards. The system:
+- A **180B-parameter MoE model** (Qwen3.8-Flash-Next, 6B active) on a 16 GB laptop GPU with 32 GB of RAM, experts streamed VRAM → RAM → NVMe, serving eight sessions at 108.5 t/s aggregate decode — above every published single-GPU run of it, each on a host with 64–128 GB (§9.6.5).
+- **Throughput flat in depth**: 99% of prefill and 111% of decode kept from 32K to 128K, the model's own sparse-attention indexer bounding each token's attended set (§9.6.2).
+- **KV compression up to 7.6×**, each 32-token block choosing its format as it is sealed; at 8K the top level costs 0–8% of decode for 3.3–6.3× (§9.6.3).
+- **Concurrency**: aggregate decode 1.3–37.9× the best published llama.cpp rate for the same model and card class, 2,869.9 t/s across 64 sessions on one card; a 284B model at sixteen sessions on one GPU, 4.1× the best published single-GPU decode (§9.6.4, §9.6.6).
+- **Retrieval over its own codebase**: the answer file first of 7,943 on 49% of questions and top-five on 69%; the memory worth 36.7 points of recall with tools forbidden, re-selection during reasoning 4.6 (§9.12).
+- **Selection at depth**: every fact planted in a history twelve times the working set is selected, at C10 as at C0 (§9.11.2).
 
-- Runs a 180B-parameter mixture-of-experts model (Qwen3.8-Flash-Next, 6B active) on a 16GB RTX 4090 Laptop GPU with 32GB of host RAM, streaming its experts VRAM → RAM → NVMe, and serves eight concurrent sessions at 108.5 t/s aggregate decode with every session's output validated — above every published single-GPU run of the model, each on a host with 64–128GB of RAM
-- Keeps Flash-Next's throughput flat in context depth: from 32K to 128K tokens it retains 99% of its prefill and 111% of its decode, with speculative acceptance fixed at 4.85 tokens per step from 8K to 128K — the model's own trained sparse-attention indexer bounding each token's attended set, which the engine runs without adding a depth-dependent cost of its own (§9.6.2)
-- Compresses the KV cache up to 7.6× inline, each 32-token block choosing its own format as it is sealed, with prefill within 5% of uncompressed at every depth; at 8K the top level costs 0–8% of decode for 3.3×–6.3×
-- Serves concurrent sessions at an aggregate decode 1.3–37.9× the best published llama.cpp single-stream rate for the same model and card class, reaching 2,869.9 t/s across 64 sessions on one 72GB card and 256 concurrent sessions on a 0.8B model
-- Runs a 284B model (DeepSeek-V4-Flash) at sixteen-way concurrency on a single GPU: 1,177.1 t/s prefill and 114.4 t/s aggregate decode, 4.1× the best published single-GPU decode
-- Achieves per-block validated KV cache compression across eleven levels with asymmetric K/V thresholds, with the top-quality level achieving K_SNR 58.6 dB — consistent with the ε_hot ≈ 0 assumption of the Asymptotic Numerical Stability theorem
-- Replaces each turn's decode-drifted K/V with K/V re-prefilled from the finished turn at its seal, so no decoded token's stored state inherits the drift of the tokens decoded before it (§5)
-- Retrieval over a live, shared, growing corpus, every score read against its candidate's own background: held-out tool questions find their tool first 87.9% of the time among 93 (§9.10), and reading each score against its background lifts the answer file's R@1 from 0.107 to 0.239 over 37,284 calibration questions (§6.4)
-- Finds the file that answers a question about its own 2.2M-line Rust/CUDA Candle fork among 6,854 ingested files (40M signature tokens): first on 65% of questions, top five on 83%, from the question and the model's first reasoning about it (§9.12)
-- Answers that battery's 24 questions from memory alone, tools forbidden, at 57.3% recall over three runs, declining rather than inventing where it has not seen the source — and at 38.8% when the working set is held fixed while the model reasons, every held run below every reprojecting run: re-selecting the working set *during reasoning* is worth 18.5 points (§9.12)
-- Selects every fact planted in the middle of a conversation twelve times its working set into that working set, at C10 as at C0, where a single projection and a rolling window select none (§9.11.2)
-
-The system is implemented entirely in Rust on a custom fork of the Candle framework. This was not a choice of convenience — it was a necessity, because standard GEMM libraries dequantise weight matrices to full precision before computation, which would OOM during prefill on 16GB. Writing native quantized matmul kernels that never materialise a BF16 weight copy was a prerequisite for the rest of the system to exist.
-
-**Three audiences.** The four technical contributions of §1.2, and the inference stack that supports them, bear on three communities on different timescales.
-
-*For inference systems researchers:* a 180B model served to eight concurrent sessions from a 16GB laptop GPU; throughput that does not fall as context grows from 32K to 128K; up to 7.6× KV compression written inline; and one card's aggregate decode at 1.3–37.9× the best published llama.cpp rate for the same model and card class, up to 2,869.9 t/s across 64 sessions (§9.6). The high-concurrency design is not incidental: unbounded context with provenance-selected attention requires simultaneous parallel prefill across semantic boundaries and multi-dimensional decode across concurrent sessions — the architecture only achieves its full performance and quality properties under genuine concurrency load. The system also runs in production as its own workload: a persistent coding assistant whose sessions outlive any single model, whose memory is the substrate described here, and which is the source of the retrieval measurements in §9.11 and the daily record in §9.13.
-
-*For the KV quantization and ML theory community:* the Asymptotic Numerical Stability theorem (§11.2), which reframes the foundational problem of this subfield. The current literature treats KV quantization as an optimization problem — find the best compression scheme within a regime where error grows with context depth. The theorem shows that the regime itself is escapable through architectural means: provenance-selected sparse attention with a working set bounded independently of depth is sufficient to bound the error each step is exposed to at any depth. That changes which questions are worth asking — how good the selection is, rather than how small each token's error can be made — not just the answers.
-
-*For the broader research community:* the constraint-driven innovation methodology documented in §11.5 — a pattern, observed across this system's components, in which constraints that close standard solutions force replacements that hold up beyond the constraint. It is an observation from one system rather than a result, and it is offered as such.
-
-The agent use case is the existence proof that the system's parts can be built and run together. It is not the subject of the paper.
-
-A bound on per-step error exposure that holds at unbounded context depth has not, to our knowledge, been stated for any prior serving system. More VRAM does not supply one: an H100 at 80GB holds more tokens at full precision, but once a token is compressed or evicted it is in the same position as a 16GB card — the threshold shifts, but the structure does not (§11.2 Corollary 2). Summarization is not compression; it discards the verbatim detail — exact numbers, quotes, commitments — that persistent memory exists to keep. The KV quantization literature optimises inside the full-attention regime and asks how to compress within it; it has not asked whether the regime itself can be left (§11.2, §11.3). The constraint that forced this architecture is the one that produced its central property: the 16GB ceiling forced provenance-selected attention, which is the property the theorem uses (§11.5). Attention is retrieval; this system extends the retrieval mechanism that attention already is to unbounded depth, rather than replacing it with something that loses attentional continuity (§6, §11.4). Whether that extension reaches what it should is measured in §9.11.2, and whether the model reasons over what it retrieves in §9.12.
+The agent use case is the existence proof that the parts run together; it is not the subject of the paper. To our knowledge no prior serving system states a bound on per-step error exposure at unbounded depth. An 80 GB card holds more tokens at full precision, but once a token is compressed or evicted it is in the same position as on a 16 GB card (§11.2, Corollary 2).
 
 ### 1.2 Technical Contributions
 
-1. **Online Markov Expert Prediction with DMA Offload** — a self-learning transition matrix that predicts expert routing from actual inference observations without calibration, combined with a wave-batched grouped GEMM kernel that exploits cross-request expert locality to reduce effective PCIe transfer costs.
-
-2. **Two-Phase KV Cache Quantization with Prefill Refresh** — a turn-boundary prefill refresh strategy that removes autoregressive decode drift from every sealed turn, coupled with an adaptive per-block selection kernel that assigns independent K/V formats based on asymmetric error metrics grounded in the softmax-amplified K vs. linear-bounded V error propagation asymmetry [AsymKV, COLING 2025]. Compression ratios span three tiers from near-lossless (top-quality) to high-compression, validated end-to-end by the multi-session story rewrite test (§9.8).
-
-3. **Attentional Provenance Indexing with Mid-Decode Reprojection** — capturing Q vectors as persistent cognitive-state fingerprints and binarising them into Binary Directional Provenance signatures — packed Q sign bits folded per head — matched Q→Q by sign agreement (XNOR + popcount). The signature design was calibrated in v1 on a 128-bit 8-head XOR fold across two syntactic-band layer depths (MH_XOR_QQ_l0×l4, §9.10); the production signature is its successor over every attention layer — three layer-fold groups of one 128-bit signature per KV head, 192 bytes per token on a four-KV-head model (§6.6). The corpus is scanned on the GPU over a VRAM-resident paged gallery by tensor-core kernels — 1-bit BMMA on Ada at ~9.5 ms steady-state on a 16GB laptop GPU, INT8 IMMA on Blackwell — bit-identical to a scalar reference. During generation the working set is re-selected from the decode's own Q signatures — every 64 decoded tokens, or at a line break once more than 16 have passed, scoring the last 128 decoded tokens (§6.5) — and the scan's result feeds the next reprojection rather than blocking the current forward, so its latency stays off the decode's critical path. The think block is itself the probe that decodes ahead of the answer: its reprojections steer the answer's context, and at seal its K/V is dropped, so it costs the answer nothing in memory (§6.5). What the memory answers is measured by §9.12's battery, and whether turns far past the working set are selected by §9.11.2. What re-selection during reasoning adds is measured too: holding the working set through the think block takes the battery from 57.3% to 38.8% over three runs per arm (§9.12). The scan's retrieval quality is §9.11.1 and §9.12's scoring lab — the answer file first of 6,854 on 65% of questions.
-
-4. **Unbounded Three-Tier Paged Context** — a VRAM-hot / CPU RAM-warm / disk-cold paged context architecture, together with a proof that the summed stored error of the tokens entering a generation step — from any source, including F16 rounding — is bounded by a constant independent of context depth N under provenance-selected attention, where the same bound under full attention grows linearly in N. The bound is independent of hardware: more VRAM defers the point at which tokens must be compressed or evicted, but does not change which tokens a full-attention step reads. Decoupling working-set size from context depth is sufficient for the bound; §11.2 states what it does not establish.
-
-5. **Native Quantized Inference Stack** (supporting, not one of the four) — greedy decomposition for smooth 1–500 token throughput without remainder handling, a fused sampling kernel covering all common sampling modifiers in one CUDA launch, and native quantized matmul kernels that eliminate the dequant materialisation OOM during prefill.
+1. **Online Markov expert prediction** (§4) — a transition matrix learned from live routing, with no calibration, and a wave-batched grouped GEMM that amortises each expert's transfer across the sessions that route to it.
+2. **Two-phase KV quantization** (§5) — K/V re-prefilled from the finished turn at its seal, removing decode drift, then a per-block format chosen independently for K and V by error metrics matched to K's softmax-amplified and V's linear error paths [AsymKV, COLING 2025].
+3. **Attentional provenance indexing** (§6) — Q-vector sign signatures matched Q→Q by XNOR and popcount, scanned on the GPU over a VRAM-resident gallery by tensor-core kernels (~9.5 ms on a 16 GB laptop GPU) and re-selecting the working set every 64 decoded tokens, off the decode's critical path. The think block is the probe that decodes ahead of the answer.
+4. **Unbounded three-tier context** (§7, §11.2) — VRAM-hot, RAM-warm and disk-cold paging, with the proof that the stored error entering a step is bounded independent of depth under provenance-selected attention.
+5. **Native quantized kernels** (§8, supporting) — matmuls that never materialise a full-precision weight copy, greedy batch decomposition, and a fused sampling kernel.
 
 ---
 
@@ -72,95 +47,67 @@ A bound on per-step error exposure that holds at unbounded context depth has not
 
 ### 2.1 MoE Expert Offloading
 
-Several systems have addressed expert offloading for MoE models under VRAM constraints. Fiddler [Kamahori et al., 2024] and HybriMoE [Zhong et al., 2025] partition experts between CPU and GPU based on activation frequency. DAOP [DATE 2025] extends this with data-aware prefetching. The core limitation shared by these systems is that they rely on offline profiling or trained auxiliary modules to predict expert routing — prediction accuracy degrades on novel distributions, and the calibration requirement creates deployment friction.
-
-Our Markov predictor learns online from actual routing observations, has no calibration requirement, and improves continuously during inference. Combined with the wave-batched kernel that coalesces expert work across concurrent requests, it keeps the GPU working while experts stream under partial VRAM residency (§4.3, §9.7).
+Fiddler [Kamahori et al., 2024] and HybriMoE [Zhong et al., 2025] partition experts between CPU and GPU by activation frequency; DAOP [DATE 2025] adds data-aware prefetching. All rely on offline profiling or trained predictors, which degrade on novel distributions. Our Markov predictor learns online from live routing, and the wave-batched kernel coalesces expert work across concurrent requests (§4.3, §9.7).
 
 ### 2.2 KV Cache Quantization
 
-The online, inference-time, training-free KV cache quantization field has three meaningful entries. **KIVI** [Liu et al., ICML 2024] established channel-wise outlier structure in Keys and token-wise structure in Values, motivating per-channel K and per-token V quantization at uniform 2-bit. It is the standard baseline: well-reproduced, widely cited, but a blunt instrument — identical format assigned to every block regardless of activation difficulty. Their Table 2 shows quality degradation on long-context retrieval tasks at 5× CR. **KVQuant** [Hooper et al., NeurIPS 2024] added sensitivity-aware treatment: per-vector outlier handling and special-casing of the first token, achieving sub-0.1 perplexity degradation at 3-bit. The contribution was demonstrating that careful outlier handling makes aggressive uniform quantization viable — but format assignment remains population-level, not per-block. **TurboQuant** [Zandieh et al., ICLR 2026] achieves near-optimal compression via Hadamard rotation and Lloyd-Max quantization. The rotation spreads energy uniformly before quantization, with theoretical advantage below 3-bit. In practice, community benchmarks on Qwen3 find that Q4_0 matches or exceeds PolarQuant-MSE (the residual implementation after removing QJL) at comparable 4–5× compression ratios, suggesting the rotation overhead does not pay for itself in the range where most deployments operate.
+**KIVI** [Liu et al., ICML 2024] established channel-wise outliers in K and token-wise structure in V, quantizing both uniformly at 2 bits. **KVQuant** [Hooper et al., NeurIPS 2024] added per-vector outlier handling and first-token special-casing, under 0.1 perplexity at 3 bits. **TurboQuant** [Zandieh et al., ICLR 2026] rotates and Lloyd-Max quantizes, with its advantage below 3 bits; community benchmarks on Qwen3 find Q4_0 matching its residual implementation at 4–5×. **KITTY** [Xia et al., 2025] boosts 12.5–25% of K channels to 4 bits by an offline magnitude ranking and names adaptive selection as future work. Token eviction (H2O, TOVA, StreamingLLM) is lossy by design, DMS needs fine-tuning, SVD approaches (xKV, LoRC) are per-prompt, and KVTC [Staniszewski & Łańcucki, ICLR 2026] compresses ~20× offline for storage rather than live inference. OTT [Su et al., ACL 2025] finds outlier tokens cluster at block boundaries, independently motivating our 4/28 sub-block structure.
 
-**KITTY** [Xia et al., 2025] demonstrates that mixed-precision channel-wise quantization can recover most of the accuracy gap between 2-bit and 4-bit Key caches by boosting 12.5–25% of channels to 4-bit. Their selection uses an offline-computed magnitude ranking; the authors note that "more principled or adaptive strategies may yield stronger robustness accuracy recovery" as future work. This paper addresses that directly. The binary precision-boost decision is replaced with adaptive per-block format selection using per-block reconstruction error in the Q-projected metric for K and normalised-L2 error for V. The selector operates at per-(layer, head) block granularity and is recomputed per operating point. We extend adaptation to V as well as K, providing an 11-point Pareto curve (C0–C10) rather than two configurations, operating on dense, MoE, DeltaNet-hybrid and native-sparse models up to 284B parameters with no per-model calibration data — a model carries at most a scale on the thresholds, set at its validation edge (§9.9).
-
-Everything else in the quantization-adjacent space is either orthogonal or a different design point. Token eviction systems (H2O, TOVA, StreamingLLM) are lossy by definition — they solve a different problem. Trained compression (DMS) requires fine-tuning. SVD-based approaches (xKV, LoRC) are per-prompt and offline-flavoured. KVTC [Staniszewski & Łańcucki, ICLR 2026] achieves ~20× compression via PCA decorrelation and entropy coding but operates offline on completed caches for storage and transfer rather than during live inference — a complementary design point. None of these compete in the online inference-time setting.
-
-OTT [Su et al., ACL 2025] identified that outlier tokens cluster near block boundaries, independently motivating our 4/28 sub-block structure — the same insight that drives KVQuant's first-token sensitivity, generalised to a structural per-block design.
-
-The gap this paper occupies: all three competitive systems optimise the compression *primitive* — better quantization formula, rotation, codebooks. None treat format assignment as a per-block decision with a quality guarantee. None establish any theoretical result about error scaling with context depth. The adaptive selection architecture subsumes the insights of KVQuant's outlier handling (via _KS sub-block formats and attention sink protection) and RefreshKV's drift correction (§2.3), while adding the per-block quality guarantee that makes all three possible simultaneously.
+Every one of these optimises the compression *primitive*. None treats format assignment as a per-block decision with a quality guarantee, and none states a result on error scaling with depth. Here each (layer, head) block chooses its own K and V formats, by Q-projected error for K and normalised L2 for V, along an 11-point Pareto curve (C0–C10) that runs on dense, MoE, DeltaNet-hybrid and native-sparse models up to 284B with no per-model calibration data beyond a threshold scale (§9.9).
 
 ### 2.3 Autoregressive Error Accumulation
 
-GEAR [Kang et al., 2024] formally established that quantization error in autoregressive decode compounds multiplicatively across steps, causing critical generation deviation in long sequences. RefreshKV [Xu et al., ACL 2025] is the only published work addressing this specifically: periodic full-attention KV regeneration recovers precision lost through sequential accumulation. They identified the problem and demonstrated the fix, but as a standalone technique — not integrated with any compression system. Our two-phase architecture takes the same insight and couples it structurally with the quantization system: prefill refresh is not periodic but turn-boundary-triggered, and it feeds directly into the adaptive format selection on the refreshed activations. RelayCaching [2026] confirmed that KV values are highly consistent across prefill and decode phases, validating prefill as the correct ground-truth regeneration strategy.
+GEAR [Kang et al., 2024] showed quantization error in autoregressive decode compounds across steps. RefreshKV [Xu et al., ACL 2025] regenerates the KV periodically with full attention, as a standalone technique. Our refresh is turn-boundary-triggered and feeds the per-block format selection directly; RelayCaching [2026] confirms prefill and decode K/V agree closely, so prefill is the right ground truth.
 
 ### 2.4 Attention Sinks
 
-StreamingLLM [Xiao et al., ICLR 2024] established that a small cluster of initial tokens carries disproportionate attention weight and must be preserved under any compression scheme. KVSink [Su & Yuan, COLM 2025] extended this to mid-sequence emergent sinks. The system's treatment of attention sinks reframes this generatively rather than defensively: on attention-only models, turn-boundary sinks are recomputed in the current frame at every assembly rather than stored, closing a class of stale-frame error that defensive protection cannot address (§5). KVTuner [2025] and community benchmarks [llama.cpp #20969, 2025] both identify boundary transformer layers as specifically more sensitive to K quantization on Qwen3.
+StreamingLLM [Xiao et al., ICLR 2024] showed initial tokens carry disproportionate attention; KVSink [Su & Yuan, COLM 2025] extended this to mid-sequence sinks. Here, on attention-only models, turn-boundary sinks are recomputed in the current frame at every assembly rather than stored (§5). KVTuner [2025] and [llama.cpp #20969, 2025] find boundary layers more sensitive to K quantization on Qwen3.
 
 ### 2.5 KV-Based Retrieval
 
-RetrievalAttention [Liu et al., NeurIPS 2025] identified and quantified the Q→K distributional gap: Q vectors deviate more than 10× farther from K vectors than K vectors deviate from each other, causing standard ANNS to degrade severely when queried cross-distribution. Our attentional provenance indexing addresses this by storing Q fingerprints alongside K fingerprints, enabling within-distribution Q→Q matching to carry the dominant retrieval signal.
+RetrievalAttention [Liu et al., NeurIPS 2025] measured the Q→K gap: Q vectors sit more than 10× farther from K than K from K, degrading cross-distribution ANNS. Provenance indexing stores Q signatures, so the dominant signal is a within-distribution Q→Q match.
 
 ---
 
 ## 3. System Architecture
 
-The system is structured as a forward pass pipeline with six integrated subsystems. The architecture is organised around a single theoretical requirement: the working set of tokens attending any generation step must be bounded independently of total context depth — the structural property the Asymptotic Numerical Stability theorem (§11.2) requires. Every subsystem was designed with knowledge of this requirement and of every other subsystem's constraints and capabilities.
+One requirement organises the system: the tokens attending any step must be bounded independently of context depth, the property §11.2 uses. Figure 3-1 shows one decode step and the two loops that feed it. No component materialises an intermediate the next operation does not consume: there is no dequantised weight copy and no BF16 expansion between the logits and the sampling modifiers.
 
-```
-Token Embeddings
-       │
-       ▼
-┌──────────────────────────────────────────────────────────┐
-│  MID-DECODE REPROJECTION (generation-time loop)          │
-│                                                          │
-│  Decode captures each token's Q signature (192 B)        │
-│  Trigger: every 64 tokens, or a line break after > 16    │
-│  GPU provenance scan over the resident gallery,          │
-│    probe = last 128 decoded tokens' signatures           │
-│    (~9.5 ms on the laptop, off the critical path)        │
-│  Result assembles the working set of the NEXT forward    │
-└──────────────────────────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────────┐
-│  ATTENTION LAYER (all layers)       │
-│  Paged KV cache with adaptive quant │
-│  Chunk-sealed quantization on write │
-│  Attentional provenance hooks       │
-│  Three-tier context assembly        │
-└─────────────┬───────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────┐
-│  MoE EXPERT PIPELINE (all layers)  │
-│  Device-side routing, no readback  │
-│  Online Markov prediction           │
-│  Wave-batched grouped GEMM          │
-└─────────────┬───────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────┐
-│  SAMPLING KERNEL                    │
-│  Fused all-modifier single launch   │
-└─────────────┬───────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────┐
-│  TURN SEAL (on turn completion)     │
-│  Prefill refresh over completed turn│
-│  Re-quantize from clean activations │
-└─────────────┬───────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────────────────┐
-│  MEMORY PIPELINE (async)                        │
-│  Signatures persisted beside K/V at turn seal   │
-│  Gallery pages resident in VRAM, rebuilt on     │
-│  demand from the substrate                      │
-└─────────────────────────────────────────────────┘
-```
-
-The design principle throughout is that no component materialises an intermediate representation that is not consumed by the immediately following operation. The dequantised weight copy that standard GEMM libraries materialise does not exist. The BF16 expansion that standard sampling pipelines require between the logit tensor and each modifier does not exist. Every kernel boundary is a necessary one.
+<figure class="fig">
+<svg viewBox="0 0 640 292" role="img" aria-label="Figure 3-1. One decode step: embedding, attention over a working set, MoE experts streamed from VRAM, RAM and NVMe, a fused sampling kernel, and the next token. Every 64 decoded tokens the last 128 Q signatures are scanned against the VRAM gallery in about 9.5 ms, off the critical path, and the result assembles the next forward's working set. When a turn ends it is re-prefilled and each 32-token block is sealed in its own format, C0 to C10, into three tiers: VRAM hot, RAM warm, disk cold, which also hold the gallery.">
+  <text class="ttl" x="16" y="20">Figure 3-1 · One decode step, and the loops that feed it</text>
+  <text class="ttl-sub" x="16" y="36">each forward attends a working set, never the whole context</text>
+  <rect class="box" x="16" y="56" width="96" height="52" rx="6"/>
+  <text class="t-lbl mid" x="64" y="78">Embedding</text>
+  <text class="t-dim mid" x="64" y="94">host lookup</text>
+  <rect class="box weights" x="132" y="56" width="132" height="52" rx="6"/>
+  <text class="t-lbl mid" x="198" y="78">Attention</text>
+  <text class="t-dim mid" x="198" y="94">paged KV, working set</text>
+  <rect class="box" x="284" y="56" width="132" height="52" rx="6"/>
+  <text class="t-lbl mid" x="350" y="78">MoE experts</text>
+  <text class="t-dim mid" x="350" y="94">VRAM → RAM → NVMe</text>
+  <rect class="box" x="436" y="56" width="96" height="52" rx="6"/>
+  <text class="t-lbl mid" x="484" y="78">Sampling</text>
+  <text class="t-dim mid" x="484" y="94">one fused launch</text>
+  <rect class="box" x="552" y="56" width="72" height="52" rx="6"/>
+  <text class="t-lbl mid" x="588" y="86">token</text>
+  <rect class="box" x="132" y="140" width="400" height="50" rx="6"/>
+  <text class="t-lbl mid" x="332" y="161">Provenance scan, every 64 decoded tokens</text>
+  <text class="t-dim mid" x="332" y="178">last 128 Q signatures vs the VRAM gallery · ~9.5 ms</text>
+  <rect class="box" x="132" y="222" width="284" height="50" rx="6"/>
+  <text class="t-lbl mid" x="274" y="243">Turn seal: re-prefill the finished turn</text>
+  <text class="t-dim mid" x="274" y="260">fresh K/V; each block's format C0–C10</text>
+  <rect class="box weights" x="436" y="222" width="188" height="50" rx="6"/>
+  <text class="t-lbl mid" x="530" y="243">Three tiers</text>
+  <text class="t-dim mid" x="530" y="260">VRAM hot · RAM warm · disk</text>
+  <path class="ax" d="M112 82 H132 M264 82 H284 M416 82 H436 M532 82 H552 M588 108 V165 H532 M198 140 V108 M480 222 V190 M416 247 H436 M88 247 H132"/>
+  <path class="t-dim" d="M132 82 l-6 -3.5 v7 z M284 82 l-6 -3.5 v7 z M436 82 l-6 -3.5 v7 z M552 82 l-6 -3.5 v7 z M532 165 l6 -3.5 v7 z M198 108 l-3.5 6 h7 z M480 190 l-3.5 6 h7 z M436 247 l-6 -3.5 v7 z M132 247 l-6 -3.5 v7 z"/>
+  <text class="t-dim" x="542" y="182">Q signatures</text>
+  <text class="t-dim" x="206" y="128">next forward's working set</text>
+  <text class="t-dim" x="486" y="210">gallery, K/V</text>
+  <text class="t-dim" x="16" y="251">turn ends</text>
+</svg>
+</figure>
 
 ---
 
@@ -168,148 +115,130 @@ The design principle throughout is that no component materialises an intermediat
 
 ### 4.1 The Problem
 
-*§4.1–§4.3's four-part policy and §4.5 describe the v1 design on Qwen3-30B-A3B. The production cache and dispatch that replaced parts of it are given at the end of §4.3 and in §4.4.*
+*§4.1–§4.3 describe the v1 design on Qwen3-30B-A3B; the production cache and dispatch close §4.3 and fill §4.4.*
 
-Qwen3-30B-A3B has 48 MoE layers with 128 experts each — 6,144 experts total at approximately 3MB each (Q4_K_M), totalling ~18GB. No single consumer GPU achieves full residency. On a 16GB card with a 50% VRAM budget for experts, approximately 2,700 slots are available — 44% residency. The dominant inference cost is PCIe transfer latency for cold expert fetches. Without prediction, 56% of expert activations are cold misses, each blocking the GPU compute stream while waiting for a ~116μs DMA transfer from pinned memory (`docs/expert_cache_design.md`).
+Qwen3-30B-A3B has 48 MoE layers of 128 experts, ~18 GB at Q4_K_M. With half of a 16 GB card for experts, 44% are resident, and without prediction 56% of activations are cold misses, each stalling the stream for a ~116 μs copy from pinned memory (`docs/expert_cache_design.md`).
 
 ### 4.2 Online Markov Transition Matrix
 
-The self-learning predictor maintains a per-layer-pair transition count matrix:
+After each forward the predictor credits a `[128 × 128]` count table per layer pair, `T[L][from][to]`, only when `to` was not already active at the source layer, so it learns the *cold* experts a prefetch must cover. Production keeps one table per hop ahead and stays silent until a table has seen 64 arrivals. Successors are scored by pointwise mutual information, which discounts globally popular experts already cached:
 
 ```
-T[L→L+1] : [128 × 128] float32 co-occurrence counts
+PMI(α)[j] = Σ_i P(j | i) / P(j)^α,   i ∈ active experts at L,   α = 0.5
 ```
 
-After each forward pass, the predictor observes which experts fired at each layer and credits `T[L][from][to]` for each pair — **arrival-specialised**: a transition counts only when `to` was not already active at the source layer, so the table learns the cold experts a prefetch must cover. Production keeps one direct table per hop ahead rather than chaining the one-hop table, and emits nothing from a table until it has seen 64 arrivals (`expert_lre/transition.rs`).
+Candidates are staged into **free slots only**, so a misprediction is inert. Out of sample — 21-fold leave-one-out over a 21-prompt routing trace — PMI covers **4.7×** the cold experts a popularity baseline does at a fan-out of four, with top-1 precision of 80–91% against 22% (§9.7). A session's own transitions predict its next layers better than any cross-prompt average.
 
-Prediction for layer L+h given the active set at layer L scores each successor by pointwise mutual information, which discounts the globally popular experts that are already cached in favour of those the current routing specifically implies:
+### 4.3 Eviction Policy
 
-```
-PMI(α)[j] = Σ_i  P(j | i) / P(j)^α     for i in active_experts_L,  α = 0.5
-candidates = successors by PMI, excluding the active set, above a confidence floor
-```
+Timestamp eviction cascades — a miss at L evicts an expert L+5 needs — and halved single-token decode. Four rules remove the cascade: evict the bottom 5% by timestamp at the end of each pass, leaving ~140 free slots; on a forced eviction, evict from completed layers first; pin layers 0 and 1, which have no compute ahead to hide a reload; prefetch into free slots only. Frequency-weighted recency cuts the miss rate from LRU's 22.9% to 14.7% at half the working set, where a learned recurrence model did worse than LRU (39.5%) (§9.7).
 
-The candidates are staged into free slots. Speculative prefetch **never evicts** — it only uses free slots — so a misprediction is structurally harmless: it occupies a free slot until normal eviction reclaims it.
+**Production: three tiers.** The production cache treats the on-disk expert pack as authoritative and VRAM and pinned RAM as independent copies of it, so eviction never writes back. Its key is access frequency weighted by the wrapped distance to the layer's next use — Bélády's ordering, exact because the layer wave is a cycle — evaluated by tier, so an expert whose miss costs an NVMe read is protected over one whose miss is a pinned copy (Figure 4-1). The same gate on the laptop now measures 6,139.1 t/s at twenty contexts with its experts streaming (§9.6).
 
-**Measured out of sample** (§9.7): over a captured Qwen3-30B-A3B routing trace of 21 diverse prompts, scored by 21-fold leave-one-out cross-validation so no prompt is predicted by a model trained on it, the PMI transition model covers **4.7×** the cold experts a popularity baseline does at a four-expert fan-out, with top-1 precision of 80–91% against popularity's 22% (`docs/archived/markov_expert_prediction_eval.md`). Learning within the session is the dominant lever: a session's own transitions predict its next layers better than any cross-prompt average.
-
-**Why this works better than trained predictors.** Most published MoE prefetching systems require a trained auxiliary module or offline profiling over representative data. The Markov predictor requires neither. It learns the model's own routing tendencies from production inference — meaning it adapts to the actual workload distribution rather than a calibration proxy. For content with strong routing regularities (code tokens, prose tokens, domain-specific content), convergence is fast and prediction accuracy is high.
-
-### 4.3 Four-Part Eviction Policy
-
-Naive timestamp-based eviction causes cascade failures: a cold miss at layer L evicts an expert from layer L+5, causing a new miss that evicts from layer L+10. Empirically, this halved single-token decode throughput before the policy was redesigned.
-
-The four-part policy eliminates cascades:
-
-**Part 1 — End-of-pass batch eviction.** After layer 47, evict the bottom 5% of occupied slots by usage timestamp. This creates ~140 free slots as a shock absorber for the next pass's early layers.
-
-**Part 2 — Layer-aware forced eviction.** When a real miss occurs with no free slots, evict from completed layers first (highest completed layer, then oldest timestamp). This makes it structurally impossible to evict an expert needed later in the same pass.
-
-**Part 3 — Early-layer pinning.** The first two MoE layers, 0 and 1, are pinned — their resident experts are never evicted. These layers run first in every pass with no prior compute to overlap a reload with; a miss at layer 0 is a full stall. Pinning removes that worst case at the cost of the slots the two layers hold.
-
-**Part 4 — Free-slot-only prefetch.** As described above. Mispredictions are inert.
-
-The eviction ordering was chosen by measurement: in the same held-out evaluation, a frequency-weighted recency score cut the expert miss rate from LRU's 22.9% to 14.7% at a VRAM budget of half the working set, where a learned recurrence model did worse than LRU (39.5%) — the reuse signal that matters is frequency and recency, not a model of it (§9.7).
-
-**The production cache: three tiers.** The four-part policy was designed for a two-tier cache in which every expert not in VRAM sat in pinned RAM. The production cache treats the on-disk expert pack as authoritative and VRAM and pinned RAM as independent faster copies of it, so an expert can be resident in both and eviction never writes bytes back. Its eviction key keeps Parts 2–3's intent: access frequency weighted by the wrapped forward distance to the layer's next use — Bélády's ordering, computed exactly because the layer wave is a cycle — evaluated in passes by tier, so a pack-only expert, whose miss costs an NVMe read, is protected over a warm-backed one whose miss is a ~116μs copy from pinned memory. Measured on Qwen3-30B-A3B, RTX 4090 Laptop GPU (16GB), aggregate prefill t/s, the two-tier cache against the three-tier cache it was replaced by (design and full history: `docs/expert_cache_design.md` §12.5):
-
-| Config | Two-tier | Three-tier | Δ |
-|---|---|---|---|
-| F16 × 1 context | 377.5 t/s | 708.1 t/s | +87% |
-| BF16 × 1 context | 509.4 t/s | 780.6 t/s | +53% |
-| BF16 × 10 contexts | 1,931.4 t/s | 2,726.1 t/s | +41% |
-| Q8_0 × 20 contexts | 2,448.1 t/s | 2,732.5 t/s | +12% |
-| C9 × 2 contexts | 951.4 t/s | 1,463.1 t/s | +54% |
-
-The same gate on the laptop now measures **6,139.1 t/s at twenty contexts** with its experts streaming (§9.6, I10) — the three-tier cache is not costing the model its throughput, it is what allows the model to run at all on 16 GB.
+<figure class="fig">
+<svg viewBox="0 0 640 262" role="img" aria-label="Figure 4-1. Aggregate prefill on Qwen3-30B-A3B, RTX 4090 Laptop GPU, two-tier against three-tier expert cache. F16 one context 377.5 to 708.1 t/s, plus 87 percent. BF16 one context 509.4 to 780.6, plus 53 percent. BF16 ten contexts 1,931.4 to 2,726.1, plus 41 percent. Q8_0 twenty contexts 2,448.1 to 2,732.5, plus 12 percent. C9 two contexts 951.4 to 1,463.1, plus 54 percent.">
+  <text class="ttl" x="16" y="20">Figure 4-1 · The three-tier expert cache, against two tiers</text>
+  <text class="ttl-sub" x="16" y="36">Qwen3-30B-A3B · RTX 4090 Laptop 16 GB · aggregate prefill t/s · amber two-tier, green three-tier</text>
+  <path class="grid" d="M335.7 54 V226 M471.4 54 V226"/>
+  <path class="grid base" d="M200 54 V226"/>
+  <text class="cat" x="16" y="72">F16 × 1 context</text>
+  <text class="cat-sub" x="16" y="85">+87%</text>
+  <rect class="them" x="200" y="60" width="51.2" height="11"/>
+  <rect class="us" x="200" y="73" width="96.1" height="11"/>
+  <text class="v-them" x="257.2" y="69">377.5</text>
+  <text class="v-us" x="302.1" y="83">708.1</text>
+  <text class="cat" x="16" y="106">BF16 × 1 context</text>
+  <text class="cat-sub" x="16" y="119">+53%</text>
+  <rect class="them" x="200" y="94" width="69.1" height="11"/>
+  <rect class="us" x="200" y="107" width="105.9" height="11"/>
+  <text class="v-them" x="275.1" y="103">509.4</text>
+  <text class="v-us" x="311.9" y="117">780.6</text>
+  <text class="cat" x="16" y="140">BF16 × 10 contexts</text>
+  <text class="cat-sub" x="16" y="153">+41%</text>
+  <rect class="them" x="200" y="128" width="262.1" height="11"/>
+  <rect class="us" x="200" y="141" width="370" height="11"/>
+  <text class="v-them" x="468.1" y="137">1,931.4</text>
+  <text class="v-us" x="576" y="151">2,726.1</text>
+  <text class="cat" x="16" y="174">Q8_0 × 20 contexts</text>
+  <text class="cat-sub" x="16" y="187">+12%</text>
+  <rect class="them" x="200" y="162" width="332.2" height="11"/>
+  <rect class="us" x="200" y="175" width="370.8" height="11"/>
+  <text class="v-them" x="538.2" y="171">2,448.1</text>
+  <text class="v-us" x="576.8" y="185">2,732.5</text>
+  <text class="cat" x="16" y="208">C9 × 2 contexts</text>
+  <text class="cat-sub" x="16" y="221">+54%</text>
+  <rect class="them" x="200" y="196" width="129.1" height="11"/>
+  <rect class="us" x="200" y="209" width="198.6" height="11"/>
+  <text class="v-them" x="335.1" y="205">951.4</text>
+  <text class="v-us" x="404.6" y="219">1,463.1</text>
+  <text class="tick mid" x="200" y="244">0</text>
+  <text class="tick mid" x="335.7" y="244">1,000</text>
+  <text class="tick mid" x="471.4" y="244">2,000 t/s</text>
+</svg>
+</figure>
 
 ### 4.4 Wave-Batched Grouped GEMM
 
-The key insight is that batching prefill and decode requests together and routing them through the expert layer as a wave creates **cache locality in the expert hot set**. When Request A and Request C both need Expert 7, Expert 7's weights load once and serve both. The effective hot set is the union of expert activations across all concurrent requests — which is smaller than the naive sum because similar content routes to similar experts.
-
-The production dispatch (`docs/moe_live_dispatch_design.md`) keeps routing on the device. Per layer:
-
-```
-Bucketize: a kernel classifies each routed expert VRAM / pinned RAM / cold,
-           and writes a routing summary into a mapped host ring
-
-Experts:   the grouped GEMM runs every assignment; a VRAM-resident expert is
-           read in place, a pinned-RAM expert is copied by the expert kernel
-           itself, and only a cold expert waits — on a mapped word the stager
-           thread publishes once the expert is in pinned memory
-
-Scatter:   the expert outputs are combined into the residual stream
-```
-
-No host CUDA call reads the routing or waits on it: the host threads read the summary off the critical path, to stage cold experts, score residency and promote, and nothing on the device waits for them to do so. The wait that remains is the cold miss, which is what the Markov prefetch and the eviction policy exist to make rare: modelled on the held-out trace at 60% VRAM residency, the two together leave ≈13% of expert accesses as stalling misses, and tuned for stall cost rather than hit rate — about 2% forced churn and sixteen prefetch candidates a layer — 7.8%, half the stall cost of the hit-rate optimum (§9.7). In production the predictor's live precision is 66–85%, 74% typically (`docs/expert_cache_design.md` §7).
-
-Cross-request coalescing is the true batch dimension for MoE inference. In a dense model, batching amortises the weight load cost across multiple output elements. In MoE, batching means multiple tokens processed through the same expert simultaneously — and that only happens when the wave kernel aggregates work across concurrent requests.
+Routing prefill and decode requests through the expert layer together as a wave makes the expert hot set the *union* of the requests' activations, smaller than their sum because similar content routes alike: when two requests need expert 7, its weights load once. In MoE this coalescing is the real batch dimension. The production dispatch (`docs/moe_live_dispatch_design.md`) keeps routing on the device. Per layer, a kernel classifies each routed expert as VRAM, pinned RAM or cold and writes a summary into a mapped host ring; the grouped GEMM reads VRAM experts in place and copies pinned ones itself; only a cold expert waits, on a mapped word the stager publishes. No host CUDA call reads the routing. Modelled on the held-out trace at 60% residency, prefetch and eviction leave ≈13% of accesses as stalling misses, and 7.8% when tuned for stall cost rather than hit rate (§9.7); the live predictor's precision is 66–85%, typically 74%.
 
 ### 4.5 Early-Layer Pinning and Prediction
 
-The first two MoE layers' experts stay resident in VRAM. They run first in every pass with no compute ahead of them to overlap a transfer against, so a miss there is a full stall; pinned, they never miss, and the predictor and the warm tier both skip them — a host copy of an expert that never misses serves nothing. Prediction therefore runs from layer 2 onward, where it has two layers of compute to hide each transfer behind.
+Layers 0 and 1 stay resident: they have no compute ahead of them to hide a transfer behind, so the predictor and the warm tier skip them, and prediction runs from layer 2.
 
 ---
 
 ## 5. Two-Phase KV Cache Quantization
 
-KV cache quantization in a high-concurrency system faces two distinct error sources that require separate treatment. Conflating them leads either to incorrect designs or to unnecessary memory pressure.
+Two error sources need separate fixes. **Decode drift**: each decoded token's K/V is computed over already-quantized predecessors, so error compounds along the causal chain [GEAR, Kang et al., 2024]. **Per-block noise**: a sealed 32-token block's error is bounded by its own activations and does not propagate. The two phases answer each (Figure 5-1).
 
-**The first error source: autoregressive decode drift.** During autoregressive decode, each token's KV values are computed with attention over already-quantised preceding KV. Each step introduces small quantisation error that feeds into the next step's activations. GEAR [Kang et al., 2024] established that this compounds multiplicatively, causing coherence degradation beyond approximately 500 tokens. This is a sequential dependency problem — the error accumulates through the causal chain of decode steps.
+**Phase 1 — seal each block as it fills.** Every 32-token block is quantized the moment it seals, its K and V formats chosen against its live activations, so the F16 working footprint is one block per session. Materialising whole turns instead — 200 sessions of 500 tokens on Qwen3-30B-A3B, 96 KB a token — would need ~9.8 GB beyond the weights. The unsealed tail is always F16, so the most recent tokens are always read at full precision.
 
-**The second error source: per-chunk quantisation noise.** When a 32-token block is sealed and quantised, the quantisation error is bounded by that block's own activation distribution. It does not propagate to subsequent blocks because each block is independently quantised from its own activations. Chunk-level quantisation does not compound.
+**Phase 2 — re-prefill the finished turn.** At turn completion one batched prefill recomputes the turn's tokens in parallel, none depending on a quantized predecessor, and the clean K/V replaces the drifted blocks. It costs the turn's length, not the context's; RelayCaching [2026] confirms prefill gives the ground-truth K/V.
 
-These are independent mechanisms. The correct fix for each is independent.
+<figure class="fig">
+<svg viewBox="0 0 640 214" role="img" aria-label="Figure 5-1. Two-phase quantization. During decode each 32-token block is sealed and quantized as it fills, its format chosen per block, while the unsealed tail stays F16. When the turn ends it is re-prefilled in parallel, giving fresh K/V with no decode drift, and every block is quantized again.">
+  <text class="ttl" x="16" y="20">Figure 5-1 · Two phases: seal as you go, refresh at the turn's end</text>
+  <text class="ttl-sub" x="16" y="36">one turn, 32-token blocks · colour = the block's own format, cheapest first</text>
+  <text class="cat" x="16" y="76">during decode</text>
+  <rect class="q2" x="150" y="58" width="50" height="28" rx="3"/>
+  <rect class="q3" x="204" y="58" width="50" height="28" rx="3"/>
+  <rect class="q2" x="258" y="58" width="50" height="28" rx="3"/>
+  <rect class="q4" x="312" y="58" width="50" height="28" rx="3"/>
+  <rect class="q3" x="366" y="58" width="50" height="28" rx="3"/>
+  <rect class="q2" x="420" y="58" width="50" height="28" rx="3"/>
+  <rect class="q3" x="474" y="58" width="50" height="28" rx="3"/>
+  <rect class="box weights" x="528" y="58" width="34" height="28" rx="3"/>
+  <text class="t-dim" x="568" y="76">tail, F16</text>
+  <text class="t-dim" x="150" y="102">each block sealed as it fills · K/V computed over quantized predecessors</text>
+  <path class="ax" d="M356 108 V128"/>
+  <path class="t-dim" d="M356 134 l-3.5 -6 h7 z"/>
+  <text class="t-dim" x="364" y="124">turn ends: re-prefill the whole turn at once</text>
+  <text class="cat" x="16" y="156">after the seal</text>
+  <rect class="q2" x="150" y="138" width="50" height="28" rx="3"/>
+  <rect class="q2" x="204" y="138" width="50" height="28" rx="3"/>
+  <rect class="q3" x="258" y="138" width="50" height="28" rx="3"/>
+  <rect class="q2" x="312" y="138" width="50" height="28" rx="3"/>
+  <rect class="q4" x="366" y="138" width="50" height="28" rx="3"/>
+  <rect class="q2" x="420" y="138" width="50" height="28" rx="3"/>
+  <rect class="q3" x="474" y="138" width="50" height="28" rx="3"/>
+  <rect class="q1" x="528" y="138" width="34" height="28" rx="3"/>
+  <text class="t-dim" x="150" y="182">fresh K/V, no decode drift · every block quantized again from it</text>
+  <g class="legend">
+    <rect class="q1" x="150" y="194" width="10" height="9"/><text x="164" y="202">sub-4-bit</text>
+    <rect class="q2" x="240" y="194" width="10" height="9"/><text x="254" y="202">4-bit</text>
+    <rect class="q3" x="310" y="194" width="10" height="9"/><text x="324" y="202">5-bit</text>
+    <rect class="q4" x="380" y="194" width="10" height="9"/><text x="394" y="202">8-bit</text>
+  </g>
+</svg>
+</figure>
 
-**Phase 1 — Chunk-sealed quantization (during prefill and decode).** Every 32-token block is quantised immediately when sealed, using the adaptive per-block selection kernel against the block's live activations. Memory pressure stays bounded regardless of session count or turn length — at 200 concurrent sessions with 500-token turns, materialising all turns at F16 simultaneously would require ~100K tokens × 96 KB (Qwen3-30B-A3B: 48 layers × 4 KV heads × 128 × K+V × 2 bytes) ≈ 9.8GB on top of the weights, OOMing a 16GB card. Chunk-sealed quantization keeps the working F16 footprint to one block per session at a time.
-
-A third error-reduction property follows from the chunk boundary structure. The active (unsealed) chunk — the accumulating tail of the current decode stream — is always held at full F16 precision until it reaches 32 tokens and seals. This means the most recent tokens in any session, where autoregressive error would otherwise be highest due to accumulated drift, are always attended at full precision. Quantization error is structurally confined to sealed blocks; the immediate decode tail is always clean.
-
-**Phase 2 — Turn-boundary prefill refresh (on turn completion).** Once a turn is fully decoded and sealed, a batched prefill pass processes the completed turn's tokens in parallel with full-precision activations — no token's computation depends on the quantised cache of a preceding token. The resulting clean KV values replace the decode-drifted blocks for that turn. The cost is proportional to the completed turn's length at F16, not the full context and not all sessions simultaneously.
-
-RelayCaching [2026] empirically confirmed that KV values for identical content are highly consistent across prefill and decode phases, validating that the prefill pass produces the ground-truth KV for a given token sequence.
-
-**Why prefill refresh sets the asymptotic quality floor.** The Asymptotic Numerical Stability theorem (§11.2) establishes that under provenance-selected attention, the expected total numerical error per generation step is bounded by ε_hot + C_ret = O(1), a constant independent of context depth N. Hot-tier tokens — the current turn, pinned system context, and prefill-refreshed recent history — are always present in the working set and are therefore always attended. Their error is not diluted by the provenance selection mechanism; it is the irreducible floor. The prefill refresh is what keeps ε_hot ≈ 0: without it, hot-tier tokens would carry sequential decode drift, raising the asymptotic floor. Warm- and cold-tier tokens share the fixed retrieval budget and together contribute at most C_ret = W_warm_max · ε_ret — bounded at any depth, but not vanishing: a retrieved token contributes its full per-token error however old it is. The practical consequence is that compression format selection can be aggressive outside the hot tier only as far as the per-block threshold bounds the error (it sets ε_ret, and with it the constant), and must be conservative for hot-tier tokens (their error is the system's permanent floor, attended at every step). This is exactly what the two-phase strategy implements: chunk-sealed quantization for all tiers during decode, and prefill refresh specifically for the tokens that will remain hot.
+**Why the refresh sets the floor.** Under §11.2 a step's error is bounded by ε_hot + C_ret. Hot tokens — the current turn, pinned system context, refreshed recent history — are attended at every step, so their error is the permanent floor; the refresh keeps ε_hot ≈ 0. Retrieved warm and cold tokens share a fixed budget and contribute at most C_ret = W_warm_max · ε_ret: bounded, not vanishing. Compression can therefore be aggressive outside the hot tier only as far as the per-block threshold bounds ε_ret.
 
 ### Boundary Reconstruction via Projection Segments
 
-The two-phase quantization above applies to **interior content tokens** — the tokens whose K/V faithfully summarises position-portable content. The system handles **structural template tokens** — the 4–6 tokens of chat-template scaffolding at each turn seam (e.g. `<|im_start|>role\n` and `<|im_end|>\n` in ChatML), system-block delimiters, tool-block envelopes, and role markers — separately.
+The two phases cover **interior content**. The 4–6 **structural template tokens** at each seam — `<|im_start|>role\n`, `<|im_end|>\n`, block envelopes, role markers — carry no content but are heavily attended as orientation markers, and their K encodes the content before them. Under provenance selection every projection assembles a different prefix, so a structural token's K/V baked against one prefix is wrong for the next. This is a third error class, frame drift, independent of quantization noise and decode drift: a structural token can be numerically perfect and still describe scaffolding that is no longer there.
 
-**Why structural tokens cannot be pre-baked.** Structural template tokens carry near-zero semantic content but are disproportionately attended to by every content token downstream. The model uses them as orientation markers — "here's where the system block closes," "here's where the user turn begins." The K vectors at those positions encode "I am a closing marker after the preceding content." If the preceding content the K was conditioned on does not match what's actually there at runtime, the orientation signal is noisy. Under provenance-selected attention this mismatch is the common case rather than an edge case: every projection selects a different combination of sections (different tools materialised, different turns selected), so a structural token's K/V baked against any single ingest-time prefix is wrong for any projection whose prefix differs.
-
-**Three structurally independent error mechanisms.** The system faces three distinct error classes, each closed by a different mechanism:
-
-1. *Quantization noise* on interior content — bounded by the theorem (§11.2), O(1) per generation step.
-2. *Autoregressive decode drift* — eliminated by Phase 2 prefill refresh (above).
-3. *Semantic frame drift via stale structural K/V* — closed by live structural-segment prefill against the current assembly (this section).
-
-A structural token can have ε(t) = 0 (numerically perfect) and still carry attention summary referring to scaffolding that no longer exists on the attention surface. The assumption that a stored token's K/V faithfully summarises its actual attended context holds for interior content tokens; it is violated for stale-frame structural tokens. The architectural response: structural template K/V is never written to the persistent substrate.
-
-**Mechanism — projection segments.** Each projection emits a sequence of three segment kinds in declaration order:
-
-- **`Sealed`** segments reference content K/V already in the substrate (authored system-prompt sections, persisted turn parts). Application is metadata-only: Arc-clone the per-layer sealed sequences and patch block-range entries onto the slot. Microseconds per segment.
-- **`Generated`** segments reference structural template tokens by name from the model's dialect catalog (system delimiters, role markers, block envelopes). They carry no persistent K/V. At assembly time they are live-prefilled against whatever sealed content actually precedes them on the slot.
-- **`NewUserMessage`** segments carry the current turn's incoming user tokens. They are live-prefilled, captured to a slot-local buffer, and committed to the substrate at turn-seal time as the user half of the resulting turn record.
-
-Adjacent `Generated` segments between two `Sealed` segments form a single **prefill run** — concatenated and executed as one `forward_batched` call. Each structural token's K/V is computed under its actual runtime causal prefix; the orientation signal is correct by construction. Boundaries become deterministic functions of (template token, current causal prefix) — computable, reproducible, never stale.
-
-**Cached by causal prefix, not by position.** A slot keeps the K/V of the structural runs it has computed, keyed by a hash of the run's whole causal context — the identity and length of every piece before it, its own tokens, and the content it bridges to. A run whose key matches is injected like a sealed section instead of being recomputed; any change anywhere in its prefix changes the key, so a cached run is never stale. Structural K is stored un-rotated and rotated at read from its chunk's position base, so a cached run stays exact under a uniform position shift. Entries are retained for a fixed number of projections rather than pruned to the current one, because reprojection can alternate between two prefix shapes, and pruning to the current shape would make the two evict each other forever.
-
-**Recurrent lineages bake it instead.** A model whose per-sequence memory is a recurrence — Qwen3.8-Flash-Next's DeltaNet layers, the production model — cannot compute a token inserted mid-sequence, because its state has already accumulated past the hole. For that lineage every structural producer is sealed: dialect markers and turn boundaries are baked into the turn's own K/V, template sections are sealed against a canonical prefix, and the live turn's opener is folded into its `NewUserMessage`; a projection of that model emits no live structural runs at all, and the engine refuses one that would (`docs/deltanet_state_persistence.md` §4.6–§4.7d). What follows on frame correctness applies to the attention-only models; on the recurrent lineage the structural tokens are stored K/V like any other and fall under the interior bound of §11.2.
-
-**Cost scales with selected boundaries.** A projection's structural cost is the number of prefill runs — one per cross-turn / section boundary in the selection — times their forward cost; the token cost per run is the structural template length, single-digit tokens per boundary. Across slots these prefill runs batch into the standard `forward_batched` calls already used for user prefills and decode steps, so structural prefills are first-class participants in the same pipeline with no new kernel.
-
-**Format quality is locked in.** `Generated` K/V is produced by a fresh prefill pass against live R16/F16 arenas — the same format the model uses during decode. Structural tokens never visit the warm tier, never round-trip through the background quantizer, never pick up Q4/Q3/Q2 quantization error. The most attention-loaded positions are guaranteed uncompressed.
-
-**What this closes.** On the attention-only models, five problems are addressed by the single decision to live-prefill structural segments rather than persist them:
-
-1. Dynamic system-prompt sections rotating in and out across turns no longer corrupt downstream structural K/V.
-2. Gathered-turn frame contamination is eliminated: gathered blocks contain no structural K/V to be stale.
-3. Compounding projection drift across many turns is closed: no stale frame ever enters a newly-sealed turn's structural computation.
-4. Structural quantization edge cases vanish: structural tokens are never compressed.
-5. BDP signature signal sharpens (§6.6): structural template ranges previously contributed high self-similarity noise to retrieval; sigs now cover content tokens only.
-
-The substrate gets smaller as a byproduct on those models — structural templates are a per-process detail of the inference engine, materialised from the dialect catalog on demand, never persisted to disk.
+On attention-only models, structural K/V is therefore never persisted. A projection is a sequence of segments: **`Sealed`** segments patch stored K/V onto the slot by reference, in microseconds; **`Generated`** segments name template tokens from the model's dialect catalog and are live-prefilled against whatever actually precedes them, adjacent ones in one `forward_batched` run batched with the other slots' prefills; **`NewUserMessage`** carries the incoming turn, committed at its seal. Computed runs are cached by a hash of their whole causal prefix, so a match is reused and any change misses; K is stored un-rotated, so a cached run stays exact under a position shift. Structural K/V is always fresh F16, never quantized, and the gallery's signatures cover content tokens only (§6.6). A recurrent model — Flash-Next's DeltaNet layers, the production model — cannot compute a token inserted mid-sequence, so there every structural producer is sealed into the turn's own K/V and falls under the interior bound (`docs/deltanet_state_persistence.md` §4.6–§4.7d).
 
 ---
 
@@ -317,94 +246,145 @@ The substrate gets smaller as a byproduct on those models — structural templat
 
 ### 6.1 Core Insight
 
-At the moment a model produces or processes any content, the Q vectors it computes are a compressed fingerprint of its cognitive state — encoding not just content semantics but the full accumulated reasoning context in which that content was produced. We call this *attentional provenance*. By capturing each token's Q signature as it is computed and storing it beside the token's K/V, we construct an index, held resident in VRAM (§6.6), that is scanned over the whole unbounded corpus before generation begins and, critically, during generation itself: the provenance index functions as an attention mechanism over unbounded context, re-selecting the working set at every reasoning boundary from the model's own Q vectors.
-
-This is qualitatively different from K vectors, which encode content semantics. A stored Q signature from a conversation turn captures the accumulated attentional context of everything preceding it — topic trajectory, reasoning state, what the model was reaching for. When a future query produces a Q vector in a similar reasoning state, the match surfaces that turn regardless of surface-level token overlap.
+The Q vectors a model computes while producing or reading content are a compressed record of its state — not only what the content says but the reasoning it was produced in. We call this *attentional provenance*. Each token's Q signature is captured as it is computed and stored beside its K/V, building an index held resident in VRAM (§6.6) that is scanned over the whole corpus before generation and, crucially, during it: re-selecting the working set at every reasoning boundary from the model's own Q vectors. Where K encodes content, a stored Q records what the model was reaching for, so a later query in a similar state matches it with no surface overlap.
 
 ### 6.2 From the v1 Fingerprint to the Production Signature
 
-v1 indexed each item by six INT8 vectors — K and Q averaged over three layer bands, ~780 bytes — scored by a weighted dot product on the CPU, with a 128-bit sign signature folded from two early layers for section discrimination, span-scored over runs of consecutive hits, and resolved one dynamic section at a time by short probes (`docs/unbounded_agents_v1.md` §6). Its calibration (§9.10) established the principle the production design keeps — **Q→Q sign agreement over a flat scan**, decode signatures against decode signatures — and two findings that still hold: Q vectors read while prefilling a prompt and Q vectors produced while decoding occupy different regions of signature space, so a probe must be matched against stored text of its own kind; and a binary signature's 50% random agreement is a pedestal that must be removed before scores are summed. Everything else was replaced: the signature by `WideQSig`, every attention layer folded into three groups (§6.6); the dot product and span scoring by per-token votes (§6.3) read against each candidate's own background (§6.4); the CPU scan by the resident GPU gallery (§6.6); and the per-section probes by reprojection during decode (§6.5).
+v1 indexed each item by six INT8 K and Q band averages, scored by a CPU dot product (`docs/unbounded_agents_v1.md` §6). Its calibration (§9.10) set the principle production keeps — **Q→Q sign agreement over a flat scan** — and two findings that still hold: prefill and decode Q occupy different regions of signature space, so a probe must match stored text of its own kind; and a binary signature's 50% chance agreement must be removed before scores are summed. Everything else was replaced: the signature by `WideQSig` (§6.6), the dot product by per-token votes (§6.3) read against each candidate's background (§6.4), the CPU scan by the GPU gallery, and per-section probes by reprojection during decode (§6.5). Figure 6-1 shows the production path.
+
+<figure class="fig">
+<svg viewBox="0 0 640 228" role="img" aria-label="Figure 6-1. The provenance path. Each token's Q vectors over every attention layer are reduced to signs and folded into three layer groups per KV head, a 192-byte WideQSig. The gallery holds these in VRAM in 32-token pages. A probe, the last 128 decoded tokens, is compared with every gallery token on the GPU by XNOR and popcount; each probe token votes for its best eight files by z times margin; scores are normalized against each file's own background; whole conversations enter a pool, and the model's own sparse-attention indexer decides which of their blocks fill the window.">
+  <text class="ttl" x="16" y="20">Figure 6-1 · From a token's Q to the working set</text>
+  <text class="ttl-sub" x="16" y="36">stored at every token · scanned every 64 decoded tokens · the result feeds the next forward</text>
+  <rect class="box" x="16" y="56" width="180" height="46" rx="6"/>
+  <text class="t-lbl mid" x="106" y="76">Q vectors</text>
+  <text class="t-dim mid" x="106" y="92">every layer, every token</text>
+  <rect class="box" x="222" y="56" width="180" height="46" rx="6"/>
+  <text class="t-lbl mid" x="312" y="76">Sign and fold</text>
+  <text class="t-dim mid" x="312" y="92">[n−2, 1, 1] per KV head</text>
+  <rect class="box weights" x="428" y="56" width="196" height="46" rx="6"/>
+  <text class="t-lbl mid" x="526" y="76">WideQSig, 192 B a token</text>
+  <text class="t-dim mid" x="526" y="92">3 groups × 4 heads × 128 bits</text>
+  <rect class="box" x="16" y="140" width="140" height="50" rx="6"/>
+  <text class="t-lbl mid" x="86" y="161">GPU scan</text>
+  <text class="t-dim mid" x="86" y="178">XNOR + popcount</text>
+  <rect class="box" x="172" y="140" width="140" height="50" rx="6"/>
+  <text class="t-lbl mid" x="242" y="161">Votes</text>
+  <text class="t-dim mid" x="242" y="178">best 8, z × margin</text>
+  <rect class="box" x="328" y="140" width="140" height="50" rx="6"/>
+  <text class="t-lbl mid" x="398" y="161">Normalize</text>
+  <text class="t-dim mid" x="398" y="178">vs its own background</text>
+  <rect class="box weights" x="484" y="140" width="140" height="50" rx="6"/>
+  <text class="t-lbl mid" x="554" y="161">Pool → window</text>
+  <text class="t-dim mid" x="554" y="178">indexer fills window</text>
+  <path class="ax" d="M196 79 H222 M402 79 H428 M526 102 V120 H86 V140 M156 165 H172 M312 165 H328 M468 165 H484"/>
+  <path class="t-dim" d="M222 79 l-6 -3.5 v7 z M428 79 l-6 -3.5 v7 z M86 140 l-3.5 -6 h7 z M172 165 l-6 -3.5 v7 z M328 165 l-6 -3.5 v7 z M484 165 l-6 -3.5 v7 z"/>
+  <text class="t-dim" x="96" y="115">gallery: resident in VRAM, 32-token pages · probe: the last 128 decoded tokens</text>
+  <text class="t-dim" x="16" y="214">each file's best-agreeing token gives it an agreement, read against the gallery's spread</text>
+</svg>
+</figure>
 
 ### 6.3 Scoring: Every Probe Token Votes
 
-A scan compares every probe token's signature with every gallery token's by sign agreement and turns the agreements into votes — **late fusion**: per probe token and fold group, each candidate's best-agreeing token gives the candidate an agreement, the agreements are read against their own distribution across the gallery, and the candidate a token picks gets a vote of `z × margin` — how far it stands out, times its lead over the next. A candidate's raw score is its summed votes. Four learnings set the production formula (§9.12 states it in full and measures it):
+Per probe token and fold group, each candidate's best-agreeing token gives it an agreement, the agreements are read against their distribution over the gallery, and each candidate the token picks gets a vote of `z × margin`. A candidate's raw score is its summed votes. Four findings set the formula (§9.12 states and measures it):
 
-- **A token votes for its best several, not its single best.** Under one vote per token, a code question's probe gave any vote to only 20–67 of 6,854 files, and seven answer files scored exactly zero — a ceiling no later stage can lift. Voting for the best eight, each vote square-rooted so one spiky match does not outweigh many moderate ones, raised the answer file's mean reciprocal rank from 0.508 to 0.713. Tool selection keeps one vote per token: a tool probe has one clean match, and spreading its vote lets wrong tools over the gate.
-- **Only the probe's strongest tokens count.** A needle gate keeps the quarter of the probe's tokens with the largest summed vote; most of a probe's tokens are function words and template, and their votes are noise.
-- **Probes find their own kind.** A question probe matches stored questions and a thinking probe matches stored thinking, so every file is stored with calibration questions shaped like the probes that will ask for it, and those are scored as a competition of their own and added at a weight — pooled with the file's content, the questions took 96.5% of a background's vote mass at 2% of the gallery and drowned it. For tools the calibration questions were the single largest lever: Tool-1 rose 74.5% → 87.9% with the scorer unchanged (§9.10).
-- **Repairing signatures does not work.** Bit-level centring is a no-op, and a correction that marks down hub files marks down the files real conversations ask about.
+- **Vote for the best several.** One vote per token gave any vote to only 20–67 of 6,854 files, and seven answer files scored exactly zero. Voting for the best eight, each vote square-rooted, raised the answer file's MRR from 0.508 to 0.713. Tool selection keeps one vote: a tool probe has one clean match.
+- **Only the strongest tokens count.** A needle gate keeps the quarter of probe tokens with the largest summed vote; most are function words and template.
+- **Probes find their own kind.** Every file is stored with calibration questions shaped like the probes that will ask for it, scored as a separate competition — pooled with content they took 96.5% of the vote mass at 2% of the gallery. For tools they were the largest lever: Tool-1 74.5% → 87.9% (§9.10).
+- **Repairing signatures does not work.** Bit centring is a no-op, and marking down hubs marks down the files conversations ask about.
 
 ### 6.4 Normalization: A Score Read Against Its Own Background
 
-Raw vote totals are not comparable across candidates. A generic file — the workspace root, whose listing names every crate; a crate's `lib.rs` — scores on almost every probe, so under a shared scale the hubs take the slots and the specific answer is crowded out; for one identical question the right folder's raw rank swung from first to tenth across turns. Nothing computable from the gallery alone fixes it: a candidate's self-match, its affinity to other candidates and a cross-probe z-score each failed, because loudness is a property of how a signature responds to the *query* distribution, which gallery-against-gallery comparisons never see (`docs/provenance_score_normalization.md` §2).
-
-The production normalizer learns each candidate's **background** — the scores it reaches on probes that are not about it — from query traffic, and reads a score as how far into that background's tail it sits:
+A generic file — the workspace root, a crate's `lib.rs` — scores on almost every probe, so on a shared scale hubs crowd out the answer. No gallery-only correction works (self-match, inter-candidate affinity and cross-probe z-scores all failed), because loudness is a response to the *query* distribution (`docs/provenance_score_normalization.md` §2). The normalizer learns each candidate's **background** — its scores on probes not about it — from live traffic, and reads a score by its tail:
 
 ```
 surprise(c | x)   = −ln P(background(c) ≥ x)
 normalized(c | x) = 1000 × surprise(c | x) / ln(1 / 0.01)
 ```
 
-so 1,000 is a full hit (beyond 99 in 100 of the candidate's own background), and under the null every candidate — loud or quiet — wins equally rarely by chance. Backgrounds are log-binned counts, so they commute and read the same whatever order their evidence came in; a probe's own answer is left out of its background; a score is read only against the samples that scored, since late fusion leaves most candidates at zero on most probes; and a candidate too new for a background of eight scoring samples reads against its scope's pooled one. A candidate's score is normalized within its score competition — one scope of the projection schema — and a file is read against the files of its own kind.
+1,000 is a full hit, beyond 99 in 100 of the candidate's background, and under the null every candidate wins equally rarely. Backgrounds are log-binned counts that commute; a probe's own answer is left out; only scoring samples count; a candidate with fewer than eight reads against its scope's pooled background; files compete within their own kind. On 37,284 calibration questions over 1,740 files the answer file's R@1 rose from 0.107 raw to **0.239**, and the largest single winner's share of wins on other files' questions fell from 54.5% to **0.1%** (§7.1 of that document).
 
-Measured on 37,284 calibration questions over 1,740 files, each with its own file as the answer: the answer file's R@1 rose from 0.107 raw to **0.239**, and the largest single winner's share of every file's wins on other files' questions fell from 54.5% to **0.1%** (`docs/provenance_score_normalization.md` §7.1). The hit-level normalizer it replaced — an asymmetric moving average meant to settle at a candidate's hit score — reached 0.225, but every probe not about a candidate pulled its level toward that probe's score, so a tool's normalized score came to follow its place in the alphabet in which the warm-up visited the catalog.
-
-**What provenance decides.** Provenance proposes; the model's own attention disposes. On a model whose attention selects (Flash-Next's indexer), a reprojection admits whole conversations — a file's reading, a guide, the dialogue — into a pool several times the attended window, by their normalized scores; the window itself is then filled with rounds of those conversations, ranked by how often the model's indexer selected their blocks or, for pooled rounds not yet loaded, would have (a shadow scan over their index rows). A round's score is `base × (1 + h)`, its provenance score lifted by a hit momentum `h ← 0.8 h + d` over the stride's hit density `d`, so the indexer's hits can bring in a turn provenance did not rank and retire one it ranked but the model never reads (`docs/hit_driven_projection.md` §7). Belief carries across a turn's reprojections the same way: on held-out probes momentum lifted the answer file's R@10 from 0.554 to 0.708 over three turns on a file, compounding the scoring gain rather than overlapping it.
+**Provenance proposes; the model's attention disposes.** On Flash-Next, a reprojection admits whole conversations — a file's reading, a guide, the dialogue — into a pool several times the attended window; the window is filled with their rounds ranked by how often the model's own indexer selected their blocks, or would have (a shadow scan). A round scores `base × (1 + h)`, with hit momentum `h ← 0.8 h + d`, so the indexer can bring in what provenance missed and retire what the model never reads (`docs/hit_driven_projection.md` §7). Momentum across a turn's reprojections lifted held-out R@10 from 0.554 to 0.708 over three turns.
 
 ### 6.5 Retrieval During Decode: Reprojection, and the Think Block as a Speculative Probe
 
-Sections §6.3 and §6.4 describe provenance retrieval *before* generation begins. During generation itself, the model's Q vectors evolve with every token produced, creating a continuous signal for context refinement.
+**Mid-decode reprojection.** Every decoded token's Q signature is captured. Every 64 decoded tokens, or at a line break more than 16 tokens after the last, inside the think block as in the answer, the last 128 decoded tokens' signatures are scanned against the gallery, and the result assembles the next forward's working set, so retrieval follows the reasoning by at most one interval and never blocks a forward (`sequence_config.rs`: `REPROJECT_EVERY_N_TOKENS`, `reproject_max_probe_tokens`, `reproject_in_thinking`).
 
-**What runs: mid-decode reprojection.** The production engine re-selects a decoding session's working set from the session's own decode. Every decoded token's Q signature is captured as it is produced (§6.6). A reprojection is triggered every 64 decoded tokens, or at a line break once more than 16 tokens have been decoded since the last one, inside the think block as in the answer; its probe is the signatures of the last 128 decoded tokens, scored against the resident gallery by the GPU scan, with the working set's momentum carrying belief across a turn's reprojections (§9.11.1). The scan's result assembles the working set for the next forward, so the scan never blocks the current one. Retrieval therefore *follows* reasoning by at most one reprojection interval: the probe is what the model has just written, not what it is about to write. The configuration is `candle-conversation/src/config/sequence_config.rs` (`REPROJECT_EVERY_N_TOKENS`, and the probe's reach and the think-block gate, `reproject_max_probe_tokens` and `reproject_in_thinking`, which zend sets as `reproject_probe_tokens` and `reproject_in_thinking`).
+**The opening.** A question's Q depends on the context it is read in, and every conversation opens on configured background files: one battery question's answer file ranked second of 6,854 alone and fifth against them. So a request is read twice — first with the background held out, scored and discarded; then again, its opening working set ranked by the first reading beside the background. The first reasoning tokens then reproject at 8, 16 and 32 tokens, because what the model writes early about what it has read stays in its context. The cost is one extra prefill and one scan before the first token.
 
-**Where a reply begins: the question read twice, and short early strides.** A query's own Q vectors depend on the context it is read against. Every conversation starts on a small set of configured background files, and a question read against them scores the corpus differently from the same question read without them — measured on one battery question, its answer file ranked second of 6,854 alone and fifth against the background (§9.12). So a request is read twice on the conversation's own slot: first prefilled to the token before its last against the working set with the background files held out, and scored, its fresh scores feeding the working set and its hits and K/V discarded; then submitted again unchanged, its opening working set ranked by the first reading's scores beside the background files, prefilled once more, and decoded with no further scan at its opening's end. The reply's first reasoning tokens then take reprojections at 8, 16 and 32 decoded tokens before the 64-token cadence, because what the model writes early in its reasoning — what it believes it has read — stays in its context whatever the working set holds afterwards. The two readings cost one extra prefill of the question and one scan before the first token; the early strides cost three reprojections in a reply's first 32 tokens and none once its reasoning closes.
+**The think block is the speculative probe.** A probe that decodes ahead of the answer, never enters memory, and chooses the answer's context is what the reasoning block already is. Each boundary inside it reprojects from what it has just reasoned, the reprojection on `</think>` assembles the answer's working set from the whole thought, and at seal its K/V is dropped and the exchange re-prefilled without it (§5). By the first answer token the context has been steered by everything the model thought. From the projection records of the 128-question battery (§9.12):
 
-**The think block is the speculative context decode.** A probe that decodes ahead of the answer, whose tokens never enter memory and whose signatures choose the context the answer is decoded against, is what the reasoning block already is. The model decodes its thinking against the working set; every boundary inside it reprojects from the signatures of what it has just reasoned, so the working set follows the reasoning toward the files it reaches for, and the reasoning that follows is decoded against what the earlier reasoning retrieved. When the block closes, the reprojection on `</think>` assembles the answer's working set from the whole thought. At seal the block is ethereal — its prose is kept, its K/V dropped (`turn_layout::TurnSegment::Thinking`) — and the exchange is re-prefilled without it (§5), so the probe costs the answer nothing in memory. Retrieval therefore leads the *answer*: by the first answer token, the context has already been steered by everything the model thought.
+<figure class="fig">
+<svg viewBox="0 0 640 200" role="img" aria-label="Figure 6-2. Share of 384 answers per arm with an answer file in the working set at the opening and at the first answer token. C1, reprojecting through its reasoning, 51.6 percent to 57.8 percent, with 17.1 reprojections inside the think block and 25.8 percent of the openings' misses brought in. B1, held, 51.6 to 51.8 percent. D1, retrieved once, 48.7 percent throughout.">
+  <text class="ttl" x="16" y="20">Figure 6-2 · The reasoning brings in the answer's file</text>
+  <text class="ttl-sub" x="16" y="36">answer file in the working set · faint: at the opening · solid: at the first answer token</text>
+  <path class="grid" d="M300 52 V168 M400 52 V168 M500 52 V168 M600 52 V168"/>
+  <path class="grid base" d="M200 52 V168"/>
+  <text class="cat" x="16" y="72">C1, reprojecting</text>
+  <text class="cat-sub" x="16" y="85">17.1 in thinking · 25.8% of misses brought in</text>
+  <path class="line-us" d="M432 74 H556"/>
+  <circle class="us-soft" cx="432" cy="74" r="5.5"/>
+  <circle class="dot-us" cx="556" cy="74" r="6.5"/>
+  <text class="t-dim mid" x="432" y="64">51.6%</text>
+  <text class="v-us mid" x="556" y="63">57.8%</text>
+  <text class="cat" x="16" y="112">B1, held</text>
+  <text class="cat-sub" x="16" y="125">0.6 in thinking · 6.5%</text>
+  <circle class="us-soft" cx="432" cy="114" r="5.5"/>
+  <circle class="dot-us" cx="436" cy="114" r="6.5"/>
+  <text class="t-dim" x="448" y="118">51.6% → 51.8%</text>
+  <text class="cat" x="16" y="152">D1, retrieve once</text>
+  <text class="cat-sub" x="16" y="165">0 in thinking · 0%</text>
+  <circle class="dot-us" cx="374" cy="154" r="6.5"/>
+  <text class="t-dim" x="386" y="158">48.7% throughout</text>
+  <text class="tick mid" x="200" y="186">40%</text>
+  <text class="tick mid" x="300" y="186">45%</text>
+  <text class="tick mid" x="400" y="186">50%</text>
+  <text class="tick mid" x="500" y="186">55%</text>
+  <text class="tick mid" x="600" y="186">60%</text>
+</svg>
+</figure>
 
-How the reasoning steers retrieval, read from the projection records of the 128-question battery (§9.12) — the full system (C1) beside the held arm (B1) and the retrieve-once arm (D1):
+B1's 0.6 is the reprojection on `</think>` itself, stamped on the block's last token. The bound of §11.2 is unchanged by how often the working set is updated: each update selects at most B tokens, so reprojection changes the aim of updates, not the bound. On attention-only models each reprojection re-resolves its structural segments (§5); on the recurrent production model they are sealed and cost nothing. Re-selecting during reasoning lets later reasoning be decoded against what the earlier reasoning reached for; §9.12 measures what that is worth.
 
-| Measured over 384 answers (128 questions × 3 runs) | C1, reprojecting | B1, held | D1, retrieve once |
-|---|---:|---:|---:|
-| Answer file in the working set at the opening | 51.6% | 51.6% | 48.7% |
-| … at `</think>` | 57.8% | 51.8% | 48.7% |
-| … at the first answer token | 57.8% | 51.8% | 48.7% |
-| Reprojections inside the think block, per answer | 17.1 | 0.6 | 0 |
-| Answers whose file entered during the reasoning, of those the opening missed | 25.8% | 6.5% | 0% |
-
-The held arm's 0.6 is the reprojection on `</think>` itself, which the records stamp on the block's last token. In the full system the answer file is in the working set at the opening for 51.6% of answers and by the first answer token for 57.8%: reasoning brings in the answer's file for 25.8% of the answers whose opening missed it. Held, the share moves by 0.2 points; retrieved once, not at all.
-
-**Relationship to the theorem.** The working-set selection budget B and hot-tier bound W_hot_max are enforced at every reprojection. The bound of §11.2 is unchanged by how often the working set is updated, because each update selects at most B tokens from the unbounded context: reprojection changes the frequency and the aim of updates, not the bound.
-
-**Structural segments at a reprojection.** Every reprojection resolves its structural segments against the new assembly (§5): on attention-only models adjacent `Generated` segments between sealed content form prefill runs that batch into the existing prefill pipeline, cached by causal prefix; on the recurrent production lineage they are sealed K/V and cost nothing at reprojection.
-
-**Quality implication.** Cost aside, the expected effect on quality is distinct. With the working set re-selected during a thinking block, later lines of reasoning are generated against a working set chosen from what the earlier lines were about, and the answer against one chosen from the whole thought. The hypothesised feedback loop is: better context produces more specific Q vectors, which produce more targeted retrieval, which produce better context for the next step. If it holds, a system with a fixed window through the whole thinking block would miss dependencies that are in its index but that the model's Q vectors have not yet reached when it retrieves. §9.12 measures that gap with the window held through the reasoning alone — every other reprojection kept, one taken at `</think>` — and it holds: over three runs per arm the battery falls from 57.3% to 38.8%, every held run below every reprojecting one.
 ### 6.6 The Production Signature and the Resident Gallery
 
-The production signature is `WideQSig`: each token's `sign(Q)` over every attention layer is folded into three layer groups — the first absorbing all but the top two attention layers, the top two kept alone (`[n − 2, 1, 1]`, derived from the model's geometry by `FoldParams::derive`; `[46, 1, 1]` on a 48-layer stack), each layer bit-rotated before the XOR so correlated layers do not cancel — of one 128-bit head signature per KV head: with four KV heads, 3 × 4 × 128 = 1,536 bits, 192 bytes per token. Retrieval is a decode→decode Q·Q consensus: a query token's signature is compared against every gallery token's by sign agreement (XNOR + popcount), a vote is cast per fold group, and the groups are weighted per score competition (§6.3). It is the successor of the 8-head two-layer fold calibrated in §9.10: the same binary directional principle, over every layer and with no K term. Signatures cover content tokens only — the user's text, the model's decoded text, a file's reading — and never the chat template's structural tokens, whose attention patterns are self-similar orientation signals that would pollute every ranking. At turn seal a turn's full signature window is persisted on the substrate beside its K/V.
+`WideQSig` folds each token's `sign(Q)` over every attention layer into three groups — all but the top two layers, then each of the top two alone (`[n − 2, 1, 1]`, `FoldParams::derive`), each layer bit-rotated before the XOR so correlated layers do not cancel — of one 128-bit signature per KV head: 3 × 4 × 128 bits, 192 bytes a token. It is the successor of v1's two-layer fold (§9.10), over every layer and with no K term. Signatures cover content tokens only, never the template's self-similar structural tokens, and are persisted beside the turn's K/V at its seal.
 
-Re-uploading every candidate turn's signatures on every scan was the bottleneck of the first GPU implementation, so signatures stay **resident in VRAM** between reprojections in a paged gallery arena modelled on the paged KV cache: fixed 32-token pages, a free-list pool and persistent storage slabs, with the scan kernel reading pre-resolved device pointers rather than gathering into a packed copy. The warm and cold tiers of the gallery are the substrate's own persisted signatures; the arena holds only the hot tier and rebuilds an evicted turn on demand.
-
-Three scan backends are verified **bit-identical** by an adversarial parity test: a scalar reference; a 1-bit tensor-core backend (`BMMA.88128.XOR.POPC`, sm_75–sm_89), ~9.5 ms steady-state on the RTX 4090 Laptop GPU; and an INT8 tensor-core backend (`mma.m16n8k32.s8`), the production path on Blackwell, which dropped the 1-bit instruction. The scan's result feeds the next reprojection, so selection and forward execution are decoupled by a full wave and the scan never blocks a forward pass.
+Re-uploading signatures every scan was the first GPU implementation's bottleneck, so they stay **resident in VRAM** in a paged gallery arena modelled on the KV cache — 32-token pages, a free-list pool, a pre-resolved pointer table the kernel reads in place. Its warm and cold tiers are the substrate's persisted signatures. Three scan backends are **bit-identical** under an adversarial parity test: a scalar reference; 1-bit tensor cores (`BMMA.88128.XOR.POPC`, sm_75–sm_89), ~9.5 ms on the RTX 4090 Laptop GPU; and INT8 tensor cores (`mma.m16n8k32.s8`), the production path on Blackwell, which dropped the 1-bit instruction.
 
 ---
 
 ## 7. Unbounded Three-Tier Paged Context
 
-The context is organised into three tiers managed by the paged allocator:
+The context is paged in 32-token blocks aligned to turn and system-prompt boundaries, so sinks stay block-local, refresh triggers on clean boundaries and promotion moves whole units, across three tiers (Figure 7-1). Each block's KV heads choose their K and V formats at seal, recorded in the descriptor tables the paged attention kernels read (`ArenaTable` / `PerHeadTable`), one read per tile.
 
-- **VRAM-hot** — current working set, full-speed attention
-- **CPU RAM-warm** — recent history, loaded on demand via PCIe
-- **Disk-cold** — full conversation history, loaded on cache miss
+<figure class="fig">
+<svg viewBox="0 0 640 214" role="img" aria-label="Figure 7-1. The three tiers. VRAM hot holds the working set, attended at full speed. RAM warm holds recent history in CPU arenas, promoted to hot on demand. Disk cold is the append-only redo log holding every sealed turn's K/V, tokens and signatures. Selected blocks are promoted to hot; hot blocks migrate to warm on the persistence thread; every sealed turn is written to the log. Under full attention every block is read every step; under provenance selection a step reads at most its budget, from any tier.">
+  <text class="ttl" x="16" y="20">Figure 7-1 · Three tiers, one budget</text>
+  <text class="ttl-sub" x="16" y="36">a step reads at most its budget of blocks, from any tier, however deep the history</text>
+  <rect class="box weights" x="16" y="58" width="184" height="78" rx="6"/>
+  <text class="t-lbl mid" x="108" y="80">VRAM · hot</text>
+  <text class="t-dim mid" x="108" y="98">the working set</text>
+  <text class="t-dim mid" x="108" y="114">attended at full speed</text>
+  <rect class="box" x="228" y="58" width="184" height="78" rx="6"/>
+  <text class="t-lbl mid" x="320" y="80">RAM · warm</text>
+  <text class="t-dim mid" x="320" y="98">recent history, CPU arenas</text>
+  <text class="t-dim mid" x="320" y="114">promoted on demand</text>
+  <rect class="box" x="440" y="58" width="184" height="78" rx="6"/>
+  <text class="t-lbl mid" x="532" y="80">Disk · cold</text>
+  <text class="t-dim mid" x="532" y="98">append-only redo log</text>
+  <text class="t-dim mid" x="532" y="114">K/V, tokens, signatures</text>
+  <path class="ax" d="M200 90 H228 M412 90 H440 M228 108 H200 M440 108 H412"/>
+  <path class="t-dim" d="M228 90 l-6 -3.5 v7 z M440 90 l-6 -3.5 v7 z M200 108 l6 -3.5 v7 z M412 108 l6 -3.5 v7 z"/>
+  <text class="t-dim" x="16" y="160">→ hot blocks migrate down on the persistence thread; every sealed turn is logged</text>
+  <text class="t-dim" x="16" y="176">← provenance-selected blocks are promoted to hot (elevate_to_hot)</text>
+  <text class="t-dim" x="16" y="198">full attention reads every block every step · provenance selection reads at most B</text>
+</svg>
+</figure>
 
-All 32-token blocks are aligned to turn and system prompt boundaries. This ensures: the attention sink cluster is always block-local; prefill refresh triggers at clean boundaries; tier promotion loads coherent semantic units.
+**Cold blocks are read only when selected.** Under full attention the oldest blocks are read by every later token. Under provenance selection a cold block is read only by the steps that select it, and the budget caps how many any step takes. A relevant block is still selected at any depth and contributes its full error, so cold quality sets part of the theorem's constant — which is why blocks reach cold storage quantized from refreshed, prefill-quality activations.
 
-**Block metadata.** Format assignment is per (32-token block, KV head, K or V palette): each block's heads choose their K and V formats independently when the block is sealed, and the choice is recorded in the per-head descriptor tables the paged attention kernels read (`ArenaTable` / `PerHeadTable`, `candle-nn/src/kv_cache/arena_table.rs`). The kernel reads a block's format once per tile from its table entry and broadcasts it across the warp, adding one global memory read per tile with no change to the inner dequantisation loop.
-
-**Cold tier quality floor.** In a naive full-attention system, cold-tier blocks — the oldest tokens — would be attended by every subsequent token, making their quantization error the most damaging in the entire context. Under provenance-selected attention, this relationship changes: a cold-tier block is attended only in the steps that select it, and the fixed retrieval budget caps how many cold blocks any one step can take in. Averaged over a growing cold tier, the chance that a given block is selected falls as N grows — but a block relevant to the current step is selected at any depth, and then contributes its full quantization error. The cold tier's contribution per step is bounded by the budget, not diminished by depth, so its quality sets part of the theorem's constant. What matters for cold-tier quality is that they were cleanly quantized to begin with — which the prefill refresh strategy ensures. Blocks reaching cold storage were quantized from prefill-quality activations, not decode-drifted ones, and were assigned the highest-precision format consistent with their error threshold by the per-block selection kernel. This provides correctness on retrieval when provenance selection does surface them, while the theorem guarantees their aggregate contribution at any depth is bounded.
-
-**Why cold storage must persist KV cache blocks, not tokens.** A naive design would store only the token sequence on disk and reconstruct the KV cache on demand by prefilling. This is correct for standard inference engines — prefill is deterministic and produces the same KV values every time. Under provenance-selected attention it is not. The KV values produced at inference time reflect the specific working set that provenance selection assembled at each reasoning step: the model attended to a particular subset of historical context, and those attention patterns shaped the hidden states that produced the K and V tensors for each token. A reconstructed prefill over the raw token sequence — without the same provenance-selected working set — will produce subtly different KV values because the model's attention context was different during original generation. The difference is small but cumulative: hot-tier and warm-tier blocks reconstructed from tokens will carry higher error than the originals, raising ε_hot above zero and degrading the asymptotic quality guarantee. Cold-tier blocks must therefore be stored as compressed KV cache data, not as token sequences. The persisted data consists of **interior content K/V cache blocks** only (authored system-prompt sections and the user/assistant parts of completed turns); structural template positions carry no persistent K/V and are reconstructed live from the dialect catalog against the current assembly's causal prefix at retrieval time (§5). The substrate's redo log (`substrate/substrate.log`) is stored this way: each sealed turn's K/V, its tokens and its provenance signatures. The tokens are kept as the rebuild source for a turn whose K/V is lost or invalidated — a reload re-prefills it — which is a recovery path, not the storage format; a substrate is valid only for the model whose K/V it holds, so a model change costs a re-ingest (§9.13).
-
-**Non-contiguous attention.** The attentional provenance selection kernel identifies relevant blocks from across all tiers. The attention kernel handles non-contiguous gathered block lists alongside the standard sequential paged layout. Selected blocks are promoted to the VRAM hot tier on demand (`elevate_to_hot`), and hot blocks migrate to the warm tier on the persistence thread. Warm residency is pageable CPU memory, so warm→hot runs at roughly half the PCIe bandwidth a pinned pool would reach.
+**The log stores K/V, not tokens.** Re-prefilling tokens does not reproduce the stored K/V under provenance selection, because the original activations were computed against the working set selected at the time, so a token-only store would raise ε_hot. The redo log (`substrate/substrate.log`) holds each sealed turn's interior K/V, its tokens and its signatures; structural tokens are rebuilt live (§5), and the tokens are a recovery path for a turn whose K/V is lost. A substrate is valid only for the model whose K/V it holds (§9.13). Warm residency is pageable CPU memory, so warm→hot runs at roughly half the PCIe bandwidth a pinned pool would reach.
 
 ---
 
@@ -419,35 +399,38 @@ Quantized weights:    ~15GB stored  (Q4)
 Dequantized BF16:     ~60GB materialised
 ```
 
-On 16GB VRAM this is an immediate OOM, not a performance concern. Writing native quantized matmul kernels that dequantise inline within the MMA kernel — producing BF16 values transiently in register file during the MMA, never materialising the full BF16 weight copy — was not a design choice. It was a hard requirement imposed by a deliberately accepted architectural constraint — the decision to build within 16GB and not exceed it, which forced every component to be efficient at the architectural level rather than relying on hardware headroom to absorb inefficiency.
-
-The constraint produced an implementation whose saving holds on every card: weights stay at their stored size, never written or read back as a dequantised copy, so the memory a dequantised path would spend on weights is left to the context — and the KV cache's own adaptive quantization (§5) multiplies what that memory holds. §9.6.9 measures the result on the production daemon under the battery's sixteen-way load: VRAM by tenant, the live mix of KV formats as load rises, and how many tokens of context stay resident against what the same bytes would hold at full precision. This is the pattern the paper's methodology section (§11.5) describes: the constraint forced an architectural decision that holds beyond the constrained platform rather than being merely viable on it.
+On 16 GB this is an immediate OOM. The matmul kernels therefore dequantise inside the MMA, in registers, and never materialise the BF16 copy. The saving holds on every card: weights stay at their stored size, and the memory a dequantised path would spend is left to the context, which the KV cache's own quantization (§5) then multiplies (§9.6.9).
 
 ### 8.2 Greedy Decomposition
 
-MoE inference with mixed prefill and decode requests produces token counts from 1 to ~500+ hitting each expert per wave step. No single kernel is optimal across this range: GEMV (1–4 tokens) is memory-bandwidth-bound and optimal at small batch sizes; pipelined GEMM (128+ tokens) is compute-bound and optimal at large batch sizes.
+Mixed prefill and decode put anywhere from 1 to 500+ tokens on an expert per wave step. GEMV is best at 1–4 tokens and pipelined GEMM from 128; greedy decomposition tiles any count exactly into the available tile sizes, each run by the kernel best for it, with no remainder and no padding (Figure 8-1), so throughput is smooth from 1 to 500 tokens.
 
-Greedy decomposition tiles any token count exactly into a combination of available kernel tile sizes, with no remainder and no padding:
-
-```
-500 tokens = 256 (pipelined GEMM)
-           + 128 (pipelined GEMM)
-           + 64  (GEMM)
-           + 32  (GEMM)
-           + 16  (batched GEMV)
-           + 4   (batched GEMV)
-= 500 exactly
-```
-
-Each tile executes with the kernel optimal for its size. The performance curve from 1 to 500 tokens is smooth and near-envelope — no performance dead zones, no cliff at tile size boundaries, no separate cleanup pass for remainders.
+<figure class="fig">
+<svg viewBox="0 0 640 120" role="img" aria-label="Figure 8-1. Greedy decomposition of 500 tokens: 256 and 128 by pipelined GEMM, 64 and 32 by GEMM, 16 and 4 by batched GEMV, exactly 500 with no padding.">
+  <text class="ttl" x="16" y="20">Figure 8-1 · 500 tokens, tiled exactly</text>
+  <text class="ttl-sub" x="16" y="36">each tile by the kernel best for its size · no remainder, no padding</text>
+  <rect class="b0" x="16" y="50" width="306.2" height="30"/>
+  <rect class="b0" x="323.2" y="50" width="152.6" height="30"/>
+  <rect class="b1" x="476.8" y="50" width="75.8" height="30"/>
+  <rect class="b1" x="553.6" y="50" width="37.4" height="30"/>
+  <rect class="b2" x="592" y="50" width="18.2" height="30"/>
+  <rect class="b2" x="611.2" y="50" width="4.8" height="30"/>
+  <text class="tick mid" x="169.1" y="96">256</text>
+  <text class="tick mid" x="400" y="96">128</text>
+  <text class="tick mid" x="514.7" y="96">64</text>
+  <text class="tick mid" x="572.8" y="96">32</text>
+  <text class="tick" x="586" y="110">16 + 4</text>
+  <g class="legend">
+    <rect class="b0" x="16" y="102" width="10" height="9"/><text x="30" y="110">pipelined GEMM</text>
+    <rect class="b1" x="140" y="102" width="10" height="9"/><text x="154" y="110">GEMM</text>
+    <rect class="b2" x="210" y="102" width="10" height="9"/><text x="224" y="110">batched GEMV</text>
+  </g>
+</svg>
+</figure>
 
 ### 8.3 Fused Sampling Kernel
 
-All sampling modifiers — temperature, top-k, top-p, repetition penalty, frequency penalty, presence penalty, DRY, min-p — are fused into a single CUDA kernel. The logit tensor (150K+ elements for large-vocabulary models) is read once from VRAM into shared memory, all modifiers execute in-kernel, and the sampled token index is written back. 
-
-The standard approach reads and writes the logit tensor multiple times — one separate kernel per modifier — accumulating ~12MB of VRAM traffic per token on typical sampling configurations. The fused kernel reduces this to ~600KB: a 20× reduction in sampling memory pressure. At low batch sizes where sampling latency is a significant fraction of total per-token latency, this translates directly to throughput improvement.
-
-Template specialisation over common modifier combinations eliminates runtime branch overhead for production configurations while a fallback generic path handles arbitrary combinations.
+Temperature, top-k, top-p, repetition, frequency and presence penalties, DRY and min-p run in one kernel: the logits are read once into shared memory and the sampled index written back. One kernel per modifier moves ~12 MB per token; the fused kernel moves ~600 KB. Templates specialise the common combinations, and a generic path handles the rest.
 
 ---
 
@@ -455,19 +438,11 @@ Template specialisation over common modifier combinations eliminates runtime bra
 
 ### 9.1 Evaluation Strategy
 
-No existing inference system provides the same capability set as the system presented here — unbounded context, adaptive per-block KV quantisation, attentional provenance indexing, and Markov-predicted DMA-offloaded MoE inference do not coexist in any published engine. A system-vs-system comparison on an identical workload is therefore not possible: no other system runs the workload.
-
-The evaluation instead uses three complementary approaches:
-
-1. **Published-figure comparison** for throughput and compression — every measured row is set against the best figure published for the same model on the same class of card by llama.cpp, vLLM, KTransformers and SGLang, with each outside figure's card, quantization, context length and engine recorded beside it (§9.6). Where our figure is an aggregate across concurrent sessions and the published one is single-stream, the comparison says so: it answers how much work one card does, which is the question this architecture is built for.
-
-2. **Output validation at every measured point** — every throughput row in §9.6 comes from a gate that replays a story-rewrite task across all of its sessions and checks each session's output text against its expected rewrite (§9.8). A row is reported only if it passes. Compression and throughput are therefore never measured on a configuration whose output has degraded.
-
-3. **Ablation studies** for each novel contribution — the value of each subsystem is measured by removing it and observing the delta. Ablations are the correct evaluation methodology for a vertically integrated system where no external baseline shares the design space. The codebase dependency analysis evaluation (§9.12) tests iterative attention-driven dependency walking during decode, scored against ground truth enumerated from the system's own source, as seven arms that remove the memory, the seed files, reprojection during reasoning and continuous reprojection in turn. The other measured ablations are §4.3's cache, §9.7's dispatch, and §9.11.2's arms with and without provenance.
+No published engine combines unbounded context, per-block KV quantization, provenance indexing and predicted expert streaming, so no system runs the same workload. The evaluation instead (1) sets every throughput and compression row against the best published figure for the same model and card class — llama.cpp, vLLM, KTransformers, SGLang — saying where ours is aggregate and theirs single-stream (§9.6); (2) validates the output of every measured row, reporting it only if every session reproduces its reference (§9.8); and (3) ablates each contribution: the expert cache (§4.3, §9.7), selection at depth (§9.11.2), and seven arms over the system's own codebase that remove the memory, the seed files and reprojection in turn (§9.12).
 
 ### 9.2 Hardware
 
-Three machines, each measured separately. The engine sizes its VRAM partition from the card it finds, so no row is transferred between machines.
+Three machines, each measured separately; the engine sizes its VRAM partition from the card it finds.
 
 | | RTX 4090 Laptop GPU | RTX 3090 | RTX PRO 5000 Blackwell |
 |---|---|---|---|
@@ -478,35 +453,7 @@ Three machines, each measured separately. The engine sizes its VRAM partition fr
 | Driver model | WDDM | WDDM (GeForce: no TCC) | WDDM for the 2026-10-10 sweep; TCC from 2026-11 |
 | Measured | width ladder, engine probe | width ladder | width ladder and depth to 128K |
 
-The 16GB laptop is the design constraint; the RTX 3090 validates the integer-only path (no native FP8, and neither tensor-core provenance backend applies) on a host whose PCIe 3.0 link gives it the same ~12 GB/s as the laptop's ×8 link; the Blackwell card, which holds every model but the 284B resident, is where the depth sweeps are run free of weight paging. The figures in §9.6 are WDDM figures on all three cards — the driver model whose submission overhead is the floor under single-session decode on the smallest models — except where a row names the TCC build (`docs/results/sweep_rtx_pro_5000_72gb_2026-11-10.md`). WDDM demotes VRAM past capacity and charges system commit for every allocation; TCC refuses an over-capacity allocation and charges nothing (`docs/driver_model.md`).
-
-**Reproducing results.** Every row in §9.6 is a test in this repository, run one model per `cargo` process with the card to itself (no daemon running); the full command list and the per-row source files are in `README.md` and `docs/performance.md`. `huge-context` enables the multi-session paged context path used for §9.8 and §9.11. The three commands below are representative; each feature they name exists in this revision of the workspace.
-
-*Qwen3-30B-A3B — parallel batched forwarding with KV compression and multi-session identity discrimination (§9.8, §9.11):*
-
-```
-cargo test --release --features cuda,verbose,huge-context --lib \
-  --package candle-transformers \
-  quantized_qwen3_moe::tests::test_parallel_batched_forwarding \
-  -- --ignored --nocapture
-```
-
-*Llama-3.2-3B — parallel batched forwarding (§9.8 metric comparison, uniform vs. adaptive):*
-
-```
-cargo test --release --features cuda,verbose,huge-context --lib \
-  --package candle-transformers \
-  quantized_llama::tests::test_parallel_batched_forwarding_llama3 \
-  -- --ignored --nocapture
-```
-
-*KV compression curve — per-block format selection across the ladder:*
-
-```
-cargo test --release -p candle-nn --features cuda,dont_check --lib \
-  sampled_selection::tests::projection::test_candidate_list_compression_curve \
-  -- --ignored --nocapture
-```
+The laptop is the design constraint; the RTX 3090 runs the integer-only path (no native FP8, neither tensor-core provenance backend) over a link no faster than the laptop's; the Blackwell card holds every model but the 284B resident and runs the depth sweeps. §9.6's figures are WDDM figures except where a row names the TCC build; WDDM demotes VRAM past capacity and charges system commit for every allocation, TCC refuses and charges nothing (`docs/driver_model.md`). Every row is a test in this repository, run one model per `cargo` process with the card to itself; the commands and source rows are in `README.md` and `docs/performance.md`.
 
 ### 9.3 Models
 
@@ -526,104 +473,56 @@ Twelve models, spanning dense, mixture-of-experts, DeltaNet-hybrid and native-sp
 
 ### 9.4 Quantized Matmul Kernel Benchmarks
 
-The system contains two quantization subsystems that share a common block structure
-and kernel dispatch infrastructure. The **qmatmul** subsystem covers formats in which
-model weights are actually stored — loaded from GGUF/AWQ files and applied directly
-during the forward pass without materialising a full-precision copy. The **kv_cache**
-subsystem extends this shared infrastructure with additional formats purpose-built for
-KV activation characteristics (Q8_KS, Q4_KS, Q4_1, Q3_0, Q2_0) that do not
-appear in weight files and are never used in qmatmul. Reusing the block structure
-across both subsystems keeps kernel dispatch consistent and the codebase coherent.
+The weight formats (**qmatmul**) and the KV formats share one block structure and dispatch; the KV-only formats (Q8_KS, Q4_KS, Q4_1, Q3_0, Q2_0) are validated by the per-block selector instead, since KV quality is attention-output fidelity, not reconstruction error. Figure 9.4-1 measures the weight kernels on the RTX 4090 Laptop GPU, 200 iterations a format under Criterion.rs, with no BF16 weight copy at any point. FP8 data formats ran at F16's ~80.5 GiB/s with no gain, and their non-uniform spacing suits block-normalised KV worse than integer formats, so FP8 left the KV ladder; E4M3 survives only as the `_KS` sub-block scale.
 
-The benchmarks below cover **qmatmul weight formats only**. KV cache format quality
-is validated separately by the adaptive per-block selection kernel at
-quantization time, since KV quality is a function of attention output fidelity
-rather than matrix reconstruction error.
+<figure class="fig">
+<svg viewBox="0 0 640 302" role="img" aria-label="Figure 9.4-1. Native quantized matmul bandwidth on the RTX 4090 Laptop GPU, GiB per second. F32 84.5, F16 82.7. Q8_0 59.7, Q8_1 59.4, Q8_K 59.6, Q6_K 57.9, Q5_0 58.9, Q5_1 59.8, Q5_K 59.0, Q4_0 59.9, Q4_1 59.6, Q4_K 59.3. Q3_K 34.0, Q2_K 35.0.">
+  <text class="ttl" x="16" y="20">Figure 9.4-1 · Quantized matmul bandwidth, no weight copy</text>
+  <text class="ttl-sub" x="16" y="36">RTX 4090 Laptop GPU · GiB/s · three tiers: float, integer ≥4-bit, sub-4-bit packing</text>
+  <path class="grid" d="M333.3 48 V276 M466.7 48 V276 M600 48 V276"/>
+  <path class="grid base" d="M200 48 V276"/>
+  <text class="tick" x="190" y="61" text-anchor="end">F32</text><rect class="b0" x="200" y="52" width="375.5" height="11"/><text class="tick" x="581.5" y="61">84.5</text>
+  <text class="tick" x="190" y="77" text-anchor="end">F16</text><rect class="b0" x="200" y="68" width="367.5" height="11"/><text class="tick" x="573.5" y="77">82.7</text>
+  <text class="tick" x="190" y="93" text-anchor="end">Q8_0</text><rect class="b1" x="200" y="84" width="265.3" height="11"/><text class="tick" x="471.3" y="93">59.7</text>
+  <text class="tick" x="190" y="109" text-anchor="end">Q8_1</text><rect class="b1" x="200" y="100" width="264" height="11"/><text class="tick" x="470" y="109">59.4</text>
+  <text class="tick" x="190" y="125" text-anchor="end">Q8_K</text><rect class="b1" x="200" y="116" width="264.9" height="11"/><text class="tick" x="470.9" y="125">59.6</text>
+  <text class="tick" x="190" y="141" text-anchor="end">Q6_K</text><rect class="b1" x="200" y="132" width="257.3" height="11"/><text class="tick" x="463.3" y="141">57.9</text>
+  <text class="tick" x="190" y="157" text-anchor="end">Q5_0</text><rect class="b1" x="200" y="148" width="261.8" height="11"/><text class="tick" x="467.8" y="157">58.9</text>
+  <text class="tick" x="190" y="173" text-anchor="end">Q5_1</text><rect class="b1" x="200" y="164" width="265.8" height="11"/><text class="tick" x="471.8" y="173">59.8</text>
+  <text class="tick" x="190" y="189" text-anchor="end">Q5_K</text><rect class="b1" x="200" y="180" width="262.2" height="11"/><text class="tick" x="468.2" y="189">59.0</text>
+  <text class="tick" x="190" y="205" text-anchor="end">Q4_0</text><rect class="b1" x="200" y="196" width="266.2" height="11"/><text class="tick" x="472.2" y="205">59.9</text>
+  <text class="tick" x="190" y="221" text-anchor="end">Q4_1</text><rect class="b1" x="200" y="212" width="264.9" height="11"/><text class="tick" x="470.9" y="221">59.6</text>
+  <text class="tick" x="190" y="237" text-anchor="end">Q4_K</text><rect class="b1" x="200" y="228" width="263.5" height="11"/><text class="tick" x="469.5" y="237">59.3</text>
+  <text class="tick" x="190" y="253" text-anchor="end">Q3_K</text><rect class="b2" x="200" y="244" width="151.1" height="11"/><text class="tick" x="357.1" y="253">34.0</text>
+  <text class="tick" x="190" y="269" text-anchor="end">Q2_K</text><rect class="b2" x="200" y="260" width="155.6" height="11"/><text class="tick" x="361.6" y="269">35.0</text>
+  <text class="tick mid" x="200" y="292">0</text>
+  <text class="tick mid" x="333.3" y="292">30</text>
+  <text class="tick mid" x="466.7" y="292">60</text>
+  <text class="tick mid" x="600" y="292">90 GiB/s</text>
+</svg>
+</figure>
 
-Native quantized CUDA matmul kernels measured on RTX 4090 Mobile (16GB). No BF16
-weight copy is materialised at any point. 200 iterations per format, Criterion.rs
-statistical harness.
-
-**Tier 1 — High bandwidth (~80+ GiB/s)**
-
-| Format | Median (µs) | Bandwidth (GiB/s) |
-|---|---|---|
-| F32 | 11.56 | 84.5 |
-| F16 | 11.81 | 82.7 |
-
-**Tier 2 — Standard integer (~59 GiB/s)**
-
-| Format | Median (µs) | Bandwidth (GiB/s) |
-|---|---|---|
-| Q8_0 | 16.37 | 59.7 |
-| Q8_1 | 16.44 | 59.4 |
-| Q8_K | 16.40 | 59.6 |
-| Q6_K | 16.88 | 57.9 |
-| Q5_0 | 16.57 | 58.9 |
-| Q5_1 | 16.32 | 59.8 |
-| Q5_K | 16.55 | 59.0 |
-| Q4_0 | 16.31 | 59.9 |
-| Q4_1 | 16.38 | 59.6 |
-| Q4_K | 16.48 | 59.3 |
-
-**Tier 3 — Low precision (~34 GiB/s)**
-
-| Format | Median (µs) | Bandwidth (GiB/s) |
-|---|---|---|
-| Q3_K | 28.72 | 34.0 |
-| Q2_K | 27.90 | 35.0 |
-
-One finding is notable. FP8 data formats (F8_0, F8_1, F8_KS) were benchmarked during development and showed throughput identical to F16 (~80.5 GiB/s) — no performance benefit. Combined with a quality finding from the KV cache evaluation: FP8's non-uniform value spacing is optimised for weight and activation distributions, not for block-normalised KV cache values where the block scale already handles the dynamic range and INT formats provide better uniform coverage per bit. FP8 was removed from the KV cache format ladder as a consequence. F16 and BF16 remain as high-fidelity fallbacks. FP8 E4M3 does appear as the scale precision in the _KS sub-block format header — but this is scale metadata, not data representation.
-
-Q3_K and Q2_K drop to ~34 GiB/s — approximately 42% of peak — reflecting
-the non-power-of-two bit packing overhead inherent to sub-byte formats.
+Q3_K and Q2_K run at ~42% of peak, the cost of non-power-of-two packing.
 
 ### 9.5 Quantized Matmul Kernel Accuracy
 
-Numerical accuracy of each kernel against a reference implementation on a 2048×2048
-matrix, measured across accumulator dtypes and batch sizes 1–128. All formats pass
-at all batch sizes. Values shown are worst-case (batch=128) and best-case (batch=1)
-max relative error and mean absolute difference.
+Each kernel against a reference on a 2048×2048 matrix, batch 1–128; every format passes at every batch size. Max relative error at batch 1 and 128, and mean absolute difference at 128:
 
-**Against F32 accumulator (highest precision reference)**
-
-| Format | max_rel (batch=1) | max_rel (batch=128) | mean_diff (batch=128) |
+| Accumulator | Q8_0 | Q4_0 | Q6_K |
 |---|---|---|---|
-| Q8_0 | 0.0016 | 0.0077 | 0.000168 |
-| Q4_0 | 0.0025 | 0.0050 | 0.000143 |
-| Q6_K | 0.0031 | 0.0083 | 0.000202 |
+| F32 | 0.0016 / 0.0077 / 0.000168 | 0.0025 / 0.0050 / 0.000143 | 0.0031 / 0.0083 / 0.000202 |
+| BF16 | 0.0267 / 0.0642 / 0.001952 | 0.0195 / 0.0447 / 0.001651 | 0.0239 / 0.0573 / 0.001921 |
+| F8E4M3 | 0.0625 / 0.0944 / 0.010276 | 0.0596 / 0.0826 / 0.010126 | 0.0743 / 0.0918 / 0.010324 |
 
-**Against BF16 accumulator**
-
-| Format | max_rel (batch=1) | max_rel (batch=128) | mean_diff (batch=128) |
-|---|---|---|---|
-| Q8_0 | 0.0267 | 0.0642 | 0.001952 |
-| Q4_0 | 0.0195 | 0.0447 | 0.001651 |
-| Q6_K | 0.0239 | 0.0573 | 0.001921 |
-
-**Against F8E4M3 accumulator**
-
-| Format | max_rel (batch=1) | max_rel (batch=128) | mean_diff (batch=128) |
-|---|---|---|---|
-| Q8_0 | 0.0625 | 0.0944 | 0.010276 |
-| Q4_0 | 0.0596 | 0.0826 | 0.010126 |
-| Q6_K | 0.0743 | 0.0918 | 0.010324 |
-
-Several observations follow from these results. Against F32 and F16 accumulators,
-all three formats produce mean absolute differences in the range 0.00013–0.00022,
-well within the quantisation noise floor of each format. The higher errors against
-BF16 reflect BF16's limited 7-bit mantissa rather than kernel inaccuracy — the
-quantised kernel and the reference accumulate rounding differently in BF16 space.
-
-Against F8E4M3 accumulators, mean differences of ~0.010 reflect E4M3's 3-bit mantissa (~12.5% relative spacing per exponent step) — an inherent format property, not kernel error. Max relative error growing with batch size reflects floating-point rounding accumulation across larger reduction dimensions; this is expected behaviour. All values remain well below thresholds that would affect model output quality at each format's intended precision level.
+Against F32 the mean differences sit at 0.00013–0.00022, inside each format's quantization noise. The larger BF16 and E4M3 figures are those formats' 7- and 3-bit mantissas, not kernel error, and max error grows with batch as rounding accumulates over longer reductions.
 
 ### 9.6 Throughput, Depth and Compression Across the Fleet
 
-Every figure in this section is produced by a test in this repository: the width ladder (`test_parallel_batched_forwarding*`, a ~700-token prompt at several batch widths and points on the compression ladder), the depth gate (`long_context_gate`, 4K–128K tokens of KV), or the engine probe (`kv_fragmentation`, which drives the full conversation engine under load). Every row validates each session's output text (§9.8) and is reported only if it passes. Source rows, dates and builds are in `docs/performance.md`; the raw rows are in `docs/results/`. **Prefill** is prompt tokens per second; **decode** is generated tokens per second, **summed across the batch** where a row has more than one context.
+Every figure here is a test in this repository — the width ladder (`test_parallel_batched_forwarding*`, a ~700-token prompt at several widths and compression levels), the depth gate (`long_context_gate`, 4K–128K), or the engine probe (`kv_fragmentation`, the full conversation engine under load) — and every row validates each session's output (§9.8). Sources are in `docs/performance.md` and `docs/results/`. **Prefill** is prompt tokens per second; **decode** is generated tokens per second, **summed across the batch** where a row has more than one context.
 
 #### 9.6.1 Width: what concurrency buys on one card
 
-RTX PRO 5000 Blackwell 72 GB, build `21c36efbd` (2026-10-10): fourteen width gates, 212 rows, every session of every validated row reproducing its reference. Each cell is the model's best validated row on that card, with the format and batch width that produced it.
+RTX PRO 5000 Blackwell 72 GB, build `21c36efbd` (2026-10-10): fourteen width gates, 212 rows. Each cell is the model's best validated row, with the format and width that produced it.
 
 | Model | Best prefill t/s | Best decode t/s | Best compression |
 |---|---:|---:|---:|
@@ -641,26 +540,59 @@ RTX PRO 5000 Blackwell 72 GB, build `21c36efbd` (2026-10-10): fourteen width gat
 | Qwen3.8-Flash-Next | 7,024.1 (BF16 ×4) | 1,163.9 (BF16 ×16) | 7.13× (C10) |
 | DeepSeek-V4-Flash | 1,177.1 (BF16 ×16) | 114.4 (BF16 ×16) | — |
 
-Prefill saturates early — the 35B MoEs barely move from ×1 to ×64 — while aggregate decode scales nearly linearly with width. Qwen3.5-35B-A3B goes from 230.2 t/s at one session to **2,869.9 t/s across sixty-four**, a 12.5× widening within one ladder, and Qwen3.6-35B-A3B from 476.6 to **2,761.0**, 5.8×, with the KV cache at C10 and prefill flat across the same range (`docs/results/sweep_rtx_pro_5000_72gb_2026-10-10_main.md`). This is the wave-batched grouped GEMM of §4.4 measured: one expert load serves every session routed to it, so additional sessions ride weight traffic that was already in flight.
+Prefill saturates early while aggregate decode scales nearly linearly with width: Qwen3.5-35B-A3B goes from 230.2 t/s at one session to **2,869.9 t/s across sixty-four** (12.5×) and Qwen3.6-35B-A3B from 476.6 to **2,761.0** (5.8×), at C10 with prefill flat. This is §4.4's wave batching measured: one expert load serves every session routed to it.
 
 #### 9.6.2 Depth: throughput does not fall with context
 
-The same card, one context, 32K → 128K, BF16. Share of the 32K rate kept at 128K:
+<figure class="fig">
+<svg viewBox="0 0 640 258" role="img" aria-label="Figure 9.6-1. Share of the 32K rate kept at 128K, one context, BF16, RTX PRO 5000. Qwen3.8-Flash-Next keeps 99 percent of prefill and 111 percent of decode. Qwen3.8-27B 28 and 58. Qwen3.5-9B 30 and 48. Qwen3.6-35B-A3B 26 and 49. Qwen3.5-35B-A3B 26 and 47. Qwen3.5-0.8B 25 and 86.">
+  <text class="ttl" x="16" y="20">Figure 9.6-1 · What a 4× deeper context costs</text>
+  <text class="ttl-sub" x="16" y="36">share of the 32K rate kept at 128K · faint bar prefill, solid bar decode · RTX PRO 5000, BF16</text>
+  <path class="grid" d="M360 50 V232"/>
+  <path class="grid base" d="M200 50 V232"/>
+  <path class="parity" d="M520 50 V232"/>
+  <text class="cat" x="16" y="66">Qwen3.8-Flash-Next</text>
+  <text class="cat-sub" x="16" y="79">sparse-attention indexer</text>
+  <rect class="us-soft" x="200" y="56" width="316.8" height="10"/>
+  <rect class="us" x="200" y="68" width="355.2" height="10"/>
+  <text class="t-dim" x="522.8" y="65">99%</text>
+  <text class="v-us" x="561.2" y="78">111%</text>
+  <text class="cat" x="16" y="96">Qwen3.8-27B</text>
+  <rect class="us-soft" x="200" y="86" width="89.6" height="10"/>
+  <rect class="us" x="200" y="98" width="185.6" height="10"/>
+  <text class="t-dim" x="295.6" y="95">28%</text>
+  <text class="t-dim" x="391.6" y="107">58%</text>
+  <text class="cat" x="16" y="126">Qwen3.5-9B</text>
+  <rect class="us-soft" x="200" y="116" width="96" height="10"/>
+  <rect class="us" x="200" y="128" width="153.6" height="10"/>
+  <text class="t-dim" x="302" y="125">30%</text>
+  <text class="t-dim" x="359.6" y="137">48%</text>
+  <text class="cat" x="16" y="156">Qwen3.6-35B-A3B</text>
+  <rect class="us-soft" x="200" y="146" width="83.2" height="10"/>
+  <rect class="us" x="200" y="158" width="156.8" height="10"/>
+  <text class="t-dim" x="289.2" y="155">26%</text>
+  <text class="t-dim" x="362.8" y="167">49%</text>
+  <text class="cat" x="16" y="186">Qwen3.5-35B-A3B</text>
+  <rect class="us-soft" x="200" y="176" width="83.2" height="10"/>
+  <rect class="us" x="200" y="188" width="150.4" height="10"/>
+  <text class="t-dim" x="289.2" y="185">26%</text>
+  <text class="t-dim" x="356.4" y="197">47%</text>
+  <text class="cat" x="16" y="216">Qwen3.5-0.8B</text>
+  <rect class="us-soft" x="200" y="206" width="80" height="10"/>
+  <rect class="us" x="200" y="218" width="275.2" height="10"/>
+  <text class="t-dim" x="286" y="215">25%</text>
+  <text class="t-dim" x="481.2" y="227">86%</text>
+  <text class="tick mid" x="200" y="248">0%</text>
+  <text class="tick mid" x="360" y="248">50%</text>
+  <text class="tick mid" x="520" y="248">100%</text>
+</svg>
+</figure>
 
-| Model | Prefill kept | Decode kept |
-|---|---:|---:|
-| **Qwen3.8-Flash-Next** | **99%** | **111%** |
-| Qwen3.8-27B | 28% | 58% |
-| Qwen3.5-9B | 30% | 48% |
-| Qwen3.6-35B-A3B | 26% | 49% |
-| Qwen3.5-35B-A3B | 26% | 47% |
-| Qwen3.5-0.8B | 25% | 86% |
-
-Flash-Next is the one model whose cost per token does not depend on how much history there is, and the reason is in its checkpoint, not in this engine's provenance: its full-attention layers carry a trained sparse-attention indexer (QSA, `{layer}.indexer.*` weights) that caps each token's attended set at 2,051 positions, where the hybrids read the whole prefix. Profiled per call, the attention kernel costs the same at shallow depth on both (0.382 ms at 32K on Flash-Next, 0.394 ms at 8K on Qwen3.5-35B), then stays within 6% to 128K on Flash-Next and grows 3.71× for 4× depth on the 35B. The other models in this table are not a failure of the engine; they cannot acquire the indexer without training, and their retention is also confounded by size — Qwen3.5-0.8B keeps 86% of decode because its step is dominated by depth-independent work (`docs/performance.md` §3.3). Across the full depth sweep on the rewrite task its speculative head accepts exactly **4.85 tokens a step at every depth from 8K to 128K**, and the story is reproduced correctly from behind 128,897 tokens of padding. On the coherence task its prefill runs 1,098.8 / 1,368.9 / 1,342.8 / 1,291.8 / 1,257.5 t/s and its decode 24.7 / 28.3 / 24.6 / 26.3 / 26.4 t/s at 8K / 16K / 32K / 64K / 128K. The published llama.cpp run of the same model on an RTX 4090 24GB keeps 64% of its prefill and 65% of its decode between 6K and 110K [31], so the engine contributes something too: its paged attention and compression add no depth-dependent cost of their own on top of the indexer's. What this row shows is the principle §11.2 rests on — a working set bounded independently of depth costs the same at any depth — demonstrated by a model-native mechanism inside one context. It is not a measurement of provenance-selected attention, which a single-context depth gate does not exercise.
+Flash-Next is the one model whose cost per token does not depend on history, and the reason is its checkpoint, not this engine's provenance: its full-attention layers carry a trained sparse-attention indexer (QSA) that caps each token's attended set at 2,051 positions, where the hybrids read the whole prefix. The attention kernel costs the same at shallow depth on both (0.382 ms at 32K on Flash-Next, 0.394 ms at 8K on Qwen3.5-35B), then stays within 6% to 128K on Flash-Next and grows 3.71× for 4× depth on the 35B. Qwen3.5-0.8B keeps 86% of decode because its step is dominated by depth-independent work. Flash-Next's speculative head accepts exactly **4.85 tokens a step at every depth from 8K to 128K**, and the story is reproduced from behind 128,897 tokens of padding. The published llama.cpp run of the same model on an RTX 4090 24 GB keeps 64% of prefill and 65% of decode from 6K to 110K [31], so the engine adds no depth-dependent cost of its own. This shows the principle §11.2 rests on — a working set bounded independently of depth costs the same at any depth — by a model-native mechanism inside one context; it is not a measurement of provenance selection.
 
 #### 9.6.3 Compression: the top level, inline, validated
 
-Each 32-token block is compressed in the forward that produced it; there is no separate compression pass. C10 against BF16 at 8K, one context, from the Blackwell depth sweep (`docs/performance.md` §3.4, the models measured at 8K or 4K only). Per-card C10 ratios on the current width builds are I6 and I14 in `docs/performance.md`:
+Each 32-token block is compressed in the forward that produced it. C10 against BF16 at 8K, one context, Blackwell (`docs/performance.md` §3.4):
 
 | Model | Prefill BF16 / C10 (t/s) | Decode BF16 / C10 (t/s) | C10 compression |
 |---|---|---|---:|
@@ -669,115 +601,281 @@ Each 32-token block is compressed in the forward that produced it; there is no s
 | Llama-2-7B (4K) | 3,684.7 / 3,851.1 | 47.1 / 44.1 | 4.81× |
 | Llama-3.2-3B | 6,195.9 / 5,936.8 | 69.9 / 66.1 | 4.62× |
 
-At 8K the top level costs **0–8% of decode for 3.3×–6.3×** across the models measured there. At 32K the largest hybrids pay 27–31% of decode for 6.3×–7.5×; at 128K the cache compresses 4.63×–7.63×, 100% of blocks quantized, with Flash-Next paying 19% for 6.97×. Prefill with C10 runs within 5% of BF16 at every depth measured, and at 128K it is marginally *faster* than BF16 on all six models, because there are fewer bytes to read back. For comparison, llama.cpp's q8_0 KV cache gives ~1.9× and costs 35% of decode at 32K and 45% at 64K; its q4_0 gives ~3.56× and costs 39% and 50% [35]; vLLM's FP8 cache gives 2× [36], and TurboQuant 2.4–3.4× for 20–27% of throughput [37]. At 32K the top level holds **nearly 4× the compression of q8_0 while slowing decode less**.
+At 8K the top level costs **0–8% of decode for 3.3–6.3×**. At 32K the largest hybrids pay 27–31% for 6.3–7.5×; at 128K the cache compresses 4.63–7.63× with every block quantized, Flash-Next paying 19% for 6.97×. C10 prefill runs within 5% of BF16 at every depth and is marginally *faster* at 128K, with fewer bytes to read. llama.cpp's q8_0 cache gives ~1.9× for 35% of decode at 32K and 45% at 64K, its q4_0 ~3.56× for 39% and 50% [35]; vLLM's FP8 gives 2× [36], TurboQuant 2.4–3.4× for 20–27% [37]. At 32K the top level holds **nearly 4× q8_0's compression while slowing decode less**.
 
 #### 9.6.4 Against the published record
 
-For each model, our aggregate decode serving concurrent sessions against the best published llama.cpp single-stream decode for the same model on the same class of card. The Blackwell rows compare our RTX PRO 5000 with published RTX 5090 figures.
+Figure 9.6-2 sets our aggregate decode, serving concurrent sessions, against the best published llama.cpp single-stream decode for the same model on the same class of card; the Blackwell rows compare our RTX PRO 5000 with published RTX 5090 figures. Aggregate against single-stream is the comparison the record allows — no aggregate for these models on these cards has been published — and it answers how much work one card does. Published single-card serving of the 35B models on an RTX PRO 6000 reports 5–10 concurrent requests [42, 43]; this engine runs them at 64, and Qwen3.5-0.8B at 256.
 
-| Card class | Model | Ours, aggregate (t/s) | llama.cpp best, single-stream (t/s) | Multiple |
-|---|---|---:|---:|---:|
-| RTX 3090 | Qwen3.5-35B-A3B, C10 ×16 | 1,228.8 | 111.2 [28] | 11.1× |
-| RTX 3090 | Qwen3.6-35B-A3B, C10 ×16 | 1,346.3 | 157.66 [33] | 8.5× |
-| RTX 3090 | Llama-2-7B, BF16 ×48 | 934.9 | 161.89 [27] | 5.8× |
-| RTX 3090 | Qwen3-8B, C8 ×10 | 383.8 | 115.3 [28] | 3.3× |
-| RTX 3090 | Qwen3.8-27B, C8 ×20 | 358.7 | 65.28, with MTP [30] | 5.5× |
-| RTX 3090 | Qwen3-30B-A3B, BF16 ×10 | 400.5 | 153.6 [28] | 2.6× |
-| RTX 3090 | Qwen3.8-Flash-Next, BF16 ×16 | 543.8 | 15 [32] | 36.3× |
-| 16 GB | Qwen3.6-35B-A3B, C10 ×16 | 336.7 | 183.29 / 249.33 MTP, IQ3_S resident [38] | 1.3–1.8× |
-| 16 GB | Qwen3-8B, C8 ×10 | 308.4 | 102.7 (RTX 4080) [29] | 3.0× |
-| 16 GB | Qwen3.8-Flash-Next, BF16 ×8 | 108.5 | 27.5–29 (RTX 5080) [32] | 3.7× |
-| Blackwell | Qwen3.5-35B-A3B, C10 ×64 | 2,869.9 | 194.0 [34] | 14.8× |
-| Blackwell | Qwen3.6-35B-A3B, C10 ×64 | 2,761.0 | 333.55, with MTP [38] | 8.3× |
-| Blackwell | Qwen3.8-Flash-Next, BF16 ×16 (TCC build) | 1,819.3 | 48.02 [42] | 37.9× |
-| Blackwell | Llama-2-7B, BF16 ×48 | 1,675.0 | 300.40 [27] | 5.6× |
-| Blackwell | Qwen3-30B-A3B, BF16 ×10 | 997.4 | 226.1 [39] | 4.4× |
-| Blackwell | Qwen3-8B, C8 ×10 | 632.9 | 200.4 [39] | 3.2× |
+<figure class="fig">
+<svg viewBox="0 0 640 494" role="img" aria-label="Figure 9.6-2. Our aggregate decode against the best published llama.cpp single-stream decode, same model and card class, on a log scale. RTX 3090: Qwen3.5-35B-A3B 11.1 times, Qwen3.6-35B-A3B 8.5, Llama-2-7B 5.8, Qwen3-8B 3.3, Qwen3.8-27B 5.5, Qwen3-30B-A3B 2.6, Flash-Next 36.3. 16 GB: Qwen3.6-35B-A3B 1.3 to 1.8, Qwen3-8B 3.0, Flash-Next 3.7. Blackwell: Qwen3.5-35B-A3B 14.8, Qwen3.6-35B-A3B 8.3, Flash-Next 37.9, Llama-2-7B 5.6, Qwen3-30B-A3B 4.4, Qwen3-8B 3.2.">
+  <text class="ttl" x="16" y="20">Figure 9.6-2 · One card's aggregate decode, against the published record</text>
+  <text class="ttl-sub" x="16" y="36">× the best published llama.cpp single-stream decode, same model and card · log scale</text>
+  <path class="grid" d="M313.8 46 V466 M398.1 46 V466 M461.9 46 V466 M525.7 46 V466 M610 46 V466"/>
+  <path class="parity" d="M250 46 V466"/>
+  <text class="cat" x="16" y="62">Qwen3.5-35B-A3B, C10 ×16</text><text class="cat-sub" x="16" y="74">RTX 3090 · 1,228.8 vs 111.2 [28]</text>
+  <path class="line-us" d="M250 64 H471.5"/><circle class="dot-us" cx="471.5" cy="64" r="5"/><text class="v-us" x="481.5" y="69">11.1×</text>
+  <text class="cat" x="16" y="88">Qwen3.6-35B-A3B, C10 ×16</text><text class="cat-sub" x="16" y="100">RTX 3090 · 1,346.3 vs 157.66 [33]</text>
+  <path class="line-us" d="M250 90 H446.9"/><circle class="dot-us" cx="446.9" cy="90" r="5"/><text class="v-us" x="456.9" y="95">8.5×</text>
+  <text class="cat" x="16" y="114">Llama-2-7B, BF16 ×48</text><text class="cat-sub" x="16" y="126">RTX 3090 · 934.9 vs 161.89 [27]</text>
+  <path class="line-us" d="M250 116 H411.8"/><circle class="dot-us" cx="411.8" cy="116" r="5"/><text class="v-us" x="421.8" y="121">5.8×</text>
+  <text class="cat" x="16" y="140">Qwen3-8B, C8 ×10</text><text class="cat-sub" x="16" y="152">RTX 3090 · 383.8 vs 115.3 [28]</text>
+  <path class="line-us" d="M250 142 H359.9"/><circle class="dot-us" cx="359.9" cy="142" r="5"/><text class="v-us" x="369.9" y="147">3.3×</text>
+  <text class="cat" x="16" y="166">Qwen3.8-27B, C8 ×20</text><text class="cat-sub" x="16" y="178">RTX 3090 · 358.7 vs 65.28 with MTP [30]</text>
+  <path class="line-us" d="M250 168 H406.9"/><circle class="dot-us" cx="406.9" cy="168" r="5"/><text class="v-us" x="416.9" y="173">5.5×</text>
+  <text class="cat" x="16" y="192">Qwen3-30B-A3B, BF16 ×10</text><text class="cat-sub" x="16" y="204">RTX 3090 · 400.5 vs 153.6 [28]</text>
+  <path class="line-us" d="M250 194 H337.9"/><circle class="dot-us" cx="337.9" cy="194" r="5"/><text class="v-us" x="347.9" y="199">2.6×</text>
+  <text class="cat" x="16" y="218">Flash-Next, BF16 ×16</text><text class="cat-sub" x="16" y="230">RTX 3090 · 543.8 vs 15 at ~130K [32]</text>
+  <path class="line-us" d="M250 220 H580.5"/><circle class="dot-us" cx="580.5" cy="220" r="5"/><text class="v-us" x="570.5" y="214" text-anchor="end">36.3×</text>
+  <text class="cat" x="16" y="244">Qwen3.6-35B-A3B, C10 ×16</text><text class="cat-sub" x="16" y="256">16 GB · 336.7 vs 183.3 / 249.3 MTP [38]</text>
+  <path class="line-us" d="M250 246 H304.1"/><circle class="dot-us" cx="274.1" cy="246" r="4"/><circle class="dot-us" cx="304.1" cy="246" r="5"/><text class="v-us" x="314.1" y="251">1.3–1.8×</text>
+  <text class="cat" x="16" y="270">Qwen3-8B, C8 ×10</text><text class="cat-sub" x="16" y="282">16 GB · 308.4 vs 102.7, RTX 4080 [29]</text>
+  <path class="line-us" d="M250 272 H351.1"/><circle class="dot-us" cx="351.1" cy="272" r="5"/><text class="v-us" x="361.1" y="277">3.0×</text>
+  <text class="cat" x="16" y="296">Flash-Next, BF16 ×8</text><text class="cat-sub" x="16" y="308">16 GB · 108.5 vs 27.5–29, RTX 5080 [32]</text>
+  <path class="line-us" d="M250 298 H370.4"/><circle class="dot-us" cx="370.4" cy="298" r="5"/><text class="v-us" x="380.4" y="303">3.7×</text>
+  <text class="cat" x="16" y="322">Qwen3.5-35B-A3B, C10 ×64</text><text class="cat-sub" x="16" y="334">Blackwell · 2,869.9 vs 194.0 [34]</text>
+  <path class="line-us" d="M250 324 H498"/><circle class="dot-us" cx="498" cy="324" r="5"/><text class="v-us" x="508" y="329">14.8×</text>
+  <text class="cat" x="16" y="348">Qwen3.6-35B-A3B, C10 ×64</text><text class="cat-sub" x="16" y="360">Blackwell · 2,761.0 vs 333.6 MTP [38]</text>
+  <path class="line-us" d="M250 350 H444.8"/><circle class="dot-us" cx="444.8" cy="350" r="5"/><text class="v-us" x="454.8" y="355">8.3×</text>
+  <text class="cat" x="16" y="374">Flash-Next, BF16 ×16, TCC</text><text class="cat-sub" x="16" y="386">Blackwell · 1,819.3 vs 48.02 [42]</text>
+  <path class="line-us" d="M250 376 H584.5"/><circle class="dot-us" cx="584.5" cy="376" r="5"/><text class="v-us" x="574.5" y="370" text-anchor="end">37.9×</text>
+  <text class="cat" x="16" y="400">Llama-2-7B, BF16 ×48</text><text class="cat-sub" x="16" y="412">Blackwell · 1,675.0 vs 300.40 [27]</text>
+  <path class="line-us" d="M250 402 H408.5"/><circle class="dot-us" cx="408.5" cy="402" r="5"/><text class="v-us" x="418.5" y="407">5.6×</text>
+  <text class="cat" x="16" y="426">Qwen3-30B-A3B, BF16 ×10</text><text class="cat-sub" x="16" y="438">Blackwell · 997.4 vs 226.1 [39]</text>
+  <path class="line-us" d="M250 428 H386.4"/><circle class="dot-us" cx="386.4" cy="428" r="5"/><text class="v-us" x="396.4" y="433">4.4×</text>
+  <text class="cat" x="16" y="452">Qwen3-8B, C8 ×10</text><text class="cat-sub" x="16" y="464">Blackwell · 632.9 vs 200.4 [39]</text>
+  <path class="line-us" d="M250 454 H357"/><circle class="dot-us" cx="357" cy="454" r="5"/><text class="v-us" x="367" y="459">3.2×</text>
+  <text class="tick mid" x="250" y="484">1×</text>
+  <text class="tick mid" x="313.8" y="484">2×</text>
+  <text class="tick mid" x="398.1" y="484">5×</text>
+  <text class="tick mid" x="461.9" y="484">10×</text>
+  <text class="tick mid" x="525.7" y="484">20×</text>
+  <text class="tick mid" x="610" y="484">50×</text>
+</svg>
+</figure>
 
-Every row clears the published single-stream rate, by 1.3× to 37.9×. Aggregate against single-stream is the comparison the published record allows — llama.cpp can serve parallel requests, but no aggregate for these models on these cards has been published — and it is the comparison that answers how much work one card does. The published single-card serving runs of the 35B models on a larger RTX PRO 6000 report 5–10 concurrent requests [42, 43]; this engine runs them at 64 on a 72GB card and Qwen3.5-0.8B at 256.
-
-Two rows in the table are not like-for-like and are marked here rather than left to the reader. The Flash-Next row against llama.cpp's 15 t/s is a published run at a ~130K context on UD-Q4_K_XL against our ~700-token prompt on Q2_KO experts; the same model against the published RTX 5090 figure at the same short prompt is 37.9×, and against the RTX 5080 figure at 16 GB it is 3.7×. The 16 GB Qwen3.6-35B row is the weakest in the table on purpose: a 3-bit quant that fits wholly in VRAM decodes one stream faster than streamed Q6_K experts can, and the honest multiple there is 1.3–1.8×, not the 8–14× the same model shows on the larger cards.
+Two rows are not like-for-like. The RTX 3090 Flash-Next row is against a published run at ~130K context on UD-Q4_K_XL, where ours is a ~700-token prompt on Q2_KO experts; at a matched short prompt it is 37.9× on Blackwell and 3.7× at 16 GB. The 16 GB Qwen3.6-35B row is the weakest on purpose: a 3-bit quant that fits wholly in VRAM decodes one stream faster than streamed Q6_K experts can, so the honest multiple there is 1.3–1.8×.
 
 #### 9.6.5 The 16GB laptop
 
-The RTX 4090 Laptop GPU with 32GB of host RAM is the constraint the architecture was designed under, and where its results are least expected.
+The RTX 4090 Laptop GPU with 32 GB of RAM is the constraint the architecture was designed under.
 
-- **A 180B model.** Qwen3.8-Flash-Next (180B total: a 125B trunk with 512 experts, a 51B n-gram table and a 4B MTP head; 6B active) runs from a Q2_KO-expert artifact of ~88GB, streaming its experts VRAM → pinned RAM → NVMe. Every rung of its ladder validates 8/8. On the 2026-10-10 sweep one warm session prefills at 269.1 t/s and decodes at 34.9; eight prefill at 1,127.5 and decode at **108.5 t/s aggregate**, with C10 at 5.79–5.82× and costing only 6.6% of that decode (1,128.7 / 101.3). Every published single-GPU run of the model that states its host uses 64–128GB of RAM; the fastest, an RTX 5090 with 128GB, decodes one stream at 48.02 t/s [42], and the only published 16GB-class run, an RTX 5080 with 64GB, at 27.5–29 [32].
-- **A 30B MoE streaming its experts.** Qwen3-30B-A3B at Q8_0 ×20 prefills at **6,139.1 t/s** on the laptop with its experts streaming through the three-tier cache.
-- **A 35B MoE serving sixteen users.** Qwen3.5-35B-A3B and Qwen3.6-35B-A3B at Q6_K — ~28GB of weights on a 16GB card — serve ×16 at **330.8 and 336.7 t/s aggregate** with C10 at 7.01× and 6.42×, every session validated. The published 16GB runs of these models are single-stream, at smaller quants that fit resident [38].
-- **A small model at workstation rate.** Qwen3.5-0.8B at C8 ×32 prefills at **46,056.8 t/s** and decodes at **3,810.7 t/s aggregate** — above the 24GB RTX 3090's 42,982.2 t/s on the same rung, on a card with half the memory and the same ~12 GB/s host link.
+- **A 180B model.** Qwen3.8-Flash-Next (a 125B trunk of 512 experts, a 51B n-gram table and a 4B MTP head; 6B active) runs from a ~88 GB Q2_KO-expert artifact, streaming VRAM → pinned RAM → NVMe, every rung validating 8/8. One session prefills at 269.1 t/s and decodes at 34.9; eight decode at **108.5 t/s aggregate**, and C10 at 5.79–5.82× costs 6.6% of that. Every published single-GPU run that states its host uses 64–128 GB of RAM: an RTX 5090 with 128 GB decodes one stream at 48.02 t/s [42], an RTX 5080 with 64 GB at 27.5–29 [32].
+- **A 30B MoE streaming its experts** prefills at **6,139.1 t/s** (Qwen3-30B-A3B, Q8_0 ×20).
+- **A 35B MoE serving sixteen.** Qwen3.5- and Qwen3.6-35B-A3B at Q6_K, ~28 GB of weights, serve ×16 at **330.8 and 336.7 t/s aggregate**, C10 at 7.01× and 6.42×. Published 16 GB runs are single-stream at quants that fit resident [38].
+- **A small model at workstation rate.** Qwen3.5-0.8B at C8 ×32 prefills at **46,056.8 t/s** and decodes at **3,810.7 t/s aggregate**, above the RTX 3090's 42,982.2 on the same rung.
 
-C10 compresses the 35B to 7.01× on the laptop and 7.03× on the RTX 3090, and Qwen3.6-35B to 6.42× and 6.45×; the same selector, the same thresholds, making the same decisions on two different GPUs and two different PCIe links. The selector's per-model thresholds are the only thing that varies between the cards, and they vary by model family, not by silicon.
+C10 compresses the 35B to 7.01× on the laptop and 7.03× on the RTX 3090: the same selector and thresholds make the same decisions on different GPUs and links.
 
 #### 9.6.6 A 284B model on one GPU
 
 DeepSeek-V4-Flash (284B total, 13B active) on one RTX PRO 5000 72GB, sixteen concurrent sessions: **1,177.1 t/s prefill and 114.4 t/s aggregate decode**, build `21c36efbd`. The best published single-GPU prefill for the model is 748.4 t/s (RTX PRO 6000 Max-Q, all experts on the CPU, 8K) [43], and the best published single-GPU decode is 28 t/s (RTX 5090, KTransformers + SGLang, INT4 experts on the CPU) [44] — every published run holding the routed experts in host RAM, as this one does. The aggregate is 4.1× that decode, and the prefill is above every published single-GPU figure for the model.
 #### 9.6.7 Where published engines lead
 
-Single-stream decode on a model that fits wholly in VRAM is llama.cpp's strength: on a 16GB card, a 3-bit Qwen3.6-35B-A3B that fits resident decodes one stream at 183.29 t/s (249.33 with MTP) [38], where this engine's sixteen-session aggregate with Q6_K experts streamed is 336.7 — more work in total, less per stream. vLLM prefills Qwen3.6-35B-A3B at 41,105 t/s on an RTX PRO 6000 [41], against ~7,200 here at one session.
+Single-stream decode on a model that fits wholly in VRAM is llama.cpp's strength: a 3-bit Qwen3.6-35B-A3B resident on a 16 GB card decodes one stream at 183.29 t/s (249.33 with MTP) [38], where our sixteen-session aggregate with Q6_K experts streamed is 336.7 — more work in total, less per stream. vLLM prefills Qwen3.6-35B-A3B at 41,105 t/s on an RTX PRO 6000 [41], against ~7,200 here at one session. Against Strata's RTX 5090 single-session benchmark, replayed through the conversation engine at C5 (`kv_fragmentation::qwen38_flash_next_strata`, median of three), ours leads prefill at 4K — 6,064.3 t/s against 4,269.8 — and trails decode: 168.4 / 159.1 / 125.3 t/s against 179.4 / 175.7 / 165.0 at 4K / 32K / 128K, 82–95% of Strata to 32K and 69–76% at 128K. Strata has a PCIe 5.0 card and a dedicated CUDA graph path; here one segment submission per MoE layer is the floor.
 
-The closest published head-to-head is Strata's RTX 5090 single-session benchmark, replayed on this engine through the conversation engine at C5 as a daemon runs it (`kv_fragmentation::qwen38_flash_next_strata`, median of three runs, warm-up excluded). Ours leads prefill at 4K — 6,064.3 t/s against Strata's 4,269.8 — and trails on decode: 168.4 / 159.1 / 125.3 t/s against Strata's 179.4 / 175.7 / 165.0 at 4K / 32K / 128K, i.e. 82–95% of Strata at 4K and 32K and 69–76% at 128K, with a fastest single run of 181.9 t/s at 4K above Strata's median there. Strata runs on a PCIe 5.0 RTX 5090 with a dedicated CUDA graph path; this engine runs on a workstation card, where one segment submission per MoE layer is the floor. Both mark directions for the next version of the kernels; neither changes the architecture's claim, which is about how much one card can serve, from how large a model, at how much context — and Strata's published run is single-session.
 #### 9.6.8 Output fidelity against depth
 
-The throughput rows say compression is cheap; they do not say how much it moves the output, or whether that grows with what a step reads. This gate measures it directly (`batch_test::fidelity`; `docs/results/theorem_depth_tests_2026-11-10.md`). At each depth a needle prompt — four codes of random characters spread through the long-context filler, asked back at the end — is prefilled, sealed at the mode's level as the substrate seals a turn, and the answer read back teacher-forced, so every mode is compared with BF16 over the same prefix at every step. RTX PRO 5000, the card alone:
+Throughput says compression is cheap, not how far it moves the output or whether that grows with what a step reads. At each depth a needle prompt — four random codes spread through filler, asked back at the end — is prefilled, sealed at the mode's level, and the answer read back teacher-forced against BF16 over the same prefix (`batch_test::fidelity`; `docs/results/theorem_depth_tests_2026-11-10.md`).
 
-| Model, attention | Mode | ~4K | ~16K | ~64K | ~124K |
-|---|---|---:|---:|---:|---:|
-| Qwen3-8B, full (to 32K) | C10 mean KL, nats | 3.2e-2 | 1.1e-2 | 3.9e-2 (32K) | — |
-| Qwen3.5-9B, whole prefix | C10 mean KL | 6.5e-3 | 1.2e-3 | 1.7e-3 | 3.5e-3 |
-| Qwen3.5-9B | C5 mean KL | 6.6e-3 | 1.0e-3 | 9.4e-4 | 3.6e-3 |
-| Flash-Next, QSA-selected | C10 mean KL | 5.9e-2 | 3.0e-2 | 1.08e-1 | 1.16e-1 |
-| Flash-Next | C5 mean KL | 9.8e-3 | 1.1e-2 | 2.1e-2 | 7.6e-3 |
+<figure class="fig">
+<svg viewBox="0 0 640 246" role="img" aria-label="Figure 9.6-3. Mean KL divergence from BF16, in nats, against context depth, RTX PRO 5000. Flash-Next at C10: 5.9e-2 at 4K, 3.0e-2 at 16K, 1.08e-1 at 64K, 1.16e-1 at 124K. Flash-Next at C5: 9.8e-3, 1.1e-2, 2.1e-2, 7.6e-3. Qwen3.5-9B at C10: 6.5e-3, 1.2e-3, 1.7e-3, 3.5e-3. Qwen3.5-9B at C5: 6.6e-3, 1.0e-3, 9.4e-4, 3.6e-3. Qwen3-8B at C10 to 32K: 3.2e-2, 1.1e-2, 3.9e-2.">
+  <text class="ttl" x="16" y="20">Figure 9.6-3 · Divergence from BF16 does not grow with depth</text>
+  <text class="ttl-sub" x="16" y="36">mean KL, nats, teacher-forced needle answer · log scales · amber: C10 · green: C5</text>
+  <path class="grid" d="M210 197.5 H600 M210 136 H600 M210 74.5 H600"/>
+  <path class="grid base" d="M210 52 V216"/>
+  <text class="tick" x="204" y="200.5" text-anchor="end">1e-3</text>
+  <text class="tick" x="204" y="139" text-anchor="end">1e-2</text>
+  <text class="tick" x="204" y="77.5" text-anchor="end">1e-1</text>
+  <path class="line-them" d="M220 88.6 L340 106.7 L460 72.5 L517.2 70.5"/>
+  <path class="line-us" d="M220 136.5 L340 133.5 L460 116.2 L517.2 143.3"/>
+  <path class="line-us dash" d="M220 147.5 L340 192.6 L460 183.3 L517.2 164"/>
+  <path class="line-us" opacity=".45" d="M220 147.1 L340 197.5 L460 199.1 L517.2 163.3"/>
+  <path class="line-them dash" d="M220 104.9 L340 133.5 L400 99.7"/>
+  <text class="t-them" x="525" y="74.5">Flash-Next C10</text>
+  <text class="t-flat" x="525" y="147">Flash-Next C5</text>
+  <text class="t-flat" x="525" y="160">Qwen3.5-9B C10</text>
+  <text class="t-flat" x="525" y="172" opacity=".6">Qwen3.5-9B C5</text>
+  <text class="t-them" x="404" y="112">Qwen3-8B C10, to 32K</text>
+  <text class="tick mid" x="220" y="232">4K</text>
+  <text class="tick mid" x="340" y="232">16K</text>
+  <text class="tick mid" x="400" y="232">32K</text>
+  <text class="tick mid" x="460" y="232">64K</text>
+  <text class="tick mid" x="517.2" y="232">124K</text>
+</svg>
+</figure>
 
-Top-1 agreement with BF16 is 95.8–100% in every cell; the run-to-run spread is 0 on the 8B and 9B and at most 4.3e-5 on Flash-Next. On the models whose attention reads the whole prefix, the divergence does not grow with depth across a 30× range — the exposure §11.2 bounds grows, the output error does not (§11.1). On Flash-Next at C5, the level production seals everything at (§9.6.9), the divergence stays flat from 4K to 124K, as at near-lossless C0; the top level, C10, is the one cell that grows — about 2× over the same range — and is the price of its extra compression on a model whose attention selects.
+Top-1 agreement with BF16 is 95.8–100% in every cell, with run-to-run spread 0 on the 8B and 9B and at most 4.3e-5 on Flash-Next. Where attention reads the whole prefix, divergence does not grow across a 30× range of depth: the exposure §11.2 bounds grows, the output error does not (§11.1). On Flash-Next at C5, the level production seals at, it stays flat from 4K to 124K; C10 is the one series that grows, about 2×, the price of its extra compression on a model whose attention selects.
 
 #### 9.6.9 Memory: what keeps a large context on one card
 
-The one-card design rests on two savings. The native kernels keep the weights at their stored size (§8.1), and adaptive per-block quantization (§5) keeps every sealed block at the format its own error allows. Both leave the card to the context.
+The native kernels keep weights at their stored size (§8.1) and per-block quantization keeps every sealed block at the format its own error allows (§5); both leave the card to the context. On Flash-Next the batched forward gate (`docs/performance.md` §3.6, RTX PRO 5000, every row validated) reads, per level:
 
-**The ladder on Flash-Next.** The batched forward gate (`batch_test`, `docs/performance.md` §3.6) on the RTX PRO 5000 reports, per compression level, the float-equivalent bytes over the bytes held — every row validated:
+| Level | Compression | Prefill ×2 (t/s) | Decode ×2 (t/s) |
+|---|---:|---:|---:|
+| C0 | 2.22× | 5,033.6 | 468.9 |
+| C5 | 4.15× | 5,903.2 | 466.8 |
+| C8 | 5.52× | 5,942.2 | 436.2 |
+| C10 | 7.14× | 5,936.9 | 429.8 |
 
-| Level | Compression | Prefill ×2 (t/s) | Decode ×2 (t/s) | Tokens per GiB of KV, against BF16 |
-|---|---:|---:|---:|---:|
-| BF16 | 1.00× | — | — | 1.00× |
-| C0 | 2.22× | 5,033.6 | 468.9 | 2.22× |
-| C5 | 4.15× | 5,903.2 | 466.8 | 4.15× |
-| C8 | 5.52× | 5,942.2 | 436.2 | 5.52× |
-| C10 | 7.14× | 5,936.9 | 429.8 | 7.14× |
+From C0 to C10 the cache shrinks 3.2× further for 8% of decode; C5, the level everything is sealed at, holds 4.15× the tokens of BF16 at C0's throughput.
 
-From C0 to C10 the cache shrinks 3.2× further for 8% of decode, and C5 — the level the dialogue seals at — holds 4.15× the tokens BF16 would in the same ground at the same throughput as near-lossless C0.
+**The substrate.** The dialogue and every ingest layer seal at C5. On 2026-11-23 BlackWorld's redo log held 103 segments, 409 GiB, ≈ 8.0 KB on disk per resident token with every record included; the galleries held 54.7M signature tokens over 29,747 turns and 7,830 code files. The K/V census (`GET /v1/kv/census`, `docs/results/battery_128/census_start_5470.json`) — exact chunk bytes from the chunk index, the sub-band format mix from a 4,096-chunk sample — finds 16,006,522 chunks holding 504.9M layer-tokens, 42.1M tokens over Flash-Next's 12 K/V layers, in 275.3 GiB of K/V standing for 976.7 GiB at BF16: **3.55×**. By lead format 68.7% of chunks are Q4_0, 18.8% Q4_1, 10.5% Q5_0 and 1.3% Q8_0; 46% of the V sub-bands are Q1_S, Q2_A or Q2_S, while no K sub-band falls below Q4_0.
 
-**The substrate.** Everything the engine remembers is sealed at C5 — the dialogue (`ModelBuilder::compression_level(5)`) and every ingest layer, the code reading among them (`repo_scan::utility_config`) — so the whole memory is held at 4.15× its full-precision size before any eviction or tiering applies. BlackWorld's store on 2026-11-23:
+**The span.** The daemon reserves one contiguous span per card and divides it between persistent tensors, KV regions, a per-wave transient tier and expert weights, with an elastic boundary between the KV side and the experts (§10.2; Figure 9.6-4). Behind it the warm tier holds 14.4 GiB of payload in host RAM.
 
-| The substrate, 2026-11-23 | |
-|---|---:|
-| Redo log on disk | 103 segments, 409 GiB |
-| Signature tokens resident in the galleries | 54.7M, over 29,747 turns |
-| Code files read | 7,830 |
-| Sealing level, dialogue and every ingest layer | C5 |
-| C5 against BF16 on Flash-Next (the forward gate above) | 4.15× |
-| Bytes on disk per resident token, every record included | ≈ 8.0 KB |
+<figure class="fig">
+<svg viewBox="0 0 640 128" role="img" aria-label="Figure 9.6-4. BlackWorld's 68.1 GiB span at rest with Flash-Next loaded: expert zone 51.0 GiB, dense weights 5.3, recurrent state 4.9, and 6.9 GiB for the KV side, the transient tier and held index pages.">
+  <text class="ttl" x="16" y="20">Figure 9.6-4 · The span at rest</text>
+  <text class="ttl-sub" x="16" y="36">BlackWorld, 72 GB card, Flash-Next · 68.1 GiB · the boundary between KV and experts moves under load</text>
+  <rect class="b0" x="16" y="50" width="448.4" height="32"/>
+  <rect class="b1" x="465.4" y="50" width="45.7" height="32"/>
+  <rect class="b2" x="512.1" y="50" width="42.2" height="32"/>
+  <rect class="q2" x="555.3" y="50" width="60.7" height="32"/>
+  <path class="parity" d="M555.3 44 V88"/>
+  <text class="t-lbl" x="24" y="71">Expert zone · 51.0 GiB</text>
+  <text class="tick mid" x="488.3" y="100">dense 5.3</text>
+  <text class="tick mid" x="533.2" y="114">state 4.9</text>
+  <text class="tick mid" x="585.7" y="100">KV side 6.9</text>
+  <text class="t-them" x="551" y="126" text-anchor="end">elastic boundary →</text>
+</svg>
+</figure>
 
-The log holds every record of every token — its K/V at C5, its 192-byte signature, its token id, its index page — and the same memory at BF16 would need the K/V share of it 4.15 times over. The format census — the share of the substrate's K/V bytes in each format, and its K/V bytes against their BF16 equivalent — is read from the serving daemon at the battery's start (`GET /v1/kv/census`, `docs/results/battery_128/census_start_5470.json`): every live chunk's stored bytes and tokens exactly, from the substrate's chunk index, and the per-sub-band format mix and BF16 ratio from the metadata heads of a 4,096-chunk uniform sample. 16,006,522 chunks hold 504.9M layer-tokens — 42.1M tokens over Flash-Next's 12 K/V layers — in 275.3 GiB of K/V, standing for 976.7 GiB at BF16 — an effective 3.55×. By lead format, 68.7% of the chunks are Q4_0, 18.8% Q4_1, 10.5% Q5_0, 1.3% Q8_0; in the sample, 46% of the V sub-bands are Q1_S, Q2_A or Q2_S, where no K sub-band falls below Q4_0.
+**Under load.** The battery's load is sampled every five seconds from `/v1/telemetry` and `/v1/memory` beside the answers in flight (`docs/results/battery_128/fig_9_6_telemetry.csv`, 6,786 loaded samples). VRAM is the newest wave's accounting by tenant; the tokens are the format census of every VRAM-resident residence, a token counted once across its layers; their BF16 size is 24.9 KB a token, 2,076 bytes a layer over 12 K/V layers. The KV figure is the arenas the span holds, at least the payload in them, so compression against it is a floor.
 
-**The span, live.** The production daemon reserves one contiguous span per card and divides it between persistent tensors, KV regions, a per-wave transient tier and expert weights, with an elastic boundary between the KV side and the experts (§10.2). BlackWorld's accounting at rest, from `/v1/memory` on 2026-11-23 — Flash-Next, the 72 GB card:
+<figure class="fig">
+<svg viewBox="0 0 640 324" role="img" aria-label="Figure 9.6-5. The card's memory by tenant over the battery's 10.2 hours, stacked, in GiB: dense 5.3 GiB on average, 5.3 at peak, experts 36.0 GiB on average, 50.1 at peak, KV 6.2 GiB on average, 11.2 at peak, activations 0.4 GiB on average, 3.7 at peak, state 15.5 GiB on average, 23.1 at peak; with 8.5 answers in flight on average and 16 at most.">
+  <text class="ttl" x="16" y="20">Figure 9.6-5 · The card under the battery</text>
+  <text class="ttl-sub" x="16" y="38">GiB each tenant of the span held, stacked · answers in flight on the right scale</text>
+  <path class="grid" d="M56 250.3 H584 M56 220.6 H584 M56 190.9 H584 M56 161.1 H584 M56 131.4 H584 M56 101.7 H584 M56 72 H584"/>
+  <text class="tick" x="48" y="283.5" text-anchor="end">0</text>
+  <text class="tick" x="48" y="253.8" text-anchor="end">10</text>
+  <text class="tick" x="48" y="224.1" text-anchor="end">20</text>
+  <text class="tick" x="48" y="194.4" text-anchor="end">30</text>
+  <text class="tick" x="48" y="164.6" text-anchor="end">40</text>
+  <text class="tick" x="48" y="134.9" text-anchor="end">50</text>
+  <text class="tick" x="48" y="105.2" text-anchor="end">60</text>
+  <text class="tick" x="48" y="75.5" text-anchor="end">70</text>
+  <path class="grid base" d="M56 280 H584"/>
+  <path class="grid" d="M56 72 V280 M144 72 V280 M232 72 V280 M320 72 V280 M408 72 V280 M496 72 V280 M584 72 V280"/>
+  <text class="tick mid" x="56" y="296">0</text>
+  <text class="tick mid" x="144" y="296">2</text>
+  <text class="tick mid" x="232" y="296">4</text>
+  <text class="tick mid" x="320" y="296">6</text>
+  <text class="tick mid" x="408" y="296">8</text>
+  <text class="tick mid" x="496" y="296">10</text>
+  <text class="tick mid" x="584" y="296">12</text>
+  <text class="t-dim mid" x="320" y="314">hours into the battery</text>
+  <path class="q4" d="M58 264 503 264 503 280 58 280 Z"/>
+  <path class="q1" d="M58 158 63 177 68 179 72 181 100 181 105 175 110 161 114 161 119 163 124 163 129 166 147 166 152 169 157 170 183 170 219 136 222 142 227 143 231 141 236 148 241 149 246 149 250 152 255 151 260 152 264 152 269 150 274 147 278 148 283 156 288 162 292 162 297 164 302 173 306 171 311 171 316 169 320 160 325 154 330 153 334 155 344 157 348 157 353 147 358 146 367 164 372 158 377 144 381 150 386 148 391 152 395 150 400 147 405 142 409 144 414 150 419 143 423 145 428 146 433 145 437 146 442 144 447 144 451 147 456 144 461 145 465 145 470 146 475 148 479 149 484 145 489 145 493 146 498 149 503 149 503 264 58 264 Z"/>
+  <path class="b0" d="M58 139 63 152 68 156 72 158 77 159 82 159 86 154 91 155 96 157 100 159 105 156 110 144 114 145 119 147 124 146 129 144 133 148 138 148 143 150 147 148 152 148 157 151 171 151 175 153 180 150 183 155 219 123 222 126 227 128 231 125 236 129 241 131 246 132 250 132 255 131 260 134 264 135 269 133 274 130 278 130 283 139 288 146 292 145 297 147 302 156 306 152 311 151 316 147 320 142 325 138 330 136 334 137 339 136 344 140 348 139 353 129 358 129 362 136 367 146 372 144 377 127 381 131 386 132 391 135 395 131 400 129 405 126 409 127 414 130 419 126 423 128 428 127 433 127 437 128 442 127 447 128 461 128 465 127 470 128 475 130 479 130 489 126 493 128 498 130 503 131 503 149 498 149 493 146 489 145 484 145 479 149 475 148 470 146 465 145 461 145 456 144 451 147 447 144 442 144 437 146 433 145 428 146 423 145 419 143 414 150 409 144 405 142 400 147 395 150 391 152 386 148 381 150 377 144 372 158 367 164 358 146 353 147 348 157 344 157 334 155 330 153 325 154 320 160 316 169 311 171 306 171 302 173 297 164 292 162 288 162 283 156 278 148 274 147 269 150 264 152 260 152 255 151 250 152 246 149 241 149 236 148 231 141 227 143 222 142 219 136 183 170 157 170 152 169 147 166 129 166 124 163 119 163 114 161 110 161 105 175 100 181 72 181 68 179 63 177 58 158 Z"/>
+  <path class="q2" d="M58 137 63 150 68 153 72 155 77 155 82 157 86 153 96 153 100 156 105 153 110 142 114 143 119 144 129 142 133 144 138 147 143 148 147 146 152 146 157 148 161 149 166 149 171 148 175 151 180 149 183 153 219 122 222 125 227 127 231 125 241 131 255 131 260 134 264 134 269 133 274 130 278 129 283 138 288 144 292 144 297 146 302 154 306 151 311 150 316 146 325 137 330 135 334 136 339 135 344 139 348 138 353 129 358 129 362 135 367 145 372 143 377 126 381 130 386 132 391 133 395 130 405 126 409 126 414 130 419 126 423 127 433 127 437 128 442 127 447 128 451 127 456 127 461 128 465 126 475 130 479 129 484 127 489 126 493 127 498 129 503 130 503 131 498 130 493 128 489 126 479 130 475 130 470 128 465 127 461 128 447 128 442 127 437 128 433 127 428 127 423 128 419 126 414 130 409 127 405 126 400 129 395 131 391 135 386 132 381 131 377 127 372 144 367 146 362 136 358 129 353 129 348 139 344 140 339 136 334 137 330 136 325 138 320 142 316 147 311 151 306 152 302 156 297 147 292 145 288 146 283 139 278 130 274 130 269 133 264 135 260 134 255 131 250 132 246 132 241 131 236 129 231 125 227 128 222 126 219 123 183 155 180 150 175 153 171 151 157 151 152 148 147 148 143 150 138 148 133 148 129 144 124 146 119 147 114 145 110 144 105 156 100 159 96 157 91 155 86 154 82 159 77 159 72 158 68 156 63 152 58 139 Z"/>
+  <path class="b3" d="M58 87 63 92 68 92 72 94 77 94 82 102 86 104 91 104 96 97 100 103 105 101 110 93 119 93 124 92 129 90 133 90 138 95 143 97 147 94 152 90 157 92 161 94 166 96 171 95 175 97 180 97 183 101 219 85 222 86 227 88 231 86 246 89 250 89 255 88 260 93 264 94 269 93 274 90 278 87 283 88 288 93 292 92 297 90 302 95 306 97 311 102 316 102 320 98 325 94 330 91 339 91 344 90 348 91 353 88 358 88 362 87 367 94 372 91 377 87 381 90 386 88 391 88 395 90 400 89 405 87 409 87 414 89 419 87 428 87 433 88 437 89 442 88 451 88 456 87 461 88 465 87 470 88 475 90 479 89 484 89 489 87 493 88 498 89 503 88 503 130 498 129 493 127 489 126 484 127 479 129 475 130 465 126 461 128 456 127 451 127 447 128 442 127 437 128 433 127 423 127 419 126 414 130 409 126 405 126 395 130 391 133 386 132 381 130 377 126 372 143 367 145 362 135 358 129 353 129 348 138 344 139 339 135 334 136 330 135 325 137 316 146 311 150 306 151 302 154 297 146 292 144 288 144 283 138 278 129 274 130 269 133 264 134 260 134 255 131 241 131 231 125 227 127 222 125 219 122 183 153 180 149 175 151 171 148 166 149 161 149 157 148 152 146 147 146 143 148 138 147 133 144 129 142 119 144 114 143 110 142 105 153 100 156 96 153 86 153 82 157 77 155 72 155 68 153 63 150 58 137 Z"/>
+  <text class="tick t-them" x="592" y="283.5">0</text>
+  <text class="tick t-them" x="592" y="231.5">4</text>
+  <text class="tick t-them" x="592" y="179.5">8</text>
+  <text class="tick t-them" x="592" y="127.5">12</text>
+  <text class="tick t-them" x="592" y="75.5">16</text>
+  <path class="line-them" d="M58 72 77 72 82 104 86 176 498 176 503 180"/>
+  <text class="tick" x="48" y="60" text-anchor="end">GiB</text>
+  <text class="tick t-them" x="592" y="60">in flight</text>
+  <g class="legend">
+  <rect class="q4" x="56" y="50" width="10" height="10"/>
+  <text x="74" y="58">dense</text>
+  <rect class="q1" x="121" y="50" width="10" height="10"/>
+  <text x="139" y="58">experts</text>
+  <rect class="b0" x="198.4" y="50" width="10" height="10"/>
+  <text x="216.4" y="58">KV</text>
+  <rect class="q2" x="244.8" y="50" width="10" height="10"/>
+  <text x="262.8" y="58">activations</text>
+  <rect class="b3" x="347" y="50" width="10" height="10"/>
+  <text x="365" y="58">state</text>
+  <path class="line-them" d="M412 55 H426"/>
+  <text x="430" y="58">answers in flight</text>
+  </g>
+</svg>
+</figure>
 
-| Tenant | GiB |
-|---|---:|
-| The span | 68.1 |
-| Expert zone | 51.0 |
-| Dense weights | 5.3 |
-| Recurrent state | 4.9 |
-| Held (index pages, pinned ranges) | 0.3 |
-| Warm tier resident in RAM / held payload | 0.5 / 14.4 |
+<figure class="fig">
+<svg viewBox="0 0 640 324" role="img" aria-label="Figure 9.6-6. The share of the resident K/V tokens each format held over the battery, stacked to 100%; over the whole run: Q1_S 14.0%, Q3_0 13.3%, Q4_0 22.2%, Q4_1 8.4%, Q5_0 10.5%, Q8_0 11.4%, other 20.3%.">
+  <text class="ttl" x="16" y="20">Figure 9.6-6 · The format mix does not move with load</text>
+  <text class="ttl-sub" x="16" y="38">share of the resident tokens held in each K/V format, per 32-token block</text>
+  <path class="grid" d="M56 228 H584 M56 176 H584 M56 124 H584 M56 72 H584"/>
+  <text class="tick" x="48" y="283.5" text-anchor="end">0%</text>
+  <text class="tick" x="48" y="231.5" text-anchor="end">25%</text>
+  <text class="tick" x="48" y="179.5" text-anchor="end">50%</text>
+  <text class="tick" x="48" y="127.5" text-anchor="end">75%</text>
+  <text class="tick" x="48" y="75.5" text-anchor="end">100%</text>
+  <path class="grid base" d="M56 280 H584"/>
+  <path class="grid" d="M56 72 V280 M144 72 V280 M232 72 V280 M320 72 V280 M408 72 V280 M496 72 V280 M584 72 V280"/>
+  <text class="tick mid" x="56" y="296">0</text>
+  <text class="tick mid" x="144" y="296">2</text>
+  <text class="tick mid" x="232" y="296">4</text>
+  <text class="tick mid" x="320" y="296">6</text>
+  <text class="tick mid" x="408" y="296">8</text>
+  <text class="tick mid" x="496" y="296">10</text>
+  <text class="tick mid" x="584" y="296">12</text>
+  <text class="t-dim mid" x="320" y="314">hours into the battery</text>
+  <path class="q4" d="M58 251 63 250 68 250 72 253 77 252 82 247 86 249 91 253 96 255 100 252 105 250 110 252 114 249 119 248 129 248 133 249 138 251 143 252 147 250 152 251 161 251 166 247 171 247 175 250 180 252 183 254 219 252 222 252 227 251 231 253 236 248 241 252 246 252 250 254 255 252 260 252 264 253 269 250 274 251 278 252 283 252 288 249 292 251 297 251 302 254 306 255 311 252 316 252 320 251 325 255 330 250 334 252 339 255 344 251 348 247 353 246 358 248 362 249 367 248 372 251 377 251 381 252 386 251 391 252 395 252 400 251 405 249 409 251 414 253 419 250 423 251 428 250 433 254 437 253 442 249 447 252 451 251 456 255 461 253 465 251 470 250 475 251 479 251 484 252 489 250 493 252 498 248 503 251 503 280 58 280 Z"/>
+  <path class="q3" d="M58 223 63 222 68 222 72 225 77 224 82 220 86 221 91 225 96 226 100 224 105 223 110 224 114 221 129 221 133 222 143 224 147 223 152 224 157 223 161 223 166 220 171 220 175 223 180 224 183 226 219 224 222 224 227 223 231 225 236 221 241 224 246 224 250 226 255 224 260 224 264 225 269 222 274 223 278 224 283 224 288 222 292 223 297 223 302 226 306 227 311 224 316 224 320 223 325 226 330 223 334 224 339 226 344 224 348 220 353 219 358 221 367 221 372 223 377 223 381 224 386 223 391 224 395 224 405 222 409 223 414 225 419 222 423 223 428 223 433 226 437 224 442 221 447 224 451 223 456 226 461 225 465 223 470 222 475 224 479 223 484 224 489 223 493 224 498 221 503 223 503 251 498 248 493 252 489 250 484 252 479 251 475 251 470 250 465 251 461 253 456 255 451 251 447 252 442 249 437 253 433 254 428 250 423 251 419 250 414 253 409 251 405 249 400 251 395 252 391 252 386 251 381 252 377 251 372 251 367 248 362 249 358 248 353 246 348 247 344 251 339 255 334 252 330 250 325 255 320 251 316 252 311 252 306 255 302 254 297 251 292 251 288 249 283 252 278 252 274 251 269 250 264 253 260 252 255 252 250 254 246 252 241 252 236 248 231 253 227 251 222 252 219 252 183 254 180 252 175 250 171 247 166 247 161 251 152 251 147 250 143 252 138 251 133 249 129 248 119 248 114 249 110 252 105 250 100 252 96 255 91 253 86 249 82 247 77 252 72 253 68 250 63 250 58 251 Z"/>
+  <path class="b0" d="M58 177 63 175 68 175 72 180 77 178 82 171 86 174 91 180 96 182 100 178 105 176 110 178 114 174 124 172 129 173 133 175 143 179 147 176 152 178 157 177 161 177 166 172 171 171 175 176 180 178 183 182 219 179 222 179 227 177 231 180 236 173 241 179 246 178 250 182 255 178 260 178 264 179 269 175 274 177 278 178 283 179 288 175 292 176 297 177 302 181 306 183 311 179 316 179 320 177 325 182 330 176 334 178 339 182 344 178 348 171 353 171 358 174 362 174 367 173 372 177 377 177 381 179 386 177 391 178 395 178 400 177 405 175 409 177 414 180 419 175 423 177 428 176 433 181 437 179 442 173 447 178 451 177 456 182 461 180 465 177 470 175 475 177 479 177 484 178 489 177 493 178 498 173 503 177 503 223 498 221 493 224 489 223 484 224 479 223 475 224 470 222 465 223 461 225 456 226 451 223 447 224 442 221 437 224 433 226 428 223 423 223 419 222 414 225 409 223 405 222 395 224 391 224 386 223 381 224 377 223 372 223 367 221 358 221 353 219 348 220 344 224 339 226 334 224 330 223 325 226 320 223 316 224 311 224 306 227 302 226 297 223 292 223 288 222 283 224 278 224 274 223 269 222 264 225 260 224 255 224 250 226 246 224 241 224 236 221 231 225 227 223 222 224 219 224 183 226 180 224 175 223 171 220 166 220 161 223 157 223 152 224 147 223 143 224 133 222 129 221 114 221 110 224 105 223 100 224 96 226 91 225 86 221 82 220 77 224 72 225 68 222 63 222 58 223 Z"/>
+  <path class="q1" d="M58 159 63 158 68 158 72 163 77 161 82 154 86 157 91 162 96 165 100 161 105 158 110 160 114 156 119 155 129 155 133 157 138 160 143 161 147 159 152 161 157 160 161 159 166 155 171 154 175 159 180 161 183 164 219 161 222 161 227 159 231 162 236 155 241 161 246 161 250 164 255 161 260 161 264 162 269 158 274 159 278 161 283 161 288 158 292 159 297 159 302 164 306 165 311 161 316 161 320 160 325 165 330 159 334 161 339 165 344 161 348 154 353 153 358 156 367 156 372 160 377 160 381 161 386 159 391 161 395 160 400 160 405 157 409 160 414 162 419 158 423 159 428 159 433 163 437 162 442 156 447 160 451 159 456 164 461 162 465 159 470 158 475 160 479 159 484 161 489 159 493 161 498 156 503 159 503 177 498 173 493 178 489 177 484 178 479 177 475 177 470 175 465 177 461 180 456 182 451 177 447 178 442 173 437 179 433 181 428 176 423 177 419 175 414 180 409 177 405 175 400 177 395 178 391 178 386 177 381 179 377 177 372 177 367 173 362 174 358 174 353 171 348 171 344 178 339 182 334 178 330 176 325 182 320 177 316 179 311 179 306 183 302 181 297 177 292 176 288 175 283 179 278 178 274 177 269 175 264 179 260 178 255 178 250 182 246 178 241 179 236 173 231 180 227 177 222 179 219 179 183 182 180 178 175 176 171 171 166 172 161 177 157 177 152 178 147 176 143 179 133 175 129 173 124 172 114 174 110 178 105 176 100 178 96 182 91 180 86 174 82 171 77 178 72 180 68 175 63 175 58 177 Z"/>
+  <path class="b2" d="M58 138 63 137 68 137 72 139 77 138 82 136 86 137 91 139 96 140 100 138 105 137 110 138 114 136 129 136 133 137 138 138 147 138 152 139 157 138 161 138 166 136 171 136 175 138 180 138 183 139 219 138 227 138 231 139 236 136 241 138 246 138 250 139 255 138 260 138 264 139 269 137 274 138 283 138 288 137 292 138 297 138 302 139 306 140 311 138 320 138 325 140 330 138 334 138 339 140 344 138 348 136 353 136 358 137 367 137 372 138 400 138 405 137 409 138 414 139 419 137 423 138 428 137 433 139 437 138 442 136 447 138 451 138 456 139 461 139 465 138 470 137 475 138 484 138 489 137 493 138 498 136 503 137 503 159 498 156 493 161 489 159 484 161 479 159 475 160 470 158 465 159 461 162 456 164 451 159 447 160 442 156 437 162 433 163 428 159 423 159 419 158 414 162 409 160 405 157 400 160 395 160 391 161 386 159 381 161 377 160 372 160 367 156 358 156 353 153 348 154 344 161 339 165 334 161 330 159 325 165 320 160 316 161 311 161 306 165 302 164 297 159 292 159 288 158 283 161 278 161 274 159 269 158 264 162 260 161 255 161 250 164 246 161 241 161 236 155 231 162 227 159 222 161 219 161 183 164 180 161 175 159 171 154 166 155 161 159 157 160 152 161 147 159 143 161 138 160 133 157 129 155 119 155 114 156 110 160 105 158 100 161 96 165 91 162 86 157 82 154 77 161 72 163 68 158 63 158 58 159 Z"/>
+  <path class="q2" d="M58 114 68 114 72 115 77 114 82 112 86 113 91 115 96 116 100 114 110 114 114 113 133 113 143 115 147 114 152 115 157 114 161 114 171 112 175 114 180 114 183 115 219 115 222 114 227 114 231 115 236 113 241 115 246 114 250 116 255 114 260 115 264 115 269 114 278 114 283 115 288 114 297 114 302 115 306 116 311 115 316 115 320 114 325 116 330 114 334 115 339 116 344 114 348 113 353 112 358 113 367 113 372 114 377 114 381 115 386 114 391 115 395 114 400 114 405 113 409 114 414 115 419 114 428 114 433 115 437 115 442 113 447 114 451 114 456 116 461 115 465 114 493 114 498 113 503 114 503 137 498 136 493 138 489 137 484 138 475 138 470 137 465 138 461 139 456 139 451 138 447 138 442 136 437 138 433 139 428 137 423 138 419 137 414 139 409 138 405 137 400 138 372 138 367 137 358 137 353 136 348 136 344 138 339 140 334 138 330 138 325 140 320 138 311 138 306 140 302 139 297 138 292 138 288 137 283 138 274 138 269 137 264 139 260 138 255 138 250 139 246 138 241 138 236 136 231 139 227 138 219 138 183 139 180 138 175 138 171 136 166 136 161 138 157 138 152 139 147 138 138 138 133 137 129 136 114 136 110 138 105 137 100 138 96 140 91 139 86 137 82 136 77 138 72 139 68 137 63 137 58 138 Z"/>
+  <path class="b3" d="M58 72 503 72 503 114 498 113 493 114 465 114 461 115 456 116 451 114 447 114 442 113 437 115 433 115 428 114 419 114 414 115 409 114 405 113 400 114 395 114 391 115 386 114 381 115 377 114 372 114 367 113 358 113 353 112 348 113 344 114 339 116 334 115 330 114 325 116 320 114 316 115 311 115 306 116 302 115 297 114 288 114 283 115 278 114 269 114 264 115 260 115 255 114 250 116 246 114 241 115 236 113 231 115 227 114 222 114 219 115 183 115 180 114 175 114 171 112 161 114 157 114 152 115 147 114 143 115 133 113 114 113 110 114 100 114 96 116 91 115 86 113 82 112 77 114 72 115 68 114 58 114 Z"/>
+  <g class="legend">
+  <rect class="q4" x="56" y="50" width="10" height="10"/>
+  <text x="74" y="58">Q1_S</text>
+  <rect class="q3" x="114.8" y="50" width="10" height="10"/>
+  <text x="132.8" y="58">Q3_0</text>
+  <rect class="b0" x="173.6" y="50" width="10" height="10"/>
+  <text x="191.6" y="58">Q4_0</text>
+  <rect class="q1" x="232.4" y="50" width="10" height="10"/>
+  <text x="250.4" y="58">Q4_1</text>
+  <rect class="b2" x="291.2" y="50" width="10" height="10"/>
+  <text x="309.2" y="58">Q5_0</text>
+  <rect class="q2" x="350" y="50" width="10" height="10"/>
+  <text x="368" y="58">Q8_0</text>
+  <rect class="b3" x="408.8" y="50" width="10" height="10"/>
+  <text x="426.8" y="58">other</text>
+  </g>
+</svg>
+</figure>
 
-**Under load.** The battery's load is sampled every five seconds from `/v1/telemetry` and `/v1/memory` on one time axis with the number of answers in flight, each sample reduced to the newest point of every series and written a column per field to `docs/results/battery_128/fig_9_6_telemetry.csv`; 6,786 samples had answers in flight. VRAM is the newest wave's accounting by tenant (`waves.vram`). The tokens are the format census of every VRAM-resident residence (`mix.tok`), which counts a token once across its layers, split over the formats its bands are stored in. Their BF16 size is the K/V census's 24.9 KB a token: 2,076 bytes a token a layer, over Flash-Next's 12 K/V layers. The KV figure is the KV arenas the span holds, which is at least the payload in them, so the compression read against it is a floor on the payload's.
-
-**Figure 9.6-1 — VRAM by tenant under load** (`fig_9_6_telemetry.csv`, `telemetry/waves/vram/*`). Stacked area of the span's tenants — experts, KV, transient tier, dense weights, recurrent state — against time, with the answers in flight above it.
-
-**Figure 9.6-2 — The KV format mix as load rises** (`fig_9_6_telemetry.csv`, `telemetry/mix/tok/*`; `table_9_6_load_bands.csv`). The share of the resident tokens in each format against time and against the answers in flight.
-
-**Figure 9.6-3 — Context resident against its full-precision size** (`fig_9_6_telemetry.csv`). The tokens resident in VRAM, their BF16 size, and the KV arenas holding them, against time.
+<figure class="fig">
+<svg viewBox="0 0 640 324" role="img" aria-label="Figure 9.6-7. Over the battery, the resident tokens would take 13.2 GiB at BF16 on average and 21.9 at peak; the KV arenas the span held for them took 6.2 GiB on average and 11.2 at peak, 2.16 times smaller, out of 10.7 GiB of KV ground on average.">
+  <text class="ttl" x="16" y="20">Figure 9.6-7 · The context against its BF16 size</text>
+  <text class="ttl-sub" x="16" y="38">GiB · resident tokens at BF16, 24,916 B each, against the KV arenas that hold them</text>
+  <path class="grid" d="M56 228 H584 M56 176 H584 M56 124 H584 M56 72 H584"/>
+  <text class="tick" x="48" y="283.5" text-anchor="end">0</text>
+  <text class="tick" x="48" y="231.5" text-anchor="end">5</text>
+  <text class="tick" x="48" y="179.5" text-anchor="end">10</text>
+  <text class="tick" x="48" y="127.5" text-anchor="end">15</text>
+  <text class="tick" x="48" y="75.5" text-anchor="end">20</text>
+  <path class="grid base" d="M56 280 H584"/>
+  <path class="grid" d="M56 72 V280 M144 72 V280 M232 72 V280 M320 72 V280 M408 72 V280 M496 72 V280 M584 72 V280"/>
+  <text class="tick mid" x="56" y="296">0</text>
+  <text class="tick mid" x="144" y="296">2</text>
+  <text class="tick mid" x="232" y="296">4</text>
+  <text class="tick mid" x="320" y="296">6</text>
+  <text class="tick mid" x="408" y="296">8</text>
+  <text class="tick mid" x="496" y="296">10</text>
+  <text class="tick mid" x="584" y="296">12</text>
+  <text class="t-dim mid" x="320" y="314">hours into the battery</text>
+  <path class="area-us" d="M58 214 63 193 68 199 72 201 77 204 82 205 86 187 91 189 96 197 100 204 105 213 110 223 114 225 119 224 124 219 129 203 133 216 138 218 143 224 147 218 152 208 157 211 161 213 166 212 171 214 175 221 180 211 183 226 219 236 222 223 227 225 231 224 236 215 241 219 246 221 250 212 255 213 260 219 264 221 269 220 274 222 278 217 283 220 288 222 292 220 297 220 302 219 306 212 311 208 316 205 320 217 325 223 330 221 334 214 339 210 344 220 348 218 353 218 358 222 362 218 367 219 372 228 377 221 381 215 386 224 391 223 395 214 400 215 405 225 409 218 414 210 419 222 423 217 428 214 433 217 437 218 447 224 451 214 456 221 461 220 465 216 475 216 479 213 484 219 489 214 493 216 498 212 503 216 503 280 58 280 Z"/>
+  <path class="line-us dash" d="M58 183 63 144 68 149 72 144 77 147 82 120 86 95 91 97 96 130 100 115 105 133 110 171 114 174 119 171 124 171 129 159 133 175 138 159 143 159 147 161 152 165 161 156 166 148 171 153 175 153 180 144 183 147 219 211 222 193 227 191 231 195 236 183 246 181 250 173 255 178 260 166 264 163 269 167 274 181 278 184 283 183 288 170 292 170 297 177 302 158 306 144 311 122 316 119 320 147 325 167 330 174 334 167 339 163 344 179 348 171 353 183 358 186 362 187 367 164 372 182 377 189 381 171 386 190 391 187 395 173 400 177 405 195 409 188 414 173 419 191 423 185 428 181 433 183 437 180 442 186 447 187 451 179 456 189 461 184 465 185 470 182 475 174 479 174 484 181 489 183 493 181 498 175 503 179"/>
+  <path class="line-them" d="M58 128 63 80 68 98 72 107 77 120 82 155 86 145 91 143 96 128 100 154 105 157 110 152 114 163 119 158 124 141 129 123 133 145 138 145 143 165 147 144 152 126 157 136 161 133 166 148 171 143 175 150 180 134 183 168 219 180 222 154 227 158 231 154 236 127 241 145 246 152 250 129 255 127 260 145 264 153 269 145 274 149 278 140 283 147 288 151 292 145 297 155 302 149 306 130 311 140 316 136 320 139 325 152 330 147 334 130 339 130 344 147 348 140 353 142 358 149 362 138 367 157 372 164 377 151 381 131 386 155 391 154 395 141 400 135 405 156 409 139 414 143 419 145 423 138 428 129 433 143 437 144 442 155 447 158 451 139 456 153 461 152 465 137 470 139 475 151 479 135 484 148 489 129 493 139 498 128 503 138"/>
+  <path class="line-us" d="M58 214 63 193 68 199 72 201 77 204 82 205 86 187 91 189 96 197 100 204 105 213 110 223 114 225 119 224 124 219 129 203 133 216 138 218 143 224 147 218 152 208 157 211 161 213 166 212 171 214 175 221 180 211 183 226 219 236 222 223 227 225 231 224 236 215 241 219 246 221 250 212 255 213 260 219 264 221 269 220 274 222 278 217 283 220 288 222 292 220 297 220 302 219 306 212 311 208 316 205 320 217 325 223 330 221 334 214 339 210 344 220 348 218 353 218 358 222 362 218 367 219 372 228 377 221 381 215 386 224 391 223 395 214 400 215 405 225 409 218 414 210 419 222 423 217 428 214 433 217 437 218 447 224 451 214 456 221 461 220 465 216 475 216 479 213 484 219 489 214 493 216 498 212 503 216"/>
+  <g class="legend">
+  <path class="line-them" d="M56 55 H70"/>
+  <text x="74" y="58">tokens at BF16</text>
+  <path class="line-us" d="M176.8 55 H190.8"/>
+  <text x="194.8" y="58">KV arenas held</text>
+  <path class="line-us dash" d="M297.6 55 H311.6"/>
+  <text x="315.6" y="58">KV ground</text>
+  </g>
+</svg>
+</figure>
 
 | Under the battery's load | Mean | Peak |
 |---|---:|---:|
@@ -788,23 +886,13 @@ The log holds every record of every token — its K/V at C5, its 192-byte signat
 | Effective compression (BF16 / arenas held) | 2.16× | 2.70× |
 | Expert zone (GiB) | 36.0 | 50.1 |
 
-| Answers in flight | Samples | Tokens resident | Compression | Q4_0 | Q1_S | Q3_0 | Q8_0 | Q5_0 | Q4_1 | Other |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1–4 | 3 | 448,487 | 1.71× | 22.6% | 14.7% | 13.2% | 11.3% | 9.9% | 8.5% | 19.8% |
-| 5–8 | 6,358 | 562,084 | 2.16× | 22.2% | 14.0% | 13.3% | 11.4% | 10.5% | 8.4% | 20.3% |
-| 13–16 | 425 | 703,786 | 2.20× | 22.3% | 14.0% | 13.4% | 11.3% | 10.5% | 8.4% | 20.2% |
-
-(The battery ran sixteen answers at once for its first 142 and eight for the rest, so no sample falls between nine and twelve.)
-
-Under the battery's load the card holds 571 thousand tokens of context on average and 945 thousand at its peak — 13.3 and 21.9 GiB of K/V at BF16 — in 6.2 and 11.2 GiB of KV arenas, while the expert zone keeps 36.0 GiB on average and 50.1 GiB at its widest, against 51.0 GiB at rest: the elastic boundary gives the KV side and the wave tier the ground the sessions need and returns it to the experts as they finish. The format mix does not move with load. Every band holds 22% of its tokens in Q4_0, 14% in Q1_S and 11% in Q8_0 to within a point, because a block's format is chosen as it is sealed, by its level (C5 throughout) and its own cosine distance, never by the pressure on the card. Against the arenas held, the compression is 2.16× at eight answers and 2.20× at sixteen, below the stored K/V's 3.55× (the census above); the difference is KV the span holds beyond the payload, which this load leaves far from the card's limit.
+The card holds 571 thousand tokens of context on average and 945 thousand at its peak — 13.3 and 21.9 GiB at BF16 — in 6.2 and 11.2 GiB of KV arenas, while the expert zone gives up ground, from 51.0 GiB at rest to 36.0 on average, and takes it back as sessions finish. The larger tenant under load is not the KV but the recurrent state of Flash-Next's DeltaNet layers, one per session and fork: 15.5 GiB on average and 23.1 at peak, against 4.9 at rest. **The format mix does not move with load**: with eight answers in flight and with sixteen, 22% of resident tokens are Q4_0, 14% Q1_S and 11% Q8_0, to within a point (`table_9_6_load_bands.csv`), because a block's format is set as it is sealed, by its level and its own error, never by the pressure on the card. Compression against the arenas is 2.16× at eight answers and 2.20× at sixteen, below the stored K/V's 3.55×; the difference is ground the span holds beyond the payload, at a load far from the card's limit. (The battery ran sixteen at once for its first 142 answers and eight for the rest.)
 
 ### 9.7 Ablation: Expert Prediction and Eviction Policy
 
-The three-tier expert cache's measured effect against the two-tier cache it replaced is reported in §4.3 (+12% to +87% prefill across the configurations shown there, RTX 4090 Laptop GPU).
+The three-tier cache's effect is Figure 4-1 (+12% to +87% prefill). A cleaner ablation came from replacing the MoE dispatch with the live, device-side one: the dense models in the same sweep, which do not touch it, moved −1.2% to +0.5% on prefill and −1.6% to +0.2% on decode — a control reading as a control should — while Qwen3.5-35B-A3B gained 24–36% prefill and 11–23% decode, Qwen3.6-35B-A3B likewise, and Qwen3-30B-A3B's single-session decode went from 45.8 to 54.9 t/s (+20%) on the same card and artifact (`docs/results/moe_live_dispatch_rtx_3090_24gb_2026-10-04.md`).
 
-A second, cleaner ablation came from replacing the MoE dispatch itself rather than adding to it. When the live dispatch landed — routing classified on the device, expert kernels copying their own misses, no host round-trip — the dense models in the same sweep moved by −1.2% to +0.5% on best prefill and −1.6% to +0.2% on best decode, with compression identical everywhere: they do not touch the dispatch, so they are a control, and the control reads as a control should. The MoE models moved: Qwen3.5-35B-A3B +24–36% best prefill and +11–23% best decode, Qwen3.6-35B-A3B likewise, and Qwen3-30B-A3B's single-session decode from 45.8 to 54.9 t/s (+20%) on the same card and the same artifact (`docs/results/moe_live_dispatch_rtx_3090_24gb_2026-10-04.md`). The same sweep is the first run on which the Qwen3-30B-A3B engine probe passed on the 24 GB card.
-
-**The predictor and the eviction policy, isolated.** Both were evaluated offline against a captured routing trace of Qwen3-30B-A3B (48 MoE layers, 128 experts, top-8) over 21 prompts spanning code, prose, facts, mathematics and lists, by 21-fold leave-one-out cross-validation: each prompt is predicted by a model trained on the other twenty and learning causally as the held-out prompt decodes, decode-phase routing only, pinned layers excluded from every denominator (`docs/archived/markov_expert_prediction_eval.md`; harness `candle-transformers/src/models/expert_lre/eval/`). Coverage is the share of *cold* experts a prefetch of fan-out k would have staged — the misses it converts.
+**The predictor and eviction, isolated** on a captured Qwen3-30B-A3B routing trace of 21 prompts (code, prose, facts, maths, lists) by 21-fold leave-one-out, each prompt predicted by a model trained on the other twenty and learning causally as it decodes (`docs/archived/markov_expert_prediction_eval.md`). Coverage is the share of *cold* experts a prefetch of fan-out k would have staged.
 
 | Promotion predictor (held out) | Top-1 precision | Cold coverage, k = 1 | k = 2 | k = 4 |
 |---|---:|---:|---:|---:|
@@ -813,7 +901,7 @@ A second, cleaner ablation came from replacing the MoE dispatch itself rather th
 | PMI(0.5) | 80.4% | 10.7% | 19.9% | 34.9% |
 | PMI(0.5), cross-prompt prior + live session matrix | **91.1%** | **12.1%** | **23.4%** | **42.7%** |
 
-At eight candidates a layer the best model stages 67.7% of the cold experts. Per-layer-pair tables beat every coarser sharing (a single shared table falls to 15.2% at k = 4), and weighting by router mass collapses coverage to 23.6%: what predicts is how often a transition occurs, not how heavily it is routed.
+At eight candidates a layer the best model stages 67.7% of cold experts. Per-layer-pair tables beat every coarser sharing (one shared table: 15.2% at k = 4), and weighting by router mass collapses coverage to 23.6%: what predicts is how often a transition occurs, not how heavily it is routed.
 
 | Eviction policy (held out) | Miss rate, budget ½ of working set | Budget 0.7 |
 |---|---:|---:|
@@ -822,78 +910,72 @@ At eight candidates a layer the best model stages 67.7% of the cold experts. Per
 | Learned recurrence model | 39.5% | 29.1% |
 | **Frequency-weighted recency** (`last_used + ln(1 + freq) · 16`) | **14.7%** | **12.7%** |
 
-Together, at 60% residency: ≈82% of expert accesses hit, ≈5% are converted to overlapped loads by prediction, and ≈13% stall; re-tuned for stall cost — a stall counted at ten times a converted load — the stalling share falls to 7.8% and the stall cost by 52%, with no change to the hardware. Modelled as the batched wave, where one expert load serves every session routed to it, aggregate throughput grows with the batch, and prediction pays in the regime between the working set fitting and the link saturating; past saturation, at about 256 concurrent decodes, prefetching every missing expert of the next layer matches the fully tuned optimum within 1–4%, and the predictor is not needed. In production the predictor's live precision is 66–85%, 74% typically.
-
+At 60% residency ≈82% of accesses hit, ≈5% become overlapped loads by prediction and ≈13% stall; tuned for stall cost (a stall weighed at ten converted loads) the stalling share falls to 7.8% and the stall cost by 52%. In the batched wave, prediction pays between the working set fitting and the link saturating; past about 256 concurrent decodes, prefetching every missing expert of the next layer matches the tuned optimum within 1–4%. Live precision in production is 66–85%, typically 74%.
 
 ### 9.8 Quality Evaluation: Multi-Session Identity Discrimination
 
-**Test protocol.** The story rewrite test evaluates end-task quality directly rather than via perplexity. Up to 256 concurrent sessions run simultaneously in one batch, each with a distinct character identity (name and gender assignment, cycling with period 99). The model is instructed to rewrite a narrative passage using the assigned character. A session passes if: (a) the correct name appears, (b) gender pronouns are consistent with the assignment, and (c) no other session's name appears. This test is designed to stress exactly the signal that aggressive K quantization degrades: session-discriminating features that live in the high-relevance sub-block population.
-
-**Results.** Every throughput row in §9.6 passes this test with every session correct — across the 213 rows of the RTX 3090 sweep, the 192 of the laptop sweep and the 212 of the Blackwell sweep, not one session failed. The top compression level, C10, passes on every model in the fleet at 4.1×–7.6× (§9.6.3), sitting just inside the edge where the test starts failing; the one exception on record is Flash-Next's C10 ×8 row under the TCC driver build, which validated 7 of 8 sessions on all three runs of that sweep and is reported as a failure rather than rounded away; the validated figure for that rung is the WDDM build's 885.8 t/s. On Llama-3.2-3B, failures under compression past the validation edge fall into three qualitatively distinct regimes — clean output, soft semantic drift, then session identity collapse. That progression is what the theorem's constant would lead one to expect as per-token error grows: small errors move the text, large ones move which session's content the model attends. The test runs in one forward with no tiering, so it says nothing about which tier the error came from; what bounds the error a selected block can carry in production is the per-block threshold it was sealed under (§11.2). Cross-architecture generalization is quantified in §9.9.
+Up to 256 sessions run in one batch, each assigned a distinct character (name and gender, period 99) and asked to rewrite a passage with it. A session passes if its name appears, its pronouns match, and no other session's name appears — stressing the session-discriminating signal aggressive K quantization degrades first. Every throughput row of §9.6 passes with every session correct: 213 rows on the RTX 3090, 192 on the laptop, 212 on Blackwell. C10 passes on every model at 4.1–7.6×, just inside the edge where the test fails; the one exception on record, Flash-Next's C10 ×8 under the TCC build, validated 7 of 8 sessions and is reported as a failure (the WDDM build's 885.8 t/s is the validated figure). Past the edge, Llama-3.2-3B fails in three regimes — clean, soft drift, then identity collapse: small errors move the text, large ones move which session the model attends.
 
 ### 9.9 Cross-Architecture Transfer: Held-Out Model Validation
 
-The adaptive quantization system is derived from K/V activation samples on two reference models: Qwen3-30B-A3B (MoE) and Llama-3.2-3B (dense), spanning the MoE/dense axis and a 10× model size range.
-
-**Cross-architecture transfer result.** In v1, deployed unchanged on the held-out Qwen3-8B model — a dense model from a different size point and model family, not used in system derivation — the system achieved 7.42× compression, exceeding either reference model (7.04× on Qwen3-30B-A3B; 5.02× on Llama-3.2-3B). The ordering holds on the current production gates at 8K: **6.31× on Qwen3-8B**, above 5.94× on Qwen3-30B-A3B and 4.62× on Llama-3.2-3B (§9.6.3). Since v1 the same selector has been deployed across twelve models — dense, MoE, DeltaNet-hybrid and native-sparse latent attention, 0.5B to 284B — reaching 4.1×–7.6× at the top level on every one.
-
-This result supports a generalization claim: pre-RoPE K/V activation structure is similar enough across the transformer architectures measured — MoE and dense, several families, 0.5B to 284B — that one adaptive selection system covers them with no per-model calibration data. The held-out model achieving *higher* compression than either reference model is the diagnostic: Qwen3-8B activations are more amenable to the system's format assignments than the reference models, not less, which is not what overfitting to the reference models would produce.
-
-**Deployment implication.** The system needs no calibration data for a new architecture. The selection algorithm, candidate formats and error metrics transfer directly; a model carries at most a scale on the thresholds (its `*_KV_FACTORS` row), set by stepping the top level until the story gate's validation edge is found, which is how C10 sits just inside each model's edge. This distinguishes the approach from systems whose quantization parameters are fitted to a specific model's activation statistics (GPTQ, AWQ, KVQuant sensitivity profiling) and validates the per-block adaptive architecture as the mechanism: the kernel responds to each block's actual distribution at inference time, not to a population-level prior established at calibration.
+The selector was derived from two reference models, Qwen3-30B-A3B (MoE) and Llama-3.2-3B (dense). Deployed unchanged on held-out Qwen3-8B it compressed *more* than either — 7.42× in v1 against 7.04× and 5.02×, and **6.31×** against 5.94× and 4.62× on the current 8K gates (§9.6.3) — the opposite of what overfitting would produce. It now runs on twelve models, dense, MoE, DeltaNet-hybrid and native-sparse, 0.5B to 284B, reaching 4.1–7.6× at the top level on each, with no calibration data: a model carries at most a scale on its thresholds (`*_KV_FACTORS`), set by stepping C10 to the story gate's edge. Unlike GPTQ, AWQ or KVQuant's sensitivity profiles, the kernel responds to each block's distribution at inference time.
 
 ### 9.10 Attentional Provenance Indexing: The Signal, and Tool Selection
 
-**Which signal: the v1 sweep.** v1's calibration on Qwen3-30B-A3B (`docs/unbounded_agents_v1.md` §9.10) compared every family of signature on a 48-probe, 8-tool harness and fixed the principle the production design keeps. Only sign signatures folded across several heads discriminated the right tool on every probe; single heads, band averages and every Q→K strategy failed on some probes (Q→K scored zero on some), confirming **Q→Q sign agreement** as the signal and multi-head folding as what suppresses false matches. The production signature carries the same principle across every attention layer (§6.6).
+v1's calibration (`docs/unbounded_agents_v1.md` §9.10), a 48-probe, 8-tool harness, fixed the signal: only sign signatures folded across several heads found the right tool on every probe, while single heads, band averages and every Q→K strategy failed on some. Within a content type the right item's scores and the rest overlapped in their lower tails, so no threshold separated them — which is why production reads every score against its own background (§6.4). v1's tool selection first failed outright because its corpus held decode signatures while the probe was a prefilled request: over 8 tools the prefill produced one discriminative token, the decode that followed sixteen, all on the right tool. Hence calibration questions shaped like the probe beside every tool and file (§6.3).
 
-A finding of the same calibration explains why absolute thresholds were abandoned: within a content type, the right item's scores and every other item's overlapped in their lower tails, so no threshold separated them and ranking was the only discrimination. The production design takes that to its end — every score is read against the candidate's own background (§6.4) rather than against a threshold.
+The production tool selector (`docs/tool_selection_provenance_results.md` §23–§26) scores the last 128 decoded tokens' signatures against a gallery of tagged tool turns at every reprojection, votes by `z × margin` with the strongest quarter kept, carries belief across the turn, and scopes one to three tools. Leave-one-out with a question as the probe over 766 tool turns and 93 tools (chance ≈ 1.1%), the calibration questions were the lever (Figure 9.10-1):
 
-**Prefill against decode.** Tool selection in v1 first failed outright: the model wrote tool calls with no tool definitions in context. The tools' corpus had been built from decode-phase signatures, while the probe was the user's request read during prefill — and the two occupy different regions of signature space. Over 8 tools, a request's prefill produced one discriminative token, hitting every tool equally; the decode that followed produced 16, every one of them on the right tool. A probe must be matched against stored signatures of its own kind, which is why production stores calibration questions beside every tool and file (§6.3).
+<figure class="fig">
+<svg viewBox="0 0 640 176" role="img" aria-label="Figure 9.10-1. Tool selection over 93 tools, leave-one-out. 766 tool turns: Tool-1 74.5 percent, Tool-3 92.7, recall in scope 77.8, MRR 0.833. Adding 8 calibration questions a tool: 85.1, 96.5, 87.1, MRR 0.907. Adding 24 a tool: 87.9, 97.5, 89.0, MRR 0.925.">
+  <text class="ttl" x="16" y="20">Figure 9.10-1 · The corpus, not the scorer, lifted tool selection</text>
+  <text class="ttl-sub" x="16" y="36">93 tools, leave-one-out · solid Tool-1 · faint Tool-3 · chance ≈ 1.1%</text>
+  <path class="grid" d="M300 48 V150 M400 48 V150 M500 48 V150"/>
+  <path class="grid base" d="M200 48 V150"/>
+  <text class="cat" x="16" y="66">766 tool turns</text>
+  <text class="cat-sub" x="16" y="79">MRR 0.833 · in scope 77.8%</text>
+  <rect class="us-soft" x="200" y="56" width="370.8" height="10"/>
+  <rect class="us" x="200" y="68" width="298" height="10"/>
+  <text class="t-dim" x="576.8" y="65">92.7%</text>
+  <text class="v-us" x="504" y="78">74.5%</text>
+  <text class="cat" x="16" y="100">+ 8 questions a tool</text>
+  <text class="cat-sub" x="16" y="113">MRR 0.907 · in scope 87.1%</text>
+  <rect class="us-soft" x="200" y="90" width="386" height="10"/>
+  <rect class="us" x="200" y="102" width="340.4" height="10"/>
+  <text class="t-dim" x="592" y="99">96.5%</text>
+  <text class="v-us" x="546.4" y="112">85.1%</text>
+  <text class="cat" x="16" y="134">+ 24 questions a tool</text>
+  <text class="cat-sub" x="16" y="147">MRR 0.925 · in scope 89.0%</text>
+  <rect class="us-soft" x="200" y="124" width="390" height="10"/>
+  <rect class="us" x="200" y="136" width="351.6" height="10"/>
+  <text class="t-dim" x="596" y="133">97.5%</text>
+  <text class="v-us" x="557.6" y="146">87.9%</text>
+  <text class="tick mid" x="200" y="166">0%</text>
+  <text class="tick mid" x="300" y="166">25%</text>
+  <text class="tick mid" x="400" y="166">50%</text>
+  <text class="tick mid" x="500" y="166">75%</text>
+</svg>
+</figure>
 
-**Tool selection in production.** The shipped tool selector (`docs/tool_selection_provenance_results.md` §23–§26) drops the prefill/decode split: at each reprojection the last 128 decoded tokens' `WideQSig`s (§6.6) are scored against a gallery of tagged tool turns, each query token casting a vote per fold group weighted by how far it stands out from that group's agreement distribution and by the margin between the leading tool and the runner-up, with only the strongest quarter of votes kept; belief is carried and decayed across a turn's reprojections, and one to three tools are put in scope. Measured leave-one-out with a question as the probe — the call the probe would otherwise contain names its own tool, so scoring a whole stored turn matches on the answer and overstates the rate (97.4–97.8% Top-1) — over 766 tool turns and 93 tools, with eight to twenty-four plain calibration questions per tool added to the gallery (chance ≈ 1.1% Top-1):
-
-| Gallery | Tool-1 | Tool-3 | Tool-5 | MRR | Recall in scope |
-|---|---:|---:|---:|---:|---:|
-| 766 tool turns | 74.5% | 92.7% | 93.7% | 0.833 | 77.8% |
-| + 8 questions a tool (1,510) | 85.1% | 96.5% | 96.9% | 0.907 | 87.1% |
-| + 24 questions a tool (2,998) | **87.9%** | **97.5%** | **97.8%** | **0.925** | **89.0%** |
-
-The lever was the corpus, not the scorer: calibration questions shaped like the live probe lifted Tool-1 by 13.4 points with the probe set held fixed. The code-corpus equivalent is the file-retrieval result of §9.12.
+Scoring a whole stored turn instead overstates the rate (97.4–97.8% Top-1), because the call inside it names its own tool. The code-corpus equivalent is §9.12's file retrieval.
 
 ### 9.11 Concurrent Persistent-Memory Session Result
 
-The width ladder of §9.6 drives the batched forward from a clean slate; it never constructs the conversation engine, so it cannot exercise admission, per-turn context projection, the persistence thread, KV compaction or tier migration. The **engine probe** (`candle-conversation/tests/kv_fragmentation.rs`) does: it runs a conversational workload through the full engine on the target hardware — admission, per-turn projection, sealing, compaction and tier migration all live — and checks every session's story rewrite against its expected text.
-
-| Card | Model | Stories correct |
-|---|---|---:|
-| RTX 4090 Laptop GPU 16 GB | Qwen3.8-Flash-Next | 8/8 |
-| RTX 3090 24 GB | Qwen3-30B-A3B | 20/20 |
-| RTX 3090 24 GB | Qwen3.6-35B-A3B | 16/16 |
-| RTX 3090 24 GB | Qwen3.8-Flash-Next | 8/8 |
-| RTX PRO 5000 72 GB | Qwen3-30B-A3B | 20/20 |
-| RTX PRO 5000 72 GB | Qwen3.6-35B-A3B | 16/16 |
-| RTX PRO 5000 72 GB | Qwen3.8-Flash-Next | 8/8 |
-
-Rows are the latest probe run on each card: laptop `bf291341c` (2026-09-30), RTX 3090 `c375834c8` and RTX PRO 5000 `21c36efbd` (both 2026-10-10). No probe log has a `non-finite` layer, and every story in every probe is correct. Flash-Next is the stronger test: it is the one model in the fleet carrying per-sequence recurrent state outside the paged K/V, so a pass that corrupts either shows as non-finite recurrent layers, and it returns every story correct on all three cards.
-
-The direction of travel is measurable. On the RTX 3090, Flash-Next's gate went from 24.3 to 138.1 t/s single-session decode and from 95.6 to 361.6 t/s at C10 ×8 in ten days (`e596fad8d` → `5776799ac` → `7aecbeab3` → `c375834c8`), every row validated on all four builds, with the probe's story gate green throughout — the throughput work and the correctness work did not trade against each other.
-
-**Recall under compression and depth** is measured three ways: output fidelity against depth under compression, teacher-forced on four planted codes from 4K to 124K (§9.6.8); selection of planted facts from the middle of a conversation up to twelve times the engine's working set (§9.11.2); and multi-hop questions over the system's own codebase memory (§9.12).
+The width ladder never builds the conversation engine. The **engine probe** (`candle-conversation/tests/kv_fragmentation.rs`) does — admission, per-turn projection, sealing, compaction and tier migration all live — and checks every session's story. On the latest run on each card (laptop `bf291341c`, RTX 3090 `c375834c8`, RTX PRO 5000 `21c36efbd`) every story is correct: Flash-Next 8/8 on all three cards, Qwen3-30B-A3B 20/20 and Qwen3.6-35B-A3B 16/16 on both desktops, with no non-finite layer in any log. Flash-Next is the stronger test, the one model carrying recurrent state outside the paged K/V. On the RTX 3090 its gate went from 24.3 to 138.1 t/s single-session decode, and from 95.6 to 361.6 at C10 ×8, in ten days with every row validated: the throughput work did not trade against correctness.
 
 #### 9.11.1 Retrieval on the live gallery
 
-Every retrieval figure in this paper is measured on the running daemon's resident gallery over HTTP (`POST /v1/substrate/zend/scan`), not on a copy, with held-out probes: a question never present in the background or the gallery, plus the stretch of thinking it starts — the probe a live projection actually makes.
+Every retrieval figure here is measured on the running daemon's resident gallery over HTTP (`POST /v1/substrate/zend/scan`), with held-out probes — a question never in the gallery plus the thinking it starts:
 
-- **Tools:** the answer tool first on 87.9% of held-out questions over 93 tools, in the top three on 97.5% (§9.10).
-- **Code:** the answer file first of 6,854 on 65% of questions, in the top five on 83% (§9.12).
-- **Normalization:** read against its background, the answer file's R@1 over 37,284 calibration questions rises from 0.107 to 0.239, and no file takes more than 0.1% of the wins on other files' questions (§6.4).
-- **Momentum across a turn:** carrying belief from one reprojection to the next lifted the answer file's R@10 from 0.554 to 0.708 over three turns on a file — compounding the scoring gain rather than overlapping it — at the cost of slower topic switches: with the leak at 0.2, a new file leads in 70% of dialogues after three turns (`docs/results/provenance_gates_2026-10-26.md`).
-- **A real conversation:** replayed on the paper conversation itself (`docs/paper_conversation_replay.md`), the scorer finds 91% of the files the conversation should place and puts all 14 of its tool calls' tools in the top ten (`docs/results/provenance_gates_2026-10-25.md`).
-
-We know of no published engine that couples a bounded working set with the expert staging, KV compression and context retrieval this workload needs, so the result is reported without a direct comparison baseline. The codebase dependency analysis evaluation (§9.12) puts the same retrieval mechanism to a harder use: compositional multi-hop reasoning rather than recall.
+- **Tools:** first on 87.9% over 93 tools, top three on 97.5% (§9.10).
+- **Code:** the answer file first of 7,943 on 49% of the 128-question battery, top five on 69% (§9.12).
+- **Normalization:** R@1 over 37,284 calibration questions 0.107 → 0.239, no file taking more than 0.1% of the wins on other files' questions (§6.4).
+- **Momentum:** R@10 0.554 → 0.708 over three turns on a file, at the cost of slower topic switches — a new file leads in 70% of dialogues after three turns (`docs/results/provenance_gates_2026-10-26.md`).
+- **A real conversation:** replayed on the paper conversation itself, the scorer finds 91% of the files it should place and puts all 14 of its tool calls' tools in the top ten (`docs/results/provenance_gates_2026-10-25.md`).
 
 #### 9.11.2 Selection past the working set
 
-This test asks the theorem's premise directly: whether the bounded working set is delivered when the history is many times larger than it (`candle-conversation/tests/provenance_depth.rs`; `docs/results/theorem_depth_tests_2026-11-10.md`). The engine runs Flash-Next with its slot capped at 32,768 tokens. A conversation is built from the repository's own source files, one file a turn, to 30K, 131K and 393K tokens, with four turns stating vault codes placed together at 45% of its depth — the middle, where neither a fill from the oldest turns nor one from the newest reaches; the last turn asks for the codes back. Each cell is a fresh conversation, and each records the projections its question's decode emitted.
+Is the bounded working set delivered when the history is many times larger than it (`candle-conversation/tests/provenance_depth.rs`; `docs/results/theorem_depth_tests_2026-11-10.md`)? Flash-Next runs with its slot capped at 32,768 tokens. A conversation is built from the repository's source, one file a turn, to 30K, 131K and 393K tokens, with four turns stating vault codes together at 45% of its depth, where neither an oldest-first nor a newest-first fill reaches; the last turn asks for the codes. Each cell is a fresh conversation:
 
 | Needle turns selected into the working set | 30K (19 turns) | 131K (64 turns) | 393K (195 turns) |
 |---|---|---|---|
@@ -902,25 +984,17 @@ This test asks the theorem's premise directly: whether the bounded working set i
 | One-shot projection, C10 | 3/4 | 0/4 | 0/4 |
 | Rolling window (no provenance) | 3/4 | 0/4 | 0/4 |
 
-**Selection works at depth.** Mid-decode reprojection brought every needle turn into a working set of 15–18 turns drawn from 64 and from 195 — a history twelve times the slot — at C10 and at near-lossless C0 alike, and the arms without it selected none past 30K: a one-shot projection and the append path both fill from the oldest turns. The bounded working set the theorem assumes is delivered at every depth measured, and compression does not change what is selected. What the model then does with what is selected is measured on the codebase memory itself, in §9.12.
+Mid-decode reprojection brought every needle turn into a working set of 15–18 turns drawn from 195 — a history twelve times the slot — at C10 and C0 alike; the arms without it selected none past 30K, both filling from the oldest turns. The working set the theorem assumes is delivered at every depth measured, and compression does not change what is selected.
 
 ### 9.12 Unbounded Context: Codebase Dependency Analysis
 
-This evaluation tests a categorically harder property than verbatim factual recall: compositional reasoning over structured dependencies via iterative multi-hop retrieval during decode. The test subject is the system's own Candle fork (2.2M lines of Rust and CUDA). The model must walk transitive dependency chains through the provenance system across multiple reasoning steps — each decode step's Q vectors drive retrieval of the next dependency node, assembling context as the reasoning develops. A corrupted dependency from quantization noise does not merely produce a wrong name; it produces a wrong architectural conclusion that propagates through the reasoning chain.
+A harder property than recall: multi-hop reasoning over the system's own Candle fork (2.2M lines of Rust and CUDA), each decode step's Q vectors retrieving the next node of a dependency chain. The production code-reading ingest has the daemon's model, Flash-Next, read the repository file by file as turns of its own, sealing their K/V and signatures with calibration questions beside each file; nothing in it was written by an external model. It persists as the substrate does (§7), valid for the model that wrote it.
 
-**Ingestion as run.** The gallery the battery would query exists and is the one §9.11.1 measures: the production code-reading ingest has the daemon's model, Qwen3.8-Flash-Next on the local engine, read the repository file by file as turns of its own, sealing each turn's K/V and signatures into the substrate — 2,206 files, ~25.8M signature tokens, ~5 GB of signatures at 192 bytes a token — with a calibration question per file stored beside it (§9.11.1). Nothing in it was written by an external model.
+**The claim.** *Provenance projection supplies the memory the answers come from, and re-selecting the working set while the model reasons brings in the files a question does not name.* The battery isolates the memory, the seed files a conversation opens on, reprojection during reasoning, and continuous reprojection against a single retrieval, holding all else equal.
 
-The ingested conversation persists as the substrate does (§7) — K/V, tokens and signatures in the redo log — so the codebase understanding is a file kept alongside the code, valid for the model that wrote it. By 2026-11-20 the code-reading layer held 6,854 files and 39,954,048 signature tokens.
+**Questions.** 128 (`zend/examples/dependency_battery/battery.yaml`): 43 direct, 43 transitive, 42 architectural, each listing the items a correct answer must name, its answer files, and whether it names its answer's file — all from the source and committed before the first run with the analysis; no question spells an item it expects. The direct questions are generated mechanically (`direct.rs`: a public function defined once and called from one to three other non-test files, picked by a seeded hash), so their selection carries no judgement; the rest are the 24-question pilot's and 69 more, written by hand against the lines they cite. *Direct:* where `tier_fits` is defined and what calls it. *Transitive:* how MoE routing reaches the expert kernels with no host readback — the bucketize kernel, the mapped ring, the stager's word, the cold expert's wait. *Architectural:* the elastic boundary between KV and experts (`weight_floor`) and the check that refuses a tier crossing it.
 
-**The question.** One claim, on Qwen3.8-Flash-Next over its own codebase memory: *provenance projection supplies the memory the answers come from, and re-selecting the working set while the model reasons is what brings in the files a question does not name.* The battery isolates each part — the memory, the seed files a conversation opens on, reprojection during reasoning, and continuous reprojection against a single retrieval — with every other condition held equal.
-
-**Questions.** 128 questions (`zend/examples/dependency_battery/battery.yaml`), in the proportions of the 24-question pilot below: 43 direct, 43 transitive, 42 architectural. Each lists the files, identifiers or values a correct answer must name, its answer files, and whether the question names its answer's file — all enumerated from the source and committed before the first run, with the analysis below; no question spells an item it expects. The direct questions are generated mechanically from the source (`direct.rs`): a public function whose name is defined exactly once in the repository and is called from one to three other non-test files, taken in the order a seeded hash of its name gives, one per defining file — so their selection carries no judgement. The transitive and architectural questions are the pilot's sixteen and sixty-nine more, written by hand and each checked against the lines it cites.
-
-- *Direct:* where a thing is defined and what calls it. Example: where `tier_fits` is defined (`span_geometry.rs`) and what calls it in production (`region_pool/transient_tier.rs`).
-- *Transitive:* a chain of three or more hops. Example: how a MoE layer's routing reaches the expert kernels with no host readback — the bucketize kernel, the mapped pinned ring it writes, the word the stager thread publishes, the cold expert's wait on it.
-- *Architectural:* an assumption several components share with no single call path. Example: the elastic boundary between the KV side and the expert weights (`weight_floor`) and the check that refuses a transient tier crossing it (`tier_fits`).
-
-**Arms.** Three request-level settings, each a dial of the turn as its thinking and tools are, rather than a restart of the daemon. `projection` is *Full* (every layer provenance selects from), *Limited* (the journals alone) or *Minimal* (the tool catalog alone — and so nothing, with tools off, as every battery question runs). `seed` opens the conversation on its configured seed files, or on none. Reprojection re-selects through the think block (`reproject_in_thinking`), holds it, or selects only once at the opening — the retrieve-once turn. Reprojection exists only where something is projected, so the arms are seven:
+**Arms.** Three request-level dials: `projection` *Full* or *Minimal* (the tool catalog alone, and so nothing with tools off); `seed` on or off; and reprojection through the think block, held in it, or at the opening only:
 
 | Arm | Seed | Projection | Reprojection | What it isolates |
 |---|---|---|---|---|
@@ -932,27 +1006,130 @@ The ingested conversation persists as the substrate does (§7) — K/V, tokens a
 | C0 | off | Full | full | — |
 | C1 | on | Full | full | the production system |
 
-**Running.** On BlackWorld across two builds — the first 748 answers at 5470-6eb469ce5, the remaining 1,940 at 5475-3c73da839, which sweeps prompts of 32 rows or fewer in 8-row pieces on the decode step and changes no retrieval dial — through the daemon's chat API (`zend/examples/dependency_battery`, `run`) — one fresh conversation per question, its arm's dials on the request, deleted once its answer and its projection points (`GET /v1/conversations/{id}/placements`) are read — every question prefixed with an instruction to answer from memory and call no tool, thinking at the chat's default effort. The first 142 answers ran sixteen at once and the rest eight — at sixteen, the prefill scratch and recurrent state of the forks beside the answers pushed the expert zone below the model's working set — and the order mixes the arms throughout, so whatever drifts across the run — the gallery, ingest, the card's load, the build — falls on every arm alike. Each arm runs the 128 questions three times: 2,688 answers.
+**Running.** On BlackWorld through the daemon's chat API (`dependency_battery run`), the first 748 answers at build 5470-6eb469ce5 and the rest at 5475-3c73da839, which changes no retrieval dial. One fresh conversation per question, its arm's dials on the request, deleted once its answer and projection points (`GET /v1/conversations/{id}/placements`) are read; every question asks for an answer from memory with no tool. The first 142 answers ran sixteen at once and the rest eight, and the order mixes the arms throughout, so drift falls on every arm alike. Each arm answers the 128 questions three times: 2,688 answers.
 
-**Scoring and statistics.** Recall: the share of a question's expected items the answer names, any of an item's spellings found case-insensitively; a 10% sample of answers is graded by hand against the source to show that recall tracks correct answers, and every answer is read for invented names. A question's score in an arm is its recall averaged over the three runs. Every interval is a 95% bootstrap interval over questions (10,000 resamples; for a difference, of the per-question paired differences). Every contrast is tested by Wilcoxon signed-rank on the per-question differences, Holm-corrected across the five contrasts below, and reported beside its effect size in points of recall.
+**Scoring.** Recall is the share of a question's expected items the answer names, any spelling, case-insensitive; a question's score in an arm is its mean over three runs. Intervals are 95% bootstrap intervals over questions (10,000 resamples, paired for differences); contrasts are Wilcoxon signed-rank on per-question differences, Holm-corrected across five. Every figure's data and `summary.md` are in `docs/results/battery_128/`.
 
-The analysis (`dependency_battery analyse`) writes every figure's data beside the answers in `docs/results/battery_128/`, with its tables in `summary.md`.
+<figure class="fig">
+<svg viewBox="0 0 640 306" role="img" aria-label="Figure 9.12-1. Mean recall by arm over 128 questions, each with its 95% bootstrap interval: A0 0.4% (0.1% to 0.9%); A1 0.5% (0.1% to 1.0%); D1 30.6% (25.0% to 36.4%); B0 31.9% (26.1% to 37.7%); B1 32.5% (26.8% to 38.3%); C0 36.7% (30.8% to 42.6%); C1 37.2% (31.0% to 43.2%). The reprojecting arms C0 and C1 recall the most.">
+  <text class="ttl" x="16" y="20">Figure 9.12-1 · Recall by arm</text>
+  <text class="ttl-sub" x="16" y="38">mean recall over 128 questions · bar: 95% bootstrap interval · small dots: each run's mean</text>
+  <path class="grid" d="M70 212.4 H624 M70 174.8 H624 M70 137.2 H624 M70 99.6 H624 M70 62 H624"/>
+  <text class="tick" x="62" y="253.5" text-anchor="end">0%</text>
+  <text class="tick" x="62" y="215.9" text-anchor="end">10%</text>
+  <text class="tick" x="62" y="178.3" text-anchor="end">20%</text>
+  <text class="tick" x="62" y="140.7" text-anchor="end">30%</text>
+  <text class="tick" x="62" y="103.1" text-anchor="end">40%</text>
+  <text class="tick" x="62" y="65.5" text-anchor="end">50%</text>
+  <path class="grid base" d="M70 250 H624"/>
+  <rect class="them" opacity="0.35" x="102.6" y="246.7" width="14" height="3.1"/>
+  <circle class="q1" cx="125.6" cy="248.3" r="2.5"/>
+  <circle class="q1" cx="125.6" cy="248.4" r="2.5"/>
+  <circle class="q1" cx="125.6" cy="248.8" r="2.5"/>
+  <circle class="dot-them" cx="109.6" cy="248.5" r="6"/>
+  <text class="v-them mid" x="109.6" y="238.7">0.4%</text>
+  <text class="cat mid" x="109.6" y="268">A0</text>
+  <text class="cat-sub mid" x="109.6" y="282">no memory</text>
+  <text class="cat-sub mid" x="109.6" y="295">no seed</text>
+  <rect class="them" opacity="0.35" x="181.7" y="246.3" width="14" height="3.3"/>
+  <circle class="q1" cx="204.7" cy="247.6" r="2.5"/>
+  <circle class="q1" cx="204.7" cy="248.4" r="2.5"/>
+  <circle class="q1" cx="204.7" cy="248.7" r="2.5"/>
+  <circle class="dot-them" cx="188.7" cy="248.2" r="6"/>
+  <text class="v-them mid" x="188.7" y="238.3">0.5%</text>
+  <text class="cat mid" x="188.7" y="268">A1</text>
+  <text class="cat-sub mid" x="188.7" y="282">no memory</text>
+  <text class="cat-sub mid" x="188.7" y="295">seed</text>
+  <rect class="them" opacity="0.35" x="260.9" y="113" width="14" height="43"/>
+  <circle class="q1" cx="283.9" cy="134.3" r="2.5"/>
+  <circle class="q1" cx="283.9" cy="132.3" r="2.5"/>
+  <circle class="q1" cx="283.9" cy="137.9" r="2.5"/>
+  <circle class="dot-them" cx="267.9" cy="134.8" r="6"/>
+  <text class="v-them mid" x="267.9" y="105">30.6%</text>
+  <text class="cat mid" x="267.9" y="268">D1</text>
+  <text class="cat-sub mid" x="267.9" y="282">once</text>
+  <text class="cat-sub mid" x="267.9" y="295">seed</text>
+  <rect class="them" opacity="0.35" x="340" y="108.3" width="14" height="43.5"/>
+  <circle class="q1" cx="363" cy="130.9" r="2.5"/>
+  <circle class="q1" cx="363" cy="135.8" r="2.5"/>
+  <circle class="q1" cx="363" cy="123.8" r="2.5"/>
+  <circle class="dot-them" cx="347" cy="130.2" r="6"/>
+  <text class="v-them mid" x="347" y="100.3">31.9%</text>
+  <text class="cat mid" x="347" y="268">B0</text>
+  <text class="cat-sub mid" x="347" y="282">held</text>
+  <text class="cat-sub mid" x="347" y="295">no seed</text>
+  <rect class="them" opacity="0.35" x="419.1" y="106.1" width="14" height="43.1"/>
+  <circle class="q1" cx="442.1" cy="124.3" r="2.5"/>
+  <circle class="q1" cx="442.1" cy="127.4" r="2.5"/>
+  <circle class="q1" cx="442.1" cy="131.5" r="2.5"/>
+  <circle class="dot-them" cx="426.1" cy="127.8" r="6"/>
+  <text class="v-them mid" x="426.1" y="98.1">32.5%</text>
+  <text class="cat mid" x="426.1" y="268">B1</text>
+  <text class="cat-sub mid" x="426.1" y="282">held</text>
+  <text class="cat-sub mid" x="426.1" y="295">seed</text>
+  <rect class="us-soft" x="498.3" y="89.9" width="14" height="44.2"/>
+  <circle class="q1" cx="521.3" cy="111.4" r="2.5"/>
+  <circle class="q1" cx="521.3" cy="108.4" r="2.5"/>
+  <circle class="q1" cx="521.3" cy="115.7" r="2.5"/>
+  <circle class="dot-us" cx="505.3" cy="111.8" r="6"/>
+  <text class="v-us mid" x="505.3" y="81.9">36.7%</text>
+  <text class="cat mid" x="505.3" y="268">C0</text>
+  <text class="cat-sub mid" x="505.3" y="282">reprojecting</text>
+  <text class="cat-sub mid" x="505.3" y="295">no seed</text>
+  <rect class="us-soft" x="577.4" y="87.5" width="14" height="45.9"/>
+  <circle class="q1" cx="600.4" cy="112.6" r="2.5"/>
+  <circle class="q1" cx="600.4" cy="102.3" r="2.5"/>
+  <circle class="q1" cx="600.4" cy="116.1" r="2.5"/>
+  <circle class="dot-us" cx="584.4" cy="110.3" r="6"/>
+  <text class="v-us mid" x="584.4" y="79.5">37.2%</text>
+  <text class="cat mid" x="584.4" y="268">C1</text>
+  <text class="cat-sub mid" x="584.4" y="282">reprojecting</text>
+  <text class="cat-sub mid" x="584.4" y="295">seed</text>
+</svg>
+</figure>
 
-**Figure 9.12-1 — Recall by arm** (`fig_9_12_1_recall_by_arm.csv`). One point per arm with its 95% interval, the three run means beside it; arms ordered A0, A1, D1, B0, B1, C0, C1.
+Recall climbs the ladder the design predicts. The model alone (A0, 0.4%) says it has no record of what is asked rather than invent it; the seed files alone (A1, 0.5%) add nothing; a single retrieval (D1, 30.6%) adds the memory; re-selection during reasoning (C1, 37.2%) adds the files the question does not name. Full marks: 0, 0, 9, 13, 10, 11 and 12 questions across A0–C1. The direct questions are drawn mechanically, so they include call sites no document describes, which makes the 128 harder than the pilot's 24.
 
-| Arm | Mean recall | 95% interval | Run means | Full marks |
-|---|---:|---|---|---:|
-| A0 | 0.4% | 0.1–0.9% | 0.5, 0.4, 0.3 | 0 |
-| A1 | 0.5% | 0.1–1.0% | 0.7, 0.4, 0.4 | 0 |
-| D1 | 30.6% | 25.0–36.4% | 30.8, 31.3, 29.8 | 9 |
-| B0 | 31.9% | 26.1–37.7% | 31.7, 30.4, 33.6 | 13 |
-| B1 | 32.5% | 26.8–38.3% | 33.4, 32.6, 31.5 | 10 |
-| C0 | 36.7% | 30.8–42.6% | 36.8, 37.7, 35.7 | 11 |
-| C1 | 37.2% | 31.0–43.2% | 36.5, 39.3, 35.6 | 12 |
-
-Recall climbs the ladder the design predicts. The model alone (A0) answers almost nothing: asked about its own codebase with tools forbidden, it says it has no record of what is asked rather than invent it. The seed files alone (A1) add nothing measurable. Projection with a single retrieval (D1) adds the memory. Re-selection during reasoning (C1) adds the files the question does not name. The production system scores 37.2% against the model's own 0.4%. The 128 questions are harder than the pilot's 24: the direct questions are drawn mechanically, so they include call sites no document describes. The pilot's reprojecting arm, on 24 questions, averaged 57.3%.
-
-**Figure 9.12-2 — Effect sizes** (`fig_9_12_2_effects.csv`). A forest plot of the five contrasts, each a point estimate in points of recall with its 95% interval and its Holm-adjusted p, against a line at zero:
+<figure class="fig">
+<svg viewBox="0 0 640 294" role="img" aria-label="Figure 9.12-2. The effect of each contrast on mean recall over 128 paired questions, with its 95% bootstrap interval and Holm-corrected Wilcoxon p-value: The memory (C1 − A1 · Holm p = 1.8e-15), +36.7 points (+30.7 to +42.7); Reasoning-time reprojection (C1 − B1 · Holm p = 0.047), +4.6 points (+1.2 to +8.2); Continuous against retrieve-once (C1 − D1 · Holm p = 0.001), +6.5 points (+2.8 to +10.3); Reasoning-time reprojection without the seed (C0 − B0 · Holm p = 0.010), +4.9 points (+1.7 to +8.2); The seed files (C1 − C0 · Holm p = 0.670), +0.4 points (−2.7 to +3.5).">
+  <text class="ttl" x="16" y="20">Figure 9.12-2 · What each part of the memory buys</text>
+  <text class="ttl-sub" x="16" y="38">paired difference in mean recall, points · 128 questions · 95% interval · faded: Holm p ≥ 0.05</text>
+  <path class="grid" d="M372 66 V270 M410.7 66 V270 M449.3 66 V270 M488 66 V270 M526.7 66 V270 M565.3 66 V270 M604 66 V270"/>
+  <text class="tick mid" x="372" y="284">−10</text>
+  <text class="tick mid" x="410.7" y="284">0</text>
+  <text class="tick mid" x="449.3" y="284">+10</text>
+  <text class="tick mid" x="488" y="284">+20</text>
+  <text class="tick mid" x="526.7" y="284">+30</text>
+  <text class="tick mid" x="565.3" y="284">+40</text>
+  <text class="tick mid" x="604" y="284">+50</text>
+  <path class="parity" d="M410.7 66 V270"/>
+  <text class="cat" x="16" y="82">The memory</text>
+  <text class="cat-sub" x="16" y="96">C1 − A1 · Holm p = 1.8e-15</text>
+  <path class="line-us" d="M529.2 84 H575.7"/>
+  <circle class="dot-us" cx="552.5" cy="84" r="6"/>
+  <text class="v-us mid" x="552.5" y="74">+36.7</text>
+  <text class="cat" x="16" y="122">Reasoning-time reprojection</text>
+  <text class="cat-sub" x="16" y="136">C1 − B1 · Holm p = 0.047</text>
+  <path class="line-us" d="M415.4 124 H442.3"/>
+  <circle class="dot-us" cx="428.6" cy="124" r="6"/>
+  <text class="v-us mid" x="428.6" y="114">+4.6</text>
+  <text class="cat" x="16" y="162">Continuous against retrieve-once</text>
+  <text class="cat-sub" x="16" y="176">C1 − D1 · Holm p = 0.001</text>
+  <path class="line-us" d="M421.6 164 H450.4"/>
+  <circle class="dot-us" cx="435.9" cy="164" r="6"/>
+  <text class="v-us mid" x="435.9" y="154">+6.5</text>
+  <text class="cat" x="16" y="202">Reasoning-time reprojection without the seed</text>
+  <text class="cat-sub" x="16" y="216">C0 − B0 · Holm p = 0.010</text>
+  <path class="line-us" d="M417.2 204 H442.3"/>
+  <circle class="dot-us" cx="429.5" cy="204" r="6"/>
+  <text class="v-us mid" x="429.5" y="194">+4.9</text>
+  <text class="cat" x="16" y="242">The seed files</text>
+  <text class="cat-sub" x="16" y="256">C1 − C0 · Holm p = 0.670</text>
+  <path class="line-us" opacity="0.45" d="M400.2 244 H424.1"/>
+  <circle class="dot-us" opacity="0.45" cx="412.2" cy="244" r="6"/>
+  <text class="v-them mid" x="412.2" y="234">+0.4</text>
+</svg>
+</figure>
 
 | Contrast | Arms | Effect | 95% interval | p (Holm) |
 |---|---|---:|---:|---:|
@@ -962,154 +1139,353 @@ Recall climbs the ladder the design predicts. The model alone (A0) answers almos
 | Reasoning-time reprojection without the seed | C0 − B0 | 4.9 | 1.7 to 8.2 | 0.010 |
 | The seed files | C1 − C0 | 0.4 | −2.7 to 3.5 | 0.67 |
 
-Every contrast that removes a part of provenance retrieval lowers recall, with an interval clear of zero. The memory is worth 36.7 points. Reprojection during reasoning is worth 4.6 with the seed files and 4.9 without them. Continuous reprojection beats a single retrieval before reasoning by 6.5. The seed files change nothing measurable: 0.4 points, an interval across zero. The pilot measured the reasoning-time contrast at 18.5 points on 24 questions; over 128 it is smaller, and its interval is clear of zero.
+Every contrast that removes a part of provenance retrieval lowers recall, with an interval clear of zero; the seed files change nothing measurable.
 
-**Figure 9.12-3 — Question by question** (`fig_9_12_3_questions.csv`). Each question a point: its recall held in thinking (B1) across, with reprojection (C1) up, coloured by category, the diagonal drawn.
+<figure class="fig">
+<svg viewBox="0 0 640 384" role="img" aria-label="Figure 9.12-3. Each of the 128 questions' mean recall under reprojection during the reasoning (C1) against the held projection (B1): 51 questions lie above the diagonal, where C1 recalls more, 29 below it, where B1 does, and 48 on it.">
+  <text class="ttl" x="16" y="20">Figure 9.12-3 · Question by question</text>
+  <text class="ttl-sub" x="16" y="38">each question's mean recall over its runs · 51 above the diagonal, 29 below, 48 on it</text>
+  <path class="grid" d="M70 270 H350 M70 200 H350 M70 130 H350 M70 60 H350"/>
+  <text class="tick" x="62" y="343.5" text-anchor="end">0%</text>
+  <text class="tick" x="62" y="273.5" text-anchor="end">25%</text>
+  <text class="tick" x="62" y="203.5" text-anchor="end">50%</text>
+  <text class="tick" x="62" y="133.5" text-anchor="end">75%</text>
+  <text class="tick" x="62" y="63.5" text-anchor="end">100%</text>
+  <path class="grid base" d="M70 340 H350"/>
+  <path class="grid" d="M70 60 V340 M140 60 V340 M210 60 V340 M280 60 V340 M350 60 V340"/>
+  <text class="tick mid" x="70" y="356">0%</text>
+  <text class="tick mid" x="140" y="356">25%</text>
+  <text class="tick mid" x="210" y="356">50%</text>
+  <text class="tick mid" x="280" y="356">75%</text>
+  <text class="tick mid" x="350" y="356">100%</text>
+  <path class="parity" d="M70 340 L350 60"/>
+  <circle class="us" opacity="0.3" cx="350" cy="60" r="4"/>
+  <circle class="us" opacity="0.3" cx="350" cy="60" r="4"/>
+  <circle class="us" opacity="0.3" cx="163.3" cy="246.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="210" cy="153.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="350" cy="60" r="4"/>
+  <circle class="us" opacity="0.3" cx="303.3" cy="200" r="4"/>
+  <circle class="us" opacity="0.3" cx="132.2" cy="215.6" r="4"/>
+  <circle class="us" opacity="0.3" cx="350" cy="60" r="4"/>
+  <circle class="us" opacity="0.3" cx="182" cy="172" r="4"/>
+  <circle class="us" opacity="0.3" cx="256.7" cy="116" r="4"/>
+  <circle class="us" opacity="0.3" cx="280" cy="83.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="210" cy="60" r="4"/>
+  <circle class="us" opacity="0.3" cx="144.7" cy="228" r="4"/>
+  <circle class="us" opacity="0.3" cx="233.3" cy="223.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="331.3" cy="78.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="163.3" cy="200" r="4"/>
+  <circle class="us" opacity="0.3" cx="275.3" cy="172" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="270" r="4"/>
+  <circle class="us" opacity="0.3" cx="210" cy="130" r="4"/>
+  <circle class="us" opacity="0.3" cx="194.4" cy="246.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="233.3" cy="130" r="4"/>
+  <circle class="us" opacity="0.3" cx="163.3" cy="223.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="233.3" cy="153.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="182" cy="302.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="144.7" cy="116" r="4"/>
+  <circle class="us" opacity="0.3" cx="233.3" cy="106.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="238" cy="153.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="93.3" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="93.3" cy="316.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="130" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="316.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="186.7" cy="246.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="210" cy="153.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="233.3" cy="246.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="280" cy="200" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="246.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="350" cy="106.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="350" cy="83.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="256.7" cy="223.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="163.3" cy="106.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="163.3" cy="223.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="101.1" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="163.3" cy="293.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="101.1" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="101.1" cy="308.9" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="246.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="293.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="163.3" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="293.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="163.3" cy="293.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="293.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="93.3" cy="316.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="293.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="176.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="210" cy="176.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="233.3" cy="130" r="4"/>
+  <circle class="us" opacity="0.3" cx="350" cy="215.6" r="4"/>
+  <circle class="us" opacity="0.3" cx="194.4" cy="184.4" r="4"/>
+  <circle class="us" opacity="0.3" cx="93.3" cy="60" r="4"/>
+  <circle class="us" opacity="0.3" cx="101.1" cy="215.6" r="4"/>
+  <circle class="us" opacity="0.3" cx="194.4" cy="184.4" r="4"/>
+  <circle class="us" opacity="0.3" cx="326.7" cy="60" r="4"/>
+  <circle class="us" opacity="0.3" cx="233.3" cy="130" r="4"/>
+  <circle class="us" opacity="0.3" cx="294" cy="97.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="326.7" cy="83.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="163.3" cy="228" r="4"/>
+  <circle class="us" opacity="0.3" cx="238" cy="116" r="4"/>
+  <circle class="us" opacity="0.3" cx="256.7" cy="134.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="238" cy="190.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="302.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="126" cy="302.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="144.7" cy="302.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="246.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="182" cy="265.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="210" cy="60" r="4"/>
+  <circle class="us" opacity="0.3" cx="312.7" cy="60" r="4"/>
+  <circle class="us" opacity="0.3" cx="107.3" cy="153.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="88.7" cy="302.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="238" cy="302.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="275.3" cy="116" r="4"/>
+  <circle class="us" opacity="0.3" cx="350" cy="60" r="4"/>
+  <circle class="us" opacity="0.3" cx="93.3" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="93.3" cy="316.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="270" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="200" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="316.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="233.3" cy="176.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="93.3" cy="200" r="4"/>
+  <circle class="us" opacity="0.3" cx="70" cy="340" r="4"/>
+  <circle class="us" opacity="0.3" cx="256.7" cy="153.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="140" cy="316.7" r="4"/>
+  <circle class="us" opacity="0.3" cx="350" cy="60" r="4"/>
+  <circle class="us" opacity="0.3" cx="116.7" cy="223.3" r="4"/>
+  <circle class="us" opacity="0.3" cx="350" cy="60" r="4"/>
+  <text class="t-dim" x="82" y="76">C1 higher</text>
+  <text class="t-dim" x="338" y="330" text-anchor="end">B1 higher</text>
+  <text class="t-dim mid" x="210" y="372">B1 recall · projection held</text>
+  <text class="t-dim" x="70" y="52">C1 recall · reprojecting</text>
+  <text class="v-us" x="396" y="110">51</text>
+  <text class="cat-sub" x="396" y="126">above the diagonal: C1 recalls more</text>
+  <text class="v-them" x="396" y="166">29</text>
+  <text class="cat-sub" x="396" y="182">below it: B1 recalls more</text>
+  <text class="v-them" x="396" y="222">48</text>
+  <text class="cat-sub" x="396" y="238">on it: the same recall</text>
+</svg>
+</figure>
 
-The gain is broad: 51 of 128 questions sit above the diagonal and 29 below, with 48 on it, so the effect is not carried by a few questions.
+The gain is broad: 51 of 128 questions sit above the diagonal, 29 below and 48 on it.
 
-**Figure 9.12-4 — Where the gain falls** (`fig_9_12_4_gain_by_naming.csv`). The reasoning-time gain (C1 − B1) with its interval, for questions that name their answer's file and for those that do not — a split fixed in the battery before any run.
+<figure class="fig">
+<svg viewBox="0 0 640 174" role="img" aria-label="Figure 9.12-4. The gain in mean recall of reprojecting during the reasoning (C1) over the held projection (B1), split by whether the question names its answer file, with 95% bootstrap intervals: Names its file (n=17), −3.1 points (−11.2 to +4.1); Does not (n=111), +5.8 points (+2.2 to +9.7).">
+  <text class="ttl" x="16" y="20">Figure 9.12-4 · Where the gain falls</text>
+  <text class="ttl-sub" x="16" y="38">C1 − B1 in mean recall, points · 95% bootstrap interval over questions</text>
+  <path class="grid" d="M372 66 V150 M418.4 66 V150 M464.8 66 V150 M511.2 66 V150 M557.6 66 V150 M604 66 V150"/>
+  <text class="tick mid" x="372" y="164">−15</text>
+  <text class="tick mid" x="418.4" y="164">−10</text>
+  <text class="tick mid" x="464.8" y="164">−5</text>
+  <text class="tick mid" x="511.2" y="164">0</text>
+  <text class="tick mid" x="557.6" y="164">+5</text>
+  <text class="tick mid" x="604" y="164">+10</text>
+  <path class="parity" d="M511.2 66 V150"/>
+  <text class="cat" x="16" y="82">Names its file (n=17)</text>
+  <text class="cat-sub" x="16" y="96">the question names its answer file</text>
+  <path class="line-us" opacity="0.45" d="M407.5 84 H549.4"/>
+  <circle class="dot-us" opacity="0.45" cx="482.1" cy="84" r="6"/>
+  <text class="v-them mid" x="482.1" y="74">−3.1</text>
+  <text class="cat" x="16" y="122">Does not (n=111)</text>
+  <text class="cat-sub" x="16" y="136">the question leaves its answer file unnamed</text>
+  <path class="line-us" d="M531.3 124 H601.3"/>
+  <circle class="dot-us" cx="565.3" cy="124" r="6"/>
+  <text class="v-us mid" x="565.3" y="114">+5.8</text>
+</svg>
+</figure>
 
-The gain lies on the 111 questions that do not name their answer's file: 5.8 points (2.2 to 9.7). On the 17 that do, it is −3.1 (−11.2 to 4.1), indistinguishable from zero. That is the mechanism the design predicts (§6.5). What the question names, the opening finds. What it does not, the model's reasoning reaches, and only a reprojection inside the reasoning places it while the reasoning can use it.
+The gain lies on the 111 questions that do not name their answer's file, 5.8 points (2.2 to 9.7); on the 17 that do it is −3.1 (−11.2 to 4.1), indistinguishable from zero — a split fixed before any run. What the question names, the opening finds; what it does not, the reasoning reaches, and only a reprojection inside the reasoning places it while the reasoning can use it.
 
-**Figure 9.12-5 — Retrieval as the reasoning proceeds** (`fig_9_12_5_retrieval_curve.csv`). The share of answers whose answer file is in the working set, against tokens decoded, for C1, B1 and D1 with bootstrap bands, read from each turn's projection records.
+<figure class="fig">
+<svg viewBox="0 0 640 324" role="img" aria-label="Figure 9.12-5. The share of answers whose projection held an answer file, by decoded token, with 95% bootstrap bands: C1 from 51.6% at the first token to 57.8% at token 4,096; B1 from 51.6% at the first token to 54.9% at token 4,096; D1 from 48.7% at the first token to 54.9% at token 4,096.">
+  <text class="ttl" x="16" y="20">Figure 9.12-5 · Retrieval as the reasoning proceeds</text>
+  <text class="ttl-sub" x="16" y="38">answers with an answer file placed, by decoded token · band: 95% bootstrap interval</text>
+  <path class="grid" d="M62 210 H616 M62 140 H616 M62 70 H616"/>
+  <text class="tick" x="54" y="283.5" text-anchor="end">40%</text>
+  <text class="tick" x="54" y="213.5" text-anchor="end">50%</text>
+  <text class="tick" x="54" y="143.5" text-anchor="end">60%</text>
+  <text class="tick" x="54" y="73.5" text-anchor="end">70%</text>
+  <path class="grid base" d="M62 280 H616"/>
+  <path class="grid" d="M62 70 V280 M200.5 70 V280 M339 70 V280 M477.5 70 V280 M616 70 V280"/>
+  <text class="tick mid" x="62" y="296">0</text>
+  <text class="tick mid" x="200.5" y="296">1,024</text>
+  <text class="tick mid" x="339" y="296">2,048</text>
+  <text class="tick mid" x="477.5" y="296">3,072</text>
+  <text class="tick mid" x="616" y="296">4,096</text>
+  <text class="t-dim mid" x="339" y="314">decoded token</text>
+  <path class="area-us" d="M62 142.6 L70.7 144.4 L79.3 98.8 L88 102.4 L96.6 102.4 L105.3 104.3 L113.9 111.6 L122.6 111.6 L131.3 109.7 L139.9 118.9 L148.6 106.1 L157.2 113.4 L165.9 109.7 L174.5 111.6 L183.2 102.4 L191.8 107.9 L200.5 117 L209.2 115.2 L217.8 106.1 L226.5 111.5 L235.1 104.3 L243.8 97 L252.4 107.9 L261.1 104.3 L269.8 107.9 L278.4 104.3 L287.1 100.6 L295.7 102.4 L304.4 106.1 L313 100.6 L321.7 100.6 L330.3 98.8 L339 102.4 L347.7 102.4 L356.3 104.3 L365 104.2 L373.6 104.3 L382.3 106.1 L390.9 106.1 L399.6 102.4 L408.3 104.3 L416.9 102.4 L425.6 104.3 L434.2 104.3 L442.9 102.4 L451.5 102.4 L460.2 104.3 L468.8 100.6 L477.5 104.3 L486.2 102.4 L494.8 104.3 L503.5 106.1 L512.1 106.1 L520.8 106.1 L529.4 104.3 L538.1 104.3 L546.8 104.3 L555.4 104.3 L564.1 104.3 L572.7 104.3 L581.4 102.4 L590 104.3 L598.7 104.3 L607.3 102.4 L616 102.4 L616 210 L607.3 210 L598.7 211.8 L590 211.8 L581.4 210 L572.7 211.8 L564.1 211.8 L555.4 211.8 L546.8 211.8 L538.1 211.8 L529.4 211.8 L520.8 213.6 L512.1 213.6 L503.5 213.6 L494.8 211.8 L486.2 210 L477.5 211.8 L468.8 208.2 L460.2 211.8 L451.5 210 L442.9 210 L434.2 211.8 L425.6 211.8 L416.9 210 L408.3 211.8 L399.6 210 L390.9 213.6 L382.3 213.6 L373.6 213.6 L365 211.8 L356.3 211.8 L347.7 210 L339 210 L330.3 204.5 L321.7 208.2 L313 206.4 L304.4 213.6 L295.7 210 L287.1 208.2 L278.4 211.8 L269.8 215.5 L261.1 211.8 L252.4 215.5 L243.8 200.9 L235.1 211.8 L226.5 219.1 L217.8 213.6 L209.2 222.8 L200.5 224.6 L191.8 213.6 L183.2 206.4 L174.5 215.5 L165.9 215.5 L157.2 219.1 L148.6 211.8 L139.9 224.6 L131.3 215.5 L122.6 217.3 L113.9 219.1 L105.3 210 L96.6 208.2 L88 208.2 L79.3 208.2 L70.7 255.6 L62 253.8 Z"/>
+  <path class="them" opacity="0.12" d="M62 144.4 L70.7 144.4 L79.3 144.4 L88 142.6 L96.6 142.6 L105.3 138.9 L113.9 140.7 L122.6 133.4 L131.3 137.1 L139.9 135.3 L148.6 131.6 L157.2 124.3 L165.9 126.1 L174.5 128 L183.2 126.1 L191.8 133.4 L200.5 133.4 L209.2 128 L217.8 122.5 L226.5 120.7 L235.1 122.5 L243.8 118.9 L252.4 120.7 L261.1 118.9 L269.8 118.9 L278.4 118.9 L287.1 117 L295.7 118.9 L304.4 118.9 L313 117 L321.7 122.5 L330.3 122.5 L339 120.7 L347.7 118.9 L356.3 120.7 L365 126.1 L373.6 122.5 L382.3 118.9 L390.9 120.7 L399.6 122.5 L408.3 122.5 L416.9 122.5 L425.6 120.7 L434.2 118.9 L442.9 120.7 L451.5 120.7 L460.2 120.7 L468.8 120.7 L477.5 120.7 L486.2 120.7 L494.8 122.5 L503.5 120.7 L512.1 120.7 L520.8 122.5 L529.4 122.5 L538.1 122.5 L546.8 120.7 L555.4 118.9 L564.1 122.5 L572.7 118.9 L581.4 118.9 L590 118.9 L598.7 118.9 L607.3 118.9 L616 120.7 L616 230.1 L607.3 228.2 L598.7 228.2 L590 228.2 L581.4 228.2 L572.7 228.2 L564.1 231.9 L555.4 228.2 L546.8 230.1 L538.1 231.9 L529.4 231.9 L520.8 231.9 L512.1 230.1 L503.5 230.1 L494.8 231.9 L486.2 228.2 L477.5 228.2 L468.8 230.1 L460.2 230.1 L451.5 230.1 L442.9 230.1 L434.2 228.2 L425.6 230.1 L416.9 231.9 L408.3 231.9 L399.6 231.9 L390.9 230.1 L382.3 226.4 L373.6 230.1 L365 233.7 L356.3 228.2 L347.7 226.4 L339 228.2 L330.3 230.1 L321.7 230.1 L313 224.6 L304.4 226.4 L295.7 226.4 L287.1 224.6 L278.4 226.4 L269.8 226.4 L261.1 226.4 L252.4 226.4 L243.8 226.4 L235.1 230.1 L226.5 228.2 L217.8 230.1 L209.2 235.5 L200.5 241 L191.8 241 L183.2 233.7 L174.5 235.5 L165.9 231.9 L157.2 231.9 L148.6 239.2 L139.9 242.8 L131.3 244.6 L122.6 242.8 L113.9 250.1 L105.3 248.3 L96.6 251.9 L88 251.9 L79.3 253.8 L70.7 253.8 L62 253.8 Z"/>
+  <path class="line-them dash" d="M62 219.1 L70.7 219.1 L79.3 219.1 L88 219.1 L96.6 219.1 L105.3 219.1 L113.9 213.6 L122.6 213.6 L131.3 213.6 L139.9 211.8 L148.6 211.8 L157.2 206.4 L165.9 206.4 L174.5 206.4 L183.2 204.5 L191.8 202.7 L200.5 200.9 L209.2 199.1 L217.8 197.2 L226.5 197.2 L235.1 193.6 L243.8 193.6 L252.4 193.6 L261.1 193.6 L269.8 191.8 L278.4 191.8 L287.1 189.9 L295.7 189.9 L304.4 188.1 L313 184.5 L321.7 184.5 L330.3 182.7 L339 182.7 L347.7 182.7 L356.3 179 L365 177.2 L373.6 177.2 L382.3 177.2 L390.9 177.2 L399.6 177.2 L408.3 177.2 L416.9 177.2 L425.6 177.2 L434.2 177.2 L442.9 177.2 L451.5 177.2 L460.2 177.2 L468.8 177.2 L477.5 175.4 L486.2 175.4 L494.8 175.4 L503.5 175.4 L512.1 175.4 L520.8 175.4 L529.4 175.4 L538.1 175.4 L546.8 175.4 L555.4 175.4 L564.1 175.4 L572.7 175.4 L581.4 175.4 L590 175.4 L598.7 175.4 L607.3 175.4 L616 175.4"/>
+  <path class="line-them" d="M62 199.1 L70.7 199.1 L79.3 199.1 L88 197.2 L96.6 197.2 L105.3 193.6 L113.9 195.4 L122.6 188.1 L131.3 191.8 L139.9 189.9 L148.6 186.3 L157.2 179 L165.9 179 L174.5 182.7 L183.2 180.8 L191.8 188.1 L200.5 188.1 L209.2 182.7 L217.8 177.2 L226.5 175.4 L235.1 177.2 L243.8 173.5 L252.4 173.5 L261.1 173.5 L269.8 173.5 L278.4 173.5 L287.1 171.7 L295.7 173.5 L304.4 173.5 L313 171.7 L321.7 177.2 L330.3 177.2 L339 175.4 L347.7 173.5 L356.3 175.4 L365 180.8 L373.6 177.2 L382.3 173.5 L390.9 175.4 L399.6 177.2 L408.3 177.2 L416.9 177.2 L425.6 175.4 L434.2 173.5 L442.9 175.4 L451.5 175.4 L460.2 175.4 L468.8 175.4 L477.5 175.4 L486.2 175.4 L494.8 177.2 L503.5 175.4 L512.1 175.4 L520.8 177.2 L529.4 177.2 L538.1 177.2 L546.8 175.4 L555.4 173.5 L564.1 177.2 L572.7 173.5 L581.4 173.5 L590 173.5 L598.7 173.5 L607.3 173.5 L616 175.4"/>
+  <path class="line-us" d="M62 199.1 L70.7 200.9 L79.3 153.5 L88 155.3 L96.6 155.3 L105.3 157.1 L113.9 164.4 L122.6 164.4 L131.3 162.6 L139.9 171.7 L148.6 159 L157.2 166.2 L165.9 162.6 L174.5 162.6 L183.2 153.5 L191.8 160.8 L200.5 169.9 L209.2 168.1 L217.8 159 L226.5 164.4 L235.1 157.1 L243.8 148 L252.4 160.8 L261.1 157.1 L269.8 160.8 L278.4 157.1 L287.1 153.5 L295.7 155.3 L304.4 159 L313 153.5 L321.7 153.5 L330.3 151.7 L339 155.3 L347.7 155.3 L356.3 157.1 L365 157.1 L373.6 159 L382.3 159 L390.9 159 L399.6 155.3 L408.3 157.1 L416.9 155.3 L425.6 157.1 L434.2 157.1 L442.9 155.3 L451.5 155.3 L460.2 157.1 L468.8 153.5 L477.5 157.1 L486.2 155.3 L494.8 157.1 L503.5 159 L512.1 159 L520.8 159 L529.4 157.1 L538.1 157.1 L546.8 157.1 L555.4 157.1 L564.1 157.1 L572.7 157.1 L581.4 155.3 L590 157.1 L598.7 157.1 L607.3 155.3 L616 155.3"/>
+  <g class="legend">
+  <path class="line-us" d="M330 53 H344"/>
+  <text x="348" y="56">C1 reprojecting</text>
+  <path class="line-them" d="M457 53 H471"/>
+  <text x="475" y="56">B1 held</text>
+  <path class="line-them dash" d="M534.4 53 H548.4"/>
+  <text x="552.4" y="56">D1 once</text>
+  </g>
+</svg>
+</figure>
 
-With reprojection the share climbs as the model reasons: from 51.6% at the opening to 58.1% by the 128th decoded token, then 57.8% by `</think>`. Held it stays at the opening's 51.6% (51.8% at `</think>`), and retrieved once at 48.7%, until the reasoning is over. The reasoning moves retrieval toward the answer, and it does so early in the reasoning, inside the first two reprojection intervals.
+With reprojection the share of answers with an answer file in the working set jumps from 51.6% at the opening to 58.1% by the 128th decoded token, inside the reasoning's first two reprojection intervals, and holds there. Held or retrieved once, it stays at the opening's 51.6% or 48.7% until the reasoning ends, and only then climbs — to 54.9% by token 4,096 — as those arms' answers reproject: the file arrives, but after the thought that needed it.
 
-**Figure 9.12-6 — Recall when the answer file is placed** (`fig_9_12_6_recall_by_placement.csv`). Recall for answers decoded with their answer file in the working set and without it, pooled over the projecting arms.
+<figure class="fig">
+<svg viewBox="0 0 640 188" role="img" aria-label="Figure 9.12-6. Mean recall of the answers by whether their projection held an answer file for the first answer token, with 95% bootstrap intervals: answer file placed (1,025 answers): 51.1% (49.0% to 53.3%); not placed (895 answers): 13.9% (12.0% to 15.8%).">
+  <text class="ttl" x="16" y="20">Figure 9.12-6 · Recall when the answer file is in view</text>
+  <text class="ttl-sub" x="16" y="38">mean recall by whether an answer file was placed for the first answer token · 95% interval</text>
+  <path class="grid" d="M250 66 V162 M308.3 66 V162 M366.7 66 V162 M425 66 V162 M483.3 66 V162 M541.7 66 V162 M600 66 V162"/>
+  <text class="tick mid" x="250" y="176">0%</text>
+  <text class="tick mid" x="308.3" y="176">10%</text>
+  <text class="tick mid" x="366.7" y="176">20%</text>
+  <text class="tick mid" x="425" y="176">30%</text>
+  <text class="tick mid" x="483.3" y="176">40%</text>
+  <text class="tick mid" x="541.7" y="176">50%</text>
+  <text class="tick mid" x="600" y="176">60%</text>
+  <text class="cat" x="16" y="84">Answer file placed</text>
+  <text class="cat-sub" x="16" y="98">1,025 answers</text>
+  <rect class="us" x="250" y="75" width="298.3" height="22"/>
+  <path class="grid base" d="M535.6 80 V92 M535.6 86 H561.2 M561.2 80 V92"/>
+  <text class="v-us" x="569.2" y="90">51.1%</text>
+  <text class="cat" x="16" y="130">Not placed</text>
+  <text class="cat-sub" x="16" y="144">895 answers</text>
+  <rect class="us-soft" x="250" y="121" width="81.2" height="22"/>
+  <path class="grid base" d="M320.2 126 V138 M320.2 132 H342.3 M342.3 126 V138"/>
+  <text class="v-us" x="350.3" y="136">13.9%</text>
+</svg>
+</figure>
 
-Placement is what the answers turn on. Over 1,920 answers in the projecting arms, recall is 51.1% (49.0–53.3%) with the answer file placed for the first answer token, and 13.9% (12.0–15.8%) without it. Retrieval and the answers are one measurement seen twice, which ties every contrast above to the selection it changed.
+Over 1,920 answers in the projecting arms, recall is 51.1% (49.0–53.3%) with the answer file placed for the first answer token and 13.9% (12.0–15.8%) without it: retrieval and the answers are one measurement seen twice.
 
-**The pilot battery.** The 128 questions extend a 24-question pilot, eight in each category, run on production from 2026-11-10 as the retrieval changed. The first run (2026-11-10, `docs/results/dependency_battery_2026-11-10.md`) and the run after the retrieval work below (2026-11-20, `docs/results/dependency_battery_2026-11-20_b.md`):
+**Ranking, apart from the answers.** A scoring lab (`provenance_gates lab`) probes each question once through the daemon — prefilled and decoded through its thinking — scans its votes against every ingested file on the resident gallery, and re-ranks on the host under formulas read from a file, so every variant scores the same votes. It found the binding limit was votes per token (§6.3); every non-linear alternative tried scored below summed `z × margin` (`docs/results/provenance_scoring_lab_2026-11-16.md`). Over the whole battery, on the gallery of 2026-11-24 — 7,943 files, 36.1M tokens, every probe fresh (`docs/results/battery_128/needle.md`) — 121 questions rank; seven name only files since split away:
 
-| Category | Mean recall, 11-10 | Full marks | Mean recall, 11-20 | Full marks |
-|---|---:|---:|---:|---:|
-| Direct | 33.3% | 1 of 8 | 47.9% | 2 of 8 |
-| Transitive | 54.2% | 2 of 8 | 51.0% | 1 of 8 |
-| Architectural | 85.4% | 5 of 8 | 87.5% | 6 of 8 |
-| All 24 | 57.6% | 8 | **62.2%** | **9** |
-
-Between them the battery ran nine more times as the retrieval changed, at 46.2–59.7%; with 24 questions one question moves a category by up to 12 points, so it is the direct questions' rise and the ranking measurements below, not the total alone, that carry the result. Seven later runs on 2026-11-23 measure what reprojection during reasoning contributes, three runs per arm on one build; their reprojecting arm averages 57.3% and its best run scores 64.2% with 11 full marks (below, *The pilot reasoning-hold ablation*).
-
-**The scoring formula.** Which files a question's probe should place was measured apart from the model's answers, in a scoring lab (`candle-conversation/examples/provenance_gates`, `lab`): the battery's 23 file-answered questions, each probed once through the daemon — the question prefilled and decoded through its thinking — and its tokens' votes scanned against every one of the 6,854 ingested files on the resident gallery, 39,954,048 signature tokens, then re-ranked on the host under formulas read from a file, so every variant scores the same probes and the same votes (`docs/results/provenance_scoring_lab_2026-11-16.md`). The binding limit it found was votes per token, not normalization: under one vote per token a question's probe gave any vote to only 20–67 files, and seven answer files scored exactly zero, which no normalization can lift. The formula production runs on code reading:
-
-- **Top-k votes.** Each probe token votes for its best 8 files, file `r` by `z_r × (a_r − a_9)` — its z-score times its margin over the ninth — not for its single best.
-- **Vote power ½.** Each kept vote is square-rooted before summing, so one spiky match does not outweigh many moderate ones.
-- **A needle gate.** Only the quarter of the probe's tokens with the largest summed vote count.
-- **Every fold group alike** (`[1, 1, 1]`), and the file's **calibration** questions (§9.11.1) as a second competition at weight 1, one vote a token — a calibration question matches its own file cleanly, and spreading its vote dilutes it.
-- **Kind-normalized.** A file scores as a z-score among the files of its own kind on the same question, which replaces a hand-set down-weighting of documents.
-- **The lineage out.** The conversation's own inherited documents, placed anyway, are not ranked.
-
-Every non-linear alternative tried — reciprocal-rank and softmax vote laws, token weighting, log or count aggregates, content/calibration blends, token runs — scored below summed `z × margin`; the formula plateaus there. Tool selection keeps one vote per token: a tool probe has one clean match, and spreading its vote raised wrong tools over the selection gate (Top-1 80.0% → 63.7%).
-
-| Probe, on the recalibrated substrate (2026-11-20) | hit@1 | hit@5 | hit@10 | MRR |
-|---|---:|---:|---:|---:|
-| The question and its decoded thinking | 0.65 | **0.83** | **0.87** | **0.713** |
-| The decoded thinking alone | 0.61 | 0.83 | 0.83 | 0.676 |
-| The question alone | 0.43 | 0.78 | 0.78 | 0.573 |
-| One vote per token, the whole probe (2026-11-18) | 0.43 | 0.57 | 0.61 | 0.508 |
-
-The answer file is in the top five of 6,854 on 19 of 23 questions, and first on 15 (`docs/results/provenance_scoring_lab_2026-11-20.md`). Each is a needle-in-a-haystack search at a scale no context window holds: the answer is one file of 6,854, on average 0.015% of a 40M-token corpus, located by sign agreement between the probe's Q signatures and every stored token's, with no text index, no embedding model and no file name in the query — and the probe is a question plus the first stretch of the model's own reasoning about it, not a keyword. Ranking the answer first two times in three, and in the top five (the top 0.07% of the corpus) more than four times in five, is the selection the bounded working set depends on. The production gallery has grown since: on 2026-11-23 the projection galleries preloaded on BlackWorld held 29,747 turns and 54.7M resident signature tokens, across every layer.
-
-**Figure 9.12-7 — The needle in the haystack** (`fig_9_12_7_needle_ranks.csv`: each question's best-ranked answer file, and how many of its answer files the gallery holds). The share of the battery's questions whose answer file ranks at or above k of every ingested file, for k from 1 to 100 on a log axis, with a bootstrap band, over the line a random ranking draws (k times the question's answer files, over the file count).
-
-The same lab and formula over the whole 128-question battery, on BlackWorld's gallery of 2026-11-24 — 7,943 files, 36.1M tokens, every probe and scan taken fresh (`docs/results/battery_128/needle.md`) — ranks 121 questions; the other seven name answer files only under paths their modules have since been split out of, which the gallery no longer holds. The curve leaves the random line at its first point: the answer file is first of 7,943 on 49% of questions (59 of 121) and in the top five on 69% (84), where a random ranking puts one there 0.032% and 0.16% of the time — about 1,500 and 430 to one. It is in the top ten on 74% and the top hundred on 88% (MRR 0.578); first on 43% of the direct questions, 52% of the transitive and 50% of the architectural. The whole battery is harder than the 23 questions above — 0.49 at hit@1 against 0.65 — and most of its misses lose their top places to the same few files that score on every question (`tests_grid.rs`, `file_grep.yaml`, `tasks.rs`, `AGENTS.md`).
-
-| Probe, the 128-question battery (2026-11-24) | Questions | hit@1 | hit@5 | hit@10 | hit@100 | MRR |
+| Probe | Questions | hit@1 | hit@5 | hit@10 | hit@100 | MRR |
 |---|---:|---:|---:|---:|---:|---:|
-| The question and its decoded thinking | 121 | 0.49 | 0.69 | 0.74 | 0.88 | 0.578 |
+| Question and decoded thinking, 128-question battery | 121 | 0.49 | 0.69 | 0.74 | 0.88 | 0.578 |
+| Same, the pilot's 23 file-answered questions (2026-11-20) | 23 | 0.65 | 0.83 | 0.87 | | 0.713 |
+| The pilot's 23, decoded thinking alone | 23 | 0.61 | 0.83 | 0.83 | | 0.676 |
+| The pilot's 23, the question alone | 23 | 0.43 | 0.78 | 0.78 | | 0.573 |
 | A random ranking of 7,943 files | | 0.0003 | 0.0016 | 0.0032 | 0.032 | |
 
-**What raised the hit rate.** The ranking and the answers are two measurements: the lab ranks, and what the model reads is what the projection places from that ranking. The work between the two runs closed gaps between them, each found by reading a failing question's projection records:
+<figure class="fig">
+<svg viewBox="0 0 640 334" role="img" aria-label="Figure 9.12-7. The share of the 121 questions whose best-ranked answer file lies within the top k of the gallery's 7,943 files, with a 95% bootstrap band over questions: 49% at k = 1, 69% at k = 5, 74% at k = 10, 88% at k = 100; a random ranking of the gallery would reach 3% at k = 100.">
+  <text class="ttl" x="16" y="20">Figure 9.12-7 · The needle in the haystack</text>
+  <text class="ttl-sub" x="16" y="38">share of 121 questions with an answer file in the top k of 7,943 files · band: 95% bootstrap</text>
+  <path class="grid" d="M62 235 H616 M62 180 H616 M62 125 H616 M62 70 H616"/>
+  <text class="tick" x="54" y="293.5" text-anchor="end">0%</text>
+  <text class="tick" x="54" y="238.5" text-anchor="end">25%</text>
+  <text class="tick" x="54" y="183.5" text-anchor="end">50%</text>
+  <text class="tick" x="54" y="128.5" text-anchor="end">75%</text>
+  <text class="tick" x="54" y="73.5" text-anchor="end">100%</text>
+  <path class="grid base" d="M62 290 H616"/>
+  <path class="grid" d="M62 70 V290 M145.4 70 V290 M255.6 70 V290 M339 70 V290 M422.4 70 V290 M532.6 70 V290 M616 70 V290"/>
+  <text class="tick mid" x="62" y="306">1</text>
+  <text class="tick mid" x="145.4" y="306">2</text>
+  <text class="tick mid" x="255.6" y="306">5</text>
+  <text class="tick mid" x="339" y="306">10</text>
+  <text class="tick mid" x="422.4" y="306">20</text>
+  <text class="tick mid" x="532.6" y="306">50</text>
+  <text class="tick mid" x="616" y="306">100</text>
+  <text class="t-dim mid" x="339" y="324">k, the rank cut-off (log scale)</text>
+  <path class="area-us" d="M62 162.7 L145.4 142.7 L194.2 137.3 L228.8 120.9 L255.6 119.1 L277.5 117.3 L296.1 117.3 L312.2 113.6 L326.3 110 L339 110 L350.5 110 L360.9 108.2 L370.6 102.7 L379.5 100.9 L387.8 99.1 L395.5 99.1 L402.8 95.5 L409.7 93.6 L416.2 93.6 L422.4 93.6 L428.3 93.6 L433.9 93.6 L439.2 93.6 L444.3 93.6 L449.2 91.8 L453.9 91.8 L458.5 91.8 L462.9 91.8 L467.1 91.8 L471.2 91.8 L475.1 91.8 L478.9 91.8 L482.6 91.8 L486.2 91.8 L489.7 91.8 L493.1 91.8 L496.4 91.8 L499.6 91.8 L502.7 91.8 L505.8 90 L508.7 90 L511.6 90 L514.5 90 L517.2 90 L519.9 90 L522.6 90 L525.2 90 L527.7 90 L530.2 90 L532.6 90 L535 90 L537.3 90 L539.6 90 L541.9 90 L544.1 90 L546.2 90 L548.4 90 L550.5 90 L552.5 90 L554.5 90 L556.5 90 L558.5 88.2 L560.4 88.2 L562.3 88.2 L564.2 88.2 L566 88.2 L567.8 88.2 L569.6 88.2 L571.4 88.2 L573.1 88.2 L574.8 88.2 L576.5 88.2 L578.1 88.2 L579.8 88.2 L581.4 86.4 L583 86.4 L584.6 86.4 L586.1 86.4 L587.6 86.4 L589.2 86.4 L590.7 86.4 L592.1 86.4 L593.6 86.4 L595 86.4 L596.4 84.5 L597.9 84.5 L599.2 84.5 L600.6 84.5 L602 84.5 L603.3 84.5 L604.7 84.5 L606 84.5 L607.3 84.5 L608.6 84.5 L609.8 84.5 L611.1 84.5 L612.3 84.5 L613.6 84.5 L614.8 84.5 L616 84.5 L616 108.2 L614.8 108.2 L613.6 108.2 L612.3 108.2 L611.1 108.2 L609.8 108.2 L608.6 108.2 L607.3 111.8 L606 111.8 L604.7 111.8 L603.3 111.8 L602 111.8 L600.6 111.8 L599.2 111.8 L597.9 111.8 L596.4 111.8 L595 113.6 L593.6 113.6 L592.1 113.6 L590.7 113.6 L589.2 113.6 L587.6 113.6 L586.1 113.6 L584.6 113.6 L583 113.6 L581.4 113.6 L579.8 115.5 L578.1 115.5 L576.5 115.5 L574.8 115.5 L573.1 115.5 L571.4 115.5 L569.6 115.5 L567.8 115.5 L566 115.5 L564.2 115.5 L562.3 115.5 L560.4 115.5 L558.5 115.5 L556.5 117.3 L554.5 117.3 L552.5 117.3 L550.5 117.3 L548.4 117.3 L546.2 117.3 L544.1 117.3 L541.9 117.3 L539.6 117.3 L537.3 117.3 L535 117.3 L532.6 117.3 L530.2 117.3 L527.7 117.3 L525.2 117.3 L522.6 117.3 L519.9 117.3 L517.2 117.3 L514.5 117.3 L511.6 117.3 L508.7 117.3 L505.8 117.3 L502.7 119.1 L499.6 120.9 L496.4 120.9 L493.1 120.9 L489.7 120.9 L486.2 120.9 L482.6 120.9 L478.9 120.9 L475.1 120.9 L471.2 120.9 L467.1 120.9 L462.9 120.9 L458.5 120.9 L453.9 120.9 L449.2 120.9 L444.3 124.5 L439.2 124.5 L433.9 124.5 L428.3 124.5 L422.4 124.5 L416.2 124.5 L409.7 124.5 L402.8 126.4 L395.5 130 L387.8 130 L379.5 131.8 L370.6 135.5 L360.9 140.9 L350.5 142.7 L339 142.7 L326.3 142.7 L312.2 146.4 L296.1 151.8 L277.5 151.8 L255.6 155.5 L228.8 157.3 L194.2 173.6 L145.4 180.9 L62 202.7 Z"/>
+  <path class="line-them dash" d="M62 289.9 L145.4 289.9 L194.2 289.8 L228.8 289.7 L255.6 289.6 L277.5 289.6 L296.1 289.5 L312.2 289.4 L326.3 289.4 L339 289.3 L350.5 289.2 L360.9 289.2 L370.6 289.1 L379.5 289 L387.8 288.9 L395.5 288.9 L402.8 288.8 L409.7 288.7 L416.2 288.7 L422.4 288.6 L428.3 288.5 L433.9 288.4 L439.2 288.4 L444.3 288.3 L449.2 288.2 L453.9 288.2 L458.5 288.1 L462.9 288 L467.1 288 L471.2 287.9 L475.1 287.8 L478.9 287.7 L482.6 287.7 L486.2 287.6 L489.7 287.5 L493.1 287.5 L496.4 287.4 L499.6 287.3 L502.7 287.3 L505.8 287.2 L508.7 287.1 L511.6 287 L514.5 287 L517.2 286.9 L519.9 286.8 L522.6 286.8 L525.2 286.7 L527.7 286.6 L530.2 286.5 L532.6 286.5 L535 286.4 L537.3 286.3 L539.6 286.3 L541.9 286.2 L544.1 286.1 L546.2 286.1 L548.4 286 L550.5 285.9 L552.5 285.8 L554.5 285.8 L556.5 285.7 L558.5 285.6 L560.4 285.6 L562.3 285.5 L564.2 285.4 L566 285.3 L567.8 285.3 L569.6 285.2 L571.4 285.1 L573.1 285.1 L574.8 285 L576.5 284.9 L578.1 284.9 L579.8 284.8 L581.4 284.7 L583 284.6 L584.6 284.6 L586.1 284.5 L587.6 284.4 L589.2 284.4 L590.7 284.3 L592.1 284.2 L593.6 284.1 L595 284.1 L596.4 284 L597.9 283.9 L599.2 283.9 L600.6 283.8 L602 283.7 L603.3 283.7 L604.7 283.6 L606 283.5 L607.3 283.4 L608.6 283.4 L609.8 283.3 L611.1 283.2 L612.3 283.2 L613.6 283.1 L614.8 283 L616 282.9"/>
+  <path class="line-us" d="M62 182.7 L145.4 162.7 L194.2 155.5 L228.8 139.1 L255.6 137.3 L277.5 133.6 L296.1 133.6 L312.2 130 L326.3 126.4 L339 126.4 L350.5 126.4 L360.9 124.5 L370.6 119.1 L379.5 115.5 L387.8 113.6 L395.5 113.6 L402.8 110 L409.7 108.2 L416.2 108.2 L422.4 108.2 L428.3 108.2 L433.9 108.2 L439.2 108.2 L444.3 108.2 L449.2 106.4 L453.9 106.4 L458.5 106.4 L462.9 106.4 L467.1 106.4 L471.2 106.4 L475.1 106.4 L478.9 106.4 L482.6 106.4 L486.2 106.4 L489.7 106.4 L493.1 106.4 L496.4 106.4 L499.6 106.4 L502.7 104.5 L505.8 102.7 L508.7 102.7 L511.6 102.7 L514.5 102.7 L517.2 102.7 L519.9 102.7 L522.6 102.7 L525.2 102.7 L527.7 102.7 L530.2 102.7 L532.6 102.7 L535 102.7 L537.3 102.7 L539.6 102.7 L541.9 102.7 L544.1 102.7 L546.2 102.7 L548.4 102.7 L550.5 102.7 L552.5 102.7 L554.5 102.7 L556.5 102.7 L558.5 100.9 L560.4 100.9 L562.3 100.9 L564.2 100.9 L566 100.9 L567.8 100.9 L569.6 100.9 L571.4 100.9 L573.1 100.9 L574.8 100.9 L576.5 100.9 L578.1 100.9 L579.8 100.9 L581.4 99.1 L583 99.1 L584.6 99.1 L586.1 99.1 L587.6 99.1 L589.2 99.1 L590.7 99.1 L592.1 99.1 L593.6 99.1 L595 99.1 L596.4 97.3 L597.9 97.3 L599.2 97.3 L600.6 97.3 L602 97.3 L603.3 97.3 L604.7 97.3 L606 97.3 L607.3 97.3 L608.6 95.5 L609.8 95.5 L611.1 95.5 L612.3 95.5 L613.6 95.5 L614.8 95.5 L616 95.5"/>
+  <circle class="dot-us" cx="62" cy="182.7" r="5.5"/>
+  <text class="v-us" x="72" y="174.7">49% at 1</text>
+  <circle class="dot-us" cx="255.6" cy="137.3" r="5.5"/>
+  <text class="v-us" x="265.6" y="129.3">69% at 5</text>
+  <g class="legend">
+  <path class="line-us" d="M330 53 H344"/>
+  <text x="348" y="56">best answer-file rank</text>
+  <path class="line-them dash" d="M494.2 53 H508.2"/>
+  <text x="512.2" y="56">random ranking</text>
+  </g>
+</svg>
+</figure>
 
-- **Calibrations that saw their file.** A calibration is drafted by a conversation forked on the file's reading; when append-only conversations stopped carrying their lineage in their frame, every draft was asked for its file's questions knowing only the file's name, and 1,227 calibrations were written blind. The frame carries the lineage again, a draft that holds none of its reading is refused, and a reading past the 64,000-token lineage cap — the battery's six largest answer files among them — is drafted over windows of its turns. The whole substrate was recalibrated; the scoring formula's MRR rose 0.663 → 0.713 with nothing in the formula changed.
-- **Hits that survive a reprojection.** A reprojection moves the turn onto a rebuilt view; the hit counters stayed with the old one, so every file's hit momentum read zero after the first boundary. They now move with the state.
-- **The question's leaders keep their places.** The pool's minimum per kind is filled first by the files the boundary's scan scores highest, so a file lifted only by hits earned on whatever the slot held cannot push out a file the question names.
-- **Short strides early in the reasoning.** A reply still reasoning reprojects at 8, 16 and 32 decoded tokens before the 64-token cadence. Measured on one direct question, its answer file entered at token 64 before — after the reasoning had written that it had read nothing holding the symbol — and at token 8 after.
-- **A first question that opens its slot.** The first boundary after a new question chooses its rounds whole; a conversation's set, cleared when it opens, ignored the mark, and the first question's slot was filled a third of a budget at a time.
-- **A request read twice.** Every conversation starts on configured seed files as background, and the question read against them is a different probe: one direct question scored its answer file second of 6,854 read alone and fifth read against the seeds. A request is now prefilled first without the seeds and scored, that reading discarded, and the turn submitted again — its opening ranked by the first reading's scores beside the seeds, prefilled once more, and decoded (§6.5).
+The answer file is first of 7,943 on 49% of questions and in the top five on 69%, about 1,500 and 430 times a random ranking — by sign agreement alone, with no text index, no embedding model and no file name in the query. By kind it is first on 43% of direct, 52% of transitive and 50% of architectural questions. Most misses lose their top places to the same few files that score on every question (`tests_grid.rs`, `file_grep.yaml`, `tasks.rs`, `AGENTS.md`).
 
-What remains is placement, not ranking: three questions still declined with files they do not concern in context, and the first reading's own score of an answer file still moves with what the question is read against.
+**The pilot.** A 24-question pilot, run on production from 2026-11-10 as retrieval changed (57.6% → 62.2% by 2026-11-20; `docs/results/dependency_battery_2026-11-20_b.md`), first measured reasoning-time reprojection with a daemon-wide switch, `reproject_in_thinking: false`, which passes over every boundary inside the think block and keeps the rest — the opening, the answer's boundaries, and one reprojection on `</think>`. Over three runs per arm at one build (`docs/results/dependency_battery_2026-11-23_l_m.md`), reprojecting averaged **57.3%** and holding **38.8%**; every held run scored below every reprojecting run (p = 0.05, one-sided permutation), and per question reprojection won 14 to 4 (sign test, p = 0.031). Its loss fell where the answer lives in a file the question does not name. The 128-question battery measures the same contrast at 4.6 points: smaller, and with an interval clear of zero.
 
-**The pilot reasoning-hold ablation.** Before the 128-question battery, the pilot measured the contrast at the centre of the claim — whether the working set must follow the model *while it reasons* — with a daemon-wide setting changed between runs. `reproject_in_thinking: false` (`scheduler/think_gate.rs`) passes over every boundary inside the think block and keeps everything else: the turn's opening projection from the question read twice, every boundary through the answer, and one reprojection on the committed `</think>`, so the answer is decoded against a selection informed by the whole thought. The held arm therefore differs from the full system in one thing only: during its reasoning, the model reads what the question alone selected.
+**What the answers show.** The memory holds documentation and module structure more than the call graph. Answers cite their sources — a design document's section, a module header — and when the model had not read the source it said so, declining rather than inventing; the errors found on reading are near-misses (a constant placed in the header beside the one that defines it, an out-of-date caller), not invented names.
 
-Seven runs on BlackWorld at `e6ebbb188`, each after a restart with the normalization replay drained, the last two, (q) and (r), on a store with every earlier conversation archived or deleted first (`docs/results/dependency_battery_2026-11-23_l_m.md`). The probe's reach was shortened from 256 decoded tokens to 128 for the same runs; (l), at 256 on the build before, is the control for that change.
-
-| Run | Probe | Think block | Direct | Transitive | Architectural | All 24 | Full marks |
-|---|---:|---|---:|---:|---:|---:|---:|
-| (l) | 256 | reprojects | 25.0% | 56.3% | 66.7% | 49.3% | 7 |
-| (n) | 128 | reprojects | 26.0% | 64.6% | 70.8% | 53.8% | 7 |
-| (p) | 128 | reprojects | 27.1% | 69.8% | 95.8% | 64.2% | 11 |
-| (q) | 128 | reprojects | 25.0% | 67.7% | 68.8% | 53.8% | 7 |
-| (m) | 128 | held | 20.8% | 51.0% | 47.9% | 39.9% | 4 |
-| (o) | 128 | held | 14.6% | 50.0% | 47.9% | 37.5% | 6 |
-| (r) | 128 | held | 18.8% | 39.6% | 58.3% | 38.9% | 5 |
-| **Reprojecting, mean of (n)(p)(q)** | 128 | reprojects | 26.0% | 67.4% | 78.5% | **57.3%** | 8.3 |
-| **Held, mean of (m)(o)(r)** | 128 | held | 18.1% | 46.9% | 51.4% | **38.8%** | 5.0 |
-
-- **Reprojecting during reasoning is worth 18.5 points of recall.** With every other reprojection in place, holding the think block on its opening projection takes the battery from 57.3% to 38.8%.
-- **The arms do not overlap.** Every held run scores below every reprojecting run: under no effect, the three held runs take the three lowest places of six with probability 1/20 (one-sided permutation, p = 0.05). No run that reprojects in thinking — every battery run since 2026-11-10, 46.2% at the lowest — has scored as low as any held run.
-- **Question by question,** summing each question's recall over the three runs of each arm, the reprojecting arm scores higher on 14 questions, the held arm on 4, with 6 tied (sign test, p = 0.031 two-sided).
-- **The probe's reach is not the cause.** At 128 tokens the reprojecting arm averages 57.3%, above (l)'s 49.3% at 256, and production runs at 128.
-
-The loss has a shape. A held answer declines rather than errs: it says it has not read the file, and the files in its context are the ones the question selected. It is largest where the answer lives in a file the question does not name — the glue-island cache (t7, 2.67 against 0.33 summed over three runs), the reprojection configuration (t6, 2.0 against 0), the recurrent model's refusal of live glue and the un-rotated key store (a3, a4) — and absent where the question names what it needs (a1, a5 level). That is the mechanism the design predicts (§6.5): reasoning about a question moves the model's Q vectors toward the files that answer it, a reprojection inside the reasoning places those files while the reasoning can still use them, and one at `</think>` places them after the thought that needed them is over. The one repetition loop in the seven runs came from a held run.
-
-The held arm still re-selects at `</think>` and through the answer, so it is an upper bound on what retrieval before reasoning alone would score; the battery's retrieve-once arm (D1) measures that score itself.
-
-What the memory holds is the documentation and the module structure more than the call graph: the architectural answers are in `AGENTS.md` and the design documents, and five of eight came back whole; the direct questions ask for call sites, which documents rarely name, and one did. The answers cite where they came from — a design document's section, a module header — and when the model had not seen the source it said so: five declined outright, more named what they knew and declined the rest, and one withdrew identifiers it had just named because it had not read the file that would confirm them. The errors found on reading are near-misses (the CUDA constant placed in the arena-table header beside the one that defines it; an out-of-date caller), not invented names.
-
-**What is public.** The source and the raw measurement rows are public (Appendix A); every throughput, compression and retrieval figure in this paper is reproducible from a named test in the repository and a named row in `docs/performance.md`. The live system is open to signed-in users, but it does not expose a retrieval log, and the ingested conversation is not released; the battery, its ground truth, its analysis and its per-question scoring are in the repository (`zend/examples/dependency_battery/`, the pilot's `docs/results/dependency_battery_2026-11-10.md`, `docs/results/dependency_battery_2026-11-20_b.md` and `docs/results/dependency_battery_2026-11-23_l_m.md`, and the 128-question battery's `docs/results/battery_128/` — its answers, the census at start and end, every figure's data and `summary.md`), and so is the scoring lab with its formulas and measurements (`candle-conversation/examples/provenance_gates`, `docs/results/provenance_scoring_lab_2026-11-16.md`, `docs/results/provenance_scoring_lab_2026-11-20.md`).
+**What is public.** The source, the raw measurement rows, the battery with its ground truth and analysis (`zend/examples/dependency_battery/`, `docs/results/battery_128/`), the pilot's results and the scoring lab with its formulas (`candle-conversation/examples/provenance_gates`) are in the repository (Appendix A). The live system is open to signed-in users; the ingested conversation is not released.
 
 ---
 
 ### 9.13 The System as Its Own Workload
 
-Everything above is measured on a system that is also in use, and the use is itself the most interesting evidence, because it exercises the parts no benchmark can: memory that outlives the process that wrote it, and memory written by one model and read by another.
-
-**The substrate is the estate's memory, not one session's.** The journal store is a separate repository — one master journal per group, `people/`, `conversations/`, `topics/`, `threads/`, `bots/` — whose entries are minute-stamped YAML records written by whichever agent is speaking: `claude-code`, `claude.ai`, Grok, this engine's own workers, and the game's NPC bots. A note written by one agent at 00:39 is read by another the next morning, and the note's `by:` and `account:` fields are the record of who said it. Memory is therefore portable across models in the strongest sense that matters operationally: the memory is not in any model's weights, nor in a model-specific embedding space, and swapping the model that reads it does not orphan it.
-
-**Folding is what keeps it readable.** The journal entries fold the way the KV cache folds: a day's steps fold into the day, a week's days into the week, up to years, with the folded entry replacing its children in place and carrying a one-line summary plus a digest kept behind the line. The same discipline that keeps a 128K-token working set bounded keeps a years-long journal readable in one prompt, and the same single-flight discipline that keeps a fold and a draft from racing in the KV cache keeps them from racing in the journal.
-
-**Retrieval is scoped, not global.** Each group's journal declares what its members and its bots may read, and there is a deliberately public slice — a group whose entries restate only what the public site already publishes, each line naming its public source. Which groups a reader may see is decided by those declarations, not by retrieval: provenance ranks what a reader is allowed to see, and the access question is asked once, at the boundary, rather than assumed.
-
-**The measurement follows the deployment.** The retrieval numbers in §9.11.1 and §9.12 are not from a corpus assembled for the paper; they are from the gallery the running daemon holds — 6,854 code files and 40M signature tokens when the scoring lab ran, 54.7M resident tokens across every layer by 2026-11-23 — and the scans run against it over HTTP while it is being written to. The engine probe (§9.11) drives admission, projection, the persistence thread, KV compaction and the three tiers together, which is the shape of the production workload rather than the shape of a benchmark.
-
-**What this buys.** Sessions that survive restarts; a model swap that costs a re-ingest rather than a memory transplant; a body of work — decisions, errata, design reversals — that accumulates across agents and months; and an audit trail in which every entry is attributable to a named account at a named minute. None of that is a throughput number or a measured quality result, and none of it is claimed as one; it is what the deployment is for, reported as operating experience.
+The system is also in use, and the use exercises what no benchmark can: memory that outlives the process that wrote it, written by one model and read by another. The journal store — one master journal per group, with `people/`, `conversations/`, `topics/`, `threads/` and `bots/` — holds minute-stamped records written by whichever agent is speaking, each naming its author and account, so the memory is in no model's weights and swapping the reader does not orphan it. Entries fold as the KV cache does, steps into days into weeks into years, so a years-long journal reads in one prompt. Each group declares what its members may read; provenance ranks only what a reader may see. The retrieval numbers of §9.11.1 and §9.12 come from this live gallery, scanned over HTTP while it is written to. What this buys — sessions that survive restarts, a model swap that costs a re-ingest, an attributable record across agents and months — is operating experience, not a measured result, and is reported as such.
 
 #### 9.13.1 This revision, as a workload
 
-Much of this version was revised by the system itself. The author asked a Qwen3.8-Flash-Next session on the production daemon for a critique of the v2 draft, read it, and then asked it to revise: fix what the critique found, bring the figures to the current sweeps, add the live-operation results, and drop the disclaimer that the system was still being engineered. The session ran 85 tool rounds over ~320K tokens of conversation, made thirty-one edits to this paper and brought the README's figures with it (`docs/results/paper_revision_session_2026-11-09.md`).
+Much of an earlier draft of this version was revised by the system: a Flash-Next session on the production daemon, asked to critique and then revise the paper, ran 85 tool rounds over ~320K tokens and made thirty-one edits (`docs/results/paper_revision_session_2026-11-09.md`). Asked to fill §9.12's then-empty results table, it searched for a measured table, found none, wrote that the battery was not yet run, and corrected the other places that claimed its results; it missed some, which a later review found. Its failures were mechanical — stale anchors after neighbouring edits — a defect of the editing tools.
 
-**How it did.** The edits are the ones this version carries — §9.6's current figures, §9.7's live-dispatch ablation, §9.11.1, §9.13 itself, and the removal of most of the sentences that claimed a result for the then-unrun battery of §9.12 — and the quality of the judgement in them is the finding worth recording. Asked to fill the draft's gaps, among them §9.12's empty results table, it searched the repository for a measured table, found none, and wrote that the battery is not run rather than supplying numbers. It then went looking for every other place the paper claimed that battery's results — the abstract, §1, §11.2, §11.4, the conclusion, Appendix A's list of what is released — and corrected them. It did not find them all: a later review by the author found such claims still standing in §1.2, §6.5, §9.1, §9.11 and §11.5, and an attribution of Flash-Next's flat depth to provenance alone, which this subsection's first draft also made; those are corrected in this version. It caught its own citation error (reference numbers from `docs/performance.md`'s own list written into a table that cites the paper's), and it softened its own new status banner when it noticed that the banner said more than the evidence it had read could support. It kept the engine probe's failing rows in §9.11's table rather than leaving them out. Where it failed, the failures were mechanical: anchors gone stale after neighbouring edits, and one edit reported as failed that had in fact applied, together costing a dozen rounds. That is a defect in the editing tools, and it was the tools, not the model, that lost the time.
+It decoded one token for every 2.9 prefilled (82,963 against 238,619). Every token was prefilled once, the earlier turns' K/V projected back rather than resent, where a client re-sending its history would have sent on the order of eighty times as much. Decode held at ~102 t/s at 48K–130K tokens, ~110 at 162K–237K and ~106 at 309K–321K: the working set does not grow with the history, though the session does not separate provenance's bound from Flash-Next's own indexer (§9.6.2). That the model read less because what it read came back is the right hypothesis, and the session is consistent with it; the run that would establish it replaces provenance with a full window.
 
-**The ratio, and what explains it.** The author's own reading of the session was that it decoded unusually much for the amount it read, and that provenance selection is the reason. The round log bears out the first half. Across the session one token was decoded for every 2.9 prefilled — 82,963 decoded against 238,619 prefilled — and after the paper was read whole once, in the first four rounds, each round's new input averaged ~2,100 tokens against ~970 decoded. The model edited thirty-odd parts of a 1,400-line document across eighty rounds without reading it whole again; its later reads were of single parts, the one it was about to replace.
+OpenRouter's picture of agent traffic is ~87% cached prompt, 12% novel prompt and 1% output, "because an agent re-sends its whole context on every step" [OpenRouter, *Cache is Crucial*, October 2026; 50]; on SWE-bench Verified under OpenHands, input tokens dominate the cost of agentic coding even with caching [Bai et al., arXiv:2604.22750; 51]. Against genuinely new input, this session wrote about four times as much per token read (Figure 9.13-1). OpenRouter's novel prompt includes re-reads a provider failed to cache, so this is a comparison, not a result; counted as a re-sending client counts it, ~19M tokens, the session would be 1 : 230. What the architecture changes is not how much a long session would re-read, but that it does not.
 
-Three mechanisms are in play, and the session separates only the first of them cleanly:
+<figure class="fig">
+<svg viewBox="0 0 640 128" role="img" aria-label="Figure 9.13-1. Tokens written per token of new input. This revision session decoded one token for every 2.9 prefilled, 0.345. OpenRouter's agentic mix, output against novel prompt, about one in twelve, 0.083.">
+  <text class="ttl" x="16" y="20">Figure 9.13-1 · Written per token newly read</text>
+  <text class="ttl-sub" x="16" y="36">decoded or output tokens ÷ new input tokens · amber: published agent traffic</text>
+  <path class="grid base" d="M200 48 V104"/>
+  <text class="cat" x="16" y="64">This session</text>
+  <text class="cat-sub" x="16" y="77">82,963 ÷ 238,619</text>
+  <rect class="us" x="200" y="54" width="310.3" height="16"/>
+  <text class="v-us" x="516.3" y="67">1 : 2.9</text>
+  <text class="cat" x="16" y="94">OpenRouter, agents</text>
+  <text class="cat-sub" x="16" y="107">1% output ÷ 12% novel</text>
+  <rect class="them" x="200" y="84" width="75" height="16"/>
+  <text class="v-them" x="281" y="97">≈ 1 : 12</text>
+</svg>
+</figure>
 
-- **Every token is prefilled once.** The 238,619 tokens prefilled are the session's new input and nothing more: the earlier turns' K/V is held by the substrate and projected back, never prefilled again, though the conversation grew to ~320K tokens. A client that re-sends its history each round would have sent on the order of eighty times as many input tokens over the same session.
-- **Decode does not slow as the conversation grows.** Decode ran at ~102 t/s while the conversation was 48K–130K tokens, ~110 t/s at 162K–237K and ~106 t/s at 309K–321K — the working set does not grow with the history it is selected from, so neither does the cost of a decoded token. Two bounds are at work and the session does not separate them: provenance caps how much of the conversation is projected into the working set, and Flash-Next's own sparse-attention indexer caps how much of the working set each token attends (§9.6.2). Either alone would flatten decode across this range; the session is evidence for the bounded working set of §11.2 in live use, not for provenance's share of it. (One stretch, rounds 47–57, dips to ~74 t/s and recovers; the longer rounds after it run at full rate, so the dip is not the conversation's length.)
-- **The model reads less because what it read comes back.** Earlier reads retrieved into the working set when they become relevant would let the model edit a part it read sixty rounds before without reading it again — which is what it did. But the file tools address a part by its anchor, which also lets a model edit without reading the file around it, and the session ran no control. The author's attribution of the ratio to provenance is the right hypothesis, and this session is consistent with it; the run that would establish it is the same task with provenance selection replaced by a full window, and with the file tools reading whole files.
-
-**Against the published record.** The largest published picture of agent traffic is OpenRouter's: in September 2026, cached prompt tokens were just under 90% of all the tokens agents used, novel prompt tokens most of the rest, and output plus reasoning around 1% — its worked example is 87% cached, 12% novel prompt, 1% output — against around 12% output for human traffic, because "an agent re-sends its whole context on every step" [OpenRouter, *Cache is Crucial*, October 2026; 50]. A study of eight models running SWE-bench Verified under OpenHands finds the same shape: input tokens, not output, dominate the cost of agentic coding even with caching, and an agentic task consumes on the order of a thousand times the tokens of a single-round one [Bai et al., arXiv:2604.22750; 51]. The comparable figure from this session is decoded tokens against genuinely new input, since the substrate holds everything earlier: **1 : 2.9 here, against about 1 : 12 for output against novel prompt in OpenRouter's agentic mix** — roughly four times as much written for each token newly read. Two things keep that a comparison rather than a result. OpenRouter's novel prompt tokens include re-reads a provider failed to cache, which makes the average agent's denominator larger than its genuinely new input. And counted the way a re-sending client counts it — the whole history at every round, ~19M tokens — this session's ratio would be about 1 : 230, more input-heavy than OpenRouter's average of about 1 : 99, because a 320K-token session would re-read far more at each step than the average agent does. What the architecture changes is not how much a long session would have to re-read, but that it does not.
-
-**What else it showed.** A restart during the session resumed its open tool round on a second member while the first was still running it, and the two members wrote the conversation at once; the second's duplicate rounds reverted one of the first's edits. Nothing was lost: the committed files were rebuilt edit by edit from the session's own record, and the fault — a resumed turn that took no claim on its conversation — is fixed. It is a small instance of §9.13's point: the record outlived both processes that wrote it.
+A restart during the session resumed its open tool round on a second member while the first still ran it, and the duplicate rounds reverted one edit; the files were rebuilt edit by edit from the session's own record, and the fault — a resumed turn that took no claim on its conversation — is fixed. The record outlived both processes that wrote it.
 
 ## 10. Analysis
 
 ### 10.1 Why Coherence Produces Disproportionate Results
 
-Each component of this system has research precedents. What does not exist anywhere in the published literature is their combination in a single coherent design.
-
-The expert prediction system benefits from the wave-batched kernel — more concurrent requests means better cross-request expert coalescing, which means the effective hot set is smaller, which means the Markov predictor's free-slot-only prefetch converts more misses to hits. The KV compression benefits from the prefill refresh — quantising clean activations rather than decode-drifted ones means the error thresholds in the selection kernel are calibrated to actual quality, not a noisy lower bound, and specifically keeps the hot-tier error floor ε_hot ≈ 0, which the theorem establishes as the asymptotic quality limit of the entire system. The provenance indexing benefits from the turn-boundary paging — every 32-token block begins at a semantic boundary, making fingerprint extraction temporally coherent. The unbounded context tier system benefits from the adaptive quantisation — V blocks systematically landing at Q2_0/Q3_0 means 3× more tokens fit in the warm RAM tier before cold storage is needed, and the theorem bounds what this aggressive compression costs: however deep the cold tier grows, no more than the fixed retrieval budget of its blocks enters any one step, each within its per-block threshold.
-Most critically: the provenance selection mechanism and the KV quantization system interact to produce a property neither achieves alone. Provenance selection bounds the working set W independently of N. KV quantization with prefill refresh keeps the hot-tier error floor near zero. Together they give the bound of §11.2 — per-step error exposure independent of depth — which no KV quantization system in the literature states, because none we are aware of decouples context depth from working set size. Each component was designed knowing the properties of every other; we credit that, rather than any single component, for the results on 16GB.
+Each component has precedents; their combination does not. More concurrent requests coalesce more expert work, shrinking the hot set the Markov prefetch must cover. Refreshed activations make the selector's thresholds measure real quality and keep ε_hot ≈ 0. Turn-aligned blocks make signatures temporally coherent. V blocks landing at Q2–Q3 fit 3× more tokens in the warm tier, and the theorem bounds what that costs: however deep the cold tier grows, at most the retrieval budget enters a step, each block within its threshold. Above all, provenance selection bounds the working set independently of N and the refresh keeps the hot floor near zero; together they give §11.2's bound, which no KV quantization system states, because none decouples depth from the working set.
 
 ### 10.2 The VRAM Budget
 
-The engine has no fixed shares. It reserves one contiguous span per card, sized before the weights load, and divides it between four tenants — `| persistent tensors | KV regions | per-wave transient tier | expert weights |` — with one elastic boundary between the KV side and the experts. Each side re-checks the boundary before crossing it: a wave's transient tier is refused above it, and the boundary may not move below a standing tier. Load moves the boundary: concurrent sessions take ground from the expert zone, which then streams more of its experts through the three-tier cache (§4.3), and an idle card gives the ground back to the experts.
-
-On BlackWorld (72 GB) at rest, Flash-Next's span is 68.1 GiB: 51.0 GiB of expert zone, 5.3 GiB of dense weights, 4.9 GiB of recurrent state, and the KV side the rest; the warm tier holds 14.4 GiB of payload in host RAM behind it (§9.6.9). Under the battery's load the same span holds 6.2 GiB of KV arenas on average and 11.2 GiB at the peak — 571 thousand and 945 thousand tokens of context, 13.3 and 21.9 GiB at BF16 — and the expert zone 36.0 GiB on average (Figure 9.6-1).
-
-The working set per session is the quality ceiling of each generation step: provenance must choose that many tokens from an unbounded history, and a larger working set gives it more room. Because the boundary is elastic, more VRAM buys concurrency or working set, at the operator's discretion, and compression multiplies whichever is bought: at C5 a GiB of KV holds 4.15× the tokens it holds at BF16 (§9.6.9).
+The engine has no fixed shares: one span per card, sized before the weights load, divided between `| persistent tensors | KV regions | per-wave transient tier | expert weights |` with one elastic boundary between the KV side and the experts, which each side re-checks before crossing. Concurrent sessions take ground from the expert zone, which streams more experts through the three-tier cache, and an idle card gives it back (Figures 9.6-4 and 9.6-5). The working set per session is each step's quality ceiling, so more VRAM buys concurrency or working set at the operator's choice, and compression multiplies either: at C5 a GiB of KV holds 4.15× the tokens of BF16.
 
 ---
 
@@ -1117,19 +1493,30 @@ The working set per session is the quality ceiling of each generation step: prov
 
 ### 11.1 The Baseline Problem: Error Growth in Full-Attention Systems
 
-The KV quantization literature — KIVI, KVQuant, TurboQuant, GEAR — is conducted under a full-attention model where every token in the context window contributes to every generation step. Two mechanisms connect stored error to context depth. The first is sequential: during autoregressive decode, each token's KV values are computed with attention over already-compressed preceding KV, so each step's rounding and quantization error enters the residual stream and is inherited by later steps; GEAR [Kang et al., 2024] characterised its multiplicative compounding. The second is exposure: every one of the N cached tokens enters every step, so the number of stored values carrying error that a step reads grows with N, and so does the number of perturbed attention scores competing with the relevant tokens for mass.
+KIVI, KVQuant, TurboQuant and GEAR all work under full attention, where two mechanisms tie stored error to depth. *Sequential*: each decoded token's K/V is computed over already-compressed predecessors, so error enters the residual stream and is inherited [GEAR, Kang et al., 2024]. *Exposure*: all N cached tokens enter every step, so the stored error a step reads — and the number of perturbed scores competing for attention mass — grows with N. Neither is specific to compression; F16 rounding is stored error too.
 
-Exposure is not output error. Softmax attention's output is a convex combination of its values, so per-token value errors are averaged by the attention weights rather than summed, and a perturbation of a low-weight token's key moves little mass. Whether full-attention output error actually grows with N therefore depends on the attention distribution — on how much mass the step spreads, and on how many distractors sit near the relevant tokens in score — and we do not prove that it does. Measured directly, it does not grow within the windows we can reach (§9.6.8): teacher-forced on the same answer, C10's next-token divergence from BF16 on Qwen3.5-9B, whose full-attention layers read the whole prefix, is 6.5e-3 nats at 4K and 3.5e-3 at 124K, and on Qwen3-8B it moves between 1.1e-2 and 3.9e-2 from 4K to 32K with no trend; and every model of §9.6 whose attention layers read the whole prefix passes the story gate at C10 at every depth it was run to. What the literature has not offered is a bound on exposure that is independent of depth, and that is what §11.2 supplies. Neither mechanism is specific to compression: F16 rounding is stored error too.
-
-More VRAM defers the threshold but does not eliminate it. An H100 at 80GB holds more tokens at full precision before compression is required, but as sessions grow persistent across days and weeks, the context is not 1 million tokens — it is 100 million tokens, and no finite hardware holds that in F16. The industry response at that scale is summarization and eviction: older context is compressed into summaries or discarded. Both are lossy by definition. Summarization destroys the precise factual recall — verbatim quotes, specific numbers, exact commitments — that makes persistent memory useful for real applications. Eviction discards it entirely. Hardware scaling moves the wall; it does not remove it.
-
-The theorem in §11.2 shows that leaving this regime does not need more hardware or better compression: architectural decoupling of working set size from context depth is sufficient. No full-attention system has that property — its working set is by definition the entire context. Provenance-selected attention has it structurally, and the bound follows directly.
+Exposure is not output error. Attention's output is a convex combination of values, so value errors are averaged, not summed, and whether full-attention output error grows with N depends on the attention distribution; we do not prove that it does. Measured, it does not within the windows we reach (§9.6.8, Figure 9.6-3): C10's divergence from BF16 on Qwen3.5-9B is 6.5e-3 nats at 4K and 3.5e-3 at 124K, and every whole-prefix model of §9.6 passes the story gate at C10 at every depth run. What the literature lacks is a bound on exposure independent of depth. More VRAM defers the threshold, but a context persistent across months is 100 million tokens, which no card holds at F16, and summarization and eviction discard the verbatim detail. §11.2 shows decoupling the working set from depth is sufficient; no full-attention system has that property, because its working set is the whole context.
 
 ### 11.2 Theorem: Asymptotic Numerical Stability Under Provenance-Selected Attention
 
-Every published KV quantization analysis — GEAR [Kang et al., 2024], KIVI [Liu et al., 2024], KVQuant [Hooper et al., 2024], TurboQuant [Zandieh et al., 2026] — is conducted under a full-attention model where all N tokens contribute to every generation step, so the error a step is exposed to grows with N. That premise is correct for standard attention. It does not hold for provenance-selected attention.
+ε(t) denotes the **total stored numerical error** of token t's K/V from every source — quantization, rounding, decode drift. The quantity bounded is the sum of ε(t) over the tokens entering a step: that step's exposure, not its output error. The proof uses nothing specific to compression.
 
-We state the following result formally. ε(t) denotes the **total stored numerical error** of token t's K/V from all sources — quantization, floating-point rounding, decode drift — not compression error alone. The quantity bounded is the sum of ε(t) over the tokens that enter a step: an upper bound on that step's exposure, not its output error. The proof does not use any property specific to compression; it applies to any finite-precision arithmetic.
+<figure class="fig">
+<svg viewBox="0 0 640 224" role="img" aria-label="Figure 11-1. The bound. Under full attention a step's exposure, the summed stored error of the tokens it reads, grows linearly with context depth N; more VRAM only moves the point where tokens must be compressed or evicted. Under provenance-selected attention it is bounded by epsilon hot plus the retrieval budget times epsilon ret, at any depth.">
+  <text class="ttl" x="16" y="20">Figure 11-1 · What a step is exposed to, as the context grows</text>
+  <text class="ttl-sub" x="16" y="36">summed stored error of the tokens a step reads · schematic</text>
+  <path class="ax" d="M70 190 H610 M70 190 V52"/>
+  <path class="ax thin" d="M210 56 V190 M330 56 V190"/>
+  <path class="c-rise" d="M70 186 L600 58"/>
+  <path class="c-flat" d="M70 178 C110 156 140 150 180 148 H600"/>
+  <text class="t-rise" x="470" y="78">full attention: Θ(N · ε̄)</text>
+  <text class="t-flat" x="390" y="140">provenance: ε_hot + W_warm_max · ε_ret</text>
+  <text class="t-dim mid" x="210" y="204">16 GB fills</text>
+  <text class="t-dim mid" x="330" y="204">80 GB fills</text>
+  <text class="t-dim" x="580" y="206">depth N →</text>
+  <text class="t-dim" x="76" y="64">Σ ε(t)</text>
+</svg>
+</figure>
 
 ---
 
@@ -1185,87 +1572,45 @@ $$E\left[\sum_{t \in \mathcal{W}} \varepsilon(t)\right] \approx \varepsilon_{\te
 
 ---
 
-**Contrast with the standard result.** Under full attention with any finite-precision arithmetic — F16, BF16, or uniform compression — all N tokens enter every generation step and the exposure this proof bounds is Θ(N · ε̄), unbounded. Under provenance-selected attention it is bounded regardless of N: the system at N = 10,000,000 turns operates under the same bound as at N = 1,000 turns. The contrast is between bounds. It is not a demonstration that full-attention output degrades: §11.1 gives the reasons it may not, and §9.6.8 measures that within 128K it does not. What full attention lacks is the bound, not the behaviour at the depths a single context can reach; how its output behaves past them, where every token held must be compressed or evicted, is the regime the bound is about and that no single-context measurement reaches.
+**The contrast is between bounds** (Figure 11-1). Under full attention the exposure is Θ(N · ε̄); under provenance selection the system at 10 million turns works under the same bound as at a thousand. This is not a demonstration that full-attention output degrades — §11.1 gives the reasons it may not, and within 128K it does not (§9.6.8). What full attention lacks is the bound, for the regime past a single context where every token held must be compressed or evicted.
 
-**Empirical status.** The theorem is a proof, and its premises — a fixed selection budget, a hot tier of fixed size, a per-block threshold on everything sealed — are properties of the engine that hold by construction. What the measurements show is consistent with it, not a test of it. The depth measurement of §9.6.2 shows the operating signature of a bounded working set — Qwen3.8-Flash-Next keeps 99% of its prefill and 111% of its decode from 32K to 128K — but the bound there is the model's own trained indexer inside one context, not provenance, so it supports the principle, not this mechanism. The live session of §9.13.1 shows decode flat from 48K to 321K tokens of conversation with provenance in the loop, with the indexer as a confound. The story evaluation (§9.8) shows every throughput row reproducing its reference text at the compression levels in use, and on Llama-3.2-3B a progression of failure past the validation edge consistent with error growing per token. The direct test of the premise — the model fixed, N far past the working set, provenance on and off — is §9.11.2: with the engine's slot capped at 32K and a history twelve times that, mid-decode reprojection selected every planted turn into a working set of 15–18 turns, at C10 and C0 alike, where the one-shot and rolling-window arms selected none. The dependency battery of §9.12 tests what the model does with the selected set, at the level of compositional reasoning; its results are given there, and the theorem does not rest on them.
+**Empirical status.** The premises — a fixed budget, a fixed hot tier, a per-block threshold on everything sealed — hold by construction, so the measurements are consistent with the theorem rather than tests of it. Flash-Next's flat depth (§9.6.2) is its own indexer inside one context, supporting the principle, not the mechanism; the live session of §9.13.1 keeps decode flat from 48K to 321K with the indexer as a confound. The direct test of the premise is §9.11.2: with the slot capped at 32K and a history twelve times that, reprojection selected every planted turn at C10 and C0 alike, where one-shot and rolling-window arms selected none. §9.12 tests what the model does with the selected set; the theorem does not rest on it.
 
-**Implication for compression ratio selection.** The theorem bounds how many cold-storage tokens can enter a step, not how much error each carries: a selected cold block contributes its full per-token error at any depth. Compression aggressiveness on cold storage therefore moves ε_cold, and with it the constant — it never threatens the O(1) bound, but it is not free. The adaptive selection kernel's highest-compression modes (C7–C9) are assigned to V cache blocks and cold-storage K blocks as a capacity trade-off with a bounded quality cost: every block still passes the per-block threshold of the level it was sealed under, which is what bounds ε_cold. The binding design constraints are the always-attended working set error floor ε_hot — confirmed near zero by the prefill refresh strategy — and the retrieval threshold θ, which bounds ε_ret for warm and cold blocks alike. The design is an engineering trade-off the theorem makes explicit: capacity against the size of the constant, never against the bound itself.
-
-**Key assumption.** The selection budget B and hot tier bound W_hot_max must be independent of N. This is structurally guaranteed by the system architecture. The bound fails if the provenance selection mechanism grows the working set proportionally with N, which recovers the O(N) full-attention regime.
+**Compression moves the constant, never the bound.** A selected cold block contributes its full error at any depth, so aggressive levels on cold K and on V raise ε_cold — a capacity trade bounded by the threshold each block was sealed under. The binding constraints are ε_hot, kept near zero by the refresh, and the retrieval threshold θ. The bound fails only if selection grows the working set with N, which recovers the full-attention regime.
 
 ### 11.3 Compression Architecture vs. Compression Primitive
 
-The competitive field for online, inference-time, training-free KV cache quantization is KIVI, KVQuant, and the residual PolarQuant-MSE portion of TurboQuant. All three optimise the same thing: the compression *primitive* — a better quantization formula, a smarter rotation, a tighter codebook. The design question they answer is: given that we must assign a format to every block, what is the best format to assign? KIVI assigns uniform 2-bit. KVQuant adds outlier handling before assigning a fixed format. TurboQuant rotates before assigning.
-
-This paper optimises the compression *architecture* — the decisions that determine when to quantize, what quality to guarantee per block, how to separate error sources, and how error scales with context depth. The design question is different: given that blocks have different difficulty, how do we build a system that guarantees quality on every block and separates the error mechanisms that cause quality loss? The answer — adaptive per-block format selection coupled with two-phase prefill refresh — does not depend on having the best quantization primitive. It absorbs primitive-level failures through selection: a block that Q4_0 cannot represent adequately gets Q8_0 or better. This is why TurboQuant's rotation can fail at 4–5× CR on real workloads while the adaptive system continues to hold quality — the architecture compensates where the primitive falls short.
-
-The specific gaps in the competitive field: none of the three systems perform per-block format selection with a quality guarantee. None couple quantization with decode drift correction. None establish any theoretical result about error scaling with context depth. The system exceeds KIVI's CR at balanced-tier operating points with per-block validated quality guarantees KIVI cannot offer. KVQuant's outlier handling insight is subsumed — the _KS sub-block formats and attention sink protection factor implement the same protection, integrated into adaptive selection rather than applied uniformly. TurboQuant's theoretical Shannon-optimal primitive is irrelevant when the architecture guarantees per-block quality regardless of which primitive is used.
-
-The combination is what the application requires. None of it is achievable through better primitives alone.
-
-**Empirical validation.** The story rewrite evaluation (§9.8) directly confirms this. On Llama-3.2-3B, adaptive C5 at 3.27× passes the multi-session identity discrimination test while uniform Q4_0 at 3.17× fails — the adaptive architecture delivers better quality at higher compression than the best uniform 4-bit primitive. The query-aware K selection metric eliminates the cross-session identity contamination that an isotropic metric produced at C8–C9 by automatically assigning conservative formats to the high-query-relevance blocks that carry session-discriminating signal. This is architecture compensating where a uniform primitive cannot.
+KIVI, KVQuant and TurboQuant optimise the compression *primitive*: given that every block gets a format, which format is best. This paper optimises the *architecture*: when to quantize, what quality to guarantee per block, how to separate error sources, and how error scales with depth. Per-block selection absorbs a primitive's failures — a block Q4_0 cannot represent gets Q8_0 — which is why the adaptive system holds quality where a rotation fails at 4–5×. KVQuant's outlier insight is subsumed by the `_KS` sub-block formats and sink protection. On Llama-3.2-3B, adaptive C5 at 3.27× passes the multi-session identity test (§9.8) where uniform Q4_0 at 3.17× fails, and the query-aware K metric removed the cross-session contamination an isotropic metric produced at C8–C9.
 
 ### 11.4 Attention Was Always Retrieval
 
-The transformer attention mechanism is a retrieval system: Q vectors query against K vectors, scores select candidates, V values are aggregated weighted by relevance. That is what softmax attention computes. That is all it has ever computed. The architecture is a learned retrieval system operating over a fixed context window.
+Attention is retrieval: Q queries K, scores select, V is aggregated by relevance. This system runs it at two scales — approximate 1-bit attention over the whole unbounded context to select the working set (§6.6), then exact attention over what it selected — hierarchical retrieval at constant attention cost per step, where standard attention is flat retrieval over N. The trade is real: full attention reads all N exactly, while this system can surface the wrong B tokens. The guarantee is bounded error on the attended set, not the relevance of the set; it trades exposure that grows with N for a retrieval-quality problem the provenance mechanism bounds but cannot eliminate. That is a different trade-off from full attention, not a strict improvement on it.
 
-This system performs the same operation at two scales. The provenance index does approximate attention over the full unbounded context — a binary sign-agreement scan over every stored token's Q signature (§6.6) — selecting which blocks enter the working set. The attention kernel then performs exact attention over the selected working set. Coarse retrieval selecting for fine retrieval. The only structural difference from standard attention is granularity: standard attention performs flat retrieval over all N tokens at O(N) cost; this system performs hierarchical retrieval — approximate 1-bit selection, then exact attention over what it selects — at O(1) attention cost per generation step.
-
-When a reviewer characterises this as "RAG with extra steps," the correct response is: RAG replaces attention with an external retrieval system that has no attentional continuity — content retrieved by BM25 or embedding similarity is injected into a fresh context, severing the causal chain that attention depends on. This system extends the retrieval that attention already is to unbounded depth, without severing anything. The mechanism is preserved; the scaling constraint is removed. This comes with a different binding constraint that full attention does not have: retrieval quality. Full attention over N tokens attends to all N exactly. This system selects B tokens from N via approximate provenance matching — if the provenance system surfaces the wrong B tokens, the generation step lacks the correct context regardless of how precisely those B tokens are attended. The guarantee is bounded numerical error on the attended set, not guaranteed relevance of the attended set. This is a meaningful distinction: the system trades exposure that grows with N for a retrieval quality problem that the provenance mechanism is designed to bound but cannot eliminate. RAG abandons the attention mechanism entirely and substitutes something categorically weaker. The distinction between this system and RAG is not one of implementation style — it is a difference in what property is preserved; the distinction between this system and full attention is a different trade-off, not a strict dominance.
-
-The gap is structural, not implementational. Three deficits of RAG are architectural consequences of what RAG is, not limitations of any particular implementation.
-
-*Wrong retrieval signal.* RAG retrieves from token-level representations — embeddings or BM25 over generated text. The model's Q vectors encode a pre-linguistic representation of what the model is reaching for: the attention state that precedes and drives token output. During a transitive dependency walk, the model's Q vectors at hop 2 may already point toward the region of the index that holds hop 3's context before the model has produced any tokens that would form a textual retrieval query — the hypothesis §9.12 is designed to test. RAG cannot access this signal because it operates on tokens, not attention states. This is why iterative RAG systems (FLARE, Self-RAG) must wait for the model to produce enough text to form a query — their retrieval trails reasoning rather than leading it.
-
-*Severed causal continuity.* When RAG injects retrieved content, that content arrives without KV cache history — the model cannot attend to it in the causal context of the conversation where it was originally produced. This system promotes KV blocks from warm and cold tiers with their original quantized attention state causally intact. The model attends to retrieved content as a continuous causal subset of the full context, not a collage of fragments injected into a fresh window. The retrieved block's K and V were computed under its original causal context; K is stored un-rotated and given its position in the assembled sequence when it is read. This is the property that preserves attentional continuity as context grows — and it is the property RAG cannot replicate, because RAG's retrieved documents never had a causal position in the model's context to begin with.
-
-*Retrieval leads the answer.* Even iterative RAG systems retrieve based on text generated so far — the retrieval query is a function of committed output tokens. Mid-decode reprojection (§6.5) also retrieves from what has been decoded, but from the model's attention state rather than its text, and inside the think block, whose K/V is dropped at seal: the reasoning is a probe that decodes ahead of the answer, and by the first answer token the context has been steered by everything the model thought (§6.5, §9.12). Text-based retrieval cannot do that, because its signal does not exist until after the reasoning step that needed the context has completed.
-
-**Thought experiment.** Imagine augmenting a RAG system with three changes: (a) store Q-vector fingerprints alongside documents and use Q→Q matching for retrieval; (b) maintain causal KV continuity for retrieved blocks so the model attends to them in their original causal context; (c) run retrieval repeatedly during generation from the model's Q vectors rather than from its text. A system with all three properties would match attentional provenance indexing with mid-decode reprojection. It would also no longer be RAG — it would be this architecture. The properties that close RAG's deficits are the properties that define a different system: operating on attention states rather than tokens, and injecting with causal continuity.
-
-The provenance index's use of Q vectors as cognitive-state fingerprints is the specific choice that preserves attentional continuity: a stored Q fingerprint from a prior turn captures the accumulated attentional context of everything preceding it, not just the surface semantics of that turn. Matching a current Q against stored Q fingerprints selects turns that were attended from a similar cognitive state — the attentional equivalent of relevance, not keyword or embedding overlap. This is what makes the system's retrieval genuinely continuous with the attention mechanism rather than a separate system bolted alongside it.
-
-The codebase dependency analysis evaluation (§9.12) is the strongest demonstration this architecture is built to support. The mechanism is real and runs: every 64 decoded tokens, or at a line break, reprojection (§6.5) scores the signatures of the model's last 128 decoded tokens against the provenance index and assembles the next working set. The scan finds its needle: the file that answers a battery question ranks first of 6,854 — 40M signature tokens — on 65% of questions and in the top five on 83%. And the reasoning is what aims it: with the working set held through the think block, the battery's recall falls from 57.3% to 38.8%, every held run below every reprojecting one, and the loss is largest where the answer lives in a file the question never names. The model does not know it is performing graph traversal; it is reasoning, and its Q vectors carry the reasoning to the files it needs. The scan is approximate attention over the full unbounded context, the forward exact attention over the selected working set — two scales of the same operation, alternating during decode. The 128-question battery confirms it at scale: a single retrieval before reasoning scores 6.5 points below continuous reprojection, and the share of answers with their file in the working set climbs through the reasoning only when the reasoning reprojects.
+It is not RAG, and the difference is structural. *The signal*: RAG retrieves from text, so iterative RAG (FLARE, Self-RAG) must wait for the model to write a query; Q vectors carry what the model is reaching for before any text forms. *Causal continuity*: RAG injects text into a fresh context, while this system promotes stored K/V computed in its original causal context, K stored un-rotated and positioned on read. *Leading the answer*: reprojection inside the think block, whose K/V is dropped at seal, steers the answer's context by everything the model thought (§6.5). A RAG system given Q→Q matching, causal K/V continuity and retrieval from Q during generation would no longer be RAG; it would be this architecture. §9.12 shows it working: the answer file found among 7,943 by sign agreement alone, and a single retrieval before reasoning 6.5 points below continuous reprojection.
 
 ### 11.5 Constraint-Driven Innovation as a Methodology
 
-This system was not designed top-down from theoretical considerations. It was designed bottom-up from two constraints accepted simultaneously and without compromise: an application requiring the hardest possible form of persistent memory, and a fixed hardware limit that could not be exceeded. The application — persistent agent conversations — was selected as the existence proof of a real and demanding use case. Agents require verbatim factual recall, semantic coherence across arbitrary time gaps, high concurrency, and deployment on hardware without a datacenter budget. The constraints were not problems to be worked around. They were accepted as design drivers.
+The system was designed bottom-up from two constraints accepted together: the hardest form of persistent memory, and a hardware ceiling that could not be exceeded. Each closed a standard solution and forced a replacement that holds beyond the constraint:
 
-The methodological pattern that emerged from this acceptance is worth documenting, because it appears repeatedly across the system's components, and because it produces a specific type of innovation: decisions forced by constraint that turn out to hold beyond the constrained platform, not just to be viable on it.
+- **Native quantized kernels.** Dequantising to BF16 OOMed at 16 GB; inline dequantisation never materialises the copy, and saves its traffic on every card (§8.1).
+- **Provenance-selected attention.** The full context could not be held hot; selecting a bounded working set turned out to be the property the theorem uses.
+- **Two-phase quantization.** Materialising turns at F16 across hundreds of sessions OOMed; sealing per block and refreshing per turn separates two error mechanisms the literature conflates.
+- **Online expert prediction.** At 44% residency prediction was required; learning online from live routing covers 4.7× the cold experts popularity does, with no calibration (§9.7).
+- **Live structural segments.** Rotating system-prompt sections made stored template K/V silently wrong; storing only portable content and prefilling the template against the live prefix closes the error on attention-only models (§5).
 
-**Native quantized matmul kernels.** Standard GEMM libraries dequantise weights to BF16 before computation. On 16GB with a 30B model, this immediately OOMs — the constraint made the standard approach impossible. The forced alternative, inline dequantisation within the MMA kernel, never materialises the full-precision weight copy, and so also saves that copy's memory traffic on unconstrained hardware (§8.1). The 16GB ceiling exposed a cost that exists everywhere.
-
-**Provenance-selected sparse attention.** VRAM is finite. The full context of a persistent session cannot be held hot. The constraint forced a mechanism for selecting a bounded working set from an unbounded context — which turned out to be the architectural property the Asymptotic Numerical Stability theorem uses. The hardware-bounded hot tier is also the hardware-independent theorem's working set W. The constraint that made full-context attention impossible produced the architectural decoupling that makes unbounded-context correctness possible.
-
-**Two-phase quantization.** Materialising all active turns at F16 across 200+ concurrent sessions OOMs at scale. The forced alternative — chunk-sealed quantization during decode, prefill refresh on turn completion — turned out to correctly separate two independent error mechanisms (per-chunk quantization noise and autoregressive decode drift) that existing approaches conflate. The memory pressure that made naive quantization impossible forced a cleaner theoretical decomposition of the problem.
-
-**Online Markov expert prediction.** Low VRAM residency (44%) means most experts are cold. Acceptable cold-hit rates require prediction. The forced alternative to offline calibration — online learning from production routing observations — adapts to the actual workload distribution rather than a calibration proxy, and held out it covers 4.7× the cold experts popularity does, with learning within the session as its dominant lever (§9.7). The residency constraint that made on-demand loading inadequate forced a prediction system that needs no calibration.
-
-**Structural segments via projection.** Dynamic system-prompt sections exist in real deployments — persona, response style, and tool catalogs rotate between turns. The standard solution (store K/V uniformly for every token) closes a class of error invisibly: stored structural K/V references the ingest-time prefix, and when that prefix differs from the assembly prefix, attention scores degrade silently and drift compounds across turns. The constraint — structural orientation markers must remain semantically correct under dynamic frame rotation — closed the standard storage approach and forced a separable representation: content segments stored, structural segments live-prefilled from the dialect catalog against the current assembly's causal prefix and cached per slot by a hash of that prefix (§5). On the attention-only models the forced alternative is structurally cleaner: storage holds only what is portable, the chat template becomes a structural primitive of the inference engine rather than a prompt-engineering convention, the substrate shrinks, and the theorem (§11.2) covers boundary tokens without a frame-mismatch exception. A cached run is injected rather than recomputed, so a reprojection that keeps its prefixes pays only for the runs whose prefix changed. The constraint has a limit, which §5 records: a recurrent model cannot gap-fill, so on the production lineage the same markers are sealed K/V instead.
-
-The pattern in each case: the constraint closed the standard solution, and the forced alternative was not merely adequate but, in the dimension the constraint bounds, better. Our reading is that this is a property of constraints that are accepted rather than avoided: when a standard approach is ruled out by resource limits, the replacement must be more efficient in the dimension the constraint bounds, and efficiency in that dimension often generalises, because the constraint exposed an avoidable cost in the standard approach. It is a pattern observed in one system, not a law, and its counterexample is in the same list — the structural-segment design had to be set aside for the recurrent lineage.
-
-The codebase dependency analysis evaluation (§9.12) applies the methodology at the evaluation level. The constraint was: show the system works on real structured data, not synthetic probes. The response — the system's own codebase as the test case, with its author as the ground-truth oracle — gives an evaluation that is checkable against a codebase anyone can read. Its portability is bounded by what is released: the source is public, the ingested substrate is valid only for the model that wrote it and is not released, and the battery and its ground truth are in the repository beside its results.
+In each case the replacement is more efficient in the dimension the constraint bounds, and that efficiency generalised because the constraint exposed an avoidable cost. It is a pattern from one system, not a law, and its counterexample is in the list: the structural-segment design had to be set aside for the recurrent production model. The evaluation followed the same rule — the system's own codebase as the test, checkable by anyone who reads it.
 
 ---
 
 ## 12. Conclusion
 
-We have presented a complete inference system built from first principles as a coherent design. The four primary contributions — online Markov expert prediction with wave-batched DMA overlap, adaptive per-block KV quantisation with two-phase prefill refresh, attentional provenance indexing with mid-decode reprojection, and an unbounded three-tier paged context — are individually grounded in the literature but have not previously been integrated.
+The four contributions — online Markov expert prediction with wave-batched GEMM, per-block adaptive KV quantization with two-phase refresh, attentional provenance indexing with mid-decode reprojection, and an unbounded three-tier context — have precedents individually and had not been integrated.
 
-The empirical results demonstrate that the coherence dividend is real and substantial. A 180B mixture-of-experts model serves eight concurrent sessions from a 16GB laptop GPU with 32GB of host RAM, above every published single-GPU run of it on machines with two to four times the memory. Its throughput is flat in context depth — 99% of prefill and 111% of decode kept from 32K to 128K — because the model's own sparse-attention indexer bounds each token's attended set and the engine adds no depth-dependent cost on top: the bounded-working-set principle, measured as time, though not by provenance. The KV cache compresses up to 7.6× inline with every output validated, at nearly 4× the compression of llama.cpp's q8_0 cache while slowing decode less. That is what the one-card design stands on: the substrate behind the conversation is held at C5 — a 40M-token code memory that could not exist at full precision on any single card — and under sixteen concurrent answers the card's resident context peaks at 945 thousand tokens, 21.9 GiB at full precision, and its KV arenas at 11.2 GiB, while its expert zone streams the rest of a 180B model (§9.6.9). One card's aggregate decode exceeds the best published llama.cpp single-stream rate for the same model and card class by 1.3–37.9×, reaching 2,869.9 t/s across 64 sessions; and a 284B model serves sixteen sessions from a single GPU at 4.1× the best published single-GPU decode (§9.6). The concurrency regime these occupy is one existing consumer deployments do not reach: the most comparable published study found standard frameworks degrade beyond 2 concurrent users on an RTX 5090 32GB [Herz et al., arXiv:2512.23029], and the published single-card serving runs of the 35B models stop at 5–10.
+Together they run a 180B MoE model for eight sessions on a 16 GB laptop GPU, above every published single-GPU run of it on hosts with two to four times the memory; keep throughput flat from 32K to 128K, through the model's own sparse-attention indexer with no depth-dependent cost from the engine; compress the KV cache up to 7.6× inline with every output validated, nearly 4× llama.cpp's q8_0 for less decode; and serve concurrent sessions at 1.3–37.9× the best published single-stream rate for the same model and card class, up to 2,869.9 t/s across 64 sessions, with a 284B model at sixteen sessions on one GPU at 4.1× the best published single-GPU decode. The memory behind it is a 42M-token code substrate held at C5; under sixteen concurrent answers the card's resident context peaks at 945 thousand tokens, 21.9 GiB at full precision, while the expert zone streams the rest of the model. The most comparable published study found standard frameworks degrade beyond two concurrent users on an RTX 5090 [Herz et al., arXiv:2512.23029].
 
-The primary theoretical result is the Asymptotic Numerical Stability theorem (§11.2): under provenance-selected attention over unbounded context, the summed stored error of the tokens entering a generation step is bounded by a constant independent of N, where the same bound under full attention grows linearly in N. Warm- and cold-tier tokens share a fixed retrieval budget and together contribute a bounded constant C_ret, small when retrieved blocks originate from prefill-refreshed hot-tier blocks and pass the per-block threshold. The result bounds exposure, not output error, and it does not show that full attention degrades; what it changes is the framing of the KV quantization literature, which has optimised within the full-attention regime without asking whether the regime could be left. Provenance-selected attention leaves it structurally.
+The Asymptotic Numerical Stability theorem bounds the summed stored error entering a step by a constant independent of depth, where full attention's grows linearly. It bounds exposure, not output error, and it does not show full attention degrades; what it changes is the question the KV quantization literature asks — not how small each token's error can be made inside the full-attention regime, but whether the regime can be left. Provenance selection leaves it, and §9.11.2 shows the premise holds: every planted turn selected from a history twelve times the working set, at the top compression level as at near-lossless.
 
-The broader competitive position follows from the same distinction. The existing KV quantization literature — KIVI, KVQuant, TurboQuant — optimises the compression primitive: better quantization formulas, rotation, codebooks. This paper optimises the compression architecture: when to quantize, what quality to guarantee per block, how to separate error sources, and how error scales with depth. The architecture absorbs primitive-level failures through adaptive selection; it does not depend on having the best primitive. That is why the system maintains per-block validated quality at compression ratios where population-level systems begin to degrade — the architecture compensates where any fixed primitive falls short.
-
-The application target — many concurrent persistent-memory agent sessions on a single consumer card, each with unbounded conversation history — is met at every scale measured: sixteen users of a 35B model and eight of a 180B model on a 16GB laptop, sixty-four of a 35B model on one 72GB card. The problem the system was designed to solve is solvable at scale. The inference engine exists in service of that requirement, not as an end in itself.
-
-The codebase dependency battery (§9.12) is the evidence that projection and reprojection with provenance work together. Retrieval finds the needle — the answer file first of 6,854, in a 40M-token corpus, on 65% of questions, top five on 83%. The model then answers from memory with tools forbidden at 57.3% recall over three runs, documented architecture well and call sites less well, and declines rather than invents. Holding the working set fixed while the model reasons takes that to 38.8%, every held run below every reprojecting run: re-selection during reasoning is worth 18.5 points, most of them on answers in files the question does not name. The 128-question battery measures each part on its own: against the model alone the memory is worth 36.7 points, reprojection during reasoning 4.6, continuous reprojection 6.5 over a single retrieval, and the seed files 0.4 — the last indistinguishable from zero, the other three clear of it after Holm correction. The theorem's direct test (§9.11.2) shows its premise holds — a bounded working set selected, needle for needle, from a history twelve times its size, at the top compression level as at near-lossless. The deployment itself — §9.13 — is operating experience of what the architecture is for: memory that outlives the process, the session and the model that wrote it. That experience is not a substitute for the battery's table, and is not offered as one.
-
-The sliding-window alternative degrades by construction rather than gracefully: a window that cannot see past its boundary cannot discover a dependency that lives beyond it, and a 131K window covers only a fraction of a 2.2M-line codebase. The contrast that matters is measured in its sharpest form: the same provenance index, the same opening retrieval and every other reprojection, with only the reasoning's re-selection held — and the battery loses 18.5 points (§9.12). The retrieve-once turn — the same index and the same opening retrieval, then a fixed window through the reasoning — scores 6.5 points below the production system over 128 questions (2.8 to 10.3). What is measured is retrieval quality on the live gallery (§9.11.1) and against the 40M-token code corpus (§9.12), selection far past the working set (§9.11.2), the battery from memory and its reasoning-hold ablation (§9.12), output fidelity against depth (§9.6.8), and the absence of a depth cliff in the engine's own throughput (§9.6.2). The KV quantization literature — KIVI, KVQuant, TurboQuant — optimises inside a regime whose boundaries it has not examined; the growth of exposure with N is a property of full attention, not a law of compression, and this architecture leaves the regime (§11.2, §11.3). Attention is retrieval: the provenance index performs approximate attention over the full unbounded context, selecting which blocks enter exact attention; standard attention is flat retrieval at O(N) cost; this system is hierarchical retrieval whose exact-attention cost per step does not grow with N, plus a scan that does — flat over the resident gallery, ~9.5 ms steady-state on the laptop, and off the critical path; RAG replaces the attention mechanism and loses attentional continuity; this system preserves the mechanism and removes the scaling constraint on exact attention (§6, §11.4). The structural argument is straightforward: a system running full attention over a 2.2M-line codebase reads every compressed token at every step once it holds more than it can keep at full precision; this one reads a bounded working set, on a laptop GPU — and more hardware does not give full attention a depth-independent bound (§11.2 Corollary 2).
-
-The deeper lesson is methodological: constraints accepted as first-class design requirements rather than problems to be avoided force architectural decisions that are more efficient in the dimension the constraint bounds — and efficiency in that dimension tends to generalise. The 16GB ceiling produced native quantized kernels that never pay for a dequantised copy. The finite hot tier produced the sparse attention that makes unbounded context tractable to bound. The memory pressure of concurrent sessions produced the two-phase quantization that separates two error mechanisms the literature conflates. Each constraint closed a standard solution and forced one that holds up beyond it. The measurements show it on three cards from 16GB to 72GB; the theorem explains why the bound, though not every figure, carries to any card.
+On the system's own codebase, retrieval ranks the answer file first among 7,943 on 49% of questions by sign agreement alone, and answering 128 questions from memory with tools forbidden, the memory is worth 36.7 points of recall, re-selection during reasoning 4.6, and continuous re-selection 6.5 over a single retrieval, each clear of zero after Holm correction; the gain falls on the questions that do not name their answer's file, the ones only the reasoning can reach. Attention is retrieval: this system runs it hierarchically, approximate over the unbounded context and exact over what it selects, preserving the mechanism RAG replaces and removing the scaling constraint on exact attention. The deeper lesson is methodological: constraints accepted as design requirements forced decisions more efficient in the dimension they bound, measured here on three cards from 16 GB to 72 GB, with a bound that carries to any card.
 
 ---
 
@@ -1379,8 +1724,8 @@ The deeper lesson is methodological: constraints accepted as first-class design 
 
 **Source code:** https://github.com/john-sharratt/candle (public)
 
-**Live system:** https://code.tokera.com — the deployed coding assistant over this repository, on the cluster that produced §9.11.1 and §9.13. It requires sign-in; access is by allowlist, with a queue for guests. The project site, https://www.tokera.com, carries v1 of this paper.
+**Live system:** https://code.tokera.com — the deployed coding assistant over this repository, on the cluster that produced §9.11.1 and §9.13. It requires sign-in; access is by allowlist, with a queue for guests. The project site, https://www.tokera.com, carries v1 and this version.
 
-**What is released.** The full inference engine codebase, and the raw measurement rows behind every figure in this paper — `docs/performance.md` and `docs/results/`, each row naming its build, its machine and the test that produced it — with the tests that produce them. What is not released: the substrate the live gallery holds (a KV archive valid only for the model that wrote it, and holding conversations that are not this paper's to publish), and an interface to the retrieval record — the live system shows a conversation's turns and tool calls, not which signatures matched at each reprojection. A turn's `projection` (Full, Limited to the journals, or Minimal to the tools), `seed` and reprojection are dials of the request and of the MCP tools that start a turn, as its thinking and tools are, so every arm of §9.12 is a setting a caller can choose — and a task can limit what it is shown. The §9.12 battery's questions and ground truth (`zend/examples/dependency_battery/battery.yaml`), its harness and analysis, and every answer's per-question score (the pilot's `docs/results/dependency_battery_2026-11-10.md`, `docs/results/dependency_battery_2026-11-20_b.md` and `docs/results/dependency_battery_2026-11-23_l_m.md`; the 128-question battery's `docs/results/battery_128/`) are in the repository, as are the tests behind §9.6.8 and §9.11.2.
+**What is released.** The engine, and the raw measurement rows behind every figure — `docs/performance.md` and `docs/results/`, each naming its build, machine and test — with the tests that produce them; the §9.12 battery's questions, ground truth, harness, analysis and per-answer scores (`zend/examples/dependency_battery/`, `docs/results/battery_128/`, and the pilot's `docs/results/dependency_battery_2026-11-*.md`); and the tests behind §9.6.8 and §9.11.2. Not released: the live substrate, a KV archive valid only for its model and holding conversations that are not this paper's to publish, and a view of which signatures matched at each reprojection. A turn's `projection`, `seed` and reprojection are dials of the request, so every arm of §9.12 is a setting a caller can choose.
 
-**Invitation.** This is v2, and it is open for full critical review. The v1 erratum is part of the record rather than quietly corrected, and the same discipline applies here: every figure in this version names its build, its machine and its test, and every claim that is not measured says so. Contributions to validation, stress-testing, or optimisation are invited — contributors will be recognised in the next revision. Issues, pull requests, and evaluation results may be submitted via the GitHub repository.
+**Invitation.** v2 is open for critical review. The v1 erratum stays part of the record; every figure here names its build, machine and test, and every unmeasured claim says so. Validation, stress tests and optimisations are welcome through the GitHub repository, and contributors will be recognised in the next revision.
