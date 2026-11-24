@@ -14,7 +14,7 @@ This powers two products:
 - **Zen Code** — a persistent AI coding assistant (`zend` daemon + `zen-vscode` Continue fork) with institutional memory across sessions and shared KV prefix across developer forks
 - **Battle Cities** — an NPC narrative game with unbounded agent memory
 
-**Paper**: v1 published May 13, 2026 (Zenodo 10.5281/zenodo.20156060), archived at `docs/unbounded_agents_v1.md` and still what tokera.com serves; v2 in preparation at `docs/unbounded_agents.md`, then MLSys/ACL/EMNLP/NeurIPS 2027.
+**Paper**: v1 published May 13, 2026 (Zenodo 10.5281/zenodo.20156060), archived at `docs/unbounded_agents_v1.md`; v2 is final (25 November 2026) at `docs/unbounded_agents.md`, served at tokera.com/papers/one-card-v2, then MLSys/ACL/EMNLP/NeurIPS 2027. Reading sealed K/V as reliably as text (§9.12) is the follow-up paper.
 
 ---
 

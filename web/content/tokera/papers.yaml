@@ -27,20 +27,21 @@ papers:
       Constraint-driven architecture for asymptotically stable inference over
       unbounded agent memory
     authors: "Johnathan Paul Sharratt"
-    date: "24 November 2026"
-    status: "v2 working draft"
+    date: "25 November 2026"
+    status: "v2"
     source: unbounded_agents.md
     summary: >-
       v2 of One Card, One Stack, measured on the production system. A 180B
       mixture-of-experts model serves eight concurrent sessions from a 16 GB
       laptop GPU, with throughput flat from 32K to 128K tokens of context, and
       the KV cache compresses up to 7.6× with every output validated. On a
-      40M-token memory of its own codebase, a 128-question battery run in
-      seven arms with tools forbidden measures what each part of provenance
-      retrieval is worth: the memory 36.7 points of recall, re-selecting the
-      working set while the model reasons 4.6, and continuous reprojection 6.5
-      over a single retrieval, each clear of zero after correction. Not yet
-      deposited; v1 below is the archived version of record.
+      42M-token memory of its own codebase, a 128-question battery with tools
+      forbidden measures what each part of provenance retrieval is worth: the
+      memory 37.0 points of recall, re-selecting the working set while the
+      model reasons 5.3, and continuous reprojection 6.9 over a single
+      retrieval, each clear of zero after correction. Against BM25 retrieval
+      of the same repository, the memory puts the answer's text in front of
+      the model more often.
 
   - slug: palquant
     title: "PalQuant"
