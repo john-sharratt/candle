@@ -292,29 +292,34 @@ mod tests {
     use super::*;
     use crate::models::gpu_test_lock::gpu_serial;
     use crate::models::quantized_qwen38_moe::cached_vision_tower_file;
+    use candle::cuda_backend::cudarc::driver::DevicePtr;
+    use candle_nn::kv_cache::{close_guest_arena, open_guest_arena};
 
-    /// **The real tower runs on the card**: Flash-Next's pinned mmproj, loaded
-    /// as the guest loads it, reads a 768 × 512 image — 1 536 patches, two
-    /// attention bands and a ragged third — into one finite 2 560-wide row
-    /// per `<|image_pad|>`. On a machine that has not fetched the tower there
-    /// is nothing to run.
-    #[test]
-    fn the_pinned_tower_reads_an_image_on_the_card() {
-        let _gpu = gpu_serial();
-        let Ok(dev) = Device::new_cuda(0) else { return };
-        let Some(path) = cached_vision_tower_file() else {
-            return;
-        };
+    /// The pinned tower on the card, or `None` on a machine without a card or
+    /// without the tower fetched.
+    fn tower() -> Option<(Device, VisionTower)> {
+        let dev = Device::new_cuda(0).ok()?;
+        let path = cached_vision_tower_file()?;
         let vb = VarBuilder::from_gguf(&path, &dev).unwrap();
         let tower = VisionTower::load(&vb, Int8Mode::auto(&dev)).unwrap();
+        Some((dev, tower))
+    }
+
+    /// A 768 × 512 image: 1 536 patches, two attention bands and a ragged
+    /// third.
+    fn image() -> VisionInput {
         let grid = Grid {
             height: 512,
             width: 768,
         };
-        let rgb: Vec<u8> = (0..grid.height * grid.width * 3)
+        let rgb = (0..grid.height * grid.width * 3)
             .map(|i| (i * 31 % 251) as u8)
             .collect();
-        let rows = tower.forward(&VisionInput { rgb, grid }).unwrap();
+        VisionInput { rgb, grid }
+    }
+
+    /// One finite, non-zero 2 560-wide row per `<|image_pad|>`.
+    fn assert_rows(rows: &Tensor, grid: Grid) {
         assert_eq!(rows.dims(), [grid.tokens(), OUT_HIDDEN]);
         let values = rows
             .to_dtype(DType::F32)
@@ -325,5 +330,39 @@ mod tests {
             .unwrap();
         assert!(values.iter().all(|v| v.is_finite()), "a row is not finite");
         assert!(values.iter().any(|v| *v != 0.0), "every row is zero");
+    }
+
+    /// **The real tower runs on the card**: Flash-Next's pinned mmproj reads
+    /// an image into its rows. On a machine that has not fetched the tower
+    /// there is nothing to run.
+    #[test]
+    fn the_pinned_tower_reads_an_image_on_the_card() {
+        let _gpu = gpu_serial();
+        let Some((_, tower)) = tower() else { return };
+        let input = image();
+        let grid = input.grid;
+        assert_rows(&tower.forward(&input).unwrap(), grid);
+    }
+
+    /// **And on a guest arena**, sized as the vision guest sizes it: the
+    /// image's patches at [`ACTIVATION_BYTES_PER_PATCH`] — the way the drain
+    /// runs it, every stage and block carving from that one stretch.
+    #[test]
+    fn the_pinned_tower_reads_an_image_on_a_guest_arena() {
+        let _gpu = gpu_serial();
+        let Some((dev, tower)) = tower() else { return };
+        let input = image();
+        let grid = input.grid;
+        let bytes = grid.patches() * ACTIVATION_BYTES_PER_PATCH;
+        let Device::Cuda(cuda) = &dev else {
+            unreachable!()
+        };
+        let stream = cuda.cuda_stream();
+        let ground = stream.alloc_zeros::<u8>(bytes).unwrap();
+        let (base, _guard) = ground.device_ptr(&stream);
+        open_guest_arena(&stream, base, bytes);
+        let rows = tower.forward(&input);
+        close_guest_arena(&stream);
+        assert_rows(&rows.unwrap(), grid);
     }
 }
