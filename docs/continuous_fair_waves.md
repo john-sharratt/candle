@@ -266,17 +266,24 @@ prefill phase. A card whose zone holds its experts judges prefills on their
 trade alone, as before; each member's `learned rates published` line says which
 (`streams`).
 
-**The rule binds only a turn the forward cannot take whole.** A turn whose rows
-are the whole of its prefill (`Cost::finishes`) holds no store across narrow
-forwards: it finishes in the forward it joins and its store serves the decode it
-becomes, in whatever wave the prefill runs. Refusing it saves no residency — it
-returns as a later wave's head, which is carried, and claims the same store there
-— so it is admitted beside the others on the rules above. Without this the rule
-serialised every short turn: on WhiteWorld (2026-11-24, seven NPC missions) turns
-of 10–30 tokens, whose rows add a few tens of MB of tier against a ~66 MB store,
-were refused behind each wave's first, the prefill width stood at 1 with 16
-queued, and residency stood at 13–15 GB against a 7.4 GB hold with no refusal on
-the floor.
+**A turn the forward takes whole is exempt while the zone stays in its upper
+half.** A turn whose rows are the whole of its prefill (`Cost::finishes`) holds
+no store across narrow forwards: it finishes in the forward it joins and its
+store serves the decode it becomes, in whatever wave the prefill runs. Refused,
+it only returns as a later wave's head, which is carried, and claims the same
+store there. So while the residency it leaves stays above the zone's midpoint
+(`Headroom::midpoint`, halfway between the hold and the achievable residency —
+the margin `gate::may_start_decode` keeps a decode's working set alive with) it
+is admitted beside the others on the rules above; below it, the rule judges it as
+any other turn. Both sides were measured on WhiteWorld (2026-11-24, seven NPC
+missions, Flash-Next Q3_KO: hold 7.4 GB, achievable ~14.8 GB, so a midpoint near
+11 GB). Held to the rule, turns of 10–30 tokens — whose rows add a few tens of MB
+of tier against a ~66 MB store — were refused behind each wave's first: prefill
+width 1 with 16 queued, residency 13–15 GB. Exempted without a bound, they ran
+2–9 to a wave and stood their stores at once: residency fell to the hold, the
+expert hit rate from ~60% to 20–50%, disk reads per wave from ~200–450 to
+600–1,800, and the decode step from ~100 ms to 300–600 ms. A card whose zone
+holds its experts never meets the rule (`Budget::streams_experts`).
 
 **A short prompt rides as a stencil run does, a short span a step.** A prompt of
 at most four of the model's short spans (`ManagedBatchedModel::short_span_rows`,

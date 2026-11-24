@@ -398,20 +398,28 @@ pub(crate) fn fill<G: Ground>(ground: &mut G, rate: &mut WaveRate) -> Filled {
             // for rows the new turn is the wave's work and is admitted on the
             // rules above; the head of an idle wave is carried.
             //
-            // **A turn that finishes in this forward does not crowd.** Its store
-            // is not held across narrow forwards — it serves the decode the turn
-            // becomes, whichever wave the prefill runs in — so refusing it saves
-            // no residency: it comes back as a later wave's head, which is
-            // carried, and claims the same store there, having lost only its
-            // place beside the others. On WhiteWorld (2026-11-24) the NPCs'
-            // 10–30-token turns, whose rows add a few tens of MB of tier against
-            // a ~66 MB store, were refused this way behind every first turn: the
-            // prefill width stood at 1 with 16 queued, residency 13–15 GB against
-            // a 7.4 GB hold, no refusal on the floor.
+            // **A turn that finishes in this forward does not crowd while the
+            // zone stays in its upper half.** Its store is not held across narrow
+            // forwards — it serves the decode the turn becomes — so refused, it
+            // only comes back as a later wave's head and claims the same store
+            // there. On WhiteWorld (2026-11-24) the NPCs' 10–30-token turns,
+            // whose rows add a few tens of MB of tier against a ~66 MB store,
+            // were refused this way behind every first turn: prefill width 1
+            // with 16 queued, residency 13–15 GB against a 7.4 GB hold.
+            //
+            // But every one of those stores stands at once once admitted, and
+            // the decodes they become step on what is left. Exempted without a
+            // bound, the same turns took residency from 13–15 GB to the hold,
+            // the expert hit rate from ~60% to 20–50%, and the decode step from
+            // ~100 ms to 300–600 ms. So the exemption holds down to the
+            // [`Headroom::midpoint`] — halfway between the hold and the
+            // achievable residency, the margin [`gate::may_start_decode`] keeps
+            // a decode's working set alive with — and below it a short turn is
+            // judged by the rule as any other.
             let crowds = allowed
                 && budget.streams_experts
                 && kind != Kind::Decode
-                && !cost.finishes
+                && !(cost.finishes && after > room.midpoint())
                 && (standing > 0 || out.prefills + out.sections > 0)
                 && !(idle && out.admitted() == 0)
                 && cost.activations < cost.recurrent;

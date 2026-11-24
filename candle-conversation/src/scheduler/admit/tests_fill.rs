@@ -537,6 +537,47 @@ pub(super) mod tests {
         );
     }
 
+    /// **A short turn joins only while the zone stays in its upper half, and a
+    /// card that holds its experts never meets the rule.** A turn that
+    /// finishes in its forward, beside standing rows, is admitted where the
+    /// residency it leaves is above the zone's midpoint; one whose claim
+    /// would take it under is held to the store rule and refused; the same
+    /// offer on a card whose zone holds its experts (BlackWorld) is admitted
+    /// at either residency.
+    #[test]
+    fn a_short_turn_joins_only_above_the_zone_midpoint() {
+        let midpoint = Fake::new(Vec::new(), Vec::new(), 0).headroom().midpoint();
+        let offer = |streams: bool, resident: u64| {
+            let mut f = Fake::new(Vec::new(), vec![REGION], resident);
+            f.active = 4;
+            f.standing = 512;
+            f.streams = streams;
+            f.prefill_prio = DecodePriority::High;
+            f.store = 4 * REGION;
+            f.tier = REGION;
+            f.finishes = true;
+            let got = fill_once(&mut f);
+            (got.prefills, got.stopped_on_rate)
+        };
+        // The offer dislodges its K/V and store (five regions) and its tier
+        // (one): from midpoint + 2 regions it lands four under the midpoint.
+        assert_eq!(
+            offer(true, midpoint + 64 * REGION),
+            (1, false),
+            "upper half: a short turn joins"
+        );
+        assert_eq!(
+            offer(true, midpoint + 2 * REGION),
+            (0, true),
+            "its claim takes the zone under the midpoint: the store rule refuses it"
+        );
+        assert_eq!(
+            offer(false, midpoint + 2 * REGION),
+            (1, false),
+            "a card holding its experts is untouched by the rule"
+        );
+    }
+
     /// **The head of an idle wave is carried on a streaming card.** With
     /// nothing running and nothing standing, the first offer runs whatever it
     /// costs, so a turn too large to ever fit cannot block the queue; the one
