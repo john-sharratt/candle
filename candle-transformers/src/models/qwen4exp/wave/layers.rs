@@ -200,17 +200,35 @@ impl Qwen4ExpBatched {
         // what the gather reads — so only a wave with a host-side input uploads
         // its ids again (`WaveBuffer::RowTokenIds` prices both).
         let ids = host_token_ids(inputs, fwd_ticket)?;
-        let seq_tokens: Vec<Vec<u32>> = ids.per_input;
+        let mut seq_tokens: Vec<Vec<u32>> = ids.per_input;
+        // An image's rows arrive under virtual ids: resolved here, the hash
+        // side handed `<|image_pad|>` in their place, and their values the
+        // gather's second table.
+        let images = take_wave_images(
+            &mut seq_tokens,
+            m.embed.n_rows(),
+            cfg.ple.image_token_id,
+            n_embd,
+            dev,
+            fwd_ticket,
+        )?;
         if fresh || head_embeds {
-            let ids = match ids.device {
-                Some(t) => t,
-                None => {
+            let ids = match (&images, ids.device) {
+                (Some(w), _) => {
+                    wave_from_vec_ticketed(w.gather_ids.clone(), (total_rows,), dev, fwd_ticket)?
+                }
+                (None, Some(t)) => t,
+                (None, None) => {
                     let flat_ids: Vec<u32> = seq_tokens.iter().flatten().copied().collect();
                     wave_from_vec_ticketed(flat_ids, (total_rows,), dev, fwd_ticket)?
                 }
             };
-            m.embed
-                .gather_into(&ids, entry.as_ref(), row_embeds.as_ref())?;
+            m.embed.gather_into(
+                &ids,
+                images.as_ref().map(|w| &w.extra),
+                entry.as_ref(),
+                row_embeds.as_ref(),
+            )?;
         }
 
         // ── Residual: the fresh rows as gathered, or resume. ──
@@ -276,6 +294,28 @@ impl Qwen4ExpBatched {
             generation,
             &dec_pm,
         );
+        // The prefill group's image rows, by their row in the group: image ids
+        // arrive in prompts, which are prefill rows, after the decode group.
+        let image_rotation = match &images {
+            Some(w) => {
+                let runs: Vec<ImageRun> = w
+                    .runs
+                    .iter()
+                    .map(|r| ImageRun {
+                        row: r.row - n_decode,
+                        ..*r
+                    })
+                    .collect();
+                Some(ImageRotation::new(
+                    runs,
+                    cfg.attn_head_dim,
+                    cfg.rope_dim,
+                    f64::from(theta),
+                    |v, s| wave_from_vec_ticketed(v, s, dev, fwd_ticket),
+                )?)
+            }
+            None => None,
+        };
         let pre_params = BatchedAttentionParams::new(
             &pre_rope,
             false,
@@ -284,7 +324,8 @@ impl Qwen4ExpBatched {
             pre_q,
             generation,
             &pre_pm,
-        );
+        )
+        .with_image_rotation(image_rotation.as_ref());
 
         // QSA: the indexer's rotation table and this wave's index caches.
         // Absolute positions per row, in the wave's packed order — decode

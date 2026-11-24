@@ -67,6 +67,10 @@ pub struct PleConfig {
     pub conv_kernel: usize,
     /// Hash-window reset token (`ple.eos_token_id`).
     pub eos_token_id: u32,
+    /// `<|image_pad|>` (`ple.image_token_id`): what an image's rows hash as.
+    /// The hash reads input ids, and an image's positions hold this one, so a
+    /// wave whose image rows arrive under virtual ids hashes them as this.
+    pub image_token_id: u32,
     /// Hash multipliers, one per n-gram position (`ple.layer_multipliers`).
     pub multipliers: Vec<u64>,
     /// Per-head row offset into the one stacked table (`ple.head_offsets`).
@@ -349,6 +353,7 @@ impl Qwen4ExpConfig {
             heads_per_ngram,
             conv_kernel: get_usize("ple.conv_kernel")?,
             eos_token_id: get_usize("ple.eos_token_id")? as u32,
+            image_token_id: get_usize("ple.image_token_id")? as u32,
             multipliers,
             head_offsets: head_offsets[..n_heads].to_vec(),
             head_vocab_sizes: head_vocab_sizes[..n_heads].to_vec(),
@@ -454,6 +459,7 @@ mod tests {
         put("ple.heads_per_ngram", Value::U32(8));
         put("ple.conv_kernel", Value::U32(4));
         put("ple.eos_token_id", Value::U32(248_044));
+        put("ple.image_token_id", Value::U32(248_056));
         put(
             "ple.layer_multipliers",
             Value::Array(vec![

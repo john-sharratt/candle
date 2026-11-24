@@ -384,6 +384,8 @@ impl<M: BatchedModelCore> BatchedInference<M> {
                         qsa_bytes: 0,
                         // No look-ahead routers on this path.
                         look_ahead_hops: 0,
+                        // No vision tower on this path.
+                        image_rows: 0,
                         // The prefill launch's carve: up to one key chunk of
                         // each bulk chunk's sequence, and the carry beside it.
                         // Glue rows take their own kernel, which stages nothing.

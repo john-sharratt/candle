@@ -54,12 +54,20 @@
 // `warp, warp + 4, ...`, so every lane of a warp takes the same iterations and
 // the warp stays converged, which those functions require.
 //
+// A SECOND TABLE: ROWS PAST THE VOCABULARY
+// ----------------------------------------
+// `extra` is an optional dense F32 table of `n_extra` rows: an id in
+// `[n_src_rows, n_src_rows + n_extra)` copies row `id − n_src_rows` from it
+// into every destination. An image's rows reach the residual this way — the
+// wave names them by ids past the vocabulary and uploads them beside the
+// quantized table — so one launch still seeds the whole wave.
+//
 // OUT-OF-RANGE INDICES
 // --------------------
-// An id at or beyond `n_src_rows` writes zero rows to every destination
-// rather than reading past the table. The destinations are allocated
-// uninitialised by the caller, so this is also what keeps "every byte is
-// written" true for a malformed id.
+// An id past both tables writes zero rows to every destination rather than
+// reading out of bounds. The destinations are allocated uninitialised by the
+// caller, so this is also what keeps "every byte is written" true for a
+// malformed id.
 // =============================================================================
 
 #include <cuda_runtime.h>
@@ -80,6 +88,8 @@ __global__ void __launch_bounds__(EMBED_GATHER_THREADS) embed_gather_dequant_f32
     float *__restrict__ wide,
     int32_t replicas,
     float *__restrict__ narrow,
+    const float *__restrict__ extra,
+    int64_t n_extra,
     int64_t ncols,
     int64_t n_src_rows,
     int32_t n_rows) {
@@ -92,12 +102,15 @@ __global__ void __launch_bounds__(EMBED_GATHER_THREADS) embed_gather_dequant_f32
   float *narrow_row = narrow ? narrow + (int64_t)row * ncols : nullptr;
 
   if (id >= n_src_rows) {
+    const int64_t e = id - n_src_rows;
+    const float *src = (extra && e < n_extra) ? extra + e * ncols : nullptr;
     for (int64_t i = threadIdx.x; i < ncols; i += blockDim.x) {
+      const float v = src ? src[i] : 0.0f;
       for (int32_t r = 0; r < replicas && wide_row; ++r) {
-        wide_row[r * ncols + i] = 0.0f;
+        wide_row[r * ncols + i] = v;
       }
       if (narrow_row) {
-        narrow_row[i] = 0.0f;
+        narrow_row[i] = v;
       }
     }
     return;
@@ -127,6 +140,8 @@ static int32_t launch(
     float *wide,
     int32_t replicas,
     float *narrow,
+    const float *extra,
+    int64_t n_extra,
     int64_t ncols,
     int64_t n_src_rows,
     int32_t n_rows,
@@ -136,7 +151,8 @@ static int32_t launch(
   }
   embed_gather_dequant_f32_kernel<block_t, BLOCKS_PER_UNIT, ELEMS_PER_UNIT>
       <<<n_rows, EMBED_GATHER_THREADS, 0, stream>>>(
-          (const block_t *)table, ids, wide, replicas, narrow, ncols, n_src_rows, n_rows);
+          (const block_t *)table, ids, wide, replicas, narrow, extra, n_extra, ncols,
+          n_src_rows, n_rows);
   return 0;
 }
 
@@ -151,6 +167,8 @@ extern "C" int32_t run_embed_gather_dequant_f32(
     float *wide,
     int32_t replicas,
     float *narrow,
+    const float *extra,
+    int64_t n_extra,
     int64_t ncols,
     int64_t n_src_rows,
     int32_t n_rows,
@@ -161,9 +179,12 @@ extern "C" int32_t run_embed_gather_dequant_f32(
   if (wide == nullptr) {
     replicas = 0;
   }
+  if (extra == nullptr) {
+    n_extra = 0;
+  }
   cudaStream_t s = (cudaStream_t)stream;
   switch (qtype) {
-  case QTYPE_Q8_0: return launch<block_q8_0, 2, 2 * QK8_0>(table, ids, wide, replicas, narrow, ncols, n_src_rows, n_rows, s);
+  case QTYPE_Q8_0: return launch<block_q8_0, 2, 2 * QK8_0>(table, ids, wide, replicas, narrow, extra, n_extra, ncols, n_src_rows, n_rows, s);
   default: return -1;
   }
 }

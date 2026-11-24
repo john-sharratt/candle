@@ -509,6 +509,7 @@ impl WaveBuffer {
             Self::PrefillQLens | Self::PrefillKvLens => dense(w.prefill_spans, 1, DType::U32),
             // Two carves at most, so one bump alignment between them as well.
             Self::RowTokenIds => dense(2 * rows + BUMP_ALIGNMENT / 4, 1, DType::U32),
+            Self::ImageRows => dense(w.image_rows, g.hidden, DType::F32),
             // The draft head's input assembly, over every row of the wave.
             Self::HeadShift
             | Self::HeadHiddenNorm

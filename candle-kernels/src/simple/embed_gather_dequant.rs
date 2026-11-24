@@ -16,10 +16,13 @@ pub const EMBED_GATHER_RAGGED_ROW: i32 = -2;
 extern "C" {
     // table:      device base of the row-major quantized table.
     // qtype:      `GgmlDType as u32` (the `QTYPE_*` numbering).
-    // ids:        device u32[n_rows]. Ids at or beyond `n_src_rows` write zeros.
+    // ids:        device u32[n_rows]. An id at or beyond `n_src_rows` reads row
+    //             `id − n_src_rows` of `extra` when there is one, else zeros.
     // wide:       device f32[n_rows * replicas * ncols], or null.
     // replicas:   copies of each row in `wide`; ignored when `wide` is null.
     // narrow:     device f32[n_rows * ncols], or null.
+    // extra:      device f32[n_extra * ncols], rows past the table, or null.
+    // n_extra:    rows in `extra`.
     // ncols:      elements per row.
     // n_src_rows: rows in the table, for the bounds check.
     // n_rows:     rows to gather.
@@ -33,6 +36,8 @@ extern "C" {
         wide: *mut f32,
         replicas: i32,
         narrow: *mut f32,
+        extra: *const f32,
+        n_extra: i64,
         ncols: i64,
         n_src_rows: i64,
         n_rows: i32,

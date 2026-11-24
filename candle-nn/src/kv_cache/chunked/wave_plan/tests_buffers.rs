@@ -197,6 +197,7 @@ pub(super) mod tests {
                             PrefillLaunchBounds::PRODUCTION,
                         ),
                         look_ahead_hops: rows,
+                        image_rows: rows,
                     };
                     let s = b.shape(&g, width);
                     if conditional {

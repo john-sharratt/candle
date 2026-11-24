@@ -27,6 +27,7 @@ pub(super) fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     rope: &RopeRungs,
     generation: &Generation,
     shared_pm: &std::cell::RefCell<Option<SharedPm>>,
+    image_rotation: Option<&ImageRotation>,
     qsa: Option<&QsaSelection>,
     wave: WaveRef<'w>,
 ) -> Result<LiveTensor<'w>> {
@@ -69,6 +70,15 @@ pub(super) fn forward_attn_batched_multi<'w, L: BatchedAttentionLayer>(
     let q = ensure_contiguous(&q)?;
     let k = ensure_contiguous(&k)?;
     g_qkv.end();
+
+    // An image's rows turned by their place in the image, once, before the
+    // kernel rotates Q by its slot and before K is written — so every later
+    // read's slot rotation composes to the multimodal position, wherever the
+    // chunk is placed (`docs/flash_next_vision.md` §4.4).
+    if let Some(rotation) = image_rotation {
+        rotation.apply(&q)?;
+        rotation.apply(&k)?;
+    }
 
     // Check for paged (chunked) CUDA path BEFORE applying model-side RoPE.
     // The paged prefill kernel applies RoPE internally; applying it here first

@@ -493,6 +493,10 @@ pub enum WaveBuffer {
     /// row there, the most either takes. A single-stream stack reads nothing
     /// back and takes one.
     RowTokenIds,
+    /// The rows the wave's image ids name, `[image_rows, hidden]` F32 — the
+    /// embedding gather's second table, uploaded once per forward beside the
+    /// ids that index it (`WaveWidth::image_rows`). Zero on a wave with no image.
+    ImageRows,
     /// One attention layer's sparse selection, as the model states it — see
     /// [`WaveWidth::qsa_bytes`] for why the width cannot say it alone. Carved
     /// on the attention phase, after the pre-mix and ahead of the projections.

@@ -332,6 +332,9 @@ impl WaveSweep for Qwen4ExpBatched {
                         PrefillLaunchBounds::PRODUCTION,
                     ),
                     look_ahead_hops: look_ahead_hops(total_rows),
+                    // The rows the gather's second table holds: one per
+                    // virtual id among the wave's inputs.
+                    image_rows: count_image_rows(inputs)?,
                 };
                 let per_phase = [
                     plan.phase_bytes(LayerPhase::Attention, width),

@@ -87,6 +87,11 @@ pub struct WaveWidth {
     /// cache's look-ahead votes: each is `n_experts` more F32 columns of
     /// [`WaveBuffer::LookAheadLogits`]. Zero on a stack that votes on nothing.
     pub look_ahead_hops: usize,
+    /// Rows whose ids name an image's rows rather than the vocabulary — the
+    /// wave uploads each one's values as [`WaveBuffer::ImageRows`]. The caller
+    /// counts them before the forward, from the wave's own ids; zero on a wave
+    /// with no image in it.
+    pub image_rows: usize,
 }
 
 impl WaveWidth {
@@ -112,6 +117,7 @@ impl WaveWidth {
             qsa_bytes: 0,
             kv_stage: PrefillKvStageLayout::NONE,
             look_ahead_hops: 0,
+            image_rows: 0,
         }
     }
 
@@ -128,6 +134,7 @@ impl WaveWidth {
             qsa_bytes: 0,
             kv_stage: PrefillKvStageLayout::NONE,
             look_ahead_hops: 0,
+            image_rows: 0,
         }
     }
 

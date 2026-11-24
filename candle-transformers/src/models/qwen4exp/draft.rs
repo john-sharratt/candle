@@ -435,7 +435,7 @@ impl Qwen4ExpBatched {
         let fwd_ticket = Some(fwd_wave.ticket());
         // Fully written by the lookup (invariant 6), in the head's F32.
         let embeds = wave_empty_ticketed((n, m.embed.ncols()), DType::F32, dev, fwd_ticket)?;
-        m.embed.gather_into(ids, None, Some(&embeds))?;
+        m.embed.gather_into(ids, None, None, Some(&embeds))?;
 
         // ── Attention half. ──
         let attn_wave = begin_wave(&stream, LayerPhase::Attention)?;

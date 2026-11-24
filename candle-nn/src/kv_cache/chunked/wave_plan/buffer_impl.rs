@@ -108,7 +108,8 @@ impl WaveBuffer {
             | Self::GlueWriteTables
             | Self::ForwardResidual
             | Self::DeltaNetDecodeTable
-            | Self::RowTokenIds => Chain::ForwardSetup,
+            | Self::RowTokenIds
+            | Self::ImageRows => Chain::ForwardSetup,
             other => match other.phase() {
                 LayerPhase::Attention => Chain::Attention,
                 LayerPhase::Ffn => Chain::Ffn,
@@ -256,7 +257,8 @@ impl WaveBuffer {
             | Self::GlueWriteTables
             | Self::ForwardResidual
             | Self::DeltaNetDecodeTable
-            | Self::RowTokenIds => LayerPhase::Forward,
+            | Self::RowTokenIds
+            | Self::ImageRows => LayerPhase::Forward,
         }
     }
 }

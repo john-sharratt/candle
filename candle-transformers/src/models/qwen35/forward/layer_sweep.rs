@@ -290,6 +290,8 @@ pub(super) fn sweep_layers(
                 qsa_bytes: 0,
                 // Its MoE layers apply no look-ahead routers.
                 look_ahead_hops: 0,
+                // This lineage's engine takes no image rows.
+                image_rows: 0,
                 // A one-row prefill group takes the decode kernels, so it carves
                 // no span-table entry and, alone, no scan transient.
                 prefill_spans: pre_q.iter().filter(|&&l| l > 1).count(),

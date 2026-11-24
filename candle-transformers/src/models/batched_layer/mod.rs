@@ -40,6 +40,7 @@ use crate::models::prefill_utils::{
 use crate::models::profile::{gpu_span, pipeline_record, profile_now, span};
 use crate::models::qsa_selection::QsaSelection;
 use crate::models::quantized_matmul::QMatMul;
+use crate::models::qwen_vision::ImageRotation;
 use crate::models::rope_schedule::RopeRungs;
 use crate::utils::repeat_kv;
 
@@ -118,6 +119,9 @@ pub struct BatchedAttentionParams<'a> {
     /// buffer instead of rebuilding + re-uploading it. Empty (`None`) at forward
     /// start; unused on the decode and CPU paths.
     pub shared_prefill_pm: &'a std::cell::RefCell<Option<SharedPm>>,
+    /// The group's image rows, turned by their place in their image before
+    /// any reader rotates them by their slot. `None` for a group with no image.
+    pub image_rotation: Option<&'a ImageRotation>,
 }
 
 impl<'a> BatchedAttentionParams<'a> {
@@ -140,7 +144,14 @@ impl<'a> BatchedAttentionParams<'a> {
             q_lens,
             generation,
             shared_prefill_pm,
+            image_rotation: None,
         }
+    }
+
+    /// These params with the group's image rows to turn.
+    pub fn with_image_rotation(mut self, rotation: Option<&'a ImageRotation>) -> Self {
+        self.image_rotation = rotation;
+        self
     }
 }
 
@@ -343,6 +354,7 @@ pub fn forward_attn_batched<'w, L: BatchedAttentionLayer>(
             params.rope,
             params.generation,
             params.shared_prefill_pm,
+            params.image_rotation,
             qsa,
             wave,
         )?;

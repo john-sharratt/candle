@@ -646,6 +646,7 @@ mod tests {
             heads_per_ngram: 2,
             conv_kernel: 4,
             eos_token_id: 99,
+            image_token_id: 98,
             multipliers: vec![
                 0x9E37_79B9_7F4A_7C15,
                 0xC2B2_AE3D_27D4_EB4F,

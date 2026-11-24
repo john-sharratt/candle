@@ -125,17 +125,34 @@ impl DeviceEmbedding {
     ///
     /// `ids` is a dense U32 device tensor. Both destinations must be dense F32
     /// on the table's device — validated, never converted — and are overwritten
-    /// in full. An id past the table writes zeros rather than reading out of
-    /// bounds.
+    /// in full. `extra`, a dense F32 `[n_extra, ncols]` table, holds the rows of
+    /// ids past this one: id `n_rows() + e` reads its row `e` — an image's rows,
+    /// named by ids past the vocabulary. An id past both writes zeros rather
+    /// than reading out of bounds.
     pub fn gather_into(
         &self,
         ids: &Tensor,
+        extra: Option<&Tensor>,
         wide: Option<&Tensor>,
         narrow: Option<&Tensor>,
     ) -> Result<()> {
         if wide.is_none() && narrow.is_none() {
             candle::bail!("device embedding: a lookup with no destination");
         }
+        let n_extra = match extra {
+            Some(t) => {
+                expect_dense_dtype(t, DType::F32, "device embedding: extra")?;
+                let (rows, cols) = t.dims2()?;
+                if cols != self.ncols {
+                    candle::bail!(
+                        "device embedding: extra rows are {cols} wide, the table {}",
+                        self.ncols
+                    );
+                }
+                rows
+            }
+            None => 0,
+        };
         if ids.dtype() != DType::U32 || !ids.is_contiguous() {
             candle::bail!(
                 "device embedding: ids must be dense U32, got {:?} {:?}",
@@ -208,6 +225,15 @@ impl DeviceEmbedding {
         let narrow_ptr = narrow_dp
             .as_ref()
             .map_or(std::ptr::null_mut(), |(p, _)| *p as *mut f32);
+        let extra_storage = extra.map(|t| t.storage_and_layout());
+        let extra_view = match &extra_storage {
+            Some((s, l)) => Some(f32_view(s, l, "extra")?),
+            None => None,
+        };
+        let extra_dp = extra_view.as_ref().map(|v| v.device_ptr(&stream));
+        let extra_ptr = extra_dp
+            .as_ref()
+            .map_or(std::ptr::null(), |(p, _)| *p as *const f32);
 
         candle::set_kernel_breadcrumb("run_embed_gather_dequant_f32", file!(), line!());
         let status = unsafe {
@@ -218,6 +244,8 @@ impl DeviceEmbedding {
                 wide_ptr,
                 replicas as i32,
                 narrow_ptr,
+                extra_ptr,
+                n_extra as i64,
                 self.ncols as i64,
                 self.n_rows as i64,
                 n as i32,
@@ -310,7 +338,7 @@ mod tests {
             .unwrap();
         let emb = DeviceEmbedding::new(table).unwrap();
         let narrow = Tensor::empty((ids_host.len(), ncols), DType::F32, &dev).unwrap();
-        emb.gather_into(&ids, None, Some(&narrow)).unwrap();
+        emb.gather_into(&ids, None, None, Some(&narrow)).unwrap();
         assert_eq!(bits(&narrow), bits(&reference));
     }
 
@@ -339,7 +367,7 @@ mod tests {
         let emb = DeviceEmbedding::new(table).unwrap();
         let ids = Tensor::new([2u32, 0, 3].as_slice(), &dev).unwrap();
         let narrow = Tensor::empty((3, ncols), DType::F32, &dev).unwrap();
-        emb.gather_into(&ids, None, Some(&narrow)).unwrap();
+        emb.gather_into(&ids, None, None, Some(&narrow)).unwrap();
         let got = bits(&narrow);
         assert_eq!(got[0], expected[2]);
         assert_eq!(got[1], expected[0]);
@@ -357,7 +385,7 @@ mod tests {
         let ids = Tensor::new([5u32, 1, 1].as_slice(), &dev).unwrap();
         let wide = Tensor::empty((3, hc, ncols), DType::F32, &dev).unwrap();
         let narrow = Tensor::empty((3, ncols), DType::F32, &dev).unwrap();
-        emb.gather_into(&ids, Some(&wide), Some(&narrow)).unwrap();
+        emb.gather_into(&ids, None, Some(&wide), Some(&narrow)).unwrap();
         let rows = bits(&narrow);
         let streams = wide.to_vec3::<f32>().unwrap();
         for (t, per_stream) in streams.iter().enumerate() {
@@ -368,7 +396,7 @@ mod tests {
         }
         // A wide-only lookup writes the same thing.
         let wide_only = Tensor::empty((3, hc, ncols), DType::F32, &dev).unwrap();
-        emb.gather_into(&ids, Some(&wide_only), None).unwrap();
+        emb.gather_into(&ids, None, Some(&wide_only), None).unwrap();
         assert_eq!(wide_only.to_vec3::<f32>().unwrap(), streams);
     }
 
@@ -384,7 +412,7 @@ mod tests {
         let ids = Tensor::new([1u32, 3, u32::MAX].as_slice(), &dev).unwrap();
         let wide = Tensor::full(f32::NAN, (3, hc, ncols), &dev).unwrap();
         let narrow = Tensor::full(f32::NAN, (3, ncols), &dev).unwrap();
-        emb.gather_into(&ids, Some(&wide), Some(&narrow)).unwrap();
+        emb.gather_into(&ids, None, Some(&wide), Some(&narrow)).unwrap();
         let rows = narrow.to_vec2::<f32>().unwrap();
         assert!(
             rows[0].iter().any(|v| *v != 0.0),
@@ -435,9 +463,51 @@ mod tests {
         let emb = DeviceEmbedding::new(device_table(GgmlDType::Q8_0, 4, 64, &dev)).unwrap();
         let ids = Tensor::new([0u32, 1].as_slice(), &dev).unwrap();
         let short = Tensor::empty((1, 64), DType::F32, &dev).unwrap();
-        assert!(emb.gather_into(&ids, None, Some(&short)).is_err());
+        assert!(emb.gather_into(&ids, None, None, Some(&short)).is_err());
         let bf16 = Tensor::empty((2, 64), DType::BF16, &dev).unwrap();
-        assert!(emb.gather_into(&ids, None, Some(&bf16)).is_err());
-        assert!(emb.gather_into(&ids, None, None).is_err());
+        assert!(emb.gather_into(&ids, None, None, Some(&bf16)).is_err());
+        assert!(emb.gather_into(&ids, None, None, None).is_err());
+        let narrow_extra = Tensor::empty((2, 32), DType::F32, &dev).unwrap();
+        let ok = Tensor::empty((2, 64), DType::F32, &dev).unwrap();
+        assert!(emb
+            .gather_into(&ids, Some(&narrow_extra), None, Some(&ok))
+            .is_err());
+    }
+
+    /// Ids past the table read the second table's rows, in every destination,
+    /// beside ordinary ids — and an id past both still writes zeros.
+    #[test]
+    fn ids_past_the_table_read_the_second_table() {
+        let _gpu = gpu_guard();
+        let Some(dev) = cuda() else { return };
+        let (n_rows, ncols, hc) = (5usize, 128usize, 3usize);
+        let table = device_table(GgmlDType::Q8_0, n_rows, ncols, &dev);
+        let reference = table.dequantize(&dev).unwrap();
+        let emb = DeviceEmbedding::new(table).unwrap();
+        let extra_vals: Vec<f32> = (0..2 * ncols).map(|i| i as f32 * 0.25 - 7.0).collect();
+        let extra = Tensor::from_vec(extra_vals.clone(), (2, ncols), &dev).unwrap();
+        // Table row 2, extra row 1, extra row 0, table row 4, past both.
+        let ids = Tensor::new([2u32, 6, 5, 4, 7].as_slice(), &dev).unwrap();
+        let wide = Tensor::full(f32::NAN, (5, hc, ncols), &dev).unwrap();
+        let narrow = Tensor::full(f32::NAN, (5, ncols), &dev).unwrap();
+        emb.gather_into(&ids, Some(&extra), Some(&wide), Some(&narrow))
+            .unwrap();
+        let got = narrow.to_vec2::<f32>().unwrap();
+        let table_rows = reference.to_vec2::<f32>().unwrap();
+        assert_eq!(got[0], table_rows[2]);
+        assert_eq!(got[1], extra_vals[ncols..]);
+        assert_eq!(got[2], extra_vals[..ncols]);
+        assert_eq!(got[3], table_rows[4]);
+        assert!(got[4].iter().all(|v| v.to_bits() == 0));
+        let streams = wide.to_vec3::<f32>().unwrap();
+        for (t, per_stream) in streams.iter().enumerate() {
+            for stream in per_stream {
+                assert_eq!(
+                    stream.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    got[t].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    "token {t}"
+                );
+            }
+        }
     }
 }

@@ -213,6 +213,9 @@ pub mod qwen35;
 pub mod qwen3_moe;
 #[cfg(feature = "cuda")]
 pub mod qwen4exp;
+/// The Qwen3-VL vision tower and its image geometry, model-agnostic: the
+/// tower runs on any device, so its CPU forward is its own test reference.
+pub mod qwen_vision;
 /// The per-pair repack fingerprint both model-pack sections record. Producing
 /// one needs the device; the hashing and the check are compiled everywhere so
 /// the section formats' tests run without a GPU.
