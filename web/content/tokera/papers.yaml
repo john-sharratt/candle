@@ -29,6 +29,7 @@ papers:
     authors: "Johnathan Paul Sharratt"
     date: "25 November 2026"
     status: "v2"
+    pdf: "/pdf/one-card-v2.pdf"
     source: unbounded_agents.md
     summary: >-
       v2 of One Card, One Stack, measured on the production system. A 180B

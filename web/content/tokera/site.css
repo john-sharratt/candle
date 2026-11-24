@@ -1307,4 +1307,15 @@ html, body, .pane-view, .pane-index {
      and unquotable in a review. */
   .prose.paper .fig, .prose.paper table, .prose.paper pre { break-inside: avoid; }
   .prose.paper h2, .prose.paper h3 { break-after: avoid; }
+  /* The sheet opens on the paper's own title and byline; the page's heading
+     above it is the site's, and printed it only repeats them. */
+  .doc-head { display: none; }
+  /* The site's dark ground would print as a rim around the white sheet. */
+  html, body, body.tokera, main.split, .pane-view, .pane-inner { background: #fff; }
+  /* Paper cannot scroll: a wide table is laid out as a table and fitted to the
+     page, its headers wrapping, rather than cut at the margin. */
+  .prose.paper table { display: table; overflow: visible; font-size: 8pt; }
+  .prose.paper table thead th { white-space: normal; font-size: 7pt; padding: 4px 8px 4px 0; }
+  .prose.paper table td { padding: 4px 8px 4px 0; }
+  .prose pre, .math-block { overflow: visible; white-space: pre-wrap; }
 }
