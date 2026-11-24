@@ -58,9 +58,11 @@ const MERGED_VALUES: usize = HIDDEN * MERGE * MERGE;
 pub const ATTN_BAND: usize = 512;
 /// Activation bytes per patch a forward needs at its peak: one block's
 /// intermediates (the residual, its norm, `qkv`, the rotated heads and the
-/// context, about 13 hidden widths; the MLP's 4 304, twice), the band's scores,
-/// and the chain's two carried hidden states — about 110 KiB in bf16, with the
-/// margin a carve's alignment and the merger's tail take.
+/// context, about 13 hidden widths; the MLP's 4 304, twice), one band's scores
+/// and probabilities — each band a stage of its own, so they never sum — and
+/// the chain's two carried hidden states: about 100 KiB in bf16, with the
+/// margin a carve's alignment and the merger's tail take. The embedding is a
+/// stage before the chain, so its patch rows are gone by the first block.
 pub const ACTIVATION_BYTES_PER_PATCH: usize = 128 * 1024;
 
 /// One image, resized to its grid: RGB8, row-major, `grid.height · grid.width · 3`
@@ -237,6 +239,28 @@ impl VisionTower {
     fn encode(&self, pixels: &Tensor, grid: Grid) -> Result<Tensor> {
         let dev = pixels.device().clone();
         let n = grid.patches();
+        // A stage of its own: the patch rows and the position taps die with
+        // it, and only the embedded rows are carried into the blocks.
+        let x = guest_stage(pixels, |pixels| self.embed(pixels, grid))?;
+
+        let angles = Tensor::from_vec(vit_rope_angles(grid), (n, 2 * VIT_ROPE_FREQS), &dev)?;
+        let cos = angles.cos()?.to_dtype(self.dtype)?;
+        let sin = angles.sin()?.to_dtype(self.dtype)?;
+        let x = guest_chain(&x, &self.blocks, |x, block| block.forward(x, &cos, &sin))?;
+
+        let merged = self
+            .post_ln
+            .forward(&x)?
+            .reshape((n / (MERGE * MERGE), MERGED_VALUES))?;
+        let h = self.fc1.forward(&merged)?.gelu_erf()?;
+        self.fc2.forward(&h)
+    }
+
+    /// The patch rows embedded, with their interpolated positions added:
+    /// `[patches, 1152]`.
+    fn embed(&self, pixels: &Tensor, grid: Grid) -> Result<Tensor> {
+        let dev = pixels.device().clone();
+        let n = grid.patches();
         let (bh, bw) = (grid.merged_rows(), grid.merged_cols());
         // Normalised to (x/255 − 0.5)/0.5, then permuted into patch rows in
         // merge-block order, each row channel-major then pixel row then column.
@@ -261,19 +285,7 @@ impl VisionTower {
             .reshape((n, 4, HIDDEN))?
             .broadcast_mul(&w)?
             .sum(1)?;
-        let x = (x + pos)?;
-
-        let angles = Tensor::from_vec(vit_rope_angles(grid), (n, 2 * VIT_ROPE_FREQS), &dev)?;
-        let cos = angles.cos()?.to_dtype(self.dtype)?;
-        let sin = angles.sin()?.to_dtype(self.dtype)?;
-        let x = guest_chain(&x, &self.blocks, |x, block| block.forward(x, &cos, &sin))?;
-
-        let merged = self
-            .post_ln
-            .forward(&x)?
-            .reshape((n / (MERGE * MERGE), MERGED_VALUES))?;
-        let h = self.fc1.forward(&merged)?.gelu_erf()?;
-        self.fc2.forward(&h)
+        x + pos
     }
 
     /// The device the tower's weights are on.
@@ -327,7 +339,7 @@ mod tests {
     use crate::models::gpu_test_lock::gpu_serial;
     use crate::models::quantized_qwen38_moe::cached_vision_tower_file;
     use candle::cuda_backend::cudarc::driver::DevicePtr;
-    use candle_nn::kv_cache::{close_guest_arena, open_guest_arena};
+    use candle_nn::kv_cache::{close_guest_arena, guest_domain_stats, open_guest_arena};
 
     /// The pinned tower on the card, or `None` on a machine without a card or
     /// without the tower fetched.
@@ -396,7 +408,13 @@ mod tests {
         let (base, _guard) = ground.device_ptr(&stream);
         open_guest_arena(&stream, base, bytes);
         let rows = tower.forward(&input);
+        let (_, peak, _) = guest_domain_stats(stream.context().ordinal()).unwrap();
         close_guest_arena(&stream);
+        println!(
+            "guest arena peak: {} KiB a patch of {} priced",
+            peak / grid.patches() / 1024,
+            ACTIVATION_BYTES_PER_PATCH / 1024
+        );
         assert_rows(&rows.unwrap(), grid);
     }
 }
