@@ -55,6 +55,7 @@ pub(super) mod wave_chunk_tests {
                 free_tool_calls_from_penalties: false,
                 recorded_reply: None,
                 recurrent_spans: Vec::new(),
+                image_spans: Vec::new(),
                 rereads: false,
             },
             offset: 0,

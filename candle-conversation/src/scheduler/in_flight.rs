@@ -287,6 +287,10 @@ pub(in super::super) struct PrefillWork {
     /// Spans of `tokens` each prefilled as a chunk of its own, armed on the
     /// model for a capture or a replay of their recurrent state.
     pub(in super::super) recurrent_spans: Vec<TokenSpan>,
+    /// The images in `tokens`, whose pads reach the engine as their rows'
+    /// virtual ids ([`crate::vision::engine_ids`]); their handles hold the rows
+    /// for as long as this work can be prefilled.
+    pub(in super::super) image_spans: Vec<ImageSpan>,
     /// A request's first reading (`first_reading`): the question is
     /// prefilled to its last token against a projection without the seeds,
     /// scored, and submitted again with them. Set at submit for a turn a new

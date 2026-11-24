@@ -238,6 +238,9 @@ pub(crate) enum SchedulerRequest {
         /// Spans of `prefill_tokens` whose recurrent state is captured or
         /// replayed — see [`crate::TurnOptions::recurrent_spans`].
         recurrent_spans: Vec<TokenSpan>,
+        /// The images in `prefill_tokens`: where each one's pads are, and the
+        /// rows they name to the engine ([`crate::vision::engine_ids`]).
+        image_spans: Vec<ImageSpan>,
     },
 
     /// Free a sequence slot.
@@ -407,6 +410,8 @@ pub(crate) enum SchedulerRequest {
         /// conversation's own history and are injected onto the replay slot as
         /// context; turns from it on are the span being replayed.
         adopted_from: u32,
+        /// The images in `tokens`, whose pads replay as their rows.
+        image_spans: Vec<ImageSpan>,
         response_tx: Sender<Result<bool, ConversationError>>,
     },
 

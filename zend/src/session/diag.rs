@@ -488,10 +488,10 @@ impl ZendSession {
 
         for &(raw, index) in &run.catch_up {
             let tl = TimelineId::from_raw(raw).context("a catch-up turn's timeline")?;
-            let Some(turn) = conv.sealed_turns(tl).into_iter().find(|t| t.index == index) else {
+            if !conv.sealed_turns(tl).iter().any(|t| t.index == index) {
                 bail!("no turn {index} on timeline {raw} to catch up over");
-            };
-            conv.catch_memory_up_over(turn.token_ids)
+            }
+            conv.catch_memory_up_over(tl, index)
                 .context("catching the memory up")?;
         }
 

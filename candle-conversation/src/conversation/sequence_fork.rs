@@ -194,7 +194,7 @@ impl Sequence {
         if !self.model_core.carries_recurrent_state {
             return Ok(());
         }
-        // The adopted tokens, and where the adopted span starts — everything
+        // The adopted turns, and where the adopted span starts — everything
         // before it is this conversation's own history, which the replay must
         // attend over.
         //
@@ -203,28 +203,14 @@ impl Sequence {
         // conversation decoded it. Replaying against nothing — the first
         // version of this — makes the attention layers feed the recurrent
         // layers outputs no real forward ever produced.
-        let (tokens, adopted_from) = {
-            let view = self.substrate.read();
-            let tokens: Vec<u32> = adopted
-                .iter()
-                .flat_map(|idx| view.token_ids_of(self.target.timeline, TurnIndex(*idx)))
-                .collect();
-            (tokens, adopted.iter().copied().min().unwrap_or(0))
-        };
-        if tokens.is_empty() {
-            return Ok(());
-        }
-        let (tx, rx) = flume::bounded(1);
-        self.scheduler_tx
-            .send(SchedulerRequest::MemoryCatchUp {
-                sequence_id: self.id,
-                tokens: TokenBuffer::from(tokens),
-                adopted_from,
-                response_tx: tx,
-            })
-            .map_err(|_| ConversationError::SchedulerGone)?;
-        match replied(&rx).map_err(|_| ConversationError::SchedulerGone)? {
+        let turns: Vec<(TimelineId, TurnIndex)> = adopted
+            .iter()
+            .map(|idx| (self.target.timeline, TurnIndex(*idx)))
+            .collect();
+        let adopted_from = adopted.iter().copied().min().unwrap_or(0);
+        match self.replay_memory_over(&turns, adopted_from) {
             Ok(_) => Ok(()),
+            Err(ConversationError::SchedulerGone) => Err(ConversationError::SchedulerGone),
             Err(e) => {
                 // Not fatal to the splice — the K/V is committed and the
                 // conversation is usable — but it leaves memory behind its
@@ -239,16 +225,42 @@ impl Sequence {
         }
     }
 
-    /// Advance this conversation's recurrent memory over `tokens`, all of its
-    /// own turns as their left context, adding no K/V: the catch-up a splice
-    /// runs, for tokens this conversation holds some other way.
-    pub fn catch_memory_up_over(&self, tokens: Vec<u32>) -> crate::Result<bool> {
+    /// Advance this conversation's recurrent memory over the stored turn
+    /// `index` of `timeline`, all of its own turns as their left context,
+    /// adding no K/V: the catch-up a splice runs, for a turn this conversation
+    /// holds some other way.
+    pub fn catch_memory_up_over(&self, timeline: TimelineId, index: u32) -> crate::Result<bool> {
+        self.replay_memory_over(&[(timeline, TurnIndex(index))], u32::MAX)
+    }
+
+    /// Replay `turns`' stored ids, their images as their rows, through this
+    /// conversation's recurrent memory, the turns of its own timeline before
+    /// `adopted_from` injected as their context. `Ok(false)` when there is
+    /// nothing to replay or the model carries no recurrent memory.
+    fn replay_memory_over(
+        &self,
+        turns: &[(TimelineId, TurnIndex)],
+        adopted_from: u32,
+    ) -> crate::Result<bool> {
+        let tokens: Vec<u32> = {
+            let view = self.substrate.read();
+            turns
+                .iter()
+                .flat_map(|&(timeline, index)| view.token_ids_of(timeline, index))
+                .collect()
+        };
+        if tokens.is_empty() {
+            return Ok(false);
+        }
+        let image_spans = stored_spans(&self.substrate, VisionTokens::of(&self.tokenizer), turns)
+            .map_err(ConversationError::Other)?;
         let (tx, rx) = flume::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::MemoryCatchUp {
                 sequence_id: self.id,
                 tokens: TokenBuffer::from(tokens),
-                adopted_from: u32::MAX,
+                adopted_from,
+                image_spans,
                 response_tx: tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;

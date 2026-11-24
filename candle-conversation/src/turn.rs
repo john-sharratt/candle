@@ -5,6 +5,7 @@ use crate::projection::SelectionState;
 use crate::recurrent_span::TextSpan;
 use crate::stencil::{TriggerRegistry, TurnGrammar};
 use crate::token_buffer::TokenBuffer;
+use crate::vision::TurnImage;
 use serde::{Deserialize, Serialize};
 
 /// Monotonic turn identifier within a conversation.
@@ -132,6 +133,11 @@ pub struct TurnOptions {
     /// before `Done` — or replayed from a record
     /// (`docs/deltanet_timeline.md` §14).
     pub recurrent_spans: Vec<TextSpan>,
+
+    /// Images the user half opens with, in order: each one's block of ids and
+    /// its marker in the text go ahead of the message
+    /// ([`crate::vision::turn_images`] makes them).
+    pub images: Vec<TurnImage>,
 }
 
 impl TurnOptions {

@@ -90,9 +90,11 @@ impl Scheduler {
                     }
                     let off = self.active_prefills[i].offset;
                     let end = (off + advance).min(self.active_prefills[i].work.tokens.len());
-                    let toks: Vec<u32> = self.active_prefills[i].work.tokens[off..end].to_vec();
+                    let work = &self.active_prefills[i].work;
+                    let toks = engine_ids(&work.tokens[off..end], off, &work.image_spans);
                     // On the host: the forward lays every row's id on its own
-                    // span in one upload (`wave_token_ids`).
+                    // span in one upload (`wave_token_ids`), an image's pads
+                    // named by its rows' virtual ids.
                     match Tensor::new(toks.as_slice(), &Device::Cpu).and_then(|t| t.unsqueeze(0)) {
                         Ok(t) => {
                             kept.push(m);

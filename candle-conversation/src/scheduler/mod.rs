@@ -235,6 +235,7 @@ use crate::provenance::{
 };
 use crate::recorded_reply::{RecordedReply, Replay};
 use crate::recurrent_span::TokenSpan;
+use crate::vision::{engine_ids, ImageSpan};
 use crate::sequence_handle::{BlockCount, BlockRange, SequenceId};
 use crate::stencil::{
     Healed, StencilDriver, StepMask, TriggerRegistry, TurnGrammar, TOOL_CALL_TREE_LABEL,

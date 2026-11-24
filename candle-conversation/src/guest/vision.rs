@@ -30,18 +30,30 @@ const ARENA_HEADROOM_BYTES: usize = 32 << 20;
 /// The smallest arena opened: a 64-token image's forward.
 const MIN_ARENA_BYTES: usize = 64 << 20;
 
-/// The tower, configured by the path of its `mmproj` GGUF.
+/// The tower, configured by where its `mmproj` GGUF is found.
+///
+/// `mmproj` answers from the local cache alone. The file is fetched by the
+/// caller before it queues a job ([`crate::vision::encode`]), so a drain — every
+/// wave stopped — never waits on the network.
 pub struct VisionGuest {
-    mmproj: PathBuf,
+    mmproj: fn() -> Option<PathBuf>,
     loaded: Option<(Device, VisionTower)>,
 }
 
 impl VisionGuest {
-    pub fn new(mmproj: PathBuf) -> Self {
+    pub fn new(mmproj: fn() -> Option<PathBuf>) -> Self {
         Self {
             mmproj,
             loaded: None,
         }
+    }
+
+    fn path(&self) -> Result<PathBuf, String> {
+        (self.mmproj)().ok_or_else(|| {
+            "vision guest: the tower's mmproj is not in the local cache — it is fetched before a \
+             job is queued"
+                .to_string()
+        })
     }
 }
 
@@ -68,7 +80,10 @@ impl GuestModel for VisionGuest {
 
     fn footprint_bytes(&self, jobs: &[GuestRequest]) -> usize {
         let mode = Int8Mode::auto(&Device::Cpu);
-        let weights = ground_bytes(&self.mmproj, mode, &[]).unwrap_or(0);
+        let weights = self
+            .path()
+            .and_then(|p| ground_bytes(&p, mode, &[]))
+            .unwrap_or(0);
         weights + activation_bytes(jobs).max(MIN_ARENA_BYTES) + ARENA_HEADROOM_BYTES
     }
 
@@ -100,7 +115,7 @@ impl GuestModel for VisionGuest {
                 .map_err(|e| format!("vision guest: placing the arena: {e}"))?;
             (at, len)
         };
-        let vb = place_gguf(&self.mmproj, device, ground, mode, &[])?;
+        let vb = place_gguf(&self.path()?, device, ground, mode, &[])?;
         let tower = VisionTower::load(&vb, mode).map_err(|e| format!("vision guest: {e}"))?;
         if let Device::Cuda(cuda) = device {
             candle_nn::kv_cache::open_guest_arena(&cuda.cuda_stream(), arena.0.ptr, arena.1);

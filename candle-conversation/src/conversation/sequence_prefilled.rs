@@ -148,6 +148,8 @@ impl Sequence {
             // Nothing is decoded, so there is no reply to replay.
             None,
             Vec::new(),
+            // A calibration trajectory carries no image.
+            Vec::new(),
         )?;
         self.turn_in_flight = true;
         Ok(handle)
@@ -313,6 +315,7 @@ impl Sequence {
                 free_tool_calls_from_penalties: false,
                 recorded_reply: None,
                 recurrent_spans: Vec::new(),
+                image_spans: Vec::new(),
                 seal_group: Some(turns),
             })
             .map_err(|_| ConversationError::SchedulerGone)?;

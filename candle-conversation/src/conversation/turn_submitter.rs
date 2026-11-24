@@ -32,7 +32,15 @@ impl Sequence {
         options: TurnOptions,
     ) -> crate::Result<TurnHandle> {
         let user_message = user_message.into();
-        let user_text = user_message.text();
+        // An image is in the turn's text as its marker, ahead of the message,
+        // as its block of ids is ahead of the message's ids: the record a
+        // transcript reads, and what names the image's rows to a rebuild.
+        let markers: String = options
+            .images
+            .iter()
+            .map(|i| format!("{}\n", marker(&i.id, i.width, i.height)))
+            .collect();
+        let user_text = format!("{markers}{}", user_message.text());
         if self.turn_in_flight {
             return Err(ConversationError::TurnInFlight {
                 sequence_id: self.id,
@@ -214,7 +222,13 @@ impl TurnSubmitter {
         // follow as one string, exactly as they always have. The half meets the
         // markers on `user_end`, a registered tag the tokenizer splits at anyway,
         // so the concatenation is the whole grid's encoding.
-        let user_tokens = self.encode_text(user_message)?;
+        // The user half opens with its images, each a block of ids — start,
+        // one pad per row, end — ahead of the message; the message's spans move
+        // past them.
+        let (image_ids, image_spans) = self.image_blocks(&options.images)?;
+        let images_len = image_ids.len();
+        let mut user_tokens = TokenBuffer::from(image_ids);
+        user_tokens.extend_from_slice(&self.encode_text(user_message)?);
         // The user half opens the grid, so a span's tokens in the half are its
         // tokens in the grid until the turn's head is baked on.
         let recurrent_spans = options
@@ -228,7 +242,7 @@ impl TurnSubmitter {
                     s.bytes.clone(),
                 )
                 .map(|tokens| TokenSpan {
-                    tokens,
+                    tokens: tokens.start + images_len..tokens.end + images_len,
                     kind: s.kind.clone(),
                 })
                 .map_err(|e| ConversationError::Tokenizer(e.to_string()))
@@ -375,8 +389,32 @@ impl TurnSubmitter {
                 .recorded_turn
                 .map(|g| (g, options.forced_tokens, options.forced_suffix)),
             recurrent_spans,
+            image_spans,
         )?;
         Ok((handle, user_tokens))
+    }
+
+    /// `images` as the ids the user half opens with, and each image's span in
+    /// them.
+    fn image_blocks(&self, images: &[TurnImage]) -> crate::Result<(Vec<u32>, Vec<ImageSpan>)> {
+        if images.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let tokens = VisionTokens::of(&self.tokenizer).ok_or_else(|| {
+            ConversationError::Other(
+                "a turn with an image, and this model's tokenizer has no vision tokens".into(),
+            )
+        })?;
+        let mut ids = Vec::new();
+        let mut spans = Vec::with_capacity(images.len());
+        for image in images {
+            spans.push(ImageSpan {
+                start: ids.len() + 1,
+                handle: image.handle.clone(),
+            });
+            ids.extend(tokens.block(image.handle.len()));
+        }
+        Ok((ids, spans))
     }
 }
 
@@ -425,6 +463,7 @@ impl TurnSubmitter {
         free_tool_calls_from_penalties: bool,
         recorded_turn: Option<(Vec<u32>, Option<usize>, Vec<u32>)>,
         recurrent_spans: Vec<TokenSpan>,
+        image_spans: Vec<ImageSpan>,
     ) -> crate::Result<TurnHandle> {
         // ── Bake the turn's own boundary markers into its grid ──────────────
         //
@@ -491,6 +530,10 @@ impl TurnSubmitter {
                 kind: s.kind,
             })
             .collect();
+        let image_spans: Vec<ImageSpan> = image_spans
+            .iter()
+            .map(|s| s.shifted(head_len as usize))
+            .collect();
         // The closing marker rides the post-decode tail, so it lands after the
         // decoded body and inside the sealed grid.
         let mut post_decode_tokens = post_decode_tokens;
@@ -555,6 +598,7 @@ impl TurnSubmitter {
                 free_tool_calls_from_penalties,
                 recorded_reply: reply,
                 recurrent_spans,
+                image_spans,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         Ok(TurnHandle::new(event_rx))

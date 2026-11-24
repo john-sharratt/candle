@@ -60,6 +60,7 @@ mod supersession;
 mod tag_index;
 mod tombstones;
 mod turn_placement;
+mod user_half;
 
 use std::sync::OnceLock;
 
@@ -135,6 +136,7 @@ pub use stream_index::{StreamKey, TurnStream};
 use tag_index::TagIndex;
 pub use tombstones::TurnMark;
 pub use turn_placement::RestoredTurn;
+pub use user_half::UserHalf;
 
 // ── Substrate ─────────────────────────────────────────────────────────────────
 

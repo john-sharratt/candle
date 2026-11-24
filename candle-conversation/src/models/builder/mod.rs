@@ -738,6 +738,8 @@ impl std::fmt::Display for ModelBuilder {
 mod build_engine;
 mod builder_config;
 mod load_arch;
+#[cfg(feature = "hub")]
+mod model_guests;
 mod pack;
 #[cfg(test)]
 mod tests_header;

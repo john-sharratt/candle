@@ -456,6 +456,10 @@ impl ModelBuilder {
             );
         }
 
+        // A hub build fetches the model's own guests' weights the way it
+        // fetches the model's; one without the hub has no way to.
+        #[cfg(feature = "hub")]
+        model_guests::register_model_guests(&self.spec.arch, &mut self.guests);
         let engine = ConversationEngine::new(model, tokenizer, config, self.guests.clone())?;
         Ok(engine)
     }

@@ -132,6 +132,7 @@ pub mod turn;
 pub mod turn_group;
 pub mod turn_layout;
 pub mod turn_text;
+pub mod vision;
 pub mod working_set;
 
 pub use cancel::{CancelToken, CancelWait};

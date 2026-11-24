@@ -86,6 +86,7 @@ fn resubmission(work: PrefillWork, parent: SequenceId) -> Option<SchedulerReques
         free_tool_calls_from_penalties: work.free_tool_calls_from_penalties,
         recorded_reply: work.recorded_reply,
         recurrent_spans: work.recurrent_spans,
+        image_spans: work.image_spans,
     })
 }
 

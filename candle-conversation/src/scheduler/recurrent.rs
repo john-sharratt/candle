@@ -286,7 +286,7 @@ impl Scheduler {
             None => Ok(()),
         };
         let result = staged
-            .and_then(|()| self.prefill_tokens_on(seq, tokens))
+            .and_then(|()| self.prefill_tokens_on(seq, tokens, &[]))
             .and_then(|()| self.export_state_of(seq));
         let _ = self.model.release_sequence(seq);
         let _ = self.session.free_sequence(seq);
@@ -356,7 +356,7 @@ impl Scheduler {
     }
 
     /// Run `tokens` through the model on `seq`, in [`Self::prefill_pass_budget`]
-    /// chunks.
+    /// chunks, the pads of `image_spans` as their rows.
     ///
     /// The chunking is not an optimisation: one forward over a whole prompt is a
     /// transient activation spike large enough to page, which is the same reason
@@ -365,14 +365,16 @@ impl Scheduler {
         &mut self,
         seq: usize,
         tokens: &[u32],
+        image_spans: &[ImageSpan],
     ) -> Result<(), ConversationError> {
         let cap = self.prefill_pass_budget();
         let n_layers = self.model.num_layers();
         let mut off = 0usize;
         while off < tokens.len() {
             let advance = (tokens.len() - off).min(cap);
+            let ids = engine_ids(&tokens[off..off + advance], off, image_spans);
             // On the host: the forward lays the ids on its own span.
-            let input = Tensor::new(&tokens[off..off + advance], &Device::Cpu)
+            let input = Tensor::new(ids.as_slice(), &Device::Cpu)
                 .and_then(|t| t.unsqueeze(0))
                 .map_err(ConversationError::Model)?;
             let step = self
@@ -432,6 +434,7 @@ impl Scheduler {
         sequence_id: SequenceId,
         tokens: &[u32],
         adopted_from: u32,
+        image_spans: &[ImageSpan],
     ) -> Result<bool, ConversationError> {
         if !self.model.carries_recurrent_state() || tokens.is_empty() {
             return Ok(false);
@@ -591,7 +594,7 @@ impl Scheduler {
             "memory catch-up: replaying {} adopted tokens over {injected} injected turns",
             tokens.len(),
         );
-        let result = self.prefill_tokens_on(scratch, tokens).and_then(|()| {
+        let result = self.prefill_tokens_on(scratch, tokens, image_spans).and_then(|()| {
             self.model
                 .move_recurrent(scratch, sequence_id.0)
                 .map_err(ConversationError::Model)

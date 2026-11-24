@@ -145,6 +145,7 @@ impl Scheduler {
                 free_tool_calls_from_penalties,
                 recorded_reply,
                 recurrent_spans,
+                image_spans,
             } => {
                 // **The whole SubmitTurn handler, because it is the one that runs real
                 // work on the loop thread.** Its siblings are bookkeeping; this one
@@ -586,6 +587,7 @@ impl Scheduler {
                         free_tool_calls_from_penalties,
                         recorded_reply,
                         recurrent_spans,
+                        image_spans,
                         rereads,
                     },
                     lift,
@@ -914,9 +916,11 @@ impl Scheduler {
                 sequence_id,
                 tokens,
                 adopted_from,
+                image_spans,
                 response_tx,
             } => {
-                let result = self.handle_memory_catch_up(sequence_id, &tokens, adopted_from);
+                let result =
+                    self.handle_memory_catch_up(sequence_id, &tokens, adopted_from, &image_spans);
                 let _ = response_tx.send(result);
                 true
             }

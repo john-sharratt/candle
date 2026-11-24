@@ -101,6 +101,21 @@ impl Substrate {
             .is_some_and(|e| e.content.layout.has_assistant_text())
     }
 
+    /// A turn's user half, read in place.
+    pub fn user_half(&self, timeline: TimelineId, index: TurnIndex) -> Option<UserHalf<'_>> {
+        let e = self.turn(timeline, index)?;
+        let span = e.content.layout.user_span();
+        let ids = e
+            .content
+            .token_ids
+            .get(span.offset as usize..span.end() as usize)?;
+        Some(UserHalf {
+            offset: span.offset as usize,
+            ids,
+            text: e.content.layout.user_text(),
+        })
+    }
+
     /// Turn token IDs as an owned `Vec` (clones the buffer).
     pub fn token_ids_of(&self, timeline: TimelineId, index: TurnIndex) -> Vec<u32> {
         self.turn(timeline, index)

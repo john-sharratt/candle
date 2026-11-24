@@ -69,6 +69,7 @@ use candle_transformers::models::dialect::Dialect;
 use crate::recurrent_span::TokenSpan;
 use crate::stencil::{ThinkMode, TriggerRegistry, TurnGrammar};
 use crate::turn_text::{encode_pieces, token_span, TurnText};
+use crate::vision::{marker, stored_spans, ImageSpan, TurnImage, VisionTokens};
 use flume::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 

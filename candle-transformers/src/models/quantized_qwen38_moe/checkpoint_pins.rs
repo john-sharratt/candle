@@ -75,6 +75,19 @@ pub const QWEN4EXP_MTP_FILE: (&str, u64, &str) = (
     "cd87e5d1a4dadaeed63e35929f3b2f28d13e081b4cd32e00f2835095ec09351e",
 );
 
+/// The revision the vision tower is pinned at: the commit of the same
+/// repository its `mmproj` header was read and its digest taken at.
+pub const QWEN4EXP_MMPROJ_REV: &str = "f5d175de2cf7f720d45d6064019a81fcf056e986";
+
+/// The vision tower at [`QWEN4EXP_MMPROJ_REV`], F16: `(path, bytes, LFS SHA-256)`.
+/// llama.cpp's `mmproj` for this model — an unmodified Qwen3-VL ViT and merger
+/// (`docs/flash_next_vision.md` §1.2).
+pub const QWEN4EXP_MMPROJ_FILE: (&str, u64, &str) = (
+    "mmproj-F16.gguf",
+    904_004_000,
+    "1f7b7f0b984cf065c604360c29c8098362ed61b290db0ff12c6f360bb1a8a980",
+);
+
 /// Shard `i` (1-based) of the pinned Q8_0 split.
 pub fn q8_0_shard_name(i: usize) -> String {
     format!("Q8_0/Qwen3.8-Flash-Next-Q8_0-{i:05}-of-{QWEN4EXP_Q8_0_SHARDS:05}.gguf")

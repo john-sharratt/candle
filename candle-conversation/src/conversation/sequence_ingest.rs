@@ -240,6 +240,8 @@ impl Sequence {
             false,
             None,
             Vec::new(),
+            // A structured ingest carries no image.
+            Vec::new(),
         )?;
 
         // Drain events synchronously to Done.  The handle's event_rx
