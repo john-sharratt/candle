@@ -163,12 +163,17 @@ with every wave stopped. It is not a pack source: the engine recipe, and the
 serves a `VisionRequest` — images at their grid — with each image's rows on
 the host. Between waves it places its activation arena on the guest ground's
 widest run, places the GGUF's tensors in the ground beside it
-(`place_gguf`; GEMM weights at the card's int8 mode), loads `VisionTower`
-(`qwen_vision/tower.rs`: plain candle ops, one forward that is both the CPU
-reference and the guest arena's run), runs each image, and gives the ground
-back. Its footprint is the weights plus the largest image's activations,
-stated per patch (`ACTIVATION_BYTES_PER_PATCH`); the tower attends in
-512-row bands so a 16 384-patch image never materialises `N × N` scores.
+(`place_gguf`; GEMM weights at the card's int8 mode, and the position table
+— a matrix the tower dequantizes, never multiplies by — as its file bytes,
+`gguf_pick::Pick`), loads `VisionTower` (`qwen_vision/tower.rs`: plain candle
+ops, one forward that is both the CPU reference and the guest arena's run),
+runs each image, and gives the ground back. Its footprint is the weights plus
+the largest image's activations, stated per patch
+(`ACTIVATION_BYTES_PER_PATCH`; 88 KiB measured at 768 × 512 against 128
+priced). The arena is a bump, so what bounds it is the stages: the embedding,
+each block's attention half and MLP half, and each 512-row attention band are
+guest stages of their own, so a 16 384-patch image never holds `N × N`
+scores, nor more than one band's.
 Flash-Next's engine registers the guest itself
 (`models/builder/model_guests.rs`): the tower ships with the model, so it is
 not named in a deployment's `guests.yaml`.

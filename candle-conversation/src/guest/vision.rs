@@ -16,9 +16,10 @@ use std::sync::{Arc, Mutex};
 use candle::quantized::Int8Mode;
 use candle::{DType, Device};
 use candle_nn::kv_cache::{close_guest_arena, open_guest_arena};
-use candle_transformers::models::qwen_vision::tower::ACTIVATION_BYTES_PER_PATCH;
+use candle_transformers::models::qwen_vision::tower::{ACTIVATION_BYTES_PER_PATCH, POSITION_TABLE};
 use candle_transformers::models::qwen_vision::VisionTower;
 
+use super::gguf_pick::Pick;
 use super::ground::GuestGround;
 use super::groundgguf::{ground_bytes, place_gguf};
 use super::model::GuestModel;
@@ -30,6 +31,12 @@ use super::work::{Guest, GuestOutcome, GuestRequest, VisionRows};
 const ARENA_HEADROOM_BYTES: usize = 32 << 20;
 /// The smallest arena opened: a 64-token image's forward.
 const MIN_ARENA_BYTES: usize = 64 << 20;
+/// Every tensor of the mmproj, the position table as its file bytes: the
+/// tower dequantizes it, and an int8 twin is a layout only the matmul reads.
+const TOWER_PICK: Pick = Pick {
+    skip: &[],
+    verbatim: &[POSITION_TABLE],
+};
 
 /// The tower, configured by where its `mmproj` GGUF is found.
 ///
@@ -83,7 +90,7 @@ impl GuestModel for VisionGuest {
         let mode = Int8Mode::auto(&Device::Cpu);
         let weights = self
             .path()
-            .and_then(|p| ground_bytes(&p, mode, &[]))
+            .and_then(|p| ground_bytes(&p, mode, TOWER_PICK))
             .unwrap_or(0);
         weights + activation_bytes(jobs).max(MIN_ARENA_BYTES) + ARENA_HEADROOM_BYTES
     }
@@ -116,7 +123,7 @@ impl GuestModel for VisionGuest {
                 .map_err(|e| format!("vision guest: placing the arena: {e}"))?;
             (at, len)
         };
-        let vb = place_gguf(&self.path()?, device, ground, mode, &[])?;
+        let vb = place_gguf(&self.path()?, device, ground, mode, TOWER_PICK)?;
         let tower = VisionTower::load(&vb, mode).map_err(|e| format!("vision guest: {e}"))?;
         if let Device::Cuda(cuda) = device {
             open_guest_arena(&cuda.cuda_stream(), arena.0.ptr, arena.1);

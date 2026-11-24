@@ -47,6 +47,10 @@ pub const DEPTH: usize = 27;
 pub const OUT_HIDDEN: usize = 2560;
 /// Every LayerNorm's epsilon.
 pub const EPS: f64 = 1e-6;
+/// The learned position table: a matrix the tower dequantizes and gathers
+/// rows from, never multiplies by — so a loader that turns tileable matrices
+/// into int8 twins must place it as its file bytes.
+pub const POSITION_TABLE: &str = "v.position_embd.weight";
 /// Values in one patch row: three channels of 16 × 16 pixels.
 pub const PATCH_VALUES: usize = 3 * PATCH * PATCH;
 /// Values in one merged row: four patches side by side.
@@ -215,7 +219,7 @@ impl VisionTower {
             .dequantize(&dev)?
             .to_dtype(dtype)?;
         let pos = vb
-            .get((POS_SIDE * POS_SIDE, HIDDEN), "v.position_embd.weight")?
+            .get((POS_SIDE * POS_SIDE, HIDDEN), POSITION_TABLE)?
             .dequantize(&dev)?
             .to_dtype(dtype)?;
         let blocks = (0..DEPTH)
