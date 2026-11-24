@@ -1,6 +1,6 @@
 # One Card, One Stack: Constraint-Driven Architecture for Asymptotically Stable Inference over Unbounded Agent Memory
 
-> **Version 2.** v1 (13 May 2026, [10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) is archived with an erratum at `docs/unbounded_agents_v1.md`; its "509 t/s" and "2,446 t/s" headlines were prefill rates and are withdrawn. v2 adds a measured evaluation across three machines and twelve models from 0.5B to 284B parameters (§9.6), every number produced by a test in this repository and recorded in `docs/performance.md`, and runs the retrieval evaluation on the production system (§9.11–§9.12). §4.1–§4.5 describe the v1 design on Qwen3-30B-A3B; provenance as production runs it is §6.
+> **Version 2.** v1 (13 May 2026, [10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) is archived with an erratum at `docs/unbounded_agents_v1.md`; its "509 t/s" and "2,446 t/s" headlines were prefill rates and are withdrawn. v2 adds a measured evaluation across three machines and twelve models from 0.5B to 284B parameters (§9.6), every number produced by a test in this repository and recorded in `docs/performance.md`, and runs the retrieval evaluation on the production system (§9.11–§9.12). §4.1–§4.3 describe the v1 design on Qwen3-30B-A3B; provenance as production runs it is §6.
 
 **Abstract**
 
@@ -10,9 +10,9 @@ Persistent agents need context that grows without bound. Under full attention ev
 
 The system combines (1) online Markov expert prediction with wave-batched grouped GEMM for MoE inference under partial VRAM residency; (2) per-block adaptive KV quantization across eleven levels (C0–C10) with asymmetric K/V error metrics and a prefill refresh at every turn seal, compressing the KV cache 4.1–7.6× at the top level; (3) attentional provenance indexing — Q-vector sign signatures scanned on the GPU, re-selecting the working set during decode; and (4) an unbounded three-tier context, VRAM-hot, RAM-warm and disk-cold.
 
-Implemented in Rust on a Candle fork, the system runs a **180B-parameter MoE model on a 16 GB laptop GPU**, serving eight sessions at 108.5 t/s aggregate decode, above every published single-GPU run of the model. From 32K to 128K tokens it keeps **99% of its prefill and 111% of its decode**. One card's aggregate decode is **1.3–37.9×** the best published llama.cpp single-stream rate for the same model and card class, reaching **2,869.9 t/s across 64 sessions**, and a **284B model serves sixteen sessions from one GPU** at 4.1× the best published single-GPU decode.
+Implemented in Rust on a Candle fork, the system runs a **180B-parameter MoE model on a 16 GB laptop GPU**, serving eight sessions at 108.5 t/s aggregate decode, above every published llama.cpp run of the model and every published multi-session figure for it. From 32K to 128K tokens it keeps **99% of its prefill and 111% of its decode**. One card's aggregate decode is **1.3–37.9×** the best published llama.cpp single-stream rate for the same model and card class, reaching **2,869.9 t/s across 64 sessions**, and a **284B model serves sixteen sessions from one GPU** at 4.1× the best published single-GPU decode.
 
-On the system's own 2.2M-line codebase, retrieval ranks a question's answer file first among 7,943 files on 49% of 121 questions and in the top five on 69%, by Q-signature agreement alone. Answering 128 questions from memory with tools forbidden, over seven arms and three runs, the memory is worth **36.7 points of recall**, re-selection during reasoning 4.6, and continuous re-selection 6.5 over a single retrieval, every interval clear of zero (§9.12). Mid-decode reprojection selects every fact planted in a history twelve times the working set, at the top compression level as at near-lossless, where a single projection and a rolling window select none (§9.11.2).
+On the system's own 2.2M-line codebase, retrieval ranks one of a question's answer files first among 7,943 files on 49% of 121 questions and in the top five on 69%, by Q-signature agreement alone. Answering 128 questions from memory with tools forbidden, over seven arms and three runs, the memory is worth **36.7 points of recall**, re-selection during reasoning 4.6, and continuous re-selection 6.5 over a single retrieval, every interval clear of zero (§9.12). Mid-decode reprojection selects every fact planted in a history twelve times the working set, at the top compression level as at near-lossless, where a single projection and a rolling window select none (§9.11.2).
 
 ---
 
@@ -24,11 +24,11 @@ The fix here is to decouple the tokens that take part in a step from the tokens 
 
 The system came from two constraints held together: persistent agent conversations, the hardest form of the memory problem (verbatim recall across unbounded sessions, many agents at once), and a single 16 GB consumer GPU. Each constraint closed the standard solution: GEMM dequantisation OOMed, so the matmul kernels read quantized weights natively; full context could not be held hot, so attention became provenance-selected; materialising turns at F16 OOMed, so quantization became two-phase (§11.5). The result, on that card and two larger ones:
 
-- A **180B-parameter MoE model** (Qwen3.8-Flash-Next, 6B active) on a 16 GB laptop GPU with 32 GB of RAM, experts streamed VRAM → RAM → NVMe, serving eight sessions at 108.5 t/s aggregate decode — above every published single-GPU run of it, each on a host with 64–128 GB (§9.6.5).
+- A **180B-parameter MoE model** (Qwen3.8-Flash-Next, 6B active) on a 16 GB laptop GPU with 32 GB of RAM, experts streamed VRAM → RAM → NVMe, serving eight sessions at 108.5 t/s aggregate decode — above every published llama.cpp run of it, each on a host with 64–128 GB, and above Strata's published 63.1 t/s across four sessions (§9.6.5).
 - **Throughput flat in depth**: 99% of prefill and 111% of decode kept from 32K to 128K, the model's own sparse-attention indexer bounding each token's attended set (§9.6.2).
 - **KV compression up to 7.6×**, each 32-token block choosing its format as it is sealed; at 8K the top level costs 0–8% of decode for 3.3–6.3× (§9.6.3).
 - **Concurrency**: aggregate decode 1.3–37.9× the best published llama.cpp rate for the same model and card class, 2,869.9 t/s across 64 sessions on one card; a 284B model at sixteen sessions on one GPU, 4.1× the best published single-GPU decode (§9.6.4, §9.6.6).
-- **Retrieval over its own codebase**: the answer file first of 7,943 on 49% of questions and top-five on 69%; the memory worth 36.7 points of recall with tools forbidden, re-selection during reasoning 4.6 (§9.12).
+- **Retrieval over its own codebase**: an answer file first of 7,943 on 49% of 121 questions and top-five on 69%; the memory worth 36.7 points of recall with tools forbidden, re-selection during reasoning 4.6 (§9.12).
 - **Selection at depth**: every fact planted in a history twelve times the working set is selected, at C10 as at C0 (§9.11.2).
 
 The agent use case is the existence proof that the parts run together; it is not the subject of the paper. To our knowledge no prior serving system states a bound on per-step error exposure at unbounded depth. An 80 GB card holds more tokens at full precision, but once a token is compressed or evicted it is in the same position as on a 16 GB card (§11.2, Corollary 2).
@@ -288,7 +288,7 @@ v1 indexed each item by six INT8 K and Q band averages, scored by a CPU dot prod
 
 Per probe token and fold group, each candidate's best-agreeing token gives it an agreement, the agreements are read against their distribution over the gallery, and each candidate the token picks gets a vote of `z × margin`. A candidate's raw score is its summed votes. Four findings set the formula (§9.12 states and measures it):
 
-- **Vote for the best several.** One vote per token gave any vote to only 20–67 of 6,854 files, and seven answer files scored exactly zero. Voting for the best eight, each vote square-rooted, raised the answer file's MRR from 0.508 to 0.713. Tool selection keeps one vote: a tool probe has one clean match.
+- **Vote for the best several.** On the 6,854-file gallery of 2026-11-16, one vote per token gave any vote to only 20–67 files, and seven answer files scored exactly zero. Voting for the best eight, each vote square-rooted, raised the answer file's MRR from 0.508 to 0.713. Tool selection keeps one vote: a tool probe has one clean match.
 - **Only the strongest tokens count.** A needle gate keeps the quarter of probe tokens with the largest summed vote; most are function words and template.
 - **Probes find their own kind.** Every file is stored with calibration questions shaped like the probes that will ask for it, scored as a separate competition — pooled with content they took 96.5% of the vote mass at 2% of the gallery. For tools they were the largest lever: Tool-1 74.5% → 87.9% (§9.10).
 - **Repairing signatures does not work.** Bit centring is a no-op, and marking down hubs marks down the files conversations ask about.
@@ -310,7 +310,7 @@ normalized(c | x) = 1000 × surprise(c | x) / ln(1 / 0.01)
 
 **Mid-decode reprojection.** Every decoded token's Q signature is captured. Every 64 decoded tokens, or at a line break more than 16 tokens after the last, inside the think block as in the answer, the last 128 decoded tokens' signatures are scanned against the gallery, and the result assembles the next forward's working set, so retrieval follows the reasoning by at most one interval and never blocks a forward (`sequence_config.rs`: `REPROJECT_EVERY_N_TOKENS`, `reproject_max_probe_tokens`, `reproject_in_thinking`).
 
-**The opening.** A question's Q depends on the context it is read in, and every conversation opens on configured background files: one battery question's answer file ranked second of 6,854 alone and fifth against them. So a request is read twice — first with the background held out, scored and discarded; then again, its opening working set ranked by the first reading beside the background. The first reasoning tokens then reproject at 8, 16 and 32 tokens, because what the model writes early about what it has read stays in its context. The cost is one extra prefill and one scan before the first token.
+**The opening.** A question's Q depends on the context it is read in, and every conversation opens on configured background files: one battery question's answer file ranked second of the 6,854 files then ingested alone, and fifth against them. So a request is read twice — first with the background held out, scored and discarded; then again, its opening working set ranked by the first reading beside the background. The first reasoning tokens then reproject at 8, 16 and 32 tokens, because what the model writes early about what it has read stays in its context. The cost is one extra prefill and one scan before the first token.
 
 **The think block is the speculative probe.** A probe that decodes ahead of the answer, never enters memory, and chooses the answer's context is what the reasoning block already is. Each boundary inside it reprojects from what it has just reasoned, the reprojection on `</think>` assembles the answer's working set from the whole thought, and at seal its K/V is dropped and the exchange re-prefilled without it (§5). By the first answer token the context has been steered by everything the model thought. From the projection records of the 128-question battery (§9.12):
 
@@ -335,7 +335,7 @@ normalized(c | x) = 1000 × surprise(c | x) / ln(1 / 0.01)
   <text class="cat" x="16" y="152">D1, retrieve once</text>
   <text class="cat-sub" x="16" y="165">0 in thinking · 0%</text>
   <circle class="dot-us" cx="374" cy="154" r="6.5"/>
-  <text class="t-dim" x="386" y="158">48.7% throughout</text>
+  <text class="t-dim" x="386" y="158">48.7% → 48.7%</text>
   <text class="tick mid" x="200" y="186">40%</text>
   <text class="tick mid" x="300" y="186">45%</text>
   <text class="tick mid" x="400" y="186">50%</text>
@@ -540,7 +540,7 @@ RTX PRO 5000 Blackwell 72 GB, build `21c36efbd` (2026-10-10): fourteen width gat
 | Qwen3.8-Flash-Next | 7,024.1 (BF16 ×4) | 1,163.9 (BF16 ×16) | 7.13× (C10) |
 | DeepSeek-V4-Flash | 1,177.1 (BF16 ×16) | 114.4 (BF16 ×16) | — |
 
-Prefill saturates early while aggregate decode scales nearly linearly with width: Qwen3.5-35B-A3B goes from 230.2 t/s at one session to **2,869.9 t/s across sixty-four** (12.5×) and Qwen3.6-35B-A3B from 476.6 to **2,761.0** (5.8×), at C10 with prefill flat. This is §4.4's wave batching measured: one expert load serves every session routed to it.
+Prefill saturates early while aggregate decode keeps climbing with width: Qwen3.5-35B-A3B goes from 230.2 t/s at one session to **2,869.9 t/s across sixty-four** (12.5×) and Qwen3.6-35B-A3B from 476.6 to **2,761.0** (5.8×), at C10 with prefill flat. This is §4.4's wave batching measured: one expert load serves every session routed to it.
 
 #### 9.6.2 Depth: throughput does not fall with context
 
@@ -601,11 +601,11 @@ Each 32-token block is compressed in the forward that produced it. C10 against B
 | Llama-2-7B (4K) | 3,684.7 / 3,851.1 | 47.1 / 44.1 | 4.81× |
 | Llama-3.2-3B | 6,195.9 / 5,936.8 | 69.9 / 66.1 | 4.62× |
 
-At 8K the top level costs **0–8% of decode for 3.3–6.3×**. At 32K the largest hybrids pay 27–31% for 6.3–7.5×; at 128K the cache compresses 4.63–7.63× with every block quantized, Flash-Next paying 19% for 6.97×. C10 prefill runs within 5% of BF16 at every depth and is marginally *faster* at 128K, with fewer bytes to read. llama.cpp's q8_0 cache gives ~1.9× for 35% of decode at 32K and 45% at 64K, its q4_0 ~3.56× for 39% and 50% [35]; vLLM's FP8 gives 2× [36], TurboQuant 2.4–3.4× for 20–27% [37]. At 32K the top level holds **nearly 4× q8_0's compression while slowing decode less**.
+At 8K the top level costs **2–8% of decode for 4.6–6.3×**. At 32K the largest hybrids pay 27–31% for 6.3–7.5×; at 128K the cache compresses 4.63–7.63× with every block quantized, Flash-Next paying 19% for 6.97× and the whole-prefix hybrids 35–51%, the cost of reading quantized K/V growing with the number of reads (`docs/performance.md` §3.5). C10 prefill runs within 5% of BF16 at every depth and is marginally *faster* at 128K, with fewer bytes to read. llama.cpp's q8_0 cache gives ~1.9× for 35% of decode at 32K and 45% at 64K, its q4_0 ~3.56× for 39% and 50% [35]; vLLM's FP8 gives 2× [36], TurboQuant 2.4–3.4× for 20–27% [37]. At 32K the top level holds **nearly 4× q8_0's compression while slowing decode less**.
 
 #### 9.6.4 Against the published record
 
-Figure 9.6-2 sets our aggregate decode, serving concurrent sessions, against the best published llama.cpp single-stream decode for the same model on the same class of card; the Blackwell rows compare our RTX PRO 5000 with published RTX 5090 figures. Aggregate against single-stream is the comparison the record allows — no aggregate for these models on these cards has been published — and it answers how much work one card does. Published single-card serving of the 35B models on an RTX PRO 6000 reports 5–10 concurrent requests [42, 43]; this engine runs them at 64, and Qwen3.5-0.8B at 256.
+Figure 9.6-2 sets our aggregate decode, serving concurrent sessions, against the best published llama.cpp single-stream decode for the same model on the same class of card; the Blackwell rows compare our RTX PRO 5000 with published RTX 5090 figures. Aggregate against single-stream is the comparison the llama.cpp record allows, and it answers how much work one card does. The published aggregates are larger engines on larger cards: vLLM serves Qwen3.6-35B-A3B at 449.0 t/s across five concurrent requests on a 96 GB RTX PRO 6000 [41], where this engine serves it at 2,761.0 across sixty-four on a 72 GB card, 6.1×; Strata serves Flash-Next at 63.1 t/s across four on a 12 GB card [49], where the 16 GB laptop serves eight at 108.5. Published single-card serving of the 35B models stops at 5–10 concurrent requests [40, 41]; this engine runs them at 64, and Qwen3.5-0.8B at 256.
 
 <figure class="fig">
 <svg viewBox="0 0 640 494" role="img" aria-label="Figure 9.6-2. Our aggregate decode against the best published llama.cpp single-stream decode, same model and card class, on a log scale. RTX 3090: Qwen3.5-35B-A3B 11.1 times, Qwen3.6-35B-A3B 8.5, Llama-2-7B 5.8, Qwen3-8B 3.3, Qwen3.8-27B 5.5, Qwen3-30B-A3B 2.6, Flash-Next 36.3. 16 GB: Qwen3.6-35B-A3B 1.3 to 1.8, Qwen3-8B 3.0, Flash-Next 3.7. Blackwell: Qwen3.5-35B-A3B 14.8, Qwen3.6-35B-A3B 8.3, Flash-Next 37.9, Llama-2-7B 5.6, Qwen3-30B-A3B 4.4, Qwen3-8B 3.2.">
@@ -672,7 +672,7 @@ C10 compresses the 35B to 7.01× on the laptop and 7.03× on the RTX 3090: the s
 DeepSeek-V4-Flash (284B total, 13B active) on one RTX PRO 5000 72GB, sixteen concurrent sessions: **1,177.1 t/s prefill and 114.4 t/s aggregate decode**, build `21c36efbd`. The best published single-GPU prefill for the model is 748.4 t/s (RTX PRO 6000 Max-Q, all experts on the CPU, 8K) [43], and the best published single-GPU decode is 28 t/s (RTX 5090, KTransformers + SGLang, INT4 experts on the CPU) [44] — every published run holding the routed experts in host RAM, as this one does. The aggregate is 4.1× that decode, and the prefill is above every published single-GPU figure for the model.
 #### 9.6.7 Where published engines lead
 
-Single-stream decode on a model that fits wholly in VRAM is llama.cpp's strength: a 3-bit Qwen3.6-35B-A3B resident on a 16 GB card decodes one stream at 183.29 t/s (249.33 with MTP) [38], where our sixteen-session aggregate with Q6_K experts streamed is 336.7 — more work in total, less per stream. vLLM prefills Qwen3.6-35B-A3B at 41,105 t/s on an RTX PRO 6000 [41], against ~7,200 here at one session. Against Strata's RTX 5090 single-session benchmark, replayed through the conversation engine at C5 (`kv_fragmentation::qwen38_flash_next_strata`, median of three), ours leads prefill at 4K — 6,064.3 t/s against 4,269.8 — and trails decode: 168.4 / 159.1 / 125.3 t/s against 179.4 / 175.7 / 165.0 at 4K / 32K / 128K, 82–95% of Strata to 32K and 69–76% at 128K. Strata has a PCIe 5.0 card and a dedicated CUDA graph path; here one segment submission per MoE layer is the floor.
+Single-stream decode on a model that fits wholly in VRAM is llama.cpp's strength: a 3-bit Qwen3.6-35B-A3B resident on a 16 GB card decodes one stream at 183.29 t/s (249.33 with MTP) [38], where our sixteen-session aggregate with Q6_K experts streamed is 336.7 — more work in total, less per stream. vLLM prefills Qwen3.6-35B-A3B at 41,105 t/s on an RTX PRO 6000 [41], against 10,582.4 here at one session. Against Strata's RTX 5090 single-session benchmark [49], replayed through the conversation engine at C5 (`kv_fragmentation::qwen38_flash_next_strata`, median of three), ours leads prefill at 4K — 5,794.4 t/s against 4,269.8 — and trails decode: 168.4 / 159.1 / 125.3 t/s against 179.4 / 175.7 / 165.0 at 4K / 32K / 128K, 94%, 91% and 76% of Strata. Strata has a PCIe 5.0 card and a dedicated CUDA graph path; here one segment submission per MoE layer is the floor.
 
 #### 9.6.8 Output fidelity against depth
 
@@ -680,7 +680,7 @@ Throughput says compression is cheap, not how far it moves the output or whether
 
 <figure class="fig">
 <svg viewBox="0 0 640 246" role="img" aria-label="Figure 9.6-3. Mean KL divergence from BF16, in nats, against context depth, RTX PRO 5000. Flash-Next at C10: 5.9e-2 at 4K, 3.0e-2 at 16K, 1.08e-1 at 64K, 1.16e-1 at 124K. Flash-Next at C5: 9.8e-3, 1.1e-2, 2.1e-2, 7.6e-3. Qwen3.5-9B at C10: 6.5e-3, 1.2e-3, 1.7e-3, 3.5e-3. Qwen3.5-9B at C5: 6.6e-3, 1.0e-3, 9.4e-4, 3.6e-3. Qwen3-8B at C10 to 32K: 3.2e-2, 1.1e-2, 3.9e-2.">
-  <text class="ttl" x="16" y="20">Figure 9.6-3 · Divergence from BF16 does not grow with depth</text>
+  <text class="ttl" x="16" y="20">Figure 9.6-3 · Divergence from BF16 against depth</text>
   <text class="ttl-sub" x="16" y="36">mean KL, nats, teacher-forced needle answer · log scales · amber: C10 · green: C5</text>
   <path class="grid" d="M210 197.5 H600 M210 136 H600 M210 74.5 H600"/>
   <path class="grid base" d="M210 52 V216"/>
@@ -696,7 +696,7 @@ Throughput says compression is cheap, not how far it moves the output or whether
   <text class="t-flat" x="525" y="147">Flash-Next C5</text>
   <text class="t-flat" x="525" y="160">Qwen3.5-9B C10</text>
   <text class="t-flat" x="525" y="172" opacity=".6">Qwen3.5-9B C5</text>
-  <text class="t-them" x="404" y="112">Qwen3-8B C10, to 32K</text>
+  <text class="t-them" x="404" y="110">8B C10, to 32K</text>
   <text class="tick mid" x="220" y="232">4K</text>
   <text class="tick mid" x="340" y="232">16K</text>
   <text class="tick mid" x="400" y="232">32K</text>
@@ -725,19 +725,19 @@ From C0 to C10 the cache shrinks 3.2× further for 8% of decode; C5, the level e
 **The span.** The daemon reserves one contiguous span per card and divides it between persistent tensors, KV regions, a per-wave transient tier and expert weights, with an elastic boundary between the KV side and the experts (§10.2; Figure 9.6-4). Behind it the warm tier holds 14.4 GiB of payload in host RAM.
 
 <figure class="fig">
-<svg viewBox="0 0 640 128" role="img" aria-label="Figure 9.6-4. BlackWorld's 68.1 GiB span at rest with Flash-Next loaded: expert zone 51.0 GiB, dense weights 5.3, recurrent state 4.9, and 6.9 GiB for the KV side, the transient tier and held index pages.">
+<svg viewBox="0 0 640 128" role="img" aria-label="Figure 9.6-4. BlackWorld's 68.1 GiB span at rest with Flash-Next loaded, in span order: dense weights 5.3 GiB, recurrent state 4.9, 6.9 GiB for the KV side, the transient tier and held index pages, then the expert zone, 51.0, across the elastic boundary.">
   <text class="ttl" x="16" y="20">Figure 9.6-4 · The span at rest</text>
   <text class="ttl-sub" x="16" y="36">BlackWorld, 72 GB card, Flash-Next · 68.1 GiB · the boundary between KV and experts moves under load</text>
-  <rect class="b0" x="16" y="50" width="448.4" height="32"/>
-  <rect class="b1" x="465.4" y="50" width="45.7" height="32"/>
-  <rect class="b2" x="512.1" y="50" width="42.2" height="32"/>
-  <rect class="q2" x="555.3" y="50" width="60.7" height="32"/>
-  <path class="parity" d="M555.3 44 V88"/>
-  <text class="t-lbl" x="24" y="71">Expert zone · 51.0 GiB</text>
-  <text class="tick mid" x="488.3" y="100">dense 5.3</text>
-  <text class="tick mid" x="533.2" y="114">state 4.9</text>
-  <text class="tick mid" x="585.7" y="100">KV side 6.9</text>
-  <text class="t-them" x="551" y="126" text-anchor="end">elastic boundary →</text>
+  <rect class="b1" x="16" y="50" width="45.7" height="32"/>
+  <rect class="b2" x="62.7" y="50" width="42.2" height="32"/>
+  <rect class="q2" x="105.9" y="50" width="60.3" height="32"/>
+  <rect class="b0" x="167.2" y="50" width="448.8" height="32"/>
+  <path class="parity" d="M166.7 44 V88"/>
+  <text class="t-lbl" x="176" y="71">Expert zone · 51.0 GiB</text>
+  <text class="tick mid" x="38.9" y="100">dense 5.3</text>
+  <text class="tick mid" x="83.8" y="114">state 4.9</text>
+  <text class="tick mid" x="136" y="100">KV side 6.9</text>
+  <text class="t-them" x="172" y="126">← elastic boundary</text>
 </svg>
 </figure>
 
@@ -777,6 +777,8 @@ From C0 to C10 the cache shrinks 3.2× further for 8% of decode; C5, the level e
   <text class="tick t-them" x="592" y="127.5">12</text>
   <text class="tick t-them" x="592" y="75.5">16</text>
   <path class="line-them" d="M58 72 77 72 82 104 86 176 498 176 503 180"/>
+  <rect class="hatch" x="184" y="72" width="34" height="208"/>
+  <text class="t-dim mid" x="201" y="276">new build</text>
   <text class="tick" x="48" y="60" text-anchor="end">GiB</text>
   <text class="tick t-them" x="592" y="60">in flight</text>
   <g class="legend">
@@ -845,7 +847,7 @@ From C0 to C10 the cache shrinks 3.2× further for 8% of decode; C5, the level e
 <figure class="fig">
 <svg viewBox="0 0 640 324" role="img" aria-label="Figure 9.6-7. Over the battery, the resident tokens would take 13.2 GiB at BF16 on average and 21.9 at peak; the KV arenas the span held for them took 6.2 GiB on average and 11.2 at peak, 2.16 times smaller, out of 10.7 GiB of KV ground on average.">
   <text class="ttl" x="16" y="20">Figure 9.6-7 · The context against its BF16 size</text>
-  <text class="ttl-sub" x="16" y="38">GiB · resident tokens at BF16, 24,916 B each, against the KV arenas that hold them</text>
+  <text class="ttl-sub" x="16" y="38">GiB, 96 bucket means · resident tokens at BF16, 24,916 B each, against the KV arenas</text>
   <path class="grid" d="M56 228 H584 M56 176 H584 M56 124 H584 M56 72 H584"/>
   <text class="tick" x="48" y="283.5" text-anchor="end">0</text>
   <text class="tick" x="48" y="231.5" text-anchor="end">5</text>
@@ -914,7 +916,7 @@ At 60% residency ≈82% of accesses hit, ≈5% become overlapped loads by predic
 
 ### 9.8 Quality Evaluation: Multi-Session Identity Discrimination
 
-Up to 256 sessions run in one batch, each assigned a distinct character (name and gender, period 99) and asked to rewrite a passage with it. A session passes if its name appears, its pronouns match, and no other session's name appears — stressing the session-discriminating signal aggressive K quantization degrades first. Every throughput row of §9.6 passes with every session correct: 213 rows on the RTX 3090, 192 on the laptop, 212 on Blackwell. C10 passes on every model at 4.1–7.6×, just inside the edge where the test fails; the one exception on record, Flash-Next's C10 ×8 under the TCC build, validated 7 of 8 sessions and is reported as a failure (the WDDM build's 885.8 t/s is the validated figure). Past the edge, Llama-3.2-3B fails in three regimes — clean, soft drift, then identity collapse: small errors move the text, large ones move which session the model attends.
+Up to 256 sessions run in one batch, each assigned a distinct character (name and gender, period 99) and asked to rewrite a passage with it. A session passes if its name appears, its pronouns match, and no other session's name appears — stressing the session-discriminating signal aggressive K quantization degrades first. Every throughput row of §9.6 passes with every session correct: 213 rows on the RTX 3090, 192 on the laptop, 212 on Blackwell. C10 passes on every model at 4.1–7.6×, just inside the edge where the test fails; two exceptions are on record and reported as failures. Flash-Next's C10 ×8 under the TCC build validated 7 of 8 sessions; the WDDM build's 885.8 t/s is the validated figure for that rung. Qwen3.6-35B-A3B's C10 at ×32 and ×64 validated 31 of 32 and 61 of 64 sessions on one sweep and every session on the next. Past the edge, Llama-3.2-3B fails in three regimes — clean, soft drift, then identity collapse: small errors move the text, large ones move which session the model attends.
 
 ### 9.9 Cross-Architecture Transfer: Held-Out Model Validation
 
@@ -968,7 +970,7 @@ The width ladder never builds the conversation engine. The **engine probe** (`ca
 Every retrieval figure here is measured on the running daemon's resident gallery over HTTP (`POST /v1/substrate/zend/scan`), with held-out probes — a question never in the gallery plus the thinking it starts:
 
 - **Tools:** first on 87.9% over 93 tools, top three on 97.5% (§9.10).
-- **Code:** the answer file first of 7,943 on 49% of the 128-question battery, top five on 69% (§9.12).
+- **Code:** an answer file first of 7,943 on 49% of the battery's 121 ranked questions, top five on 69% (§9.12).
 - **Normalization:** R@1 over 37,284 calibration questions 0.107 → 0.239, no file taking more than 0.1% of the wins on other files' questions (§6.4).
 - **Momentum:** R@10 0.554 → 0.708 over three turns on a file, at the cost of slower topic switches — a new file leads in 70% of dialogues after three turns (`docs/results/provenance_gates_2026-10-26.md`).
 - **A real conversation:** replayed on the paper conversation itself, the scorer finds 91% of the files it should place and puts all 14 of its tool calls' tools in the top ten (`docs/results/provenance_gates_2026-10-25.md`).
@@ -1000,7 +1002,7 @@ A harder property than recall: multi-hop reasoning over the system's own Candle 
 |---|---|---|---|---|
 | A0 | off | Minimal | — | the model alone |
 | A1 | on | Minimal | — | the seed files alone |
-| D1 | on | Full | opening only | retrieve once, before reasoning |
+| D1 | on | Full | at the opening; none in thinking or at `</think>` | retrieve once, before reasoning |
 | B0 | off | Full | held in thinking | — |
 | B1 | on | Full | held in thinking | reasoning-time reprojection removed |
 | C0 | off | Full | full | — |
@@ -1437,7 +1439,7 @@ Over 1,920 answers in the projecting arms, recall is 51.1% (49.0–53.3%) with t
 </svg>
 </figure>
 
-The answer file is first of 7,943 on 49% of questions and in the top five on 69%, about 1,500 and 430 times a random ranking — by sign agreement alone, with no text index, no embedding model and no file name in the query. By kind it is first on 43% of direct, 52% of transitive and 50% of architectural questions. Most misses lose their top places to the same few files that score on every question (`tests_grid.rs`, `file_grep.yaml`, `tasks.rs`, `AGENTS.md`).
+An answer file is first of 7,943 on 49% of questions and in the top five on 69%, about 1,500 and 430 times a random ranking — by sign agreement alone, with no text index and no embedding model. By kind it is first on 43% of direct, 52% of transitive and 50% of architectural questions. Most misses lose their top places to the same few files that score on every question (`tests_grid.rs`, `file_grep.yaml`, `tasks.rs`, `AGENTS.md`).
 
 **The pilot.** A 24-question pilot, run on production from 2026-11-10 as retrieval changed (57.6% → 62.2% by 2026-11-20; `docs/results/dependency_battery_2026-11-20_b.md`), first measured reasoning-time reprojection with a daemon-wide switch, `reproject_in_thinking: false`, which passes over every boundary inside the think block and keeps the rest — the opening, the answer's boundaries, and one reprojection on `</think>`. Over three runs per arm at one build (`docs/results/dependency_battery_2026-11-23_l_m.md`), reprojecting averaged **57.3%** and holding **38.8%**; every held run scored below every reprojecting run (p = 0.05, one-sided permutation), and per question reprojection won 14 to 4 (sign test, p = 0.031). Its loss fell where the answer lives in a file the question does not name. The 128-question battery measures the same contrast at 4.6 points: smaller, and with an interval clear of zero.
 
@@ -1457,7 +1459,7 @@ Much of an earlier draft of this version was revised by the system: a Flash-Next
 
 It decoded one token for every 2.9 prefilled (82,963 against 238,619). Every token was prefilled once, the earlier turns' K/V projected back rather than resent, where a client re-sending its history would have sent on the order of eighty times as much. Decode held at ~102 t/s at 48K–130K tokens, ~110 at 162K–237K and ~106 at 309K–321K: the working set does not grow with the history, though the session does not separate provenance's bound from Flash-Next's own indexer (§9.6.2). That the model read less because what it read came back is the right hypothesis, and the session is consistent with it; the run that would establish it replaces provenance with a full window.
 
-OpenRouter's picture of agent traffic is ~87% cached prompt, 12% novel prompt and 1% output, "because an agent re-sends its whole context on every step" [OpenRouter, *Cache is Crucial*, October 2026; 50]; on SWE-bench Verified under OpenHands, input tokens dominate the cost of agentic coding even with caching [Bai et al., arXiv:2604.22750; 51]. Against genuinely new input, this session wrote about four times as much per token read (Figure 9.13-1). OpenRouter's novel prompt includes re-reads a provider failed to cache, so this is a comparison, not a result; counted as a re-sending client counts it, ~19M tokens, the session would be 1 : 230. What the architecture changes is not how much a long session would re-read, but that it does not.
+OpenRouter's picture of agent traffic is ~87% cached prompt, 12% novel prompt and 1% output, "because an agent re-sends its whole context on every step" [OpenRouter, *Cache is Crucial*, October 2026; 47]; on SWE-bench Verified under OpenHands, input tokens dominate the cost of agentic coding even with caching [Bai et al., arXiv:2604.22750; 48]. Against genuinely new input, this session wrote about four times as much per token read (Figure 9.13-1). OpenRouter's novel prompt includes re-reads a provider failed to cache, so this is a comparison, not a result; counted as a re-sending client counts it, ~19M tokens, the session would be 1 : 230. What the architecture changes is not how much a long session would re-read, but that it does not.
 
 <figure class="fig">
 <svg viewBox="0 0 640 128" role="img" aria-label="Figure 9.13-1. Tokens written per token of new input. This revision session decoded one token for every 2.9 prefilled, 0.345. OpenRouter's agentic mix, output against novel prompt, about one in twelve, 0.083.">
@@ -1509,8 +1511,8 @@ Exposure is not output error. Attention's output is a convex combination of valu
   <path class="ax thin" d="M210 56 V190 M330 56 V190"/>
   <path class="c-rise" d="M70 186 L600 58"/>
   <path class="c-flat" d="M70 178 C110 156 140 150 180 148 H600"/>
-  <text class="t-rise" x="470" y="78">full attention: Θ(N · ε̄)</text>
-  <text class="t-flat" x="390" y="140">provenance: ε_hot + W_warm_max · ε_ret</text>
+  <text class="t-rise" x="420" y="118">full attention: Θ(N · ε̄)</text>
+  <text class="t-flat" x="300" y="168">provenance: ε_hot + W_warm_max · ε_ret</text>
   <text class="t-dim mid" x="210" y="204">16 GB fills</text>
   <text class="t-dim mid" x="330" y="204">80 GB fills</text>
   <text class="t-dim" x="580" y="206">depth N →</text>
@@ -1606,11 +1608,11 @@ In each case the replacement is more efficient in the dimension the constraint b
 
 The four contributions — online Markov expert prediction with wave-batched GEMM, per-block adaptive KV quantization with two-phase refresh, attentional provenance indexing with mid-decode reprojection, and an unbounded three-tier context — have precedents individually and had not been integrated.
 
-Together they run a 180B MoE model for eight sessions on a 16 GB laptop GPU, above every published single-GPU run of it on hosts with two to four times the memory; keep throughput flat from 32K to 128K, through the model's own sparse-attention indexer with no depth-dependent cost from the engine; compress the KV cache up to 7.6× inline with every output validated, nearly 4× llama.cpp's q8_0 for less decode; and serve concurrent sessions at 1.3–37.9× the best published single-stream rate for the same model and card class, up to 2,869.9 t/s across 64 sessions, with a 284B model at sixteen sessions on one GPU at 4.1× the best published single-GPU decode. The memory behind it is a 42M-token code substrate held at C5; under sixteen concurrent answers the card's resident context peaks at 945 thousand tokens, 21.9 GiB at full precision, while the expert zone streams the rest of the model. The most comparable published study found standard frameworks degrade beyond two concurrent users on an RTX 5090 [Herz et al., arXiv:2512.23029].
+Together they run a 180B MoE model for eight sessions on a 16 GB laptop GPU, above every published llama.cpp run of it, on hosts with two to four times the memory; keep throughput flat from 32K to 128K, through the model's own sparse-attention indexer with no depth-dependent cost from the engine; compress the KV cache up to 7.6× inline with every output validated, nearly 4× llama.cpp's q8_0 for less decode; and serve concurrent sessions at 1.3–37.9× the best published single-stream rate for the same model and card class, up to 2,869.9 t/s across 64 sessions, with a 284B model at sixteen sessions on one GPU at 4.1× the best published single-GPU decode. The memory behind it is a 42M-token code substrate held at C5; under sixteen concurrent answers the card's resident context peaks at 945 thousand tokens, 21.9 GiB at full precision, while the expert zone streams the rest of the model. The most comparable published study found standard frameworks degrade beyond two concurrent users on an RTX 5090 [Herz et al., arXiv:2512.23029].
 
 The Asymptotic Numerical Stability theorem bounds the summed stored error entering a step by a constant independent of depth, where full attention's grows linearly. It bounds exposure, not output error, and it does not show full attention degrades; what it changes is the question the KV quantization literature asks — not how small each token's error can be made inside the full-attention regime, but whether the regime can be left. Provenance selection leaves it, and §9.11.2 shows the premise holds: every planted turn selected from a history twelve times the working set, at the top compression level as at near-lossless.
 
-On the system's own codebase, retrieval ranks the answer file first among 7,943 on 49% of questions by sign agreement alone, and answering 128 questions from memory with tools forbidden, the memory is worth 36.7 points of recall, re-selection during reasoning 4.6, and continuous re-selection 6.5 over a single retrieval, each clear of zero after Holm correction; the gain falls on the questions that do not name their answer's file, the ones only the reasoning can reach. Attention is retrieval: this system runs it hierarchically, approximate over the unbounded context and exact over what it selects, preserving the mechanism RAG replaces and removing the scaling constraint on exact attention. The deeper lesson is methodological: constraints accepted as design requirements forced decisions more efficient in the dimension they bound, measured here on three cards from 16 GB to 72 GB, with a bound that carries to any card.
+On the system's own codebase, retrieval ranks an answer file first among 7,943 on 49% of 121 questions by sign agreement alone, and answering 128 questions from memory with tools forbidden, the memory is worth 36.7 points of recall, re-selection during reasoning 4.6, and continuous re-selection 6.5 over a single retrieval, each clear of zero after Holm correction; the gain falls on the questions that do not name their answer's file, the ones only the reasoning can reach. Attention is retrieval: this system runs it hierarchically, approximate over the unbounded context and exact over what it selects, preserving the mechanism RAG replaces and removing the scaling constraint on exact attention. The deeper lesson is methodological: constraints accepted as design requirements forced decisions more efficient in the dimension they bound, measured here on three cards from 16 GB to 72 GB, with a bound that carries to any card.
 
 ---
 
@@ -1716,7 +1718,9 @@ On the system's own codebase, retrieval ranks the answer file first among 7,943 
 
 [48] Bai, L., Huang, Z., Wang, X., et al. (2026). **How Do AI Agents Spend Your Money? Analyzing and Predicting Token Consumption in Agentic Coding Tasks.** arXiv:2604.22750. https://arxiv.org/abs/2604.22750
 
-[17], [19], [22] and [23] are background reading and are not cited in the text.
+[49] Niko1221 and contributors. (2026). **Strata.** Community RTX 5090 run, Strata 0.1.29 (d6708a4), IQ2_XS, MTP, median of 3, https://github.com/Niko1221/Strata/tree/main/bench/results/2026-09-30-community-rtx-5090; batching, RTX 5070 12 GB, https://github.com/Niko1221/Strata/blob/main/docs/BATCHING.md
+
+[16], [17], [19]–[23] are background reading and are not cited in the text.
 
 ---
 
