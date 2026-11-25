@@ -109,11 +109,11 @@ working set as it reasons — the production system — and it gets **37.5%**.
 
 Paired question by question, and corrected for the number of comparisons:
 
-| what's being measured | arms | points of recall | 95% interval | p (Holm) |
-|---|---|---:|---:|---:|
-| the memory at all | C1 − A1 | **37.0** | 31.3 to 42.6 | 1.9 × 10⁻¹⁷ |
-| re-selecting while it reasons | C1 − B1 | **5.3** | 3.2 to 7.4 | 2.8 × 10⁻⁶ |
-| continuous, against retrieve-once | C1 − D1 | **6.9** | 3.6 to 10.1 | 1.7 × 10⁻⁴ |
+| what's being measured | points of recall | 95% interval | p (Holm) |
+|---|---:|---:|---:|
+| the memory at all | **37.0** | 31.3 to 42.6 | 1.9 × 10⁻¹⁷ |
+| re-selecting while it reasons | **5.3** | 3.2 to 7.4 | 2.8 × 10⁻⁶ |
+| continuous, against retrieve-once | **6.9** | 3.6 to 10.1 | 1.7 × 10⁻⁴ |
 
 Take away any part of provenance retrieval and recall drops, every interval
 clear of zero.
