@@ -670,3 +670,37 @@ these in the same commit:
 - **Journal notes and guides.** They move with readings; whether the
   per-conversation `journal` collection should render in the same format is
   left as it is.
+
+## 12. Implementation decisions
+
+Made while planning the build (2026-11-26), each consistent with the
+sections above. The build may adjust a decision its tests disprove, and
+records the change here.
+
+| # | Decision |
+|---|---|
+| D1 | `FileKey(u64)` is the first 8 bytes of `content_hash` over the content key `v{N}:{path}@{blob}` (a folder: `@{listing hash}`); the path and blob live on the file's record. `ChunkKey { file: FileKey, lines: LineSpan { first, last } }`, 1-based and inclusive, the spans `file_read` pages report. |
+| D2 | The pieces: `files_open` `"\n# Knowledge Base\n\n"`; heading `"## The content from {path}:\n\n```\n"`; gap `"\n\n...\n\n"`; `closing_join` `"\n```\n\n"` when another file follows, `closing_last` `"\n```\n"` for the last. Two closing pieces rather than a closing fence plus a blank-line piece, because a lone `\n` piece tokenizes differently from `\n\n`. A real-vocabulary test pins the cuts against Q1's token ids. |
+| D3 | A chunk is whole lines, up to `PAGE_LINES`. Every cut is checked against the tokenizer — the tokens of the joined text equal the two parts' tokens joined — and a cut whose seam tokenizes differently moves to the next line where it does not. |
+| D4 | A member is sealed behind the default branch's birth prefix (`Sequence::birth_prefix`: no collection member, no `depends_on` section, so no tool and no journal) and `files_open`. Its K/V prefix is the prefix its recurrent start was computed over: the checkpoint advanced over `files_open`. |
+| D5 | A file is a chain: `files_open` state → heading → chunk 1 … chunk N, the last chunk keeping its end state. Gap and the two closing pieces are shared singletons sealed behind D4's prefix. A seed link seals its own heading, chunks and closing in the seed chain; a seed file is also an ordinary file, sealed behind `files_open` alone so it can be calibrated behind itself. |
+| D6 | A target that draws on `files` (the dialogue, calibration, first readings) always emits `files_open`: an empty knowledge base is the heading alone. Its opening state is the seed-end snapshot when the seed is placed, otherwise the state after `files_open`. A target that does not (npcd, the other reserved layers) emits no `files_open` and opens on the checkpoint. §6.2's "an empty collection omits `files_open`" holds for those. |
+| D7 | The close row is the opening turn's head: a leading glue segment before `user_start` in the turn's grid, forwarded in the opening's prefill. It is left out of the turn's signatures, as reasoning is. A turn opens a conversation when the conversation and its lineage hold no turn. |
+| D8 | The fill's floor is the conversation's root exchange — a fork's lineage's first, otherwise its own first — so the exchange holding the close row is never dropped. The lineage drop below `ProjectionLevel::Full` goes. |
+| D9 | Whether the seed is placed is decided at the opening, from the `seed` dial and the projection level, and recorded on the timeline (`seeded`). Every later projection of the conversation and its forks places it exactly then, whatever later dials say: the close row's state assumes it. |
+| D10 | The opening question's first reading is the empty frame: `files_open`, nothing placed, the state after `files_open`, the close row, the question — the empty calibration's frame. A later question's first reading holds the seed out, as today, and forwards no close row. |
+| D11 | A calibration conversation opens on the dialogue's schema under the calibration layer, reusing the dialogue's sealed system prompt, with the frame pinned on its selection: `FilesPin::Empty` or `FilesPin::Only(file)`. The target frame's state is the file's chain end, restored from its last chunk's end state or recomputed when absent. |
+| D12 | A calibration records its frame (`calibration_frame`: `empty` or `target`); `CALIBRATES_KEY` holds the `FileKey`. The scoring lab takes `--calibrations none|empty|target|all` for §7.1's split. |
+| D13 | `calibrate:` moves onto the `files` collection, its profiles unchanged and its guidance prompts per kind; `OWN_FILE` goes. |
+| D14 | A folder's listing is its immediate children in git tree order, each repository-relative, a directory ending in `/`, a file followed by a space and its size in bytes; its heading's source is the folder's path (`candle/zend/src/`). It is chunked as a file is. |
+| D15 | Member section ids are per process, from the owned partition under one owner for the collection, never persisted: records name content addresses and streams. Members register at boot from the file records, and on a replica's arrival, in one batched restore. |
+| D16 | The seed refuses to build when it leaves the dialogue less than its share of the room: `slot_window − reserve − fixed system part − seed < dialogue share × (slot_window − reserve − fixed system part)`, the error naming the seed's tokens and the slot's. |
+| D17 | Analysis layers of `unit: file` fork from a file's reading, which no longer exists; no shipped schema declares one. `UnitKind::File` is removed; `unit: day` stays. |
+| D18 | A sweep releases member streams no live file record and not the seed reference, once a superseded record's tombstone activates. |
+
+The build is staged on the branch `provenance-system-collection`, each
+stage compiling with its tests passing, and merged to `main` whole:
+1 the notation · 2 file records and the member seal · 3 the close row ·
+4 the collection in the projection (schema, scan, working set and fill) ·
+5 ingest as prefill · 6 the seed chain · 7 calibration · 8 prompt text,
+removals and documents.
