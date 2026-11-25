@@ -652,13 +652,13 @@ Figure 9.6-2 sets our aggregate decode, serving concurrent sessions, against the
 </svg>
 </figure>
 
-The 16 GB Qwen3.6-35B row sets our streamed Q6_K experts against a 3-bit quant that fits wholly in VRAM, which decodes one stream faster: 1.4–1.8×.
+The 16 GB Qwen3.6-35B row sets our streamed Q6_K experts against a 3-bit quant that fits wholly in VRAM, which decodes one stream faster: 1.4–1.8×. Every Flash-Next figure here decodes with the model's own MTP head, part of its 180B; [42]'s llama.cpp build had not implemented it, and the four n-gram speculation modes it tried instead were each slower than plain decoding, while [32]'s RTX 5080 drafts from the model's n-gram table.
 
 #### 9.6.5 The 16GB laptop
 
 The RTX 4090 Laptop GPU with 32 GB of RAM is the constraint the architecture was designed under.
 
-- **A 180B model.** Qwen3.8-Flash-Next (a 125B trunk of 512 experts, a 51B n-gram table and a 4B MTP head; 6B active) runs from a ~88 GB Q2_KO-expert artifact, streaming VRAM → pinned RAM → NVMe, every rung validating 8/8. One session prefills at 269.1 t/s and decodes at 34.9; eight decode at **108.5 t/s aggregate**, and C10 at 5.79–5.82× costs 6.6% of that. Every published single-GPU run that states its host uses 64–128 GB of RAM: an RTX 5090 with 128 GB decodes one stream at 48.02 t/s [42], an RTX 5080 with 64 GB at 27.5–29 [32].
+- **A 180B model.** Qwen3.8-Flash-Next (a 125B trunk of 512 experts, a 51B n-gram table and a 4B MTP head; 6B active) runs from a ~88 GB Q2_KO-expert artifact, streaming VRAM → pinned RAM → NVMe, every rung validating 8/8. One session prefills at 269.1 t/s and decodes at 34.9; eight decode at **108.5 t/s aggregate**, and C10 at 5.79–5.82× costs 6.6% of that. Every published single-GPU run that states its host uses 64–128 GB of RAM: an RTX 5090 with 128 GB decodes one stream at 48.02 t/s [42], an RTX 5080 with 64 GB at 27.5–29 [32], the latter drafting from the n-gram table as ours drafts from the MTP head (§9.6.4).
 - **A 30B MoE streaming its experts** prefills at **6,139.1 t/s** (Qwen3-30B-A3B, Q8_0 ×20).
 - **A 35B MoE serving sixteen.** Qwen3.5- and Qwen3.6-35B-A3B at Q6_K, ~28 GB of weights, serve ×16 at **330.8 and 336.7 t/s aggregate**, C10 at 7.01× and 6.42×. Published 16 GB runs are single-stream at quants that fit resident [38].
 - **A small model at workstation rate.** Qwen3.5-0.8B at C8 ×32 prefills at **46,056.8 t/s** and decodes at **3,810.7 t/s aggregate**, above the RTX 3090's 42,982.2 on the same rung.
