@@ -1010,16 +1010,17 @@ A harder property than recall: multi-hop reasoning over the system's own Candle 
 | C0 | off | Full | full | — |
 | C1 | on | Full | full | the production system |
 | R1 | off | Minimal | — | retrieval-augmented generation: BM25's top files as text |
+| P1 | off | Minimal | — | the memory's own selection, as text under R1's budget |
 | T1 | off | Minimal | — | reading the repository with tools, for reference |
 
-The two baselines project no memory. **R1** ranks every text file of the repository by BM25 over identifier terms of path and body (`zend/examples/dependency_battery/rag/`), the battery and its results left out of the index, and packs the best-ranked files, whole, into the prompt ahead of the question until 24,000 tokens, cutting the file that reaches the budget; its prompt asks for an answer from those files. **T1** may call the workspace's read and search tools and answers once it has read what it needs.
+The two baselines project no memory. **R1** ranks every text file of the repository by BM25 over identifier terms of path and body (`zend/examples/dependency_battery/rag/`), the battery and its results left out of the index, and packs the best-ranked files, whole, into the prompt ahead of the question until 24,000 tokens, cutting the file that reaches the budget; its prompt asks for an answer from those files. **P1** asks C1 the question first, takes the files of the reading turns its governing projection point placed, in that point's own order, and packs them whole under R1's budget and prompt, so it differs from R1 in the selection alone and from C1 in reading text instead of K/V. **T1** may call the workspace's read and search tools and answers once it has read what it needs.
 
-**Running.** On BlackWorld through the daemon's chat API (`dependency_battery run`), the first 748 answers at build 5470-6eb469ce5 and the rest at 5475-3c73da839, which changes no retrieval dial. One fresh conversation per question, its arm's dials on the request, deleted once its answer and projection points (`GET /v1/conversations/{id}/placements`) are read; every memory arm's question asks for an answer from memory with no tool. The first 142 answers ran sixteen at once and the rest eight, and the order mixes the arms throughout, so drift falls on every arm alike. Each arm answers the 128 questions three times: 2,688 answers. The runs added after — R1 and T1 three times each, B1 runs 4–6, C1 runs 4–7, R1 run 4 — ran sixteen at once, interleaved across the arms still owed, on the builds deployed while they ran; none changed retrieval code (no commit to `candle-conversation/src/projection`, `provenance` or `scheduler/reproject*` in the period). 4,480 answers in all.
+**Running.** On BlackWorld through the daemon's chat API (`dependency_battery run`), the first 748 answers at build 5470-6eb469ce5 and the rest at 5475-3c73da839, which changes no retrieval dial. One fresh conversation per question, its arm's dials on the request, deleted once its answer and projection points (`GET /v1/conversations/{id}/placements`) are read; every memory arm's question asks for an answer from memory with no tool. The first 142 answers ran sixteen at once and the rest eight, and the order mixes the arms throughout, so drift falls on every arm alike. Each arm answers the 128 questions three times: 2,688 answers. The runs added after — R1 and T1 three times each, B1 runs 4–6, C1 runs 4–7, R1 run 4 — ran sixteen at once, interleaved across the arms still owed, on the builds deployed while they ran; none changed retrieval code (no commit to `candle-conversation/src/projection`, `provenance` or `scheduler/reproject*` in the period). P1 ran once, sixteen at once, at build 5564-10dd9ff2b, which changes no retrieval code either, started only once the member reported its memory settled — every file ingested, calibrated and normalized. 4,608 answers in all.
 
-**Scoring.** Recall is the share of a question's expected items the answer names, any spelling, case-insensitive; a question's score in an arm is its mean over the arm's runs. Intervals are 95% bootstrap intervals over questions (10,000 resamples, paired for differences); contrasts are Wilcoxon signed-rank on per-question differences, Holm-corrected across the five pre-registered, and the three against the baselines as a family of their own. Every figure's data and `summary.md` are in `docs/results/battery_128/`.
+**Scoring.** Recall is the share of a question's expected items the answer names, any spelling, case-insensitive; a question's score in an arm is its mean over the arm's runs. Intervals are 95% bootstrap intervals over questions (10,000 resamples, paired for differences); contrasts are Wilcoxon signed-rank on per-question differences, Holm-corrected across the five pre-registered, and the four against the baselines as a family of their own. Every figure's data and `summary.md` are in `docs/results/battery_128/`.
 
 <figure class="fig">
-<svg viewBox="0 0 640 306" role="img" aria-label="Figure 9.12-1. Mean recall by arm over 128 questions, each with its 95% bootstrap interval: A0 0.4% (0.1% to 0.9%); A1 0.5% (0.1% to 1.0%); D1 30.6% (25.0% to 36.4%); B0 31.9% (26.1% to 37.7%); B1 32.2% (26.8% to 37.6%); C0 36.7% (30.8% to 42.6%); C1 37.5% (31.7% to 43.1%); R1 52.6% (46.1% to 58.9%); T1 95.3% (93.3% to 97.1%). Of the memory arms, the reprojecting C0 and C1 recall the most; R1 is handed BM25's files as text and T1 reads the repository with tools.">
+<svg viewBox="0 0 640 306" role="img" aria-label="Figure 9.12-1. Mean recall by arm over 128 questions, each with its 95% bootstrap interval: A0 0.4% (0.1% to 0.9%); A1 0.5% (0.1% to 1.0%); D1 30.6% (25.0% to 36.4%); B0 31.9% (26.1% to 37.7%); B1 32.2% (26.8% to 37.6%); C0 36.7% (30.8% to 42.6%); C1 37.5% (31.7% to 43.1%); R1 52.6% (46.1% to 58.9%); P1 44.0% (37.4% to 50.9%); T1 95.3% (93.3% to 97.1%). Of the memory arms, the reprojecting C0 and C1 recall the most; R1 is handed BM25's files as text, P1 the memory's own selection as text, and T1 reads the repository with tools.">
   <text class="ttl" x="16" y="20">Figure 9.12-1 · Recall by arm</text>
   <text class="ttl-sub" x="16" y="38">mean recall over 128 questions · bar: 95% bootstrap interval · small dots: each run's mean</text>
   <path class="grid" d="M70 231.2 H624 M70 212.4 H624 M70 193.6 H624 M70 174.8 H624 M70 156 H624 M70 137.2 H624 M70 118.4 H624 M70 99.6 H624 M70 80.8 H624 M70 62 H624"/>
@@ -1035,95 +1036,102 @@ The two baselines project no memory. **R1** ranks every text file of the reposit
   <text class="tick" x="62" y="84.3" text-anchor="end">90%</text>
   <text class="tick" x="62" y="65.5" text-anchor="end">100%</text>
   <path class="grid base" d="M70 250 H624"/>
-  <rect class="them" opacity="0.35" x="93.8" y="248.4" width="14" height="1.5"/>
-  <circle class="q1" cx="116.8" cy="249.1" r="2.5"/>
-  <circle class="q1" cx="116.8" cy="249.2" r="2.5"/>
-  <circle class="q1" cx="116.8" cy="249.4" r="2.5"/>
-  <circle class="dot-them" cx="100.8" cy="249.3" r="6"/>
-  <text class="v-them mid" x="100.8" y="240.4">0.4%</text>
-  <text class="cat mid" x="100.8" y="268">A0</text>
-  <text class="cat-sub mid" x="100.8" y="282">no memory</text>
-  <text class="cat-sub mid" x="100.8" y="295">no seed</text>
-  <rect class="them" opacity="0.35" x="155.3" y="248.1" width="14" height="1.7"/>
-  <circle class="q1" cx="178.3" cy="248.8" r="2.5"/>
-  <circle class="q1" cx="178.3" cy="249.2" r="2.5"/>
-  <circle class="q1" cx="178.3" cy="249.3" r="2.5"/>
-  <circle class="dot-them" cx="162.3" cy="249.1" r="6"/>
-  <text class="v-them mid" x="162.3" y="240.1">0.5%</text>
-  <text class="cat mid" x="162.3" y="268">A1</text>
-  <text class="cat-sub mid" x="162.3" y="282">no memory</text>
-  <text class="cat-sub mid" x="162.3" y="295">seed</text>
-  <rect class="them" opacity="0.35" x="216.9" y="181.5" width="14" height="21.5"/>
-  <circle class="q1" cx="239.9" cy="192.1" r="2.5"/>
-  <circle class="q1" cx="239.9" cy="191.1" r="2.5"/>
-  <circle class="q1" cx="239.9" cy="194" r="2.5"/>
-  <circle class="dot-them" cx="223.9" cy="192.4" r="6"/>
-  <text class="v-them mid" x="223.9" y="173.5">30.6%</text>
-  <text class="cat mid" x="223.9" y="268">D1</text>
-  <text class="cat-sub mid" x="223.9" y="282">once</text>
-  <text class="cat-sub mid" x="223.9" y="295">seed</text>
-  <rect class="them" opacity="0.35" x="278.4" y="179.1" width="14" height="21.8"/>
-  <circle class="q1" cx="301.4" cy="190.4" r="2.5"/>
-  <circle class="q1" cx="301.4" cy="192.9" r="2.5"/>
-  <circle class="q1" cx="301.4" cy="186.9" r="2.5"/>
-  <circle class="dot-them" cx="285.4" cy="190.1" r="6"/>
-  <text class="v-them mid" x="285.4" y="171.1">31.9%</text>
-  <text class="cat mid" x="285.4" y="268">B0</text>
-  <text class="cat-sub mid" x="285.4" y="282">held</text>
-  <text class="cat-sub mid" x="285.4" y="295">no seed</text>
-  <rect class="them" opacity="0.35" x="340" y="179.2" width="14" height="20.4"/>
-  <circle class="q1" cx="363" cy="187.2" r="2.5"/>
-  <circle class="q1" cx="363" cy="188.7" r="2.5"/>
-  <circle class="q1" cx="363" cy="190.8" r="2.5"/>
-  <circle class="q1" cx="363" cy="189.7" r="2.5"/>
-  <circle class="q1" cx="363" cy="190.3" r="2.5"/>
-  <circle class="q1" cx="363" cy="190.4" r="2.5"/>
-  <circle class="dot-them" cx="347" cy="189.5" r="6"/>
-  <text class="v-them mid" x="347" y="171.2">32.2%</text>
-  <text class="cat mid" x="347" y="268">B1</text>
-  <text class="cat-sub mid" x="347" y="282">held</text>
-  <text class="cat-sub mid" x="347" y="295">seed</text>
-  <rect class="us-soft" x="401.6" y="169.9" width="14" height="22.1"/>
-  <circle class="q1" cx="424.6" cy="180.7" r="2.5"/>
-  <circle class="q1" cx="424.6" cy="179.2" r="2.5"/>
-  <circle class="q1" cx="424.6" cy="182.9" r="2.5"/>
-  <circle class="dot-us" cx="408.6" cy="180.9" r="6"/>
-  <text class="v-us mid" x="408.6" y="161.9">36.7%</text>
-  <text class="cat mid" x="408.6" y="268">C0</text>
-  <text class="cat-sub mid" x="408.6" y="282">reprojecting</text>
-  <text class="cat-sub mid" x="408.6" y="295">no seed</text>
-  <rect class="us-soft" x="463.1" y="169" width="14" height="21.3"/>
-  <circle class="q1" cx="486.1" cy="181.3" r="2.5"/>
-  <circle class="q1" cx="486.1" cy="176.1" r="2.5"/>
-  <circle class="q1" cx="486.1" cy="183" r="2.5"/>
-  <circle class="q1" cx="486.1" cy="176.9" r="2.5"/>
-  <circle class="q1" cx="486.1" cy="180.5" r="2.5"/>
-  <circle class="q1" cx="486.1" cy="178.1" r="2.5"/>
-  <circle class="q1" cx="486.1" cy="180.7" r="2.5"/>
-  <circle class="dot-us" cx="470.1" cy="179.5" r="6"/>
-  <text class="v-us mid" x="470.1" y="161">37.5%</text>
-  <text class="cat mid" x="470.1" y="268">C1</text>
-  <text class="cat-sub mid" x="470.1" y="282">reprojecting</text>
-  <text class="cat-sub mid" x="470.1" y="295">seed</text>
-  <rect class="them" opacity="0.35" x="524.7" y="139.3" width="14" height="24"/>
-  <circle class="q1" cx="547.7" cy="148" r="2.5"/>
-  <circle class="q1" cx="547.7" cy="153" r="2.5"/>
-  <circle class="q1" cx="547.7" cy="151.8" r="2.5"/>
-  <circle class="q1" cx="547.7" cy="151.7" r="2.5"/>
-  <circle class="dot-them" cx="531.7" cy="151.1" r="6"/>
-  <text class="v-them mid" x="531.7" y="131.3">52.6%</text>
-  <text class="cat mid" x="531.7" y="268">R1</text>
-  <text class="cat-sub mid" x="531.7" y="282">BM25 files</text>
-  <text class="cat-sub mid" x="531.7" y="295">no seed</text>
-  <rect class="them" opacity="0.35" x="586.2" y="67.4" width="14" height="7.3"/>
-  <circle class="q1" cx="609.2" cy="71.4" r="2.5"/>
-  <circle class="q1" cx="609.2" cy="70.7" r="2.5"/>
-  <circle class="q1" cx="609.2" cy="70.2" r="2.5"/>
-  <circle class="dot-them" cx="593.2" cy="70.8" r="6"/>
-  <text class="v-them mid" x="593.2" y="59.4">95.3%</text>
-  <text class="cat mid" x="593.2" y="268">T1</text>
-  <text class="cat-sub mid" x="593.2" y="282">tools</text>
-  <text class="cat-sub mid" x="593.2" y="295">no seed</text>
+  <rect class="them" opacity="0.35" x="90.7" y="248.4" width="14" height="1.5"/>
+  <circle class="q1" cx="113.7" cy="249.1" r="2.5"/>
+  <circle class="q1" cx="113.7" cy="249.2" r="2.5"/>
+  <circle class="q1" cx="113.7" cy="249.4" r="2.5"/>
+  <circle class="dot-them" cx="97.7" cy="249.3" r="6"/>
+  <text class="v-them mid" x="97.7" y="240.4">0.4%</text>
+  <text class="cat mid" x="97.7" y="268">A0</text>
+  <text class="cat-sub mid" x="97.7" y="282">no memory</text>
+  <text class="cat-sub mid" x="97.7" y="295">no seed</text>
+  <rect class="them" opacity="0.35" x="146.1" y="248.1" width="14" height="1.7"/>
+  <circle class="q1" cx="169.1" cy="248.8" r="2.5"/>
+  <circle class="q1" cx="169.1" cy="249.2" r="2.5"/>
+  <circle class="q1" cx="169.1" cy="249.3" r="2.5"/>
+  <circle class="dot-them" cx="153.1" cy="249.1" r="6"/>
+  <text class="v-them mid" x="153.1" y="240.1">0.5%</text>
+  <text class="cat mid" x="153.1" y="268">A1</text>
+  <text class="cat-sub mid" x="153.1" y="282">no memory</text>
+  <text class="cat-sub mid" x="153.1" y="295">seed</text>
+  <rect class="them" opacity="0.35" x="201.5" y="181.5" width="14" height="21.5"/>
+  <circle class="q1" cx="224.5" cy="192.1" r="2.5"/>
+  <circle class="q1" cx="224.5" cy="191.1" r="2.5"/>
+  <circle class="q1" cx="224.5" cy="194" r="2.5"/>
+  <circle class="dot-them" cx="208.5" cy="192.4" r="6"/>
+  <text class="v-them mid" x="208.5" y="173.5">30.6%</text>
+  <text class="cat mid" x="208.5" y="268">D1</text>
+  <text class="cat-sub mid" x="208.5" y="282">once</text>
+  <text class="cat-sub mid" x="208.5" y="295">seed</text>
+  <rect class="them" opacity="0.35" x="256.9" y="179.1" width="14" height="21.8"/>
+  <circle class="q1" cx="279.9" cy="190.4" r="2.5"/>
+  <circle class="q1" cx="279.9" cy="192.9" r="2.5"/>
+  <circle class="q1" cx="279.9" cy="186.9" r="2.5"/>
+  <circle class="dot-them" cx="263.9" cy="190.1" r="6"/>
+  <text class="v-them mid" x="263.9" y="171.1">31.9%</text>
+  <text class="cat mid" x="263.9" y="268">B0</text>
+  <text class="cat-sub mid" x="263.9" y="282">held</text>
+  <text class="cat-sub mid" x="263.9" y="295">no seed</text>
+  <rect class="them" opacity="0.35" x="312.3" y="179.2" width="14" height="20.4"/>
+  <circle class="q1" cx="335.3" cy="187.2" r="2.5"/>
+  <circle class="q1" cx="335.3" cy="188.7" r="2.5"/>
+  <circle class="q1" cx="335.3" cy="190.8" r="2.5"/>
+  <circle class="q1" cx="335.3" cy="189.7" r="2.5"/>
+  <circle class="q1" cx="335.3" cy="190.3" r="2.5"/>
+  <circle class="q1" cx="335.3" cy="190.4" r="2.5"/>
+  <circle class="dot-them" cx="319.3" cy="189.5" r="6"/>
+  <text class="v-them mid" x="319.3" y="171.2">32.2%</text>
+  <text class="cat mid" x="319.3" y="268">B1</text>
+  <text class="cat-sub mid" x="319.3" y="282">held</text>
+  <text class="cat-sub mid" x="319.3" y="295">seed</text>
+  <rect class="us-soft" x="367.7" y="169.9" width="14" height="22.1"/>
+  <circle class="q1" cx="390.7" cy="180.7" r="2.5"/>
+  <circle class="q1" cx="390.7" cy="179.2" r="2.5"/>
+  <circle class="q1" cx="390.7" cy="182.9" r="2.5"/>
+  <circle class="dot-us" cx="374.7" cy="180.9" r="6"/>
+  <text class="v-us mid" x="374.7" y="161.9">36.7%</text>
+  <text class="cat mid" x="374.7" y="268">C0</text>
+  <text class="cat-sub mid" x="374.7" y="282">reprojecting</text>
+  <text class="cat-sub mid" x="374.7" y="295">no seed</text>
+  <rect class="us-soft" x="423.1" y="169" width="14" height="21.3"/>
+  <circle class="q1" cx="446.1" cy="181.3" r="2.5"/>
+  <circle class="q1" cx="446.1" cy="176.1" r="2.5"/>
+  <circle class="q1" cx="446.1" cy="183" r="2.5"/>
+  <circle class="q1" cx="446.1" cy="176.9" r="2.5"/>
+  <circle class="q1" cx="446.1" cy="180.5" r="2.5"/>
+  <circle class="q1" cx="446.1" cy="178.1" r="2.5"/>
+  <circle class="q1" cx="446.1" cy="180.7" r="2.5"/>
+  <circle class="dot-us" cx="430.1" cy="179.5" r="6"/>
+  <text class="v-us mid" x="430.1" y="161">37.5%</text>
+  <text class="cat mid" x="430.1" y="268">C1</text>
+  <text class="cat-sub mid" x="430.1" y="282">reprojecting</text>
+  <text class="cat-sub mid" x="430.1" y="295">seed</text>
+  <rect class="them" opacity="0.35" x="478.5" y="139.3" width="14" height="24"/>
+  <circle class="q1" cx="501.5" cy="148" r="2.5"/>
+  <circle class="q1" cx="501.5" cy="153" r="2.5"/>
+  <circle class="q1" cx="501.5" cy="151.8" r="2.5"/>
+  <circle class="q1" cx="501.5" cy="151.7" r="2.5"/>
+  <circle class="dot-them" cx="485.5" cy="151.1" r="6"/>
+  <text class="v-them mid" x="485.5" y="131.3">52.6%</text>
+  <text class="cat mid" x="485.5" y="268">R1</text>
+  <text class="cat-sub mid" x="485.5" y="282">BM25 files</text>
+  <text class="cat-sub mid" x="485.5" y="295">no seed</text>
+  <rect class="them" opacity="0.35" x="533.9" y="154.4" width="14" height="25.4"/>
+  <circle class="q1" cx="556.9" cy="167.2" r="2.5"/>
+  <circle class="dot-them" cx="540.9" cy="167.2" r="6"/>
+  <text class="v-them mid" x="540.9" y="146.4">44.0%</text>
+  <text class="cat mid" x="540.9" y="268">P1</text>
+  <text class="cat-sub mid" x="540.9" y="282">selected files</text>
+  <text class="cat-sub mid" x="540.9" y="295">no seed</text>
+  <rect class="them" opacity="0.35" x="589.3" y="67.4" width="14" height="7.3"/>
+  <circle class="q1" cx="612.3" cy="71.4" r="2.5"/>
+  <circle class="q1" cx="612.3" cy="70.7" r="2.5"/>
+  <circle class="q1" cx="612.3" cy="70.2" r="2.5"/>
+  <circle class="dot-them" cx="596.3" cy="70.8" r="6"/>
+  <text class="v-them mid" x="596.3" y="59.4">95.3%</text>
+  <text class="cat mid" x="596.3" y="268">T1</text>
+  <text class="cat-sub mid" x="596.3" y="282">tools</text>
+  <text class="cat-sub mid" x="596.3" y="295">no seed</text>
 </svg>
 </figure>
 
@@ -1428,48 +1436,54 @@ With reprojection the share of answers with an answer file in the working set ju
 
 Over 2,816 answers in the projecting arms, recall is 51.4% (49.6–53.2%) with the answer file placed for the first answer token and 13.7% (12.1–15.3%) without it: retrieval and the answers are one measurement seen twice.
 
-**Against retrieval-augmented generation.** R1 hands the model the files BM25 ranks best for the question, as text, under a 24,000-token budget; T1 reads the repository with tools. Their contrasts form a second Holm family, so the five above are corrected without them:
+**Against retrieval-augmented generation.** R1 hands the model the files BM25 ranks best for the question, as text, under a 24,000-token budget; P1 hands it the memory's own selection the same way; T1 reads the repository with tools. Their contrasts form a second Holm family, so the five above are corrected without them:
 
 <figure class="fig">
-<svg viewBox="0 0 640 214" role="img" aria-label="Figure 9.12-2b. The effect of each contrast on mean recall over 128 paired questions, with its 95% bootstrap interval and Holm-corrected Wilcoxon p-value: the memory against BM25 retrieval (C1 − R1 · Holm p = 4.3e-4), −15.1 points (−23.0 to −7.1); the memory against tool use (C1 − T1 · Holm p = 3.0e-21), −57.8 points (−64.1 to −51.5); BM25 retrieval against the seed files (R1 − A1 · Holm p = 1.3e-18), +52.1 points (+45.6 to +58.4).">
+<svg viewBox="0 0 640 254" role="img" aria-label="Figure 9.12-2b. The effect of each contrast on mean recall over 128 paired questions, with its 95% bootstrap interval and Holm-corrected Wilcoxon p-value: the memory against BM25 retrieval (C1 − R1 · Holm p = 8.7e-4), −15.1 points (−23.0 to −7.1); the memory's selection against BM25's, both read as text (P1 − R1 · Holm p = 0.047), −8.5 points (−16.9 to −0.1); the memory against tool use (C1 − T1 · Holm p = 4.0e-21), −57.8 points (−64.1 to −51.5); BM25 retrieval against the seed files (R1 − A1 · Holm p = 2.0e-18), +52.1 points (+45.6 to +58.4).">
   <text class="ttl" x="16" y="20">Figure 9.12-2b · The memory against the baselines</text>
   <text class="ttl-sub" x="16" y="38">paired difference in mean recall, points · 128 questions · 95% interval · faded: Holm p ≥ 0.05</text>
-  <path class="grid" d="M372 66 V190 M389.8 66 V190 M407.7 66 V190 M425.5 66 V190 M443.4 66 V190 M461.2 66 V190 M479.1 66 V190 M496.9 66 V190 M514.8 66 V190 M532.6 66 V190 M550.5 66 V190 M568.3 66 V190 M586.2 66 V190 M604 66 V190"/>
-  <text class="tick mid" x="372" y="204">−70</text>
-  <text class="tick mid" x="407.7" y="204">−50</text>
-  <text class="tick mid" x="443.4" y="204">−30</text>
-  <text class="tick mid" x="479.1" y="204">−10</text>
-  <text class="tick mid" x="496.9" y="204">0</text>
-  <text class="tick mid" x="532.6" y="204">+20</text>
-  <text class="tick mid" x="568.3" y="204">+40</text>
-  <text class="tick mid" x="604" y="204">+60</text>
-  <path class="parity" d="M496.9 66 V190"/>
+  <path class="grid" d="M372 66 V230 M389.8 66 V230 M407.7 66 V230 M425.5 66 V230 M443.4 66 V230 M461.2 66 V230 M479.1 66 V230 M496.9 66 V230 M514.8 66 V230 M532.6 66 V230 M550.5 66 V230 M568.3 66 V230 M586.2 66 V230 M604 66 V230"/>
+  <text class="tick mid" x="372" y="244">−70</text>
+  <text class="tick mid" x="407.7" y="244">−50</text>
+  <text class="tick mid" x="443.4" y="244">−30</text>
+  <text class="tick mid" x="479.1" y="244">−10</text>
+  <text class="tick mid" x="496.9" y="244">0</text>
+  <text class="tick mid" x="532.6" y="244">+20</text>
+  <text class="tick mid" x="568.3" y="244">+40</text>
+  <text class="tick mid" x="604" y="244">+60</text>
+  <path class="parity" d="M496.9 66 V230"/>
   <text class="cat" x="16" y="82">The memory against BM25 retrieval</text>
-  <text class="cat-sub" x="16" y="96">C1 − R1 · Holm p = 4.3e-4</text>
+  <text class="cat-sub" x="16" y="96">C1 − R1 · Holm p = 8.7e-4</text>
   <path class="line-us" d="M455.9 84 H484.2"/>
   <circle class="dot-us" cx="470" cy="84" r="6"/>
   <text class="v-us mid" x="470" y="74">−15.1</text>
-  <text class="cat" x="16" y="122">The memory against tool use</text>
-  <text class="cat-sub" x="16" y="136">C1 − T1 · Holm p = 3.0e-21</text>
-  <path class="line-us" d="M382.6 124 H405"/>
-  <circle class="dot-us" cx="393.7" cy="124" r="6"/>
-  <text class="v-us mid" x="393.7" y="114">−57.8</text>
-  <text class="cat" x="16" y="162">BM25 retrieval against the seed files</text>
-  <text class="cat-sub" x="16" y="176">R1 − A1 · Holm p = 1.3e-18</text>
-  <path class="line-us" d="M578.4 164 H601.2"/>
-  <circle class="dot-us" cx="589.9" cy="164" r="6"/>
-  <text class="v-us mid" x="589.9" y="154">+52.1</text>
+  <text class="cat" x="16" y="122">The memory's selection against BM25's, as text</text>
+  <text class="cat-sub" x="16" y="136">P1 − R1 · Holm p = 0.047</text>
+  <path class="line-us" d="M466.8 124 H496.8"/>
+  <circle class="dot-us" cx="481.7" cy="124" r="6"/>
+  <text class="v-us mid" x="481.7" y="114">−8.5</text>
+  <text class="cat" x="16" y="162">The memory against tool use</text>
+  <text class="cat-sub" x="16" y="176">C1 − T1 · Holm p = 4.0e-21</text>
+  <path class="line-us" d="M382.6 164 H405"/>
+  <circle class="dot-us" cx="393.7" cy="164" r="6"/>
+  <text class="v-us mid" x="393.7" y="154">−57.8</text>
+  <text class="cat" x="16" y="202">BM25 retrieval against the seed files</text>
+  <text class="cat-sub" x="16" y="216">R1 − A1 · Holm p = 2.0e-18</text>
+  <path class="line-us" d="M578.4 204 H601.2"/>
+  <circle class="dot-us" cx="589.9" cy="204" r="6"/>
+  <text class="v-us mid" x="589.9" y="194">+52.1</text>
 </svg>
 </figure>
 
-BM25 retrieval recalls 52.6% (46.1–58.9%) against the memory's 37.5%, 15.1 points (7.1 to 23.0) more. To find where, each expected item of C1's seventh run and R1's fourth was looked for in the text the model held as its answer began — for C1, the bodies of the turns the governing projection point injected; for R1, the files its prompt carried — by the same spellings recall matches (`zend/examples/dependency_battery/view.rs`):
+BM25 retrieval recalls 52.6% (46.1–58.9%) against the memory's 37.5%, 15.1 points (7.1 to 23.0) more. To find where, each expected item of C1's seventh run, R1's fourth and P1's run was looked for in the text the model held as its answer began — for C1, the bodies of the turns the governing projection point injected; for R1 and P1, the files their prompts carried — by the same spellings recall matches (`zend/examples/dependency_battery/view.rs`):
 
 | Arm | Items | In an answer file's text | Named, when there | Named, when not | Anywhere in view | Named, when anywhere |
 |---|---:|---:|---:|---:|---:|---:|
 | C1 (the memory) | 445 | **48.5%** | 69.9% | 14.0% | **60.4%** | 66.2% |
 | R1 (BM25 files) | 445 | 38.2% | **97.6%** | 22.5% | 56.0% | **90.0%** |
+| P1 (the memory's selection, as text) | 445 | 39.8% | 96.0% | 15.3% | 50.8% | 92.0% |
 
-The memory puts the answer in front of the model more often than BM25 does — 48.5% of expected items were in the text of an answer file it injected, against 38.2% for the files BM25 retrieved, and 60.4% against 56.0% anywhere in view. It placed 48.3% of an answer file's reading turns, and those carried the item more often than BM25's whole files did. The difference is in what the model makes of an item once it holds it: from BM25's plain text it names 97.6%, from the memory's K/V 69.9% (`docs/results/battery_128/summary_run11.md`, `table_9_12_in_view.csv`). That is the model's reading, not provenance's selection: how well a model reads K/V placed from memory is a capability of the model, and it has grown with every model this system has been upgraded to. T1, reading the source with 12.3 tool calls an answer, recalls 95.3%, the reference for what the questions allow.
+The memory puts the answer in front of the model more often than BM25 does — 48.5% of expected items were in the text of an answer file it injected, against 38.2% for the files BM25 retrieved, and 60.4% against 56.0% anywhere in view. It placed 48.3% of an answer file's reading turns, and those carried the item more often than BM25's whole files did. The difference is in what the model makes of an item once it holds it: from BM25's plain text it names 97.6%, from the memory's K/V 69.9% (`docs/results/battery_128/summary_run11.md`, `table_9_12_in_view.csv`). Handing the model the memory's own selection as text (P1, under R1's budget and prompt) lifts recall from 37.5% to 44.0%, and the model then names 96.0% of what an answer file carries: 6.5 of the 15.1 points are the model's reading of K/V, not provenance's selection. How well a model reads K/V placed from memory is a capability of the model, and it has grown with every model this system has been upgraded to. Provenance's selection puts an answer file first more often than BM25 does (hit@1 40.6% against 28.9%, `table_9_12_retrieval.csv`); what remains sits with BM25's wider spread of whole files under a fixed text budget. T1, reading the source with 12.3 tool calls an answer, recalls 95.3%, the reference for what the questions allow.
 
 **Ranking, apart from the answers.** A scoring lab (`provenance_gates lab`) probes each question once through the daemon — prefilled and decoded through its thinking — scans its votes against every ingested file on the resident gallery, and re-ranks on the host under formulas read from a file, so every variant scores the same votes. It found the binding limit was votes per token (§6.3); every non-linear alternative tried scored below summed `z × margin` (`docs/results/provenance_scoring_lab_2026-11-16.md`). Over the whole battery, on the gallery of 2026-11-24 — 7,943 files, 36.1M tokens, every probe fresh (`docs/results/battery_128/needle.md`) — 121 questions rank; seven name only files since split away:
 
