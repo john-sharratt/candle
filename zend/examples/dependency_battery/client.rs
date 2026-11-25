@@ -246,10 +246,18 @@ impl Zend {
     }
 
     /// Wait until the member's memory is settled, saying each minute what it
-    /// waits on. An error when its zend does not report settling.
+    /// waits on; a member down or restarting is waited for too. An error when
+    /// its zend does not report settling.
     pub async fn until_settled(&self) -> anyhow::Result<()> {
         loop {
-            let status = self.sample("/v1/status").await?;
+            let status = match self.sample("/v1/status").await {
+                Ok(status) => status,
+                Err(e) => {
+                    println!("waiting for the member to answer: {e:#}");
+                    sleep(SETTLED_POLL).await;
+                    continue;
+                }
+            };
             match settled_of(&status) {
                 Some((true, _)) => return Ok(()),
                 Some((false, waiting_on)) => {
