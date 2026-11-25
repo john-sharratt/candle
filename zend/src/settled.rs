@@ -15,9 +15,16 @@
 //!   pass read ([`candle_conversation::IngestWarmer`]);
 //! - the dialogue normalization replay after a load.
 //!
-//! The verdict is `settled` only when all four are empty, and names what it
-//! waits on otherwise. It reads counters and nothing else, so `/v1/status`
-//! answers it at once.
+//! **Empty is not done until something has counted.** At boot every count is
+//! empty because nothing has run: the daemon is loading, and the first ingest
+//! pass — which registers the backlog and whose warm-up learns every file's
+//! backgrounds — has not begun. So the verdict also waits for the load to end
+//! and for that first pass and its warm-up to finish
+//! ([`crate::ingest_worker::first_pass_warmed`]).
+//!
+//! The verdict is `settled` only when all of it is done, and names what it
+//! waits on otherwise. It reads counters and flags and nothing else, so
+//! `/v1/status` answers it at once.
 
 use serde::Serialize;
 
@@ -30,14 +37,30 @@ pub struct Settled {
     pub waiting_on: Vec<String>,
 }
 
-/// The verdict from the four counts.
-pub fn settled(
-    backlog: Option<&BacklogSnapshot>,
-    calibration_owed: usize,
-    warming: Option<(usize, usize)>,
-    normalizing: Option<(usize, usize)>,
-) -> Settled {
+/// What the verdict is made of.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Drains<'a> {
+    /// The daemon is still loading.
+    pub loading: bool,
+    /// The process's first ingest pass and its warm-up have finished.
+    pub first_pass_warmed: bool,
+    pub backlog: Option<&'a BacklogSnapshot>,
+    pub calibration_owed: usize,
+    pub warming: Option<(usize, usize)>,
+    pub normalizing: Option<(usize, usize)>,
+}
+
+/// The verdict from what drains.
+pub fn settled(d: &Drains<'_>) -> Settled {
     let mut waiting_on = Vec::new();
+    if d.loading {
+        waiting_on.push("loading".to_string());
+    }
+    if !d.first_pass_warmed {
+        waiting_on.push("the first ingest pass and its warm-up".to_string());
+    }
+    let (backlog, calibration_owed, warming, normalizing) =
+        (d.backlog, d.calibration_owed, d.warming, d.normalizing);
     if let Some(b) = backlog {
         waiting_on.push(format!(
             "ingest: {} of {} done ({} calibrating, {} facing)",
@@ -63,12 +86,20 @@ pub fn settled(
 mod tests {
     use super::*;
 
-    /// **Settled only when all four are empty**, and every one still draining
-    /// is named.
+    /// A member past its load and its first pass, with nothing draining.
+    fn done<'a>() -> Drains<'a> {
+        Drains {
+            first_pass_warmed: true,
+            ..Drains::default()
+        }
+    }
+
+    /// **Settled only when every drain is empty**, and every one still
+    /// draining is named.
     #[test]
-    fn settled_only_when_all_four_are_empty() {
+    fn settled_only_when_everything_has_drained() {
         assert_eq!(
-            settled(None, 0, None, None),
+            settled(&done()),
             Settled {
                 settled: true,
                 waiting_on: vec![],
@@ -82,7 +113,13 @@ mod tests {
             facing: 1,
         };
         assert_eq!(
-            settled(Some(&b), 2, Some((5, 16)), Some((1, 64))),
+            settled(&Drains {
+                backlog: Some(&b),
+                calibration_owed: 2,
+                warming: Some((5, 16)),
+                normalizing: Some((1, 64)),
+                ..done()
+            }),
             Settled {
                 settled: false,
                 waiting_on: vec![
@@ -94,8 +131,34 @@ mod tests {
             }
         );
         assert!(
-            !settled(None, 1, None, None).settled,
+            !settled(&Drains {
+                calibration_owed: 1,
+                ..done()
+            })
+            .settled,
             "a failed calibration alone"
+        );
+    }
+
+    /// **Empty counts at boot are not settled**: a member still loading, or
+    /// whose first pass and warm-up have not finished, has counted nothing
+    /// yet.
+    #[test]
+    fn nothing_counted_yet_is_not_settled() {
+        assert_eq!(
+            settled(&Drains::default()).waiting_on,
+            vec!["the first ingest pass and its warm-up".to_string()]
+        );
+        assert_eq!(
+            settled(&Drains {
+                loading: true,
+                ..Drains::default()
+            })
+            .waiting_on,
+            vec![
+                "loading".to_string(),
+                "the first ingest pass and its warm-up".to_string()
+            ]
         );
     }
 }

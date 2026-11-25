@@ -23,6 +23,16 @@ use tokio::task::JoinHandle;
 /// branches before any layer above them reads another unit.
 static PREEMPT: AtomicBool = AtomicBool::new(false);
 
+/// Raised once the process's first pass and its warm-up are done: until then
+/// the backlog and the warm-up's counts are empty only because nothing has
+/// been counted yet, and the memory is not settled (`crate::settled`).
+static FIRST_PASS_WARMED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the process's first ingest pass and its warm-up have finished.
+pub fn first_pass_warmed() -> bool {
+    FIRST_PASS_WARMED.load(Ordering::SeqCst)
+}
+
 /// Ask for a pass through `wake`: what every caller holding the worker's
 /// `Notify` calls, so a pass in flight learns it is wanted again.
 pub fn request(wake: &Notify) {
@@ -94,6 +104,7 @@ pub fn spawn(
                 "ingest worker: pass complete",
             );
             if warms_after(first, changed) {
+                let was_first = first;
                 first = false;
                 // Ordering invariant: the warm-up's heavy self-match scan must
                 // run AFTER ingest, never during (it freezes the scheduler).
@@ -105,6 +116,9 @@ pub fn spawn(
                 if !stop_loop.load(Ordering::Relaxed) && !crate::ingest_cancel::cancelled() {
                     let w = Arc::clone(&warm);
                     let _ = tokio::task::spawn_blocking(move || w()).await;
+                    if was_first {
+                        FIRST_PASS_WARMED.store(true, Ordering::SeqCst);
+                    }
                 }
             }
         }

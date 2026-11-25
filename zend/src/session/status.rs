@@ -10,7 +10,8 @@
 
 use super::*;
 use crate::calibrate::owed;
-use crate::settled::{settled, Settled};
+use crate::ingest_worker::first_pass_warmed;
+use crate::settled::{settled, Drains, Settled};
 
 /// The last maintenance operation the redo log ran: `(op_name, unix_millis)`.
 /// `None` when nothing has run since the log was opened.
@@ -50,12 +51,14 @@ pub struct StatusSnapshot {
 impl StatusSnapshot {
     /// Whether the memory is settled, and what it waits on ([`crate::settled`]).
     pub fn settled(&self) -> Settled {
-        settled(
-            self.ingest_backlog.as_ref(),
-            self.calibration_owed,
-            self.warming,
-            self.normalizing,
-        )
+        settled(&Drains {
+            loading: self.loading.is_some(),
+            first_pass_warmed: first_pass_warmed(),
+            backlog: self.ingest_backlog.as_ref(),
+            calibration_owed: self.calibration_owed,
+            warming: self.warming,
+            normalizing: self.normalizing,
+        })
     }
 }
 
