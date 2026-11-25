@@ -237,8 +237,8 @@ Averaging slows the decline. It doesn't stop it.
   <path class="c-flat" d="M70 60 H600"/>
   <text class="t-dim" x="70" y="30">the signal a step needs, against the perturbation it carries</text>
   <text class="t-flat" x="170" y="50">provenance-selected: bounded below, at any N</text>
-  <text class="t-rise" x="296" y="142">full attention, errors averaged: still Θ(1/√N)</text>
-  <text class="t-rise" x="330" y="183">full attention: the needed token's weight, Θ(1/N)</text>
+  <text class="t-rise" x="600" y="142" text-anchor="end">full attention, errors averaged: still Θ(1/√N)</text>
+  <text class="t-rise" x="600" y="183" text-anchor="end">full attention: the needed token's weight, Θ(1/N)</text>
   <text class="t-dim" x="70" y="232">schematic · relative to shallow depth · §11.2</text>
   <text class="t-dim" x="600" y="232" text-anchor="end">context depth N →</text>
 </svg>
