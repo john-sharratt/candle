@@ -16,6 +16,7 @@ pub(super) mod tests {
     };
 
     use super::super::tests_mind::tests::mind_state;
+    use crate::engine::api as engine_api;
 
     /// `gender` is a choice, so the API enforces the same two options the
     /// console offers — a value a character cannot read must not be storable
@@ -563,6 +564,75 @@ pub(super) mod tests {
             .await;
             assert_eq!(npc["state"], want, "{}", npc["name"]);
         }
+    }
+
+    /// **A trial is refused for the first thing standing in its way**: a
+    /// stranger's character is absent, a malformed body says what is wrong,
+    /// a running character is refused because its context would move under
+    /// the trial, and a suspended one reaches the engine — which this daemon
+    /// is not running.
+    #[tokio::test]
+    async fn a_trial_is_refused_until_the_character_is_suspended() {
+        let st = state(tmp("trial"));
+        let (a, b) = ("google-1", "google-2");
+        sign_in(&st, a).await;
+        sign_in(&st, b).await;
+        sign_in(&st, ADMIN).await;
+        author(&st).await;
+        let engine = || engine_api(st.roles.clone()).into_routes(st.clone()).router;
+        let (s, npc) = call(
+            router(st.clone()),
+            send(
+                "/v1/npc",
+                "POST",
+                a,
+                json!({ "name": "Varek", "world_id": "battle-cities", "personality_id": "commander" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "{npc}");
+        let varek = npc["npc_id"].as_str().unwrap().to_string();
+        let path = format!("/v1/npc/{varek}/trial");
+        let trial = json!({
+            "turn": "Which way is the gate?",
+            "tools": [{ "name": "answer", "params": [
+                { "name": "value", "type": "string", "required": true, "enum": ["north", "south"] }
+            ]}]
+        });
+
+        let (s, _) = call(engine(), send(&path, "POST", b, trial.clone())).await;
+        assert_eq!(s, StatusCode::NOT_FOUND, "a stranger's character is absent");
+
+        let (s, e) = call(
+            engine(),
+            send(&path, "POST", a, json!({ "turn": "x", "tools": [] })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{e}");
+        assert_eq!(e["error"], "bad_trial");
+        assert_eq!(
+            e["detail"],
+            "a trial needs at least one tool in `tools` to answer through"
+        );
+
+        let (s, e) = call(engine(), send(&path, "POST", a, trial.clone())).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{e}");
+        assert_eq!(e["error"], "npc_not_suspended");
+
+        let (s, _) = call(
+            router(st.clone()),
+            send(
+                &format!("/v1/npc/{varek}/suspend"),
+                "POST",
+                a,
+                json!({ "suspended": true }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, e) = call(engine(), send(&path, "POST", a, trial)).await;
+        assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{e}");
+        assert_eq!(e["error"], "no_engine");
     }
 
     /// **Hidden worlds, and the whole word that reveals them.**

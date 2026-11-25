@@ -21,6 +21,7 @@
 //! - `tests_perception`: the order and bounds of what a turn reads.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -216,6 +217,14 @@ pub struct Minds {
     /// second copy of a prompt is a copy that diverges from the one being edited.
     /// See [`crate::engine::schema::ReflectionTurns`].
     reflection: Option<ReflectionTurns>,
+    /// Each character's opening lock, held while its conversation is opened or
+    /// replaced — see [`Minds::resident_for`].
+    openings: LockFreeMap<u64, Arc<ConversationLock<()>>>,
+    /// The trials in flight on each character — see [`Minds::trial_own`].
+    trials_in_flight: LockFreeMap<u64, Arc<AtomicUsize>>,
+    /// The selection a character's trials read, with the timeline of the
+    /// conversation it was prepared on.
+    trial_selections: LockFreeMap<u64, (TimelineId, SelectionState)>,
 }
 
 /// A character's live conversation, and the handle that can put it a question
@@ -335,6 +344,9 @@ impl Minds {
             system_prompts: LockFreeMap::new(),
             keep_turns: None,
             reflection: None,
+            openings: LockFreeMap::new(),
+            trials_in_flight: LockFreeMap::new(),
+            trial_selections: LockFreeMap::new(),
         }
     }
 
@@ -442,9 +454,11 @@ mod tests_identity;
 #[cfg(test)]
 mod tests_perception;
 mod think;
+mod trial;
 
 pub use conversation::*;
 use journaling::*;
 pub use mind_schema::*;
 pub use perception::*;
 pub use think::*;
+pub use trial::TrialDecode;
