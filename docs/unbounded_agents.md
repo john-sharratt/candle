@@ -1043,7 +1043,7 @@ The two baselines project no memory. **R1** ranks every text file of the reposit
   <circle class="dot-them" cx="97.7" cy="249.3" r="6"/>
   <text class="v-them mid" x="97.7" y="240.4">0.4%</text>
   <text class="cat mid" x="97.7" y="268">A0</text>
-  <text class="cat-sub mid" x="97.7" y="282">no memory</text>
+  <text class="cat-sub mid" x="97.7" y="282">none</text>
   <text class="cat-sub mid" x="97.7" y="295">no seed</text>
   <rect class="them" opacity="0.35" x="146.1" y="248.1" width="14" height="1.7"/>
   <circle class="q1" cx="169.1" cy="248.8" r="2.5"/>
@@ -1052,7 +1052,7 @@ The two baselines project no memory. **R1** ranks every text file of the reposit
   <circle class="dot-them" cx="153.1" cy="249.1" r="6"/>
   <text class="v-them mid" x="153.1" y="240.1">0.5%</text>
   <text class="cat mid" x="153.1" y="268">A1</text>
-  <text class="cat-sub mid" x="153.1" y="282">no memory</text>
+  <text class="cat-sub mid" x="153.1" y="282">none</text>
   <text class="cat-sub mid" x="153.1" y="295">seed</text>
   <rect class="them" opacity="0.35" x="201.5" y="181.5" width="14" height="21.5"/>
   <circle class="q1" cx="224.5" cy="192.1" r="2.5"/>
@@ -1091,7 +1091,7 @@ The two baselines project no memory. **R1** ranks every text file of the reposit
   <circle class="dot-us" cx="374.7" cy="180.9" r="6"/>
   <text class="v-us mid" x="374.7" y="161.9">36.7%</text>
   <text class="cat mid" x="374.7" y="268">C0</text>
-  <text class="cat-sub mid" x="374.7" y="282">reprojecting</text>
+  <text class="cat-sub mid" x="374.7" y="282">full</text>
   <text class="cat-sub mid" x="374.7" y="295">no seed</text>
   <rect class="us-soft" x="423.1" y="169" width="14" height="21.3"/>
   <circle class="q1" cx="446.1" cy="181.3" r="2.5"/>
@@ -1104,7 +1104,7 @@ The two baselines project no memory. **R1** ranks every text file of the reposit
   <circle class="dot-us" cx="430.1" cy="179.5" r="6"/>
   <text class="v-us mid" x="430.1" y="161">37.5%</text>
   <text class="cat mid" x="430.1" y="268">C1</text>
-  <text class="cat-sub mid" x="430.1" y="282">reprojecting</text>
+  <text class="cat-sub mid" x="430.1" y="282">full</text>
   <text class="cat-sub mid" x="430.1" y="295">seed</text>
   <rect class="them" opacity="0.35" x="478.5" y="139.3" width="14" height="24"/>
   <circle class="q1" cx="501.5" cy="148" r="2.5"/>
@@ -1114,14 +1114,14 @@ The two baselines project no memory. **R1** ranks every text file of the reposit
   <circle class="dot-them" cx="485.5" cy="151.1" r="6"/>
   <text class="v-them mid" x="485.5" y="131.3">52.6%</text>
   <text class="cat mid" x="485.5" y="268">R1</text>
-  <text class="cat-sub mid" x="485.5" y="282">BM25 files</text>
+  <text class="cat-sub mid" x="485.5" y="282">BM25</text>
   <text class="cat-sub mid" x="485.5" y="295">no seed</text>
   <rect class="them" opacity="0.35" x="533.9" y="154.4" width="14" height="25.4"/>
   <circle class="q1" cx="556.9" cy="167.2" r="2.5"/>
   <circle class="dot-them" cx="540.9" cy="167.2" r="6"/>
   <text class="v-them mid" x="540.9" y="146.4">44.0%</text>
   <text class="cat mid" x="540.9" y="268">P1</text>
-  <text class="cat-sub mid" x="540.9" y="282">selected files</text>
+  <text class="cat-sub mid" x="540.9" y="282">selected</text>
   <text class="cat-sub mid" x="540.9" y="295">no seed</text>
   <rect class="them" opacity="0.35" x="589.3" y="67.4" width="14" height="7.3"/>
   <circle class="q1" cx="612.3" cy="71.4" r="2.5"/>
@@ -1398,11 +1398,11 @@ The gain lies on the 111 questions that do not name their answer's file, 5.7 poi
   <path class="line-us" d="M62 199.8 70.7 199.8 79.3 148.3 88 152.2 96.6 153.8 105.3 159.2 113.9 160.8 122.6 158.4 131.3 156.1 139.9 163.1 148.6 153.7 157.2 156.9 165.9 160 174.5 160.8 183.2 152.2 191.8 155.3 200.5 160 209.2 157.7 217.8 149.8 226.5 153.8 235.1 152.2 243.8 148.3 252.4 155.3 261.1 153.8 269.8 156.9 278.4 153.8 287.1 151.4 295.7 151.4 304.4 154.5 313 152.2 321.7 153 330.3 152.2 339 153.8 347.7 151.4 356.3 151.4 365 153 373.6 149.8 382.3 150.6 390.9 149.8 399.6 149.1 408.3 149.8 416.9 150.6 425.6 152.2 434.2 151.4 442.9 149.1 451.5 150.6 460.2 150.6 468.8 149.8 486.2 149.8 494.8 150.6 503.5 149.8 512.1 149.8 520.8 150.6 529.4 149.8 538.1 150.6 555.4 150.6 564.1 152.2 572.7 150.6 581.4 149.1 590 149.8 616 149.8"/>
   <g class="legend">
   <path class="line-us" d="M330 53 H344"/>
-  <text x="348" y="56">C1 reprojecting</text>
-  <path class="line-them" d="M457 53 H471"/>
-  <text x="475" y="56">B1 held</text>
-  <path class="line-them dash" d="M534.4 53 H548.4"/>
-  <text x="552.4" y="56">D1 once</text>
+  <text x="348" y="56">C1 full</text>
+  <path class="line-them" d="M407.4 53 H421.4"/>
+  <text x="425.4" y="56">B1 held</text>
+  <path class="line-them dash" d="M484.8 53 H498.8"/>
+  <text x="502.8" y="56">D1 once</text>
   </g>
 </svg>
 </figure>

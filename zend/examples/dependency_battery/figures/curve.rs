@@ -154,7 +154,7 @@ mod tests {
             "<path class=\"line-us\" d=\"M62 175 616 122.5\"/>",
             "<text class=\"tick mid\" x=\"616\" y=\"296\">64</text>",
             "<text class=\"tick\" x=\"54\" y=\"283.5\" text-anchor=\"end\">30%</text>",
-            "<text x=\"348\" y=\"56\">C1 reprojecting</text>",
+            "<text x=\"348\" y=\"56\">C1 full</text>",
         ] {
             assert!(lines.contains(&want), "missing {want}\n{out}");
         }
