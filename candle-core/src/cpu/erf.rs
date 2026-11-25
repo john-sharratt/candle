@@ -29,7 +29,6 @@ mod evaluate {
         sum
     }
 }
-use std::f64;
 
 /// `erf` calculates the error function at `x`.
 pub fn erf(x: f64) -> f64 {

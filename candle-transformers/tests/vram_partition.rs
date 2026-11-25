@@ -382,9 +382,9 @@ fn a6_the_pinned_head_is_resident_and_furthest_from_the_frontier() {
         let mut budget = imgs[..pinned].iter().map(|i| i.total).sum::<usize>() + widest;
         while budget <= total {
             if let Ok(plan) = plan_zone(&imgs, pinned, end, budget) {
-                for l in 0..pinned {
+                for (l, home) in plan.homes.iter().enumerate().take(pinned) {
                     assert!(
-                        plan.homes[l].is_some(),
+                        home.is_some(),
                         "{name} @ {budget}: pinned layer {l} has no home"
                     );
                 }

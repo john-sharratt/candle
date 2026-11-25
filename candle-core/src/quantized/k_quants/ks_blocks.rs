@@ -113,8 +113,8 @@ impl GgmlType for BlockQ4_KS {
             let xs = &xs[i * Self::BLCK_SIZE..(i + 1) * Self::BLCK_SIZE];
             let h = KsHeader::of(xs, 1.0 / 7.0);
             let q = |j: usize| -> u8 { (h.quant(xs, j, 7.0) + 8) as u8 };
-            for j in 0..QK_Q4_KS / 2 {
-                ys.qs[j] = q(j) | (q(j + QK_Q4_KS / 2) << 4);
+            for (j, byte) in ys.qs.iter_mut().enumerate().take(QK_Q4_KS / 2) {
+                *byte = q(j) | (q(j + QK_Q4_KS / 2) << 4);
             }
             ys.d = f16::from_f32(h.coarse);
             ys.sa = h.sa;

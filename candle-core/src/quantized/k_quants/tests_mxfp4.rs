@@ -71,8 +71,8 @@ pub(super) mod mxfp4_tests {
         assert_eq!(blk[0].qs[1], 5 | (13 << 4));
         assert_eq!(blk[0].qs[2], 3 | (6 << 4));
         assert_eq!(blk[0].qs[3], 1 | (9 << 4));
-        for j in 4..16 {
-            assert_eq!(blk[0].qs[j], 0, "qs[{j}] should be zero");
+        for (j, &byte) in blk[0].qs.iter().enumerate().take(16).skip(4) {
+            assert_eq!(byte, 0, "qs[{j}] should be zero");
         }
 
         let mut ys = vec![0f32; QK_MXFP4];

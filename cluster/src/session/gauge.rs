@@ -38,9 +38,15 @@ impl Gauges {
             Lane::CatchUp => &self.catchup,
             Lane::Control | Lane::Stream => return,
         };
-        let _ = gauge.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
-            Some(held.saturating_sub(bytes))
-        });
+        let mut held = gauge.load(Ordering::Relaxed);
+        while let Err(now) = gauge.compare_exchange_weak(
+            held,
+            held.saturating_sub(bytes),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            held = now;
+        }
     }
 
     /// Bytes of live events queued and not yet written.

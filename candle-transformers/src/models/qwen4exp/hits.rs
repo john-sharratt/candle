@@ -1016,7 +1016,7 @@ mod tests {
             let h = parent.lock()?;
             let keep = h.stride.keep.to_vec1::<u32>()?;
             let rec = 4 + CUT_WORDS;
-            for layer in 0..2 {
+            for (layer, &kept) in h.stride.kept.iter().enumerate().take(2) {
                 for (row, slot) in [(0usize, 70 % 64), (1, 71 % 64), (4, 72 % 64)] {
                     let at = (layer * KEEP_SLOTS + slot) * rec;
                     assert_eq!(keep[at..at + 4], [(row as f32).to_bits(); 4]);
@@ -1025,7 +1025,7 @@ mod tests {
                         [1.5f32.to_bits(), positions[row], 20, 1]
                     );
                 }
-                assert_eq!(h.stride.kept[layer], kept_slots(72, 2) | kept_slots(73, 1));
+                assert_eq!(kept, kept_slots(72, 2) | kept_slots(73, 1));
             }
         }
         {

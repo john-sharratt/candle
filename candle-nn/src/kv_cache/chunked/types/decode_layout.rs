@@ -42,13 +42,10 @@ impl SequenceState {
             return 0;
         }
         let start = self.writer_start_idx().min(n - 1);
-        for i in start..n {
-            let c = &self.chunks[i];
-            if (c.offset as usize + c.usage as usize) < CHUNK_SIZE {
-                return i;
-            }
-        }
-        n - 1
+        self.chunks[start..]
+            .iter()
+            .position(|c| (c.offset as usize + c.usage as usize) < CHUNK_SIZE)
+            .map_or(n - 1, |i| start + i)
     }
 
     /// Everything the shared decode position map is derived from, reduced to a
