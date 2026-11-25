@@ -15,10 +15,10 @@ It is built per projection the way the `tools` collection is, and selected
 the way readings are selected now: a large pool chosen by provenance
 momentum, reduced to what fits by the QSA index. The seed stays a chain
 computed with the recurrent state and snapshotted, now as the collection's
-last members; the dynamic members are placed before it, and at every
-projection the collection's close is forwarded live from the seed's
-snapshot, so the system prompt's end is a real forward over what was placed
-and a new conversation starts its recurrent state there. A reading stops
+last members; the dynamic members are placed before it, and when a
+conversation opens the system prompt's close is forwarded from the seed's
+snapshot over what the opening placed, so its end is a real forward and the
+conversation's recurrent state starts there. A reading stops
 being a conversation: ingest prefills each file's chunks as collection
 members and asks the file's calibration questions; nothing is decoded about
 a file but those answers. The dialogue's turns are the dialogue's own and
@@ -82,7 +82,7 @@ tools_overview · tool summary · <tools> tool members </tools>
 files_open                      # "\n# Knowledge Base\n\n"
 dynamic members                 # provenance's selection, sealed, attended only
 seed members                    # the seed chain, sealed with the recurrence
-close row  …```<|im_end|>\n     # forwarded live at every projection (§6.2)
+close row  <|im_end|>\n         # forwarded once, at the opening (§6.2)
 <|im_start|>user …              # the dialogue's own turns only
 ```
 
@@ -119,14 +119,21 @@ are). Everything the collection holds arrives per projection.
 - So a file's rendering is built from sealed pieces: its **heading piece**
   (`## The content from <path>:\n\n```\n`), its **chunk members**, the
   **gap piece** (`\n\n...\n\n`) where placed chunks are not contiguous, and
-  its **closing piece** (`\n```\n\n`). The heading, gap and closing pieces
-  are small sections of the collection, sealed as members are (§5). The one
-  exception is the collection's last file, the seed's last: its closing
-  fence is not sealed but forwarded in the close row (§6.2), so the bytes end
-  `\n```<|im_end|>\n` exactly as Q1's did.
-- The **dynamic members** come first, in **fill order, strongest first** —
-  the order the probes used, not declaration order as tools have — and the
-  **seed** last, nearest the question, in its chain's fixed order (§6).
+  its **closing piece** (`\n```\n`, a blank line after it when another file
+  follows, as Q1 joined its snippets). The heading, gap and closing pieces
+  are small sections of the collection, sealed as members are (§5). Every
+  file, the last included, seals its own closing fence, so the collection
+  ends `\n```\n` and the close row is `<|im_end|>\n` (§6.2).
+- The **dynamic members** come first and the **seed** last, nearest the
+  question, in its chain's fixed order (§6).
+- **Dynamic order is strongest first, and stable once placed (decided
+  2026-11-26).** The opening places its files in fill order, best-ranked
+  first, the order every probe arm used. From then on a placed file keeps
+  its place relative to the others: a reprojection never reorders what it
+  keeps. A file it adds goes after the kept ones, at the end of the dynamic
+  run before the seed, and a file it drops leaves the others in their order.
+  Reordering placed content during a decode has been seen to unsettle it;
+  rank decides what is placed, not where a kept file moves to.
 
 ## 4. Selection: the pool and the fill, unchanged, now feeding a collection
 
@@ -149,11 +156,54 @@ What changes is the destination: the fill's placed chunks become **members
 of `files`** (`ProjectionSegment::Sealed(SealedKind::Section)` inside the
 system block) instead of sealed assistant turns after it.
 
+**A file is keyed as a file (decided 2026-11-26).** Every structure the two
+stages use names a file by a reading's timeline and turns today: the working
+set (`working_set/state.rs:89,133,223-239`), the fill's pieces
+(`WorkingPiece.exchanges: Vec<Vec<TurnKey>>`, a reading's floor its request
+and answer, `dialogue_fill.rs:36-40,110-118`), the pool's pages and hits
+(`PoolPages`, `pooled_rounds.rs:21,26-64`), belief and normalization
+(`FileScan.timeline`, `ChildKey::timeline`, `belief_groups.rs:328-341`), and
+calibration's votes (`CALIBRATES_KEY` on the unit's timeline). They are
+re-keyed to **`FileKey`** (the workspace path and the content's blob) and
+**`ChunkKey`** (a `FileKey` and the chunk's part span):
+
+- the working set's members and momentum are `FileKey`s;
+- a fill piece is a file, its units its chunks; a file has no floor (there
+  is no request or answer turn), and its first chunk is placed with any
+  other;
+- pool pages and hits are per `ChunkKey`;
+- the gallery holds a member's signatures under its `ChunkKey`, and a
+  calibration's votes go to its `FileKey`;
+- a superseded member is retired by its `FileKey`'s blob changing, which
+  `code_read/process.rs:128-137` does by `PATH_KEY`/`CONTENT_KEY` today.
+
+Members are **shared submitted sections**, not schema members: a schema
+collection's members join the birth prefix, cannot be offloaded, and must
+fit the KV reservation whole (`sequence_construction.rs:484-498`), which for
+a corpus is impossible. They are sealed and placed as the per-conversation
+journal's members are (`conversation/submitted_sections.rs`), shared across
+conversations (`Sharing`, `shared_section_prefix`, `:455-459`).
+
+The QSA's stratified selection ranks the prompt in every window, and the
+prompt is the leading run of section and glue pieces (`slot_state.rs:274-283`,
+`qwen4exp/indexer/cache.rs:89-97`). The prompt therefore ends at
+`files_open`: members are selected by the index like any other piece, never
+pinned (`apply_build.rs:526-532`), and counted where the trained window's
+shares are checked (`apply_build.rs:533-557`).
+
 - `scopes`, `guidance` and `journals` stop being groups of the
-  `code_reading` layer and become **kinds of the one collection**, each with
-  its share of the room as now (`working_set.shares`: readings, guides,
-  journals). The `draws: from: scopes, paths: …` rules carry over as the
-  kind's path filter.
+  `code_reading` layer, and `structure` of `repo_map`; all four become
+  **kinds of the one collection**, each with its share of the room as now
+  (`working_set.shares`: readings, guides, journals, folders). The `draws:
+  from: scopes, paths: …` rules carry over as the kind's path filter.
+- **A folder is its listing (decided 2026-11-26).** A `repo_map` folder unit
+  stops being a conversation ending in a decoded summary
+  (`projection.yaml:726-795`). It is its listing, rendered as a snippet in
+  Q1's notation (`## The content from candle/zend/src/:` and the listing in
+  the fence), prefilled and calibrated as a file is, with no summary decode.
+  The seed's root listings are folders of this kind. The listing is a plain
+  path list: one entry a line, repository-relative, a directory ending in
+  `/`, a file followed by its size in bytes.
 - The schema allows `selection: { kind: working_set, share: … }` on a
   collection; `yaml/parse_groups.rs:277` refuses it today and is lifted.
 - The fill's room is computed as now (`slot_window − reserve − system −
@@ -166,16 +216,23 @@ system block) instead of sealed assistant turns after it.
 ## 5. Sealing a member
 
 A member's K/V is sealed **behind the system prompt before the collection**
-— the same prefix a code reading is sealed behind today
-(`code_read/process.rs:153-160`), so nothing about a member's portability
-changes — plus the **earlier chunks of its own file**:
+plus the **earlier chunks of its own file**. That prefix is the base
+conversation's projected prompt, as a code reading's is today
+(`code_read/process.rs:150-160`) — at most five tools and none of a
+conversation's journal — and not `prefix_before_collection`
+(`projection/owned_prefix.rs:31`), which holds every member of the
+collections before it: the whole tool catalog and one conversation's
+journal entries.
 
-- chunk *k* of a file seals against `prefix_before_collection`, then
-  `files_open`, then the file's heading piece, then chunks 1…*k*−1, and
+- chunk *k* of a file seals against that prompt, then `files_open`, then
+  the file's heading piece, then chunks 1…*k*−1, and
   starts the recurrent state from the state after chunk *k*−1
-  (`submitted_sections.rs` `continue_state`). A chunk is thereby sealed in
-  the very text Q1 showed: under its file's heading, as the continuation of
-  its file;
+  (`conversation/prefix_state.rs:194` `continue_state`, as
+  `submitted_sections.rs:422` uses it). A chunk is thereby sealed in the
+  very text Q1 showed: under its file's heading, as the continuation of its
+  file. That recurrent state exists only to seal the chunk's K/V: it is the
+  member's, never a slot's, and no conversation's recurrent state is run
+  over a dynamic member (§8);
 - its content address is `{prefix_hash over the system prefix and the file's
   earlier chunks, section_hash}`, members excluded from every other
   section's `prefix_hash` as tool members are (`sequence_sections.rs:246-251`);
@@ -214,16 +271,98 @@ priming chain is built today:
   changes re-prefills the chain from the last unchanged link, as a link
   whose key holds is reused today (`code_read/link.rs`);
 - the snapshot at the **seed's end** is the state of a system prompt that
-  has read the seed. The last seed file's closing fence is held out of the
-  chain (§3); it is forwarded in the close row.
+  has read the seed, closing fence included.
+- `system_close` leaves the birth prefix and the prompt checkpoint. It is a
+  template with no `depends_on` today, so it sits in `fixed_prefix`
+  (`sequence_construction.rs:449-451`) and the checkpoint has read
+  `<|im_end|>` (`prompt_branch`, `:733-743`). The checkpoint ends at the
+  last section before `files_open`, so the seed chain starts from a prompt
+  still open, and `<|im_end|>` is forwarded only as the close row, for every
+  layer, with or without a `files` collection.
+- a changed seed file re-prefills the chain **from that file on**, the
+  later links included, their snapshots taken again. That replaces today's
+  rule: a later link is re-pointed, not re-read, and keeps K/V and a
+  snapshot computed against the old predecessor
+  (`code_read/link.rs:24-27,40-46`; `branch_ingest/prime.rs:31-34,279-281`).
+  A recurrent state is only correct if the forward that made it read what
+  precedes it.
 
 The seed is the one part of the collection the recurrence has read, and it
 sits last, nearest the question.
 
-### 6.2 The close row: forwarded live at every projection
+Two rules fix it (decided 2026-11-26):
 
-At every projection, after the fill has chosen the dynamic members and the
-slot is rebuilt with them placed **before the seed**, the collection's close
+- **One chain, behind the default branch.** The system prompt before the
+  collection is a section tree a turn's dials select, with a checkpoint per
+  branch (`install_branch_states`). The seed chain and its snapshots are
+  computed once, behind the default branch, and read under every branch as
+  sealed sections are. A turn on another branch reads a seed-end state that
+  carries the default branch's dial text; the dials' sections themselves are
+  read under the turn's branch.
+- **Pinned, with no cap.** The close row's state assumes the whole seed is in
+  the slot, so the seed is always placed whole and never gives way to the
+  selection; the dynamic members get the room that remains. This replaces
+  the working-set seeds, which give way to what the question ranks
+  (`working_set/state.rs:85-89,218-239`), and the 64K
+  `INHERITED_CHAIN_TOKEN_CAP` (`substrate/registry.rs:269`). The seed is
+  bounded only by the slot: a chain that leaves less than the slot's
+  reserve and the dialogue's minimum room refuses to build, with the seed's
+  size and the slot's in the error.
+
+### 6.2 The close row: forwarded once, at the conversation's opening
+
+**Decided 2026-11-26:** the close row is forwarded only when a conversation
+opens. At that point the dialogue is empty, so the close row is the first
+thing the opening prefills, at the slot's tail. Its recurrent state starts
+from the seed-end snapshot. Its attention reads the knowledge base the
+opening placed, and the conversation's first user message is prefilled
+straight after it, in the same prefill, through `drive_prefill_and_capture`
+(`projection_assembler/prefill.rs:188-276`), the existing path that forwards
+at the tail and captures K/V and index pages.
+
+The close row is then **one sealed piece of the conversation**, its own and
+no other's. At every later rebuild it is injected between the collection
+and the dialogue like any sealed piece. A running conversation never
+forwards it again:
+
+- its recurrent state is its own, live, moved across the rebuild as now
+  (`move_recurrent`, `reprojection.rs:403-434`), and never receives a close
+  row a second time — the re-feed's failure cannot occur;
+- the close row's K/V keeps the opening's placement and does not see later
+  placements. What a later placement adds reaches the conversation through
+  attention, by the dialogue's tokens forwarded after it;
+- a rebuild needs no forward in the middle of the slot, no second recurrent
+  store and no new step in the assembler. A changed member costs that
+  member only, as a changed reading's piece costs only that piece today
+  (`apply_build.rs:85-91,143-146`).
+
+The close row rides the opening's prefill, so conversations opening
+together forward their close rows in one batched prefill, never one launch
+a conversation (hot-path invariant 5).
+
+The request is still read twice (decided 2026-11-26). Its first reading
+(`scheduler/first_reading.rs`) prefills the question against the opening's
+projection with the seeds held out, and seals nothing. It forwards its own close row from the state at `files_open`
+on the same discarded prefill. The second reading is the real opening: the
+close row from the seed-end snapshot, then the question, sealed.
+
+The close row is **`<|im_end|>\n` in every case**. Every file seals its own
+closing fence (§3), so the close row does not depend on which file ends the
+collection. That matters because a running conversation keeps its opening's
+close row while the files before it change. An empty collection omits
+`files_open` and ends on the same close row. The one byte Q1 did not have
+is the newline between the last fence and `<|im_end|>`, which is ChatML's
+own shape. The close row is checked at load to be at most 8 tokens.
+
+The rest of this section is the analysis behind the decision, kept as the
+record of the alternative.
+
+### 6.2a Forwarding the close row at every projection (not chosen)
+
+At every projection that changes the slot (a reprojection that keeps the
+selection does not rebuild, and the close row it holds stands), after the
+fill has chosen the dynamic members and the slot is rebuilt with them placed
+**before the seed**, the collection's close
 — the last seed file's closing fence and `system_close`, `\n```<|im_end|>\n`
 — is **forwarded**, not injected:
 
@@ -241,8 +380,11 @@ slot is rebuilt with them placed **before the seed**, the collection's close
   Flash-Next's tokenizer; a close longer than the row refuses to load.
 
 The forward writes a position in the middle of the slot, below the
-dialogue's turns, and the writer only writes at the tail
-(`truncate_sequence_to_tokens` refuses below `writer_start`). So the rebuild
+dialogue's turns. The writer only writes at the tail
+(`truncate_sequence_to_tokens` clamps to the sealed boundary below
+`writer_start`, `candle-nn/src/kv_cache/chunked/sequence_ops/tail.rs:288-303`),
+and the hybrid stacks refuse a forward into the middle of a slot outright
+(`qwen4exp/wave/wave_sweep.rs:159-164`, `qwen35/forward/layer_sweep.rs:159-165`). So the rebuild
 is done in two steps: the parent is rebuilt to the collection's end, the
 close row is forwarded as its tail, and the dialogue's turns and the turn's
 captured tail are then injected after it (`inject_sealed_at_tail`) and the
@@ -287,16 +429,36 @@ new conversation receives it once, as the end of its system prompt.
 
 A file's ingest is:
 
-1. **Cut** into chunks as now (200 lines, `MAX_READ_LINES`).
+1. **Cut** into chunks as `file_read` pages it now: whole parts, up to 200
+   lines a page (`PAGE_LINES`, `zend-tools/src/sandboxes/page.rs:20`;
+   `tools/file/read.rs:126`).
 2. **Prefill** each chunk as a `files` member (§5) — no reading
    conversation, no `file=<path>` face, no `file_read` call, no tool
    response wrapper, no summary decode, no summary tree (`code_reading`
    layer's `summary:` block goes).
-3. **Calibrate.** The file's calibration questions are asked against a
-   context of its own members in the knowledge format, and their thinking
-   and answers are sealed as today; they and the members' own signatures are
-   what the gallery scans (`belief_groups.rs`). The calibration conversation
-   is the only thing decoded.
+3. **Calibrate**, in the two steps of today (`zend/src/calibrate/run.rs`):
+   - the **draft** writes the file's questions with the file in front of
+     it — now its members in the collection, in Q1's layout, where it was
+     the reading's turns (`calibrate/sections.rs`, one message, one part per
+     prompt);
+   - each question is then **asked again behind its own file**
+     (decided 2026-11-26): the system prompt with the collection holding
+     **only the target file's members**, in Q1's layout, never the seed;
+     the recurrent state the file's own chain end (every file is sealed as
+     a chain of its chunks, §5, and its end state is snapshotted); then the
+     close row and the question, thinking on. Its question and thinking are
+     sealed as the calibration (`Substrate::CALIBRATES_KEY`, now voting for
+     the `FileKey`), then distilled provenance-only. This replaces asking it
+     alone with nothing projected (`calibrate/run.rs:10-23`;
+     `docs/provenance_scoped_signatures.md` §2.5, revised with this change):
+     the knowledge base is real, so the question's K/V and the thinking's
+     queries are computed in the frame a live query has; nothing but the
+     target is in it, so no other file bleeds in; and the seed is never in
+     it, so a seed change recalibrates nothing.
+
+   The calibrations and the members' own signatures are what the gallery
+   scans (`belief_groups.rs`). The draft and the calibrations are the only
+   things decoded.
 
 The seed's files are ingested as the chain of §6.1 instead — prefilled in
 order with the recurrent state carried and snapshotted at each file's end —
@@ -308,14 +470,81 @@ are removed: there is no reading turn to face.
 A gallery entry is keyed by member section rather than by reading turn;
 `cases: file` groups a file's members as it grouped a reading's turns.
 
+### 7.1 Calibration is load-bearing
+
+Provenance ranks a file by the agreement of the live decode's queries with
+the file's stored signatures (BDP, `sign(Q_PCA^T K)`; `docs/attention_provenance.md`).
+The live queries come from an assistant turn reasoning in a dialogue. A
+member's **content** signatures now come from system-block content, where
+they once came from tool-response turns, and the two can point differently.
+Content-only ranking may weaken.
+
+A **calibration** is a question about the file asked as a live turn opens,
+with the target file in the knowledge base and nothing else (§7 step 3): a
+user turn, its thinking after it, behind a system prompt that ends as every
+dialogue's does. Its signatures sit where a dialogue's queries do — the same
+role, the same frame, the knowledge base real — and they carry the ranking
+where the content's fall short.
+
+The cost of asking it with the file in view: its thinking can answer from
+the file rather than reason toward it, and lean toward the file's own
+content, which the content signatures already cover, and away from a query
+that has not yet found the file — the one provenance must pull the file in
+for. The ranking split below measures whether that happens. The
+numbers already lean on them: the scoring lab's formula took MRR 0.235 →
+0.663 largely through how calibration votes are weighed
+(`docs/results/provenance_scoring_lab_2026-11-16.md`), and the needle
+ranking (49% first of 7,943 files) was measured with question-and-thinking
+probes, the shape a calibration has (`docs/unbounded_agents.md` §9.12).
+
+Three consequences:
+
+- **Coverage is correctness.** A file without its calibrations is all but
+  invisible to provenance. The memory is settled only when every ingested
+  file is both prefilled and calibrated; a calibration that fails is
+  retried, and a file still without one is reported by the settled check
+  (`zend::settled`, `waiting_on`) rather than counted as read.
+- **Calibration's known failures are failures of the memory.** Calibrations
+  flooding the votes and outranking the content they describe, and drafts
+  written blind to their file, are held to the per-file competition already
+  tuned (`calibration_weight`, `vote_top_k`, `kind_z`,
+  `projection.yaml` `scopes` policy) and checked on the first memory.
+- **The split is measured.** On the depth-1 memory (§9 step 5) the test
+  questions are ranked by the scoring lab (`provenance_gates lab`) three
+  ways — content signatures alone, calibration alone, both — before their
+  answers are read. Content-only collapsing while calibration carries the
+  rank confirms this section; both collapsing stops the rollout there.
+
+### 7.2 What the system prompt tells the model
+
+Two sections describe the old arrangement and change with it
+(`zend/src/prompts/projection.yaml`):
+
+- `history_stance` says most earlier turns are the model's reading and that
+  the conversation "descends from the workspace's listings and documents".
+  After this change the turns are the conversation and nothing else, and
+  the files are in the knowledge base below. It says that: earlier turns are
+  the model's own work with the user, built on rather than repeated; the
+  files it has read are under *Knowledge Base* at the end of this prompt;
+  the user's latest message is what to do now.
+- `grounding` and `grounding_no_tools` say "answer from what is actually in
+  this conversation, the reading done before this session began included".
+  They say instead: from this conversation and the files in the knowledge
+  base.
+
+Their wording is set with the user and pinned by the schema's tests, as the
+persona's is.
+
 ## 8. The recurrent layers — what remains a risk
 
-The seed has been read by the recurrence (§6.1), and the close row reaches
-the recurrent layers having attended to the dynamic members (§6.2). The
-dynamic members themselves are not run through the recurrence: they are
-sealed with their own file's state (§5) and only attended in the slot. The
-recurrent layers therefore learn of a dynamic file only through the close
-row's few positions and the tokens forwarded after it.
+The seed has been read by the recurrence (§6.1). The dynamic members are
+not run through any conversation's recurrence: each is sealed with its own
+file's state (§5) and only attended in the slot. A new conversation's
+recurrent state learns of the dynamic files its opening placed through the
+close row's few positions (§6.2), and every conversation's through the
+tokens forwarded after a placement, whose attention reads the members — the
+user's message, the reply, tool results. A running conversation's state
+never receives a close row.
 
 The probes do not settle whether that is enough: on the passthrough route
 every file was prefilled, so the recurrence had run over all of them. The
@@ -323,9 +552,10 @@ diag result (§2) says the recurrence was not what failed the turn
 presentation; it does not say attention alone suffices for the knowledge
 presentation. It is measured on the first memory the new build ingests (§9,
 step 5): sealed dynamic members against the same members re-prefilled. If
-attention alone falls short, the members' recurrent rows are captured at
-seal time (the `capture`/`merge` machinery of the decode diag) and folded in
-where the collection sits.
+attention alone falls short, the rollout stops at step 5 and the fallback is
+decided with the user from the measurement. Recurrent states do not compose
+(`conversation/prefix_state.rs:10-11`), so no captured state is folded in,
+and the decode diag's `capture`/`merge` stays a diagnostic.
 
 ## 9. Rollout
 
@@ -341,28 +571,40 @@ rollout (2026-11-26).
 2. **Implement the whole design** (§3–§7) in one change, with its tests
    written alongside:
    - the `files` collection at the end of the system prompt, in Q1's
-     notation, its pieces asserted byte for byte against
-     `probe::qwen_knowledge` for whole files and against the
-     `...`-joined text for a file with a gap;
+     notation. The pieces are sealed separately, so the test asserts
+     **token ids**, not only bytes: the assembled pieces' tokens against the
+     tokenization of `probe::qwen_knowledge`'s text for whole files and of
+     the `...`-joined text for a file with a gap, a seam that tokenizes
+     differently cut where it tokenizes alike;
    - the pool and the fill feeding the collection, and the `working_set`
      selection allowed on a collection;
    - ingest as chunk prefill plus calibration (§7);
    - the seed chain built with the recurrence and snapshotted (§6.1), placed
      last in the collection;
-   - the close row forwarded at every projection from the seed-end
-     snapshot, the two-step rebuild around it, a new conversation opening
-     on its recurrent state and a running one keeping its own (§6.2);
+   - the close row forwarded once at the opening from the seed-end snapshot,
+     the conversation's first message prefilled straight after it, and the
+     close row a sealed piece of the conversation from then on (§6.2);
+   - `system_close` out of the birth prefix and the prompt checkpoint
+     (§6.1);
    - faces, reading summaries, the seed lineage and the code_reading groups'
      turn placement removed.
 3. **Wipe BlackWorld's zend substrate** and start the new build on it with
-   the ingest's **max depth set to 1**, so the memory holds the workspace
-   roots, their seed documents and the files one level down: small enough
-   to ingest, calibrate and normalize in one sitting.
+   the ingest's **max depth set to 1** (`max_depth: 1`, which admits only each
+   repository's own root files, `branch_ingest/filter.rs:90`), so the memory
+   holds the seed documents and the other root files: small enough to
+   ingest, calibrate and normalize in one sitting.
 4. **Run the ingest to settled.** Every depth-1 file prefilled, its
    calibration questions asked, and normalization run, until the member
-   reports its memory settled (`/v1/status`, `tenants.zend.settled`).
+   reports its memory settled (`/v1/status`, `tenants.zend.settled`) — no
+   file uncalibrated (§7.1).
 5. **Test** with questions answered by the depth-1 documents and by the
    seed documents, on the production chat path:
+   - the ranking split of §7.1: content alone, calibration alone, both;
+   - the production placement, which Q1 did not test: Q1's system prompt
+     was the persona alone and its user message told the model to answer
+     from the files above (`probe.rs:96-99`). Here the files sit after the
+     full system prompt and tool catalog, and the question carries no such
+     instruction;
    - every in-view item named, as Q1 named 16 of 16 — the measure of
      whether the presentation is fixed in production and not only on the
      passthrough route;
@@ -379,21 +621,35 @@ rollout (2026-11-26).
    This is the test of whether the fix holds. The battery's memory arms
    follow once it does.
 
-## 10. Open questions
+## 10. Documents this change revises
+
+Design documents are authoritative, so the implementing change updates
+these in the same commit:
+
+| Document | What changes |
+|---|---|
+| `docs/zend_working_set.md` §4.1, §4.9 | members keyed by `FileKey`; faces removed |
+| `docs/hit_driven_projection.md` §7, §8 | the fill's pieces are files of chunks placed in the system block; no reading floor |
+| `docs/zend_workspace_execution.md` §6, `docs/zend_branch_ingest.md` §6 | the seed is a chain of collection members, re-prefilled from a changed file on |
+| `docs/deltanet_state_persistence.md` §4.7d | `system_close` forwarded as the close row, out of the checkpoint |
+| `docs/provenance_scoped_signatures.md` §2.5 | calibration asked behind its target file |
+| `docs/guidance_layer.md` | guides and journal notes are kinds of the collection |
+
+## 11. Open questions
 
 - **Partial files.** The probes placed whole files (cut only at the 24K
   budget). Whether a file shown as chunks with `...` gaps reads as well as a
   whole file, and whether the fill should place a chunk's predecessor with
   it so a definition split at a boundary is not shown in halves, is measured
   in step 5.
-- **Calibration context.** Whether a calibration question sees only its own
-  file's members or a selection like a dialogue's.
-- **The seed chain under the dials.** The system prompt before the
-  collection is a section tree whose branch a turn's dials select, and a
-  prompt checkpoint exists per branch (`install_branch_states`). Whether the
-  seed chain and its snapshots are computed per branch, or once behind the
-  default branch and read under every branch as sealed sections are, is
-  decided in the implementation and recorded here.
+- **Calibration context** — decided 2026-11-26: a draft and its calibrated
+  questions both see the target file's members only, the seed files
+  included: a seed file is calibrated behind itself alone, not behind the
+  chain, so `OWN_FILE` (`calibrate/sections.rs`), which exists because a
+  link's draft saw the chain, goes. The draft's reading check
+  (`calibrate/draft_sight.rs`, `reading_held`) and its prompts ("It is above,
+  already read", `projection.yaml:850-874`) are rewritten for a file in the
+  knowledge base.
 - **Journal notes and guides.** They move with readings; whether the
   per-conversation `journal` collection should render in the same format is
   left as it is.
