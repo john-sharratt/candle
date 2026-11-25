@@ -2118,7 +2118,7 @@ Qwen3.8-Flash-Next is 125B + 51B n-gram + 4B MTP, 6B active** (§3.1, E60).
 | *RTX 4090 24 GB* | Core Ultra 7 270K, 96 GB DDR5 | llama.cpp | UD-IQ3_XXS | `--fit on` | **q8_0** | 6K / 90K / 110K | ~1,360 / ~905 / ~863 | ~30 / ~22 / ~19.5 | E49 |
 | *RTX 4090 24 GB* | same | same | same | same | **q4_0** vs **q8_0** | 32K | — | 28.9 vs 30.1 | E49 |
 | *RTX 4090 24 GB* | n/s | n/s | n/s | n/s | f16 ("no kv cache quantization") | 250K | 364 | 21 (no MTP) | E50 |
-| *RTX 5090* | Ryzen 7 9700X, 128 GB DDR5 | llama.cpp PR #27742 | UD-Q2_K_XL | `-ncmoe 24` | n/s | 65,536 | 1,429 | 48.02 short; 43.28 after ~16K | E52 |
+| *RTX 5090* | Ryzen 7 9700X, 128 GB DDR5 | llama.cpp PR #27742 (`0b19188e9`) | UD-Q2_K_XL | `-ncmoe 24`; no MTP (not implemented in that PR), four n-gram speculation modes tried and each slower | n/s | 65,536 | 1,429 | 48.02 short; 43.28 after ~16K | E52 |
 | *RTX PRO 6000 Blackwell* | n/s | n/s (Unsloth) | n/s | n/s | n/s | n/s | — | 100; 170 **MTP** | E53 |
 | *RTX 5090* | Core Ultra 9 285K, 64 GB, PCIe 5 x16 | Strata 0.1.29 (d6708a4) | IQ2_XS | 17,463 expert slots (23.4 GiB, 71% of the experts) in VRAM, misses on the CPU | INT8 | 4K / 32K / 128K | 4,269.8 / 5,543.2 / 5,778.7 | 179.4 / 175.7 / 165.0 (**MTP**) | E91 |
 | *RTX 5070 12 GB* | Ryzen 5 7600, 64 GB DDR5-5200 | Strata 0.1.36 | Q2_0 / IQ3_S | ~4.8 GiB expert cache (14% of the experts) in VRAM, misses on the CPU | n/s | 4K answers, 32K prompt | 2,650 / 1,620 | 94 / 53 (**MTP**) | E90 |

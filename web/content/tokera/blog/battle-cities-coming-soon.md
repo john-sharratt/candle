@@ -1,7 +1,7 @@
 ---
 title: "Battle Cities is coming"
 date: 2026-08-23
-feature: 4
+feature: 5
 tint: crit
 tags: [battle-cities, games]
 summary: >-

@@ -1,6 +1,6 @@
 # One Card, One Stack: Constraint-Driven Architecture for Asymptotically Stable Inference over Unbounded Agent Memory
 
-> **Version 2.** v1 (13 May 2026, [10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) is archived with an erratum at `docs/unbounded_agents_v1.md`; its "509 t/s" and "2,446 t/s" headlines were prefill rates and are withdrawn. v2 adds a measured evaluation across three machines and twelve models from 0.5B to 284B parameters (§9.6), every number produced by a test in this repository and recorded in `docs/performance.md`, and runs the retrieval evaluation on the production system (§9.11–§9.12). §4.1–§4.3 describe the v1 design on Qwen3-30B-A3B; provenance as production runs it is §6.
+> **Version 2.** v1 ([10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) and its erratum: Appendix A.
 
 **Abstract**
 
@@ -10,7 +10,7 @@ Persistent agents need context that grows without bound. Under full attention ev
 
 The system combines (1) online Markov expert prediction with wave-batched grouped GEMM for MoE inference under partial VRAM residency; (2) per-block adaptive KV quantization across eleven levels (C0–C10) with asymmetric K/V error metrics and a prefill refresh at every turn seal, compressing the KV cache 4.1–7.6× at the top level across the fleet's compressing models; (3) attentional provenance indexing — Q-vector sign signatures scanned on the GPU, re-selecting the working set during decode; and (4) an unbounded three-tier context, VRAM-hot, RAM-warm and disk-cold.
 
-Implemented in Rust on a Candle fork, the system runs a **180B-parameter MoE model on a 16 GB laptop GPU**, serving eight sessions at 108.5 t/s aggregate decode, above every published llama.cpp run of the model and every published multi-session figure for it. From 32K to 128K tokens it keeps **96–99% of its prefill and 93–111% of its decode** across two tasks. One card's aggregate decode is **1.4–37.9×** the best published llama.cpp single-stream rate for the same model and card class, reaching **2,869.9 t/s across 64 sessions**, and a **284B model serves sixteen sessions from one GPU** at 4.1× the best published single-GPU decode.
+Implemented in Rust on a Candle fork, the system runs a **180B-parameter MoE model on a 16 GB laptop GPU**, decoding one session at 34.9 t/s — above the 27.5–29 published for an RTX 5080, the same 16 GB class with twice the host RAM — and eight at 108.5 t/s aggregate, above every published llama.cpp run of the model and every published multi-session figure for it. On a 72 GB RTX PRO 5000, from 32K to 128K tokens it keeps **96–99% of its prefill and 93–111% of its decode** across two tasks. One card's aggregate decode is **1.4–37.9×** the best published llama.cpp single-stream rate for the same model and card class, reaching **2,869.9 t/s across 64 sessions**, and a **284B model serves sixteen sessions from one GPU** at 4.1× the best published single-GPU decode.
 
 On the system's own 2.2M-line codebase, retrieval ranks one of a question's answer files first among 7,943 files on 49% of 121 questions and in the top five on 69%, by Q-signature agreement alone. Answering 128 questions from memory with tools forbidden, over seven memory arms and three to seven runs each, the memory is worth **37.0 points of recall**, re-selection during reasoning 5.3, and continuous re-selection 6.9 over a single retrieval, every interval clear of zero (§9.12). Mid-decode reprojection selects every fact planted in a history twelve times the working set, at the top compression level as at near-lossless, where a single projection and a rolling window select none (§9.11.2).
 
@@ -24,8 +24,8 @@ The fix here is to decouple the tokens that take part in a step from the tokens 
 
 The system came from two constraints held together: persistent agent conversations, the hardest form of the memory problem (verbatim recall across unbounded sessions, many agents at once), and a single 16 GB consumer GPU. Each constraint closed the standard solution: GEMM dequantisation OOMed, so the matmul kernels read quantized weights natively; full context could not be held hot, so attention became provenance-selected; materialising turns at F16 OOMed, so quantization became two-phase (§11.5). The result, on that card and two larger ones:
 
-- A **180B-parameter MoE model** (Qwen3.8-Flash-Next, 6B active) on a 16 GB laptop GPU with 32 GB of RAM, experts streamed VRAM → RAM → NVMe, serving eight sessions at 108.5 t/s aggregate decode — above every published llama.cpp run of it, each on a host with 64–128 GB, and above Strata's published 63.1 t/s across four sessions (§9.6.5).
-- **Throughput flat in depth**: 96–99% of prefill and 93–111% of decode kept from 32K to 128K across two tasks (§9.6.2).
+- A **180B-parameter MoE model** (Qwen3.8-Flash-Next, 6B active) on a 16 GB laptop GPU with 32 GB of RAM, experts streamed VRAM → RAM → NVMe, decoding one session at 34.9 t/s against the 27.5–29 published for an RTX 5080 with 64 GB [32], and eight at 108.5 t/s aggregate — above every published llama.cpp run of it, each on a host with 64–128 GB, and above Strata's published 63.1 t/s across four sessions (§9.6.5).
+- **Throughput flat in depth**: 96–99% of prefill and 93–111% of decode kept from 32K to 128K across two tasks on the RTX PRO 5000 (§9.6.2).
 - **KV compression up to 7.6×**, each 32-token block choosing its format as it is sealed; at 8K the top level costs 2–8% of decode for 4.6–6.3× (§9.6.3).
 - **Concurrency**: aggregate decode 1.4–37.9× the best published llama.cpp rate for the same model and card class, 2,869.9 t/s across 64 sessions on one card; a 284B model at sixteen sessions on one GPU, 4.1× the best published single-GPU decode (§9.6.4, §9.6.6).
 - **Retrieval over its own codebase**: an answer file first of 7,943 on 49% of 121 questions and top-five on 69%; the memory worth 37.0 points of recall with tools forbidden, re-selection during reasoning 5.3 (§9.12).
@@ -652,13 +652,13 @@ Figure 9.6-2 sets our aggregate decode, serving concurrent sessions, against the
 </svg>
 </figure>
 
-The 16 GB Qwen3.6-35B row sets our streamed Q6_K experts against a 3-bit quant that fits wholly in VRAM, which decodes one stream faster: 1.4–1.8×.
+The 16 GB Qwen3.6-35B row sets our streamed Q6_K experts against a 3-bit quant that fits wholly in VRAM, which decodes one stream faster: 1.4–1.8×. Every Flash-Next figure here decodes with the model's own MTP head, part of its 180B; [42]'s llama.cpp build had not implemented it, and the four n-gram speculation modes it tried instead were each slower than plain decoding, while [32]'s RTX 5080 drafts from the model's n-gram table.
 
 #### 9.6.5 The 16GB laptop
 
 The RTX 4090 Laptop GPU with 32 GB of RAM is the constraint the architecture was designed under.
 
-- **A 180B model.** Qwen3.8-Flash-Next (a 125B trunk of 512 experts, a 51B n-gram table and a 4B MTP head; 6B active) runs from a ~88 GB Q2_KO-expert artifact, streaming VRAM → pinned RAM → NVMe, every rung validating 8/8. One session prefills at 269.1 t/s and decodes at 34.9; eight decode at **108.5 t/s aggregate**, and C10 at 5.79–5.82× costs 6.6% of that. Every published single-GPU run that states its host uses 64–128 GB of RAM: an RTX 5090 with 128 GB decodes one stream at 48.02 t/s [42], an RTX 5080 with 64 GB at 27.5–29 [32].
+- **A 180B model.** Qwen3.8-Flash-Next (a 125B trunk of 512 experts, a 51B n-gram table and a 4B MTP head; 6B active) runs from a ~88 GB Q2_KO-expert artifact, streaming VRAM → pinned RAM → NVMe, every rung validating 8/8. One session prefills at 269.1 t/s and decodes at 34.9; eight decode at **108.5 t/s aggregate**, and C10 at 5.79–5.82× costs 6.6% of that. Every published single-GPU run that states its host uses 64–128 GB of RAM: an RTX 5090 with 128 GB decodes one stream at 48.02 t/s [42], an RTX 5080 with 64 GB at 27.5–29 [32], the latter drafting from the n-gram table as ours drafts from the MTP head (§9.6.4).
 - **A 30B MoE streaming its experts** prefills at **6,139.1 t/s** (Qwen3-30B-A3B, Q8_0 ×20).
 - **A 35B MoE serving sixteen.** Qwen3.5- and Qwen3.6-35B-A3B at Q6_K, ~28 GB of weights, serve ×16 at **330.8 and 336.7 t/s aggregate**, C10 at 7.01× and 6.42×. Published 16 GB runs are single-stream at quants that fit resident [38].
 - **A small model at workstation rate.** Qwen3.5-0.8B at C8 ×32 prefills at **46,056.8 t/s** and decodes at **3,810.7 t/s aggregate**, above the RTX 3090's 42,982.2 on the same rung.
@@ -1010,16 +1010,17 @@ A harder property than recall: multi-hop reasoning over the system's own Candle 
 | C0 | off | Full | full | — |
 | C1 | on | Full | full | the production system |
 | R1 | off | Minimal | — | retrieval-augmented generation: BM25's top files as text |
+| P1 | off | Minimal | — | the memory's own selection, as text under R1's budget |
 | T1 | off | Minimal | — | reading the repository with tools, for reference |
 
-The two baselines project no memory. **R1** ranks every text file of the repository by BM25 over identifier terms of path and body (`zend/examples/dependency_battery/rag/`), the battery and its results left out of the index, and packs the best-ranked files, whole, into the prompt ahead of the question until 24,000 tokens, cutting the file that reaches the budget; its prompt asks for an answer from those files. **T1** may call the workspace's read and search tools and answers once it has read what it needs.
+The two baselines project no memory. **R1** ranks every text file of the repository by BM25 over identifier terms of path and body (`zend/examples/dependency_battery/rag/`), the battery and its results left out of the index, and packs the best-ranked files, whole, into the prompt ahead of the question until 24,000 tokens, cutting the file that reaches the budget; its prompt asks for an answer from those files. **P1** asks C1 the question first, takes the files of the reading turns its governing projection point placed, in that point's own order, and packs them whole under R1's budget and prompt, so it differs from R1 in the selection alone and from C1 in reading text instead of K/V. **T1** may call the workspace's read and search tools and answers once it has read what it needs.
 
-**Running.** On BlackWorld through the daemon's chat API (`dependency_battery run`), the first 748 answers at build 5470-6eb469ce5 and the rest at 5475-3c73da839, which changes no retrieval dial. One fresh conversation per question, its arm's dials on the request, deleted once its answer and projection points (`GET /v1/conversations/{id}/placements`) are read; every memory arm's question asks for an answer from memory with no tool. The first 142 answers ran sixteen at once and the rest eight, and the order mixes the arms throughout, so drift falls on every arm alike. Each arm answers the 128 questions three times: 2,688 answers. The runs added after — R1 and T1 three times each, B1 runs 4–6, C1 runs 4–7, R1 run 4 — ran sixteen at once, interleaved across the arms still owed, on the builds deployed while they ran; none changed retrieval code (no commit to `candle-conversation/src/projection`, `provenance` or `scheduler/reproject*` in the period). 4,480 answers in all.
+**Running.** On BlackWorld through the daemon's chat API (`dependency_battery run`), the first 748 answers at build 5470-6eb469ce5 and the rest at 5475-3c73da839, which changes no retrieval dial. One fresh conversation per question, its arm's dials on the request, deleted once its answer and projection points (`GET /v1/conversations/{id}/placements`) are read; every memory arm's question asks for an answer from memory with no tool. The first 142 answers ran sixteen at once and the rest eight, and the order mixes the arms throughout, so drift falls on every arm alike. Each arm answers the 128 questions three times: 2,688 answers. The runs added after — R1 and T1 three times each, B1 runs 4–6, C1 runs 4–7, R1 run 4 — ran sixteen at once, interleaved across the arms still owed, on the builds deployed while they ran; none changed retrieval code (no commit to `candle-conversation/src/projection`, `provenance` or `scheduler/reproject*` in the period). P1 ran once, sixteen at once, at build 5564-10dd9ff2b, which changes no retrieval code either, started only once the member reported its memory settled — every file ingested, calibrated and normalized. 4,608 answers in all.
 
-**Scoring.** Recall is the share of a question's expected items the answer names, any spelling, case-insensitive; a question's score in an arm is its mean over the arm's runs. Intervals are 95% bootstrap intervals over questions (10,000 resamples, paired for differences); contrasts are Wilcoxon signed-rank on per-question differences, Holm-corrected across the five pre-registered, and the three against the baselines as a family of their own. Every figure's data and `summary.md` are in `docs/results/battery_128/`.
+**Scoring.** Recall is the share of a question's expected items the answer names, any spelling, case-insensitive; a question's score in an arm is its mean over the arm's runs. Intervals are 95% bootstrap intervals over questions (10,000 resamples, paired for differences); contrasts are Wilcoxon signed-rank on per-question differences, Holm-corrected across the five pre-registered, and the four against the baselines as a family of their own. Every figure's data and `summary.md` are in `docs/results/battery_128/`.
 
 <figure class="fig">
-<svg viewBox="0 0 640 306" role="img" aria-label="Figure 9.12-1. Mean recall by arm over 128 questions, each with its 95% bootstrap interval: A0 0.4% (0.1% to 0.9%); A1 0.5% (0.1% to 1.0%); D1 30.6% (25.0% to 36.4%); B0 31.9% (26.1% to 37.7%); B1 32.2% (26.8% to 37.6%); C0 36.7% (30.8% to 42.6%); C1 37.5% (31.7% to 43.1%); R1 52.6% (46.1% to 58.9%); T1 95.3% (93.3% to 97.1%). Of the memory arms, the reprojecting C0 and C1 recall the most; R1 is handed BM25's files as text and T1 reads the repository with tools.">
+<svg viewBox="0 0 640 306" role="img" aria-label="Figure 9.12-1. Mean recall by arm over 128 questions, each with its 95% bootstrap interval: A0 0.4% (0.1% to 0.9%); A1 0.5% (0.1% to 1.0%); D1 30.6% (25.0% to 36.4%); B0 31.9% (26.1% to 37.7%); B1 32.2% (26.8% to 37.6%); C0 36.7% (30.8% to 42.6%); C1 37.5% (31.7% to 43.1%); R1 52.6% (46.1% to 58.9%); P1 44.0% (37.4% to 50.9%); T1 95.3% (93.3% to 97.1%). Of the memory arms, the reprojecting C0 and C1 recall the most; R1 is handed BM25's files as text, P1 the memory's own selection as text, and T1 reads the repository with tools.">
   <text class="ttl" x="16" y="20">Figure 9.12-1 · Recall by arm</text>
   <text class="ttl-sub" x="16" y="38">mean recall over 128 questions · bar: 95% bootstrap interval · small dots: each run's mean</text>
   <path class="grid" d="M70 231.2 H624 M70 212.4 H624 M70 193.6 H624 M70 174.8 H624 M70 156 H624 M70 137.2 H624 M70 118.4 H624 M70 99.6 H624 M70 80.8 H624 M70 62 H624"/>
@@ -1035,95 +1036,102 @@ The two baselines project no memory. **R1** ranks every text file of the reposit
   <text class="tick" x="62" y="84.3" text-anchor="end">90%</text>
   <text class="tick" x="62" y="65.5" text-anchor="end">100%</text>
   <path class="grid base" d="M70 250 H624"/>
-  <rect class="them" opacity="0.35" x="93.8" y="248.4" width="14" height="1.5"/>
-  <circle class="q1" cx="116.8" cy="249.1" r="2.5"/>
-  <circle class="q1" cx="116.8" cy="249.2" r="2.5"/>
-  <circle class="q1" cx="116.8" cy="249.4" r="2.5"/>
-  <circle class="dot-them" cx="100.8" cy="249.3" r="6"/>
-  <text class="v-them mid" x="100.8" y="240.4">0.4%</text>
-  <text class="cat mid" x="100.8" y="268">A0</text>
-  <text class="cat-sub mid" x="100.8" y="282">no memory</text>
-  <text class="cat-sub mid" x="100.8" y="295">no seed</text>
-  <rect class="them" opacity="0.35" x="155.3" y="248.1" width="14" height="1.7"/>
-  <circle class="q1" cx="178.3" cy="248.8" r="2.5"/>
-  <circle class="q1" cx="178.3" cy="249.2" r="2.5"/>
-  <circle class="q1" cx="178.3" cy="249.3" r="2.5"/>
-  <circle class="dot-them" cx="162.3" cy="249.1" r="6"/>
-  <text class="v-them mid" x="162.3" y="240.1">0.5%</text>
-  <text class="cat mid" x="162.3" y="268">A1</text>
-  <text class="cat-sub mid" x="162.3" y="282">no memory</text>
-  <text class="cat-sub mid" x="162.3" y="295">seed</text>
-  <rect class="them" opacity="0.35" x="216.9" y="181.5" width="14" height="21.5"/>
-  <circle class="q1" cx="239.9" cy="192.1" r="2.5"/>
-  <circle class="q1" cx="239.9" cy="191.1" r="2.5"/>
-  <circle class="q1" cx="239.9" cy="194" r="2.5"/>
-  <circle class="dot-them" cx="223.9" cy="192.4" r="6"/>
-  <text class="v-them mid" x="223.9" y="173.5">30.6%</text>
-  <text class="cat mid" x="223.9" y="268">D1</text>
-  <text class="cat-sub mid" x="223.9" y="282">once</text>
-  <text class="cat-sub mid" x="223.9" y="295">seed</text>
-  <rect class="them" opacity="0.35" x="278.4" y="179.1" width="14" height="21.8"/>
-  <circle class="q1" cx="301.4" cy="190.4" r="2.5"/>
-  <circle class="q1" cx="301.4" cy="192.9" r="2.5"/>
-  <circle class="q1" cx="301.4" cy="186.9" r="2.5"/>
-  <circle class="dot-them" cx="285.4" cy="190.1" r="6"/>
-  <text class="v-them mid" x="285.4" y="171.1">31.9%</text>
-  <text class="cat mid" x="285.4" y="268">B0</text>
-  <text class="cat-sub mid" x="285.4" y="282">held</text>
-  <text class="cat-sub mid" x="285.4" y="295">no seed</text>
-  <rect class="them" opacity="0.35" x="340" y="179.2" width="14" height="20.4"/>
-  <circle class="q1" cx="363" cy="187.2" r="2.5"/>
-  <circle class="q1" cx="363" cy="188.7" r="2.5"/>
-  <circle class="q1" cx="363" cy="190.8" r="2.5"/>
-  <circle class="q1" cx="363" cy="189.7" r="2.5"/>
-  <circle class="q1" cx="363" cy="190.3" r="2.5"/>
-  <circle class="q1" cx="363" cy="190.4" r="2.5"/>
-  <circle class="dot-them" cx="347" cy="189.5" r="6"/>
-  <text class="v-them mid" x="347" y="171.2">32.2%</text>
-  <text class="cat mid" x="347" y="268">B1</text>
-  <text class="cat-sub mid" x="347" y="282">held</text>
-  <text class="cat-sub mid" x="347" y="295">seed</text>
-  <rect class="us-soft" x="401.6" y="169.9" width="14" height="22.1"/>
-  <circle class="q1" cx="424.6" cy="180.7" r="2.5"/>
-  <circle class="q1" cx="424.6" cy="179.2" r="2.5"/>
-  <circle class="q1" cx="424.6" cy="182.9" r="2.5"/>
-  <circle class="dot-us" cx="408.6" cy="180.9" r="6"/>
-  <text class="v-us mid" x="408.6" y="161.9">36.7%</text>
-  <text class="cat mid" x="408.6" y="268">C0</text>
-  <text class="cat-sub mid" x="408.6" y="282">reprojecting</text>
-  <text class="cat-sub mid" x="408.6" y="295">no seed</text>
-  <rect class="us-soft" x="463.1" y="169" width="14" height="21.3"/>
-  <circle class="q1" cx="486.1" cy="181.3" r="2.5"/>
-  <circle class="q1" cx="486.1" cy="176.1" r="2.5"/>
-  <circle class="q1" cx="486.1" cy="183" r="2.5"/>
-  <circle class="q1" cx="486.1" cy="176.9" r="2.5"/>
-  <circle class="q1" cx="486.1" cy="180.5" r="2.5"/>
-  <circle class="q1" cx="486.1" cy="178.1" r="2.5"/>
-  <circle class="q1" cx="486.1" cy="180.7" r="2.5"/>
-  <circle class="dot-us" cx="470.1" cy="179.5" r="6"/>
-  <text class="v-us mid" x="470.1" y="161">37.5%</text>
-  <text class="cat mid" x="470.1" y="268">C1</text>
-  <text class="cat-sub mid" x="470.1" y="282">reprojecting</text>
-  <text class="cat-sub mid" x="470.1" y="295">seed</text>
-  <rect class="them" opacity="0.35" x="524.7" y="139.3" width="14" height="24"/>
-  <circle class="q1" cx="547.7" cy="148" r="2.5"/>
-  <circle class="q1" cx="547.7" cy="153" r="2.5"/>
-  <circle class="q1" cx="547.7" cy="151.8" r="2.5"/>
-  <circle class="q1" cx="547.7" cy="151.7" r="2.5"/>
-  <circle class="dot-them" cx="531.7" cy="151.1" r="6"/>
-  <text class="v-them mid" x="531.7" y="131.3">52.6%</text>
-  <text class="cat mid" x="531.7" y="268">R1</text>
-  <text class="cat-sub mid" x="531.7" y="282">BM25 files</text>
-  <text class="cat-sub mid" x="531.7" y="295">no seed</text>
-  <rect class="them" opacity="0.35" x="586.2" y="67.4" width="14" height="7.3"/>
-  <circle class="q1" cx="609.2" cy="71.4" r="2.5"/>
-  <circle class="q1" cx="609.2" cy="70.7" r="2.5"/>
-  <circle class="q1" cx="609.2" cy="70.2" r="2.5"/>
-  <circle class="dot-them" cx="593.2" cy="70.8" r="6"/>
-  <text class="v-them mid" x="593.2" y="59.4">95.3%</text>
-  <text class="cat mid" x="593.2" y="268">T1</text>
-  <text class="cat-sub mid" x="593.2" y="282">tools</text>
-  <text class="cat-sub mid" x="593.2" y="295">no seed</text>
+  <rect class="them" opacity="0.35" x="90.7" y="248.4" width="14" height="1.5"/>
+  <circle class="q1" cx="113.7" cy="249.1" r="2.5"/>
+  <circle class="q1" cx="113.7" cy="249.2" r="2.5"/>
+  <circle class="q1" cx="113.7" cy="249.4" r="2.5"/>
+  <circle class="dot-them" cx="97.7" cy="249.3" r="6"/>
+  <text class="v-them mid" x="97.7" y="240.4">0.4%</text>
+  <text class="cat mid" x="97.7" y="268">A0</text>
+  <text class="cat-sub mid" x="97.7" y="282">none</text>
+  <text class="cat-sub mid" x="97.7" y="295">no seed</text>
+  <rect class="them" opacity="0.35" x="146.1" y="248.1" width="14" height="1.7"/>
+  <circle class="q1" cx="169.1" cy="248.8" r="2.5"/>
+  <circle class="q1" cx="169.1" cy="249.2" r="2.5"/>
+  <circle class="q1" cx="169.1" cy="249.3" r="2.5"/>
+  <circle class="dot-them" cx="153.1" cy="249.1" r="6"/>
+  <text class="v-them mid" x="153.1" y="240.1">0.5%</text>
+  <text class="cat mid" x="153.1" y="268">A1</text>
+  <text class="cat-sub mid" x="153.1" y="282">none</text>
+  <text class="cat-sub mid" x="153.1" y="295">seed</text>
+  <rect class="them" opacity="0.35" x="201.5" y="181.5" width="14" height="21.5"/>
+  <circle class="q1" cx="224.5" cy="192.1" r="2.5"/>
+  <circle class="q1" cx="224.5" cy="191.1" r="2.5"/>
+  <circle class="q1" cx="224.5" cy="194" r="2.5"/>
+  <circle class="dot-them" cx="208.5" cy="192.4" r="6"/>
+  <text class="v-them mid" x="208.5" y="173.5">30.6%</text>
+  <text class="cat mid" x="208.5" y="268">D1</text>
+  <text class="cat-sub mid" x="208.5" y="282">once</text>
+  <text class="cat-sub mid" x="208.5" y="295">seed</text>
+  <rect class="them" opacity="0.35" x="256.9" y="179.1" width="14" height="21.8"/>
+  <circle class="q1" cx="279.9" cy="190.4" r="2.5"/>
+  <circle class="q1" cx="279.9" cy="192.9" r="2.5"/>
+  <circle class="q1" cx="279.9" cy="186.9" r="2.5"/>
+  <circle class="dot-them" cx="263.9" cy="190.1" r="6"/>
+  <text class="v-them mid" x="263.9" y="171.1">31.9%</text>
+  <text class="cat mid" x="263.9" y="268">B0</text>
+  <text class="cat-sub mid" x="263.9" y="282">held</text>
+  <text class="cat-sub mid" x="263.9" y="295">no seed</text>
+  <rect class="them" opacity="0.35" x="312.3" y="179.2" width="14" height="20.4"/>
+  <circle class="q1" cx="335.3" cy="187.2" r="2.5"/>
+  <circle class="q1" cx="335.3" cy="188.7" r="2.5"/>
+  <circle class="q1" cx="335.3" cy="190.8" r="2.5"/>
+  <circle class="q1" cx="335.3" cy="189.7" r="2.5"/>
+  <circle class="q1" cx="335.3" cy="190.3" r="2.5"/>
+  <circle class="q1" cx="335.3" cy="190.4" r="2.5"/>
+  <circle class="dot-them" cx="319.3" cy="189.5" r="6"/>
+  <text class="v-them mid" x="319.3" y="171.2">32.2%</text>
+  <text class="cat mid" x="319.3" y="268">B1</text>
+  <text class="cat-sub mid" x="319.3" y="282">held</text>
+  <text class="cat-sub mid" x="319.3" y="295">seed</text>
+  <rect class="us-soft" x="367.7" y="169.9" width="14" height="22.1"/>
+  <circle class="q1" cx="390.7" cy="180.7" r="2.5"/>
+  <circle class="q1" cx="390.7" cy="179.2" r="2.5"/>
+  <circle class="q1" cx="390.7" cy="182.9" r="2.5"/>
+  <circle class="dot-us" cx="374.7" cy="180.9" r="6"/>
+  <text class="v-us mid" x="374.7" y="161.9">36.7%</text>
+  <text class="cat mid" x="374.7" y="268">C0</text>
+  <text class="cat-sub mid" x="374.7" y="282">full</text>
+  <text class="cat-sub mid" x="374.7" y="295">no seed</text>
+  <rect class="us-soft" x="423.1" y="169" width="14" height="21.3"/>
+  <circle class="q1" cx="446.1" cy="181.3" r="2.5"/>
+  <circle class="q1" cx="446.1" cy="176.1" r="2.5"/>
+  <circle class="q1" cx="446.1" cy="183" r="2.5"/>
+  <circle class="q1" cx="446.1" cy="176.9" r="2.5"/>
+  <circle class="q1" cx="446.1" cy="180.5" r="2.5"/>
+  <circle class="q1" cx="446.1" cy="178.1" r="2.5"/>
+  <circle class="q1" cx="446.1" cy="180.7" r="2.5"/>
+  <circle class="dot-us" cx="430.1" cy="179.5" r="6"/>
+  <text class="v-us mid" x="430.1" y="161">37.5%</text>
+  <text class="cat mid" x="430.1" y="268">C1</text>
+  <text class="cat-sub mid" x="430.1" y="282">full</text>
+  <text class="cat-sub mid" x="430.1" y="295">seed</text>
+  <rect class="them" opacity="0.35" x="478.5" y="139.3" width="14" height="24"/>
+  <circle class="q1" cx="501.5" cy="148" r="2.5"/>
+  <circle class="q1" cx="501.5" cy="153" r="2.5"/>
+  <circle class="q1" cx="501.5" cy="151.8" r="2.5"/>
+  <circle class="q1" cx="501.5" cy="151.7" r="2.5"/>
+  <circle class="dot-them" cx="485.5" cy="151.1" r="6"/>
+  <text class="v-them mid" x="485.5" y="131.3">52.6%</text>
+  <text class="cat mid" x="485.5" y="268">R1</text>
+  <text class="cat-sub mid" x="485.5" y="282">BM25</text>
+  <text class="cat-sub mid" x="485.5" y="295">no seed</text>
+  <rect class="them" opacity="0.35" x="533.9" y="154.4" width="14" height="25.4"/>
+  <circle class="q1" cx="556.9" cy="167.2" r="2.5"/>
+  <circle class="dot-them" cx="540.9" cy="167.2" r="6"/>
+  <text class="v-them mid" x="540.9" y="146.4">44.0%</text>
+  <text class="cat mid" x="540.9" y="268">P1</text>
+  <text class="cat-sub mid" x="540.9" y="282">selected</text>
+  <text class="cat-sub mid" x="540.9" y="295">no seed</text>
+  <rect class="them" opacity="0.35" x="589.3" y="67.4" width="14" height="7.3"/>
+  <circle class="q1" cx="612.3" cy="71.4" r="2.5"/>
+  <circle class="q1" cx="612.3" cy="70.7" r="2.5"/>
+  <circle class="q1" cx="612.3" cy="70.2" r="2.5"/>
+  <circle class="dot-them" cx="596.3" cy="70.8" r="6"/>
+  <text class="v-them mid" x="596.3" y="59.4">95.3%</text>
+  <text class="cat mid" x="596.3" y="268">T1</text>
+  <text class="cat-sub mid" x="596.3" y="282">tools</text>
+  <text class="cat-sub mid" x="596.3" y="295">no seed</text>
 </svg>
 </figure>
 
@@ -1390,11 +1398,11 @@ The gain lies on the 111 questions that do not name their answer's file, 5.7 poi
   <path class="line-us" d="M62 199.8 70.7 199.8 79.3 148.3 88 152.2 96.6 153.8 105.3 159.2 113.9 160.8 122.6 158.4 131.3 156.1 139.9 163.1 148.6 153.7 157.2 156.9 165.9 160 174.5 160.8 183.2 152.2 191.8 155.3 200.5 160 209.2 157.7 217.8 149.8 226.5 153.8 235.1 152.2 243.8 148.3 252.4 155.3 261.1 153.8 269.8 156.9 278.4 153.8 287.1 151.4 295.7 151.4 304.4 154.5 313 152.2 321.7 153 330.3 152.2 339 153.8 347.7 151.4 356.3 151.4 365 153 373.6 149.8 382.3 150.6 390.9 149.8 399.6 149.1 408.3 149.8 416.9 150.6 425.6 152.2 434.2 151.4 442.9 149.1 451.5 150.6 460.2 150.6 468.8 149.8 486.2 149.8 494.8 150.6 503.5 149.8 512.1 149.8 520.8 150.6 529.4 149.8 538.1 150.6 555.4 150.6 564.1 152.2 572.7 150.6 581.4 149.1 590 149.8 616 149.8"/>
   <g class="legend">
   <path class="line-us" d="M330 53 H344"/>
-  <text x="348" y="56">C1 reprojecting</text>
-  <path class="line-them" d="M457 53 H471"/>
-  <text x="475" y="56">B1 held</text>
-  <path class="line-them dash" d="M534.4 53 H548.4"/>
-  <text x="552.4" y="56">D1 once</text>
+  <text x="348" y="56">C1 full</text>
+  <path class="line-them" d="M407.4 53 H421.4"/>
+  <text x="425.4" y="56">B1 held</text>
+  <path class="line-them dash" d="M484.8 53 H498.8"/>
+  <text x="502.8" y="56">D1 once</text>
   </g>
 </svg>
 </figure>
@@ -1428,48 +1436,54 @@ With reprojection the share of answers with an answer file in the working set ju
 
 Over 2,816 answers in the projecting arms, recall is 51.4% (49.6–53.2%) with the answer file placed for the first answer token and 13.7% (12.1–15.3%) without it: retrieval and the answers are one measurement seen twice.
 
-**Against retrieval-augmented generation.** R1 hands the model the files BM25 ranks best for the question, as text, under a 24,000-token budget; T1 reads the repository with tools. Their contrasts form a second Holm family, so the five above are corrected without them:
+**Against retrieval-augmented generation.** R1 hands the model the files BM25 ranks best for the question, as text, under a 24,000-token budget; P1 hands it the memory's own selection the same way; T1 reads the repository with tools. Their contrasts form a second Holm family, so the five above are corrected without them:
 
 <figure class="fig">
-<svg viewBox="0 0 640 214" role="img" aria-label="Figure 9.12-2b. The effect of each contrast on mean recall over 128 paired questions, with its 95% bootstrap interval and Holm-corrected Wilcoxon p-value: the memory against BM25 retrieval (C1 − R1 · Holm p = 4.3e-4), −15.1 points (−23.0 to −7.1); the memory against tool use (C1 − T1 · Holm p = 3.0e-21), −57.8 points (−64.1 to −51.5); BM25 retrieval against the seed files (R1 − A1 · Holm p = 1.3e-18), +52.1 points (+45.6 to +58.4).">
+<svg viewBox="0 0 640 254" role="img" aria-label="Figure 9.12-2b. The effect of each contrast on mean recall over 128 paired questions, with its 95% bootstrap interval and Holm-corrected Wilcoxon p-value: the memory against BM25 retrieval (C1 − R1 · Holm p = 8.7e-4), −15.1 points (−23.0 to −7.1); the memory's selection against BM25's, both read as text (P1 − R1 · Holm p = 0.047), −8.5 points (−16.9 to −0.1); the memory against tool use (C1 − T1 · Holm p = 4.0e-21), −57.8 points (−64.1 to −51.5); BM25 retrieval against the seed files (R1 − A1 · Holm p = 2.0e-18), +52.1 points (+45.6 to +58.4).">
   <text class="ttl" x="16" y="20">Figure 9.12-2b · The memory against the baselines</text>
   <text class="ttl-sub" x="16" y="38">paired difference in mean recall, points · 128 questions · 95% interval · faded: Holm p ≥ 0.05</text>
-  <path class="grid" d="M372 66 V190 M389.8 66 V190 M407.7 66 V190 M425.5 66 V190 M443.4 66 V190 M461.2 66 V190 M479.1 66 V190 M496.9 66 V190 M514.8 66 V190 M532.6 66 V190 M550.5 66 V190 M568.3 66 V190 M586.2 66 V190 M604 66 V190"/>
-  <text class="tick mid" x="372" y="204">−70</text>
-  <text class="tick mid" x="407.7" y="204">−50</text>
-  <text class="tick mid" x="443.4" y="204">−30</text>
-  <text class="tick mid" x="479.1" y="204">−10</text>
-  <text class="tick mid" x="496.9" y="204">0</text>
-  <text class="tick mid" x="532.6" y="204">+20</text>
-  <text class="tick mid" x="568.3" y="204">+40</text>
-  <text class="tick mid" x="604" y="204">+60</text>
-  <path class="parity" d="M496.9 66 V190"/>
+  <path class="grid" d="M372 66 V230 M389.8 66 V230 M407.7 66 V230 M425.5 66 V230 M443.4 66 V230 M461.2 66 V230 M479.1 66 V230 M496.9 66 V230 M514.8 66 V230 M532.6 66 V230 M550.5 66 V230 M568.3 66 V230 M586.2 66 V230 M604 66 V230"/>
+  <text class="tick mid" x="372" y="244">−70</text>
+  <text class="tick mid" x="407.7" y="244">−50</text>
+  <text class="tick mid" x="443.4" y="244">−30</text>
+  <text class="tick mid" x="479.1" y="244">−10</text>
+  <text class="tick mid" x="496.9" y="244">0</text>
+  <text class="tick mid" x="532.6" y="244">+20</text>
+  <text class="tick mid" x="568.3" y="244">+40</text>
+  <text class="tick mid" x="604" y="244">+60</text>
+  <path class="parity" d="M496.9 66 V230"/>
   <text class="cat" x="16" y="82">The memory against BM25 retrieval</text>
-  <text class="cat-sub" x="16" y="96">C1 − R1 · Holm p = 4.3e-4</text>
+  <text class="cat-sub" x="16" y="96">C1 − R1 · Holm p = 8.7e-4</text>
   <path class="line-us" d="M455.9 84 H484.2"/>
   <circle class="dot-us" cx="470" cy="84" r="6"/>
   <text class="v-us mid" x="470" y="74">−15.1</text>
-  <text class="cat" x="16" y="122">The memory against tool use</text>
-  <text class="cat-sub" x="16" y="136">C1 − T1 · Holm p = 3.0e-21</text>
-  <path class="line-us" d="M382.6 124 H405"/>
-  <circle class="dot-us" cx="393.7" cy="124" r="6"/>
-  <text class="v-us mid" x="393.7" y="114">−57.8</text>
-  <text class="cat" x="16" y="162">BM25 retrieval against the seed files</text>
-  <text class="cat-sub" x="16" y="176">R1 − A1 · Holm p = 1.3e-18</text>
-  <path class="line-us" d="M578.4 164 H601.2"/>
-  <circle class="dot-us" cx="589.9" cy="164" r="6"/>
-  <text class="v-us mid" x="589.9" y="154">+52.1</text>
+  <text class="cat" x="16" y="122">The memory's selection against BM25's, as text</text>
+  <text class="cat-sub" x="16" y="136">P1 − R1 · Holm p = 0.047</text>
+  <path class="line-us" d="M466.8 124 H496.8"/>
+  <circle class="dot-us" cx="481.7" cy="124" r="6"/>
+  <text class="v-us mid" x="481.7" y="114">−8.5</text>
+  <text class="cat" x="16" y="162">The memory against tool use</text>
+  <text class="cat-sub" x="16" y="176">C1 − T1 · Holm p = 4.0e-21</text>
+  <path class="line-us" d="M382.6 164 H405"/>
+  <circle class="dot-us" cx="393.7" cy="164" r="6"/>
+  <text class="v-us mid" x="393.7" y="154">−57.8</text>
+  <text class="cat" x="16" y="202">BM25 retrieval against the seed files</text>
+  <text class="cat-sub" x="16" y="216">R1 − A1 · Holm p = 2.0e-18</text>
+  <path class="line-us" d="M578.4 204 H601.2"/>
+  <circle class="dot-us" cx="589.9" cy="204" r="6"/>
+  <text class="v-us mid" x="589.9" y="194">+52.1</text>
 </svg>
 </figure>
 
-BM25 retrieval recalls 52.6% (46.1–58.9%) against the memory's 37.5%, 15.1 points (7.1 to 23.0) more. To find where, each expected item of C1's seventh run and R1's fourth was looked for in the text the model held as its answer began — for C1, the bodies of the turns the governing projection point injected; for R1, the files its prompt carried — by the same spellings recall matches (`zend/examples/dependency_battery/view.rs`):
+BM25 retrieval recalls 52.6% (46.1–58.9%) against the memory's 37.5%, 15.1 points (7.1 to 23.0) more. To find where, each expected item of C1's seventh run, R1's fourth and P1's run was looked for in the text the model held as its answer began — for C1, the bodies of the turns the governing projection point injected; for R1 and P1, the files their prompts carried — by the same spellings recall matches (`zend/examples/dependency_battery/view.rs`):
 
 | Arm | Items | In an answer file's text | Named, when there | Named, when not | Anywhere in view | Named, when anywhere |
 |---|---:|---:|---:|---:|---:|---:|
 | C1 (the memory) | 445 | **48.5%** | 69.9% | 14.0% | **60.4%** | 66.2% |
 | R1 (BM25 files) | 445 | 38.2% | **97.6%** | 22.5% | 56.0% | **90.0%** |
+| P1 (the memory's selection, as text) | 445 | 39.8% | 96.0% | 15.3% | 50.8% | 92.0% |
 
-The memory puts the answer in front of the model more often than BM25 does — 48.5% of expected items were in the text of an answer file it injected, against 38.2% for the files BM25 retrieved, and 60.4% against 56.0% anywhere in view. It placed 48.3% of an answer file's reading turns, and those carried the item more often than BM25's whole files did. The difference is in what the model makes of an item once it holds it: from BM25's plain text it names 97.6%, from the memory's K/V 69.9% (`docs/results/battery_128/summary_run11.md`, `table_9_12_in_view.csv`). That is the model's reading, not provenance's selection: how well a model reads K/V placed from memory is a capability of the model, and it has grown with every model this system has been upgraded to. T1, reading the source with 12.3 tool calls an answer, recalls 95.3%, the reference for what the questions allow.
+The memory puts the answer in front of the model more often than BM25 does — 48.5% of expected items were in the text of an answer file it injected, against 38.2% for the files BM25 retrieved, and 60.4% against 56.0% anywhere in view. It placed 48.3% of an answer file's reading turns, and those carried the item more often than BM25's whole files did. The difference is in what the model makes of an item once it holds it: from BM25's plain text it names 97.6%, from the memory's K/V 69.9% (`docs/results/battery_128/summary_run11.md`, `table_9_12_in_view.csv`). Handing the model the memory's own selection as text (P1, under R1's budget and prompt) lifts recall from 37.5% to 44.0%, and the model then names 96.0% of what an answer file carries: 6.5 of the 15.1 points are the model's reading of K/V, not provenance's selection. How well a model reads K/V placed from memory is a capability of the model, and it has grown with every model this system has been upgraded to. Provenance's selection puts an answer file first more often than BM25 does (hit@1 40.6% against 28.9%, `table_9_12_retrieval.csv`); what remains sits with BM25's wider spread of whole files under a fixed text budget. T1, reading the source with 12.3 tool calls an answer, recalls 95.3%, the reference for what the questions allow.
 
 **Ranking, apart from the answers.** A scoring lab (`provenance_gates lab`) probes each question once through the daemon — prefilled and decoded through its thinking — scans its votes against every ingested file on the resident gallery, and re-ranks on the host under formulas read from a file, so every variant scores the same votes. It found the binding limit was votes per token (§6.3); every non-linear alternative tried scored below summed `z × margin` (`docs/results/provenance_scoring_lab_2026-11-16.md`). Over the whole battery, on the gallery of 2026-11-24 — 7,943 files, 36.1M tokens, every probe fresh (`docs/results/battery_128/needle.md`) — 121 questions rank; seven name only files since split away:
 
@@ -1660,6 +1674,8 @@ For (b), $\tilde{p}_r = 1 / (1 + \sum_{t \neq r} e^{\tilde{s}_t - \tilde{s}_r})$
 
 (c) is (a) and (b) with n ≤ B under selection and n = N under full attention: under selection the ratio of the needed token's weight to the perturbation is at least $1 / [(1 + (B - 1) e^{-(\Delta - 2\eta)}) (\varepsilon_V + (e^{2\eta} - 1) R_V)]$, which names no N. □
 
+**Averaging does not rescue full attention.** If the value errors are independent and zero-mean with spread σ, the value term Σ_t p̃_t δv_t is smaller than (a)'s worst case: its size is about σ‖p̃‖₂, which for weight spread over N comparable tokens is σ/√N. But the needed token's weight in that regime is Θ(1/N), so the ratio of signal to perturbation still falls as Θ(1/√N) with depth. Under selection both are set by B and the thresholds, at any N.
+
 **Recurrent layers.** On the DeltaNet-hybrid models — Flash-Next is 36 Gated DeltaNet layers and 12 attention layers — the recurrent layers store no per-token K/V and read no working set: each holds one fixed-size state per sequence, `[h_v, d_v, d_k]`, kept in F32 and never quantized by the ladder, so what a step reads from them is the same size at any N. Each update is non-expansive — S ← e^g · S, g ≤ 0, then S ← S + β(v − Sk)kᵀ with k l2-normed and β ∈ (0, 1), so S(I − βkkᵀ) has operator norm at most ‖S‖ — and adds one F32 rounding (`candle-kernels/src/delta-net/delta_net_decode_kernel.cuh`). An error already in the state is therefore never amplified and decays wherever the gate is below one; the arithmetic is the reference model's own, and the bound neither adds to it nor relies on it. Measured with all 36 recurrent layers in the path, Flash-Next's divergence from BF16 is flat from 4K to 124K at C0 (2.2e-4 → 1.4e-4 nats) and at C5 (9.8e-3 → 7.6e-3) (§9.6.8).
 
 **Cost is not error.** The bound is on what a step attends; the work of choosing it is separate. Exact attention reads at most B tokens a step at any depth. The 1-bit provenance scan that selects them reads every signature in the gallery, linear in N, once per reprojection — every 64 decoded tokens, off the decode's critical path (§6.6) — and its result is a selection, which the bound covers through the budget whatever the scan's size.
@@ -1678,7 +1694,7 @@ $$\sum_{t \in \mathcal{W}} \varepsilon(t) \leq B \cdot \theta, \qquad \text{ever
 
 **Empirical status.** The premises — a fixed budget, a fixed hot tier, a per-block threshold on everything sealed — hold by construction. Throughput is flat in depth from 32K to 128K (§9.6.2), and the live session of §9.13.1 keeps decode flat from 48K to 321K. The direct test of the premise is §9.11.2: with the slot capped at 32K and a history twelve times that, reprojection selected every planted turn at C10 and C0 alike, where one-shot and rolling-window arms selected none. §9.12 tests what the model does with the selected set; the theorem does not rest on it.
 
-**Compression moves the constant, never the bound.** A selected cold block contributes its full error at any depth, so aggressive levels on cold K and on V raise ε_cold — a capacity trade bounded by the threshold each block was sealed under. The binding constraints are ε_hot, kept near zero by the refresh, and the retrieval threshold θ. The bound fails only if selection grows the working set with N, which recovers the full-attention regime.
+**Compression moves the constant, never the bound.** A selected cold block contributes its full error at any depth, so aggressive levels on cold K and on V raise ε_cold — a capacity trade bounded by the threshold each block was sealed under. The binding constraints are ε_hot, kept near zero by the refresh, and the retrieval threshold θ. The bound holds over whatever selection attends, and is lost only if selection grows the working set with N, which recovers the full-attention regime. Part (b) speaks of a needed token the selection holds; whether selection holds it is retrieval, which §9.12 measures (Figure 9.12-6).
 
 ### 11.3 Compression Architecture vs. Compression Primitive
 
@@ -1688,7 +1704,7 @@ KIVI, KVQuant and TurboQuant optimise the compression *primitive*: given that ev
 
 Attention is retrieval: Q queries K, scores select, V is aggregated by relevance. This system runs it at two scales — approximate 1-bit attention over the whole unbounded context to select the working set (§6.6), then exact attention over what it selected — hierarchical retrieval at constant exact-attention cost per step, the scan's linear 1-bit work running every 64 tokens off the decode's critical path, where standard attention is flat retrieval over N at every step.
 
-It is not RAG, and the difference is structural. *The signal*: RAG retrieves from text, so iterative RAG (FLARE, Self-RAG) must wait for the model to write a query; Q vectors carry what the model is reaching for before any text forms. *Causal continuity*: RAG injects text into a fresh context, while this system promotes stored K/V computed in its original causal context, K stored un-rotated and positioned on read. *Leading the answer*: reprojection inside the think block, whose K/V is dropped at seal, steers the answer's context by everything the model thought (§6.5). A RAG system given Q→Q matching, causal K/V continuity and retrieval from Q during generation would no longer be RAG; it would be this architecture. §9.12 shows it working: the answer file found among 7,943 by sign agreement alone, and a single retrieval before reasoning 6.5 points below continuous reprojection.
+It is not RAG, and the difference is structural. *The signal*: RAG retrieves from text, so iterative RAG (FLARE, Self-RAG) must wait for the model to write a query; Q vectors carry what the model is reaching for before any text forms. *Causal continuity*: RAG injects text into a fresh context, while this system promotes stored K/V computed in its original causal context, K stored un-rotated and positioned on read. *Leading the answer*: reprojection inside the think block, whose K/V is dropped at seal, steers the answer's context by everything the model thought (§6.5). A RAG system given Q→Q matching, causal K/V continuity and retrieval from Q during generation would no longer be RAG; it would be this architecture. §9.12 shows it working: the answer file found among 7,943 by sign agreement alone, and a single retrieval before reasoning 6.9 points below continuous reprojection.
 
 ### 11.5 Constraint-Driven Innovation as a Methodology
 
@@ -1732,7 +1748,7 @@ On the system's own codebase, retrieval ranks an answer file first among 7,943 o
 
 [7] Xu, F., Goyal, T., Choi, E. (2025). **RefreshKV: Updating Small KV Cache During Long-form Generation.** ACL 2025. https://aclanthology.org/2025.acl-long.1211/
 
-[8] RelayCaching: Accelerating LLM Collaboration via Decoding KV Cache Reuse. (2026). https://arxiv.org/html/2603.13289
+[8] Geng, Y., Gao, Y., Wu, W., Liu, G., & Liu, J. (2026). **RelayCaching: Accelerating LLM Collaboration via Decoding KV Cache Reuse.** ICML 2026, PMLR 306. https://arxiv.org/abs/2603.13289
 
 [9] Xiao, G., Tian, Y., Chen, B., Han, S., Lewis, M. (2024). **Efficient Streaming Language Models with Attention Sinks.** ICLR 2024. https://arxiv.org/abs/2309.17453
 
@@ -1744,11 +1760,11 @@ On the system's own codebase, retrieval ranks an answer file first among 7,943 o
 
 [13] Liu, D., et al. (2024). **RetrievalAttention: Accelerating Long-Context LLM Inference via Vector Retrieval.** NeurIPS 2025. https://arxiv.org/abs/2409.10516
 
-[14] Kamahori, K., et al. (2024). **Fiddler: CPU-GPU Orchestration for Fast Inference of Mixture-of-Experts Models.**
+[14] Kamahori, K., Tang, T., Gu, Y., Zhu, K., & Kasikci, B. (2025). **Fiddler: CPU-GPU Orchestration for Fast Inference of Mixture-of-Experts Models.** ICLR 2025. https://arxiv.org/abs/2402.07033
 
 [15] DAOP: Data-Aware Offloading and Predictive Pre-Calculation for Efficient MoE Inference. DATE 2025. https://arxiv.org/html/2501.10375
 
-[16] KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models. SOSP 2025.
+[16] Chen, H., et al. (2025). **KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models.** SOSP 2025. https://doi.org/10.1145/3731569.3764843
 
 [17] NVIDIA Technical Blog. (2025). **Optimizing Inference for Long Context and Large Batch Sizes with NVFP4 KV Cache.** https://developer.nvidia.com/blog/optimizing-inference-for-long-context-and-large-batch-sizes-with-nvfp4-kv-cache/
 
@@ -1839,5 +1855,7 @@ On the system's own codebase, retrieval ranks an answer file first among 7,943 o
 **Live system:** https://code.tokera.com — the deployed coding assistant over this repository, on the cluster that produced §9.11.1 and §9.13. It requires sign-in; access is by allowlist, with a queue for guests. The project site, https://www.tokera.com, carries v1 and this version.
 
 **What is released.** The engine, and the raw measurement rows behind every figure — `docs/performance.md` and `docs/results/`, each naming its build, machine and test — with the tests that produce them; the §9.12 battery's questions, ground truth, harness, analysis and per-answer scores (`zend/examples/dependency_battery/`, `docs/results/battery_128/`, and the pilot's `docs/results/dependency_battery_2026-11-*.md`); and the tests behind §9.6.8 and §9.11.2. Not released: the live substrate, a KV archive valid only for its model and holding conversations that are not this paper's to publish, and a view of which signatures matched at each reprojection. A turn's `projection`, `seed` and reprojection are dials of the request, so every arm of §9.12 is a setting a caller can choose.
+
+**Versions.** v1 (13 May 2026, [10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) is archived with an erratum at `docs/unbounded_agents_v1.md`; its "509 t/s" and "2,446 t/s" headlines were prefill rates and are withdrawn. v2 adds a measured evaluation across three machines and twelve models from 0.5B to 284B parameters (§9.6), every number produced by a test in this repository and recorded in `docs/performance.md`, and runs the retrieval evaluation on the production system (§9.11–§9.12). §4.1–§4.3 describe the v1 design on Qwen3-30B-A3B; provenance as production runs it is §6.
 
 **Invitation.** v2 is the final version of this paper, and critical review of it is welcome. The v1 erratum stays part of the record; every figure here names its build, machine and test. Validation, stress tests and optimisations are welcome through the GitHub repository.

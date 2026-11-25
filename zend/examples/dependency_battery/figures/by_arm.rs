@@ -38,12 +38,12 @@ pub fn points(t: &Table) -> anyhow::Result<Vec<ArmPoint>> {
 /// in place of the reprojection, and no seed.
 pub fn dials(arm: &str) -> (&'static str, &'static str) {
     let reprojection = match arm.chars().next() {
-        Some('A') => "no memory",
+        Some('A') => "none",
         Some('D') => "once",
         Some('B') => "held",
-        Some('C') => "reprojecting",
-        Some('R') => "BM25 files",
-        Some('P') => "selected files",
+        Some('C') => "full",
+        Some('R') => "BM25",
+        Some('P') => "selected",
         Some('T') => "tools",
         _ => "",
     };
@@ -186,9 +186,10 @@ mod tests {
     /// **A baseline is labelled by what it is handed, and has no seed.**
     #[test]
     fn the_baselines_are_labelled_by_what_they_are_given() {
-        assert_eq!(dials("C1"), ("reprojecting", "seed"));
-        assert_eq!(dials("A0"), ("no memory", "no seed"));
-        assert_eq!(dials("R1"), ("BM25 files", "no seed"));
+        assert_eq!(dials("C1"), ("full", "seed"));
+        assert_eq!(dials("A0"), ("none", "no seed"));
+        assert_eq!(dials("R1"), ("BM25", "no seed"));
+        assert_eq!(dials("P1"), ("selected", "no seed"));
         assert_eq!(dials("T1"), ("tools", "no seed"));
     }
 
