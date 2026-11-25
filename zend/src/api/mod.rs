@@ -531,6 +531,9 @@ mod tests {
             got,
             [
                 ("/v1/chat/completions", "user"),
+                ("/v1/images", "user"),
+                ("/v1/images/:id", "user"),
+                ("/v1/images/:id/thumb", "user"),
                 ("/v1/models", "unauthenticated"),
                 ("/v1/substrate/zend/objects/export", "admin"),
                 ("/v1/substrate/zend/objects/import", "admin"),

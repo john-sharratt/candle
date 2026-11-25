@@ -40,6 +40,8 @@ pub fn encode(
     engine: &ConversationEngine,
     images: &[PreparedImage],
 ) -> Result<Vec<ImageRows>, String> {
+    // The check stands in every build; only a build with the hub fetches the pack.
+    #[cfg_attr(not(feature = "hub"), allow(unused_variables))]
     let tower = tower_of(engine)?;
     // Fetched and packed here, on the caller's thread — the first time, a
     // download and a few seconds of host conversion — so the drain only reads
