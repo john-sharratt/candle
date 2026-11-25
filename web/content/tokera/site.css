@@ -1293,14 +1293,56 @@ html, body, .pane-view, .pane-index {
   .prose.paper > blockquote::before { display: none; }
 }
 
+/* The printed sheet: US Letter with a typeset paper's margins and the page
+   number at the foot. A paper's PDF is typeset from its source by LaTeX
+   (`web/examples/paper_pdf`); this is what the browser's own print gives. */
+@page {
+  size: letter;
+  margin: 1in 1.1in 0.85in;
+  @bottom-center {
+    content: counter(page);
+    font: 10pt "Times New Roman", Times, serif;
+  }
+}
+
 @media print {
   .site-top, .site-foot, .pane-index, .paper-tools { display: none; }
   main.reading { max-width: none; padding: 0; }
   main.split { display: block; }
   .pane-view, .pane-inner { overflow: visible; height: auto; padding: 0; }
-  .prose { color: #000; font-size: 10.5pt; }
+  .prose { color: #000; font-size: 10pt; }
   .prose h2 { border-top: none; }
-  .prose.paper { border: none; padding: 0; font-size: 10.5pt; }
+  /* Set as a paper is typeset: Times at 10 pt on a 12 pt line, justified. */
+  .prose.paper {
+    border: none;
+    padding: 0;
+    max-width: none;
+    font-family: "Times New Roman", Times, serif;
+    font-size: 10pt;
+    line-height: 1.22;
+  }
+  .prose.paper h1, .prose.paper h2, .prose.paper h3, .prose.paper h4 {
+    font-family: "Times New Roman", Times, serif;
+  }
+  .prose.paper .paper-head { margin: 0.35in 0 0.3in; }
+  .prose.paper .paper-head h1 { font-size: 17pt; line-height: 1.25; max-width: none; margin-bottom: 8pt; }
+  .prose.paper .paper-by { font-size: 10.5pt; }
+  .prose.paper h2 { font-size: 12pt; margin: 14pt 0 6pt; padding-top: 0; }
+  .prose.paper h3 { font-size: 10.5pt; margin: 10pt 0 4pt; }
+  .prose.paper h4 { font-size: 10pt; margin: 8pt 0 3pt; }
+  .prose.paper p, .prose.paper ul, .prose.paper ol, .prose.paper blockquote { margin: 0 0 6pt; }
+  .prose.paper li { margin: 0 0 2pt; }
+  .prose.paper figcaption { font-size: 9pt; line-height: 1.25; }
+  .prose.paper code, .prose.paper pre { font-size: 8.5pt; }
+  /* Block numbers are the screen's reference marks; a printed sheet is quoted
+     by page. */
+  .prose.paper > p::before,
+  .prose.paper > ul::before,
+  .prose.paper > ol::before,
+  .prose.paper > pre::before,
+  .prose.paper > table::before,
+  .prose.paper > figure::before,
+  .prose.paper > blockquote::before { display: none; }
   .prose.paper .fig svg { border: none; }
   .cite { border: 1px solid #bbb; }
   /* A figure or a table split across a page break is unreadable in a printout
