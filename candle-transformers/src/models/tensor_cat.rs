@@ -258,10 +258,7 @@ impl TensorCat {
                 self.len()
             );
         }
-        let mut offset = 0;
-        for i in 0..index {
-            offset += self.segment_sizes[i];
-        }
+        let offset: usize = self.segment_sizes[..index].iter().sum();
         let size = self.segment_sizes[index];
         self.tensor.narrow(self.cat_dim, offset, size)
     }

@@ -88,15 +88,11 @@ impl BatchedInferenceSession {
             .filter_map(|li| self.backings[li].sequence_block_count(seq_idx))
             .max()
             .unwrap_or(0);
-        for li in 0..self.backings.len() {
+        for backing in &mut self.backings {
             // `None` (unallocated) reads as `max_blocks`, so the loop is skipped and
             // never spins; a successful push raises the count by one toward `max`.
-            while self.backings[li]
-                .sequence_block_count(seq_idx)
-                .unwrap_or(max_blocks)
-                < max_blocks
-            {
-                self.backings[li].push_empty_writer_chunk(seq_idx)?;
+            while backing.sequence_block_count(seq_idx).unwrap_or(max_blocks) < max_blocks {
+                backing.push_empty_writer_chunk(seq_idx)?;
             }
         }
         Ok(())

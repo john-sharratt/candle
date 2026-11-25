@@ -171,8 +171,15 @@ pub(crate) fn rollback_wave_kv(
     let mut first_err: Option<candle::Error> = None;
     for c in contexts.iter_mut() {
         let offset = c.offset;
-        for layer_idx in layer_start..layer_end {
-            if let Err(e) = c.kv_caches.caches[layer_idx].rollback_to_offset(offset) {
+        for (layer_idx, cache) in c
+            .kv_caches
+            .caches
+            .iter_mut()
+            .enumerate()
+            .take(layer_end)
+            .skip(layer_start)
+        {
+            if let Err(e) = cache.rollback_to_offset(offset) {
                 tracing::warn!(
                     layer = layer_idx,
                     offset,

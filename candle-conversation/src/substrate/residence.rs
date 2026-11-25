@@ -887,9 +887,18 @@ impl ResidenceSlab {
         }
         for &i in before.difference(&keep) {
             if let Some(r) = self.slots.get(i) {
-                let _ = r
-                    .pins
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |p| p.checked_sub(1));
+                let mut held = r.pins.load(Ordering::SeqCst);
+                while held > 0 {
+                    match r.pins.compare_exchange_weak(
+                        held,
+                        held - 1,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
+                        Ok(_) => break,
+                        Err(now) => held = now,
+                    }
+                }
             }
         }
         for &i in &keep {

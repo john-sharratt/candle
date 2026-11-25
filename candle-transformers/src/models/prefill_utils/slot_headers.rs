@@ -364,9 +364,7 @@ pub(super) fn build_slot_headers(
             let s = cache
                 .as_ref()
                 .expect("pm_cached implies shared_pm is populated");
-            for i in 0..caches.len() {
-                write_slices.push(s.per_slot_write[i]);
-            }
+            write_slices.extend_from_slice(&s.per_slot_write[..caches.len()]);
         }
     }
     pipeline_record("slot:build", t_build);

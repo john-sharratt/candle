@@ -42,10 +42,10 @@ pub fn quantize_mxfp4_ko(w: &[f32], nrows: usize, ncols: usize) -> Vec<u8> {
                     ob[cbase + dm_base + r * 4 + sub] = blk[0].e;
                     // The KO ql byte at lane (r,q3), sub, i holds MXFP4 qs[q3*4+i] verbatim:
                     //   low nibble = element (q3*4+i), high nibble = element 16+(q3*4+i).
-                    for p in 0..16 {
+                    for (p, &byte) in blk[0].qs.iter().enumerate().take(16) {
                         let q3 = p / 4;
                         let i = p % 4;
-                        ob[cbase + (r * 4 + q3) * 16 + sub * 4 + i] = blk[0].qs[p];
+                        ob[cbase + (r * 4 + q3) * 16 + sub * 4 + i] = byte;
                     }
                 }
             }

@@ -81,14 +81,14 @@ pub(crate) fn scan(
             slice_n.get_or_insert(stats.seg_tokens.iter().sum());
             let mut row_token = 0usize;
             for &(p, s, e) in chunk {
-                for t in s..e {
+                for token in &mut out.stats[p][s..e] {
                     for (place, &g) in stats.groups.iter().enumerate() {
                         for seg in 0..stats.n_segments() {
                             if let Some(row) = stats.row(row_token, place, seg) {
                                 let es = EntryStats::of_row(row, |c| {
                                     case_files.get(c as usize).copied().unwrap_or(0)
                                 });
-                                out.stats[p][t][g].merge(&es);
+                                token[g].merge(&es);
                             }
                         }
                     }

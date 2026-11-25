@@ -279,12 +279,12 @@ impl KeyPages {
         let n = keys.n_rows();
         self.ensure(n)?;
         let at = scale_plane_offset(self.d);
-        for p in 0..n.div_ceil(PAGE_BLOCKS) {
+        for (p, page) in self.pages.iter().enumerate().take(n.div_ceil(PAGE_BLOCKS)) {
             let first = p * PAGE_BLOCKS;
             let used = (n - first).min(PAGE_BLOCKS);
             let (codes, scales) = keys.rows(first, used);
-            write_bytes(&self.pages[p], 0, codes)?;
-            write_bytes(&self.pages[p], at, &scale_bytes(scales))?;
+            write_bytes(page, 0, codes)?;
+            write_bytes(page, at, &scale_bytes(scales))?;
         }
         Ok(())
     }
