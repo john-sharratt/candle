@@ -226,31 +226,54 @@ the attention layers read it.
 The probes do not settle this: on the passthrough route every file was
 prefilled, so the recurrence *had* run over them. The diag result (§2) says
 the recurrence was not what failed the turn presentation; it does not say
-attention alone suffices for the knowledge presentation. This is measured
-first (§9, step 2), before anything is removed. If attention alone falls
+attention alone suffices for the knowledge presentation. It is measured on
+the first memory the new build ingests (§9, step 5). If attention alone falls
 short, the members' recurrent rows are captured at seal time (the
 `capture`/`merge` machinery of the decode diag) and folded into the slot's
 state where the collection sits.
 
-## 9. Order of work and the gate for each step
+## 9. Rollout
 
-1. **The rendering is Q1's.** A unit test assembles a projection's `files`
-   pieces for whole files and for a file with a gap, and asserts the raw
-   bytes against `probe::qwen_knowledge` for the whole-file case and against
-   the expected `...`-joined text for the gap. Gate: byte equality.
-2. **Attention-only reading.** Build the `files` collection (§3–§5) with
-   ingest unchanged underneath (members materialised from the existing
-   readings' tool-response chunks), then run the decode diag forced
-   inventory and the seven questions on C1: *sealed* members (recurrence not
-   run over them) against *fresh* (re-prefilled). Gate: sealed names the
-   in-view items as fresh does. If not, §8's fold first.
-3. **Ingest as prefill** (§7) and **the seed as pinned members** (§6);
-   faces, reading summaries, the seed lineage and the code_reading groups'
-   turn placement removed in the same change. The substrate's readings are
-   re-ingested; that wipe is the user's call.
-4. **Measure.** C1 on the seven questions, then the battery's memory arms.
-   The expectation the design is held to: in-view naming from 69.9% to the
-   ~96% the text arms reach.
+The change is built whole and tried on BlackWorld against a fresh, small
+memory, with WhiteWorld's zend held out so nothing of the old memory
+replicates back into it. The wipes below are approved by the user for this
+rollout (2026-11-26).
+
+1. **Take WhiteWorld's zend out.** Stop the zend tenant on WhiteWorld and
+   keep npcd running there. Wipe WhiteWorld's zend substrate. A member with
+   no zend substrate holds nothing to offer, so the old readings cannot
+   replicate back into the new memory, and BlackWorld serves zend alone.
+2. **Implement the whole design** (§3–§7) in one change, with its tests
+   written alongside:
+   - the `files` collection at the end of the system prompt, in Q1's
+     notation, its pieces asserted byte for byte against
+     `probe::qwen_knowledge` for whole files and against the
+     `...`-joined text for a file with a gap;
+   - the pool and the fill feeding the collection, and the `working_set`
+     selection allowed on a collection;
+   - ingest as chunk prefill plus calibration (§7);
+   - the seed as pinned members (§6);
+   - faces, reading summaries, the seed lineage and the code_reading groups'
+     turn placement removed.
+3. **Wipe BlackWorld's zend substrate** and start the new build on it with
+   the ingest's **max depth set to 1**, so the memory holds the workspace
+   roots, their seed documents and the files one level down: small enough
+   to ingest, calibrate and normalize in one sitting.
+4. **Run the ingest to settled.** Every depth-1 file prefilled, its
+   calibration questions asked, and normalization run, until the member
+   reports its memory settled (`/v1/status`, `tenants.zend.settled`).
+5. **Test** with questions answered by the depth-1 documents and by the
+   seed documents, on the production chat path:
+   - every in-view item named, as Q1 named 16 of 16 — the measure of
+     whether the presentation is fixed in production and not only on the
+     passthrough route;
+   - the decode diag's forced inventory lists the placed files;
+   - *sealed* members against *fresh* (§8): attention alone reading the
+     members as well as a re-prefill does. If it does not, §8's fold is
+     built before anything else.
+
+   This is the test of whether the fix holds. The battery's memory arms
+   follow once it does.
 
 ## 10. Open questions
 
@@ -258,7 +281,7 @@ state where the collection sits.
   budget). Whether a file shown as chunks with `...` gaps reads as well as a
   whole file, and whether the fill should place a chunk's predecessor with
   it so a definition split at a boundary is not shown in halves, is measured
-  in step 4.
+  in step 5.
 - **Calibration context.** Whether a calibration question sees only its own
   file's members or a selection like a dialogue's.
 - **Journal notes and guides.** They move with readings; whether the
