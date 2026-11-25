@@ -10,7 +10,7 @@ Persistent agents need context that grows without bound. Under full attention ev
 
 The system combines (1) online Markov expert prediction with wave-batched grouped GEMM for MoE inference under partial VRAM residency; (2) per-block adaptive KV quantization across eleven levels (C0–C10) with asymmetric K/V error metrics and a prefill refresh at every turn seal, compressing the KV cache 4.1–7.6× at the top level across the fleet's compressing models; (3) attentional provenance indexing — Q-vector sign signatures scanned on the GPU, re-selecting the working set during decode; and (4) an unbounded three-tier context, VRAM-hot, RAM-warm and disk-cold.
 
-Implemented in Rust on a Candle fork, the system runs a **180B-parameter MoE model on a 16 GB laptop GPU**, serving eight sessions at 108.5 t/s aggregate decode, above every published llama.cpp run of the model and every published multi-session figure for it. From 32K to 128K tokens it keeps **96–99% of its prefill and 93–111% of its decode** across two tasks. One card's aggregate decode is **1.4–37.9×** the best published llama.cpp single-stream rate for the same model and card class, reaching **2,869.9 t/s across 64 sessions**, and a **284B model serves sixteen sessions from one GPU** at 4.1× the best published single-GPU decode.
+Implemented in Rust on a Candle fork, the system runs a **180B-parameter MoE model on a 16 GB laptop GPU**, decoding one session at 34.9 t/s — above the 27.5–29 published for an RTX 5080, the same 16 GB class with twice the host RAM — and eight at 108.5 t/s aggregate, above every published llama.cpp run of the model and every published multi-session figure for it. On a 72 GB RTX PRO 5000, from 32K to 128K tokens it keeps **96–99% of its prefill and 93–111% of its decode** across two tasks. One card's aggregate decode is **1.4–37.9×** the best published llama.cpp single-stream rate for the same model and card class, reaching **2,869.9 t/s across 64 sessions**, and a **284B model serves sixteen sessions from one GPU** at 4.1× the best published single-GPU decode.
 
 On the system's own 2.2M-line codebase, retrieval ranks one of a question's answer files first among 7,943 files on 49% of 121 questions and in the top five on 69%, by Q-signature agreement alone. Answering 128 questions from memory with tools forbidden, over seven memory arms and three to seven runs each, the memory is worth **37.0 points of recall**, re-selection during reasoning 5.3, and continuous re-selection 6.9 over a single retrieval, every interval clear of zero (§9.12). Mid-decode reprojection selects every fact planted in a history twelve times the working set, at the top compression level as at near-lossless, where a single projection and a rolling window select none (§9.11.2).
 
@@ -24,8 +24,8 @@ The fix here is to decouple the tokens that take part in a step from the tokens 
 
 The system came from two constraints held together: persistent agent conversations, the hardest form of the memory problem (verbatim recall across unbounded sessions, many agents at once), and a single 16 GB consumer GPU. Each constraint closed the standard solution: GEMM dequantisation OOMed, so the matmul kernels read quantized weights natively; full context could not be held hot, so attention became provenance-selected; materialising turns at F16 OOMed, so quantization became two-phase (§11.5). The result, on that card and two larger ones:
 
-- A **180B-parameter MoE model** (Qwen3.8-Flash-Next, 6B active) on a 16 GB laptop GPU with 32 GB of RAM, experts streamed VRAM → RAM → NVMe, serving eight sessions at 108.5 t/s aggregate decode — above every published llama.cpp run of it, each on a host with 64–128 GB, and above Strata's published 63.1 t/s across four sessions (§9.6.5).
-- **Throughput flat in depth**: 96–99% of prefill and 93–111% of decode kept from 32K to 128K across two tasks (§9.6.2).
+- A **180B-parameter MoE model** (Qwen3.8-Flash-Next, 6B active) on a 16 GB laptop GPU with 32 GB of RAM, experts streamed VRAM → RAM → NVMe, decoding one session at 34.9 t/s against the 27.5–29 published for an RTX 5080 with 64 GB [32], and eight at 108.5 t/s aggregate — above every published llama.cpp run of it, each on a host with 64–128 GB, and above Strata's published 63.1 t/s across four sessions (§9.6.5).
+- **Throughput flat in depth**: 96–99% of prefill and 93–111% of decode kept from 32K to 128K across two tasks on the RTX PRO 5000 (§9.6.2).
 - **KV compression up to 7.6×**, each 32-token block choosing its format as it is sealed; at 8K the top level costs 2–8% of decode for 4.6–6.3× (§9.6.3).
 - **Concurrency**: aggregate decode 1.4–37.9× the best published llama.cpp rate for the same model and card class, 2,869.9 t/s across 64 sessions on one card; a 284B model at sixteen sessions on one GPU, 4.1× the best published single-GPU decode (§9.6.4, §9.6.6).
 - **Retrieval over its own codebase**: an answer file first of 7,943 on 49% of 121 questions and top-five on 69%; the memory worth 37.0 points of recall with tools forbidden, re-selection during reasoning 5.3 (§9.12).
@@ -1674,6 +1674,8 @@ For (b), $\tilde{p}_r = 1 / (1 + \sum_{t \neq r} e^{\tilde{s}_t - \tilde{s}_r})$
 
 (c) is (a) and (b) with n ≤ B under selection and n = N under full attention: under selection the ratio of the needed token's weight to the perturbation is at least $1 / [(1 + (B - 1) e^{-(\Delta - 2\eta)}) (\varepsilon_V + (e^{2\eta} - 1) R_V)]$, which names no N. □
 
+**Averaging does not rescue full attention.** If the value errors are independent and zero-mean with spread σ, the value term Σ_t p̃_t δv_t is smaller than (a)'s worst case: its size is about σ‖p̃‖₂, which for weight spread over N comparable tokens is σ/√N. But the needed token's weight in that regime is Θ(1/N), so the ratio of signal to perturbation still falls as Θ(1/√N) with depth. Under selection both are set by B and the thresholds, at any N.
+
 **Recurrent layers.** On the DeltaNet-hybrid models — Flash-Next is 36 Gated DeltaNet layers and 12 attention layers — the recurrent layers store no per-token K/V and read no working set: each holds one fixed-size state per sequence, `[h_v, d_v, d_k]`, kept in F32 and never quantized by the ladder, so what a step reads from them is the same size at any N. Each update is non-expansive — S ← e^g · S, g ≤ 0, then S ← S + β(v − Sk)kᵀ with k l2-normed and β ∈ (0, 1), so S(I − βkkᵀ) has operator norm at most ‖S‖ — and adds one F32 rounding (`candle-kernels/src/delta-net/delta_net_decode_kernel.cuh`). An error already in the state is therefore never amplified and decays wherever the gate is below one; the arithmetic is the reference model's own, and the bound neither adds to it nor relies on it. Measured with all 36 recurrent layers in the path, Flash-Next's divergence from BF16 is flat from 4K to 124K at C0 (2.2e-4 → 1.4e-4 nats) and at C5 (9.8e-3 → 7.6e-3) (§9.6.8).
 
 **Cost is not error.** The bound is on what a step attends; the work of choosing it is separate. Exact attention reads at most B tokens a step at any depth. The 1-bit provenance scan that selects them reads every signature in the gallery, linear in N, once per reprojection — every 64 decoded tokens, off the decode's critical path (§6.6) — and its result is a selection, which the bound covers through the budget whatever the scan's size.
@@ -1692,7 +1694,7 @@ $$\sum_{t \in \mathcal{W}} \varepsilon(t) \leq B \cdot \theta, \qquad \text{ever
 
 **Empirical status.** The premises — a fixed budget, a fixed hot tier, a per-block threshold on everything sealed — hold by construction. Throughput is flat in depth from 32K to 128K (§9.6.2), and the live session of §9.13.1 keeps decode flat from 48K to 321K. The direct test of the premise is §9.11.2: with the slot capped at 32K and a history twelve times that, reprojection selected every planted turn at C10 and C0 alike, where one-shot and rolling-window arms selected none. §9.12 tests what the model does with the selected set; the theorem does not rest on it.
 
-**Compression moves the constant, never the bound.** A selected cold block contributes its full error at any depth, so aggressive levels on cold K and on V raise ε_cold — a capacity trade bounded by the threshold each block was sealed under. The binding constraints are ε_hot, kept near zero by the refresh, and the retrieval threshold θ. The bound fails only if selection grows the working set with N, which recovers the full-attention regime.
+**Compression moves the constant, never the bound.** A selected cold block contributes its full error at any depth, so aggressive levels on cold K and on V raise ε_cold — a capacity trade bounded by the threshold each block was sealed under. The binding constraints are ε_hot, kept near zero by the refresh, and the retrieval threshold θ. The bound holds over whatever selection attends, and is lost only if selection grows the working set with N, which recovers the full-attention regime. Part (b) speaks of a needed token the selection holds; whether selection holds it is retrieval, which §9.12 measures (Figure 9.12-6).
 
 ### 11.3 Compression Architecture vs. Compression Primitive
 
@@ -1746,7 +1748,7 @@ On the system's own codebase, retrieval ranks an answer file first among 7,943 o
 
 [7] Xu, F., Goyal, T., Choi, E. (2025). **RefreshKV: Updating Small KV Cache During Long-form Generation.** ACL 2025. https://aclanthology.org/2025.acl-long.1211/
 
-[8] RelayCaching: Accelerating LLM Collaboration via Decoding KV Cache Reuse. (2026). https://arxiv.org/html/2603.13289
+[8] Geng, Y., Gao, Y., Wu, W., Liu, G., & Liu, J. (2026). **RelayCaching: Accelerating LLM Collaboration via Decoding KV Cache Reuse.** ICML 2026, PMLR 306. https://arxiv.org/abs/2603.13289
 
 [9] Xiao, G., Tian, Y., Chen, B., Han, S., Lewis, M. (2024). **Efficient Streaming Language Models with Attention Sinks.** ICLR 2024. https://arxiv.org/abs/2309.17453
 
@@ -1758,11 +1760,11 @@ On the system's own codebase, retrieval ranks an answer file first among 7,943 o
 
 [13] Liu, D., et al. (2024). **RetrievalAttention: Accelerating Long-Context LLM Inference via Vector Retrieval.** NeurIPS 2025. https://arxiv.org/abs/2409.10516
 
-[14] Kamahori, K., et al. (2024). **Fiddler: CPU-GPU Orchestration for Fast Inference of Mixture-of-Experts Models.**
+[14] Kamahori, K., Tang, T., Gu, Y., Zhu, K., & Kasikci, B. (2025). **Fiddler: CPU-GPU Orchestration for Fast Inference of Mixture-of-Experts Models.** ICLR 2025. https://arxiv.org/abs/2402.07033
 
 [15] DAOP: Data-Aware Offloading and Predictive Pre-Calculation for Efficient MoE Inference. DATE 2025. https://arxiv.org/html/2501.10375
 
-[16] KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models. SOSP 2025.
+[16] Chen, H., et al. (2025). **KTransformers: Unleashing the Full Potential of CPU/GPU Hybrid Inference for MoE Models.** SOSP 2025. https://doi.org/10.1145/3731569.3764843
 
 [17] NVIDIA Technical Blog. (2025). **Optimizing Inference for Long Context and Large Batch Sizes with NVFP4 KV Cache.** https://developer.nvidia.com/blog/optimizing-inference-for-long-context-and-large-batch-sizes-with-nvfp4-kv-cache/
 
