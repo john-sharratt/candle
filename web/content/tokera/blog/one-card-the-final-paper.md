@@ -2,7 +2,6 @@
 title: "AI: One Card, One Stack — the table I owed you"
 date: 2026-11-25
 feature: 1
-draft: true
 tint: accent
 tags: [inference, architecture, research]
 summary: >-
