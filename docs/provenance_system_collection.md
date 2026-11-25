@@ -13,10 +13,16 @@ chain the dialogue forks from — moves into the **system prompt**, as members
 of one dynamic collection, `files`, rendered in Qwen-Agent's knowledge format.
 It is built per projection the way the `tools` collection is, and selected
 the way readings are selected now: a large pool chosen by provenance
-momentum, reduced to what fits by the QSA index. A reading stops being a
-conversation: ingest prefills each file's chunks as collection members and
-asks the file's calibration questions; nothing is decoded about a file but
-those answers. The dialogue's turns are the dialogue's own and nothing else.
+momentum, reduced to what fits by the QSA index. The seed stays a chain
+computed with the recurrent state and snapshotted, now as the collection's
+last members; the dynamic members are placed before it, and at every
+projection the collection's close is forwarded live from the seed's
+snapshot, so the system prompt's end is a real forward over what was placed
+and a new conversation starts its recurrent state there. A reading stops
+being a conversation: ingest prefills each file's chunks as collection
+members and asks the file's calibration questions; nothing is decoded about
+a file but those answers. The dialogue's turns are the dialogue's own and
+nothing else.
 
 ## 2. Why: the model cannot read files presented as turns
 
@@ -74,10 +80,15 @@ persona · dials · role · history_stance · grounding
 journal_intro · journal members
 tools_overview · tool summary · <tools> tool members </tools>
 files_open                      # "\n# Knowledge Base\n\n"
-files members                   # pinned seed first, then the selection
-<|im_end|>
+dynamic members                 # provenance's selection, sealed, attended only
+seed members                    # the seed chain, sealed with the recurrence
+close row  …```<|im_end|>\n     # forwarded live at every projection (§6.2)
 <|im_start|>user …              # the dialogue's own turns only
 ```
+
+The prompt checkpoint holds the system block with the collection **empty**
+(`files_open` and its members are outside the checkpoint, as tool members
+are). Everything the collection holds arrives per projection.
 
 - `files` is **the end of the system prompt**: the last thing before
   `system_close` and so before the first user turn, after the tool catalog.
@@ -108,12 +119,14 @@ files members                   # pinned seed first, then the selection
 - So a file's rendering is built from sealed pieces: its **heading piece**
   (`## The content from <path>:\n\n```\n`), its **chunk members**, the
   **gap piece** (`\n\n...\n\n`) where placed chunks are not contiguous, and
-  its **closing piece** (`\n```\n\n`, the last file's without the trailing
-  blank line). The heading, gap and closing pieces are small sections of the
-  collection, sealed as members are (§5).
-- Files emit in **fill order, strongest first**, the order the probes used,
-  not in declaration order as tools do. The pinned seed files (§6) come
-  first.
+  its **closing piece** (`\n```\n\n`). The heading, gap and closing pieces
+  are small sections of the collection, sealed as members are (§5). The one
+  exception is the collection's last file, the seed's last: its closing
+  fence is not sealed but forwarded in the close row (§6.2), so the bytes end
+  `\n```<|im_end|>\n` exactly as Q1's did.
+- The **dynamic members** come first, in **fill order, strongest first** —
+  the order the probes used, not declaration order as tools have — and the
+  **seed** last, nearest the question, in its chain's fixed order (§6).
 
 ## 4. Selection: the pool and the fill, unchanged, now feeding a collection
 
@@ -170,29 +183,105 @@ changes — plus the **earlier chunks of its own file**:
   chunk *k* without chunk *k*−1, or in another order, re-seats it for free
   (`hit_driven_projection.md` §4).
 
-`system_close` cannot seal against the whole catalog, as `tools_close` does
-(`sequence_construction.rs:432-436`): the catalog is the corpus. It seals
-against the prefix without members. It is a three-token marker; the cost is
-nil.
+Nothing after the collection is sealed: `system_close` cannot seal against
+the whole catalog as `tools_close` does (`sequence_construction.rs:432-436`),
+the catalog being the corpus. It is forwarded live with the collection's
+last closing fence, as the close row (§6.2).
 
-## 6. The seed becomes pinned members
+## 6. The seed chain and the close row: the recurrent state
 
-The priming chain stops being a fork lineage. Its files — per repository the
-root listing, README, ARCHITECTURE, AGENTS, CLAUDE (`branch_ingest/prime.rs`)
-— are ordinary members of `files`, **pinned** (the collection's `mandatory`
-members, as a mandatory tool is) and placed first, under a pinned share of
-the room.
+The 36 DeltaNet layers of Flash-Next carry state the attention layers' K/V
+does not: what has been read, and in what order. A dynamic member is
+attended but never run through them (§8). The recurrent state a
+conversation runs on must still be one a forward actually produced, over a
+system prompt that ends where the dialogue begins. The seed chain provides
+it, and the close row ties it to what each projection placed.
+
+### 6.1 The seed chain is computed with the recurrence and snapshotted
+
+The seed's files — per repository the root listing, README, ARCHITECTURE,
+AGENTS, CLAUDE (`branch_ingest/prime.rs`) — are members of `files`, but they
+are not sealed as dynamic members are. They are built as a **chain**, as the
+priming chain is built today:
+
+- each seed file is prefilled behind the system prompt with the collection
+  empty, then `files_open`, then every seed file before it, in the chain's
+  fixed order — its K/V sealed as members are (§5), and the **recurrent
+  state run over it** and carried to the next;
+- the recurrent state is **snapshotted at the end of each seed file**, as
+  each chain link's is today (`ingest_snapshots.rs`, a link keeps its tail;
+  `scheduler/recurrent.rs` `restore_recurrent_state`). A seed file that
+  changes re-prefills the chain from the last unchanged link, as a link
+  whose key holds is reused today (`code_read/link.rs`);
+- the snapshot at the **seed's end** is the state of a system prompt that
+  has read the seed. The last seed file's closing fence is held out of the
+  chain (§3); it is forwarded in the close row.
+
+The seed is the one part of the collection the recurrence has read, and it
+sits last, nearest the question.
+
+### 6.2 The close row: forwarded live at every projection
+
+At every projection, after the fill has chosen the dynamic members and the
+slot is rebuilt with them placed **before the seed**, the collection's close
+— the last seed file's closing fence and `system_close`, `\n```<|im_end|>\n`
+— is **forwarded**, not injected:
+
+- its **recurrent state starts from the seed-end snapshot** (§6.1), the state
+  of a system prompt that has read the seed;
+- its **attention reads everything placed**: the dynamic members and the
+  seed, at their positions in this slot. Its K/V is computed in the context
+  this projection built, and its rows reach the recurrent layers above each
+  attention layer having attended to the dynamic content;
+- it rides a wave as a row of **at most 8 tokens**, the recurrent layers'
+  short span (`delta_net::timeline::TIMELINE_ROWS`), the most one wave
+  writes for a row — the decode-wave row the re-feed used
+  (`docs/archived/reprojection_refeed.md` §2 item 1), here at the system
+  block's end rather than the turn's tail. The close is 4–5 tokens of
+  Flash-Next's tokenizer; a close longer than the row refuses to load.
+
+The forward writes a position in the middle of the slot, below the
+dialogue's turns, and the writer only writes at the tail
+(`truncate_sequence_to_tokens` refuses below `writer_start`). So the rebuild
+is done in two steps: the parent is rebuilt to the collection's end, the
+close row is forwarded as its tail, and the dialogue's turns and the turn's
+captured tail are then injected after it (`inject_sealed_at_tail`) and the
+view carved over all of it, as a reprojection carves it now
+(`docs/archived/reprojection_refeed.md` §2.1).
+
+**What the close row's recurrent state is used for depends on the
+conversation:**
+
+- **A new conversation** opens on it. The state after the close row — the
+  seed-end snapshot advanced by a close computed against the opening's
+  placement — is the recurrent state its first user message is prefilled
+  on. That replaces forking from the seed and `seed_recurrent_from_lineage`.
+- **A conversation already running** keeps its own live recurrent state, as
+  a reprojection keeps it now (`move_recurrent`, `reprojection.rs:403-434`):
+  it is already bootstrapped and has read its own turns. The close row's
+  K/V is still recomputed against the new placement, which is what the
+  dialogue's later positions attend. The close row's recurrent output is
+  discarded: it was computed on a scratch copy of the seed-end snapshot, and
+  never touches the turn's own state.
+
+This is what the re-feed got wrong and this does not. The re-feed wrote the
+turn's last tokens into the live recurrent state a second time at every
+boundary, and the reasoning looped (`docs/archived/reprojection_refeed.md`,
+*Why it went*). The close row is forwarded on a scratch copy of the
+seed-end snapshot, and a running conversation's state never receives it. A
+new conversation receives it once, as the end of its system prompt.
+
+### 6.3 What goes
 
 - `forked_from = "seed"`, `set_forked_from_seed` and the dialogue's
-  `seed_recurrent_from_lineage` are removed (`stream_turn.rs:199-258`). A
-  dialogue opens on the system prompt alone; its recurrent state starts from
-  the prompt checkpoint.
-- The inherited-chain handling for the seed goes with it:
-  `INHERITED_CHAIN_TOKEN_CAP`, the lineage base score in the fill
-  (`sink.rs:1048-1063`), the lineage drop below `ProjectionLevel::Full`.
-  Forks of a *dialogue* keep their lineage; only the seed stops being one.
-- The `seed` request dial gates the pinned seed members, as it gates the
-  working-set seed files today (`turn_dials.rs:130-146`).
+  `seed_recurrent_from_lineage` (`stream_turn.rs:199-258`): a dialogue no
+  longer forks from the seed. Its recurrent start is the close row's.
+- The seed as a lineage of turns: `INHERITED_CHAIN_TOKEN_CAP`, the lineage
+  base score in the fill (`sink.rs:1048-1063`), the lineage drop below
+  `ProjectionLevel::Full`. Forks of a *dialogue* keep their lineage.
+- The `seed` request dial gates the seed members. With the seed off, the
+  close row starts from the state at `files_open`, the end of the empty
+  collection.
 
 ## 7. Ingest: prefill and calibration, nothing decoded about the file
 
@@ -209,28 +298,34 @@ A file's ingest is:
    what the gallery scans (`belief_groups.rs`). The calibration conversation
    is the only thing decoded.
 
+The seed's files are ingested as the chain of §6.1 instead — prefilled in
+order with the recurrent state carried and snapshotted at each file's end —
+and are calibrated as every other file is.
+
 Faces (`substrate/faces.rs`, `zend/src/faces.rs`, the reserved `Face` layer)
 are removed: there is no reading turn to face.
 
 A gallery entry is keyed by member section rather than by reading turn;
 `cases: file` groups a file's members as it grouped a reading's turns.
 
-## 8. The recurrent layers — the risk this design carries
+## 8. The recurrent layers — what remains a risk
 
-Collection members are never folded into a slot's recurrent state: the
-prompt checkpoint skips them (`sequence_construction.rs:733-736`) and a
-reprojection moves the turn's state on unchanged (`reprojection.rs:403-434`).
-The 36 DeltaNet layers will therefore not have run over a placed file; only
-the attention layers read it.
+The seed has been read by the recurrence (§6.1), and the close row reaches
+the recurrent layers having attended to the dynamic members (§6.2). The
+dynamic members themselves are not run through the recurrence: they are
+sealed with their own file's state (§5) and only attended in the slot. The
+recurrent layers therefore learn of a dynamic file only through the close
+row's few positions and the tokens forwarded after it.
 
-The probes do not settle this: on the passthrough route every file was
-prefilled, so the recurrence *had* run over them. The diag result (§2) says
-the recurrence was not what failed the turn presentation; it does not say
-attention alone suffices for the knowledge presentation. It is measured on
-the first memory the new build ingests (§9, step 5). If attention alone falls
-short, the members' recurrent rows are captured at seal time (the
-`capture`/`merge` machinery of the decode diag) and folded into the slot's
-state where the collection sits.
+The probes do not settle whether that is enough: on the passthrough route
+every file was prefilled, so the recurrence had run over all of them. The
+diag result (§2) says the recurrence was not what failed the turn
+presentation; it does not say attention alone suffices for the knowledge
+presentation. It is measured on the first memory the new build ingests (§9,
+step 5): sealed dynamic members against the same members re-prefilled. If
+attention alone falls short, the members' recurrent rows are captured at
+seal time (the `capture`/`merge` machinery of the decode diag) and folded in
+where the collection sits.
 
 ## 9. Rollout
 
@@ -252,7 +347,11 @@ rollout (2026-11-26).
    - the pool and the fill feeding the collection, and the `working_set`
      selection allowed on a collection;
    - ingest as chunk prefill plus calibration (§7);
-   - the seed as pinned members (§6);
+   - the seed chain built with the recurrence and snapshotted (§6.1), placed
+     last in the collection;
+   - the close row forwarded at every projection from the seed-end
+     snapshot, the two-step rebuild around it, a new conversation opening
+     on its recurrent state and a running one keeping its own (§6.2);
    - faces, reading summaries, the seed lineage and the code_reading groups'
      turn placement removed.
 3. **Wipe BlackWorld's zend substrate** and start the new build on it with
@@ -270,7 +369,12 @@ rollout (2026-11-26).
    - the decode diag's forced inventory lists the placed files;
    - *sealed* members against *fresh* (§8): attention alone reading the
      members as well as a re-prefill does. If it does not, §8's fold is
-     built before anything else.
+     built before anything else;
+   - the close row: a new conversation's recurrent state at its first user
+     token equals the seed-end snapshot advanced by the close row, and a
+     running conversation's state is the same before and after a
+     reprojection (both asserted by GPU tests at one thread); no reasoning
+     loop over a long thinking block, the failure that withdrew the re-feed.
 
    This is the test of whether the fix holds. The battery's memory arms
    follow once it does.
@@ -284,6 +388,12 @@ rollout (2026-11-26).
   in step 5.
 - **Calibration context.** Whether a calibration question sees only its own
   file's members or a selection like a dialogue's.
+- **The seed chain under the dials.** The system prompt before the
+  collection is a section tree whose branch a turn's dials select, and a
+  prompt checkpoint exists per branch (`install_branch_states`). Whether the
+  seed chain and its snapshots are computed per branch, or once behind the
+  default branch and read under every branch as sealed sections are, is
+  decided in the implementation and recorded here.
 - **Journal notes and guides.** They move with readings; whether the
   per-conversation `journal` collection should render in the same format is
   left as it is.
