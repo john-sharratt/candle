@@ -1,6 +1,6 @@
 # One Card, One Stack: Constraint-Driven Architecture for Asymptotically Stable Inference over Unbounded Agent Memory
 
-> **Version 2.** v1 (13 May 2026, [10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) is archived with an erratum at `docs/unbounded_agents_v1.md`; its "509 t/s" and "2,446 t/s" headlines were prefill rates and are withdrawn. v2 adds a measured evaluation across three machines and twelve models from 0.5B to 284B parameters (§9.6), every number produced by a test in this repository and recorded in `docs/performance.md`, and runs the retrieval evaluation on the production system (§9.11–§9.12). §4.1–§4.3 describe the v1 design on Qwen3-30B-A3B; provenance as production runs it is §6.
+> **Version 2.** v1 ([10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) and its erratum: Appendix A.
 
 **Abstract**
 
@@ -1855,5 +1855,7 @@ On the system's own codebase, retrieval ranks an answer file first among 7,943 o
 **Live system:** https://code.tokera.com — the deployed coding assistant over this repository, on the cluster that produced §9.11.1 and §9.13. It requires sign-in; access is by allowlist, with a queue for guests. The project site, https://www.tokera.com, carries v1 and this version.
 
 **What is released.** The engine, and the raw measurement rows behind every figure — `docs/performance.md` and `docs/results/`, each naming its build, machine and test — with the tests that produce them; the §9.12 battery's questions, ground truth, harness, analysis and per-answer scores (`zend/examples/dependency_battery/`, `docs/results/battery_128/`, and the pilot's `docs/results/dependency_battery_2026-11-*.md`); and the tests behind §9.6.8 and §9.11.2. Not released: the live substrate, a KV archive valid only for its model and holding conversations that are not this paper's to publish, and a view of which signatures matched at each reprojection. A turn's `projection`, `seed` and reprojection are dials of the request, so every arm of §9.12 is a setting a caller can choose.
+
+**Versions.** v1 (13 May 2026, [10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) is archived with an erratum at `docs/unbounded_agents_v1.md`; its "509 t/s" and "2,446 t/s" headlines were prefill rates and are withdrawn. v2 adds a measured evaluation across three machines and twelve models from 0.5B to 284B parameters (§9.6), every number produced by a test in this repository and recorded in `docs/performance.md`, and runs the retrieval evaluation on the production system (§9.11–§9.12). §4.1–§4.3 describe the v1 design on Qwen3-30B-A3B; provenance as production runs it is §6.
 
 **Invitation.** v2 is the final version of this paper, and critical review of it is welcome. The v1 erratum stays part of the record; every figure here names its build, machine and test. Validation, stress tests and optimisations are welcome through the GitHub repository.
