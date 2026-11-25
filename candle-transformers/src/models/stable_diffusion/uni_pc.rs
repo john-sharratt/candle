@@ -824,25 +824,22 @@ mod stats {
                 return;
             }
 
-            let mut k: usize;
+            let k: usize;
             if x < self.q[0] {
                 self.q[0] = x;
                 k = 0;
             } else {
-                k = 4;
-                for i in 1..5 {
-                    if x < self.q[i] {
-                        k = i;
-                        break;
-                    }
-                }
+                k = self.q[1..5]
+                    .iter()
+                    .position(|&q| x < q)
+                    .map_or(4, |i| i + 1);
                 if self.q[4] < x {
                     self.q[4] = x;
                 }
             };
 
-            for i in k..5 {
-                self.n[i] += 1;
+            for n in &mut self.n[k..5] {
+                *n += 1;
             }
             for i in 0..5 {
                 self.m[i] += self.dm[i];

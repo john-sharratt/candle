@@ -1,8 +1,8 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 
 use candle::{Device, Result, Storage, Tensor, WithDType};
+use std::iter::Sum;
 use std::sync::LazyLock;
-use std::{f32, iter::Sum};
 
 use rayon::prelude::*;
 use rayon::ThreadPool;

@@ -253,8 +253,8 @@ impl Sim {
             }
         }
         // The decision is written as a replicated record: every member learns.
-        for i in 0..MEMBERS {
-            self.members[i].learn(&key, &value).unwrap();
+        for member in &mut self.members {
+            member.learn(&key, &value).unwrap();
         }
     }
 
@@ -301,9 +301,9 @@ impl Sim {
     fn reassign(&mut self, owners: &[usize]) {
         for (w, owner) in owners.iter().enumerate() {
             let key = world(w);
-            for m in 0..MEMBERS {
+            for (m, member) in self.members.iter_mut().enumerate() {
                 if m != *owner {
-                    self.members[m].abandon(&key);
+                    member.abandon(&key);
                 }
             }
         }
@@ -404,8 +404,8 @@ fn h7_consensus() {
             for (key, value) in sim.decided.clone() {
                 sim.members[r].learn(&key, &value).unwrap();
             }
-            for w in 0..WORLDS {
-                sim.holders[w].retain(|(h, _)| *h != r);
+            for holders in &mut sim.holders {
+                holders.retain(|(h, _)| *h != r);
             }
         }
 

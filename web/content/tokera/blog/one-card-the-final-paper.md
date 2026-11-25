@@ -247,8 +247,8 @@ and a 42-million-token memory answering questions on one card.
 Everything needed to check it is out: the engine, the raw rows behind every
 figure, the tests that produce them, and the battery's questions, ground truth,
 harness and scores. The code is [on GitHub](https://github.com/john-sharratt/candle),
-and critical review is welcome. Next come the 2027 conferences — MLSys, ACL,
-EMNLP, NeurIPS — and the follow-up paper: reading sealed K/V as reliably as the
+and critical review is welcome. Next comes the 2027 conference round, and the
+follow-up paper: reading sealed K/V as reliably as the
 model reads text.
 
 The KV-quantization literature keeps asking how small each token's error can be
