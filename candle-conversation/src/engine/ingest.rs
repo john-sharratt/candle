@@ -172,6 +172,12 @@ impl ConversationEngine {
         self.conversation.warm_replay_progress()
     }
 
+    /// `(warmed, total)` of the ingest files' normalization warm-up now
+    /// running ([`Self::ingest_warmer`]); `None` when none is.
+    pub fn ingest_warm_progress(&self) -> Option<(usize, usize)> {
+        self.conversation.ingest_warm_state().progress()
+    }
+
     /// Preload what a projection's belief scan reads — every scanned group's
     /// signatures and every collection's gallery, decoded and resident on the
     /// GPU gallery arena — so the first projection after a start does none of

@@ -365,51 +365,58 @@ impl ZendSession {
 
                         // The single background ingest worker. Its pass at
                         // startup reads every branch as the tracking refs hold
-                        // it (`crate::branch_ingest`), and is followed by the
-                        // ingest normalization warm-up; after that it runs when
+                        // it (`crate::branch_ingest`); it and every later pass
+                        // that changes a layer are followed by the ingest
+                        // normalization warm-up. After that it runs when
                         // an origin watcher fetched a moved branch, or a tool
                         // round published one — and on a clock while a layer
                         // changes with time.
                         let wake = Arc::new(Notify::new());
                         if !read_only_substrate {
                             let pass_state = Arc::clone(&state);
-                            let pass: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                                match pass_state.refresh_ingest_layers() {
-                                    Ok(true) => tracing::info!("ingest pass: layers updated"),
-                                    Ok(false) => {
-                                        tracing::debug!("ingest pass: no layer changed")
+                            let pass: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+                                let changed = match pass_state.refresh_ingest_layers() {
+                                    Ok(true) => {
+                                        tracing::info!("ingest pass: layers updated");
+                                        true
                                     }
-                                    Err(e) => tracing::warn!("ingest pass failed: {e:#}"),
-                                }
+                                    Ok(false) => {
+                                        tracing::debug!("ingest pass: no layer changed");
+                                        false
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("ingest pass failed: {e:#}");
+                                        // What a failed pass did commit is
+                                        // still new, and is warmed.
+                                        true
+                                    }
+                                };
                                 // Folded whether or not the pass succeeded: a
                                 // failed pass is read again only on the next
                                 // branch move or layer clock, and what it did
                                 // write is folded now rather than then.
                                 pass_state.fold_chunk_exclusions_behind();
+                                changed
                             });
                             let warm_state = Arc::clone(&state);
-                            let after_first_pass: Arc<dyn Fn() + Send + Sync> =
-                                Arc::new(move || {
-                                    // The first pass is now DONE, so warm the
-                                    // per-file normalization hit levels HERE —
-                                    // off the load path and, crucially, with no
-                                    // concurrent ingest writer to starve (running
-                                    // the heavy self-match scan during ingest
-                                    // freezes the scheduler). Covers the
-                                    // first-run ingest and every restart's
-                                    // reconcile. It scores on the scheduler's GPU
-                                    // arena a slice of files at a time. The tool
-                                    // catalog's own levels are already warmed by
-                                    // the load's `Normalizing` step, before ready.
-                                    let warmer = warm_state.engine.ingest_warmer();
-                                    let schema = warm_state.refresh_builder.schema().clone();
-                                    warmer.run(&schema);
-                                });
-                            let worker = crate::ingest_worker::spawn(
-                                Arc::clone(&wake),
-                                pass,
-                                after_first_pass,
-                            );
+                            let warm: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                                // A pass is now DONE, so warm the per-file
+                                // normalization backgrounds of the files not
+                                // warmed before HERE — off the load path and,
+                                // crucially, with no concurrent ingest writer
+                                // to starve (running the heavy self-match scan
+                                // during ingest freezes the scheduler). Covers
+                                // the first-run ingest, every restart's
+                                // reconcile, and every later pass that read a
+                                // file. It scores on the scheduler's GPU arena
+                                // a slice of files at a time. The tool
+                                // catalog's own levels are already warmed by
+                                // the load's `Normalizing` step, before ready.
+                                let warmer = warm_state.engine.ingest_warmer();
+                                let schema = warm_state.refresh_builder.schema().clone();
+                                warmer.run(&schema);
+                            });
+                            let worker = crate::ingest_worker::spawn(Arc::clone(&wake), pass, warm);
                             // The startup handoff: the initial backlog — first-ever
                             // ingest, or whatever drifted while the daemon was down
                             // — starts NOW, in the background, while the lines

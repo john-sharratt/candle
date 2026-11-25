@@ -46,6 +46,7 @@ use candle_conversation::{
 
 use super::ask::Ask;
 use super::draft_sight::reading_held;
+use super::owed;
 use super::permits::{Permit, Permits};
 use super::plan::{plan, Prior, Unit};
 use super::questions::questions;
@@ -246,6 +247,7 @@ pub fn calibrate_layer(
     };
     report.done = todo.done;
     report.waiting = todo.waiting;
+    owed::global().planned(&spec.layer, todo.run.len() + todo.waiting);
     tracing::info!(
         target: "zend::calibrate",
         layer = %spec.layer,
@@ -301,14 +303,18 @@ pub fn calibrate_layer(
                 // the vote names asks for them, and a calibration handed back
                 // is looked for again before it is asked for twice.
                 let _lease = match ingest_lease::share_calibration(&unit.marker) {
+                    // Another member's to calibrate: it is owed there, and
+                    // its commit replicates here, so it is owed nothing here.
                     Share::Theirs => {
                         elsewhere.fetch_add(1, Ordering::Relaxed);
+                        owed::global().committed(&spec.layer);
                         done(unit);
                         continue;
                     }
                     Share::Mine(lease) => {
                         if lease.recheck() && calibrated(engine, &unit.marker) {
                             elsewhere.fetch_add(1, Ordering::Relaxed);
+                            owed::global().committed(&spec.layer);
                             done(unit);
                             continue;
                         }
@@ -327,6 +333,7 @@ pub fn calibrate_layer(
                 match outcome {
                     Ok(()) => {
                         sealed.fetch_add(1, Ordering::Relaxed);
+                        owed::global().committed(&spec.layer);
                     }
                     // A draft a shutdown stopped is no failure of the unit's.
                     Err(_) if crate::ingest_cancel::cancelled() => {

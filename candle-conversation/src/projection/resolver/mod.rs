@@ -182,6 +182,8 @@ pub struct Conversation {
     /// How far the replay [`Self::take_warm_replay`] handed out has been
     /// scored — the `/v1/status` warm-up bar.
     warm_replay_progress: Arc<WarmReplayProgress>,
+    /// The ingest files whose backgrounds are warmed, and the warm-up running.
+    ingest_warm: Arc<IngestWarmState>,
     /// The `/v1/status` maintenance indicator: `(segment_count, last_op,
     /// running)`. `running` is `true` only while a maintenance op's relocation
     /// is in flight, so the sidebar can show a live spinner (vs. a settled ✓
@@ -319,6 +321,8 @@ mod belief_gallery;
 mod belief_groups;
 mod belief_scoring;
 mod handle;
+mod ingest_warm_state;
+pub use ingest_warm_state::IngestWarmState;
 mod warm_collection;
 mod warm_ingest;
 mod warm_replay;

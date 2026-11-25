@@ -186,6 +186,7 @@ impl Reports for ZendReports {
     fn status(&self) -> BoxFuture<'_, TenantStatus> {
         Box::pin(self.off_runtime(|session| {
             let snap = session.status_snapshot();
+            let verdict = snap.settled();
             // Past section calibration the build has shown it works, and what
             // remains — priming above all — is as long as there is to read.
             let proven = snap
@@ -203,6 +204,13 @@ impl Reports for ZendReports {
                 "normalizing".into(),
                 snap.normalizing.map_or(Value::Null, normalizing_view),
             );
+            s.extra
+                .insert("calibration_owed".into(), json!(snap.calibration_owed));
+            s.extra.insert(
+                "warming".into(),
+                snap.warming.map_or(Value::Null, warming_view),
+            );
+            s.extra.insert("settled".into(), json!(verdict));
             s
         }))
     }
@@ -330,6 +338,11 @@ fn backlog_view(b: BacklogSnapshot) -> Value {
 /// The dialogue normalization replay draining: `(scored, total)` turns.
 fn normalizing_view((scored, total): (usize, usize)) -> Value {
     json!({ "scored": scored, "total": total })
+}
+
+/// The ingest files' normalization warm-up running: `(warmed, total)` files.
+fn warming_view((warmed, total): (usize, usize)) -> Value {
+    json!({ "warmed": warmed, "total": total })
 }
 
 /// The tools modes `role` may choose, by wire id in dial order, and the one a

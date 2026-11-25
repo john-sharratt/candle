@@ -9,6 +9,8 @@
 //! in whole seconds, so the text changes at most once a second.
 
 use super::*;
+use crate::calibrate::owed;
+use crate::settled::{settled, Settled};
 
 /// The last maintenance operation the redo log ran: `(op_name, unix_millis)`.
 /// `None` when nothing has run since the log was opened.
@@ -33,6 +35,24 @@ pub struct StatusSnapshot {
     /// `(scored, total)` of the dialogue normalization replay while it drains
     /// after a load or a re-arm; `None` once the score backgrounds are warm.
     pub normalizing: Option<(usize, usize)>,
+    /// Units the calibration passes found uncalibrated and no pass has
+    /// committed since ([`crate::calibrate::owed`]).
+    pub calibration_owed: usize,
+    /// `(warmed, total)` of the ingest files' normalization warm-up while it
+    /// runs; `None` when none is.
+    pub warming: Option<(usize, usize)>,
+}
+
+impl StatusSnapshot {
+    /// Whether the memory is settled, and what it waits on ([`crate::settled`]).
+    pub fn settled(&self) -> Settled {
+        settled(
+            self.ingest_backlog.as_ref(),
+            self.calibration_owed,
+            self.warming,
+            self.normalizing,
+        )
+    }
 }
 
 impl ZendSession {
@@ -52,6 +72,11 @@ impl ZendSession {
                 .inference
                 .load_full()
                 .and_then(|state| state.engine.warm_replay_progress()),
+            calibration_owed: owed::global().total(),
+            warming: self
+                .inference
+                .load_full()
+                .and_then(|state| state.engine.ingest_warm_progress()),
         }
     }
 

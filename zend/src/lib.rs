@@ -82,6 +82,7 @@ pub mod schema_layers;
 pub mod secrets;
 pub mod self_check;
 pub mod session;
+pub mod settled;
 pub mod substrate_git;
 pub mod tenant;
 pub mod think_budget;

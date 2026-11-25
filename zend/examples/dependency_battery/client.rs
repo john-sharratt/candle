@@ -225,10 +225,10 @@ impl Zend {
     }
 
     /// After a failed answer: whether the member was down, waiting until it
-    /// serves again, for at most [`READY_WAIT`]. A failure while the member
-    /// restarts is the deploy's, not the answer's, so it costs the answer no
-    /// try; a member that never comes back within the wait answers `false`,
-    /// and the try counts.
+    /// serves again and its memory has settled, for at most [`READY_WAIT`]. A
+    /// failure while the member restarts is the deploy's, not the answer's, so
+    /// it costs the answer no try; a member that never comes back within the
+    /// wait answers `false`, and the try counts.
     pub async fn was_down(&self) -> bool {
         if self.ready().await {
             return false;
@@ -237,10 +237,31 @@ impl Zend {
         while since.elapsed() < READY_WAIT {
             sleep(READY_POLL).await;
             if self.ready().await {
-                return true;
+                // A restart re-learns its score backgrounds: what it answers
+                // before they settle is no measurement of the memory.
+                return self.until_settled().await.is_ok();
             }
         }
         false
+    }
+
+    /// Wait until the member's memory is settled, saying each minute what it
+    /// waits on. An error when its zend does not report settling.
+    pub async fn until_settled(&self) -> anyhow::Result<()> {
+        loop {
+            let status = self.sample("/v1/status").await?;
+            match settled_of(&status) {
+                Some((true, _)) => return Ok(()),
+                Some((false, waiting_on)) => {
+                    println!(
+                        "waiting for the memory to settle: {}",
+                        waiting_on.join("; ")
+                    );
+                    sleep(SETTLED_POLL).await;
+                }
+                None => bail!("the member's zend does not report whether its memory is settled"),
+            }
+        }
     }
 }
 
@@ -254,6 +275,28 @@ pub const READY_WAIT: Duration = Duration::from_secs(3_600);
 pub fn status_is_ready(status: &Value) -> bool {
     status.get("state").and_then(Value::as_str) == Some("ready")
 }
+
+/// What a `/v1/status` answer says of zend's memory: whether it is settled —
+/// read, calibrated and normalized — and what it waits on (`zend::settled`).
+/// `None` from a member whose zend does not report it.
+pub fn settled_of(status: &Value) -> Option<(bool, Vec<String>)> {
+    let s = status.pointer("/tenants/zend/settled")?;
+    let settled = s.get("settled")?.as_bool()?;
+    let waiting_on = s
+        .get("waiting_on")
+        .and_then(Value::as_array)
+        .map(|w| {
+            w.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some((settled, waiting_on))
+}
+
+/// How often an unsettled member is asked again.
+pub const SETTLED_POLL: Duration = Duration::from_secs(60);
 
 /// Whether a reply is no answer at all: nothing said and nothing decoded — a
 /// turn the daemon declined without saying why, which is a failure to retry,
@@ -384,6 +427,30 @@ mod tests {
         assert!(status_is_ready(&json!({"state": "ready"})));
         assert!(!status_is_ready(&json!({"state": "loading"})));
         assert!(!status_is_ready(&json!({})));
+    }
+
+    /// **The member's zend says whether its memory is settled**, and what it
+    /// waits on; a zend that does not say is told apart from one that is not
+    /// settled.
+    #[test]
+    fn the_status_says_whether_the_memory_is_settled() {
+        let waiting = json!({"tenants": {"zend": {"settled": {
+            "settled": false,
+            "waiting_on": ["calibration: 2 owed", "warming: 3 of 16 files"],
+        }}}});
+        assert_eq!(
+            settled_of(&waiting),
+            Some((
+                false,
+                vec![
+                    "calibration: 2 owed".to_string(),
+                    "warming: 3 of 16 files".to_string()
+                ]
+            ))
+        );
+        let done = json!({"tenants": {"zend": {"settled": {"settled": true, "waiting_on": []}}}});
+        assert_eq!(settled_of(&done), Some((true, vec![])));
+        assert_eq!(settled_of(&json!({"tenants": {"zend": {}}})), None);
     }
 
     #[test]

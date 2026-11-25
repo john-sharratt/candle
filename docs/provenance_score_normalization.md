@@ -491,17 +491,29 @@ file's own turns are folded too (`warm_collection_normalization`,
 `warm_ingest_normalization`), each with its own member or exchange as the probe's
 answer, and scored against the gallery without it (§3.1). Details that matter:
 
-- **Once, re-armable, best-effort.** An atomic flag arms the replay: the first
-  call takes it, and `reset_normalization_warm` clears it after an ingest
-  reconcile so files added later are learned too. A reprojection that runs while
-  the replay is still scoring may read a still-warming cache; the once-per-turn
-  seal-observe keeps warming it. A replay is never armed from an ingest-time
-  (append-only target) scoring pass.
+- **Once, best-effort.** An atomic flag arms the replay; the load queues it
+  (`warm_dialogue_normalization`) and the first call takes it. A reprojection
+  that runs while the replay is still scoring may read a still-warming cache;
+  the once-per-turn seal-observe keeps warming it. A replay is never armed from
+  an ingest-time (append-only target) scoring pass.
+- **Files are warmed after every pass that reads one.** The ingest layers'
+  per-file backgrounds are learned by self-match (`IngestWarmer`) after the
+  process's first ingest pass and after every later pass that changed a layer
+  (`zend::ingest_worker`), each file once per process (`IngestWarmState`): a
+  file a later pass read is a new timeline with cold backgrounds, and warmed
+  only after the first pass it stayed read against the pool until live
+  traffic happened to teach it.
 - **Shown while it drains.** The turns handed out are counted in, and out as
   each is scored or dropped with a detaching substrate
   (`Conversation::warm_replay_progress`); `/v1/status` reports the count as
   `normalizing: { scored, total }` and the GUI draws it in the bottom strip
-  whenever no ingest backlog or tool-output read has a bar up.
+  whenever no ingest backlog or tool-output read has a bar up. The files'
+  warm-up is reported beside it as `warming: { warmed, total }`.
+- **Settled.** `/v1/status` reports `settled: { settled, waiting_on }` for
+  zend (`zend::settled`): settled only when the ingest backlog is empty, no
+  calibration is owed (a failed one included, `zend::calibrate::owed`), and
+  neither the files' warm-up nor the replay is running. A measurement of
+  retrieval waits for it (`zend/examples/dependency_battery`).
 - **Order-free.** A background is counts, so the warmed state does not depend on
   the order turns are folded in.
 - **Bounded cost.** Only the most recent `WARM_REPLAY_MAX_TURNS` (512) turns are

@@ -381,6 +381,9 @@ pub async fn run(plan: Plan<'_>) -> anyhow::Result<()> {
         .append(true)
         .open(plan.telemetry)
         .with_context(|| format!("opening {}", plan.telemetry.display()))?;
+    // A measurement of retrieval is of a settled memory: every file read,
+    // calibrated and normalized before the first question.
+    zend.until_settled().await?;
     census(&zend, &plan.census_dir.join("census_start.json")).await?;
     let in_flight = Arc::new(AtomicUsize::new(0));
     let stop = Arc::new(AtomicBool::new(false));

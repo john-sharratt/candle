@@ -101,6 +101,7 @@ impl Conversation {
             normalization: Arc::new(NormalizationCache::default()),
             normalization_warm: Arc::new(AtomicBool::new(false)),
             warm_replay_progress: Arc::default(),
+            ingest_warm: Arc::default(),
             branch_checkpoint: Arc::new(ArcSwapOption::empty()),
             gallery_cache: Arc::new(papaya::HashMap::new()),
             group_assemblies: Arc::new(Assemblies::new()),

@@ -35,28 +35,51 @@ pub struct IngestWarmer {
 }
 
 impl IngestWarmer {
-    /// Warm every ingest group's per-file backgrounds. Blocks until done. Call
-    /// after an ingest pass has finished — never concurrently with an ingest
-    /// writer, whose substrate lock the assembly reads under.
+    /// Warm the per-file backgrounds of every ingest group's timelines not
+    /// warmed before in this process — after the first pass every file, after
+    /// a later one the files it read. Blocks until done. Call after an ingest
+    /// pass has finished — never concurrently with an ingest writer, whose
+    /// substrate lock the assembly reads under.
     pub fn run(&self, schema: &Schema) {
         let started = Instant::now();
         let schema = Arc::new(schema.clone());
+        let state = self.conversation.ingest_warm_state();
+        let work: Vec<(LayerId, GroupId, Vec<TimelineId>)> = self
+            .conversation
+            .ingest_warm_work(&schema)
+            .into_iter()
+            .map(|(layer, group, timelines)| (layer, group, state.unwarmed(&timelines)))
+            .filter(|(_, _, timelines)| !timelines.is_empty())
+            .collect();
+        let mut left: usize = work.iter().map(|(_, _, t)| t.len()).sum();
+        state.started(left);
         let mut warmed = 0usize;
-        for (layer, group, timelines) in self.conversation.ingest_warm_work(&schema) {
+        for (layer, group, timelines) in &work {
             for slice in timelines.chunks(WARM_SLICE_TIMELINES) {
                 if self.conversation.ingest_cancelled() {
+                    state.abandoned(left);
                     return;
                 }
-                match self.warm_slice(&schema, layer, group, slice) {
-                    Slice::Warmed(n) => warmed += n,
+                match self.warm_slice(&schema, *layer, *group, slice) {
+                    Slice::Warmed(n) => {
+                        warmed += n;
+                        state.warmed(slice);
+                        left -= slice.len();
+                    }
                     Slice::NoArena => {
                         // A scheduler without an arena: the host path, once,
                         // for everything.
                         self.conversation.warm_ingest_normalization(&schema);
+                        for (_, _, timelines) in &work {
+                            state.warmed(timelines);
+                        }
                         return;
                     }
                     // The scheduler has shut down; nothing is left to serve.
-                    Slice::Gone => return,
+                    Slice::Gone => {
+                        state.abandoned(left);
+                        return;
+                    }
                 }
             }
         }
