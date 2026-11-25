@@ -288,6 +288,70 @@ impl Minds {
         })
     }
 
+    /// This character's conversation for `(day, chapter)`, and the day it rolled
+    /// over from when it did: the one it holds when it belongs to them, and
+    /// otherwise one opened in its place, the one it held retired first.
+    ///
+    /// **The day boundary is checked here rather than on a timer**, because a
+    /// timer fires on host-elapsed time and would be wrong the moment the
+    /// narrative clock is paused, jumped or re-paced — all of which the console
+    /// can do at any moment. **And the mission boundary.** A mission handed in
+    /// closes a chapter — the table's routines excepted, see `Missions::close`:
+    /// the next starts in a conversation of its own, the journal carrying the
+    /// work across, so a stretch that went badly — Makers once spent hours
+    /// telling each other there was nothing left to do — ends with the work it
+    /// went badly on.
+    ///
+    /// **One opening a character at a time.** The character's own turn and a
+    /// trial put to it both open its conversation here, so a trial on a
+    /// character that is resumed as it opens never adopts a second conversation
+    /// over the first's slot. Only the opening is held; each character opens on
+    /// its own.
+    pub(super) async fn resident_for(
+        &self,
+        npc_id: u64,
+        day: u64,
+        chapter: u64,
+        persona: &Persona<'_>,
+        mode: Mode,
+    ) -> anyhow::Result<(Arc<Resident>, Option<(u64, u64)>)> {
+        let lock = Arc::clone(
+            self.openings
+                .pin()
+                .get_or_insert_with(npc_id, || Arc::new(ConversationLock::new(()))),
+        );
+        let _opening = lock.lock().await;
+        let Some(current) = self.resident_of(npc_id) else {
+            let live = self.open_conversation(npc_id, day, chapter, persona, mode)?;
+            return Ok((self.adopt(npc_id, live), None));
+        };
+        let (from, from_chapter) = {
+            let l = current.conversation.lock().await;
+            (l.day, l.chapter)
+        };
+        if from == day && from_chapter == chapter {
+            return Ok((current, None));
+        }
+        if from_chapter != chapter {
+            tracing::info!(
+                npc_id,
+                from = from_chapter,
+                to = chapter,
+                "a mission was handed in — a new conversation for the next"
+            );
+        }
+        // Tombstone, not delete. The turns stay in the redo log; what changes is
+        // that they stop being selected by default.
+        if let Some(l) = self.release(npc_id) {
+            retire(&self.engine, &*l.conversation.lock().await);
+        }
+        let live = self.open_conversation(npc_id, day, chapter, persona, mode)?;
+        Ok((
+            self.adopt(npc_id, live),
+            (from != day).then_some((from, day)),
+        ))
+    }
+
     /// Let a character's conversation go without retiring it, because the
     /// character now thinks on another member.
     ///
@@ -321,6 +385,9 @@ impl Minds {
         if let Some(l) = gone {
             retire(&self.engine, &*l.conversation.lock().await);
         }
+        // What it was opened and tried under goes with it.
+        self.openings.pin().remove(&npc_id);
+        self.trial_selections.pin().remove(&npc_id);
         // Its conversations too, of every party and generation (§4.1).
         self.retire_talks(npc_id)
     }

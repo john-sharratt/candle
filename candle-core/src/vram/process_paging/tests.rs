@@ -4,8 +4,18 @@
 
 use super::*;
 
-/// **This process is found, and its counters are live**: resident memory is
-/// read, and the fault count never goes back.
+/// Memory the liveness check holds touched: several times this test binary's
+/// own footprint (~75 MB), so the committed figure crosses it only while it is
+/// held.
+const HELD: usize = 512 << 20;
+
+/// **This process is found, and its counters are live**: its committed bytes
+/// are under [`HELD`] before the test touches that much and at least that
+/// after, so the figure moved with the allocation; and the fault count never
+/// goes back. The other tests of the binary allocate and free beside this one,
+/// so the figures are bounded against what this test holds, never compared
+/// with each other. Committed bytes, because the OS may trim a resident figure
+/// at any moment.
 #[test]
 fn own_paging_is_read_and_its_fault_count_never_falls() {
     let Some(first) = own_paging() else {
@@ -14,16 +24,19 @@ fn own_paging_is_read_and_its_fault_count_never_falls() {
     };
     assert_eq!(first.pid, std::process::id());
     assert!(first.working_set > 0, "{first:?}");
-    assert!(first.private_bytes > 0, "{first:?}");
-    let held = std::hint::black_box(vec![1u8; 32 << 20]);
+    assert!(
+        first.private_bytes > 0 && first.private_bytes < HELD as u64,
+        "{first:?}"
+    );
+    let held = std::hint::black_box(vec![1u8; HELD]);
     let second = own_paging().unwrap();
     assert!(
         second.hard_faults >= first.hard_faults,
         "{first:?} then {second:?}"
     );
     assert!(
-        second.private_working_set >= first.private_working_set + (16 << 20),
-        "{first:?} then {second:?} with 32 MiB touched"
+        second.private_bytes >= HELD as u64,
+        "{second:?} with {HELD} bytes touched"
     );
     drop(held);
 }

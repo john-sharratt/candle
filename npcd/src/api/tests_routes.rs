@@ -249,6 +249,8 @@ pub(super) mod tests {
                 ("/v1/npc/:nid/mission/step", "user"),
                 ("/v1/npc/:nid/ask", "user"),
                 ("/v1/npc/:nid/mind_control", "user"),
+                // A trial turn on a suspended character, nothing of it kept.
+                ("/v1/npc/:nid/trial", "user"),
                 // The world's open channel: reading is a user's, speaking on it
                 // is a creator's, because it reaches every character in a world.
                 ("/v1/world/:wid/channel", "user"),

@@ -91,6 +91,8 @@ pub mod talk;
 pub mod terminal;
 pub mod tick;
 pub mod tools;
+pub mod trial;
+pub mod trial_api;
 pub mod watch;
 pub mod watcher;
 pub mod whereabouts;
@@ -340,6 +342,15 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             Role::User,
             character(),
             post(ask_api::mind_control),
+        )
+        // A trial turn on a suspended character: one turn answered as one
+        // call, nothing of it kept (`docs/npc_trials.md`). One owned character,
+        // so `User` plus the ownership check.
+        .route(
+            "/v1/npc/:nid/trial",
+            Role::User,
+            character(),
+            post(trial_api::trial),
         )
         // ── the world's open channel ────────────────────────────────────────
         //

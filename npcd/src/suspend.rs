@@ -55,6 +55,25 @@ pub fn refused(s: &Authored, npc_id: u64) -> Option<Response> {
     })
 }
 
+/// The `409` a trial on a character that is not suspended answers with, or
+/// `None` for one that is (`docs/npc_trials.md` §1). A running character's
+/// context moves under its trials, so only a suspended one takes them.
+pub fn not_suspended(s: &Authored, npc_id: u64) -> Option<Response> {
+    let held = s
+        .npcs
+        .view()
+        .payload(npc_id)
+        .is_some_and(|n| n.state == SUSPENDED);
+    (!held).then(|| {
+        err(
+            StatusCode::CONFLICT,
+            "npc_not_suspended",
+            "a trial runs on a suspended character, whose context nothing moves between trials: \
+             suspend it first",
+        )
+    })
+}
+
 /// `{"suspended": bool}` out of a request body, or the `400` for a body
 /// without one.
 fn wanted(body: &Value) -> Result<bool, Box<Response>> {

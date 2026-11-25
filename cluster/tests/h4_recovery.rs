@@ -33,8 +33,10 @@ const AWAY: usize = 100_000;
 
 /// The bound on a live event's p99 latency while catch-up runs: about twice
 /// the first measurements on the RTX PRO 5000 Blackwell box (190–295 ms) —
-/// the round-robin grace, a relay hop behind at most 1 MiB of catch-up, and a
-/// batch's apply.
+/// the round-robin grace, a relay hop behind at most a socket's unsent
+/// catch-up (`CATCHUP_LOW_WATER` bytes, and no more messages than its send
+/// pump holds), and a batch's apply. 210–280 ms on the RTX 4090 Mobile laptop
+/// in a debug build (2026-11-26).
 const LIVE_P99: Duration = Duration::from_millis(600);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

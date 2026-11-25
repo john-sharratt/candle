@@ -438,6 +438,7 @@ mod tests_mission;
 mod tests_standing;
 #[cfg(test)]
 mod tests_support;
+mod trial;
 mod turn;
 
 pub(crate) use ingesting::*;

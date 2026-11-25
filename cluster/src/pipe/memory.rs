@@ -1,6 +1,11 @@
 //! An in-memory message pipe with a byte capacity per direction, standing in
 //! for a WebSocket in tests and harnesses. A full direction makes its sender
-//! wait, as a socket's send buffer does.
+//! wait, as a socket's send buffer does — full in bytes, or in messages at the
+//! socket's own [`UNSENT_MESSAGES`]. A direction of small messages held only
+//! by its bytes would queue tens of thousands ahead of the next, which no
+//! socket does: the cluster's H4 measured a live event's p99 at 700–770 ms
+//! behind such a queue, and 210–280 ms with a socket's count (RTX 4090 Mobile
+//! laptop, debug build, 2026-11-26).
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,6 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
+use super::socket::UNSENT_MESSAGES;
 use super::{Drain, Message, PipeClosed, PipeRx, PipeTx};
 
 /// One direction of the pipe.
@@ -60,8 +66,9 @@ pub struct End {
     pub rx: MemoryRx,
 }
 
-/// Two connected ends; each direction holds at most `cap` bytes in flight (a
-/// single larger message is still accepted when the direction is empty).
+/// Two connected ends; each direction holds at most `cap` bytes and
+/// [`UNSENT_MESSAGES`] messages in flight (a single larger message is still
+/// accepted when the direction is empty).
 pub fn pair(cap: usize) -> (End, End) {
     let a_to_b = Direction::new(cap);
     let b_to_a = Direction::new(cap);
@@ -90,7 +97,10 @@ impl PipeTx for MemoryTx {
                 return Err(PipeClosed);
             }
             let held = self.dir.bytes.unsent();
-            if held == 0 || held + len <= self.dir.cap {
+            // This half is the direction's only sender, and the receiver only
+            // takes, so room seen here is still there at the push.
+            let queued = self.dir.queue.lock().unwrap().len();
+            if held == 0 || (held + len <= self.dir.cap && queued < UNSENT_MESSAGES) {
                 let close = matches!(message, Message::Close(_));
                 self.dir.bytes.add(len);
                 self.dir.queue.lock().unwrap().push_back(message);
@@ -173,6 +183,22 @@ mod tests {
         b.rx.recv().await.unwrap();
         send.await.unwrap();
         assert_eq!(b.rx.recv().await.unwrap().len(), 3);
+    }
+
+    /// A direction holds as many small messages as a socket holds unsent and no
+    /// more, however much byte capacity is left; taking one makes room for one.
+    #[tokio::test]
+    async fn a_direction_of_small_messages_is_full_at_a_sockets_count() {
+        let (mut a, mut b) = pair(1 << 20);
+        for _ in 0..UNSENT_MESSAGES {
+            a.tx.send(Message::Frame(vec![0])).await.unwrap();
+        }
+        assert_eq!(a.tx.unsent_bytes(), UNSENT_MESSAGES);
+        let mut send = Box::pin(a.tx.send(Message::Frame(vec![1])));
+        assert!(futures_poll_once(&mut send).await.is_none());
+        b.rx.recv().await.unwrap();
+        send.await.unwrap();
+        assert_eq!(a.tx.unsent_bytes(), UNSENT_MESSAGES);
     }
 
     #[tokio::test]

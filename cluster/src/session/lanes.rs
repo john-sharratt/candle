@@ -345,8 +345,8 @@ mod tests {
         assert_eq!(order, ["E1.0", "E1.1", "E2.0", "DONE"]);
     }
 
-    /// Catch-up waits while the socket holds 1 MiB unsent, and while the
-    /// ordered lane has anything.
+    /// Catch-up waits while the socket holds its low-water mark unsent, and
+    /// while the ordered lane has anything.
     #[test]
     fn catchup_waits_for_an_empty_ordered_lane_and_a_drained_socket() {
         let mut l = Lanes::new();

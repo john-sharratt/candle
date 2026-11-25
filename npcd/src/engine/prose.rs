@@ -25,6 +25,14 @@
 //! as written, for a caller that reads its fields. The command table's mission
 //! generator answers this way (`engine::mission_gen`).
 //!
+//! # A turn can follow a history, held as its caller says
+//!
+//! [`decode_framed`] lays completed exchanges down ahead of the turn, prefilled
+//! verbatim rather than decoded, and decodes it under the grammar, opening and
+//! sampling its caller hands it, so a trial on a given frame
+//! (`docs/npc_trials.md` §3) is read and decoded exactly as one on the
+//! character's own frame.
+//!
 //! # A fixed set of answers is a grammar, not a request
 //!
 //! `choices` compiles to a stencil whose root branches once per arm, so an answer
@@ -45,9 +53,10 @@ use candle_conversation::stencil::{
 };
 use candle_conversation::throwaway::{HeldFrame, Throwaway};
 use candle_conversation::{
-    ConversationEngine, Sequence, SequenceConfig, TokenDecoder, TurnEvent, TurnOptions,
-    TurnResponse,
+    ConversationEngine, SamplingConfig, Sequence, SequenceConfig, TokenDecoder, TurnEvent,
+    TurnOptions, TurnResponse, TurnStats,
 };
+use serde::Deserialize;
 
 use crate::engine::reflect::{plain_prose, think_off};
 use crate::prose::{Answer, Request, DEFAULT_SYSTEM};
@@ -108,13 +117,15 @@ pub async fn decode(
         max_tokens: request.max_tokens as usize,
         temperature: request.temperature,
         think: None,
+        sampling: None,
         band,
         frame,
     };
-    let (text, tokens) = framed(
+    let (text, stats) = framed(
         engine,
         base,
         system,
+        &[],
         &request.prompt,
         held,
         seed,
@@ -123,9 +134,64 @@ pub async fn decode(
     .await?;
     Ok(Answer {
         text: plain_prose(&text),
-        tokens,
+        tokens: stats.tokens_generated as u32,
         seed,
     })
+}
+
+/// One completed exchange laid down ahead of a turn: what was said, and what
+/// was answered, as the turn's own text.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Exchange {
+    pub user: String,
+    pub assistant: String,
+}
+
+/// One turn decoded under a frame of its caller's: the voice, the exchanges
+/// before it, and the grammar, opening and sampling it is held to — see
+/// [`decode_framed`].
+pub struct FramedTurn<'a> {
+    pub system: &'a str,
+    /// The exchanges read before the turn, oldest first.
+    pub history: &'a [Exchange],
+    pub prompt: &'a str,
+    pub grammar: Arc<StencilTree>,
+    /// What the reply is opened with, ahead of the grammar.
+    pub prefill: Option<String>,
+    pub sampling: SamplingConfig,
+    pub max_tokens: usize,
+    pub band: DecodePriority,
+}
+
+/// Decode `turn` in a conversation opened for it and thrown away, and return
+/// the text past its opening with the turn's stats.
+pub async fn decode_framed(
+    engine: &Arc<ConversationEngine>,
+    base: &SequenceConfig,
+    turn: &FramedTurn<'_>,
+) -> anyhow::Result<(String, TurnStats)> {
+    let held = Held {
+        turn_grammar: Some(Arc::clone(&turn.grammar)),
+        prefill: turn.prefill.clone(),
+        max_tokens: turn.max_tokens,
+        temperature: None,
+        think: None,
+        sampling: Some(turn.sampling.clone()),
+        band: turn.band,
+        frame: Frame::Transient,
+    };
+    framed(
+        engine,
+        base,
+        turn.system,
+        turn.history,
+        turn.prompt,
+        held,
+        turn.sampling.seed,
+        &mut |_: &str| {},
+    )
+    .await
 }
 
 /// One answer to ask for as a call — see [`decode_call`].
@@ -224,6 +290,7 @@ pub async fn decode_call_thought(
         max_tokens,
         temperature: ask.temperature,
         think: (ask.think != ThinkMode::Off).then_some((ask.think, ask.max_tokens)),
+        sampling: None,
         band: ask.band,
         frame: Frame::Transient,
     };
@@ -231,6 +298,7 @@ pub async fn decode_call_thought(
         engine,
         base,
         ask.system,
+        &[],
         ask.prompt,
         held,
         ask.seed,
@@ -282,25 +350,36 @@ struct Held {
     /// the turn opens one: its close budget is programmed into the sampling the
     /// way an acting turn's is.
     think: Option<(ThinkMode, usize)>,
+    /// The sampling to decode under whole, in place of the one made from the
+    /// checkpoint's own, the seed and `think`.
+    sampling: Option<SamplingConfig>,
     /// The band the turn decodes at.
     band: DecodePriority,
     /// How its system prompt is held.
     frame: Frame,
 }
 
-/// One turn under `system`, in a conversation opened for it and then thrown
-/// away. Returns the text past any prefilled opening, and the tokens decoded.
+/// One turn under `system`, after `history`, in a conversation opened for it
+/// and then thrown away. Returns the text past any prefilled opening, and the
+/// turn's stats.
+// Each is a different part of the one turn — whose engine, under what voice,
+// after what, asked what, held how, seeded how, watched by whom — and every
+// caller supplies all of them.
+#[allow(clippy::too_many_arguments)]
 async fn framed(
     engine: &Arc<ConversationEngine>,
     base: &SequenceConfig,
     system: &str,
+    history: &[Exchange],
     prompt: &str,
     held: Held,
     seed: u64,
     on_fragment: &mut (dyn FnMut(&str) + Send),
-) -> anyhow::Result<(String, u32)> {
+) -> anyhow::Result<(String, TurnStats)> {
     let mut cfg = base.clone();
-    // One turn with nothing before it: there is no history to carry.
+    // No verbatim window: a history laid down before the turn is turns of the
+    // conversation's own, which its closed group admits, read as its
+    // projection selects them.
     cfg.context_window_turns = 0;
     let Held {
         turn_grammar,
@@ -308,6 +387,7 @@ async fn framed(
         max_tokens,
         temperature,
         think,
+        sampling: whole,
         band,
         frame,
     } = held;
@@ -321,6 +401,7 @@ async fn framed(
     let (mut job, decoder) = {
         let engine = Arc::clone(engine);
         let system = system.to_string();
+        let history = history.to_vec();
         let formatted = base.dialect.format_system_prompt(&system);
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let (id, frame) = match frame {
@@ -335,25 +416,32 @@ async fn framed(
                 engine.new_conversation_with_projection(&formatted, builder, layer, group, cfg)?;
             let timeline = sequence.timeline_id();
             engine.mark_timeline_transient(timeline);
-            let job = ProseJob {
+            // Guarded before the history is laid down, so an exchange that
+            // fails to prefill still leaves nothing behind.
+            let mut job = ProseJob {
                 _retired: Throwaway::new(Arc::clone(&engine), timeline, "prose"),
                 sequence,
                 _frame: frame,
             };
+            for exchange in &history {
+                job.sequence
+                    .insert_turn(exchange.user.as_str(), &exchange.assistant)?;
+            }
             Ok((job, engine.token_decoder()))
         })
         .await
         .map_err(|e| anyhow::anyhow!("the prose opening did not finish: {e}"))??
     };
 
-    let mut sampling = match think {
+    let mut sampling = match (whole, think) {
+        (Some(whole), _) => whole,
         // The block is closed on its dial's budget, as an acting turn's is.
-        Some((mode, answer)) => base
+        (None, Some((mode, answer))) => base
             .sampling
             .clone()
             .with_seed(seed)
             .with_think_mode(mode, answer),
-        None => base
+        (None, None) => base
             .sampling
             .clone()
             .with_seed(seed)
@@ -380,8 +468,9 @@ async fn framed(
     let text = match &prefill {
         Some(p) => r.text.strip_prefix(p.as_str()).unwrap_or(&r.text),
         None => r.text.as_str(),
-    };
-    Ok((text.to_string(), r.stats.tokens_generated as u32))
+    }
+    .to_string();
+    Ok((text, r.stats))
 }
 
 /// A prose job's conversation and what it holds, let go in the order the

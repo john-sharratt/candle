@@ -61,58 +61,13 @@ impl Minds {
     ) -> anyhow::Result<Thought> {
         let mut thought = Thought::default();
 
-        // Find or open this character's conversation. The lookup holds nothing,
-        // and the open — scheduler round trips — runs after it. That gap admits
-        // no race: only this character's own task ever opens or replaces its
-        // conversation, so the entry cannot change hands in between.
-        let existing = self.resident_of(npc_id);
-        let resident = match existing {
-            Some(current) => {
-                // The day boundary. Checked here rather than on a timer because
-                // a timer fires on host-elapsed time and would be wrong the
-                // moment the narrative clock is paused, jumped or re-paced —
-                // all of which the console can do at any moment.
-                // **And the mission boundary.** A mission handed in closes a
-                // chapter — the table's routines excepted, see
-                // `Missions::close`: the next starts in a conversation of its own, the
-                // journal carrying the work across, so a stretch that went badly
-                // — Makers once spent hours telling each other there was nothing
-                // left to do — ends with the work it went badly on.
-                let (from, from_chapter) = {
-                    let l = current.conversation.lock().await;
-                    (l.day, l.chapter)
-                };
-                if from == day && from_chapter == chapter {
-                    current
-                } else {
-                    if from_chapter != chapter {
-                        tracing::info!(
-                            npc_id,
-                            from = from_chapter,
-                            to = chapter,
-                            "a mission was handed in — a new conversation for the next"
-                        );
-                    }
-                    // Tombstone, not delete. The turns stay in the redo log;
-                    // what changes is that they stop being selected by default.
-                    let gone = self.release(npc_id);
-                    if let Some(l) = gone {
-                        retire(&self.engine, &*l.conversation.lock().await);
-                    }
-                    if from != day {
-                        thought.rolled_over = Some((from, day));
-                    }
-                    self.adopt(
-                        npc_id,
-                        self.open_conversation(npc_id, day, chapter, persona, mode)?,
-                    )
-                }
-            }
-            None => self.adopt(
-                npc_id,
-                self.open_conversation(npc_id, day, chapter, persona, mode)?,
-            ),
-        };
+        // This character's conversation for the day and chapter: the one it
+        // holds, or one opened in its place — see `Minds::resident_for`, which a
+        // trial opens through too.
+        let (resident, rolled_over) = self
+            .resident_for(npc_id, day, chapter, persona, mode)
+            .await?;
+        thought.rolled_over = rolled_over;
 
         // **The answers to last turn's acts, then everything that has happened
         // since — one message.**
@@ -349,6 +304,21 @@ impl Minds {
         persona: &Persona<'_>,
         within: &tools::Within,
     ) -> SelectionState {
+        self.prepare_waiting(live, npc_id, persona, within, None)
+            .await
+    }
+
+    /// [`Self::prepare`], waiting up to `journal_wait` for journal entries still
+    /// sealing, so what is read does not change as they seal. A trial waits: two
+    /// trials of one body must read the same journal.
+    pub(super) async fn prepare_waiting(
+        &self,
+        live: &mut Live,
+        npc_id: u64,
+        persona: &Persona<'_>,
+        within: &tools::Within,
+        journal_wait: Option<Duration>,
+    ) -> SelectionState {
         let mission = persona.mission.map(|m| Want {
             name: identity::MISSION_SECTION,
             text: &m.text,
@@ -374,7 +344,7 @@ impl Minds {
                 &journal_wants(persona.journal),
                 Linking::Chain,
                 &journal_sweep(persona.journal),
-                None,
+                journal_wait,
                 tokio::time::sleep,
             )
             .await;
