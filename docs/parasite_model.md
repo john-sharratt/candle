@@ -25,7 +25,9 @@ fleet operates.**
 - WhiteWorld's primary is Qwen3.6-35B, which no tenant uses yet. Flash-Next
   runs there as a parasite that never unmounts, which is the live test of the
   parasite path.
-- Moving npcd to Qwen3.6 is a separate change made afterwards (§16, step 7).
+- Once that build is proven, the plan's last step moves npcd. BlackWorld leaves
+  npcd's cluster. npcd's substrate is wiped and npcd switches to Qwen3.6-35B,
+  serving from WhiteWorld only, on that card's primary (§16, step 7).
 
 ## 1. Where things stand
 
@@ -647,9 +649,15 @@ core (§8.3), and it names the card's primary and its mounts.
 **`/v1/status` and `/v1/telemetry`** report the primary and every mounted
 parasite, each with its `ModelView`. Each tenant's entry names its model.
 
-**Placement is unchanged.** `host/machines.yaml` and `static_placement.md` already
-send most conversations to BlackWorld and most pictures to WhiteWorld. Moving the
-cast to WhiteWorld is part of step 7 (§16), not before.
+**Placement is unchanged until step 7.** `host/machines.yaml` and
+`static_placement.md` already send most conversations to BlackWorld and most
+pictures to WhiteWorld.
+
+**Step 7 changes it:**
+- BlackWorld stops serving npcd. Its motherd config drops npcd from its apps, and
+  its `characters` share leaves `host/machines.yaml`.
+- WhiteWorld becomes npcd's only member and hosts the whole cast.
+- zend keeps both machines, conversations first on BlackWorld as today.
 
 ## 14. What the first build does on each machine
 
@@ -662,6 +670,16 @@ cast to WhiteWorld is part of step 7 (§16), not before.
 about 960 of Flash-Next's 1.9 MB slots. That is the price of running the parasite
 path live before npcd moves. The expert hit rate and decode rate on WhiteWorld
 are recorded before and after step 6, so the price is measured, not assumed.
+
+**After step 7:**
+
+| Machine | Primary | Tenants | What runs |
+|---|---|---|---|
+| BlackWorld | Flash-Next | zend on Flash-Next | the primary only; guests as mounts |
+| WhiteWorld | Qwen3.6-35B AntiLoop | npcd on Qwen3.6 (the whole cast), zend on Flash-Next | the cast on the primary; Flash-Next mounted as a parasite when a zend conversation is placed there (one once BlackWorld holds four, `host/machines.yaml`) |
+
+From then on WhiteWorld is where two LLMs alternate. It is also where §8.2's
+constants are measured.
 
 ## 15. Tests
 
@@ -710,8 +728,8 @@ rule.
 
 ## 16. Plan
 
-Each step lands green, deploys on its own, and leaves the fleet operating as
-before. Steps 1–6 are the first build. Step 7 is a separate change.
+Each of steps 1–6 lands green, deploys on its own, and leaves the fleet operating
+as before. Step 7 moves npcd. It runs once step 6 is proven live.
 
 | # | Step | Delivers |
 |---|---|---|
@@ -721,4 +739,4 @@ before. Steps 1–6 are the first build. Step 7 is a separate change.
 | 4 | **The card driver** | `housekeep` and `quanta`; one driver over one core; the per-card calls moved; the wait across channels; the held clock and per-app capacity |
 | 5 | **Guests as mounts** | kept instances, per-mount arenas and heaps, cooldowns, rung c, companions, one tower per model, bands on jobs, the image generator's two stages together where they fit |
 | 6 | **LLM parasites** | `open` / `mount` / `unmount`; the `Ground` placer; the switch mode; rung h; the primary by card size; several cores per driver. Live: BlackWorld unchanged, WhiteWorld with Flash-Next as its parasite |
-| 7 | **npcd on Qwen3.6** (separate, by decision) | `npcd::tenant::model` is Qwen3.6 AntiLoop; npcd on a new substrate; the cast moved to WhiteWorld in `host/machines.yaml`; §8.2's constants measured with two LLMs alternating |
+| 7 | **npcd on Qwen3.6, on WhiteWorld only** | in this order: (a) BlackWorld leaves npcd's cluster. Its motherd config drops npcd from its apps and `host/machines.yaml` drops its `characters` share, so WhiteWorld is npcd's only member and nothing can replicate the old substrate back. (b) `npcd::tenant::model` becomes `Qwen36_35B_A3B_AntiLoop_StyleTune`. (c) npcd's substrate on WhiteWorld is wiped, and npcd starts on a fresh one under Qwen3.6. The old one was written by Flash-Next and would be refused at open anyway (`shared_model_host.md` §4). (d) §8.2's constants are measured with the cast on Qwen3.6 and zend's overflow mounting Flash-Next beside it. The wipe and the change of cluster membership each go to the user for approval when they run |
