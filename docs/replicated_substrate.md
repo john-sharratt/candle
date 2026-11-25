@@ -3083,12 +3083,17 @@ A catch-up uses only spare capacity:
   alone, and crosses the gateway on an empty lane. A `FETCH` whose `DONE` arrives
   short of records is fetched again.
 - The answerer sends catch-up frames only when its ordered lane is empty and its
-  socket's unsent bytes are under 1 MiB (§4.2). Live traffic that keeps the socket
+  socket's unsent bytes are under 8 MiB (§4.2). Live traffic that keeps the socket
   busy therefore holds catch-up back entirely, and a live event queued behind catch-up
-  waits for at most 1 MiB of it to drain. That bound is in bytes, and small records
-  make it many frames for the gateway to relay first, so it is kept to what keeps a
-  link busy and no more: under catch-up of 100 k small records, H4 measures the live
-  p99 against it (§14.2).
+  waits for at most that much of it to drain. The mark is what keeps a link busy and
+  no more: 8 MiB is some seven milliseconds of a 10 Gbit link, where 1 MiB ran
+  WhiteWorld's 465 GB catch-up at 100 MB/s with its disk 93% idle. Small records are
+  held by the socket's send pump as well, which takes 64 messages and flushes one:
+  past 65 unsent a send waits, whatever their bytes, so a live event is never behind
+  more than that many frames of catch-up on a hop. Under catch-up of 100 k small
+  records, H4 measures the live p99 against it (§14.2); its in-memory pipe holds a
+  socket's 65 messages for that reason, and held to its bytes alone it queued tens of
+  thousands and put the p99 at 700–770 ms.
 - The writer waits for the socket to drain under that mark on the pipe's own count —
   woken by the fall itself (`pipe::drain`), never on a timer. Polled every 1 ms, the
   wait took a timer tick — ~15.6 ms on Windows — so about one 1 MiB mark went out per

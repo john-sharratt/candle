@@ -41,6 +41,10 @@ pub trait Codec: Send + Sync + 'static {
 /// How many messages wait for the pump before a send waits.
 const PUMP_DEPTH: usize = 64;
 
+/// The most messages a socket holds unsent: its pump's queue and the one the
+/// pump is flushing. A send past it waits, whatever their bytes.
+pub const UNSENT_MESSAGES: usize = PUMP_DEPTH + 1;
+
 /// How long one message may take to flush before the socket is given up: long
 /// enough for a 1 MiB fragment over a link of 4 KB/s. Past it a socket is
 /// stalled, not slow: one held a member's lanes for an hour, 223 MB unsent,
