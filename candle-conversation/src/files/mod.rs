@@ -11,9 +11,15 @@
 pub mod chunk;
 pub mod cut;
 pub mod key;
+pub mod owner;
+pub mod record;
 pub mod render;
+pub mod stream_name;
 
 pub use chunk::Chunk;
 pub use cut::cut_lines;
 pub use key::{content_key, ChunkKey, FileKey, LineSpan};
+pub use owner::files_owner;
+pub use record::{ChunkRecord, FileRecord, FileUnit, MemberRef, FILES_PREFIX};
 pub use render::{assemble_pieces, knowledge_text, RenderedFile};
+pub use stream_name::{is_member_stream_name, member_stream_name};

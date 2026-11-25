@@ -12,6 +12,7 @@
 //! to be wrong is not persisted, since every later projection would refuse it.
 
 use super::*;
+use crate::files::is_member_stream_name;
 
 impl Scheduler {
     /// `turn_content`, when `seal_action == SealAction::Turn`, carries
@@ -719,6 +720,16 @@ impl Scheduler {
                     // persistence trigger so the chunks land on disk in the next
                     // pass.
                     conversation.enqueue_tokens(stream_id, tokens.to_vec());
+                    // A member of the knowledge base is retrieved by its
+                    // signatures, as a turn is, so its seal writes them under
+                    // its own stream; no other section is retrieved, and none
+                    // carries any.
+                    if is_member_stream_name(debug_name) && !wide_sigs.is_empty() {
+                        conversation.enqueue_wide_q_sigs(
+                            stream_id,
+                            encode_wide_sigs_with(&wide_sigs, self.prov_fold),
+                        );
+                    }
                     self.persist_triggers.fire();
                 }
             }

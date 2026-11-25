@@ -78,6 +78,7 @@ mod carried;
 pub use carried::{Carried, Linking, Want};
 mod ephemeral_turn;
 mod frame;
+mod member_seal;
 pub use ephemeral_turn::{AskScope, UnsealedAsker};
 pub(crate) use frame::Frame;
 mod prefix_state;
@@ -87,9 +88,10 @@ mod sharing;
 mod submitted_sections;
 mod turn_bans;
 
+pub use member_seal::{MemberSpec, SealedMember};
 use prefix_state::{checkpoint, shared_held, state_after};
 pub use prompt_dump::{PieceKind, PromptDump, PromptPiece};
-pub use sharing::{is_shared_stream_name, Sharing, SHARED_SECTION_NAME_PREFIX};
+pub use sharing::{is_shared_stream_name, shared_stream_name, Sharing, SHARED_SECTION_NAME_PREFIX};
 use submitted_sections::SubmittedSections;
 pub use submitted_sections::{SectionRef, SectionState};
 
