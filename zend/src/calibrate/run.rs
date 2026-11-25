@@ -247,7 +247,7 @@ pub fn calibrate_layer(
     };
     report.done = todo.done;
     report.waiting = todo.waiting;
-    owed::global().planned(&spec.layer, todo.run.len() + todo.waiting);
+    owed::global().planned(&spec.layer, todo.run.len(), todo.waiting);
     tracing::info!(
         target: "zend::calibrate",
         layer = %spec.layer,

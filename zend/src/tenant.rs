@@ -207,6 +207,10 @@ impl Reports for ZendReports {
             s.extra
                 .insert("calibration_owed".into(), json!(snap.calibration_owed));
             s.extra.insert(
+                "calibration_waiting".into(),
+                json!(snap.calibration_waiting),
+            );
+            s.extra.insert(
                 "warming".into(),
                 snap.warming.map_or(Value::Null, warming_view),
             );

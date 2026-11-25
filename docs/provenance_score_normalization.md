@@ -512,7 +512,9 @@ answer, and scored against the gallery without it (§3.1). Details that matter:
 - **Settled.** `/v1/status` reports `settled: { settled, waiting_on }` for
   zend (`zend::settled`): settled only when the ingest backlog is empty, no
   calibration is owed (a failed one included, `zend::calibrate::owed`), and
-  neither the files' warm-up nor the replay is running. A measurement of
+  neither the files' warm-up nor the replay is running. A unit no pass can
+  calibrate yet — an older reading, a broken chain, failures past the limit —
+  is reported as `calibration_waiting` and not waited on. A measurement of
   retrieval waits for it (`zend/examples/dependency_battery`).
 - **Order-free.** A background is counts, so the warmed state does not depend on
   the order turns are folded in.

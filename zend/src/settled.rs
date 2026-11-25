@@ -7,9 +7,10 @@
 //!
 //! - the ingest backlog — files read, faced and calibrated by the sweep
 //!   running ([`crate::ingest_backlog`]);
-//! - calibrations owed — units the last calibration pass found uncalibrated,
-//!   a failed one included, that no pass has committed since
-//!   ([`crate::calibrate::owed`]);
+//! - calibrations owed — units a calibration pass set out to calibrate, a
+//!   failed one included, that no pass has committed since
+//!   ([`crate::calibrate::owed`]); a unit no pass can calibrate yet is
+//!   reported apart and not waited on;
 //! - the ingest normalization warm-up — the per-file backgrounds of files a
 //!   pass read ([`candle_conversation::IngestWarmer`]);
 //! - the dialogue normalization replay after a load.

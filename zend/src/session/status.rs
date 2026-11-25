@@ -35,9 +35,13 @@ pub struct StatusSnapshot {
     /// `(scored, total)` of the dialogue normalization replay while it drains
     /// after a load or a re-arm; `None` once the score backgrounds are warm.
     pub normalizing: Option<(usize, usize)>,
-    /// Units the calibration passes found uncalibrated and no pass has
+    /// Units the calibration passes set out to calibrate and no pass has
     /// committed since ([`crate::calibrate::owed`]).
     pub calibration_owed: usize,
+    /// Units the calibration passes cannot calibrate yet — an older reading,
+    /// a broken chain, a turn not held, failures past the limit. Reported, and
+    /// not waited on.
+    pub calibration_waiting: usize,
     /// `(warmed, total)` of the ingest files' normalization warm-up while it
     /// runs; `None` when none is.
     pub warming: Option<(usize, usize)>,
@@ -73,6 +77,7 @@ impl ZendSession {
                 .load_full()
                 .and_then(|state| state.engine.warm_replay_progress()),
             calibration_owed: owed::global().total(),
+            calibration_waiting: owed::global().waiting(),
             warming: self
                 .inference
                 .load_full()
