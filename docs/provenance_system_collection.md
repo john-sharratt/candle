@@ -441,20 +441,31 @@ A file's ingest is:
      it — now its members in the collection, in Q1's layout, where it was
      the reading's turns (`calibrate/sections.rs`, one message, one part per
      prompt);
-   - each question is then **asked again behind its own file**
-     (decided 2026-11-26): the system prompt with the collection holding
-     **only the target file's members**, in Q1's layout, never the seed;
-     the recurrent state the file's own chain end (every file is sealed as
-     a chain of its chunks, §5, and its end state is snapshotted); then the
-     close row and the question, thinking on. Its question and thinking are
-     sealed as the calibration (`Substrate::CALIBRATES_KEY`, now voting for
-     the `FileKey`), then distilled provenance-only. This replaces asking it
-     alone with nothing projected (`calibrate/run.rs:10-23`;
+   - each question is then **asked again, alternating between two
+     knowledge bases** (decided 2026-11-26). A file's questions take them in
+     turn, by their order in the draft: the first, third, fifth… behind the
+     **empty** knowledge base, the second, fourth, sixth… behind the
+     **target**:
+     - *empty* — `files_open` emitted with no members, the knowledge base's
+       heading and nothing under it; the recurrent state the checkpoint's,
+       advanced over `files_open`. The frame a query has before it has
+       found the file: what provenance must match to pull the file in.
+     - *target* — the collection holding **only the target file's members**,
+       in Q1's layout; the recurrent state the file's own chain end (every
+       file is sealed as a chain of its chunks, §5, and its end state is
+       snapshotted). The frame a query has once the file is in front of it.
+
+     Either way the close row and the question follow, thinking on, and the
+     question and thinking are sealed as the calibration
+     (`Substrate::CALIBRATES_KEY`, now voting for the `FileKey`), then
+     distilled provenance-only. Alternating rather than asking every
+     question twice keeps a file's signature bytes where they are. Neither
+     frame holds the seed or another file, so nothing bleeds in and a seed
+     change recalibrates nothing. This replaces asking alone with nothing
+     projected (`calibrate/run.rs:10-23`;
      `docs/provenance_scoped_signatures.md` §2.5, revised with this change):
-     the knowledge base is real, so the question's K/V and the thinking's
-     queries are computed in the frame a live query has; nothing but the
-     target is in it, so no other file bleeds in; and the seed is never in
-     it, so a seed change recalibrates nothing.
+     both knowledge bases are real frames, so the question's K/V and the
+     thinking's queries are computed where a live query's are.
 
    The calibrations and the members' own signatures are what the gallery
    scans (`belief_groups.rs`). The draft and the calibrations are the only
@@ -480,17 +491,19 @@ they once came from tool-response turns, and the two can point differently.
 Content-only ranking may weaken.
 
 A **calibration** is a question about the file asked as a live turn opens,
-with the target file in the knowledge base and nothing else (§7 step 3): a
-user turn, its thinking after it, behind a system prompt that ends as every
-dialogue's does. Its signatures sit where a dialogue's queries do — the same
-role, the same frame, the knowledge base real — and they carry the ranking
-where the content's fall short.
+behind one of two knowledge bases (§7 step 3): a user turn, its thinking
+after it, behind a system prompt that ends as every dialogue's does. Its
+signatures sit where a dialogue's queries do — the same role, the same
+frame — and they carry the ranking where the content's fall short.
 
-The cost of asking it with the file in view: its thinking can answer from
-the file rather than reason toward it, and lean toward the file's own
-content, which the content signatures already cover, and away from a query
-that has not yet found the file — the one provenance must pull the file in
-for. The ranking split below measures whether that happens. The
+The two frames cover the two queries provenance answers. Behind the
+**empty** knowledge base the thinking reasons toward a file it does not
+have, as a query does before the file is placed: the discovery that pulls
+it in. Behind the **target** it reasons with the file in front of it, as a
+query does once it is placed, and leans toward the file's own content. A
+file's questions alternate between them, so each file carries both kinds
+in the bytes one kind had. The ranking split below measures what each kind
+contributes. The
 numbers already lean on them: the scoring lab's formula took MRR 0.235 →
 0.663 largely through how calibration votes are weighed
 (`docs/results/provenance_scoring_lab_2026-11-16.md`), and the needle
@@ -510,10 +523,13 @@ Three consequences:
   tuned (`calibration_weight`, `vote_top_k`, `kind_z`,
   `projection.yaml` `scopes` policy) and checked on the first memory.
 - **The split is measured.** On the depth-1 memory (§9 step 5) the test
-  questions are ranked by the scoring lab (`provenance_gates lab`) three
-  ways — content signatures alone, calibration alone, both — before their
-  answers are read. Content-only collapsing while calibration carries the
-  rank confirms this section; both collapsing stops the rollout there.
+  questions are ranked by the scoring lab (`provenance_gates lab`) before
+  their answers are read: content signatures alone; empty-frame
+  calibrations alone; target-frame calibrations alone; and all of them
+  together. Content-only collapsing while calibration carries the rank
+  confirms this section; everything collapsing stops the rollout there. The
+  split between the two calibration kinds says whether the alternation
+  should lean one way.
 
 ### 7.2 What the system prompt tells the model
 
@@ -642,11 +658,12 @@ these in the same commit:
   whole file, and whether the fill should place a chunk's predecessor with
   it so a definition split at a boundary is not shown in halves, is measured
   in step 5.
-- **Calibration context** — decided 2026-11-26: a draft and its calibrated
-  questions both see the target file's members only, the seed files
-  included: a seed file is calibrated behind itself alone, not behind the
-  chain, so `OWN_FILE` (`calibrate/sections.rs`), which exists because a
-  link's draft saw the chain, goes. The draft's reading check
+- **Calibration context** — decided 2026-11-26: a draft sees the target
+  file's members only, and its questions alternate between the empty and
+  the target knowledge base (§7 step 3). The seed files included: a seed
+  file is calibrated behind itself alone, not behind the chain, so
+  `OWN_FILE` (`calibrate/sections.rs`), which exists because a link's draft
+  saw the chain, goes. The draft's reading check
   (`calibrate/draft_sight.rs`, `reading_held`) and its prompts ("It is above,
   already read", `projection.yaml:850-874`) are rewritten for a file in the
   knowledge base.
