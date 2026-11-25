@@ -1,7 +1,7 @@
 ---
 title: "AI: What one GPU can do"
 date: 2026-09-30
-feature: 1
+feature: 2
 tint: ok
 tags: [inference, performance, benchmarks]
 summary: >-

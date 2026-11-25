@@ -1,7 +1,7 @@
 ---
 title: "AI: one KV format per block, not per model"
 date: 2026-08-21
-feature: 3
+feature: 4
 tint: violet
 tags: [quantization, kv-cache]
 summary: >-
