@@ -402,6 +402,38 @@ impl Builder {
         Err(ConstructionError::UnknownSection(name.to_string()))
     }
 
+    /// Replace the content of option `option` of the tree node `name` BEFORE
+    /// prefill, as [`Self::set_tree_section_content`] does for a node of one
+    /// option: a node of several — an `optional`'s present side, a selector's
+    /// option — whose text is generated at runtime, such as the seed the
+    /// knowledge base opens on. The option must already exist with non-empty
+    /// authored content, so its per-branch variants were allocated. Errors when
+    /// no such node and option is found.
+    pub fn set_tree_option_content(
+        &mut self,
+        name: &str,
+        option: &str,
+        content: impl Into<String>,
+    ) -> Result<(), ConstructionError> {
+        let content = content.into();
+        for item in self.schema.system_prompt.items.iter_mut() {
+            if let SystemPromptItem::SectionTree(t) = item {
+                for node in t.nodes.iter_mut() {
+                    if node.name != name || node.collection.is_some() || node.glue.is_some() {
+                        continue;
+                    }
+                    if let Some(opt) = node.options.iter_mut().find(|o| o.id == option) {
+                        opt.content = content;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Err(ConstructionError::UnknownSection(format!(
+            "{name}/{option}"
+        )))
+    }
+
     /// Reject a duplicate section name in the shared system prompt (top-level OR
     /// nested in a collection or section-tree).
     pub(super) fn assert_section_name_free(&self, name: &str) -> Result<(), ConstructionError> {

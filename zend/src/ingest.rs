@@ -29,6 +29,8 @@ use candle_conversation::projection::{LayerSchema, Schema, SelectionRule, System
 use candle_conversation::Sequence;
 use journal_core::section::JOURNAL;
 
+use crate::files::FILES_COLLECTION;
+
 use crate::calibrate::CalibrateSpec;
 use crate::layers::LayerSpec;
 
@@ -221,8 +223,9 @@ pub fn ingest_layers(
 }
 
 /// Derive the section-collection sinks: empty collections (other than the
-/// registry-backed `tools`, the identity collections and the per-conversation
-/// `journal`) in the shared system prompt, in declaration order. Each is filled
+/// registry-backed `tools`, the identity collections, the per-conversation
+/// `journal` and the knowledge base's `files`, which the fill places from the
+/// corpus) in the shared system prompt, in declaration order. Each is filled
 /// from `<collection-name>s/`.
 pub fn section_sinks(schema: &Schema) -> Vec<SectionSink> {
     let mut out = Vec::new();
@@ -234,6 +237,7 @@ pub fn section_sinks(schema: &Schema) -> Vec<SectionSink> {
             || c.name == IDENTITY_COLLECTION
             || c.name == IDENTITY_ANCHOR_COLLECTION
             || c.name == JOURNAL
+            || c.name == FILES_COLLECTION
             || !c.sections.is_empty()
         {
             continue;

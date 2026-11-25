@@ -347,10 +347,54 @@ pub(super) mod projection_schema_tests {
             "dialogue must be excluded as the live conversation layer",
         );
         // The coding-assistant schema has no folder-backed section collections:
-        // its only collection is the registry-backed `tools`, which is excluded.
+        // its collections are the registry-backed `tools`, the journal and the
+        // knowledge base's `files`, all excluded.
         assert!(
             crate::ingest::section_sinks(builder.schema()).is_empty(),
             "embedded schema should derive no section-collection sinks",
+        );
+    }
+
+    /// **The system prompt ends on the knowledge base**: `files_open`, the
+    /// `files` collection with no schema member, the `seed` optional present
+    /// by default, then the close — so the birth prefix and every branch
+    /// checkpoint end `files_open, seed, system_close`, the dynamic members
+    /// outside them (docs/provenance_system_collection.md §6.2b).
+    #[test]
+    fn the_system_prompt_ends_on_the_knowledge_base() {
+        use candle_conversation::projection::SystemPromptItem;
+        let builder = build_projection_builder(Path::new("demo-project"));
+        let items = &builder.schema().system_prompt.items;
+        let tail: Vec<String> = items[items.len() - 4..]
+            .iter()
+            .map(|item| match item {
+                SystemPromptItem::Section(s) => format!("section {}", s.name),
+                SystemPromptItem::Collection(c) => {
+                    format!("collection {} ({} members)", c.name, c.sections.len())
+                }
+                SystemPromptItem::SectionTree(t) => {
+                    let n = &t.nodes[0];
+                    let opts: Vec<&str> = n.options.iter().map(|o| o.id.as_str()).collect();
+                    format!("tree {} [{}]", n.name, opts.join("|"))
+                }
+            })
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                "section files_open",
+                "collection files (0 members)",
+                "tree seed [present|absent]",
+                "section system_close",
+            ]
+        );
+        let SystemPromptItem::Section(open) = &items[items.len() - 4] else {
+            unreachable!()
+        };
+        assert_eq!(open.content, "\n# Knowledge Base\n\n");
+        assert!(
+            open.depends_on.is_none(),
+            "files_open is in the birth prefix"
         );
     }
 

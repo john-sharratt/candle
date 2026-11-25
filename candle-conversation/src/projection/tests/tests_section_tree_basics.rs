@@ -2192,6 +2192,85 @@ layers:
         assert!(pos(summary_id) < pos(var(&b, "tools_open")));
     }
 
+    /// **An optional's present side takes its runtime text, and the dial picks
+    /// the side**: the seed the knowledge base opens on is rendered at
+    /// startup into the `seed` optional's present option; its absent side
+    /// stays empty, the variant ids do not move, and the seed dial chooses
+    /// which side projects.
+    #[test]
+    fn an_optionals_present_side_takes_its_runtime_text_and_the_dial_picks_the_side() {
+        use crate::projection::{ProjectionMode, SelectionState};
+        let yaml = r#"
+system_prompt:
+  items:
+    - kind: section
+      id: files_open
+      content: "kb"
+    - kind: section_tree
+      nodes:
+        - kind: optional
+          id: seed
+          content: "placeholder"
+          default: present
+    - kind: section
+      id: close
+      content: "end"
+layers:
+  - name: dialogue
+    window: 8000
+    score_formula: max
+    budget:
+      priority: 100
+    summary:
+      turns:
+        max_tokens: 256
+        user:
+          system_prompt: compress
+          user_prompt: compress
+        assistant:
+          system_prompt: compress
+          user_prompt: compress
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+        let mut b = Builder::from_yaml(yaml).unwrap();
+        let seed_node = |b: &Builder| {
+            dialogue_tree(b)
+                .nodes
+                .iter()
+                .find(|n| n.name == "seed")
+                .unwrap()
+                .clone()
+        };
+        let present_id = seed_node(&b).options[0].variant_for(0).unwrap().id;
+        b.set_tree_option_content("seed", "present", "## The content from candle/README.md:")
+            .unwrap();
+        let node = seed_node(&b);
+        assert_eq!(node.options[0].id, "present");
+        assert_eq!(
+            node.options[0].content,
+            "## The content from candle/README.md:"
+        );
+        assert_eq!(node.options[1].id, "absent");
+        assert_eq!(node.options[1].content, "");
+        assert_eq!(node.options[0].variant_for(0).unwrap().id, present_id);
+        assert!(b.set_tree_option_content("seed", "sideways", "x").is_err());
+        assert!(b.set_tree_option_content("nope", "present", "x").is_err());
+
+        let resolver = MockResolver::new();
+        let projected = |seeds: bool| -> Vec<SectionId> {
+            let mut sel = SelectionState::new();
+            sel.set_seeds(seeds);
+            b.project_with_selection(tree_target(&b), &resolver, ProjectionMode::Decode, &sel)
+                .sealed_sections()
+                .map(|s| s.id)
+                .collect()
+        };
+        assert!(projected(true).contains(&present_id));
+        assert!(!projected(false).contains(&present_id));
+    }
+
     #[test]
     fn runtime_add_to_tree_collection_seals_per_branch_no_alias() {
         // Like COLLECTION_TREE_YAML but the tools collection starts empty — the
