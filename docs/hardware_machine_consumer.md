@@ -133,7 +133,7 @@ The reliability tradeoff is real but bounded. AIO pumps typically run 5-7 years 
 
 ### NeurIPS paper "One Card, One Stack"
 
-The build matches the paper's central premise exactly: single-card 72 GB inference of a near-400B MoE model at workable throughput. Compression metrics for palette4, query-subspace selection, BDP retrieval, SCD, and the C0-C10 format ladder can all be measured against actual production workloads on this hardware rather than synthetic benchmarks. The V error metric defined as normalised squared L2 error runs unchanged from the appendix B specification. Multi-session identity discrimination as described in §9.9b has comfortable headroom in the 72 GB VRAM allocation. The paper is publication-ready on this hardware, and the four-venue roadmap (arXiv preprint May 2026, MLSys October 2026, ACL February 2027, NeurIPS May 2027, EMNLP June 2027) is fully supported by the rig.
+The build matches the paper's central premise exactly: single-card 72 GB inference of a near-400B MoE model at workable throughput. Compression metrics for palette4, query-subspace selection, BDP retrieval, SCD, and the C0-C10 format ladder can all be measured against actual production workloads on this hardware rather than synthetic benchmarks. The V error metric defined as normalised squared L2 error runs unchanged from the appendix B specification. Multi-session identity discrimination as described in §9.9b has comfortable headroom in the 72 GB VRAM allocation. The paper is publication-ready on this hardware.
 
 ### Battle Cities inference target
 
