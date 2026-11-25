@@ -164,6 +164,10 @@ zend's `tool_def::DEFS`, `SCAN_*`, `ingest_backlog`, `ingest_report`; npcd's
    `Qwen38_FlashNext` (§5.1) — and every tenant runs it. No candidate lists, no VRAM ladder, no per-daemon choice: zend's
    `model_choice` ladder and `--model` flag go. A tenant only declares what it needs
    *of* a model, which is checked against the prescribed one at start.
+   **Superseded by [`parasite_model.md`](parasite_model.md):** each tenant names its
+   own model, the card picks a primary by its size, and every other model is a
+   parasite mounted on demand. §5 describes the single model as built until that
+   design's step 4 lands.
 8. **One HTTP server; where the daemons overlap, one implementation.** A path both
    daemons serve is functionality both need, so the host serves it once, as the
    superset of the two (§3.5) — the shared engine reported once, each tenant's own
@@ -823,6 +827,10 @@ its stored text. The key of §4.1 is the identity it would need.
 ---
 
 ## 5. The prescribed model
+
+> **Superseded by [`parasite_model.md`](parasite_model.md)** (decision 7). That
+> design removes `host::MODEL`: tenants name their models and the card's primary
+> is chosen by its size. This section is the single-model design as it runs today.
 
 ### 5.1 One model, named once
 

@@ -236,6 +236,7 @@ The connector Claude uses, the memory behind it, and the jobs it watches.
 | Doc | Covers |
 |---|---|
 | [`web_gateway_design.md`](web_gateway_design.md) | **Built.** The `web` crate: one front door for the estate. Host→site→upstream routing with layered content roots, tokera.com rendered from markdown (blog and the papers, read live from this directory), OIDC sign-in whose parent-domain cookie carries one account across `code.` and `bot.`, per-upstream backoff with readable error pages, and websocket tunnelling. Read before touching anything under `web/`. |
+| [`parasite_model.md`](parasite_model.md) | **Design, not built.** One card, several models. The card's primary is chosen by its size: Qwen3.6-35B below 32 GB, Flash-Next from 32 GB. Each tenant names its own model, and every other model is a parasite, mounted into ground the primary gives up, held while used and unmounted when the primary wants it back. That covers another tenant's LLM (a switch mode with a slice), the image generator and matte model (mounts with a cooldown), and vision towers (companions of their text model). One expert cache per card, shared across models. Supersedes `shared_model_host.md` decision 7 and §5. |
 | [`shared_model_host.md`](shared_model_host.md) | **Built (phases 1–7, §6.1).** One host process for every daemon: the `host` crate's startup, server, shared endpoints and identity rule; zend and npcd as its tenants on one engine core, each with its own substrate bound to the prescribed model; `motherd`, both in one process. Read before touching `host/`, a tenant's routes, or how a daemon starts. |
 | [`replicated_substrate.md`](replicated_substrate.md) | **Built in §15's order (chunks 1–10).** zend, npcd and CPU agents started with `--cluster` dial one or more active-active gateways over one authenticated WebSocket per app and become their upstreams; every substrate record replicates to the other members, applied so arrival order never changes the result, with sender retransmit and a header-first catch-up; a member cut off keeps writing and rejoins behind a Paxos-decided generation; Paxos among the members decides world authorities and group values; file-backed state moves into VFS records published by git merges that agents run; a per-app build floor, model lock, A/B certification and self-installing rollouts govern builds. |
 | [`substrate_git.md`](substrate_git.md) | Git in the substrate: repositories replicate as packs (stages 1–4 built). |
@@ -258,6 +259,7 @@ Each stays in its document as the plan of record, marked **Not built** there.
 
 | Where | What |
 |---|---|
+| [`parasite_model.md`](parasite_model.md) | The whole design: the per-tenant model, the card's expert cache, guests as mounts, the card driver and LLM parasites. |
 | [`guest_access.md`](guest_access.md) §3–§4 | The guest queue, `Cost` and `people_busy`. |
 | [`guest_draw_orchestration.md`](guest_draw_orchestration.md) §4 | Release (b): `MemberState::Paused` and `GuestOccupancy`. |
 | [`cluster_status_story.md`](cluster_status_story.md) §2.3–§2.5 | A build stranded after its retries are spent; `restored_from`; a connector that follows its daemon out of rotation. |
