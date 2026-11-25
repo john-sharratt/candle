@@ -62,6 +62,9 @@ mod dry_reference;
 mod engine;
 mod engine_attachments;
 mod error;
+/// The knowledge base: what names its files, how a file is cut into chunks,
+/// and the notation they are placed in.
+pub mod files;
 mod finish_order;
 /// The KV-fragmentation probe: the specification for the compaction pass, and the gate
 /// that keeps it honest. Reachable from both the integration tests and the

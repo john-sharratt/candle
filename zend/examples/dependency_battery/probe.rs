@@ -19,6 +19,8 @@
 //! The user message's instruction is P1's in all five
 //! (`prompt::RETRIEVED_PREFIX`).
 
+use candle_conversation::files::{knowledge_text, Chunk, LineSpan, RenderedFile};
+
 use crate::arms::Arm;
 use crate::prompt::RETRIEVED_PREFIX;
 use crate::rag::context::{first_chars, header, Packed, BUDGET_CHARS, CHARS_PER_TOKEN};
@@ -69,11 +71,11 @@ pub fn paths(arm: Arm, selected: &[String]) -> Vec<String> {
     out
 }
 
-/// `packed`'s files in Qwen-Agent's knowledge format (`qwen_agent/agents/
-/// assistant.py`, `KNOWLEDGE_TEMPLATE_EN` and `KNOWLEDGE_SNIPPET_EN`), each
-/// file's source its repository-relative path.
+/// `packed`'s files in the knowledge base's notation, Qwen-Agent's
+/// (`candle_conversation::files::render`), each file one chunk of what the
+/// budget let in and its source its repository-relative path.
 pub fn qwen_knowledge(packed: &Packed) -> String {
-    let mut snippets: Vec<String> = Vec::new();
+    let mut files: Vec<RenderedFile> = Vec::new();
     let mut at = 0;
     for f in &packed.files {
         let head = header(&f.path);
@@ -82,13 +84,25 @@ pub fn qwen_knowledge(packed: &Packed) -> String {
         };
         let start = at + found + head.len();
         let body = first_chars(&packed.text[start..], f.chars);
-        snippets.push(format!(
-            "## The content from {}:\n\n```\n{body}\n```",
-            f.path
-        ));
+        let text = if body.ends_with('\n') {
+            body.to_string()
+        } else {
+            format!("{body}\n")
+        };
+        let lines = text.matches('\n').count() as u32;
+        files.push(RenderedFile {
+            path: f.path.clone(),
+            chunks: vec![Chunk {
+                lines: LineSpan {
+                    first: 1,
+                    last: lines,
+                },
+                text,
+            }],
+        });
         at = start + body.len();
     }
-    format!("# Knowledge Base\n\n{}", snippets.join("\n\n"))
+    knowledge_text(&files)
 }
 
 /// `(system, user)` for `question` under `arm`, `packed` its files.
