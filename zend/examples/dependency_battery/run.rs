@@ -17,12 +17,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::{OnceCell, Semaphore};
 
 use crate::arms::Arm;
 use crate::battery::Question;
-use crate::client::{conv_id, Zend};
+use crate::client::{conv_id, passthrough_conv_id, Zend};
 use crate::placement::{placement, Placement};
+use crate::probe::{budget_chars, messages, paths as probe_paths};
 use crate::prompt::prompt;
 use crate::rag::context::{Packed, RetrievedFile};
 use crate::rag::{mark, Retriever};
@@ -34,6 +35,10 @@ use crate::view::{of_packed, of_point, with_named, View};
 
 /// How many times an answer is tried before it is recorded as failed.
 pub const TRIES: u32 = 3;
+
+/// One question's selection, shared by the probe arms: C1's selected paths,
+/// or why the selection failed, set by the first arm to need it.
+type SharedSelection = OnceCell<Result<Vec<String>, String>>;
 
 /// The chunk heads the K/V census samples.
 pub const CENSUS_SAMPLE: usize = 4_096;
@@ -222,6 +227,21 @@ async fn select_files(
     job: Job,
     sel: &Selection,
 ) -> Result<Packed, String> {
+    selected_paths(zend, plan_thread, tag, q, job, sel)
+        .await
+        .map(|paths| sel.files.pack_paths(&paths))
+}
+
+/// The repository-relative paths C1's selection placed for `q`, strongest
+/// first, as [`select_files`] packs them.
+async fn selected_paths(
+    zend: &Zend,
+    plan_thread: &str,
+    tag: &str,
+    q: &Question,
+    job: Job,
+    sel: &Selection,
+) -> Result<Vec<String>, String> {
     let ask = prompt(Arm::C1, &q.question, "");
     let mut last_error = String::new();
     let mut attempt = 1;
@@ -239,11 +259,7 @@ async fn select_files(
             tracing::warn!(conv, "the conversation was not deleted: {e:#}");
         }
         match asked {
-            Ok(a) => {
-                return Ok(sel
-                    .files
-                    .pack_paths(&selected(&a.points, a.think, &sel.repo)))
-            }
+            Ok(a) => return Ok(selected(&a.points, a.think, &sel.repo)),
             Err(e) => {
                 last_error = format!("{e:#}");
                 tracing::warn!(conv, attempt, "the selection failed: {last_error}");
@@ -273,6 +289,58 @@ fn failed_line(q: &Question, job: Job, vocabulary: &HashSet<String>, error: Stri
     );
     failed.error = Some(error);
     failed
+}
+
+/// A probe arm's line for `q` (`probe.rs`): `paths`, the shared selection,
+/// packed under the arm's budget and placed where the arm places them, asked
+/// on the passthrough route and its conversation deleted once answered.
+async fn probe_line(
+    zend: &Zend,
+    q: &Question,
+    job: Job,
+    vocabulary: &HashSet<String>,
+    sel: &Selection,
+    paths: &[String],
+) -> Line {
+    let packed = sel
+        .files
+        .pack_paths_under(&probe_paths(job.arm, paths), budget_chars(job.arm));
+    let (system, user) = messages(job.arm, &q.question, &packed);
+    let mut last_error = String::new();
+    let mut attempt = 1;
+    while attempt <= TRIES {
+        let asked = zend.ask_passthrough(&system, &user).await;
+        let conv = passthrough_conv_id(&system, &user);
+        if let Err(e) = zend.delete(&conv).await {
+            tracing::warn!(conv, "the conversation was not deleted: {e:#}");
+        }
+        match asked {
+            Ok(a) => {
+                let line = scored(
+                    q,
+                    job.arm,
+                    job.run,
+                    &a.text,
+                    vocabulary,
+                    a.completion_tokens,
+                    a.think,
+                    Placement::default(),
+                    a.secs,
+                );
+                return with_retrieval(line, q, &packed);
+            }
+            Err(e) => {
+                last_error = format!("{e:#}");
+                tracing::warn!(id = q.id, attempt, "the probe failed: {last_error}");
+                if zend.was_down().await {
+                    tracing::warn!(id = q.id, "the member was down; asked again, no try spent");
+                } else {
+                    attempt += 1;
+                }
+            }
+        }
+    }
+    failed_line(q, job, vocabulary, last_error)
 }
 
 /// One job's line, as [`answer_job`] records it before its retrieval.
@@ -360,9 +428,17 @@ pub async fn run(plan: Plan<'_>) -> anyhow::Result<()> {
             ids[j.question]
         );
     }
-    if plan.selection.is_none() && jobs.iter().any(|j| j.arm == Arm::P1) {
-        bail!("P1 is asked with no repository to read its selected files from");
+    if plan.selection.is_none() && jobs.iter().any(|j| j.arm == Arm::P1 || j.arm.probe()) {
+        bail!("P1 or a probe arm is asked with no repository to read its selected files from");
     }
+    // The probe arms share one selection per question: the first to need it
+    // asks C1, the others wait for that ask.
+    let shared_selection: Arc<HashMap<String, Arc<SharedSelection>>> = Arc::new(
+        plan.questions
+            .iter()
+            .map(|q| (q.id.clone(), Arc::new(OnceCell::new())))
+            .collect(),
+    );
     println!(
         "{} answers to ask ({} already recorded), {} at a time",
         jobs.len(),
@@ -424,10 +500,20 @@ pub async fn run(plan: Plan<'_>) -> anyhow::Result<()> {
         let tag = Arc::clone(&tag);
         let retrieval = Arc::clone(&retrieval);
         let selection = selection.clone();
+        let shared_selection = Arc::clone(&shared_selection);
         tasks.push(tokio::spawn(async move {
             in_flight.fetch_add(1, Ordering::AcqRel);
             let q = &questions[job.question];
             let line = match (job.arm, selection.as_deref()) {
+                (arm, Some(sel)) if arm.probe() => {
+                    let paths = shared_selection[&q.id]
+                        .get_or_init(|| selected_paths(&zend, &thread, &tag, q, job, sel))
+                        .await;
+                    match paths {
+                        Ok(paths) => probe_line(&zend, q, job, &vocabulary, sel, paths).await,
+                        Err(e) => failed_line(q, job, &vocabulary, e.clone()),
+                    }
+                }
                 (Arm::P1, Some(sel)) => match select_files(&zend, &thread, &tag, q, job, sel).await
                 {
                     Ok(packed) => {

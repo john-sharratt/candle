@@ -25,7 +25,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
+use cluster::dispatch::conversation_key;
 use cluster::gateway::NODE_HEADER;
+use zend::passthrough::{conv_id_of, conversation_timeline, PASSTHROUGH_MODEL};
 
 use crate::arms::Arm;
 use crate::placement::{answer_token, Point};
@@ -87,6 +89,27 @@ pub fn request(conv_id: &str, prompt: &str, arm: Arm) -> Value {
         b.extend(dials);
     }
     body
+}
+
+/// The passthrough request asking `user` under the system prompt `system`:
+/// no tools, the whole context the request's own.
+pub fn passthrough_request(system: &str, user: &str) -> Value {
+    json!({
+        "model": PASSTHROUGH_MODEL,
+        "stream": false,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    })
+}
+
+/// The `conv_id` the daemon lists a fresh passthrough conversation of
+/// `system` and `user` under: the first timeline of its opening's key
+/// (`zend::passthrough`), the one a context no conversation holds yet takes.
+pub fn passthrough_conv_id(system: &str, user: &str) -> String {
+    let key = conversation_key(&[system], &[], &[("user", user)]);
+    conv_id_of(conversation_timeline(&key, 0))
 }
 
 /// One answer as the daemon gave it.
@@ -199,6 +222,44 @@ impl Zend {
             first_answer,
             tool_calls: tool_calls_of(&history),
             secs,
+        })
+    }
+
+    /// Ask `user` under the system prompt `system` on the passthrough route.
+    /// Nothing is projected, so there are no points to read back.
+    pub async fn ask_passthrough(&self, system: &str, user: &str) -> anyhow::Result<Answered> {
+        let started = Instant::now();
+        let r = self
+            .with_identity(self.http.post(format!("{}/v1/chat/completions", self.base)))
+            .json(&passthrough_request(system, user))
+            .send()
+            .await
+            .context("the passthrough request")?;
+        let status = r.status();
+        let body: Value = r.json().await.context("the passthrough answer")?;
+        if !status.is_success() {
+            bail!("the turn failed ({status}): {body}");
+        }
+        let text = body
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let completion_tokens = body
+            .pointer("/usage/completion_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if answered_nothing(&text, completion_tokens) {
+            bail!("the turn answered nothing: no text and no tokens decoded");
+        }
+        Ok(Answered {
+            text,
+            completion_tokens,
+            think: None,
+            points: Vec::new(),
+            first_answer: None,
+            tool_calls: 0,
+            secs: started.elapsed().as_secs_f64(),
         })
     }
 
@@ -396,6 +457,26 @@ mod tests {
                 "seed": false, "projection": "minimal",
             })
         );
+    }
+
+    /// **A probe goes out as the passthrough model with its two messages**,
+    /// and lands under the conversation its opening names.
+    #[test]
+    fn a_probe_is_a_passthrough_request() {
+        assert_eq!(
+            passthrough_request("sys", "Where?"),
+            json!({
+                "model": "passthrough", "stream": false,
+                "messages": [
+                    {"role": "system", "content": "sys"},
+                    {"role": "user", "content": "Where?"},
+                ],
+            })
+        );
+        let id = passthrough_conv_id("sys", "Where?");
+        assert!(id.starts_with("passthrough-"), "{id}");
+        assert_eq!(id, passthrough_conv_id("sys", "Where?"));
+        assert_ne!(id, passthrough_conv_id("sys", "Why?"));
     }
 
     /// **Every call of every assistant bubble is counted**, and nothing else.

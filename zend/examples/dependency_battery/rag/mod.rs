@@ -71,12 +71,18 @@ impl Retriever {
     /// [`BUDGET_CHARS`] as [`Retriever::retrieve`] packs its ranking. A path
     /// that cannot be read as text is left out.
     pub fn pack_paths(&self, paths: &[String]) -> Packed {
+        self.pack_paths_under(paths, BUDGET_CHARS)
+    }
+
+    /// `paths` packed as [`Retriever::pack_paths`] packs them, under `budget`
+    /// characters.
+    pub fn pack_paths_under(&self, paths: &[String], budget: usize) -> Packed {
         let read = paths.iter().enumerate().filter_map(|(i, rel)| {
             let raw = fs::read(self.repo.join(rel)).ok()?;
             let text = text_of(&raw)?.to_string();
             Some((i as u32 + 1, rel.clone(), 0.0, text))
         });
-        pack(read, BUDGET_CHARS)
+        pack(read, budget)
     }
 }
 

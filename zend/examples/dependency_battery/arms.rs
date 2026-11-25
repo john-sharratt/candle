@@ -6,6 +6,15 @@
 //! daemon's tools to read the repository itself. P1 is handed, the same way
 //! and under the same budget, the files provenance selection placed when C1
 //! asked the question (`selected.rs`): the two differ only in who chose them.
+//!
+//! The probe arms ([`PROBES`]) ask where the selected files are best placed.
+//! Each takes P1's selection — one C1 ask per question, shared by the three —
+//! and runs on the daemon's passthrough route, whose context is the request's
+//! own (`probe.rs`): S1 places the files at the end of the system prompt, M1
+//! in a system block of their own after it, U1 in the user message ahead of
+//! the question, S2 at the end of the system prompt behind the seed files,
+//! under a budget four times P1's, and Q1 as S1 in Qwen-Agent's knowledge
+//! format. They are asked only when named.
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -22,7 +31,15 @@ pub enum Arm {
     R1,
     P1,
     T1,
+    S1,
+    M1,
+    U1,
+    S2,
+    Q1,
 }
+
+/// The probe arms: asked only when `--arms` names them.
+pub const PROBES: [Arm; 5] = [Arm::S1, Arm::M1, Arm::U1, Arm::S2, Arm::Q1];
 
 /// Every arm, in the order the paper tables them.
 pub const ARMS: [Arm; 10] = [
@@ -90,11 +107,21 @@ impl Arm {
             Arm::R1 => "r1",
             Arm::P1 => "p1",
             Arm::T1 => "t1",
+            Arm::S1 => "s1",
+            Arm::M1 => "m1",
+            Arm::U1 => "u1",
+            Arm::S2 => "s2",
+            Arm::Q1 => "q1",
         }
     }
 
     pub fn of(id: &str) -> Option<Self> {
-        ARMS.into_iter().find(|a| a.id() == id)
+        ARMS.into_iter().chain(PROBES).find(|a| a.id() == id)
+    }
+
+    /// Whether the arm runs on the passthrough route with P1's selection.
+    pub fn probe(self) -> bool {
+        PROBES.contains(&self)
     }
 
     /// Whether the arm's conversation opens on its seed files.
@@ -104,7 +131,7 @@ impl Arm {
 
     /// Whether the arm projects the memory at all.
     pub fn projects(self) -> bool {
-        !matches!(self, Arm::A0 | Arm::A1 | Arm::R1 | Arm::P1 | Arm::T1)
+        !matches!(self, Arm::A0 | Arm::A1 | Arm::R1 | Arm::P1 | Arm::T1) && !self.probe()
     }
 
     /// The tools mode the arm's turns run in, as the chat request's `tools`
@@ -124,7 +151,16 @@ impl Arm {
     /// to re-select.
     pub fn dials(self) -> Value {
         let reprojection = match self {
-            Arm::A0 | Arm::A1 | Arm::R1 | Arm::P1 | Arm::T1 => None,
+            Arm::A0
+            | Arm::A1
+            | Arm::R1
+            | Arm::P1
+            | Arm::T1
+            | Arm::S1
+            | Arm::M1
+            | Arm::U1
+            | Arm::S2
+            | Arm::Q1 => None,
             Arm::D1 => Some("opening"),
             Arm::B0 | Arm::B1 => Some("held"),
             Arm::C0 | Arm::C1 => Some("full"),
@@ -206,6 +242,18 @@ mod tests {
         assert_eq!(Arm::of("t1"), Some(Arm::T1));
         assert_eq!(Arm::of("x"), None);
         assert!(!Arm::R1.projects() && !Arm::P1.projects() && !Arm::T1.projects());
+    }
+
+    /// **The probe arms are named, project nothing, and are no paper arm.**
+    #[test]
+    fn the_probe_arms_stand_apart() {
+        assert_eq!(PROBES.map(Arm::id), ["s1", "m1", "u1", "s2", "q1"]);
+        assert_eq!(Arm::of("s2"), Some(Arm::S2));
+        assert!(PROBES
+            .iter()
+            .all(|a| a.probe() && !a.projects() && !a.seed()));
+        assert!(PROBES.iter().all(|a| !ARMS.contains(a)));
+        assert!(!Arm::P1.probe());
     }
 
     /// **The primary family is the five the paper pre-registers**, and the

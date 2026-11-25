@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, bail, Context};
 
-use crate::arms::{Arm, ARMS};
+use crate::arms::{Arm, ARMS, PROBES};
 
 /// The arms `specs` names, each with the highest run it is asked to: every
 /// arm up to `runs` when `specs` names none.
@@ -24,8 +24,10 @@ pub fn arm_runs(specs: &[String], runs: u32) -> anyhow::Result<Vec<(Arm, u32)>> 
             ),
             None => (spec, runs),
         };
-        let arm = Arm::of(&id.to_ascii_lowercase())
-            .ok_or_else(|| anyhow!("`{id}` is no arm: one of {}", ARMS.map(Arm::id).join(", ")))?;
+        let arm = Arm::of(&id.to_ascii_lowercase()).ok_or_else(|| {
+            let ids: Vec<&str> = ARMS.iter().chain(PROBES.iter()).map(|a| a.id()).collect();
+            anyhow!("`{id}` is no arm: one of {}", ids.join(", "))
+        })?;
         if upto == 0 {
             bail!("`{spec}`: runs are numbered from 1");
         }

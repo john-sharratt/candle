@@ -41,6 +41,7 @@ mod grounding;
 mod hits;
 mod load;
 mod placement;
+mod probe;
 mod prompt;
 mod rag;
 mod report;
@@ -269,9 +270,10 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 HashMap::new()
             };
-            // P1 reads the files provenance selected from the same checkout R1
-            // indexes, under the workspace name its readings' paths start with.
-            let selection = if arms.iter().any(|(a, _)| *a == Arm::P1) {
+            // P1 and the probe arms read the files provenance selected from the
+            // same checkout R1 indexes, under the workspace name its readings'
+            // paths start with.
+            let selection = if arms.iter().any(|(a, _)| *a == Arm::P1 || a.probe()) {
                 let name = fs::canonicalize(&repo)?
                     .file_name()
                     .and_then(|n| n.to_str())

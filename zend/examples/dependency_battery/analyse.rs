@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::arms::{Arm, Contrast, ARMS, CONTRASTS, SECONDARY};
+use crate::arms::{Arm, Contrast, ARMS, CONTRASTS, PROBES, SECONDARY};
 use crate::placement::placed_at;
 use crate::run::Line;
 use crate::stats::{bootstrap_mean_interval, holm, mean, wilcoxon};
@@ -66,6 +66,7 @@ pub struct ArmRow {
 
 pub fn arm_rows(lines: &[Line], scores: &Scores) -> Vec<ArmRow> {
     ARMS.iter()
+        .chain(PROBES.iter())
         .filter_map(|&arm| {
             let qs: Vec<f64> = scores.get(&arm)?.values().copied().collect();
             let (lo, hi) = bootstrap_mean_interval(&qs, RESAMPLES, SEED);
