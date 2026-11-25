@@ -49,6 +49,7 @@ mod run;
 mod schedule;
 mod score;
 mod seen;
+mod selected;
 mod selection;
 mod stats;
 mod telemetry;
@@ -58,6 +59,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -259,9 +261,28 @@ async fn main() -> anyhow::Result<()> {
             let results_dir = out.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
             fs::create_dir_all(&results_dir)?;
             let retrieval = if arms.iter().any(|(a, _)| *a == Arm::R1) {
-                retrieval(&repo, &[battery_path, results_dir], &questions)?
+                retrieval(
+                    &repo,
+                    &[battery_path.clone(), results_dir.clone()],
+                    &questions,
+                )?
             } else {
                 HashMap::new()
+            };
+            // P1 reads the files provenance selected from the same checkout R1
+            // indexes, under the workspace name its readings' paths start with.
+            let selection = if arms.iter().any(|(a, _)| *a == Arm::P1) {
+                let name = fs::canonicalize(&repo)?
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+                    .context("the repository's folder name")?;
+                Some(Arc::new(run::Selection {
+                    files: Retriever::build(&repo, &[battery_path.clone(), results_dir.clone()])?,
+                    repo: name,
+                }))
+            } else {
+                None
             };
             let telemetry = telemetry.unwrap_or_else(|| beside(&out, "telemetry.jsonl"));
             run::run(run::Plan {
@@ -272,6 +293,7 @@ async fn main() -> anyhow::Result<()> {
                 vocabulary: vocabulary(&repo)?,
                 arms,
                 retrieval,
+                selection,
                 seed,
                 concurrency,
                 out: &out,

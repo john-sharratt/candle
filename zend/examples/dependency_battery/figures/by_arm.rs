@@ -43,10 +43,11 @@ pub fn dials(arm: &str) -> (&'static str, &'static str) {
         Some('B') => "held",
         Some('C') => "reprojecting",
         Some('R') => "BM25 files",
+        Some('P') => "selected files",
         Some('T') => "tools",
         _ => "",
     };
-    let baseline = matches!(arm.chars().next(), Some('R' | 'T'));
+    let baseline = matches!(arm.chars().next(), Some('R' | 'P' | 'T'));
     let seed = if arm.ends_with('1') && !baseline {
         "seed"
     } else {

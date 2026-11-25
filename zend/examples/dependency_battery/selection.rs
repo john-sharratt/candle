@@ -48,7 +48,7 @@ mod tests {
     #[test]
     fn no_arm_named_is_every_arm_to_the_runs_given() {
         let all = arm_runs(&[], 3).unwrap();
-        assert_eq!(all.len(), 9);
+        assert_eq!(all.len(), ARMS.len());
         assert!(all.iter().all(|(_, r)| *r == 3));
         assert_eq!(all[0], (Arm::A0, 3));
     }

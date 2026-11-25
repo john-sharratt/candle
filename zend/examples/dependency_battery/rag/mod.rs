@@ -66,6 +66,20 @@ impl Retriever {
     }
 }
 
+impl Retriever {
+    /// `paths`, repository-relative and best first, read back and packed under
+    /// [`BUDGET_CHARS`] as [`Retriever::retrieve`] packs its ranking. A path
+    /// that cannot be read as text is left out.
+    pub fn pack_paths(&self, paths: &[String]) -> Packed {
+        let read = paths.iter().enumerate().filter_map(|(i, rel)| {
+            let raw = fs::read(self.repo.join(rel)).ok()?;
+            let text = text_of(&raw)?.to_string();
+            Some((i as u32 + 1, rel.clone(), 0.0, text))
+        });
+        pack(read, BUDGET_CHARS)
+    }
+}
+
 /// `files` with each answer file of `expected` marked; whether any was.
 pub fn mark(files: &mut [RetrievedFile], expected: &[String]) -> bool {
     for f in files.iter_mut() {
@@ -106,5 +120,34 @@ mod tests {
         assert!(mark(&mut p.files, &["src/span.rs".to_string()]));
         assert!(p.files[0].answer_file);
         assert!(!mark(&mut p.files, &["src/other.rs".to_string()]));
+    }
+
+    /// **Selected paths pack in the order given**, under the same budget and
+    /// headers as a ranking; a path that is not there is left out and keeps
+    /// its place in the numbering, as a ranking's unreadable file does.
+    #[test]
+    fn selected_paths_pack_in_their_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.rs"), "fn a() {}\n").unwrap();
+        fs::write(root.join("src/b.rs"), "fn b() {}\n").unwrap();
+        let r = Retriever::build(root, &[]).unwrap();
+        let p = r.pack_paths(&[
+            "src/b.rs".to_string(),
+            "src/gone.rs".to_string(),
+            "src/a.rs".to_string(),
+        ]);
+        assert_eq!(
+            p.text,
+            "=== src/b.rs ===\nfn b() {}\n\n\n=== src/a.rs ===\nfn a() {}\n\n\n"
+        );
+        assert_eq!(
+            p.files
+                .iter()
+                .map(|f| (f.rank, f.path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "src/b.rs"), (3, "src/a.rs")]
+        );
     }
 }

@@ -24,6 +24,9 @@ pub struct Piece {
     pub kind: String,
     #[serde(default)]
     pub path: Option<String>,
+    /// The tokens of it the point placed.
+    #[serde(default)]
+    pub tokens: usize,
 }
 
 /// What one answer's projection points say of its answer files.
@@ -109,6 +112,7 @@ mod tests {
                 .map(|p| Piece {
                     kind: "Reading".into(),
                     path: Some(p.to_string()),
+                    tokens: 0,
                 })
                 .collect(),
         }
@@ -170,6 +174,7 @@ mod tests {
             placed: vec![Piece {
                 kind: "Folder".into(),
                 path: Some("candle/zend/src/a.rs".into()),
+                tokens: 0,
             }],
         };
         assert!(!places(&folder, &files));

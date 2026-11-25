@@ -95,7 +95,7 @@ mod tests {
     fn the_queue_asks_everything_once() {
         let none = Recorded::new();
         let q = queue(&ids(128), &every_arm(3), &none, 9);
-        assert_eq!(q.len(), 128 * 3 * 9);
+        assert_eq!(q.len(), 128 * 3 * ARMS.len());
         let distinct: HashSet<(u32, usize, Arm)> =
             q.iter().map(|j| (j.run, j.question, j.arm)).collect();
         assert_eq!(distinct.len(), q.len());

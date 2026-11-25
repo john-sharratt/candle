@@ -1,6 +1,6 @@
 //! What each arm's question is asked as. The memory arms and A0/A1 carry the
-//! pilot's instruction to answer from memory alone; R1 carries the files its
-//! retrieval packed ahead of the question and is told to answer from them;
+//! pilot's instruction to answer from memory alone; R1 and P1 carry the files
+//! their retrieval packed ahead of the question and are told to answer from them;
 //! T1 is told to read the repository with its tools.
 
 use crate::arms::Arm;
@@ -20,7 +20,7 @@ pub const TOOLS_PREFIX: &str = "Use the tools to read the repository as needed, 
 /// `question` as `arm` asks it, R1's after `files`, its packed files block.
 pub fn prompt(arm: Arm, question: &str, files: &str) -> String {
     match arm {
-        Arm::R1 => format!("{files}{RETRIEVED_PREFIX}\n\n{question}"),
+        Arm::R1 | Arm::P1 => format!("{files}{RETRIEVED_PREFIX}\n\n{question}"),
         Arm::T1 => format!("{TOOLS_PREFIX}\n\n{question}"),
         _ => format!("{PREFIX}\n\n{question}"),
     }

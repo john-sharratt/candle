@@ -1,5 +1,5 @@
 //! The analysis of the two baselines written out: the secondary family of
-//! contrasts (`fig_9_12_2b_effects_secondary.csv`), R1's retrieval hit rate
+//! contrasts (`fig_9_12_2b_effects_secondary.csv`), R1's and P1's retrieval hit rates
 //! (`table_9_12_retrieval.csv`), and every arm's grounding, completion tokens
 //! and tool calls (`table_9_12_grounding.csv`), each beside its section of
 //! `summary.md`. A file without R1 or T1 answers writes the tables empty.
@@ -45,17 +45,22 @@ pub fn write(md: &mut String, lines: &[Line], scores: &Scores, dir: &Path) -> an
 
     writeln!(
         md,
-        "\n## R1's retrieval — an answer file among the files it was handed\n"
+        "\n## The files handed as text — an answer file among them (R1 by BM25, P1 by provenance)\n"
     )?;
-    let hits = retrieval_hits(lines, Arm::R1);
-    match &hits {
-        Some(h) => {
-            writeln!(
-                md,
-                "| Arm | Questions | Answers | Answer file retrieved (hit@k) | Top file an answer \
-                 file (hit@1) | Files per prompt | Files cut at the budget |"
-            )?;
-            writeln!(md, "|---|---:|---:|---:|---:|---:|---:|")?;
+    let hits: Vec<_> = [Arm::R1, Arm::P1]
+        .into_iter()
+        .filter_map(|a| retrieval_hits(lines, a))
+        .collect();
+    if hits.is_empty() {
+        writeln!(md, "No R1 or P1 answers.")?;
+    } else {
+        writeln!(
+            md,
+            "| Arm | Questions | Answers | Answer file retrieved (hit@k) | Top file an answer \
+             file (hit@1) | Files per prompt | Files cut at the budget |"
+        )?;
+        writeln!(md, "|---|---:|---:|---:|---:|---:|---:|")?;
+        for h in &hits {
             writeln!(
                 md,
                 "| {:?} | {} | {} | {}% | {}% | {:.1} | {}% |",
@@ -68,7 +73,6 @@ pub fn write(md: &mut String, lines: &[Line], scores: &Scores, dir: &Path) -> an
                 pct(h.cut)
             )?;
         }
-        None => writeln!(md, "No R1 answers.")?,
     }
     fs::write(
         dir.join("table_9_12_retrieval.csv"),
@@ -193,7 +197,7 @@ mod tests {
         let mut md = String::new();
         write(&mut md, &lines, &scores(&lines), dir.path()).unwrap();
         assert!(md.contains("No R1 or T1 answers, so no contrast to test."));
-        assert!(md.contains("No R1 answers."));
+        assert!(md.contains("No R1 or P1 answers."));
         assert!(md.contains("| C1 | 1 | 1 | 100.0% | 10.0 | 0 | — |"));
         assert!(!md.contains("T1 called"));
         assert_eq!(

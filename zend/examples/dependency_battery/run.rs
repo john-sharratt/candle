@@ -25,9 +25,10 @@ use crate::client::{conv_id, Zend};
 use crate::placement::{placement, Placement};
 use crate::prompt::prompt;
 use crate::rag::context::{Packed, RetrievedFile};
-use crate::rag::mark;
+use crate::rag::{mark, Retriever};
 use crate::schedule::{queue, Job, Recorded};
 use crate::score::{answer, grounding, recall};
+use crate::selected::selected;
 use crate::telemetry;
 use crate::view::{of_packed, of_point, with_named, View};
 
@@ -73,6 +74,13 @@ pub struct Line {
     pub view: Option<View>,
 }
 
+/// Where P1's selected files are read from: the repository's text files, and
+/// the repository's name as the workspace prefixes its readings' paths.
+pub struct Selection {
+    pub files: Retriever,
+    pub repo: String,
+}
+
 /// What a run is given.
 pub struct Plan<'a> {
     pub base: &'a str,
@@ -85,6 +93,8 @@ pub struct Plan<'a> {
     pub arms: Vec<(Arm, u32)>,
     /// R1's files block for each question, by id; empty when R1 is not asked.
     pub retrieval: HashMap<String, Packed>,
+    /// What P1 reads its selected files from; `None` when P1 is not asked.
+    pub selection: Option<Arc<Selection>>,
     pub seed: u64,
     pub concurrency: usize,
     pub out: &'a Path,
@@ -201,6 +211,70 @@ async fn answer_job(
     }
 }
 
+/// P1's files for `q`: C1 asks it on a conversation of its own, and the
+/// readings the point governing its answer's first token placed are packed as
+/// R1's files are (`selected.rs`). Tried as [`asked_line`] tries an answer.
+async fn select_files(
+    zend: &Zend,
+    plan_thread: &str,
+    tag: &str,
+    q: &Question,
+    job: Job,
+    sel: &Selection,
+) -> Result<Packed, String> {
+    let ask = prompt(Arm::C1, &q.question, "");
+    let mut last_error = String::new();
+    let mut attempt = 1;
+    let mut asked_n = 0;
+    while attempt <= TRIES {
+        asked_n += 1;
+        let conv = conv_id(
+            plan_thread,
+            job.arm,
+            job.run,
+            &attempt_id(&format!("{}-sel", q.id), tag, asked_n),
+        );
+        let asked = zend.ask(&conv, &ask, Arm::C1).await;
+        if let Err(e) = zend.delete(&conv).await {
+            tracing::warn!(conv, "the conversation was not deleted: {e:#}");
+        }
+        match asked {
+            Ok(a) => {
+                return Ok(sel
+                    .files
+                    .pack_paths(&selected(&a.points, a.think, &sel.repo)))
+            }
+            Err(e) => {
+                last_error = format!("{e:#}");
+                tracing::warn!(conv, attempt, "the selection failed: {last_error}");
+                if zend.was_down().await {
+                    tracing::warn!(conv, "the member was down; asked again, no try spent");
+                } else {
+                    attempt += 1;
+                }
+            }
+        }
+    }
+    Err(last_error)
+}
+
+/// The line for `job` when every try failed with `error`.
+fn failed_line(q: &Question, job: Job, vocabulary: &HashSet<String>, error: String) -> Line {
+    let mut failed = scored(
+        q,
+        job.arm,
+        job.run,
+        "",
+        vocabulary,
+        0,
+        None,
+        Placement::default(),
+        0.0,
+    );
+    failed.error = Some(error);
+    failed
+}
+
 /// One job's line, as [`answer_job`] records it before its retrieval.
 async fn asked_line(
     zend: &Zend,
@@ -268,19 +342,7 @@ async fn asked_line(
             }
         }
     }
-    let mut failed = scored(
-        q,
-        job.arm,
-        job.run,
-        "",
-        vocabulary,
-        0,
-        None,
-        Placement::default(),
-        0.0,
-    );
-    failed.error = Some(last_error);
-    failed
+    failed_line(q, job, vocabulary, last_error)
 }
 
 /// Run `plan` to its end.
@@ -297,6 +359,9 @@ pub async fn run(plan: Plan<'_>) -> anyhow::Result<()> {
             "R1 is asked {} with no files retrieved for it",
             ids[j.question]
         );
+    }
+    if plan.selection.is_none() && jobs.iter().any(|j| j.arm == Arm::P1) {
+        bail!("P1 is asked with no repository to read its selected files from");
     }
     println!(
         "{} answers to ask ({} already recorded), {} at a time",
@@ -330,6 +395,7 @@ pub async fn run(plan: Plan<'_>) -> anyhow::Result<()> {
     let questions = Arc::new(plan.questions);
     let vocabulary = Arc::new(plan.vocabulary);
     let retrieval = Arc::new(plan.retrieval);
+    let selection = plan.selection;
     let thread = plan.thread.to_string();
     let tag = Arc::new(launch_tag(
         SystemTime::now()
@@ -354,11 +420,23 @@ pub async fn run(plan: Plan<'_>) -> anyhow::Result<()> {
         );
         let tag = Arc::clone(&tag);
         let retrieval = Arc::clone(&retrieval);
+        let selection = selection.clone();
         tasks.push(tokio::spawn(async move {
             in_flight.fetch_add(1, Ordering::AcqRel);
             let q = &questions[job.question];
-            let files = (job.arm == Arm::R1).then(|| retrieval.get(&q.id)).flatten();
-            let line = answer_job(&zend, &thread, &tag, q, job, &vocabulary, files).await;
+            let line = match (job.arm, selection.as_deref()) {
+                (Arm::P1, Some(sel)) => match select_files(&zend, &thread, &tag, q, job, sel).await
+                {
+                    Ok(packed) => {
+                        answer_job(&zend, &thread, &tag, q, job, &vocabulary, Some(&packed)).await
+                    }
+                    Err(e) => failed_line(q, job, &vocabulary, e),
+                },
+                _ => {
+                    let files = (job.arm == Arm::R1).then(|| retrieval.get(&q.id)).flatten();
+                    answer_job(&zend, &thread, &tag, q, job, &vocabulary, files).await
+                }
+            };
             in_flight.fetch_sub(1, Ordering::AcqRel);
             let n = finished.fetch_add(1, Ordering::AcqRel) + 1;
             println!(

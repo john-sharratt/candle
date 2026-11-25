@@ -1,9 +1,11 @@
 //! The battery's arms (`docs/unbounded_agents.md` §9.12, *Arms*). The seven
 //! memory arms are each a setting of the turn's three retrieval dials, sent as
-//! the chat request's `seed`, `projection` and `reprojection` fields. The two
+//! the chat request's `seed`, `projection` and `reprojection` fields. The
 //! baselines project nothing: R1 is handed the files a BM25 ranking of the
 //! repository retrieves for the question (`rag/`), and T1 may call the
-//! daemon's tools to read the repository itself.
+//! daemon's tools to read the repository itself. P1 is handed, the same way
+//! and under the same budget, the files provenance selection placed when C1
+//! asked the question (`selected.rs`): the two differ only in who chose them.
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -18,11 +20,12 @@ pub enum Arm {
     C0,
     C1,
     R1,
+    P1,
     T1,
 }
 
 /// Every arm, in the order the paper tables them.
-pub const ARMS: [Arm; 9] = [
+pub const ARMS: [Arm; 10] = [
     Arm::A0,
     Arm::A1,
     Arm::D1,
@@ -31,6 +34,7 @@ pub const ARMS: [Arm; 9] = [
     Arm::C0,
     Arm::C1,
     Arm::R1,
+    Arm::P1,
     Arm::T1,
 ];
 
@@ -54,10 +58,15 @@ pub const CONTRASTS: [Contrast; 5] = [
 /// The memory against the two baselines, and retrieval against the seed files
 /// alone for reference: the secondary family, Holm-corrected across the
 /// contrasts of it the answers can test.
-pub const SECONDARY: [Contrast; 3] = [
+pub const SECONDARY: [Contrast; 4] = [
     (
         "Provenance memory against retrieval-augmented generation",
         Arm::C1,
+        Arm::R1,
+    ),
+    (
+        "Provenance selection against BM25 retrieval, both read as text",
+        Arm::P1,
         Arm::R1,
     ),
     ("Provenance memory against tool use", Arm::C1, Arm::T1),
@@ -79,6 +88,7 @@ impl Arm {
             Arm::C0 => "c0",
             Arm::C1 => "c1",
             Arm::R1 => "r1",
+            Arm::P1 => "p1",
             Arm::T1 => "t1",
         }
     }
@@ -94,7 +104,7 @@ impl Arm {
 
     /// Whether the arm projects the memory at all.
     pub fn projects(self) -> bool {
-        !matches!(self, Arm::A0 | Arm::A1 | Arm::R1 | Arm::T1)
+        !matches!(self, Arm::A0 | Arm::A1 | Arm::R1 | Arm::P1 | Arm::T1)
     }
 
     /// The tools mode the arm's turns run in, as the chat request's `tools`
@@ -114,7 +124,7 @@ impl Arm {
     /// to re-select.
     pub fn dials(self) -> Value {
         let reprojection = match self {
-            Arm::A0 | Arm::A1 | Arm::R1 | Arm::T1 => None,
+            Arm::A0 | Arm::A1 | Arm::R1 | Arm::P1 | Arm::T1 => None,
             Arm::D1 => Some("opening"),
             Arm::B0 | Arm::B1 => Some("held"),
             Arm::C0 | Arm::C1 => Some("full"),
@@ -181,6 +191,11 @@ mod tests {
                     "none"
                 ),
                 (
+                    "p1",
+                    json!({"seed": false, "projection": "minimal"}),
+                    "none"
+                ),
+                (
                     "t1",
                     json!({"seed": false, "projection": "minimal"}),
                     "restricted"
@@ -190,7 +205,7 @@ mod tests {
         assert_eq!(Arm::of("b1"), Some(Arm::B1));
         assert_eq!(Arm::of("t1"), Some(Arm::T1));
         assert_eq!(Arm::of("x"), None);
-        assert!(!Arm::R1.projects() && !Arm::T1.projects());
+        assert!(!Arm::R1.projects() && !Arm::P1.projects() && !Arm::T1.projects());
     }
 
     /// **The primary family is the five the paper pre-registers**, and the
@@ -211,7 +226,12 @@ mod tests {
         let secondary: Vec<(Arm, Arm)> = SECONDARY.iter().map(|&(_, a, b)| (a, b)).collect();
         assert_eq!(
             secondary,
-            vec![(Arm::C1, Arm::R1), (Arm::C1, Arm::T1), (Arm::R1, Arm::A1)]
+            vec![
+                (Arm::C1, Arm::R1),
+                (Arm::P1, Arm::R1),
+                (Arm::C1, Arm::T1),
+                (Arm::R1, Arm::A1)
+            ]
         );
     }
 }
