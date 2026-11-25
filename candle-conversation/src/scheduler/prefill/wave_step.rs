@@ -325,6 +325,10 @@ impl Scheduler {
         // prompt that has waited its own time at the front. The band's constant
         // stands until both sides are measured, and below `High` the bands decide
         // alone — background ingest yields to dialogue whatever the backlogs say.
+        // On a card that streams its experts the split never goes below decode's
+        // share beside one live prompt, so prompt rows run in bursts and decode
+        // runs between them on a warm cache (`turn_airtime::on_streaming_card`).
+        let streams = self.card_streams_experts();
         let derived = (work.is_live() && band == HIGH_BESIDE_HIGH_RATIO)
             .then(|| {
                 super::super::turn_airtime::high_airtime_ratio(
@@ -335,7 +339,14 @@ impl Scheduler {
                     &self.high_prompt_waits(),
                 )
             })
-            .flatten();
+            .flatten()
+            .map(|r| {
+                super::super::turn_airtime::on_streaming_card(
+                    r,
+                    streams,
+                    f64::from(HIGH_BESIDE_HIGH_RATIO),
+                )
+            });
         if derived.is_some() {
             self.high_airtime = derived;
         }

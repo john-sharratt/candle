@@ -162,11 +162,27 @@ dialogue's decode took 8–27 s to reach its first token, which is the pause a u
 sees at the end of a tool call. Airtime keeps the decode's step bounded by the
 slice and the prefill's progress bounded below by the ratio, on every machine.
 
+**On a card that streams its experts the split never goes below `R = 2`**
+(`turn_airtime::on_streaming_card`, gated on `Scheduler::card_streams_experts`).
+The backlog split (`turn_airtime::high_airtime_ratio`) lets the side with less
+outstanding work go first, and a stream of short prompts always has less: an NPC
+turn of 10–30 tokens takes ~0.2 s alone, so any wait makes it due and `R` pinned
+at `1/64`. Decode was owed nothing and every decode step carried a prompt's rows.
+That interleaving costs a streaming card more than airtime: a 30-token chunk
+routes 330–390 of 512 experts a layer, and those sweeps evict the ten or so a
+decode routes, so the decode beside them misses what it had just loaded. On
+WhiteWorld (2026-11-25, seven NPC missions) decode steps took 140–320 ms where
+the decode's own expert pass took ~45 ms. Held at `R = 2`, each step that
+carries prompt rows owes decode-only steps for its share (`debt_ratio`), so
+prompts prefill in bursts and decode runs between them on the experts it keeps.
+A card that holds its experts keeps the backlogs' split.
+
 Every decode has a band. zend's dialogue and a client's passthrough conversation
-are `Urgent`. npcd's characters (its perception, action and interaction layers,
-among others) are `Normal`: zend outranks them, so a character's turn creeps
-beside a zend dialogue's decode, and a zend prompt is never paced by a
-character's. The titler and summary probes are `Normal` too: background to the
+are `Urgent`. npcd's background layers (perception, action and interaction,
+among others) are `Normal`; a character's own turns and the words of its posts
+are `High` (the `talk` layer, `npcd::engine::talk::voice::POST_BAND`). zend
+outranks both, so a character's turn creeps beside a zend dialogue's decode, and
+a zend prompt is never paced by a character's. The titler and summary probes are `Normal` too: background to the
 dialogue they serve. Each creep group logs
 its band, ratio, budget and rows at debug on
 `candle_conversation::scheduler::creep`.
