@@ -79,6 +79,7 @@ use std::sync::{Arc, OnceLock};
 
 use candle_conversation::persistence::accounting::RecordAccounting;
 use candle_conversation::persistence::content_hash::{turn_stream_id, ContentHash};
+use candle_conversation::persistence::identity::{RecordIdentity, GEN_DETACHED};
 use candle_conversation::persistence::log_file::{read_record_at, LogFile, SUPERBLOCK_SIZE};
 use candle_conversation::persistence::manifest::{
     decode_conv_state_payload, decode_label_payload, Manifest,
@@ -5465,13 +5466,13 @@ fn summary(path: &std::path::Path, log: &mut LogFile) -> Result<()> {
 fn headers(log: &mut LogFile) -> Result<()> {
     let (entries, outcome) = walker::collect(log, FIRST_SEGMENT, SUPERBLOCK_SIZE)?;
     println!(
-        "{:>5}  {:>10}  {:<11}  {:>18}  {:>7}  {:>4}  {:>7}  {:>9}",
+        "{:>5}  {:>10}  {:<11}  {:>18}  {:>7}  {:>4}  {:>7}  {:>9}  identity",
         "#", "offset", "type", "stream_id", "chunk", "fmt", "tokens", "payload"
     );
     for (i, e) in entries.iter().enumerate() {
         let h = &e.record.header;
         println!(
-            "{i:>5}  {:>10}  {:<11}  {:>18}  {:>7}  {:>4}  {:>7}  {:>9}",
+            "{i:>5}  {:>10}  {:<11}  {:>18}  {:>7}  {:>4}  {:>7}  {:>9}  {}",
             e.offset,
             format!("{:?}", h.record_type),
             stream_hex(h.stream_id),
@@ -5479,10 +5480,27 @@ fn headers(log: &mut LogFile) -> Result<()> {
             h.format,
             h.token_count,
             h.payload_len,
+            identity_text(&h.identity()),
         );
     }
     println!("\n{} records walked", outcome.records);
     Ok(())
+}
+
+/// A record's identity as `origin/oseq@gen.epoch.hlc` — the order two records
+/// competing for one key are ranked by is `(gen, epoch, hlc, origin)` — with a
+/// generation written while cut off shown as `detached`, since its raw value
+/// ranks it above every generation the group can mint.
+fn identity_text(id: &RecordIdentity) -> String {
+    if id.is_none() {
+        return "-".into();
+    }
+    let gen = if id.gen == GEN_DETACHED {
+        "detached".to_string()
+    } else {
+        id.gen.to_string()
+    };
+    format!("{:x}/{}@{gen}.{}.{}", id.origin, id.oseq, id.epoch, id.hlc)
 }
 
 /// `validate` — substrate integrity check. Read-only, streaming (safe on a

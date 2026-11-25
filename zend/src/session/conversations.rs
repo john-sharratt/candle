@@ -163,6 +163,20 @@ impl ZendSession {
     /// its entries, and the text behind them is ceased: no tool runs on an
     /// archived conversation again. Returns `None` when the model isn't loaded
     /// yet.
+    /// Whether this daemon holds the conversation `conv_id`: registered, and not
+    /// deleted. Archiving or deleting one it does not hold changes nothing, so
+    /// the routes answer it as not found rather than as done. `None` while the
+    /// model is not loaded.
+    pub fn holds_conversation(&self, conv_id: &str) -> Option<bool> {
+        let state = self.loaded()?;
+        let timeline = conversation_timeline(conv_id);
+        let engine = &state.engine;
+        Some(
+            engine.timeline_group_and_order(timeline).is_some()
+                && !engine.is_timeline_tombstoned(timeline),
+        )
+    }
+
     pub fn archive_conversation(&self, conv_id: &str) -> Option<EngineResult<()>> {
         let (state, timeline, distilled) = self.distill_archived(conv_id)?;
         let engine = &state.engine;

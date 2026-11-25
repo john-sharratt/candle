@@ -13,6 +13,7 @@
 //! list call — that's the "show archived" checkbox at the bottom of the sidebar.
 
 use std::collections::BTreeMap;
+use std::fmt::Display;
 use std::sync::Arc;
 
 use axum::{
@@ -88,28 +89,43 @@ pub async fn archive(
     State(session): State<Arc<ZendSession>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    match session.archive_conversation(&id) {
-        Some(Ok(())) => Ok(StatusCode::NO_CONTENT),
-        Some(Err(e)) => {
-            tracing::warn!(conv_id = %id, "archive failed: {e}");
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
-        // Model not loaded yet — same shape as `get` returns.
-        None => Err(StatusCode::SERVICE_UNAVAILABLE),
-    }
+    change_answer(&id, "archive", session.holds_conversation(&id), || {
+        session.archive_conversation(&id)
+    })
 }
 
 pub async fn delete(
     State(session): State<Arc<ZendSession>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, StatusCode> {
-    match session.tombstone_conversation(&id) {
+    change_answer(&id, "tombstone", session.holds_conversation(&id), || {
+        session.tombstone_conversation(&id)
+    })
+}
+
+/// The answer to an archive or a delete of conversation `id`, `held` saying
+/// whether this daemon holds it and `act` making the change: `503` while the
+/// model loads, `404` for a conversation it does not hold — nothing would
+/// change, and answering done would hide a mistyped or not-yet-written id — and
+/// otherwise what `act` reports.
+fn change_answer<E: Display>(
+    id: &str,
+    what: &str,
+    held: Option<bool>,
+    act: impl FnOnce() -> Option<Result<(), E>>,
+) -> Result<StatusCode, StatusCode> {
+    match held {
+        None => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        Some(false) => return Err(StatusCode::NOT_FOUND),
+        Some(true) => {}
+    }
+    match act() {
         Some(Ok(())) => Ok(StatusCode::NO_CONTENT),
         Some(Err(e)) => {
-            tracing::warn!(conv_id = %id, "tombstone failed: {e}");
+            tracing::warn!(conv_id = %id, "{what} failed: {e}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
-        // Model not loaded yet — same shape as `get`/`archive` return.
+        // The model unloaded between the two calls.
         None => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
@@ -485,6 +501,45 @@ impl From<&UploadInfo> for UploadOut {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A change to a conversation this daemon does not hold is not found,
+    /// and nothing is attempted.** An id with a stray `\r` hashes to a timeline
+    /// no one holds; archiving it answered `204` and changed nothing, so 39
+    /// archives were reported done that never happened.
+    #[test]
+    fn a_change_to_a_conversation_not_held_is_not_found() {
+        let mut acted = false;
+        let answer = change_answer::<String>("c-1\r", "archive", Some(false), || {
+            acted = true;
+            Some(Ok(()))
+        });
+        assert_eq!(answer, Err(StatusCode::NOT_FOUND));
+        assert!(!acted);
+    }
+
+    /// A held conversation's change answers as the change went: done, failed,
+    /// or the model gone; and none is attempted while the model loads.
+    #[test]
+    fn a_change_to_a_held_conversation_answers_as_it_went() {
+        let ok = || Some(Ok::<(), String>(()));
+        let failed = || Some(Err::<(), String>("disk".into()));
+        assert_eq!(
+            change_answer("c-1", "archive", Some(true), ok),
+            Ok(StatusCode::NO_CONTENT)
+        );
+        assert_eq!(
+            change_answer("c-1", "archive", Some(true), failed),
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert_eq!(
+            change_answer::<String>("c-1", "tombstone", Some(true), || None),
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+        assert_eq!(
+            change_answer("c-1", "tombstone", None, ok),
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        );
+    }
 
     fn msg(role: TurnRole, text: &str) -> RecoveredMessage {
         RecoveredMessage {
