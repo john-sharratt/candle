@@ -34,7 +34,7 @@ Status: `[ ]` todo · `[~]` in progress · `[x]` done (commit).
   fresh, the production placement, the close-row GPU tests, no reasoning
   loops.
 
-## Stage 1 — the knowledge notation and the piece plan (S)
+## Stage 1 — the knowledge notation and the piece plan (S) — [x] `36d86f0bf`
 
 Add `candle-conversation/src/files/{mod,render,key}.rs`.
 `render::knowledge_text` reproduces Q1 (`zend/examples/dependency_battery/probe.rs`
@@ -49,7 +49,7 @@ are D2 and D3. Tests: `a_whole_file_renders_as_q1_rendered_it`,
 `tests/knowledge_pieces_real_vocab.rs::assembled_pieces_tokenize_as_the_knowledge_text`
 (token ids, through `tests/common/real_vocab.rs::for_each_tokenizer`).
 
-## Stage 2 — file records, the member seal, signatures on sections (L)
+## Stage 2 — file records, the member seal, signatures on sections (L) — [~]
 
 - Split `conversation/submitted_sections.rs`'s `SealJob` (:294-597) into
   `conversation/section_seal/{job,address,start_state}.rs`.
@@ -94,9 +94,23 @@ are D2 and D3. Tests: `a_whole_file_renders_as_q1_rendered_it`,
   `a_member_seal_writes_its_signature_and_index_page`,
   `restore_sections_installs_cold_markers_in_one_request`.
 
-## Stage 3 — the close row; `system_close` out of the checkpoint (L)
+## Stage 3 — the prompt's end: `files_open`, the seed, the close (M)
 
-Engine-wide, npcd included.
+**Rewritten 2026-11-26 (design §6.2b).** The seed is one section of the
+prompt in a section tree (`seed`: present | absent), after the `files`
+collection and before `system_close`; the branch checkpoint is the
+recurrent state a conversation opens on. Work: `files_open` a fixed section
+of zend's prompt; the `files` collection with no schema members; the seed
+tree; `zend` renders the seed from `branch_ingest::prime::links()` at
+startup and installs it into the schema before the builders are built (as
+`tools/catalog.rs` installs the catalog), refusing per D16; the `seed` dial
+selects the branch. No close row is forwarded, nothing is staged, npcd is
+untouched. Tests: the dialogue's birth prefix ends `files_open, seed,
+system_close`; a seed-off turn's checkpoint is the absent branch's; the
+seed renders its files in Q1's notation; a seed too large refuses with
+both sizes.
+
+The text below is the plan this replaced, kept for reference:
 
 - `SectionSchema.close_row: bool`; YAML `close_row: true` on `system_close`
   (zend `projection.yaml:704-706`, `npcd/projection.yaml:153`). A close row
@@ -223,7 +237,13 @@ Engine-wide, npcd included.
   `a_superseded_record_is_retired_only_after_the_new_one_commits`,
   `a_binary_file_writes_no_record`.
 
-## Stage 6 — the seed chain, pinned last; the opening on its snapshot (L)
+## Stage 6 — the seed chain's removals (S)
+
+**Rewritten 2026-11-26.** The seed is built in Stage 3. What remains here is
+the removal of the old seed lineage listed below; the chain-sealing and
+opening-state items are superseded.
+
+The text below is the plan this replaced, kept for reference:
 
 - `branch_ingest/prime.rs` keeps `links()`. `prime` and `repoint` become one
   `seal_members` chain over the links (`keep_end` on each link's last) into

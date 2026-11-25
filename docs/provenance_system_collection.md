@@ -413,6 +413,57 @@ boundary, and the reasoning looped (`docs/archived/reprojection_refeed.md`,
 seed-end snapshot, and a running conversation's state never receives it. A
 new conversation receives it once, as the end of its system prompt.
 
+### 6.2b As built: the seed and the close are part of the prompt
+
+The schema's branch checkpoint already is what §6.1–§6.2 describe: the
+recurrent state a new conversation opens on, computed by a forward over the
+birth prefix — the system prompt's fixed sections in order, collection
+members and `depends_on` sections left out (`sequence_construction.rs:449-451`,
+`prompt_branch`) — one per branch of the dials' section trees, sealed and
+persisted with the schema's sections (`install_branch_states`). So the
+build puts the seed and the close *into the prompt*:
+
+```
+… tools_close
+files_open          fixed section — in the birth prefix
+files               collection, no schema members — the dynamic members,
+                    placed by the fill, attended only
+seed                section tree, option present | absent (the `seed` dial)
+system_close        fixed section — the close
+```
+
+- The **seed** is one section: the seed files in Q1's notation, rendered at
+  startup from the repositories (`branch_ingest::prime`'s links) and
+  installed into the schema before any conversation is built, as the tool
+  catalog is installed (`tools/catalog.rs`). It is sealed behind
+  `files_open` and read by the checkpoint's recurrence: §6.1's chain, as
+  one section.
+- The **close** is `system_close`, sealed behind the seed and in the
+  checkpoint: a new conversation's recurrent state is the checkpoint's, the
+  state of a prompt that has read the seed and its close. A running
+  conversation never receives it again; nothing is forwarded at a
+  projection, and no conversation's live state is touched (§6.2's property).
+- The **dynamic members** sit between `files_open` and the seed, outside
+  the birth prefix as tool members are: placed at projection time, attended
+  only, never in any recurrent state (§8).
+- The **`seed` dial** selects the tree's branch, so seed-on and seed-off are
+  two checkpoints, each exact — finer than §6.1's one chain behind the
+  default branch.
+- A prompt without a `files` collection (npcd, the reserved layers) is
+  unchanged: its checkpoint already ends on `system_close`.
+
+What this gives up from §6.2: the close's attention reads the seed but not
+the dynamic members, because it is sealed in the prompt rather than
+forwarded over each opening's placement. The close is two tokens; the
+recurrence reads placed content through every later token's attention, the
+dialogue's own, as the user put it — it is in the session's context, it
+holds no neighbour.
+
+The seed is refreshed when the schema is built — at startup, and whenever
+the builders are rebuilt. A seed file changed while the daemon runs reaches
+new conversations once the schema is rebuilt; a conversation already open
+keeps the state it opened on and reads the new seed by attention.
+
 ### 6.3 What goes
 
 - `forked_from = "seed"`, `set_forked_from_seed` and the dialogue's
@@ -447,13 +498,14 @@ A file's ingest is:
      **empty** knowledge base, the second, fourth, sixth… behind the
      **target**:
      - *empty* — `files_open` emitted with no members, the knowledge base's
-       heading and nothing under it; the recurrent state the checkpoint's,
-       advanced over `files_open`. The frame a query has before it has
+       heading and nothing under it, on the seed's absent branch; the
+       recurrent state that branch's checkpoint. The frame a query has before it has
        found the file: what provenance must match to pull the file in.
      - *target* — the collection holding **only the target file's members**,
-       in Q1's layout; the recurrent state the file's own chain end (every
-       file is sealed as a chain of its chunks, §5, and its end state is
-       snapshotted). The frame a query has once the file is in front of it.
+       in Q1's layout, attended as a dialogue's dynamic members are; the
+       recurrent state the empty frame's, since no production query's
+       recurrence has read a dynamic file (§12 D11). The frame a query has
+       once the file is in front of it.
 
      Either way the close row and the question follow, thinking on, and the
      question and thinking are sealed as the calibration
@@ -682,19 +734,19 @@ records the change here.
 | D1 | `FileKey(u64)` is the first 8 bytes of `content_hash` over the content key `v{N}:{path}@{blob}` (a folder: `@{listing hash}`); the path and blob live on the file's record. `ChunkKey { file: FileKey, lines: LineSpan { first, last } }`, 1-based and inclusive, the spans `file_read` pages report. |
 | D2 | The pieces (`candle-conversation/src/files/render.rs`): `files_open` `"\n# Knowledge Base\n\n"`; heading `"## The content from {path}:\n\n```\n"`; a chunk's text, every line ending its `\n`; gap `"...\n\n"`; `closing_join` `"```\n\n"` when another file follows, `closing_last` `"```\n"` for the last. Nothing that follows a chunk opens with a newline: Qwen's pre-tokenizer joins a line's punctuation and the newlines after it into one pre-token, so a piece opening on `\n` would merge with the chunk's last `\n` across the seam. The test `tests/knowledge_pieces_real_vocab.rs` holds every cut on all eight cached Qwen vocabularies, Flash-Next's included. Two bytes differ from Q1's text as the probe wrote it: a file whose text ends in a newline has no blank line before its closing fence, and a gap has one newline before its dots where Qwen-Agent's separator has two. The probe now renders through the same code. |
 | D3 | A chunk is whole lines, up to `PAGE_LINES`, its last line given a `\n` when the file's has none. Every cut is checked against the tokenizer — the tokens of the joined text equal the two parts' tokens joined — and a cut whose seam tokenizes differently moves forward a line at a time until it does not, the chunk running to the end of the file when no cut holds (`files::cut_lines`). |
-| D4 | A member is sealed behind the default branch's birth prefix (`Sequence::birth_prefix`: no collection member, no `depends_on` section, so no tool and no journal) and `files_open`. Its K/V prefix is the prefix its recurrent start was computed over: the checkpoint advanced over `files_open`. |
-| D5 | A file is a chain: `files_open` state → heading → chunk 1 … chunk N, the last chunk keeping its end state. Gap and the two closing pieces are shared singletons sealed behind D4's prefix. A seed link seals its own heading, chunks and closing in the seed chain; a seed file is also an ordinary file, sealed behind `files_open` alone so it can be calibrated behind itself. |
-| D6 | A target that draws on `files` (the dialogue, calibration, first readings) always emits `files_open`: an empty knowledge base is the heading alone. Its opening state is the seed-end snapshot when the seed is placed, otherwise the state after `files_open`. A target that does not (npcd, the other reserved layers) emits no `files_open` and opens on the checkpoint. §6.2's "an empty collection omits `files_open`" holds for those. |
-| D7 | The close row is the opening turn's head: a leading glue segment before `user_start` in the turn's grid, forwarded in the opening's prefill. It is left out of the turn's signatures, as reasoning is. A turn opens a conversation when the conversation and its lineage hold no turn. |
-| D8 | The fill's floor is the conversation's root exchange — a fork's lineage's first, otherwise its own first — so the exchange holding the close row is never dropped. The lineage drop below `ProjectionLevel::Full` goes. |
-| D9 | Whether the seed is placed is decided at the opening, from the `seed` dial and the projection level, and recorded on the timeline (`seeded`). Every later projection of the conversation and its forks places it exactly then, whatever later dials say: the close row's state assumes it. |
-| D10 | The opening question's first reading is the empty frame: `files_open`, nothing placed, the state after `files_open`, the close row, the question — the empty calibration's frame. A later question's first reading holds the seed out, as today, and forwards no close row. |
-| D11 | A calibration conversation opens on the dialogue's schema under the calibration layer, reusing the dialogue's sealed system prompt, with the frame pinned on its selection: `FilesPin::Empty` or `FilesPin::Only(file)`. The target frame's state is the file's chain end, restored from its last chunk's end state or recomputed when absent. |
+| D4 | A member is sealed behind the default branch's birth prefix up to and including `files_open` (`Sequence::birth_prefix`'s sections before the `files` collection: no collection member, no `depends_on` section, so no tool and no journal; never the seed or the close, which come after). Its K/V prefix is the prefix its recurrent start was computed over. |
+| D5 | A file is a chain: heading → chunk 1 … chunk N, sealed behind D4's prefix, each continuing the one before (its recurrent state run on from the predecessor's end, so a chunk's K/V is computed as the continuation of its file). Gap and the two closing pieces are shared singletons sealed behind D4's prefix. The seed is not members: it is one section of the prompt (§6.2b). Its files are also ordinary files, so each is calibrated behind itself. |
+| D6 | `files_open` is a fixed section of the dialogue's prompt and always emits: an empty knowledge base is the heading alone. Every conversation opens on the branch checkpoint (§6.2b). A prompt without a `files` collection is unchanged. |
+| D7 | (Superseded by §6.2b.) No close row is forwarded at an opening: the close is `system_close`, sealed behind the seed and read by the checkpoint. |
+| D8 | (Superseded by §6.2b.) The fill needs no floor for the close; a file has no floor (§4). |
+| D9 | The seed is placed exactly when the turn's `seed` dial selects the tree's present branch; the conversation's recurrent state is that branch's checkpoint, so the two always agree. |
+| D10 | A question's first reading is read against its projection as every reading is, the seed placed when its dial says so: the seed is background every conversation keeps, part of the prompt, and is no longer held out of the first reading. |
+| D11 | A calibration conversation is a conversation of the calibration layer on the same prompt, on the seed's absent branch. Its empty frame is `files_open` with nothing placed; its target frame places only the target file's members (`FilesPin::Only`), attended as a dialogue's dynamic members are. Both open on the absent branch's checkpoint, as a production query opens on its own: the target frame's recurrence has not read the file, as no production query's has. |
 | D12 | A calibration records its frame (`calibration_frame`: `empty` or `target`); `CALIBRATES_KEY` holds the `FileKey`. The scoring lab takes `--calibrations none|empty|target|all` for §7.1's split. |
 | D13 | `calibrate:` moves onto the `files` collection, its profiles unchanged and its guidance prompts per kind; `OWN_FILE` goes. |
 | D14 | A folder's listing is its immediate children in git tree order, each repository-relative, a directory ending in `/`, a file followed by a space and its size in bytes; its heading's source is the folder's path (`candle/zend/src/`). It is chunked as a file is. |
 | D15 | Member section ids are per process, from the owned partition under one owner for the collection, never persisted: records name content addresses and streams. Members register at boot from the file records, and on a replica's arrival, in one batched restore. |
-| D16 | The seed refuses to build when it leaves the dialogue less than its share of the room: `slot_window − reserve − fixed system part − seed < dialogue share × (slot_window − reserve − fixed system part)`, the error naming the seed's tokens and the slot's. |
+| D16 | The seed refuses to install when the system prompt with it leaves the dialogue less than its share of the room: `slot_window − reserve − system prompt < dialogue share × (slot_window − reserve)`, the error naming the seed's tokens and the slot's. |
 | D17 | Analysis layers of `unit: file` fork from a file's reading, which no longer exists; no shipped schema declares one. `UnitKind::File` is removed; `unit: day` stays. |
 | D18 | A sweep releases member streams no live file record and not the seed reference, once a superseded record's tombstone activates. |
 
