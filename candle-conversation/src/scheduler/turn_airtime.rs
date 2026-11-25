@@ -83,6 +83,34 @@ pub(super) fn high_airtime_ratio(
     Some((ratio.clamp(1.0 / MAX_RATIO, MAX_RATIO) * due).max(1.0 / MAX_RATIO))
 }
 
+/// `R` on a card that **streams** its experts: never below `floor`, decode's
+/// share beside one live prompt (`HIGH_BESIDE_HIGH_RATIO`). Elsewhere `ratio`
+/// as the backlogs set it.
+///
+/// **There a co-batched step costs decode more than its airtime.** Each prompt
+/// row routes most of every layer — 330–390 of 512 experts for a 30-token
+/// chunk — and on a card whose zone cannot hold the expert set those sweeps
+/// evict the ten or so a decode routes per layer, so the decode steps beside
+/// them miss what they had just loaded. The backlog split lets the side with
+/// less outstanding work go first, and NPC prompts of 10–30 tokens always have
+/// less: their own time is ~0.2 s, so any wait at all makes one due and `R`
+/// pinned at `1 / MAX_RATIO`. Decode was owed nothing, every decode step
+/// carried a prompt's rows, and none ran on a warm cache — on WhiteWorld
+/// (2026-11-25, seven NPC missions) decode steps took 140–320 ms where the
+/// decode's own expert pass took ~45 ms.
+///
+/// At `floor` each step that carries prompt rows owes decode-only steps for
+/// `floor − 1` times its share ([`debt_ratio`]), so prompts prefill in bursts
+/// and decode runs between them on the experts it keeps. A card that holds its
+/// experts loses nothing to the interleaving and keeps the backlogs' split.
+pub(super) fn on_streaming_card(ratio: f64, streams: bool, floor: f64) -> f64 {
+    if streams {
+        ratio.max(floor)
+    } else {
+        ratio
+    }
+}
+
 /// The debt a co-batched step owes decode, per second of the creep's share of
 /// it, for decode to hold `ratio` of the creep's airtime: the decode rows rode
 /// that step too, so they already had one share of it, and only the rest is
@@ -339,6 +367,31 @@ mod tests {
             1.0,
             "past half the gap: one step of slice"
         );
+    }
+
+    /// **A stream of short prompts pins the split, and a streaming card floors
+    /// it.** Seven NPC prompts of 25 rows at 140 rows a second (0.18 s each
+    /// alone), each waited half a second, beside 35-token runs at 100 ms: every
+    /// one is past its own time, so `R` falls to the widest toward the prompts
+    /// and decode is owed nothing. On a card that streams its experts the
+    /// split is held at the floor, two, and each prompt-carrying step owes
+    /// decode-only steps for its own share; elsewhere it stays where the
+    /// backlogs put it.
+    #[test]
+    fn short_prompts_pin_the_split_and_a_streaming_card_floors_it() {
+        let prompts = [(25usize, Duration::from_millis(500)); 7];
+        let r =
+            high_airtime_ratio(35.0, Duration::from_millis(100), 7 * 25, 140.0, &prompts).unwrap();
+        assert_eq!(r, 1.0 / MAX_RATIO, "every short prompt is overdue");
+        assert_eq!(debt_ratio(r), 0.0, "decode is owed nothing");
+
+        let streaming = on_streaming_card(r, true, 2.0);
+        assert_eq!(streaming, 2.0);
+        assert_eq!(debt_ratio(streaming), 1.0, "a share of decode-only steps");
+        assert_eq!(on_streaming_card(r, false, 2.0), r, "holds its experts");
+        // Above the floor the backlogs still decide, on either card.
+        assert_eq!(on_streaming_card(5.0, true, 2.0), 5.0);
+        assert_eq!(on_streaming_card(5.0, false, 2.0), 5.0);
     }
 
     /// Nothing measured, nothing outstanding: the caller keeps its default.
