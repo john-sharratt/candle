@@ -1234,6 +1234,8 @@ impl InferenceState {
                 }
             }
         });
+        // Kept images no conversation uses, retired after their grace.
+        spawn_image_sweep(Arc::downgrade(&state));
         // The shared journal runs a new conversation reads, sealed ahead of
         // it (`docs/shared_journal_sections.md` §7).
         if state.journaling {

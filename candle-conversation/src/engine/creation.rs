@@ -556,6 +556,7 @@ impl ConversationEngine {
             config,
             CHUNK_SIZE,
             self.core.model_core,
+            self.vision(),
             self.conversation.clone(),
             section_progress,
         )
@@ -708,6 +709,7 @@ impl ConversationEngine {
                     config.clone(),
                     CHUNK_SIZE,
                     self.core.model_core,
+                    self.vision(),
                     self.conversation.clone(),
                     None,
                 )?;

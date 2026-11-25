@@ -252,8 +252,13 @@ impl Sequence {
         if tokens.is_empty() {
             return Ok(false);
         }
-        let image_spans = stored_spans(&self.substrate, VisionTokens::of(&self.tokenizer), turns)
-            .map_err(ConversationError::Other)?;
+        let image_spans = stored_spans(
+            &self.substrate,
+            VisionTokens::of(&self.tokenizer),
+            self.vision.map(|v| v.name),
+            turns,
+        )
+        .map_err(ConversationError::Other)?;
         let (tx, rx) = flume::bounded(1);
         self.scheduler_tx
             .send(SchedulerRequest::MemoryCatchUp {
@@ -464,6 +469,7 @@ impl Sequence {
             current_blocks: self.current_blocks,
             chunk_size: self.chunk_size,
             model_core: self.model_core,
+            vision: self.vision,
             // A fork starts from the schema its parent was given: the parent's
             // submitted sections belong to the parent and go when it does.
             base_projection: Arc::clone(&self.base_projection),

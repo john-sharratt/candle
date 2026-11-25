@@ -2278,6 +2278,8 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
           src: im.thumb, alt: 'image ' + (i + 1),
           title: onRemove ? null : 'Open the image',
           onClick: onRemove ? null : () => setState({ imageView: im.full }),
+          // An image kept with no thumbnail draws its original instead.
+          onError: im.thumb === im.full ? null : (e) => { if (!e.target.dataset.full) { e.target.dataset.full = '1'; e.target.src = im.full; } },
           style: 'display:block; max-height:' + size + 'px; max-width:100%; border-radius:8px; border:1px solid #38342f;' + (onRemove ? '' : ' cursor:zoom-in;'),
         }),
         onRemove ? h('button', { 'aria-label': 'Remove image', title: 'Remove', onClick: () => onRemove(i), style: 'position:absolute; top:3px; right:3px; width:20px; height:20px; border-radius:10px; border:none; background:rgba(0,0,0,0.65); color:#ece8e4; cursor:pointer; font-size:12px; line-height:20px; padding:0;' }, '×') : null)));
