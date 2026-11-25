@@ -25,6 +25,7 @@
 //!
 //! Skipped without an available CUDA device.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use candle::cuda_backend::cudarc::driver::CudaStream;
@@ -43,7 +44,10 @@ use candle_conversation::projection::{
 use candle_conversation::substrate::residence::{drain_reclaimed, own_device_frees};
 use candle_conversation::substrate::TierState;
 use candle_conversation::turn::Role;
-use candle_nn::kv_cache::{ChunkedKvBacking, KvFormat, QuantFormat, SealedSequence, WarmLiftRing};
+use candle_nn::kv_cache::{
+    quantize_sealed_in_place, ChunkedKvBacking, CompressionPolicy, KvFormat, QuantFormat,
+    SealedSequence, WarmLiftRing,
+};
 use half::bf16;
 
 mod common;
@@ -309,40 +313,62 @@ fn turn_state(conv: &Conversation, key: TurnKey) -> TierState {
         .expect("turn must be tracked")
 }
 
-/// Give the recalled turn its warm copy the way the persistence thread's
-/// hot→warm phase does: a cold recall lands hot only and stays pending a warm
-/// copy (`snapshot_pending_warm`), and the phase migrates each layer's hot
-/// sequence to a CPU arena, format for format, and installs it as the
-/// residence's warm tier. A test that exercises warm→hot after a recall makes
-/// that copy here, with the hot copy kept, so the next elevate reads warm.
-fn install_warm_from_hot(
+/// Give a reloaded turn its warm copy the way a running daemon does: a turn
+/// with a cold copy never takes one from hot (`pending_warm` skips it — the log
+/// already holds those bytes), so it is warmed from the log on request
+/// (`Conversation::warm_turns_from_cold`) while it holds the cold copy alone.
+/// The next elevate then reads warm.
+fn warm_from_cold(conv: &Conversation, backings: &[ChunkedKvBacking], key: TurnKey) {
+    assert_eq!(
+        turn_state(conv, key),
+        TierState {
+            hot: false,
+            warm: false,
+            cold: true,
+        },
+        "{key:?} is warmed from the log while it holds only its cold copy"
+    );
+    let warmed = conv.warm_turns_from_cold(backings, &[key], u64::MAX);
+    assert_eq!(warmed.turns, 1, "{key:?} warmed from the log: {warmed:?}");
+}
+
+/// Quantize the seeded turn the way the scheduler's gap does
+/// (`Scheduler::quantize_a_native_residence`): the residence pending its warm
+/// copy that still holds native chunks, each layer quantized under `policy` and
+/// swapped in over the hot copy it was read from. The persistence pass only
+/// copies, and leaves a turn the gap still owes as it stands.
+fn gap_quantize(
     conv: &Conversation,
     backings: &[ChunkedKvBacking],
     device: &Device,
-    stream: &Arc<CudaStream>,
-    pinned: &mut Option<PinnedBuf>,
-    key: TurnKey,
+    policy: &CompressionPolicy,
 ) {
-    let pending = conv.read().snapshot_pending_warm();
-    assert_eq!(
-        pending.len(),
-        1,
-        "{key:?} is the one recalled turn, pending its warm copy"
-    );
-    let (residence, hot, _) = pending.into_iter().next().unwrap();
-    let warm: Vec<SealedSequence> = backings
+    let (residence, hot, _) = conv
+        .read()
+        .native_pending_warm()
+        .expect("the seeded turn, still native");
+    let stream = cuda_stream(device);
+    let mut pinned: Option<PinnedBuf> = None;
+    let quantized: Vec<SealedSequence> = backings
         .iter()
         .zip(hot.iter())
         .map(|(backing, seq)| {
-            backing
-                .migrate_sealed_to_cpu_batch_async(device, stream, pinned, &[seq])
-                .expect("hot→warm migrate")
+            quantize_sealed_in_place(backing, &[seq], policy, device, &stream, &mut pinned)
+                .expect("gap quantize")
                 .pop()
                 .expect("one sequence in, one out")
         })
         .collect();
-    stream.synchronize().expect("the migrate's copies land");
-    conv.read().install_warm(residence, warm);
+    stream.synchronize().expect("the quantize lands");
+    assert!(
+        conv.read()
+            .install_gap_quantized(residence, &hot, quantized),
+        "the quantized copy is swapped in over the hot copy it read"
+    );
+    assert!(
+        conv.read().native_pending_warm().is_none(),
+        "nothing native is left for the gap"
+    );
 }
 
 fn section_state(conv: &Conversation, section: SectionId) -> TierState {
@@ -1918,15 +1944,14 @@ fn archive_state_survives_restart() {
 // ════════════════════════════════════════════════════════════════════════════
 //
 // These tests mirror the `quant_blend_*` / `single_format_*` patterns
-// above but exercise the policy-driven path through `PersistenceThread`:
-// hot is seeded as F16, the persistence thread quantizes per-(head,
-// palette) using a `CompressionPolicy`, and the warm/cold tiers end
-// up holding the compressed bytes. Identity-checks are at the
+// above but exercise the policy-driven path: hot is seeded as F16, the
+// gap quantizes it per-(head, palette) under a `CompressionPolicy`
+// (`gap_quantize`), the `PersistenceThread` copies the quantized form,
+// and the warm/cold tiers end up holding the compressed bytes. A turn
+// still native under a policy is the gap's, and the pass leaves it hot. Identity-checks are at the
 // post-persist boundary (the redo log must faithfully roundtrip the
 // quantized form), not against the original F16 source — quantization
 // is lossy by definition.
-
-use candle_nn::kv_cache::CompressionPolicy;
 
 fn make_backings_adaptive(
     device: &Device,
@@ -1985,7 +2010,23 @@ fn quantize_on_evict_full_round_trip() {
     );
     let key = TurnKey::new(timeline, idx);
 
-    // Drive a full persistence pass with the policy engaged.
+    // A pass before the gap leaves the native turn as it stands.
+    let persist = PersistenceThread::spawn(
+        conv.clone(),
+        Arc::new(backings.clone()),
+        device.clone(),
+        Some(policy),
+        WarmLedger::new().join(),
+    );
+    persist.shutdown();
+    let st = turn_state(&conv, key);
+    assert!(
+        st.hot && !st.warm && !st.cold,
+        "a turn the gap still owes is left hot alone, got {st:?}"
+    );
+
+    // The gap quantizes it; the next pass copies the quantized form.
+    gap_quantize(&conv, &backings, &device, &policy);
     let persist = PersistenceThread::spawn(
         conv.clone(),
         Arc::new(backings.clone()),
@@ -1995,10 +2036,7 @@ fn quantize_on_evict_full_round_trip() {
     );
     persist.shutdown();
 
-    // Post-persist: warm+cold (hot was atomically evicted by
-    // install_warm_and_evict_hot so the next decode reads the
-    // compressed bytes via warm→hot elevation, not the original
-    // uncompressed hot copy).
+    // Post-persist: hot+warm+cold, the hot copy kept by `install_warm_and_hot`.
     let st = turn_state(&conv, key);
     assert!(
         st.hot && st.warm && st.cold,
@@ -2045,6 +2083,9 @@ fn quantize_on_evict_actually_compresses() {
             600_011,
             None,
         );
+        if let Some(policy) = &policy_opt {
+            gap_quantize(&conv, &backings, &device, policy);
+        }
         let persist = PersistenceThread::spawn(
             conv.clone(),
             Arc::new(backings.clone()),
@@ -2062,6 +2103,13 @@ fn quantize_on_evict_actually_compresses() {
 
     let f16_bytes = run_cycle(None);
     let quant_bytes = run_cycle(Some(policy));
+    // Both cycles reached the log: a pass that wrote nothing would make any
+    // ratio below look like compression.
+    assert!(f16_bytes > 0, "the F16 cycle wrote no chunk records");
+    assert!(
+        quant_bytes > 0,
+        "the quantized cycle wrote no chunk records"
+    );
     assert!(
         quant_bytes < f16_bytes,
         "quantize-on-evict must produce strictly fewer chunk-record \
@@ -2118,6 +2166,7 @@ fn quantize_on_evict_cold_reload_round_trip() {
             700_007,
             None,
         );
+        gap_quantize(&conv, &backings, &device, &policy);
         let persist = PersistenceThread::spawn(
             conv.clone(),
             Arc::new(backings.clone()),
@@ -2173,8 +2222,8 @@ fn quantize_on_evict_cold_reload_round_trip() {
     assert_eq!(report.cold_to_hot, 1, "single cold→hot promotion");
     assert_eq!(report.failed, 0);
 
-    // Post-elevate: hot + cold (warm is repopulated by a fresh
-    // persistence pass, not the cold→hot elevation).
+    // Post-elevate: hot + cold. A cold-backed turn takes no warm copy from
+    // hot; it is warmed from the log on request.
     let post_st = turn_state(&conv, key);
     assert!(
         post_st.hot && post_st.cold,
@@ -2321,6 +2370,55 @@ fn snapshot_turn_images(
         out.push(seal_to_chunk_images(backing, device, seq).unwrap());
     }
     out
+}
+
+/// How a reloaded turn is lifted back to hot.
+#[derive(Clone, Copy)]
+enum Leg {
+    /// Straight from the log.
+    ColdToHot,
+    /// From a warm copy rebuilt from the log first.
+    WarmToHot,
+}
+
+/// Open the substrate at `dir` afresh, as a restart does, reload the log and
+/// lift `key` to hot by `leg`; answers the turn's chunk images as it lands.
+fn reload_leg(
+    dir: &Path,
+    device: &Device,
+    backings: Vec<ChunkedKvBacking>,
+    (layer_id, group_id): (LayerId, GroupId),
+    key: TurnKey,
+    leg: Leg,
+) -> Vec<Vec<ChunkImage>> {
+    let conv = open_conversation(dir);
+    conv.register_timeline(key.timeline, layer_id, group_id);
+    conv.reconstruct_from_log(backings.len(), None).unwrap();
+    if let Leg::WarmToHot = leg {
+        warm_from_cold(&conv, &backings, key);
+    }
+    let mut stager = ColdLoadStager::new();
+    let mut ring = WarmLiftRing::new().unwrap();
+    let report = elevate_to_hot(
+        &conv,
+        &backings,
+        device,
+        &mut ring,
+        &mut stager,
+        &[],
+        &[key],
+    )
+    .unwrap();
+    let (warm, cold) = match leg {
+        Leg::ColdToHot => (0, 1),
+        Leg::WarmToHot => (1, 0),
+    };
+    assert_eq!(
+        (report.warm_to_hot, report.cold_to_hot),
+        (warm, cold),
+        "the lift took the leg it was asked for"
+    );
+    snapshot_turn_images(&conv, &backings, device, key.timeline, key.index)
 }
 
 /// Field-by-field equality on the metadata that the persist path
@@ -2705,7 +2803,7 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
         .join("seg-0000000001.log");
 
     // ── Phase 1: seed F16 with varied pattern, run policy-driven persist ──
-    let key = {
+    let (key, sealed) = {
         let conv = open_conversation(&dir);
         let backings = make_backings_metadata(&device, &policy, n_layers);
         conv.register_timeline(timeline, layer_id, group_id);
@@ -2722,7 +2820,8 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
         );
         let key = TurnKey::new(timeline, idx);
 
-        // Policy quantizes per-(h, p) at hot→warm and atomically drops hot.
+        // The gap quantizes per-(h, p); the pass copies that form warm and cold.
+        gap_quantize(&conv, &backings, &device, &policy);
         let persist = PersistenceThread::spawn(
             conv.clone(),
             Arc::new(backings.clone()),
@@ -2737,48 +2836,15 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
             st.hot && st.warm && st.cold,
             "post-persist {key:?} should be hot+warm+cold (install_warm_and_hot), got {st:?}"
         );
-        key
-    };
 
-    // ── Mini path: one verify session covering both reload legs ────────
-    //
-    // The `#[ignore]`d full version below re-opens the substrate from disk for
-    // each leg (cold→hot determinism + a separate warm→hot) to mirror distinct
-    // restarts. The per-cycle guard folds it into a SINGLE reopen: cold→hot
-    // (reference + varied-format sanity), then a warm copy made from hot the
-    // way the persistence thread makes one (a recall lands hot only), evict +
-    // warm→hot in the same session, asserting the two legs produce
-    // byte-identical metadata. Same per-(h, p) reorder/drift/fallback coverage,
-    // ~half the GPU+disk work.
-    if mini {
-        let conv = open_conversation(&dir);
-        let backings = make_backings_metadata(&device, &policy, n_layers);
-        conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(n_layers, None).unwrap();
-
-        let main_stream = cuda_stream(&device);
-        let mut pinned: Option<PinnedBuf> = None;
+        // The pass's own warm copy, migrated from hot, lifts back to the same
+        // images, field for field.
+        let sealed = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
+        assert_varied_formats(&sealed, "sealed");
+        let purged = evict_from_hot(&conv, &[], &[]);
+        assert_eq!(purged.count, 1, "hot evictable onto its warm copy");
         let mut stager = ColdLoadStager::new();
         let mut ring = WarmLiftRing::new().unwrap();
-        elevate_to_hot(
-            &conv,
-            &backings,
-            &device,
-            &mut ring,
-            &mut stager,
-            &[],
-            &[key],
-        )
-        .unwrap();
-        let reference = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
-        assert_varied_formats(&reference, "mini cold→hot");
-
-        install_warm_from_hot(&conv, &backings, &device, &main_stream, &mut pinned, key);
-        let purged = evict_from_hot(&conv, &[], &[]);
-        assert_eq!(
-            purged.count, 1,
-            "hot must be evictable to exercise warm→hot"
-        );
         let report = elevate_to_hot(
             &conv,
             &backings,
@@ -2789,19 +2855,45 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
             &[key],
         )
         .unwrap();
-        assert_eq!(report.warm_to_hot, 1, "mini must exercise warm→hot");
-        let snap = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
+        assert_eq!(report.warm_to_hot, 1, "lifted from the migrated warm copy");
+        let lifted = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
+        assert_chunk_images_eq(&sealed, &lifted, "warm→hot from the pass's warm copy");
+        (key, sealed)
+    };
+    let log_len_sealed = std::fs::metadata(&log_path).unwrap().len();
+
+    // ── Mini path: one reopen per reload leg ───────────────────────────
+    //
+    // The `#[ignore]`d full version below also re-reads the log a second time
+    // for cold→hot determinism. The per-cycle guard keeps the two legs that
+    // matter: cold→hot (reference + varied-format sanity), then warm→hot from a
+    // copy warmed from the log, asserting the two produce byte-identical
+    // metadata. A cold-backed turn is warmed only while it holds the cold copy
+    // alone, so each leg opens the substrate afresh. Same per-(h, p)
+    // reorder/drift/fallback coverage, at the small depth.
+    if mini {
+        let ids = (layer_id, group_id);
+        let backings = || make_backings_metadata(&device, &policy, n_layers);
+        let reference = reload_leg(&dir, &device, backings(), ids, key, Leg::ColdToHot);
+        assert_chunk_images_eq(&sealed, &reference, "mini cold→hot");
+        let snap = reload_leg(&dir, &device, backings(), ids, key, Leg::WarmToHot);
         assert_chunk_images_eq(&reference, &snap, "mini warm→hot");
+        assert_eq!(
+            std::fs::metadata(&log_path).unwrap().len(),
+            log_len_sealed,
+            "the reloads appended nothing to the redo log"
+        );
         return;
     }
 
-    // ── Phase 2: open a fresh process state, elevate warm→hot, ─────────
+    // ── Phase 2: open a fresh process state, elevate cold→hot, ─────────
     //            capture full ChunkImage reference                       ─
     //
     // Re-opening the substrate from disk (rather than reusing the
     // Conversation from Phase 1) is what the production restart path
-    // does: the turn is recalled from cold on reopen, landing hot. So Phase 2's "reference" snapshot is *the* image set
-    // every subsequent transition must preserve.
+    // does: the turn is recalled from cold on reopen, landing hot. So Phase
+    // 2's "reference" snapshot, the sealed images as the log gives them back,
+    // is *the* image set every subsequent transition must preserve.
     let reference = {
         let conv = open_conversation(&dir);
         let backings = make_backings_metadata(&device, &policy, n_layers);
@@ -2827,6 +2919,7 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
         // — otherwise a reorder bug on uniform formats would round-trip
         // trivially and this entire test would be vacuous.
         assert_varied_formats(&snap, "Phase 2 reference");
+        assert_chunk_images_eq(&sealed, &snap, "Phase 2 cold→hot against the sealed form");
         snap
     };
 
@@ -2860,57 +2953,19 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
     }
 
     // ── Phase 4: same on-disk state, but exercise the warm→hot leg ─────
-    //            after a manual evict_from_hot — the path that runs in   ─
-    //            steady state when a hot residence is dropped and re-    ─
-    //            elevated without restart.                                ─
+    //            from a copy warmed from the log — the path a running    ─
+    //            daemon lifts a cold-backed turn by once it is warm.     ─
     {
-        let conv = open_conversation(&dir);
         let backings = make_backings_metadata(&device, &policy, n_layers);
-        conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(n_layers, None).unwrap();
-
-        let main_stream = cuda_stream(&device);
-        let mut pinned: Option<PinnedBuf> = None;
-        let mut stager = ColdLoadStager::new();
-        let mut ring = WarmLiftRing::new().unwrap();
-        // The first elevate lands the recall hot only; the warm copy is made
-        // from hot as the persistence thread makes one.
-        elevate_to_hot(
-            &conv,
-            &backings,
+        let snap = reload_leg(
+            &dir,
             &device,
-            &mut ring,
-            &mut stager,
-            &[],
-            &[key],
-        )
-        .unwrap();
-        install_warm_from_hot(&conv, &backings, &device, &main_stream, &mut pinned, key);
-        // Drop hot — turn is now warm+cold only.
-        let purged = evict_from_hot(&conv, &[], &[]);
-        assert_eq!(
-            purged.count, 1,
-            "hot must be evictable to exercise warm→hot"
+            backings,
+            (layer_id, group_id),
+            key,
+            Leg::WarmToHot,
         );
-        // Second elevate now takes the warm→hot path.
-        let report = elevate_to_hot(
-            &conv,
-            &backings,
-            &device,
-            &mut ring,
-            &mut stager,
-            &[],
-            &[key],
-        )
-        .unwrap();
-        assert_eq!(
-            report.warm_to_hot, 1,
-            "Phase 4 must exercise warm→hot, not cold→hot"
-        );
-        assert_eq!(report.cold_to_hot, 0);
-
-        let snap = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
-        assert_chunk_images_eq(&reference, &snap, "warm→hot after evict");
+        assert_chunk_images_eq(&reference, &snap, "warm→hot from the log's warm copy");
     }
 
     // ── Phase 5: redo log must not have grown across all reloads ───────
@@ -2918,8 +2973,12 @@ fn run_quantize_on_evict_metadata_round_trip(device: &Device, n_layers: usize, m
     // Any tier transition that silently appended a record during reload
     // would be a write-amplification bug; the cold tier is meant to be
     // append-only at seal time, not at recover time.
-    let log_len = std::fs::metadata(&log_path).unwrap().len();
-    assert!(log_len > 0, "redo log should be non-empty");
+    assert!(log_len_sealed > 0, "redo log should be non-empty");
+    assert_eq!(
+        std::fs::metadata(&log_path).unwrap().len(),
+        log_len_sealed,
+        "the reloads appended nothing to the redo log"
+    );
 }
 
 /// Field-level cold-reload round-trip for the **non-policy** path
@@ -2962,7 +3021,7 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
     let group_id = GroupId::from_raw(81).unwrap();
     let timeline = TimelineAllocator::new().next();
 
-    let key = {
+    let (key, sealed) = {
         let conv = open_conversation(&dir);
         let backings = make_backings_metadata_no_policy(&device, n_layers);
         conv.register_timeline(timeline, layer_id, group_id);
@@ -2986,40 +3045,14 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
             WarmLedger::new().join(),
         );
         persist.shutdown();
-        key
-    };
 
-    // Mini path: one verify session covering both reload legs (see the
-    // policy-driven sibling for the rationale). No `assert_varied_formats` here —
-    // the no-policy path deliberately preserves the uniform seed format.
-    if mini {
-        let conv = open_conversation(&dir);
-        let backings = make_backings_metadata_no_policy(&device, n_layers);
-        conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(n_layers, None).unwrap();
-
-        let main_stream = cuda_stream(&device);
-        let mut pinned: Option<PinnedBuf> = None;
+        // The pass's own warm copy, migrated from hot, lifts back to the same
+        // images, field for field.
+        let sealed = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
+        let purged = evict_from_hot(&conv, &[], &[]);
+        assert_eq!(purged.count, 1, "hot evictable onto its warm copy");
         let mut stager = ColdLoadStager::new();
         let mut ring = WarmLiftRing::new().unwrap();
-        elevate_to_hot(
-            &conv,
-            &backings,
-            &device,
-            &mut ring,
-            &mut stager,
-            &[],
-            &[key],
-        )
-        .unwrap();
-        let reference = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
-
-        install_warm_from_hot(&conv, &backings, &device, &main_stream, &mut pinned, key);
-        let purged = evict_from_hot(&conv, &[], &[]);
-        assert_eq!(
-            purged.count, 1,
-            "hot must be evictable to exercise warm→hot"
-        );
         let report = elevate_to_hot(
             &conv,
             &backings,
@@ -3030,74 +3063,51 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
             &[key],
         )
         .unwrap();
-        assert_eq!(report.warm_to_hot, 1, "mini must exercise warm→hot");
-        let snap = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
+        assert_eq!(report.warm_to_hot, 1, "lifted from the migrated warm copy");
+        let lifted = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
+        assert_chunk_images_eq(&sealed, &lifted, "no-policy warm→hot from the pass's warm copy");
+        (key, sealed)
+    };
+
+    // Mini path: one reopen per reload leg (see the policy-driven sibling for
+    // the rationale). No `assert_varied_formats` here — the no-policy path
+    // deliberately preserves the uniform seed format.
+    if mini {
+        let ids = (layer_id, group_id);
+        let backings = || make_backings_metadata_no_policy(&device, n_layers);
+        let reference = reload_leg(&dir, &device, backings(), ids, key, Leg::ColdToHot);
+        assert_chunk_images_eq(&sealed, &reference, "no-policy mini cold→hot");
+        let snap = reload_leg(&dir, &device, backings(), ids, key, Leg::WarmToHot);
         assert_chunk_images_eq(&reference, &snap, "no-policy mini warm→hot");
         return;
     }
 
-    // Reference: post-restart, post warm→hot elevation.
+    // Reference: post-restart, post cold→hot elevation — the sealed images as
+    // the log gives them back.
     let reference = {
-        let conv = open_conversation(&dir);
         let backings = make_backings_metadata_no_policy(&device, n_layers);
-        conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(n_layers, None).unwrap();
-
-        let mut stager = ColdLoadStager::new();
-        let mut ring = WarmLiftRing::new().unwrap();
-        elevate_to_hot(
-            &conv,
-            &backings,
+        reload_leg(
+            &dir,
             &device,
-            &mut ring,
-            &mut stager,
-            &[],
-            &[key],
+            backings,
+            (layer_id, group_id),
+            key,
+            Leg::ColdToHot,
         )
-        .unwrap();
-        snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index)
     };
+    assert_chunk_images_eq(&sealed, &reference, "no-policy cold→hot against the sealed form");
 
-    // Warm→hot leg after evict.
+    // Warm→hot leg, from a copy warmed from the log.
     {
-        let conv = open_conversation(&dir);
         let backings = make_backings_metadata_no_policy(&device, n_layers);
-        conv.register_timeline(timeline, layer_id, group_id);
-        conv.reconstruct_from_log(n_layers, None).unwrap();
-
-        let main_stream = cuda_stream(&device);
-        let mut pinned: Option<PinnedBuf> = None;
-        let mut stager = ColdLoadStager::new();
-        let mut ring = WarmLiftRing::new().unwrap();
-        elevate_to_hot(
-            &conv,
-            &backings,
+        let snap = reload_leg(
+            &dir,
             &device,
-            &mut ring,
-            &mut stager,
-            &[],
-            &[key],
-        )
-        .unwrap();
-        install_warm_from_hot(&conv, &backings, &device, &main_stream, &mut pinned, key);
-        let purged = evict_from_hot(&conv, &[], &[]);
-        assert_eq!(
-            purged.count, 1,
-            "hot must be evictable to exercise warm→hot"
+            backings,
+            (layer_id, group_id),
+            key,
+            Leg::WarmToHot,
         );
-        let report = elevate_to_hot(
-            &conv,
-            &backings,
-            &device,
-            &mut ring,
-            &mut stager,
-            &[],
-            &[key],
-        )
-        .unwrap();
-        assert_eq!(report.warm_to_hot, 1);
-
-        let snap = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
         assert_chunk_images_eq(&reference, &snap, "no-policy warm→hot");
     }
 
@@ -3155,7 +3165,6 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
 use candle_conversation::persistence::content_hash::section_stream_id;
 use candle_conversation::persistence::resume::TurnChunkGrid;
 use candle_conversation::persistence::streams::ContentAddress;
-use candle_nn::kv_cache::quantize_sealed_in_place;
 
 /// Seed a section in `backings` at `head_dim` width and `n_tokens`
 /// length, optionally compressed into `target_format`.  Mirrors

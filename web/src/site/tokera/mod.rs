@@ -300,6 +300,7 @@ mod tests {
         let seen = listed_slugs(&html);
 
         let expected = [
+            "one-card-the-final-paper",
             "what-one-gpu-can-do",
             "waves-and-the-pcie-bottleneck",
             "palquant-per-block",
