@@ -28,8 +28,11 @@ papers:
       unbounded agent memory
     authors: "Johnathan Paul Sharratt"
     date: "25 November 2026"
+    published: "2026-11-25"
+    doi: "10.5281/zenodo.24529143"
+    zenodo: "https://zenodo.org/records/24529143"
+    pdf: "https://zenodo.org/records/24529143/files/one-card-v2.pdf?download=1"
     status: "v2"
-    pdf: "/pdf/one-card-v2.pdf"
     source: unbounded_agents.md
     summary: >-
       v2 of One Card, One Stack, measured on the production system. A 180B
