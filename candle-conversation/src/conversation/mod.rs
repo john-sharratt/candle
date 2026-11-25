@@ -65,6 +65,7 @@ use crate::working_set::marks::gather_tags;
 use candle_nn::kv_cache::{SealedChunk, SealedSequence};
 use candle_transformers::models::batched_inference::ModelCoreProperties;
 use candle_transformers::models::dialect::Dialect;
+use candle_transformers::models::qwen_vision::VisionTowerSource;
 
 use crate::recurrent_span::TokenSpan;
 use crate::stencil::{ThinkMode, TriggerRegistry, TurnGrammar};
@@ -182,6 +183,10 @@ pub struct Sequence {
 
     /// Static model properties captured at engine construction.
     model_core: ModelCoreProperties,
+
+    /// The engine's vision tower, whose rows a stored turn's images are read
+    /// back as; `None` for a model that reads no images.
+    vision: Option<&'static VisionTowerSource>,
 
     /// Projection schema for this conversation.
     ///

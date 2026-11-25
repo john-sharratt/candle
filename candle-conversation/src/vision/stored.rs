@@ -12,10 +12,13 @@ use crate::projection::{Conversation, TimelineId, TurnIndex};
 
 /// The image spans of `turns` laid end to end in order, each turn's ids
 /// whole: positions count from the first id of the first turn. Only a turn's
-/// user half holds images. Empty for a model with no vision tokens.
+/// user half holds images, read as the rows `tower` — the engine's — kept for
+/// them; a turn whose image `tower` never read, or an image on a model with
+/// no tower, is refused. Empty for a model with no vision tokens.
 pub fn stored_spans(
     substrate: &Conversation,
     tokens: Option<VisionTokens>,
+    tower: Option<&str>,
     turns: &[(TimelineId, TurnIndex)],
 ) -> Result<Vec<ImageSpan>, String> {
     let Some(tokens) = tokens else {
@@ -39,7 +42,10 @@ pub fn stored_spans(
     let shared = substrate.shared();
     let mut spans = Vec::new();
     for (at, ids, text) in halves {
-        let found = turn_spans(&ids, &text, tokens, |id| load_rows(&shared, id))?;
+        let found = turn_spans(&ids, &text, tokens, |id| match tower {
+            Some(tower) => load_rows(&shared, id, tower),
+            None => Err(format!("image {id}: this model reads no images")),
+        })?;
         spans.extend(found.iter().map(|s| s.shifted(at)));
     }
     Ok(spans)

@@ -231,6 +231,7 @@ impl Sequence {
         config: SequenceConfig,
         chunk_size: usize,
         model_core: ModelCoreProperties,
+        vision: Option<&'static VisionTowerSource>,
         substrate: Conversation,
         section_progress: Option<&dyn Fn(u64, u64)>,
     ) -> crate::Result<(Self, Option<PendingBranchState>)> {
@@ -271,6 +272,7 @@ impl Sequence {
             current_blocks: BlockCount(0),
             chunk_size,
             model_core,
+            vision,
             base_projection: Arc::clone(&projection),
             projection,
             submitted: SubmittedSections::default(),

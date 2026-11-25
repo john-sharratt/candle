@@ -380,6 +380,9 @@ mod cpu_tests {
     /// finite row per `<|image_pad|>`, as wide as its trunk. Read from the
     /// tower's pack with no twins, which a CPU load takes, built on first use.
     #[test]
+    #[ignore = "fetches both pinned mmprojs (~1.8 GB) and builds their packs on first run. \
+                Run with: cargo test --release -p candle-transformers --features cuda --lib \
+                qwen_vision -- --include-ignored --test-threads=1"]
     fn each_pinned_tower_reads_an_image_on_the_cpu() {
         for (source, width) in pinned_towers() {
             let path = source.pack(Int8Mode::Off).unwrap();
@@ -460,6 +463,8 @@ mod tests {
     /// an image into its trunk's rows. On a machine without a card there is
     /// nothing to run.
     #[test]
+    #[ignore = "fetches both pinned mmprojs (~1.8 GB) on first run and needs the card \
+                free. Run with --include-ignored --test-threads=1"]
     fn each_pinned_tower_reads_an_image_on_the_card() {
         let _gpu = gpu_serial();
         for (source, width) in pinned_towers() {
@@ -476,6 +481,8 @@ mod tests {
     /// image's patches at [`ACTIVATION_BYTES_PER_PATCH`] — the way the drain
     /// runs it, every stage and block carving from that one stretch.
     #[test]
+    #[ignore = "fetches both pinned mmprojs (~1.8 GB) on first run and needs the card \
+                free. Run with --include-ignored --test-threads=1"]
     fn each_pinned_tower_reads_an_image_on_a_guest_arena() {
         let _gpu = gpu_serial();
         for (source, width) in pinned_towers() {

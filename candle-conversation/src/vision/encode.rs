@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use candle_transformers::models::qwen_vision::VISION_TOWER_MODE;
 use candle_transformers::models::qwen_vision::{Grid, ImageHandle, ImageRows, VisionTowerSource};
 
-use super::prepare::{prepare, PreparedImage};
+use super::prepare::{image_id, prepare, PreparedImage};
 use super::store::{load_kept, load_original, store_image};
 use crate::guest::{GuestOutcome, GuestRequest, VisionRequest};
 use crate::persistence::SharedSubstrate;
@@ -95,10 +95,22 @@ pub enum ImageSource {
     Kept(String),
 }
 
-/// `sources` as a turn's images, in order. An image the substrate keeps read
-/// by the engine's tower is read back as it was kept. Any other — a file, or a
-/// kept image another tower read — is decoded and sized, read by the tower in
-/// one job, and kept. Each is registered for the prefill.
+impl ImageSource {
+    /// The id the image is kept under: a file's is its digest's, read
+    /// without decoding it.
+    pub fn id(&self) -> String {
+        match self {
+            ImageSource::Bytes(bytes) => image_id(bytes),
+            ImageSource::Kept(id) => id.clone(),
+        }
+    }
+}
+
+/// `sources` as a turn's images, in order. An image whose rows the substrate
+/// keeps for the engine's tower is read back as it was kept, its file never
+/// decoded. Any other — a file, or a kept image only another tower read — is
+/// decoded and sized, read by the tower in one job, and kept. Each is
+/// registered for the prefill.
 pub fn turn_images(
     engine: &ConversationEngine,
     substrate: &SharedSubstrate,
@@ -113,25 +125,21 @@ pub fn turn_images(
     // The files the tower still has to read, by their place in `sources`.
     let mut unread: Vec<(usize, PreparedImage, Vec<u8>)> = Vec::new();
     for (i, source) in sources.into_iter().enumerate() {
-        let bytes = match source {
-            ImageSource::Kept(id) => match load_kept(substrate, &id, tower)? {
-                Some(k) => {
-                    known.push(Some((id, k.width, k.height, k.rows)));
-                    continue;
-                }
-                None => load_original(substrate, &id)?
-                    .ok_or_else(|| format!("no image {id} is kept"))?,
-            },
-            ImageSource::Bytes(bytes) => bytes,
-        };
-        let p = prepare(&bytes)?;
-        match load_kept(substrate, &p.id, tower)? {
-            Some(k) => known.push(Some((p.id, p.width, p.height, k.rows))),
-            None => {
-                known.push(None);
-                unread.push((i, p, bytes));
-            }
+        let id = source.id();
+        // Kept rows are the whole answer: the file is decoded only when the
+        // tower has to read it.
+        if let Some(k) = load_kept(substrate, &id, tower)? {
+            known.push(Some((id, k.width, k.height, k.rows)));
+            continue;
         }
+        let bytes = match source {
+            ImageSource::Bytes(bytes) => bytes,
+            ImageSource::Kept(id) => {
+                load_original(substrate, &id)?.ok_or_else(|| format!("no image {id} is kept"))?
+            }
+        };
+        known.push(None);
+        unread.push((i, prepare(&bytes)?, bytes));
     }
     if !unread.is_empty() {
         let prepared: Vec<PreparedImage> = unread.iter().map(|(_, p, _)| p.clone()).collect();

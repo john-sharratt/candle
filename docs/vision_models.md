@@ -113,18 +113,26 @@ A wave with no virtual id takes none of this: no upload, no launch.
 ## 3. What is kept, per tower
 
 The image's record is one per image: `vision/image/<id>` names its original,
-its thumbnail and its rows, says when it was kept, and names the **tower**
-that wrote the rows (`vision/store.rs`); who sent it and which conversations
-use it are `vision::tenancy`'s.
+its thumbnail and **each tower's rows** — `"rows": {<tower>: <sha256>}` — and
+says when it was kept (`vision/store.rs`); who sent it and which timelines use
+it are `vision::tenancy`'s.
 
 The rows are a tower's output. A turn reads them only when its engine's tower
-wrote them (`load_kept(…, tower)`); an image another tower read is read again
-by this one, from its kept original, and its rows replace the other tower's,
-which are retired. A substrate serves one model at a time — a cluster runs the
-one model its lock names — so the rows kept are the ones its turns read. The
-one path that reads rows without asking which tower — the recurrent catch-up
-replaying a stored turn — takes whichever are kept, and the engine refuses
-rows of another width rather than read them at its own (`take_wave_images`).
+wrote them (`load_kept(…, tower)`); an image only another tower read is read
+again by this one, from its kept original, and its rows are kept beside the
+other tower's. A tower reading an image again replaces only its own rows. The
+recurrent catch-up replaying a stored turn asks for its engine's tower too: a
+`Sequence` carries the engine's `VisionTowerSource`, and `stored_spans` reads
+that tower's rows, refusing — for that sequence alone — a turn whose image its
+tower never read, rather than handing a wave rows of another width.
+
+Every blob a record names is named back by a key of its own,
+`vision/blob/<sha256>/<id>` (`vision/blob_refs.rs`): blobs are
+content-addressed, so two files of the same pixels share their rows and
+thumbnail, and a file kept elsewhere — an npcd picture sent to Zen — is the
+same blob. An image releases its names when it is retired, and a blob is
+retired only once nothing names it; a blob already held before any image
+named it is named `outside` as well, which is never released.
 
 ## 4. Tests
 
@@ -132,14 +140,20 @@ rows of another width rather than read them at its own (`take_wave_images`).
   from `mm.2`; `take_wave_images` and the rotation tables as before, from their
   new home, and another width's rows refused; the row scatter placing each run
   over its placeholders and leaving every other row bit for bit; the
-  placeholders in the 35B's host inputs; the rows record's tower.
+  placeholders in the 35B's host inputs; each tower's rows kept beside the
+  other's; a blob two images name going with the second; the tenancy keys by
+  timeline.
 - **Each tower on the card, from its pack**, and as a guest from its own
   ground: one finite row per `<|image_pad|>`, `out_hidden` wide — 2560 and
   2048.
-- **The 35B end to end** (`candle-conversation`, GPU): an engine on the stock
-  checkpoint, an image turn of a drawn eight-character code and of a 5 × 5
-  grid with one filled cell; the answer must name the code and the cell. The
+- **The 35B end to end** (`zend/tests/vision_qwen36.rs`, GPU, `#[ignore]`d):
+  an engine on the stock checkpoint and two image turns, each a 5 × 5 grid
+  with one filled cell, the answer naming the cell; then a third turn naming
+  the first image by its kept id, whose rows come from the substrate. Two
+  cells right is a one-in-625 chance for a model not seeing them. The
   Flash-Next gates run unchanged, text waves bit-identical.
+- The tests that read a pinned tower are `#[ignore]`d: their first run fetches
+  both `mmproj`s (~1.8 GB) and builds their packs.
 
 ## 5. Adding a third model
 

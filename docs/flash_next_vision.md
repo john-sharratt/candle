@@ -464,15 +464,22 @@ tail prefills prefill text the engine wrote itself and need nothing.
   turn naming the image by id, answers a holder or an admin and no one else:
   a stranger's GET is the `404` an unkept id gets, and their turn the `400`
   (`images::claim`). An id learned is not an image shared. A turn records
-  that its conversation reads each image (`vision/used/<id>/<conv>`, and
-  `vision/conv/<conv>/<id>` to find them from the conversation); deleting a
-  conversation — the user's delete, or a chat closed — forgets its uses and
-  retires every image no other conversation reads: its three blobs tombstoned,
-  the record and its holders ceased. An archived conversation keeps its
-  images, as it keeps its text. An image no conversation ever read is
-  retired a day after it was kept (`kept_ms` on its record; the sweep runs
-  whenever an image is kept). Each fact is a key of its own, so two members
-  adding a holder or a use at once never overwrite each other.
+  that its timeline reads each image (`vision/used/<id>/<timeline>`, and
+  `vision/timeline/<timeline>/<id>` to find them from the timeline) *before*
+  it reads them, so a delete elsewhere meanwhile never finds them unused;
+  deleting a timeline by any path — the user's delete, a chat closed,
+  `DELETE /v1/substrate/zend/timeline/{tl}` — forgets its uses and retires
+  every image no other timeline reads: its blobs released (each retired once
+  no image names it, `vision/blob_refs.rs`), the record and its holders
+  ceased. An archived conversation keeps its images, as it keeps its text. An
+  image no timeline ever read is retired a day after it was kept or last
+  sent (`kept_ms` on its record, renewed by `vision::touch` on every
+  `POST /v1/images`; the sweep runs hourly on its own clock,
+  `zend/src/session/image_sweep.rs`, never on a request's path). Each fact is
+  a key of its own, so two members adding a holder or a use at once never
+  overwrite each other. Between members, a use noted on one reaches another
+  with replication; a delete on the second inside that window can still
+  retire the image, and the first turn's history then shows it as gone.
 - **The turn.** The session parses the last user message's images into
   `TurnStart.images`, and the turn reads them before its first round
   (`images::resolve` on the blocking pool, under a "Reading the images…"

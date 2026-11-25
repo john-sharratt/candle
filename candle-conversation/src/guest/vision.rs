@@ -222,6 +222,9 @@ mod tests {
     /// `<|image_pad|>`, as wide as its trunk. Nothing to run on a machine
     /// without a card.
     #[test]
+    #[ignore = "fetches both pinned mmprojs (~1.8 GB) on first run and needs the card \
+                free. Run with: cargo test --release -p candle-conversation --features hub \
+                --lib guest::vision -- --include-ignored --test-threads=1"]
     fn each_vision_guest_reads_an_image_from_its_ground() {
         let Ok(device) = Device::new_cuda(0) else {
             return;
