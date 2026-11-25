@@ -44,6 +44,40 @@ pub(super) mod tests {
         assert_eq!(rec.perceived.len(), 2, "on everything it missed");
     }
 
+    /// **A queued situation is retired by the next one, and nothing else is.**
+    /// Three views arrive before the character next thinks, beside two things
+    /// that happened: the turn reads the two happenings and the latest view
+    /// alone — the stale views never reach it, whatever sat between them.
+    #[test]
+    fn a_queued_situation_is_retired_by_the_next_and_nothing_else_is() {
+        let s = sched();
+        s.wake(1, 0, 0);
+        let view = |wick: &str| {
+            let text = format!("Everything inside you: Wick, {wick}");
+            s.deliver(1, 0, Salience::IDLE, EventKind::Situation { text });
+        };
+        view("at rest.");
+        s.deliver(1, 0, Salience::NORMAL, say("somebody comes in"));
+        view("carrying a mission.");
+        s.deliver(1, 0, Salience::NORMAL, say("an alarm"));
+        view("its steps done.");
+        assert_eq!(s.inbox_depth(1), Some(3), "two happenings and one view");
+
+        let now = s.now_ms();
+        let rec = s.tick(1, now, 0, |_, _| vec![]).expect("ticked");
+        let views: Vec<&String> = rec
+            .perceived
+            .iter()
+            .filter(|p| p.starts_with("Everything inside you"))
+            .collect();
+        assert_eq!(views.len(), 1, "{:?}", rec.perceived);
+        assert!(
+            views[0].ends_with("its steps done."),
+            "the latest view is the one read: {views:?}"
+        );
+        assert_eq!(rec.perceived.len(), 3, "both happenings are kept");
+    }
+
     /// **An act recorded before its result is completed with it.** A reflect
     /// goes into the window as the act alone and is answered seconds later by
     /// its own conversation; the row has to end up reading what came back, not

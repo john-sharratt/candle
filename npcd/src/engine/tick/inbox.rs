@@ -397,6 +397,19 @@ impl Inbox {
             // the alertness model, and it needs no combat branch anywhere.
             self.heartbeat = ALERT_HEARTBEAT;
         }
+        // **An event that supersedes its band retires the queued one it
+        // supersedes**, as the window does when it lands (`EventKind::replaces`,
+        // `window::Window::push`). A situation is what is true now, so a second
+        // one waiting beside the first is the first gone stale, never news. Kept,
+        // every copy rode the next tick: a mind that is its world is carried its
+        // whole view each time anything in it moves, so seven characters on
+        // missions queued a run of near-identical "Everything inside you" views
+        // between two of Zen's turns, each one listed in the tick Pulse shows.
+        // The held path collapses bands the same way (`held`).
+        if let Some(band) = event.kind.replaces() {
+            self.queue
+                .retain(|queued| queued.kind.replaces().as_deref() != Some(band.as_str()));
+        }
         self.queue.push_back(event);
     }
 
