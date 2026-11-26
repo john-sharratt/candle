@@ -388,16 +388,21 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<SlotLayout, ConversationError>>,
     },
 
-    /// Seal the per-position index `sequence_id` has forwarded since its index
-    /// was last placed as one page — a section's page — and place its index
-    /// again as `placed` then that page, pushed in order as a projection
-    /// pushes sections' pages. Replies with the new page; `None` for a model
-    /// that keeps no index.
-    IndexPiece {
+    /// Give `sequence_id` — holding the first `prompt_tokens` of a described
+    /// slot's prompt in the same chunk windows — that slot's K/V for them
+    /// (`kv`), its index pages for them (`index`), or both, from the capture
+    /// its description named. The capture is taken either way.
+    Transplant {
         sequence_id: SequenceId,
-        placed: Vec<Vec<u8>>,
-        response_tx: Sender<Result<Option<Vec<u8>>, ConversationError>>,
+        capture: u64,
+        prompt_tokens: usize,
+        kv: bool,
+        index: bool,
+        response_tx: Sender<Result<(), ConversationError>>,
     },
+
+    /// Drop a capture no transplant took.
+    ReleaseCapture { capture: u64 },
 
     /// Leave `sequence_id`'s blocks native in the gap from here on, so the only
     /// quantization its K/V takes is a [`Self::QuantizeSpans`] asked for.
@@ -807,7 +812,8 @@ impl SchedulerRequest {
             Self::IngestSection { .. } => "req:ingest_section",
             Self::InstallRecurrentState { .. } => "req:install_recurrent_state",
             Self::DescribeAtSeal { .. } => "req:describe_at_seal",
-            Self::IndexPiece { .. } => "req:index_piece",
+            Self::Transplant { .. } => "req:transplant",
+            Self::ReleaseCapture { .. } => "req:release_capture",
             Self::SealNatively { .. } => "req:seal_natively",
             Self::QuantizeSpans { .. } => "req:quantize_spans",
             Self::SeedRecurrentFromLineage { .. } => "req:seed_recurrent_from_lineage",

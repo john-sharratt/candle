@@ -151,7 +151,7 @@ pub use conversation::{
 };
 pub use engine::{
     ConversationEngine, EngineAttacher, RawDecode, SubstrateReloadStatus, SubstrateReloader,
-    ThinkSteering,
+    ThinkSteering, TransplantFrom,
 };
 pub use engine_slot::{Capabilities, EngineSlot, EngineSource, EngineTicket};
 pub use error::{is_stall_message, ConversationError};

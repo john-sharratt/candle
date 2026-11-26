@@ -1002,12 +1002,26 @@ impl Scheduler {
                 true
             }
 
-            SchedulerRequest::IndexPiece {
+            SchedulerRequest::Transplant {
                 sequence_id,
-                placed,
+                capture,
+                prompt_tokens,
+                kv,
+                index,
                 response_tx,
             } => {
-                let _ = response_tx.send(self.index_piece(sequence_id, &placed));
+                let _ = response_tx.send(self.transplant(
+                    sequence_id,
+                    capture,
+                    prompt_tokens,
+                    kv,
+                    index,
+                ));
+                true
+            }
+
+            SchedulerRequest::ReleaseCapture { capture } => {
+                self.captures.remove(&capture);
                 true
             }
 

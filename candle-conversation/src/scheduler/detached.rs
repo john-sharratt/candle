@@ -119,7 +119,7 @@ impl SchedulerRequest {
             | Self::MemoryCatchUp { sequence_id, .. }
             | Self::ExtractRawKvq { sequence_id, .. }
             | Self::DescribeAtSeal { sequence_id, .. }
-            | Self::IndexPiece { sequence_id, .. }
+            | Self::Transplant { sequence_id, .. }
             | Self::SealNatively { sequence_id, .. }
             | Self::QuantizeSpans { sequence_id, .. }
             | Self::ProbeWideSigs { sequence_id, .. }
@@ -145,6 +145,7 @@ impl SchedulerRequest {
             | Self::WarmIngestSlice { .. }
             | Self::ScanGroupVotes { .. }
             | Self::DemoteTimelinesHot { .. }
+            | Self::ReleaseCapture { .. }
             | Self::Wake
             | Self::Settle { .. }
             | Self::Shutdown => Vec::new(),
@@ -186,7 +187,8 @@ impl SchedulerRequest {
             | Self::BranchCheckpointPass { .. }
             | Self::ExtractRawKvq { .. }
             | Self::DescribeAtSeal { .. }
-            | Self::IndexPiece { .. }
+            | Self::Transplant { .. }
+            | Self::ReleaseCapture { .. }
             | Self::SealNatively { .. }
             | Self::QuantizeSpans { .. }
             | Self::ProbeWideSigs { .. }

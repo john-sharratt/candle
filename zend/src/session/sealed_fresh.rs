@@ -43,7 +43,7 @@ use candle_conversation::projection::{
 };
 use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{
-    format_name, ChunkLayout, PieceKind, PromptDump, SealAs, SlotLayout, SpanQuant,
+    format_name, ChunkLayout, PieceKind, PromptDump, SealAs, SlotLayout, SpanQuant, TransplantFrom,
 };
 use candle_conversation::{SamplingConfig, TurnOptions};
 use serde::{Deserialize, Serialize};
@@ -99,6 +99,25 @@ pub struct SealedFreshReq {
     /// Q8 K and V, the seed's — instead of a member's.
     #[serde(default)]
     pub reseal_boundary: bool,
+    /// Where the fresh side's prompt K/V comes from: its own prefill, or the
+    /// sealed slot's chunks transplanted in their place.
+    #[serde(default)]
+    pub fresh_kv: Source,
+    /// Where the fresh side's index comes from: its own prefill, or the sealed
+    /// slot's index pages transplanted in their place.
+    #[serde(default)]
+    pub fresh_index: Source,
+}
+
+/// Which side a part of the fresh slot comes from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    /// The fresh side's own.
+    #[default]
+    Fresh,
+    /// The sealed slot's, transplanted.
+    Sealed,
 }
 
 /// How the fresh side's prompt lies in its slot.
@@ -112,11 +131,10 @@ pub enum Layout {
     /// glue in its own chunks, ending in its own partial chunk — as a
     /// projection lays sealed sections out.
     Spans,
-    /// [`Layout::Spans`], mirroring the sealed side: each piece quantized
-    /// under the policy its sealed counterpart shows — a boundary section's
-    /// Q8, where every band the sealed side holds for it is `Q8_KS` K and
-    /// `Q8_0` V, else a member's level — and the index rebuilt as one page per
-    /// piece, as a projection places them.
+    /// [`Layout::Spans`], mirroring the sealed side's policies: each piece
+    /// quantized under the policy its sealed counterpart shows — a boundary
+    /// section's Q8, where every band the sealed side holds for it is `Q8_KS`
+    /// K and `Q8_0` V, else a member's level.
     Mirror,
 }
 
@@ -424,16 +442,26 @@ impl ZendSession {
                 Recurrent::Sealed => Some(without_members(&dump, &members)),
                 Recurrent::Replayed => Some(dump.token_ids.clone()),
             };
+            let transplant = (req.fresh_kv == Source::Sealed || req.fresh_index == Source::Sealed)
+                .then_some(TransplantFrom {
+                    capture: sealed_layout.capture,
+                    kv: req.fresh_kv == Source::Sealed,
+                    index: req.fresh_index == Source::Sealed,
+                });
+            if transplant.is_none() {
+                engine.release_capture(sealed_layout.capture);
+            }
             let one_pass = req.fresh_recurrent == Recurrent::Fresh
                 && req.fresh_quantize.is_none()
-                && req.fresh_layout == Layout::Contiguous;
+                && req.fresh_layout == Layout::Contiguous
+                && transplant.is_none();
             let fresh = if one_pass {
                 engine.infer_raw_token_ids(&prompt, req.n)
             } else {
                 engine.infer_raw_token_ids_swapped(
                     &fresh_pieces(&dump, req.fresh_layout, req.fresh_quantize, &sealed_layout),
                     recurrent_over,
-                    req.fresh_layout == Layout::Mirror,
+                    transplant,
                     &turn[..user_half],
                     req.n,
                 )
@@ -597,6 +625,7 @@ mod tests {
             index_coverage: None,
             index_pages: Vec::new(),
             chunks,
+            capture: 0,
         }
     }
 

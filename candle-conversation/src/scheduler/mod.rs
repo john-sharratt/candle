@@ -622,6 +622,12 @@ pub(crate) struct Scheduler {
     /// goes. Taken when the turn ends; dropped on `FreeSequence`.
     describe_at_seal: HashMap<SequenceId, Sender<Result<SlotLayout, ConversationError>>>,
 
+    /// Described slots' chunks and index pages, held under the id their
+    /// description names for a [`SchedulerRequest::Transplant`] until it is
+    /// taken or released; the last id handed out.
+    captures: HashMap<u64, transplant::SlotCapture>,
+    last_capture: u64,
+
     /// **Diagnostic**: per-slot record of every token that has been
     /// committed to the slot's K/V — in the exact order it landed
     /// in the kernel's view.  Updated by every write path:
@@ -1122,11 +1128,11 @@ mod compression;
 mod compression_turn;
 mod construct;
 mod handle_request_now;
-mod mirror_index;
 mod perform_seal;
 mod quantize_slot;
 pub use quantize_slot::SpanQuant;
 mod slot_layout;
+mod transplant;
 pub use slot_layout::{format_name, ChunkLayout, IndexPage, SlotLayout};
 mod seal_turn;
 mod section_finish;

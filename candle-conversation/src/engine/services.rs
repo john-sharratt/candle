@@ -11,7 +11,7 @@
 use super::*;
 use crate::conversation::run_state;
 use crate::scheduler::exported_state::SharedState;
-use crate::{SlotLayout, SpanQuant};
+use crate::{SlotLayout, SpanQuant, TransplantFrom};
 
 /// Live progress of the startup substrate reload (redo-log replay), shared
 /// between the scheduler thread (writer) and the daemon's load-state machine
@@ -251,14 +251,13 @@ impl ConversationEngine {
     /// its [`SpanQuant`] before `tail`. One piece is the prompt contiguous.
     /// When any piece is quantized the slot is sealed natively first, so the
     /// gap quantizes none of it and every format is the piece's own. With
-    /// `mirror_index`, each piece's index is sealed as one page after its
-    /// prefill and the slot's index replaced by those pages before `tail` —
-    /// one page per piece, as a projection places sealed sections.
+    /// `transplant`, the prompt's K/V, its index, or both are then taken from a
+    /// described slot holding the same prompt in the same windows.
     pub fn infer_raw_token_ids_swapped(
         &self,
         prompt: &[(Vec<u32>, SpanQuant)],
         recurrent_over: Option<Vec<u32>>,
-        mirror_index: bool,
+        transplant: Option<TransplantFrom>,
         tail: &[u32],
         max_decode_tokens: usize,
     ) -> crate::Result<RawDecode> {
@@ -276,27 +275,8 @@ impl ConversationEngine {
                     .map_err(|_| ConversationError::SchedulerGone)?;
                 rx.recv().map_err(|_| ConversationError::SchedulerGone)?;
             }
-            // Mirrored, every piece is forwarded over the pages of the pieces
-            // before it, injected, and its own sealed as one page after it.
-            let mut placed: Vec<Vec<u8>> = Vec::new();
             for (tokens, _) in prompt.iter().filter(|(t, _)| !t.is_empty()) {
                 self.raw_turn(sequence_id, tokens, 0)?;
-                if mirror_index {
-                    let (tx, rx) = flume::bounded(1);
-                    self.core
-                        .scheduler_tx
-                        .send(SchedulerRequest::IndexPiece {
-                            sequence_id,
-                            placed: placed.clone(),
-                            response_tx: tx,
-                        })
-                        .map_err(|_| ConversationError::SchedulerGone)?;
-                    if let Some(page) =
-                        rx.recv().map_err(|_| ConversationError::SchedulerGone)??
-                    {
-                        placed.push(page);
-                    }
-                }
             }
             if quantizes {
                 let spans = prompt
@@ -310,6 +290,21 @@ impl ConversationEngine {
                     .send(SchedulerRequest::QuantizeSpans {
                         sequence_id,
                         spans,
+                        response_tx: tx,
+                    })
+                    .map_err(|_| ConversationError::SchedulerGone)?;
+                rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
+            }
+            if let Some(t) = transplant {
+                let (tx, rx) = flume::bounded(1);
+                self.core
+                    .scheduler_tx
+                    .send(SchedulerRequest::Transplant {
+                        sequence_id,
+                        capture: t.capture,
+                        prompt_tokens: prompt.iter().map(|(p, _)| p.len()).sum(),
+                        kv: t.kv,
+                        index: t.index,
                         response_tx: tx,
                     })
                     .map_err(|_| ConversationError::SchedulerGone)?;
@@ -386,6 +381,14 @@ impl ConversationEngine {
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
         Ok(rx)
+    }
+
+    /// Drop a described slot's capture that no transplant took.
+    pub fn release_capture(&self, capture: u64) {
+        let _ = self
+            .core
+            .scheduler_tx
+            .send(SchedulerRequest::ReleaseCapture { capture });
     }
 
     /// A fresh slot bound to nothing: no projection, no substrate write.

@@ -13,6 +13,7 @@ use std::hash::{Hash, Hasher};
 use candle_nn::kv_cache::ArenaFormatTag;
 use serde::Serialize;
 
+use super::transplant::SlotCapture;
 use super::*;
 
 /// One chunk of a slot: its window, and its bands' formats on every layer.
@@ -49,6 +50,9 @@ pub struct SlotLayout {
     pub index_coverage: Option<usize>,
     pub index_pages: Vec<IndexPage>,
     pub chunks: Vec<ChunkLayout>,
+    /// The id the slot's chunks and pages are held under for a transplant
+    /// ([`SchedulerRequest::Transplant`]) until it is taken or released.
+    pub capture: u64,
 }
 
 /// A band's format tag by name.
@@ -57,8 +61,13 @@ pub fn format_name(tag: u8) -> String {
 }
 
 impl Scheduler {
-    /// Describe `slot` as it stands ([`SlotLayout`]).
-    pub(super) fn describe_slot(&self, slot: SequenceId) -> Result<SlotLayout, ConversationError> {
+    /// Describe `slot` as it stands ([`SlotLayout`]), and what was read to
+    /// describe it — its chunks on every layer and its index pages — as a
+    /// [`SlotCapture`] another slot can be given.
+    pub(super) fn describe_slot(
+        &self,
+        slot: SequenceId,
+    ) -> Result<(SlotLayout, SlotCapture), ConversationError> {
         let backings = self.session.backings();
         let mut per_layer = Vec::with_capacity(backings.len());
         for backing in backings.iter() {
@@ -95,27 +104,36 @@ impl Scheduler {
             })
             .collect();
         let depth = self.session.sequence_offset(slot.0).unwrap_or(0);
-        let index_pages = self
+        let pages = self
             .model
             .seal_positional_tail_span(slot.0, depth)
-            .map_err(ConversationError::Model)?
-            .into_iter()
+            .map_err(ConversationError::Model)?;
+        let index_pages = pages
+            .iter()
             .map(|(tokens, page)| {
                 let mut h = DefaultHasher::new();
                 page.hash(&mut h);
                 IndexPage {
-                    tokens,
+                    tokens: *tokens,
                     bytes: page.len(),
                     hash: h.finish(),
                 }
             })
             .collect();
-        Ok(SlotLayout {
+        let layout = SlotLayout {
             depth,
             index_coverage: self.model.positional_coverage(slot.0),
             index_pages,
             chunks,
-        })
+            capture: 0,
+        };
+        Ok((
+            layout,
+            SlotCapture {
+                layers: per_layer,
+                pages,
+            },
+        ))
     }
 }
 

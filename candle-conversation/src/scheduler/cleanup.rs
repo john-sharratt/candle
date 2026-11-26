@@ -378,7 +378,13 @@ impl Scheduler {
                 // A slot asked to be described is described here, where it
                 // holds the prompt and the turn and nothing has been sealed.
                 if let Some(tx) = self.describe_at_seal.remove(&seal_slot) {
-                    let _ = tx.send(self.describe_slot(seal_slot));
+                    let described = self.describe_slot(seal_slot).map(|(mut layout, capture)| {
+                        self.last_capture += 1;
+                        layout.capture = self.last_capture;
+                        self.captures.insert(self.last_capture, capture);
+                        layout
+                    });
+                    let _ = tx.send(described);
                 }
                 if self.ephemeral_slots.contains(&seal_slot) {
                     let bc = self.session.sequence_block_count(seal_slot.0).unwrap_or(0);
