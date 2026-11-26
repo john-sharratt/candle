@@ -1002,6 +1002,24 @@ impl Scheduler {
                 true
             }
 
+            SchedulerRequest::SealPieceIndex {
+                sequence_id,
+                start,
+                response_tx,
+            } => {
+                let _ = response_tx.send(self.seal_piece_index(sequence_id, start));
+                true
+            }
+
+            SchedulerRequest::ReplaceIndex {
+                sequence_id,
+                pages,
+                response_tx,
+            } => {
+                let _ = response_tx.send(self.replace_index(sequence_id, &pages));
+                true
+            }
+
             SchedulerRequest::SealNatively {
                 sequence_id,
                 response_tx,

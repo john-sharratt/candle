@@ -388,6 +388,24 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<SlotLayout, ConversationError>>,
     },
 
+    /// The per-position index `sequence_id` has forwarded from token `start`
+    /// on, sealed as one page without disturbing the live index; `None` for a
+    /// model that keeps none.
+    SealPieceIndex {
+        sequence_id: SequenceId,
+        start: usize,
+        response_tx: Sender<Result<Option<Vec<u8>>, ConversationError>>,
+    },
+
+    /// Replace `sequence_id`'s per-position index with `pages`, pushed in
+    /// order as a projection pushes sections' pages. Replies with the tokens
+    /// the index covers afterwards.
+    ReplaceIndex {
+        sequence_id: SequenceId,
+        pages: Vec<Vec<u8>>,
+        response_tx: Sender<Result<Option<usize>, ConversationError>>,
+    },
+
     /// Leave `sequence_id`'s blocks native in the gap from here on, so the only
     /// quantization its K/V takes is a [`Self::QuantizeSpans`] asked for.
     SealNatively {
@@ -796,6 +814,8 @@ impl SchedulerRequest {
             Self::IngestSection { .. } => "req:ingest_section",
             Self::InstallRecurrentState { .. } => "req:install_recurrent_state",
             Self::DescribeAtSeal { .. } => "req:describe_at_seal",
+            Self::SealPieceIndex { .. } => "req:seal_piece_index",
+            Self::ReplaceIndex { .. } => "req:replace_index",
             Self::SealNatively { .. } => "req:seal_natively",
             Self::QuantizeSpans { .. } => "req:quantize_spans",
             Self::SeedRecurrentFromLineage { .. } => "req:seed_recurrent_from_lineage",

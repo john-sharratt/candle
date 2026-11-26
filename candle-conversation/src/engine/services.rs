@@ -250,11 +250,15 @@ impl ConversationEngine {
     /// as a projection lays sealed sections out — and quantized in place under
     /// its [`SpanQuant`] before `tail`. One piece is the prompt contiguous.
     /// When any piece is quantized the slot is sealed natively first, so the
-    /// gap quantizes none of it and every format is the piece's own.
+    /// gap quantizes none of it and every format is the piece's own. With
+    /// `mirror_index`, each piece's index is sealed as one page after its
+    /// prefill and the slot's index replaced by those pages before `tail` —
+    /// one page per piece, as a projection places sealed sections.
     pub fn infer_raw_token_ids_swapped(
         &self,
         prompt: &[(Vec<u32>, SpanQuant)],
         recurrent_over: Option<Vec<u32>>,
+        mirror_index: bool,
         tail: &[u32],
         max_decode_tokens: usize,
     ) -> crate::Result<RawDecode> {
@@ -272,8 +276,39 @@ impl ConversationEngine {
                     .map_err(|_| ConversationError::SchedulerGone)?;
                 rx.recv().map_err(|_| ConversationError::SchedulerGone)?;
             }
+            let mut pages = Vec::new();
+            let mut at = 0;
             for (tokens, _) in prompt.iter().filter(|(t, _)| !t.is_empty()) {
                 self.raw_turn(sequence_id, tokens, 0)?;
+                if mirror_index {
+                    let (tx, rx) = flume::bounded(1);
+                    self.core
+                        .scheduler_tx
+                        .send(SchedulerRequest::SealPieceIndex {
+                            sequence_id,
+                            start: at,
+                            response_tx: tx,
+                        })
+                        .map_err(|_| ConversationError::SchedulerGone)?;
+                    if let Some(page) =
+                        rx.recv().map_err(|_| ConversationError::SchedulerGone)??
+                    {
+                        pages.push(page);
+                    }
+                }
+                at += tokens.len();
+            }
+            if mirror_index {
+                let (tx, rx) = flume::bounded(1);
+                self.core
+                    .scheduler_tx
+                    .send(SchedulerRequest::ReplaceIndex {
+                        sequence_id,
+                        pages,
+                        response_tx: tx,
+                    })
+                    .map_err(|_| ConversationError::SchedulerGone)?;
+                rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
             }
             if quantizes {
                 let spans = prompt

@@ -42,16 +42,20 @@ use candle_conversation::projection::{
     TOOLS_ENABLED_SELECTOR,
 };
 use candle_conversation::stencil::TriggerRegistry;
-use candle_conversation::{PieceKind, PromptDump, SpanQuant};
+use candle_conversation::{format_name, ChunkLayout, PieceKind, PromptDump, SlotLayout, SpanQuant};
 use candle_conversation::{SamplingConfig, TurnOptions};
 use serde::{Deserialize, Serialize};
 
-use super::sealed_fresh_layout::{compare, LayoutComparison};
+use super::sealed_fresh_layout::{compare, piece_chunks, LayoutComparison};
 use super::ZendSession;
 use crate::files::records;
 
 /// The most tokens either side decodes.
 pub const MAX_TOKENS: usize = 512;
+
+/// The level a collection member's K/V is sealed at
+/// (`Scheduler::section_compression_policy_member`).
+const MEMBER_LEVEL: u8 = 4;
 
 /// What to decode.
 #[derive(Debug, Clone, Deserialize)]
@@ -96,18 +100,67 @@ pub enum Layout {
     /// glue in its own chunks, ending in its own partial chunk — as a
     /// projection lays sealed sections out.
     Spans,
+    /// [`Layout::Spans`], mirroring the sealed side: each piece quantized
+    /// under the policy its sealed counterpart shows — a boundary section's
+    /// Q8, where every band the sealed side holds for it is `Q8_KS` K and
+    /// `Q8_0` V, else a member's level — and the index rebuilt as one page per
+    /// piece, as a projection places them.
+    Mirror,
+}
+
+/// A boundary section's formats: every K band `Q8_KS`, every V band `Q8_0`.
+fn is_boundary(chunks: &[ChunkLayout]) -> bool {
+    let all = |side: fn(&ChunkLayout) -> &Vec<Vec<u8>>, name: &str| {
+        chunks
+            .iter()
+            .flat_map(|c| side(c).iter().flatten())
+            .all(|&t| format_name(t) == name)
+    };
+    !chunks.is_empty() && all(|c| &c.k, "Q8_KS") && all(|c| &c.v, "Q8_0")
 }
 
 /// The fresh side's prompt as the pieces it is prefilled in, each with the
-/// policy it is quantized under.
+/// policy it is quantized under. [`Layout::Mirror`] reads each piece's policy
+/// off `sealed`, the sealed side's slot; a section it cannot place there takes
+/// the member level.
 fn fresh_pieces(
     dump: &PromptDump,
     layout: Layout,
     level: Option<u8>,
+    sealed: &SlotLayout,
 ) -> Vec<(Vec<u32>, SpanQuant)> {
     let section = level.map_or(SpanQuant::Native, SpanQuant::Level);
     match layout {
         Layout::Contiguous => vec![(dump.token_ids.clone(), section)],
+        Layout::Mirror => {
+            let member = SpanQuant::Level(level.unwrap_or(MEMBER_LEVEL));
+            let pieces: Vec<_> = dump
+                .pieces
+                .iter()
+                .filter(|p| !p.token_ids.is_empty())
+                .collect();
+            let tokens: Vec<usize> = pieces.iter().map(|p| p.token_ids.len()).collect();
+            let cut = piece_chunks(&sealed.chunks, &tokens).ok();
+            pieces
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let quant = match (&p.kind, &cut) {
+                        (PieceKind::Section, Some(cut)) => {
+                            let (a, b) = cut[i];
+                            if is_boundary(&sealed.chunks[a..b]) {
+                                SpanQuant::Boundary
+                            } else {
+                                member
+                            }
+                        }
+                        (PieceKind::Section, None) => member,
+                        _ => SpanQuant::Session,
+                    };
+                    (p.token_ids.clone(), quant)
+                })
+                .collect()
+        }
         Layout::Spans => dump
             .pieces
             .iter()
@@ -318,8 +371,9 @@ impl ZendSession {
                 engine.infer_raw_token_ids(&prompt, req.n)
             } else {
                 engine.infer_raw_token_ids_swapped(
-                    &fresh_pieces(&dump, req.fresh_layout, req.fresh_quantize),
+                    &fresh_pieces(&dump, req.fresh_layout, req.fresh_quantize, &sealed_layout),
                     recurrent_over,
+                    req.fresh_layout == Layout::Mirror,
                     &turn[..user_half],
                     req.n,
                 )
@@ -361,6 +415,7 @@ impl ZendSession {
 #[cfg(test)]
 mod tests {
     use candle_conversation::{PieceKind, PromptPiece};
+    use candle_nn::kv_cache::ArenaFormatTag;
 
     use super::*;
 
@@ -454,8 +509,9 @@ mod tests {
             pieces,
             text: String::new(),
         };
+        let none = layout_of(Vec::new());
         assert_eq!(
-            fresh_pieces(&dump, Layout::Spans, Some(4)),
+            fresh_pieces(&dump, Layout::Spans, Some(4), &none),
             vec![
                 (vec![10, 11], SpanQuant::Level(4)),
                 (vec![20], SpanQuant::Session),
@@ -463,12 +519,67 @@ mod tests {
             ]
         );
         assert_eq!(
-            fresh_pieces(&dump, Layout::Contiguous, Some(4)),
+            fresh_pieces(&dump, Layout::Contiguous, Some(4), &none),
             vec![(vec![10, 11, 20, 30, 31], SpanQuant::Level(4))]
         );
-        assert!(fresh_pieces(&dump, Layout::Spans, None)
+        assert!(fresh_pieces(&dump, Layout::Spans, None, &none)
             .iter()
             .all(|(_, q)| *q == SpanQuant::Native));
+    }
+
+    fn layout_of(chunks: Vec<ChunkLayout>) -> SlotLayout {
+        SlotLayout {
+            depth: 0,
+            index_coverage: None,
+            index_pages: Vec::new(),
+            chunks,
+        }
+    }
+
+    fn sealed_chunk(tokens: u16, k: ArenaFormatTag, v: ArenaFormatTag) -> ChunkLayout {
+        ChunkLayout {
+            offset: 0,
+            tokens,
+            k: vec![vec![k.as_u8(); 2]],
+            v: vec![vec![v.as_u8(); 2]],
+            layers_agree: true,
+        }
+    }
+
+    /// **Mirrored, each section takes the policy its sealed counterpart
+    /// shows**: Q8 where every band is `Q8_KS` K and `Q8_0` V, the member level
+    /// where any band is adaptive, and glue the session's.
+    #[test]
+    fn a_mirrored_piece_takes_its_sealed_counterparts_policy() {
+        let dump = PromptDump {
+            token_ids: vec![10, 11, 20, 30, 31],
+            token_count: 5,
+            pieces: vec![
+                piece(Some(1), vec![10, 11]),
+                piece(None, vec![20]),
+                piece(Some(7), vec![30, 31]),
+            ],
+            text: String::new(),
+        };
+        let sealed = layout_of(vec![
+            sealed_chunk(2, ArenaFormatTag::Q8_KS, ArenaFormatTag::Q8_0),
+            sealed_chunk(1, ArenaFormatTag::Q4_0, ArenaFormatTag::Q3_1),
+            ChunkLayout {
+                k: vec![vec![
+                    ArenaFormatTag::Q8_KS.as_u8(),
+                    ArenaFormatTag::Q5_1.as_u8(),
+                ]],
+                ..sealed_chunk(2, ArenaFormatTag::Q8_KS, ArenaFormatTag::Q8_0)
+            },
+        ]);
+        assert_eq!(
+            fresh_pieces(&dump, Layout::Mirror, None, &sealed),
+            vec![
+                (vec![10, 11], SpanQuant::Boundary),
+                (vec![20], SpanQuant::Session),
+                (vec![30, 31], SpanQuant::Level(MEMBER_LEVEL)),
+            ]
+        );
     }
 
     /// The sealed side runs with tools off and its opening its only
