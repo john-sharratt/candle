@@ -658,6 +658,7 @@ impl Scheduler {
                 self.ephemeral_slots.remove(&sequence_id);
                 self.slot_bands.remove(&sequence_id);
                 self.ephemeral_sigs.remove(&sequence_id);
+                self.describe_at_seal.remove(&sequence_id);
                 self.carried_beliefs.remove(&sequence_id);
                 self.slot_tokens.remove(&sequence_id);
                 self.request_laps.lap("slot_maps");
@@ -990,6 +991,14 @@ impl Scheduler {
                     None => Ok(installed),
                 };
                 let _ = response_tx.send(result);
+                true
+            }
+
+            SchedulerRequest::DescribeAtSeal {
+                sequence_id,
+                response_tx,
+            } => {
+                self.describe_at_seal.insert(sequence_id, response_tx);
                 true
             }
 

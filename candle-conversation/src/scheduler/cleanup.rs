@@ -375,6 +375,11 @@ impl Scheduler {
                 // warm wide-Q here, where the blocks are guaranteed present (the
                 // same point a real seal gathers), and stash it for the probe's
                 // `ProbeWideSigs` to drain. The turn seals nothing (`SealAction::None`).
+                // A slot asked to be described is described here, where it
+                // holds the prompt and the turn and nothing has been sealed.
+                if let Some(tx) = self.describe_at_seal.remove(&seal_slot) {
+                    let _ = tx.send(self.describe_slot(seal_slot));
+                }
                 if self.ephemeral_slots.contains(&seal_slot) {
                     let bc = self.session.sequence_block_count(seal_slot.0).unwrap_or(0);
                     let sigs = self.gather_wide_sigs(seal_slot, (seal_block_from, bc));

@@ -11,7 +11,7 @@
 use super::*;
 use crate::conversation::run_state;
 use crate::scheduler::exported_state::SharedState;
-use crate::SpanQuant;
+use crate::{SlotLayout, SpanQuant};
 
 /// Live progress of the startup substrate reload (redo-log replay), shared
 /// between the scheduler thread (writer) and the daemon's load-state machine
@@ -315,7 +315,14 @@ impl ConversationEngine {
                     .map_err(|_| ConversationError::SchedulerGone)?;
                 rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
             }
-            self.raw_turn(sequence_id, tail, max_decode_tokens)
+            let described = self.describe_at_seal(sequence_id)?;
+            let mut decoded = self.raw_turn(sequence_id, tail, max_decode_tokens)?;
+            decoded.layout = Some(
+                described
+                    .recv()
+                    .map_err(|_| ConversationError::SchedulerGone)??,
+            );
+            Ok(decoded)
         })();
         let _ = self
             .core
@@ -337,6 +344,25 @@ impl ConversationEngine {
             .scheduler_tx
             .send(SchedulerRequest::FreeSequence { sequence_id });
         out
+    }
+
+    /// Ask for `sequence_id` to be described at its next turn's end, before
+    /// its seal: the K/V chunks on every layer and the index pages the turn's
+    /// last forward read ([`SlotLayout`]). The description arrives on the
+    /// returned channel ahead of the turn's `Done`.
+    pub fn describe_at_seal(
+        &self,
+        sequence_id: SequenceId,
+    ) -> crate::Result<flume::Receiver<Result<SlotLayout, ConversationError>>> {
+        let (tx, rx) = flume::bounded(1);
+        self.core
+            .scheduler_tx
+            .send(SchedulerRequest::DescribeAtSeal {
+                sequence_id,
+                response_tx: tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        Ok(rx)
     }
 
     /// A fresh slot bound to nothing: no projection, no substrate write.
@@ -434,6 +460,7 @@ impl ConversationEngine {
             tokens: collected,
             text: text_from_done,
             finish,
+            layout: None,
         })
     }
 

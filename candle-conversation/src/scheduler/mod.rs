@@ -617,6 +617,11 @@ pub(crate) struct Scheduler {
     /// `FreeSequence`.
     ephemeral_sigs: HashMap<SequenceId, Vec<WideQSig>>,
 
+    /// Slots to describe at their next turn's end, before the seal
+    /// ([`SchedulerRequest::DescribeAtSeal`]), each with where the description
+    /// goes. Taken when the turn ends; dropped on `FreeSequence`.
+    describe_at_seal: HashMap<SequenceId, Sender<Result<SlotLayout, ConversationError>>>,
+
     /// **Diagnostic**: per-slot record of every token that has been
     /// committed to the slot's K/V — in the exact order it landed
     /// in the kernel's view.  Updated by every write path:
@@ -1120,6 +1125,8 @@ mod handle_request_now;
 mod perform_seal;
 mod quantize_slot;
 pub use quantize_slot::SpanQuant;
+mod slot_layout;
+pub use slot_layout::{format_name, ChunkLayout, IndexPage, SlotLayout};
 mod seal_turn;
 mod section_finish;
 mod sections;

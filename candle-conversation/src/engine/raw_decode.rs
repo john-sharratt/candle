@@ -1,7 +1,7 @@
 //! What a raw turn decoded: its ids, the text it finished with, and why it
 //! stopped.
 
-use crate::FinishReason;
+use crate::{FinishReason, SlotLayout};
 
 /// One raw turn's decode: what `ConversationEngine::infer_raw_token_ids`
 /// answers.
@@ -13,4 +13,6 @@ pub struct RawDecode {
     pub text: Option<String>,
     /// Why it stopped; `None` when it never finished.
     pub finish: Option<FinishReason>,
+    /// The slot at the decoding turn's end, when it was asked for.
+    pub layout: Option<SlotLayout>,
 }

@@ -379,6 +379,15 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<bool, ConversationError>>,
     },
 
+    /// Describe `sequence_id` at its next turn's end — its K/V chunks on every
+    /// layer and its index pages, after the view is finalized and before the
+    /// seal ([`SlotLayout`]) — and send it on `response_tx` ahead of the turn's
+    /// `Done`.
+    DescribeAtSeal {
+        sequence_id: SequenceId,
+        response_tx: Sender<Result<SlotLayout, ConversationError>>,
+    },
+
     /// Leave `sequence_id`'s blocks native in the gap from here on, so the only
     /// quantization its K/V takes is a [`Self::QuantizeSpans`] asked for.
     SealNatively {
@@ -786,6 +795,7 @@ impl SchedulerRequest {
             Self::ArenaGroups { .. } => "req:arena_groups",
             Self::IngestSection { .. } => "req:ingest_section",
             Self::InstallRecurrentState { .. } => "req:install_recurrent_state",
+            Self::DescribeAtSeal { .. } => "req:describe_at_seal",
             Self::SealNatively { .. } => "req:seal_natively",
             Self::QuantizeSpans { .. } => "req:quantize_spans",
             Self::SeedRecurrentFromLineage { .. } => "req:seed_recurrent_from_lineage",

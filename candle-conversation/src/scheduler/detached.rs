@@ -118,6 +118,7 @@ impl SchedulerRequest {
             | Self::SeedRecurrentFromLineage { sequence_id, .. }
             | Self::MemoryCatchUp { sequence_id, .. }
             | Self::ExtractRawKvq { sequence_id, .. }
+            | Self::DescribeAtSeal { sequence_id, .. }
             | Self::SealNatively { sequence_id, .. }
             | Self::QuantizeSpans { sequence_id, .. }
             | Self::ProbeWideSigs { sequence_id, .. }
@@ -183,6 +184,7 @@ impl SchedulerRequest {
             | Self::MemoryCatchUp { .. }
             | Self::BranchCheckpointPass { .. }
             | Self::ExtractRawKvq { .. }
+            | Self::DescribeAtSeal { .. }
             | Self::SealNatively { .. }
             | Self::QuantizeSpans { .. }
             | Self::ProbeWideSigs { .. }

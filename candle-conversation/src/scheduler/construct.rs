@@ -233,6 +233,7 @@ impl Scheduler {
             ephemeral_slots: std::collections::HashSet::new(),
             slot_bands: HashMap::new(),
             ephemeral_sigs: HashMap::new(),
+            describe_at_seal: HashMap::new(),
             turn_views: HashMap::new(),
             turn_groups: HashMap::new(),
             next_turn_group: 0,

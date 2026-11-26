@@ -46,6 +46,7 @@ use candle_conversation::{PieceKind, PromptDump, SpanQuant};
 use candle_conversation::{SamplingConfig, TurnOptions};
 use serde::{Deserialize, Serialize};
 
+use super::sealed_fresh_layout::{compare, LayoutComparison};
 use super::ZendSession;
 use crate::files::records;
 
@@ -180,6 +181,9 @@ pub struct SealedFresh {
     pub fresh_decoded: usize,
     pub sealed_finish: String,
     pub fresh_finish: String,
+    /// The two slots' layouts compared piece by piece, when the fresh side
+    /// ran in pieces it could be described in.
+    pub layout: Option<LayoutComparison>,
 }
 
 /// The first index where `a` and `b` differ, within the shorter; `None` when
@@ -277,12 +281,19 @@ impl ZendSession {
                 triggers: Arc::new(TriggerRegistry::new()),
                 ..Default::default()
             };
+            let sealed_described = engine
+                .describe_at_seal(conv.id())
+                .map_err(|e| anyhow::anyhow!("describing the sealed slot: {e}"))?;
             let handle = conv
                 .submit_turn_with_options(req.question.clone(), options)
                 .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
             let resp = handle
                 .wait()
                 .map_err(|e| anyhow::anyhow!("the sealed decode: {e}"))?;
+            let sealed_layout = sealed_described
+                .recv()
+                .context("the sealed slot's description")?
+                .map_err(|e| anyhow::anyhow!("describing the sealed slot: {e}"))?;
             conv.finish_turn(handle, &resp)
                 .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
             let turn = engine
@@ -315,6 +326,10 @@ impl ZendSession {
             }
             .map_err(|e| anyhow::anyhow!("the fresh decode: {e}"))?;
             let fresh_finish = fresh.finish.map_or("none".into(), |f| format!("{f:?}"));
+            let layout = fresh
+                .layout
+                .as_ref()
+                .map(|f| compare(&dump, &sealed_layout, f));
             let fresh = fresh.tokens;
             let decode = |ids: &[u32]| engine.tokenizer().decode(ids, false).unwrap_or_default();
             let at = first_divergence(&sealed, &fresh);
@@ -335,6 +350,7 @@ impl ZendSession {
                 fresh_decoded: fresh.len(),
                 sealed_finish: format!("{:?}", resp.stats.finish),
                 fresh_finish,
+                layout,
             })
         })();
         let _ = engine.tombstone_timeline(timeline);
