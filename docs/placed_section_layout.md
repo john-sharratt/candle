@@ -58,8 +58,9 @@ relative positions.
 - The recurrent (DeltaNet) layers. They have no positions and never run over
   placed sections (`provenance_system_collection.md` §8, D8); nothing here
   changes that. The gap it leaves is §6.
-- Turns of the dialogue. Their order carries meaning; this is for the
-  knowledge base's members.
+- Re-ranking content whose order carries meaning. The dialogue's turns and
+  the conversation's journal are laid out in the order they were born, never
+  by relevance (§3.7).
 
 ## 3. The design
 
@@ -70,11 +71,12 @@ Every placed section of the system prompt — the **tools** section and the
 `[B, B + R)`, the same in every layer. The prompt between two ranges keeps
 fixed positions, and so does everything after the last one (`system_close`,
 the user turn, the decode), which starts at the top of the last range
-whatever the sections hold. With the two regions in schema order:
+whatever the sections hold. With the regions in schema order (the journal's
+range is birth-ordered, §3.7):
 
 ```
-| system prompt … tools_open | tools range | tools_close … files_open, seed | files range | system_close, user, decode →
-0                            B_t      B_t+R_t                              B_f      B_f+R_f
+| persona, grounding | journal range | tools range | tools_close … files_open, seed | files range | system_close | dialogue (window, then the request) →
+0                    B_j       B_j+R_j B_t   B_t+R_t                              B_f    B_f+R_f
 ```
 
 A section fills its range **from the top down**: the first member placed
@@ -217,7 +219,95 @@ The room the dialogue's fill has is the slot less the system prompt **with its
 ranges at full size**, so the dialogue's share never depends on what the
 sections hold.
 
-### 3.6 Models without a QSA index
+### 3.6 Two orders: by relevance and by birth
+
+Every piece of provenance the projection places falls under one of two
+rules. Both give it a fixed range of positions during a request; they differ
+in how the range fills and when anything leaves.
+
+| Rule | Order | Fills | Changes | Leaves |
+|---|---|---|---|---|
+| **By relevance** (§3.1–§3.5) | When it came into scope | Top down, each new member in front | At any reprojection boundary, mid-request included | At a boundary, leaving a hole |
+| **By birth** (§3.7) | When it was written | Bottom up, each new piece after the newest | Appends only, during a request | Only between requests, the oldest first |
+
+What every piece of provenance is, today and under this design:
+
+| Provenance | Where it sits | Today | Rule |
+|---|---|---|---|
+| Tools | System prompt, `tools` collection | Belief selection, 1–5 signatures, re-chosen at boundaries | Relevance; projection in tokens (§3.5) |
+| Knowledge base: readings, folders, guides, journal notes | System prompt, `files` collection (`provenance_system_collection.md` §4, D19) | Pool → fill under the kind shares | Relevance |
+| The seed | System prompt, before the `files` range | Sealed once, before the files (§6.2b) | Neither: fixed prompt below the range |
+| The conversation's journal | System prompt, `journal` collection (pinned), after the grounding and before the tools | A chain of sealed sections; a new entry joins at the next round's head, mid-request included; a fold or a forgotten entry reseals everything after it (`docs/zend_journal.md` §4) | **Birth** |
+| The dialogue's turns, with its inherited lineage | After `system_close` | Floors, then rounds by score; re-chosen at every boundary, mid-reply included, and the slot renumbered under the reply (`docs/hit_driven_projection.md` §7.2 steps 4–5, §7.3) | **Birth** |
+
+Journal *notes* are files of the knowledge base, chosen by relevance among
+every journal the workspace holds. Notes from many journals do not share one
+order of birth, and a note entering mid-request older than one already placed
+would have to be inserted between placed members, which moves them. They
+stay under relevance, with their recency weight (`half_life_days: 30`) in
+their score.
+
+### 3.7 Birth-ordered regions: a window, append at the end, prune between requests
+
+A **request** is the user's turn and every tool round it takes, until a reply
+ends without a call (`docs/zend_journal.md` §6). The rule for the journal and
+the dialogue is stated in requests, not in boundaries:
+
+- **The window is the budget.** Each birth-ordered region has a window in
+  tokens. At a request's start it holds the newest pieces that fit, in birth
+  order; older pieces have dropped out of the far end. For the dialogue the
+  inherited lineage is its floor, ahead of the window, and never drops (as
+  `select_conversation` keeps it today).
+- **During a request nothing leaves and nothing moves.** New pieces — the
+  request's turns as they seal, the journal's new entries — are appended after
+  the newest at the next positions. No turn is shed, no round is re-chosen by
+  score, the slot is not renumbered under the reply, and the journal is not
+  folded. Every relative position a decoded token was formed against holds
+  until the request ends.
+- **Growth burns the reserve first, then a YaRN rung.** A request that grows
+  past its window takes positions from the native context held in reserve for
+  it (a small request ends there, on rung 1). One that passes even that — a
+  read-heavy request, a long agent loop — runs on past `L0` on the rung its
+  reach needs (`docs/progressive_yarn.md` §8), as one exchange whose floors
+  pass the slot does today. The rung changes as the reach crosses it; that is
+  the one change of rotation a request can see, and only an extreme one sees
+  it.
+- **Between requests the region is pruned and re-seated.** Once a request
+  ends, and before the next is prefilled, the oldest pieces drop until the
+  region fits its window again, and the region is re-seated at the bottom of
+  its range. Keys and index rows are stored un-rotated, so re-seating rewrites
+  nothing (`hit_driven_projection.md` §4). The next request prefills against a
+  stable layout, on rung 1 again. The journal's folds and forgotten entries,
+  which reseal everything after them, run here too.
+- **A turn is read where it was written.** Within a request every turn keeps
+  the position it was computed at, so the dialogue's own K/V is read exactly
+  as computed. A prune between requests shifts the survivors down together,
+  which keeps their positions relative to one another.
+
+The regions and their ranges:
+
+- **The journal** has its own range in the system prompt, between the
+  grounding and the tools range, so its growth never moves what follows it:
+  its window (`pin_tokens`, 1,024, bounds what is pinned of it) plus a
+  request's reserve of entries. It fills from the bottom, as its chain is
+  sealed: each entry is sealed as the continuation of the ones before it at
+  the next position, so the range holds the chain exactly as it was computed.
+  An entry a request writes past the range's reserve waits for the next
+  request's prune; the turns it was written from are in the dialogue until
+  then.
+- **The dialogue** is the last region and has no range above it: it grows
+  into the slot. Its window is its share of the room; the rest of the slot
+  above the ranges and the window is the request's reserve.
+
+This replaces, for the dialogue, the per-boundary fill of its rounds by score
+and the renumbering under a reply in progress (`hit_driven_projection.md`
+§7.2 steps 4–5, §7.3), and makes `reserve_tokens` a request's reserve rather
+than one cadence's append (§4). Older turns are reached through the journal:
+every entry carries the turns it was written from (`journal_read`,
+`zend_journal.md` §4.1). Those sections of `hit_driven_projection.md` are
+amended when this is built.
+
+### 3.8 Models without a QSA index
 
 A model whose attention reads every position has no index rows, no selection
 and no shadow scan, so it has no index stage to reduce through:
@@ -232,6 +322,9 @@ and no shadow scan, so it has no index stage to reduce through:
   every model has. Per-layer scope (§3.3) does not apply — without a
   per-layer selection there is no per-layer evidence — so every layer holds
   the same members.
+- the birth-ordered regions (§3.7) apply unchanged: the window, appending
+  during a request, the reserve, a rung past it, and pruning between
+  requests.
 
 ## 4. Engine changes
 
@@ -353,6 +446,13 @@ files; one question needing two files).
    holds; nothing placed moves within a turn (asserted from the per-boundary
    placement record); a member re-entering from the resident set is placed at
    the boundary it is chosen, not one later.
+3b. **Birth-ordered regions** (§3.7): the journal's range, the dialogue's
+   window, appending only within a request, the reserve and the rung past it,
+   pruning and re-seating between requests. *Gate:* asserted from the
+   per-boundary placement record that no dialogue turn or journal entry
+   leaves or moves within a request, on a multi-round agent request; a
+   request that passes the reserve runs on the next rung and the following
+   request starts on rung 1; the needle and multi-file cases hold.
 4. **Per-layer scope** (§3.3, §4.3). *Gate:* per-layer placement records; the
    needle and multi-file cases hold or improve against stage 3.
 5. **On the device** (§4.4). *Gate:* no readback on the per-token path
