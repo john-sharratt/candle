@@ -200,6 +200,7 @@
 
 pub mod adaptive;
 mod belief_files;
+mod belief_members;
 mod belief_scan_split;
 mod builder;
 mod chunk_exclusion;
@@ -207,6 +208,7 @@ mod cold_to_warm;
 pub mod dialogue_fill;
 mod error;
 pub(crate) mod event;
+mod files_kinds;
 pub mod fill;
 mod fill_report;
 mod group_assembly;

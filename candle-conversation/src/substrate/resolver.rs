@@ -9,6 +9,7 @@
 //! back to none silently filled no dialogue slot.
 
 use super::*;
+use crate::files::FileRecord;
 
 // ── ContentResolver trait ─────────────────────────────────────────────────────
 
@@ -276,6 +277,23 @@ pub trait ContentResolver {
     /// (`docs/hit_driven_projection.md` §7.2 step 5). `None` for a target
     /// with no working set, whose fill is chosen whole. Default `None`.
     fn working_set_boundary(&self) -> Option<SlotBoundary> {
+        None
+    }
+
+    /// The target's working set of the knowledge base's files
+    /// (`docs/provenance_system_collection.md` §4). Default `None`.
+    fn files_set(&self) -> Option<FilesSet> {
+        None
+    }
+
+    /// Every live file record of the knowledge base. Default none.
+    fn files_records(&self) -> Vec<FileRecord> {
+        Vec::new()
+    }
+
+    /// The section of the knowledge base's member registered as `name`
+    /// (`files::names`), when this process holds it. Default `None`.
+    fn member_section(&self, _name: &str) -> Option<SectionId> {
         None
     }
 

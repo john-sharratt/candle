@@ -8,6 +8,7 @@
 //! belief scan scores, so a rule ranks the unit provenance voted on.
 
 use super::*;
+use crate::files::{files_owner, FileRecord, FilesSet, FILES_PREFIX};
 
 // ── TargetedRead ──────────────────────────────────────────────────────────────
 
@@ -308,6 +309,22 @@ impl<'a> ContentResolver for TargetedRead<'a> {
     /// What the target's slot holds and whether a new question opened this
     /// boundary, as its working set recorded them at the scan
     /// (`WorkingSet::boundary`).
+    fn files_set(&self) -> Option<FilesSet> {
+        self.read.files_set_of(self.target.timeline).cloned()
+    }
+
+    fn files_records(&self) -> Vec<FileRecord> {
+        self.read
+            .custom_objects_under(FILES_PREFIX)
+            .into_iter()
+            .filter_map(|(obj, _)| FileRecord::from_object(&obj))
+            .collect()
+    }
+
+    fn member_section(&self, name: &str) -> Option<SectionId> {
+        self.read.owned_section_named(files_owner(), name)
+    }
+
     fn working_set_boundary(&self) -> Option<SlotBoundary> {
         let ws = self.read.working_set(self.target.timeline)?;
         Some(SlotBoundary {

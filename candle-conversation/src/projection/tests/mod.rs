@@ -42,6 +42,7 @@ use super::project::{
     OptionalState, ProjectionMode, ProjectionTarget, SelectionState, TOOL_ROUND_SELECTOR,
 };
 use super::schema::{Content, CorruptTurnPolicy, DecodePriority, GatherScope, SelectionRule};
+use crate::files::{FileRecord, FilesSet};
 use crate::substrate::ContentResolver;
 use crate::summary_tree::exchange::{exchanges, over_normals};
 use crate::summary_tree::{SelectionOrigin, TurnKind};
@@ -94,6 +95,12 @@ struct MockResolver {
     inherited: HashMap<u32, Vec<TurnKey>>,
     /// The timelines `seed_timelines` reports.
     seed: HashSet<TimelineId>,
+    /// The target's files set, `files_set` reports.
+    files: Option<FilesSet>,
+    /// The knowledge base's file records.
+    file_records: Vec<FileRecord>,
+    /// Each member's section by the name it is registered under.
+    members: HashMap<String, SectionId>,
 }
 
 impl MockResolver {
@@ -230,6 +237,18 @@ impl MockResolver {
 impl ContentResolver for MockResolver {
     fn trained_window(&self) -> Option<usize> {
         None
+    }
+
+    fn files_set(&self) -> Option<FilesSet> {
+        self.files.clone()
+    }
+
+    fn files_records(&self) -> Vec<FileRecord> {
+        self.file_records.clone()
+    }
+
+    fn member_section(&self, name: &str) -> Option<SectionId> {
+        self.members.get(name).copied()
     }
 
     fn target_is_ingest_self(&self) -> bool {
@@ -441,6 +460,7 @@ mod tests_dialect_sections;
 mod tests_dialect_templates;
 mod tests_exchange_and_dedup;
 mod tests_faces_and_ingest;
+mod tests_files_splice;
 mod tests_layers_and_scores;
 #[cfg(test)]
 mod tests_optional_groups;

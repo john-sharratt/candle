@@ -397,6 +397,7 @@ impl Substrate {
         for (_, ws) in self.working_sets.iter_mut() {
             Arc::make_mut(ws).remove(timeline);
         }
+        self.forget_files_set(timeline);
         // A tombstoned timeline's KV is dead — release its resident VRAM now.
         let residences: Vec<ResidenceIndex> = match self.timelines.get(&timeline) {
             Some(entry) => entry.turns.values().map(|t| t.content.residence).collect(),

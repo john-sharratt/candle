@@ -38,6 +38,8 @@ pub fn run<R: ContentResolver>(
     )
 }
 
+mod files_splice;
 mod sink;
 
+pub(crate) use files_splice::files_splice;
 pub use sink::*;

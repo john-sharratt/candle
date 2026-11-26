@@ -317,6 +317,7 @@ impl Default for Conversation {
 }
 
 mod belief_collections;
+mod belief_files_kinds;
 mod belief_gallery;
 mod belief_groups;
 mod belief_scoring;

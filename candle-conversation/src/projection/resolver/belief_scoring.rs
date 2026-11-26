@@ -203,6 +203,24 @@ impl Conversation {
                 arena,
             ));
         }
+        // The knowledge base's files, kind by kind — the working-set groups'
+        // policies, each file one case — folded into the target's files set,
+        // whose momentum the fill places from (docs/provenance_system_collection.md
+        // §4). A focused projection carries no knowledge base.
+        if let (false, Some(cfg)) = (schema.focus, working_set_config(schema, target)) {
+            let kinds: Vec<&GroupSchema> = schema
+                .layers
+                .iter()
+                .flat_map(|l| l.groups.iter())
+                .filter(|g| g.is_working_set())
+                .collect();
+            if !kinds.is_empty() {
+                let fresh = self.score_belief_files(&kinds, probe, probe_q, observe, arena);
+                self.update(|s| {
+                    s.files_observe(target.timeline, &fresh, cfg.beta, cfg.min_momentum)
+                });
+            }
+        }
         // Phase split for the reproject `scan_ms`: which side of the scan the
         // time went to (the collection scan vs the per-layer group scans), and
         // within the groups which phase — so a silent GPU→CPU fallback, a

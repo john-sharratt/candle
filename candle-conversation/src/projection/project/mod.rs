@@ -24,6 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use candle::engine_events::note;
 
+use crate::files::FileKey;
+
 use super::adaptive::AnchorMember;
 use super::dialogue_fill::{self, ContextExchange, DialogueSlot, WorkingPiece};
 use super::fill::{minimum_cap, reading_piece_cap, Caps, Kind};
@@ -147,6 +149,10 @@ pub struct Projection {
     /// The strongest conversations the scan scored that the pool does not
     /// hold.
     pub unpooled: Vec<Unpooled>,
+    /// The knowledge base's files this projection placed, in the order they
+    /// sit (`docs/provenance_system_collection.md` §3): what the target's
+    /// files set keeps as its placed order once the projection is applied.
+    pub files_placed: Vec<FileKey>,
 }
 
 /// One section-tree selector as resolved for a projection — the selector id and

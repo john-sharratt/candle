@@ -42,6 +42,7 @@ mod dominance;
 mod ended_sections;
 mod faces;
 mod file_gallery;
+mod files_sets;
 pub mod gauge;
 mod group_epoch;
 pub mod kv_census;
@@ -74,6 +75,7 @@ use std::sync::Arc;
 use crate::conversation::{
     is_shared_stream_name, window_sealed_tokens, SHARED_SECTION_NAME_PREFIX,
 };
+use crate::files::FilesSet;
 use crate::index_pages::{self, StoredPages};
 use crate::normalization::Phase;
 use crate::persistence::blob::{retired_blob, BlobKey};
@@ -255,6 +257,12 @@ pub struct Substrate {
     /// from the marks on the dialogue's own turns and the momentum from the
     /// belief scan.
     working_sets: PMap<TimelineId, Arc<WorkingSet>>,
+
+    /// Per dialogue, its working set of the knowledge base's files: each
+    /// file's momentum and the order the placed files keep
+    /// (`docs/provenance_system_collection.md` §4). In-memory only, rebuilt
+    /// from the belief scan as the working sets are.
+    files_sets: PMap<TimelineId, Arc<FilesSet>>,
 
     /// Each calibrated conversation's calibrations, by the timeline each
     /// names under [`Self::CALIBRATES_KEY`] — kept as that metadata is applied,

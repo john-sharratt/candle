@@ -11,6 +11,9 @@
 
 use super::*;
 
+/// The system-prompt section the knowledge base's files are spliced after.
+const FILES_OPEN_SECTION: &str = "files_open";
+
 /// The fill kind a working-set group's members count toward.
 fn share_kind(share: Option<WorkingSetShare>) -> Kind {
     match share {
@@ -731,6 +734,59 @@ pub fn run_with_sink<R: ContentResolver>(
     );
     mark_pins(&schema.system_prompt, resolver, &mut system_prompt_segments);
 
+    // ── Step 8b: The knowledge base — the files the target's files set holds,
+    // each kind under its share of the room, spliced after `files_open`
+    // (docs/provenance_system_collection.md §3, §4). Before any turn group is
+    // weighed, so an opening, which has none yet, places them too. The fill
+    // below counts the system prompt without them: the kinds' caps and the
+    // dialogue's share are shares of one room.
+    let mut files_placed: Vec<FileKey> = Vec::new();
+    let mut files_tokens = 0usize;
+    let knowledge_base = schema
+        .layers
+        .iter()
+        .find(|l| l.id == target.layer)
+        .and_then(|l| l.working_set.as_ref())
+        .zip(resolver.trained_window())
+        .filter(|_| !schema.focus);
+    let files_open = schema
+        .system_prompt
+        .items
+        .iter()
+        .find_map(|item| match item {
+            SystemPromptItem::Section(s) if s.name == FILES_OPEN_SECTION => Some(s.id),
+            _ => None,
+        });
+    if let (Some((ws, trained)), Some(files_open)) = (knowledge_base, files_open) {
+        let room = ws
+            .slot_window(trained)
+            .window
+            .saturating_sub(ws.reserve_tokens)
+            .saturating_sub(segment_tokens(&system_prompt_segments, resolver))
+            .saturating_sub(decode_pos.unwrap_or(0));
+        let shares = ws.fill_shares.caps(room);
+        let kind_cap = |share: WorkingSetShare| {
+            if !level.places(share_kind(Some(share))) {
+                return 0;
+            }
+            match share {
+                WorkingSetShare::Readings => shares.readings,
+                WorkingSetShare::Folders => shares.folders,
+                WorkingSetShare::Guides => shares.guides,
+                WorkingSetShare::Journals => shares.journals,
+            }
+        };
+        let splice = files_splice(schema, resolver, kind_cap, effective_selection.seeds());
+        let at = system_prompt_segments.iter().position(|seg| {
+            matches!(seg, ProjectionSegment::Sealed(SealedKind::Section(s)) if s.id == files_open)
+        });
+        if let (Some(at), false) = (at, splice.segments.is_empty()) {
+            files_tokens = segment_tokens(&splice.segments, resolver);
+            system_prompt_segments.splice(at + 1..at + 1, splice.segments);
+            files_placed = splice.order;
+        }
+    }
+
     if group_states.is_empty() {
         return Projection {
             segments: system_prompt_segments,
@@ -739,6 +795,7 @@ pub fn run_with_sink<R: ContentResolver>(
             selection_origins,
             fill: Vec::new(),
             unpooled: Vec::new(),
+            files_placed,
         };
     }
 
@@ -1013,7 +1070,9 @@ pub fn run_with_sink<R: ContentResolver>(
         let room = slot_window
             .window
             .saturating_sub(ws.reserve_tokens)
-            .saturating_sub(segment_tokens(&system_prompt_segments, resolver))
+            .saturating_sub(
+                segment_tokens(&system_prompt_segments, resolver).saturating_sub(files_tokens),
+            )
             .saturating_sub(decode_pos.unwrap_or(0));
         let (recent, lineage_base) = group_states
             .iter()
@@ -1356,5 +1415,6 @@ pub fn run_with_sink<R: ContentResolver>(
         selection_origins,
         fill,
         unpooled,
+        files_placed,
     }
 }
