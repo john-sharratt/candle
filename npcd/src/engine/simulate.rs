@@ -141,13 +141,11 @@ pub async fn run(
         return crate::engine::no_engine("simulating a conversation");
     };
 
-    let thinking = match scenario.thinking.as_deref() {
-        None | Some("off") => Deliberation::None,
-        Some("quick") => Deliberation::Quick,
-        Some("balanced") => Deliberation::Balanced,
-        Some("deep") => Deliberation::Deep,
-        Some("exhaustive") => Deliberation::Exhaustive,
-        Some(other) => {
+    let thinking = match scenario.thinking.as_deref().map(Deliberation::named) {
+        None => Deliberation::None,
+        Some(Some(level)) => level,
+        Some(None) => {
+            let other = scenario.thinking.as_deref().unwrap_or_default();
             return err(
                 StatusCode::BAD_REQUEST,
                 "unknown_thinking",
@@ -155,7 +153,7 @@ pub async fn run(
                     "`{other}` is not a deliberation level — use off, quick, balanced, deep or \
                      exhaustive"
                 ),
-            )
+            );
         }
     };
 

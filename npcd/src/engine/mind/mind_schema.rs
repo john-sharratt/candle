@@ -91,8 +91,26 @@ pub(super) fn compile_act_loop(
     catalog: Catalog,
     within: &tools::Within,
 ) -> anyhow::Result<Arc<StencilTree>> {
-    let e = engine;
-    let tok = e.tokenizer();
+    let prelude = think_prelude(engine, cfg, thinking)?;
+    let specs = act_specs(catalog, within);
+    compile_calls(engine, cfg, &specs, catalog.calls, prelude.as_ref())
+}
+
+/// The reasoning block a turn deliberating at `thinking` opens with, as the
+/// part of its grammar before the calls; `None` when it does not deliberate.
+///
+/// **Where the turn is entered decides what the tree has to cover.** Not
+/// deliberating, the prefill writes the already-closed block and the marker, so
+/// the tree begins at the call body and the reasoning question never arises.
+/// Deliberating, the prefill stops at `<think>` and the tree covers the block
+/// *and* the calls after it — one grammar, so the join at `</think>` is a node
+/// edge rather than a moment the decoder is free in.
+pub(super) fn think_prelude(
+    engine: &Arc<ConversationEngine>,
+    cfg: &SequenceConfig,
+    thinking: identity::Deliberation,
+) -> anyhow::Result<Option<TreeSpec>> {
+    let tok = engine.tokenizer();
     let (Some(_call_open), Some(think_open), Some(think_close)) = (
         tok.token_to_id("<tool_call>"),
         tok.token_to_id("<think>"),
@@ -103,15 +121,7 @@ pub(super) fn compile_act_loop(
              cannot be forced into shape"
         );
     };
-
-    // **Where the turn is entered decides what the tree has to cover.**
-    //
-    // Not deliberating, the prefill writes the already-closed block and the
-    // marker, so the tree begins at the call body and the reasoning question
-    // never arises. Deliberating, the prefill stops at `<think>` and the tree
-    // covers the block *and* the calls after it — one grammar, so the join at
-    // `</think>` is a node edge rather than a moment the decoder is free in.
-    let prelude = match thinking {
+    Ok(match thinking {
         identity::Deliberation::None => None,
         _ => {
             let steer = ThinkSteerEnvelope {
@@ -124,17 +134,15 @@ pub(super) fn compile_act_loop(
                     .token_to_id(cfg.dialect.assistant_end.trim_end())
                     .unwrap_or(0),
                 // Empty because this prelude is SPLICED onto the call grammar
-                // below (`compile_action_loop(…, Some(&prelude))`), so the join
-                // at `</think>` is already a node edge rather than a moment the
+                // (`compile_action_loop(…, Some(&prelude))`), so the join at
+                // `</think>` is already a node edge rather than a moment the
                 // decoder is free in. Injecting the marker here as well would
                 // emit it twice.
                 after_close: "",
             };
             Some(compile_think_tree(thinking.mode(), &steer))
         }
-    };
-    let specs = act_specs(catalog, within);
-    compile_calls(e, cfg, &specs, catalog.calls, prelude.as_ref())
+    })
 }
 
 /// The catalog the act grammar is compiled from, and so the catalog every

@@ -22,7 +22,7 @@ use candle_conversation::projection::DecodePriority;
 use candle_conversation::stencil::{Param, StencilTree, ToolSpec, TurnGrammar};
 use candle_conversation::{AskScope, TurnOptions};
 
-use super::{compile_calls, Minds};
+use super::{compile_calls, think_prelude, Minds};
 use crate::engine::act;
 use crate::engine::identity::Deliberation;
 use crate::engine::prompt::Persona;
@@ -94,17 +94,23 @@ pub fn read_answer(raw: &str, tools: &[ToolSpec]) -> Option<(String, Option<Stri
 
 impl Minds {
     /// Compile `specs` into the grammar a question is answered under: exactly
-    /// one call, of any of them.
+    /// one call, of any of them, after a reasoning block when `thinking` asks
+    /// for one.
     ///
     /// Errors when the checkpoint has no tool-call grammar to force an answer
     /// with.
-    pub fn answer_tree(&self, specs: &[ToolSpec]) -> anyhow::Result<Arc<StencilTree>> {
+    pub fn answer_tree(
+        &self,
+        specs: &[ToolSpec],
+        thinking: Deliberation,
+    ) -> anyhow::Result<Arc<StencilTree>> {
         if !self.grammar_ok {
             anyhow::bail!(
                 "this checkpoint has no tool-call grammar, so an answer cannot be forced"
             );
         }
-        compile_calls(&self.engine, &self.base_config, specs, 1, None)
+        let prelude = think_prelude(&self.engine, &self.base_config, thinking)?;
+        compile_calls(&self.engine, &self.base_config, specs, 1, prelude.as_ref())
     }
 
     /// Ask `npc_id` a question and return what it answered.
@@ -122,7 +128,7 @@ impl Minds {
     ) -> anyhow::Result<Answer> {
         let started = Instant::now();
         let spec = answer_spec(choices)?;
-        let tree = self.answer_tree(slice::from_ref(&spec))?;
+        let tree = self.answer_tree(slice::from_ref(&spec), Deliberation::None)?;
         let put = Put {
             scope: AskScope::Whole,
             tree,

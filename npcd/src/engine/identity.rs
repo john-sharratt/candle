@@ -218,6 +218,20 @@ impl Deliberation {
         }
     }
 
+    /// The level `effort` names — the schema's `thinking_effort` option id, as
+    /// a request names it: `off`, `quick`, `balanced`, `deep`, `exhaustive`.
+    pub fn named(effort: &str) -> Option<Self> {
+        [
+            Deliberation::None,
+            Deliberation::Quick,
+            Deliberation::Balanced,
+            Deliberation::Deep,
+            Deliberation::Exhaustive,
+        ]
+        .into_iter()
+        .find(|d| d.effort() == effort)
+    }
+
     /// The schema's `thinking_effort` option id.
     fn effort(self) -> &'static str {
         match self {
@@ -849,7 +863,10 @@ mod tests {
             (Deliberation::Exhaustive, "exhaustive"),
         ] {
             assert_eq!(level.effort(), id);
+            assert_eq!(Deliberation::named(id), Some(level), "named back");
         }
+        assert_eq!(Deliberation::named("Quick"), None);
+        assert_eq!(Deliberation::named("medium"), None);
     }
 
     #[test]

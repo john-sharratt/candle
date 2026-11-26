@@ -30,15 +30,21 @@ character route is.
   "frame": {"system": "a system prompt", "history": [{"user": "…", "assistant": "…"}]},
   "max_tokens": 640,
   "temperature": 0.0,
-  "seed": 0
+  "seed": 0,
+  "thinking": "off"
 }
 ```
 
 - `turn`: the user message, verbatim. Required and non-empty.
-- `tools`: one or more `ToolSpec`s (`candle_conversation::stencil`). The turn
-  opens with the dialect's closed think block and `<tool_call>`, and the
-  grammar holds it to exactly one call of one of them. A forced answer is an
-  `answer` spec; an act is the spec of the act. Names must be distinct.
+- `tools`: one or more `ToolSpec`s (`candle_conversation::stencil`). The
+  grammar holds the turn to exactly one call of one of them. A forced answer is
+  an `answer` spec; an act is the spec of the act. Names must be distinct.
+- `thinking`: how hard the turn thinks before its call — `off` (the default),
+  `quick`, `balanced`, `deep` or `exhaustive`, as a mind's turn would at that
+  level. Off, the turn opens with the dialect's closed think block and
+  `<tool_call>`; any other level opens `<think>`, and one grammar steers the
+  block shut at that level's budget and holds the call after it. The sampling
+  is the character's own row for that level.
 - `frame`: what the turn is read under. **Absent: the character's own** (§2).
   Present: the given `system` prompt, with `history` laid down before the
   turn as verbatim exchanges (§3). `system` must be non-empty, and `history`
@@ -71,16 +77,16 @@ admits nothing else. `prompt_tokens` is the context the turn was read in,
 and `ms` is the wall time from the route taking the request to its answer.
 
 **Both frames decode alike**: one call of the trial's tools under the same
-grammar, the reply opened with the dialect's closed think block and
-`<tool_call>`, and the character's own think-off sampling at the trial's
-`temperature` and `seed`. So a prompt measured on a given frame measures what
-it does as the mind's own.
+grammar, the reply opened as the trial's `thinking` opens it, and the
+character's own sampling for that thinking at the trial's `temperature` and
+`seed`. So a prompt measured on a given frame measures what it does as the
+mind's own.
 
 ### Refusals
 
 | Status | `error` | When |
 |---|---|---|
-| 400 | `bad_trial` | An empty `turn`, no `tools` or more than 16, two tools of one name, tools that make no grammar, an empty `system`, more than 16 exchanges, more than 256 KiB of text (tools counted), `max_tokens` out of range, `temperature` outside 0 to 2, an unknown field |
+| 400 | `bad_trial` | An empty `turn`, no `tools` or more than 16, two tools of one name, tools that make no grammar, an empty `system`, more than 16 exchanges, more than 256 KiB of text (tools counted), `max_tokens` out of range, `temperature` outside 0 to 2, a `thinking` that is no level, an unknown field |
 | 404 | `npc_not_found` | No such character, or not the caller's |
 | 409 | `npc_not_suspended` | The character is not suspended |
 | 503 | `no_engine` | The daemon runs no engine, or its model has not loaded yet |

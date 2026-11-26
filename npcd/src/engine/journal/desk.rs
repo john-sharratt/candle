@@ -25,6 +25,7 @@ use journal_core::transcript::Filed;
 use journal_core::workflow::Desk;
 use serde_json::Value;
 
+use crate::engine::identity::Deliberation;
 use crate::engine::mind::{Minds, Put};
 use crate::engine::prompt::Persona;
 use crate::engine::tools::Within;
@@ -78,7 +79,9 @@ impl Desk for EngineDesk<'_> {
         let tree = match &self.tree {
             Some(tree) => Arc::clone(tree),
             None => {
-                let tree = self.minds.answer_tree(&tool_specs(specs)?)?;
+                let tree = self
+                    .minds
+                    .answer_tree(&tool_specs(specs)?, Deliberation::None)?;
                 self.tree = Some(Arc::clone(&tree));
                 tree
             }
