@@ -243,13 +243,29 @@ sections hold.
 
 ### 3.5b Every section stands alone; some are mandatory
 
-**No section is sealed behind another.** A knowledge-base section is sealed
-behind the prompt up to its range and across the empty range (§3.1b), and
-behind nothing else: not another file, not the earlier sections of its own
-file. There is no cross-reasoning between sections at ingest. It is built
-where the conversation reads them together — in the turns, and above all in
-the thinking blocks, which are decoded over the placed sections and run
-through every layer, the recurrent ones included.
+**No file is sealed behind another; a file's sections are sealed behind its
+own earlier sections.** A knowledge-base section is sealed behind the prompt
+up to its range, across the empty range (§3.1b), and behind the sections
+before it in its own file — section *k* behind sections 1…*k*−1, its
+recurrent state continued from theirs, as `provenance_system_collection.md`
+§5 seals chunks today — and behind nothing else. A file's chain ends at the
+top of the range: section *k*'s last token sits at `B + R`, its file's
+earlier sections immediately below it.
+
+- **Within a file, cross-reasoning is kept.** A section of a large file is
+  read as the continuation of the file, so what a function means in light of
+  the types above it is in its K/V. Losing that is judged worse than what
+  the next point costs.
+- **The order of placement can break a file's relative positions.** Sections
+  enter the range by peak index attention (§3.4), not by line order, so two
+  sections of one file can be placed in an order or at a distance other than
+  the one they were sealed at. This is accepted and measured: stage 2's gate
+  includes a question that needs two sections of one file placed out of line
+  order.
+- **Between files there is no cross-reasoning at ingest.** It is built where
+  the conversation reads them together — in the turns, and above all in the
+  thinking blocks, which are decoded over the placed sections and run through
+  every layer, the recurrent ones included.
 
 This removes the **seed chain** (`provenance_system_collection.md` §6): the
 seed's files are no longer prefilled as a chain with the recurrence run over
@@ -273,9 +289,10 @@ projection, outside the selection's budget):
 - the range's budget is checked at load to hold the mandatory sections with
   room for the rest, and refuses to build otherwise.
 
-Sealed alone, a section's address is its own: the prompt's hash with the
-range (§3.1b), and the section's text. A change to a file re-seals only the
-sections whose text changed; nothing after them in the file is re-read.
+A section's address is the prompt's hash with the range (§3.1b), the hash of
+its file's earlier sections, and its own text. A change to a file re-seals
+the sections from the first changed one to the file's end; the sections
+before it, and every other file, are untouched.
 
 ### 3.5c Sections of a file, and reducing by section
 
@@ -579,8 +596,8 @@ files; one question needing two files).
 The section cut (§3.5c), standalone sealing and the mandatory set (§3.5b)
 change what the ingest seals, so they land with stage 2's new content
 address, in one re-ingest: sections in `file_read`'s format with the `...`
-marker, sealed alone at the top of the range, scored by provenance per
-section. Stage 2's gate adds an edit made from a placed section by its anchor
+marker, each file's sections sealed as a chain ending at the top of the
+range, scored by provenance per section. Stage 2's gate adds an edit made from a placed section by its anchor
 and relative line numbers, checked against the file. Until the per-step
 decision is on the device (stage 5), stages 3–4 take the scope decision at
 boundaries from the steps' peaks, with the same rule.

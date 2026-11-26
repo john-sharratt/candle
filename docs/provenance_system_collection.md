@@ -220,9 +220,9 @@ shares are checked (`apply_build.rs:533-557`).
 ## 5. Sealing a member
 
 > **Superseded by `docs/placed_section_layout.md` §3.1b, §3.5b, §3.5c when
-> built:** a section is sealed alone — behind the prompt and its section's
-> empty range, at the range's top — never behind the earlier chunks of its
-> file, and its text is `file_read`'s page of that range. This section
+> built:** a section is sealed behind the prompt, its section's empty range
+> and the earlier sections of its own file, its file's chain ending at the
+> range's top, and its text is `file_read`'s page of that range. This section
 > describes the members the running ingest seals.
 
 A member's K/V is sealed **behind the system prompt before the collection**
