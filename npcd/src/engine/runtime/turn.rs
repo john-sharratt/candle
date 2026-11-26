@@ -432,6 +432,12 @@ pub(super) async fn character_loop(rt: Arc<Runtime>, id: u64) {
                             // world's — two halves of one act, and only
                             // this half knows the clock.
                             rt.arm_pause(id, a, now_ms);
+                            // A mind that rested is woken by what reaches
+                            // it, not by its standing task
+                            // (`Inbox::nudge_due`).
+                            if took && a.tool == STOP {
+                                rt.scheduler.rested(id, world_ms);
+                            }
                             // And an act the world answered — a read, a
                             // refusal, work on a document, a step of the
                             // mission moved — brings it straight back, so

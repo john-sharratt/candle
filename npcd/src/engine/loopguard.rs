@@ -114,7 +114,7 @@ const NEVER_STRUCK: &[&str] = &["move_to", "lift_use", "lift_call", "compose", "
 /// again, roughly eighty times a minute, never taking the act the refusal
 /// named. Refused, it is judged as any call is — the same refusal again is a
 /// repeat, and `rest` is struck until the mind does something else.
-const STOP: &str = "rest";
+pub const STOP: &str = "rest";
 
 /// The acts that put words into a document. A repeat is the same text again —
 /// see [`same_text`].

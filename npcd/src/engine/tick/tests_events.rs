@@ -298,6 +298,40 @@ pub(super) mod tests {
         assert!(s.nudge_due(1, surveyed + AFTER, AFTER));
     }
 
+    /// **A mind that rested is not woken to be told to rest.** After its
+    /// `rest` lands, no cadence brings the standing task round; news ends the
+    /// rest, and once it has gone quiet again without resting, the task is due.
+    #[test]
+    fn a_rested_mind_is_not_woken_by_its_standing_task() {
+        const AFTER: u64 = 90_000;
+        const T0: u64 = 1_000_000;
+        let s = sched();
+        s.wake(1, 0, T0);
+        s.tick(1, 0, T0, |_, _| vec!["rest".into()]);
+        s.rested(1, T0);
+        for later in [AFTER, 10 * AFTER, 100 * AFTER] {
+            assert!(
+                !s.nudge_due(1, T0 + later, AFTER),
+                "{later}ms into its rest"
+            );
+        }
+
+        // A message ends the rest; quiet a cadence after it, the task is due.
+        let told = T0 + 100 * AFTER;
+        s.deliver(
+            1,
+            told,
+            Salience::NORMAL,
+            EventKind::Speech {
+                speaker: "John".into(),
+                text: "the parcels came".into(),
+                to: crate::engine::event::Addressed::Room,
+            },
+        );
+        s.tick(1, 0, told, |_, _| Vec::new());
+        assert!(s.nudge_due(1, told + AFTER, AFTER));
+    }
+
     /// **A mind may rest once it has turned to what last reached it.** With
     /// nothing arrived it has; a request arriving makes it not so until a turn
     /// of its own has acted; and news landing after that act is unanswered

@@ -103,7 +103,7 @@ use crate::engine::journal::style::NPC;
 use crate::engine::journal::world::Snapshot;
 use crate::engine::life;
 use crate::engine::loading::{LoadProgress, LoadStep};
-use crate::engine::loopguard::{salient, Took, NUDGE};
+use crate::engine::loopguard::{salient, Took, NUDGE, STOP};
 use crate::engine::mind::{frame_fingerprint, Answer, Minds, Projected};
 use crate::engine::mind_record;
 use crate::engine::mission::{

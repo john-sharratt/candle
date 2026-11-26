@@ -160,6 +160,14 @@ impl Scheduler {
             .is_some_and(|i| i.nudge_due(world_ms, after_ms))
     }
 
+    /// Note that this character's `rest` landed at `world_ms`. See
+    /// [`Inbox::rested`].
+    pub fn rested(&self, npc_id: u64, world_ms: u64) {
+        if let Some(i) = self.inboxes.lock().unwrap().get_mut(&npc_id) {
+            i.rested(world_ms);
+        }
+    }
+
     /// The next event sequence number, for a caller that builds an [`Event`] to
     /// place directly into a tick already in hand rather than [`Self::deliver`]
     /// it — the call to report at the table rides every tick this way, and `deliver`'s
