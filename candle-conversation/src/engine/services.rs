@@ -242,17 +242,32 @@ impl ConversationEngine {
     /// decoded argmax for up to `max_decode_tokens`. Fresh K/V under another
     /// recurrent state: what it answers says whether the K/V alone carries
     /// what the prompt holds. With `recurrent_over` absent nothing is
-    /// installed, and the slot runs the two raw turns on its own state.
+    /// installed, and the slot runs the two raw turns on its own state. With
+    /// `quantize_level`, the prompt's K/V is quantized in place at that level
+    /// before `tail` — the format a collection member's K/V is sealed in.
     pub fn infer_raw_token_ids_swapped(
         &self,
         prompt: &[u32],
         recurrent_over: Option<Vec<u32>>,
+        quantize_level: Option<u8>,
         tail: &[u32],
         max_decode_tokens: usize,
     ) -> crate::Result<RawDecode> {
         let sequence_id = self.new_raw_sequence()?;
         let out = (|| {
             self.raw_turn(sequence_id, prompt, 0)?;
+            if let Some(level) = quantize_level {
+                let (tx, rx) = flume::bounded(1);
+                self.core
+                    .scheduler_tx
+                    .send(SchedulerRequest::QuantizeSlot {
+                        sequence_id,
+                        level,
+                        response_tx: tx,
+                    })
+                    .map_err(|_| ConversationError::SchedulerGone)?;
+                rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
+            }
             let state = match recurrent_over {
                 Some(tokens) => run_state(&self.core.scheduler_tx, None, tokens)?,
                 None => None,

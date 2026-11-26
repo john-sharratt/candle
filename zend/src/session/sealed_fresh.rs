@@ -72,6 +72,12 @@ pub struct SealedFreshReq {
     /// run from zero without the placed file's tokens — under the fresh K/V.
     #[serde(default = "fresh")]
     pub fresh_recurrent: Recurrent,
+    /// Quantize the fresh side's prompt K/V in place at this compression level
+    /// before its user half — `4` is a collection member's seal — so the fresh
+    /// side attends over quantized K/V computed in its own context. Absent
+    /// leaves it native.
+    #[serde(default)]
+    pub fresh_quantize: Option<u8>,
 }
 
 fn fresh() -> Recurrent {
@@ -245,26 +251,24 @@ impl ZendSession {
             let mut prompt = dump.token_ids.clone();
             prompt.extend_from_slice(&turn[..user_half]);
             let sealed: Vec<u32> = resp.token_ids.to_vec();
-            let fresh = match req.fresh_recurrent {
-                Recurrent::Fresh => engine.infer_raw_token_ids(&prompt, req.n),
-                Recurrent::Sealed => engine.infer_raw_token_ids_swapped(
+            // The fresh side in one pass, unless its state is swapped or its
+            // K/V quantized between the prompt and the user half.
+            let recurrent_over = match req.fresh_recurrent {
+                Recurrent::Fresh | Recurrent::Split => None,
+                Recurrent::Sealed => Some(without_members(&dump, &members)),
+                Recurrent::Replayed => Some(dump.token_ids.clone()),
+            };
+            let one_pass = req.fresh_recurrent == Recurrent::Fresh && req.fresh_quantize.is_none();
+            let fresh = if one_pass {
+                engine.infer_raw_token_ids(&prompt, req.n)
+            } else {
+                engine.infer_raw_token_ids_swapped(
                     &dump.token_ids,
-                    Some(without_members(&dump, &members)),
+                    recurrent_over,
+                    req.fresh_quantize,
                     &turn[..user_half],
                     req.n,
-                ),
-                Recurrent::Replayed => engine.infer_raw_token_ids_swapped(
-                    &dump.token_ids,
-                    Some(dump.token_ids.clone()),
-                    &turn[..user_half],
-                    req.n,
-                ),
-                Recurrent::Split => engine.infer_raw_token_ids_swapped(
-                    &dump.token_ids,
-                    None,
-                    &turn[..user_half],
-                    req.n,
-                ),
+                )
             }
             .map_err(|e| anyhow::anyhow!("the fresh decode: {e}"))?;
             let fresh_finish = fresh.finish.map_or("none".into(), |f| format!("{f:?}"));
@@ -327,6 +331,10 @@ mod tests {
         let req: SealedFreshReq =
             serde_json::from_str(r#"{"question":"q","n":8,"fresh_recurrent":"replayed"}"#).unwrap();
         assert_eq!(req.fresh_recurrent, Recurrent::Replayed);
+        assert_eq!(req.fresh_quantize, None);
+        let req: SealedFreshReq =
+            serde_json::from_str(r#"{"question":"q","n":8,"fresh_quantize":4}"#).unwrap();
+        assert_eq!(req.fresh_quantize, Some(4));
     }
 
     fn piece(section_id: Option<u32>, token_ids: Vec<u32>) -> PromptPiece {

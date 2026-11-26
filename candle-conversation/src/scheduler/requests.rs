@@ -379,6 +379,17 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<bool, ConversationError>>,
     },
 
+    /// Quantize every block `sequence_id` holds, in place, under the adaptive
+    /// policy at `level` — the format a collection member's K/V reaches at its
+    /// seal — so the slot's next turn attends over quantized K/V as production
+    /// does. The slot's depth, recurrent state and index are untouched: only
+    /// the format of the blocks changes. Replies with the blocks it holds.
+    QuantizeSlot {
+        sequence_id: SequenceId,
+        level: u8,
+        response_tx: Sender<Result<usize, ConversationError>>,
+    },
+
     /// Re-run a slot's create-time recurrent seeding, now that its lineage is
     /// known — see [`Substrate::FORKED_FROM_KEY`].
     ///
@@ -767,6 +778,7 @@ impl SchedulerRequest {
             Self::ArenaGroups { .. } => "req:arena_groups",
             Self::IngestSection { .. } => "req:ingest_section",
             Self::InstallRecurrentState { .. } => "req:install_recurrent_state",
+            Self::QuantizeSlot { .. } => "req:quantize_slot",
             Self::SeedRecurrentFromLineage { .. } => "req:seed_recurrent_from_lineage",
             Self::MemoryCatchUp { .. } => "req:memory_catch_up",
             Self::BranchCheckpointPass { .. } => "req:branch_checkpoint_pass",

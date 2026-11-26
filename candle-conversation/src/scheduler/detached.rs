@@ -118,6 +118,7 @@ impl SchedulerRequest {
             | Self::SeedRecurrentFromLineage { sequence_id, .. }
             | Self::MemoryCatchUp { sequence_id, .. }
             | Self::ExtractRawKvq { sequence_id, .. }
+            | Self::QuantizeSlot { sequence_id, .. }
             | Self::ProbeWideSigs { sequence_id, .. }
             | Self::ReadRecurrentMemory { sequence_id, .. } => vec![*sequence_id],
             #[cfg(any(test, feature = "test-helpers"))]
@@ -181,6 +182,7 @@ impl SchedulerRequest {
             | Self::MemoryCatchUp { .. }
             | Self::BranchCheckpointPass { .. }
             | Self::ExtractRawKvq { .. }
+            | Self::QuantizeSlot { .. }
             | Self::ProbeWideSigs { .. }
             | Self::SubmitSummaryProbe { .. }
             | Self::AttachSubstrate { .. }

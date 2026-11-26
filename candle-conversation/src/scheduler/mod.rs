@@ -1118,6 +1118,7 @@ mod compression_turn;
 mod construct;
 mod handle_request_now;
 mod perform_seal;
+mod quantize_slot;
 mod seal_turn;
 mod section_finish;
 mod sections;

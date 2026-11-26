@@ -993,6 +993,15 @@ impl Scheduler {
                 true
             }
 
+            SchedulerRequest::QuantizeSlot {
+                sequence_id,
+                level,
+                response_tx,
+            } => {
+                let _ = response_tx.send(self.quantize_slot(sequence_id, level));
+                true
+            }
+
             SchedulerRequest::ReadRecurrentMemory {
                 sequence_id,
                 response_tx,
