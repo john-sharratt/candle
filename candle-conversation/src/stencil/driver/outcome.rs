@@ -51,8 +51,13 @@ pub enum StepMask {
     /// intercepted by the session).  `close_boost` is the soft close-token logit
     /// ramp; `opens_value` marks the first step of a call's value, which bans
     /// the end-of-turn tokens and lifts the repetition penalties for this one
-    /// step (see `StencilSession::free_decode_action`).
-    Free { close_boost: f32, opens_value: bool },
+    /// step (see `StencilSession::free_decode_action`); `barred` are tokens this
+    /// step may not draw — those that would close a required value blank.
+    Free {
+        close_boost: f32,
+        opens_value: bool,
+        barred: Option<Arc<[TokenId]>>,
+    },
     /// The stencil finished — resume unconstrained decoding.
     Done,
 }

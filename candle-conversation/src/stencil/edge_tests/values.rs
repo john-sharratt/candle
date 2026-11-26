@@ -186,6 +186,7 @@ fn a_forced_close_completes_the_value() {
         ramp_len: 0,
         boost: 0.0,
         forced_after: 4,
+        nonblank: false,
     };
     let spec = StencilTreeBuilder::new("t")
         .root("v")

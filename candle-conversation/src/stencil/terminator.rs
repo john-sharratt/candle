@@ -130,6 +130,7 @@ impl Terminator {
                 Terminator::JsonValue => Some(JsonLexer::value()),
                 _ => None,
             },
+            filled: false,
         }
     }
 }
@@ -167,6 +168,21 @@ pub struct TerminatorState {
     /// full JSON state. [`Terminator::JsonStringValue`] gains it at its opening
     /// quote, so `None` there means the value has not opened.
     json: Option<JsonLexer>,
+    /// A string value has been written a byte of content that is not
+    /// whitespace — see [`Self::blank`].
+    filled: bool,
+}
+
+/// Where a string value with nothing in it yet stands — what decides which
+/// tokens would close it blank ([`super::blank`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blank {
+    /// Its opening quote not yet written ([`Terminator::JsonStringValue`]):
+    /// a token that opens and closes it at once writes it empty.
+    Unopened,
+    /// Opened, with nothing but whitespace after the quote: a token that
+    /// closes it writes it blank.
+    Opened,
 }
 
 /// The outcome of feeding one token's bytes.
@@ -203,9 +219,63 @@ impl TerminatorState {
         self.kind != Terminator::JsonStringValue || self.json.is_some()
     }
 
+    /// Where this string value stands while nothing but whitespace is written
+    /// inside it; `None` once it holds content, and for any value that is not
+    /// a JSON string.
+    pub fn blank(&self) -> Option<Blank> {
+        match (self.kind, self.filled) {
+            (Terminator::JsonString | Terminator::JsonStringValue, false) => {
+                Some(match self.opened() {
+                    true => Blank::Opened,
+                    false => Blank::Unopened,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Note the string content in `bytes`, the token just fed: past its
+    /// opening quote when `was_open` is false, and up to the close when
+    /// `closed_at` is where the value's own closing quote stands.
+    fn note_content(&mut self, bytes: &[u8], was_open: bool, closed_at: Option<usize>) {
+        if self.filled
+            || !matches!(
+                self.kind,
+                Terminator::JsonString | Terminator::JsonStringValue
+            )
+        {
+            return;
+        }
+        let from = match was_open {
+            true => 0,
+            false => match bytes.iter().position(|&b| b == b'"') {
+                Some(quote) => quote + 1,
+                None => return,
+            },
+        };
+        let to = closed_at.unwrap_or(bytes.len()).max(from);
+        self.filled = bytes[from..to]
+            .iter()
+            .any(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'));
+    }
+
     /// Feed one token's decoded bytes.  Returns `Close` the moment the
     /// terminator fires, with the count of bytes that belong to the span.
     pub fn feed(&mut self, bytes: &[u8]) -> Feed {
+        let was_open = self.opened();
+        let fed = self.feed_kind(bytes);
+        // Judged on the bytes the model wrote: a rewrite only escapes them or
+        // completes the value, and a newline escaped as `\n` is still blank.
+        let closed_at = match &fed {
+            // The closing quote is the span's last consumed byte.
+            Feed::Close { consumed } => Some(consumed.saturating_sub(1)),
+            _ => None,
+        };
+        self.note_content(bytes, was_open, closed_at);
+        fed
+    }
+
+    fn feed_kind(&mut self, bytes: &[u8]) -> Feed {
         match self.kind {
             Terminator::JsonString | Terminator::JsonValue => self.feed_json(bytes),
             Terminator::JsonStringValue => self.feed_string_value(bytes),
@@ -576,6 +646,36 @@ mod tests {
             }
         }
         (chunks.len(), None)
+    }
+
+    // ── Blank ────────────────────────────────────────────────────────────────
+
+    /// **A string value is blank until a byte of content that is not
+    /// whitespace**: unopened before its quote, opened after it; an escaped
+    /// quote is content; a token that opens and writes content fills it.
+    #[test]
+    fn a_string_is_blank_until_it_holds_content() {
+        let mut v = Terminator::JsonStringValue.start();
+        assert_eq!(v.blank(), Some(Blank::Unopened));
+        v.feed(b" ");
+        assert_eq!(v.blank(), Some(Blank::Unopened));
+        v.feed(b"\"");
+        assert_eq!(v.blank(), Some(Blank::Opened));
+        v.feed(b"  ");
+        assert_eq!(v.blank(), Some(Blank::Opened));
+        v.feed(b"\\\"");
+        assert_eq!(v.blank(), None, "an escaped quote is content");
+
+        let mut at_once = Terminator::JsonStringValue.start();
+        at_once.feed(b" \"a");
+        assert_eq!(at_once.blank(), None);
+
+        let mut opened = Terminator::JsonString.start();
+        assert_eq!(opened.blank(), Some(Blank::Opened));
+        opened.feed(b"x");
+        assert_eq!(opened.blank(), None);
+
+        assert_eq!(Terminator::JsonValue.start().blank(), None, "not a string");
     }
 
     // ── JsonStringValue ─────────────────────────────────────────────────────

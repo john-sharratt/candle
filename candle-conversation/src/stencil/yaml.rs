@@ -167,6 +167,7 @@ impl From<YamlLimits> for FreeTextLimits {
             ramp_len: y.ramp_len.unwrap_or(0),
             boost: y.boost.unwrap_or(0.0),
             forced_after: y.forced_after,
+            nonblank: false,
         }
     }
 }

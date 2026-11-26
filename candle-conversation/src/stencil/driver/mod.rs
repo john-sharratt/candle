@@ -195,11 +195,13 @@ impl StencilDriver {
                 StencilAction::FreeDecode {
                     close_boost,
                     opens_value,
+                    barred,
                 } => {
                     self.stats.free_tokens += 1;
                     return StepMask::Free {
                         close_boost,
                         opens_value,
+                        barred,
                     };
                 }
                 StencilAction::Exit => {

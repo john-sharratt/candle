@@ -283,9 +283,10 @@ pub(super) mod tests {
             first,
             StepMask::Free {
                 close_boost: 0.0,
-                opens_value: true
+                opens_value: true,
+                barred: None,
             },
-            "the value's first token"
+            "the value's first token: no token of a byte vocabulary writes it empty"
         );
         driver.accept(b' ' as TokenId, b" ");
         driver.accept(b'"' as TokenId, b"\"");
@@ -294,10 +295,72 @@ pub(super) mod tests {
             driver.step(),
             StepMask::Free {
                 close_boost: 0.0,
-                opens_value: false
+                opens_value: false,
+                barred: None,
             },
             "a value begun may end on EOS"
         );
+    }
+
+    const REQUIRED_ONLY: &str = r#"[{"name":"post","params":[
+        {"name":"args","type":"string","required":true}]}]"#;
+
+    /// The next free step's mask, any branch on the way taking `want`'s token
+    /// when it offers it, else its first.
+    fn next_free(driver: &mut StencilDriver, v: &TestVocab, want: TokenId) -> StepMask {
+        loop {
+            match driver.step() {
+                StepMask::Prefill(_) => continue,
+                StepMask::Branch(set) => {
+                    let t = match set.tokens().contains(&want) {
+                        true => want,
+                        false => set.tokens()[0],
+                    };
+                    driver.accept(t, &v.token_bytes(t));
+                }
+                other => break other,
+            }
+        }
+    }
+
+    /// **A required value may not be closed blank**: before its quote, the
+    /// token that writes it empty is barred; past the quote with only
+    /// whitespace in it, the tokens that close it are; once it holds
+    /// anything, nothing is.
+    #[test]
+    fn a_required_value_may_not_be_closed_blank() {
+        const EMPTY: TokenId = 300;
+        const CLOSE_COMMA: TokenId = 301;
+        let v = TestVocab::new()
+            .with_special(" \"\"", EMPTY)
+            .with_special("\",", CLOSE_COMMA);
+        let tools = parse_tools(REQUIRED_ONLY).unwrap();
+        let spec = compile_tool_call_tree(&tools, &ToolCallEnvelope::qwen3()).unwrap();
+        let tree = Arc::new(compile(&spec, &v).unwrap());
+        let mut driver = StencilDriver::new(tree);
+        let barred = |m: StepMask| match m {
+            StepMask::Free { barred, .. } => barred.map(|b| b.to_vec()),
+            other => panic!("not a free step: {other:?}"),
+        };
+
+        assert_eq!(barred(next_free(&mut driver, &v, 0)), Some(vec![EMPTY]));
+        driver.accept(b' ' as TokenId, b" ");
+        assert_eq!(
+            barred(driver.step()),
+            Some(vec![EMPTY]),
+            "whitespace is not a value"
+        );
+        driver.accept(b'"' as TokenId, b"\"");
+        let closers = Some(vec![b'"' as TokenId, EMPTY, CLOSE_COMMA]);
+        assert_eq!(barred(driver.step()), closers, "opened and blank");
+        driver.accept(b' ' as TokenId, b" ");
+        assert_eq!(
+            barred(driver.step()),
+            closers,
+            "a space inside is still blank"
+        );
+        driver.accept(b'a' as TokenId, b"a");
+        assert_eq!(barred(driver.step()), None, "it holds something");
     }
 
     #[test]

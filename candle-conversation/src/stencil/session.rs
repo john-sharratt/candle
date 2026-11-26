@@ -30,8 +30,14 @@ pub enum StencilAction {
     /// span's close token (the soft ramp). `opens_value` is set at the first
     /// token of a call's value, where the model chooses how the value opens: no
     /// end-of-turn token may be sampled there, and no repetition penalty weighs
-    /// on the choice — see [`StencilSession::free_decode_action`].
-    FreeDecode { close_boost: f32, opens_value: bool },
+    /// on the choice — see [`StencilSession::free_decode_action`]. `barred` are
+    /// tokens this step may not draw: those that would close a required value
+    /// still blank ([`super::blank`]).
+    FreeDecode {
+        close_boost: f32,
+        opens_value: bool,
+        barred: Option<Arc<[TokenId]>>,
+    },
     /// Stencil finished — resume normal decode.
     Exit,
 }
@@ -368,10 +374,13 @@ impl StencilSession {
                     let span = span.clone();
                     self.carried.clear();
                     self.enter_span(node, &span);
-                    let action = Self::span_action(&span, 0, self.value, self.active.as_ref());
+                    let term = span.term.start();
+                    let barred = self.barred(&span, &term);
+                    let action =
+                        Self::span_action(&span, 0, self.value, self.active.as_ref(), barred);
                     self.cursor = Cursor::InFreeText {
                         node,
-                        term: span.term.start(),
+                        term,
                         emitted: 0,
                     };
                     action
@@ -385,9 +394,14 @@ impl StencilSession {
                 let offered = self.branch_trie(node).frontier(pos);
                 StencilAction::MaskedDecode(self.held_frontier(node, pos, offered))
             }
-            Cursor::InFreeText { node, emitted, .. } => {
+            Cursor::InFreeText {
+                node,
+                emitted,
+                ref term,
+            } => {
                 let span = self.free_span(node);
-                Self::span_action(span, emitted, self.value, self.active.as_ref())
+                let barred = self.barred(span, term);
+                Self::span_action(span, emitted, self.value, self.active.as_ref(), barred)
             }
             Cursor::Bailing => {
                 self.cursor = Cursor::Done;
@@ -413,17 +427,32 @@ impl StencilSession {
     }
 
     /// What the next token of `span` decodes under: `rule`'s mask while the
-    /// value stands on it, else free.
+    /// value stands on it, else free, without `barred`.
     fn span_action(
         span: &FreeTextSpan,
         emitted: u32,
         value: Option<ValueState>,
         rule: Option<&Arc<ValueRule>>,
+        barred: Option<Arc<[TokenId]>>,
     ) -> StencilAction {
         match (rule, value) {
             (Some(rule), Some(state)) => StencilAction::MaskedDecode(rule.mask(state)),
-            _ => Self::free_decode_action(span, emitted),
+            _ => Self::free_decode_action(span, emitted, barred),
         }
+    }
+
+    /// The tokens the next step of `span`, lexed so far by `term`, may not
+    /// draw: those that would close a required value still blank
+    /// ([`FreeTextLimits::nonblank`](super::tree::FreeTextLimits::nonblank)).
+    /// A value held to a rule is the rule's to bound.
+    fn barred(&self, span: &FreeTextSpan, term: &TerminatorState) -> Option<Arc<[TokenId]>> {
+        if !span.limits.nonblank || self.active.is_some() {
+            return None;
+        }
+        term.blank()
+            .map(|blank| self.tree.blank_bans(blank))
+            .filter(|bans| !bans.is_empty())
+            .map(Arc::clone)
     }
 
     /// The free-decode action for `span` given its running `emitted` count.
@@ -448,11 +477,17 @@ impl StencilSession {
     /// ` ""` is never counted. A table that had planned its faults in thinking
     /// ("I'll combine these into the faults array") wrote `"faults": ""` in 64
     /// readings of 64, and a verdict of `sound` after it. So the first step of
-    /// a value samples without the repetition penalties.
-    fn free_decode_action(span: &FreeTextSpan, emitted: u32) -> StencilAction {
+    /// a value samples without the repetition penalties — and a required one,
+    /// without the tokens that would write it blank (`barred`).
+    fn free_decode_action(
+        span: &FreeTextSpan,
+        emitted: u32,
+        barred: Option<Arc<[TokenId]>>,
+    ) -> StencilAction {
         StencilAction::FreeDecode {
             close_boost: span.limits.boost_at(emitted),
             opens_value: emitted == 0 && !span.eos_ends && span.term != Terminator::Never,
+            barred,
         }
     }
 
