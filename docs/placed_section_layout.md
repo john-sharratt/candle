@@ -499,8 +499,8 @@ The regions and their ranges:
 
 - **The journal** has its own range in the system prompt, between the
   grounding and the tools range, so its growth never moves what follows it:
-  its window (`pin_tokens`, 1,024, bounds what is pinned of it) plus a
-  request's reserve of entries. It fills from the bottom, as its chain is
+  8K on a model with a native context of 128K or more, 2K below (§3.7b), of
+  which `pin_tokens` (1,024) is pinned. It fills from the bottom, as its chain is
   sealed: each entry is sealed as the continuation of the ones before it at
   the next position, so the range holds the chain exactly as it was computed.
   A full journal range is a window: an entry a request writes past it drops
@@ -527,16 +527,23 @@ The first build's budgets, on Flash-Next's trained window (`L0` =
 
 | Region | Order | Projection (positions) | Residency | Scan |
 |---|---|---:|---:|---|
-| Journal | Birth | 2K (2,048): `pin_tokens` 1,024 and a request's entries | — (the conversation's own sections, always hot) | — |
+| Journal | Birth | 8K (8,192) on a model whose native context is 128K or more — Flash-Next, Qwen3.6-35B; 2K (2,048) on a smaller one | — (the conversation's own sections, always hot) | — |
 | Tools | Relevance | 8K (8,192) | the catalog | the catalog |
 | Knowledge base | Relevance | 96K (98,304), the mandatory sections inside it | 2× the range: 192K, on every card | the pool, `PoolSize::for_card` |
 | Dialogue window | Birth | 96K (98,304) of past turns at a request's start | — | — |
-| Request reserve | Birth | the rest: `L0` less the ranges, the window and the fixed prompt — ≈ 49K with a ~6K fixed prompt | — | — |
+| Request reserve | Birth | the rest: `L0` less the ranges, the window and the fixed prompt — ≈ 43K on Flash-Next with a ~6K fixed prompt | — | — |
 
 - **The reserve is the request's.** There is no separate `reserve_tokens`
   margin: what the ranges, the window and the fixed prompt leave is the room a
-  request grows into on rung 1 (§3.7), about twelve 200-line reads. Past it a
+  request grows into on rung 1 (§3.7), about seven 200-line reads. Past it a
   request runs on the next rung.
+- **The journal's range follows the native context.** 8K holds a long
+  conversation's folded history and a request's notes on a model that reads
+  128K or more natively; a smaller native context cannot spare it and gets
+  2K. The range is chosen from the engine's reported trained window at load,
+  never configured per machine. `pin_tokens` (1,024) still bounds what of the
+  journal every selecting query attends whole; the rest of the range is
+  selected by score.
 - **Residency is the same on every card.** It is twice the knowledge base's
   range; on the 16 and 24 GB cards the expert zone gives up the difference.
 - **Tools: the mandatory ones in the range, the rest by score.** `file_read`
