@@ -11,10 +11,11 @@
 
 #[cfg(test)]
 pub(super) mod tests {
+    use super::super::super::card_key::ModelIx;
 
     use super::super::tests_floor::tests::cache;
 
-    use super::super::tests_scores::tests::{best_victim, occupy};
+    use super::super::tests_scores::tests::{best_victim, k, occupy};
 
     use super::super::tests_distance::tests::demand_eviction;
 
@@ -27,11 +28,11 @@ pub(super) mod tests {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 10, 100, 1, 0.0);
         occupy(&mut inner, 1, 10, 101, 2, 0.0);
-        inner.record_prefill_elevate(10, 100);
-        inner.record_prefill_elevate(10, 101);
+        inner.record_prefill_elevate(k(10, 100));
+        inner.record_prefill_elevate(k(10, 101));
         // 100 keeps a warm copy; 101 lives only in the pack, so it is the one
         // worth keeping.
-        inner.set_warm_backed(&[(10, 100)]);
+        inner.set_warm_backed(ModelIx::FIRST, &[(10, 100)]);
         assert_eq!(
             best_victim(&inner, 20, &[]),
             Some((0, (10, 100))),
@@ -45,9 +46,9 @@ pub(super) mod tests {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 10, 100, 1, 0.0);
         occupy(&mut inner, 1, 10, 101, 2, 0.0);
-        inner.record_prefill_elevate(10, 100);
-        inner.record_prefill_elevate(10, 101);
-        inner.set_warm_backed(&[(10, 100)]);
+        inner.record_prefill_elevate(k(10, 100));
+        inner.record_prefill_elevate(k(10, 101));
+        inner.set_warm_backed(ModelIx::FIRST, &[(10, 100)]);
         let evicted = demand_eviction(&mut inner, 15, 1, &[]);
         assert_eq!(
             evicted,
@@ -67,9 +68,9 @@ pub(super) mod tests {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 10, 100, 5, 0.0); // warm, most recently used
         occupy(&mut inner, 1, 10, 101, 1, 0.0); // pack-only, least recently used
-        inner.set_warm_backed(&[(10, 100)]);
-        assert_eq!(inner.score(10, 100), 0.0);
-        assert_eq!(inner.score(10, 101), 0.0);
+        inner.set_warm_backed(ModelIx::FIRST, &[(10, 100)]);
+        assert_eq!(inner.score(k(10, 100)), 0.0);
+        assert_eq!(inner.score(k(10, 101)), 0.0);
 
         let evicted = demand_eviction(&mut inner, 15, 1, &[]);
         assert_eq!(
@@ -86,7 +87,7 @@ pub(super) mod tests {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 10, 50, 5, 1.0); // warm-backed
         occupy(&mut inner, 1, 10, 51, 5, 1.0); // pack-only, same temperature
-        inner.set_warm_backed(&[(10, 50)]);
+        inner.set_warm_backed(ModelIx::FIRST, &[(10, 50)]);
 
         assert_eq!(
             best_victim(&inner, 20, &[]).map(|v| v.1),
@@ -106,7 +107,7 @@ pub(super) mod tests {
         occupy(&mut inner, 2, 12, 52, 3, 0.2);
         occupy(&mut inner, 3, 13, 53, 4, 0.3);
         occupy(&mut inner, 4, 14, 54, 5, 0.4);
-        inner.set_warm_backed(&[(10, 50)]);
+        inner.set_warm_backed(ModelIx::FIRST, &[(10, 50)]);
 
         assert_eq!(best_victim(&inner, 20, &[]), Some((1, (11, 51))));
     }
@@ -120,7 +121,7 @@ pub(super) mod tests {
         occupy(&mut inner, 0, 10, 50, 1, 0.0); // behind, pack-only, never used
         occupy(&mut inner, 1, 30, 51, 2, 7.0); // ahead, warm-backed, hot
         occupy(&mut inner, 2, 40, 52, 3, 2.0); // ahead, warm-backed, cooler
-        inner.set_warm_backed(&[(30, 51), (40, 52)]);
+        inner.set_warm_backed(ModelIx::FIRST, &[(30, 51), (40, 52)]);
         assert_eq!(
             best_victim(&inner, 20, &[]),
             Some((0, (10, 50))),
@@ -140,11 +141,11 @@ pub(super) mod tests {
         occupy(&mut inner, 2, 12, 52, 3, 0.5); // pack-only
         occupy(&mut inner, 3, 13, 53, 4, 2.0); // pack-only
         occupy(&mut inner, 4, 32, 54, 5, 3.0); // pack-only
-        inner.set_warm_backed(&[(10, 50), (11, 51)]);
+        inner.set_warm_backed(ModelIx::FIRST, &[(10, 50), (11, 51)]);
 
         let evicted = demand_eviction(&mut inner, 35, 4, &[]);
         assert_eq!(evicted, vec![(12, 52), (32, 54), (11, 51), (13, 53)]);
-        assert!(inner.key_to_slot.contains_key(&(10, 50)));
+        assert!(inner.key_to_slot.contains_key(&k(10, 50)));
         assert_eq!(inner.free_len(), 4);
     }
 

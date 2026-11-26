@@ -18,14 +18,35 @@ pub(super) mod tests {
 
     use super::super::tests_distance::tests::demand_eviction;
 
-    /// Mark a slot occupied by `(layer, expert)` without a real `ExpertSlot`
-    /// (eviction selection reads only the bookkeeping tables, never the VRAM
-    /// buffers).
+    /// The key of `(row, expert)` of the fixtures' one model.
+    pub(in super::super) fn k(row: usize, expert: usize) -> ExpertKey {
+        ExpertKey::new(ModelIx::FIRST, row, expert)
+    }
+
+    /// The wave at `row` of the fixtures' one model.
+    pub(in super::super) fn at(row: usize) -> (ModelIx, usize) {
+        (ModelIx::FIRST, row)
+    }
+
+    /// Mark a slot occupied by the fixtures' model's `(layer, expert)` without
+    /// a real `ExpertSlot` (eviction selection reads only the bookkeeping
+    /// tables, never the VRAM buffers).
     pub(in super::super) fn occupy(
         inner: &mut ExpertCacheInner,
         slot: usize,
         layer: usize,
         expert: usize,
+        last_used: u32,
+        freq: f32,
+    ) {
+        occupy_key(inner, slot, k(layer, expert), last_used, freq);
+    }
+
+    /// Mark a slot occupied by `key`.
+    pub(in super::super) fn occupy_key(
+        inner: &mut ExpertCacheInner,
+        slot: usize,
+        key: ExpertKey,
         last_used: u32,
         freq: f32,
     ) {
@@ -36,25 +57,25 @@ pub(super) mod tests {
         // the one its assertions name.
         let taken = inner.zone.alloc().expect("a free slot");
         assert_eq!(taken, slot, "fixture must occupy slots in ascending order");
-        inner.slot_to_key[slot] = Some((layer, expert));
-        inner.key_to_slot.insert((layer, expert), slot);
+        inner.slot_to_key[slot] = Some(key);
+        inner.key_to_slot.insert(key, slot);
         inner.last_used[slot] = last_used;
-        inner.expert_scores[layer * inner.experts_per_layer + expert] = freq;
+        let idx = inner.models.flat(key);
+        inner.expert_scores[idx] = freq;
     }
 
-    /// The single best demand victim, `(slot, key)`, if there is one.
+    /// The single best demand victim with the wave at `current` of the
+    /// fixtures' model, `(slot, (row, expert))`, if there is one.
     pub(in super::super) fn best_victim(
         inner: &ExpertCacheInner,
         current: usize,
         protect: &[usize],
     ) -> Option<(usize, (usize, usize))> {
         let s = *inner
-            .rank_victims(current, 1, |s, _| !protect.contains(&s))
+            .rank_victims(at(current), 1, |s, _| !protect.contains(&s))
             .first()?;
-        Some((
-            s,
-            inner.slot_to_key[s].expect("a ranked victim holds an expert"),
-        ))
+        let key = inner.slot_to_key[s].expect("a ranked victim holds an expert");
+        Some((s, (key.row, key.expert)))
     }
 
     #[test]
@@ -75,41 +96,43 @@ pub(super) mod tests {
     fn record_prefill_hit_bumps_by_the_small_credit_only() {
         let mut inner = cache(1);
         occupy(&mut inner, 0, 10, 100, 1, 0.0);
-        inner.record_prefill_hit(10, 100);
-        assert_eq!(inner.score(10, 100), 0.1);
-        inner.record_prefill_hit(10, 100);
-        assert_eq!(inner.score(10, 100), 0.2);
+        inner.record_prefill_hit(k(10, 100));
+        assert_eq!(inner.score(k(10, 100)), 0.1);
+        inner.record_prefill_hit(k(10, 100));
+        assert_eq!(inner.score(k(10, 100)), 0.2);
     }
 
     #[test]
     fn record_hit_still_bumps_by_the_full_decode_credit() {
         let mut inner = cache(1);
         occupy(&mut inner, 0, 10, 100, 1, 0.0);
-        inner.record_hit(10, 100);
-        let idx = 10 * inner.experts_per_layer + 100;
+        inner.record_hit(k(10, 100));
+        // Row 10, expert 100 of a 128-wide model: entry 1,380.
+        let idx = 1_380;
+        assert_eq!(inner.models.flat(k(10, 100)), idx);
         assert_eq!(inner.expert_scores[idx], 1.0);
         assert_eq!(inner.decode_reuse[idx], 1.0);
-        assert_eq!(inner.score(10, 100), 1.1);
+        assert_eq!(inner.score(k(10, 100)), 1.1);
     }
 
     #[test]
     fn a_decode_miss_earns_the_decode_credit_but_no_reuse() {
         let mut inner = cache(1);
         occupy(&mut inner, 0, 10, 100, 1, 0.0);
-        inner.record_decode_miss(10, 100);
-        let idx = 10 * inner.experts_per_layer + 100;
+        inner.record_decode_miss(k(10, 100));
+        let idx = inner.models.flat(k(10, 100));
         assert_eq!(inner.expert_scores[idx], 1.0);
         assert_eq!(inner.decode_reuse[idx], 0.0);
-        assert_eq!(inner.score(10, 100), 1.0);
+        assert_eq!(inner.score(k(10, 100)), 1.0);
     }
 
     #[test]
     fn decode_reuse_decays_on_its_own_slower_clock() {
         let mut inner = cache(1);
         occupy(&mut inner, 0, 10, 100, 1, 0.0);
-        inner.record_hit(10, 100);
+        inner.record_hit(k(10, 100));
         inner.decay_scores(0.5);
-        let idx = 10 * inner.experts_per_layer + 100;
+        let idx = inner.models.flat(k(10, 100));
         assert_eq!(inner.expert_scores[idx], 0.5);
         assert_eq!(inner.decode_reuse[idx], 0.99);
     }
@@ -121,8 +144,8 @@ pub(super) mod tests {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 10, 100, 1, 0.0);
         occupy(&mut inner, 1, 10, 101, 1, 0.0);
-        inner.record_hit(10, 100);
-        inner.record_decode_miss(10, 101);
+        inner.record_hit(k(10, 100));
+        inner.record_decode_miss(k(10, 101));
         assert_eq!(best_victim(&inner, 20, &[]), Some((1, (10, 101))));
     }
 
@@ -130,8 +153,8 @@ pub(super) mod tests {
     fn record_prefill_elevate_pushes_the_score_negative() {
         let mut inner = cache(1);
         occupy(&mut inner, 0, 10, 100, 1, 0.0);
-        inner.record_prefill_elevate(10, 100);
-        assert_eq!(inner.score(10, 100), -0.1);
+        inner.record_prefill_elevate(k(10, 100));
+        assert_eq!(inner.score(k(10, 100)), -0.1);
     }
 
     /// An elevation resets the recency score but keeps the decode reuse the
@@ -140,13 +163,13 @@ pub(super) mod tests {
     fn a_prefill_elevation_keeps_the_experts_decode_reuse() {
         let mut inner = cache(1);
         occupy(&mut inner, 0, 10, 100, 1, 0.0);
-        inner.record_hit(10, 100);
-        inner.record_hit(10, 100);
-        inner.record_prefill_elevate(10, 100);
-        let idx = inner.score_idx(10, 100);
+        inner.record_hit(k(10, 100));
+        inner.record_hit(k(10, 100));
+        inner.record_prefill_elevate(k(10, 100));
+        let idx = inner.models.flat(k(10, 100));
         assert_eq!(inner.expert_scores[idx], -0.1);
         assert_eq!(inner.decode_reuse[idx], 2.0);
-        assert_eq!(inner.score(10, 100), 0.1);
+        assert_eq!(inner.score(k(10, 100)), 0.1);
     }
 
     /// **A previous tenant's score is not inherited.** `install` leaves
@@ -158,10 +181,10 @@ pub(super) mod tests {
     fn a_prefill_elevation_does_not_inherit_a_hot_predecessors_score() {
         let mut inner = cache(1);
         occupy(&mut inner, 0, 10, 100, 1, 0.0);
-        let idx = inner.score_idx(10, 100);
+        let idx = inner.models.flat(k(10, 100));
         inner.expert_scores[idx] = 12.0;
-        inner.record_prefill_elevate(10, 100);
-        assert_eq!(inner.score(10, 100), -0.1);
+        inner.record_prefill_elevate(k(10, 100));
+        assert_eq!(inner.score(k(10, 100)), -0.1);
     }
 
     /// The protection, raw, for 48 layers: the floor plus 0.75 × 1/48
@@ -220,9 +243,9 @@ pub(super) mod tests {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 10, 100, 1, 0.0); // dist 43 → five behind
         occupy(&mut inner, 1, 20, 101, 2, 0.0); // dist 5 → about to be used
-        inner.record_prefill_elevate(10, 100);
-        inner.record_prefill_elevate(20, 101);
-        inner.set_warm_backed(&[(10, 100), (20, 101)]);
+        inner.record_prefill_elevate(k(10, 100));
+        inner.record_prefill_elevate(k(20, 101));
+        inner.set_warm_backed(ModelIx::FIRST, &[(10, 100), (20, 101)]);
         let evicted = demand_eviction(&mut inner, 15, 1, &[]);
         assert_eq!(
             evicted,
@@ -242,7 +265,7 @@ pub(super) mod tests {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 20, 100, 1, 0.0); // five ahead of the wave
         occupy(&mut inner, 1, 10, 101, 2, 1.0); // one decode hit, five behind
-        inner.record_prefill_elevate(20, 100);
+        inner.record_prefill_elevate(k(20, 100));
         let evicted = demand_eviction(&mut inner, 15, 1, &[]);
         assert_eq!(
             evicted,
@@ -259,7 +282,7 @@ pub(super) mod tests {
     fn prefill_elevated_expert_is_the_preferred_victim_over_any_hit() {
         let mut inner = cache(3);
         occupy(&mut inner, 0, 10, 100, 1, 0.0); // freshly prefill-elevated
-        inner.record_prefill_elevate(10, 100);
+        inner.record_prefill_elevate(k(10, 100));
         occupy(&mut inner, 1, 10, 101, 2, 0.1); // one prefill hit
         occupy(&mut inner, 2, 10, 102, 3, 1.0); // one decode hit
 

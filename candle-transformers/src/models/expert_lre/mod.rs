@@ -145,6 +145,9 @@ mod blend;
 #[cfg(feature = "cuda")]
 mod boundary;
 mod cache;
+/// Which model an expert belongs to on a card whose cache every model shares:
+/// the `(model, row, expert)` key and each model's place in the flat tables.
+pub mod card_key;
 #[cfg(feature = "cuda")]
 mod cold_wait;
 pub(crate) mod compute;

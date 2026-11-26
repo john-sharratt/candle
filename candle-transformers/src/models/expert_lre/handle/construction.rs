@@ -103,7 +103,9 @@ impl ExpertCache {
                 pinned_layer_count(num_moe_layers),
             );
         }
-        let mut inner = ExpertCacheInner::new(zone, num_moe_layers, experts_per_layer);
+        let mut models = CardModels::default();
+        let model = models.register(num_moe_layers, experts_per_layer);
+        let mut inner = ExpertCacheInner::new(zone, models);
 
         // ── The copy stream: every promotion and relocation, in order ──
         let Device::Cuda(cuda_dev_ref) = device else {
@@ -231,10 +233,11 @@ impl ExpertCache {
                 // The eviction policy weighs what a reload would cost, so it has
                 // to know which experts the warm tier holds before the first
                 // victim is chosen.
-                inner.set_warm_backed(membership);
+                inner.set_warm_backed(model, membership);
                 let mut ring = StartupRing::new(&pad);
                 let targets = StartupTargets {
                     inner: &mut inner,
+                    model,
                     warm: &mut warm,
                     residency: &mut residency,
                     membership,
@@ -465,7 +468,7 @@ impl ExpertCache {
             s.resident_capacity = warm.pinned_slots();
         }
         let resident_capacity = warm.pinned_slots();
-        let host_backed = inner.warm_backed.clone();
+        let host_backed = Arc::clone(&inner.warm_backed[model.index()]);
 
         let pack = Arc::new(pack);
         let pad = Arc::new(pad);
@@ -535,6 +538,7 @@ impl ExpertCache {
         let pinned_slots = pinned_layer_count(num_moe_layers) * experts_per_layer;
         let state = PipelineState::new(
             inner,
+            model,
             device.clone(),
             copy_stream,
             places,

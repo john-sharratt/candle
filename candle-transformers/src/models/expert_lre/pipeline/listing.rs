@@ -122,7 +122,7 @@ impl PipelineState {
     /// instead measured ~1,000 unrouted reads a pass on Flash-Next's ×8 prefill
     /// and covered ~40% of the next row's cold set — those scores are decode's.
     pub(super) fn stage_voted(&mut self, row: usize, votes: &Votes) -> Result<()> {
-        let width = self.inner.experts_per_layer;
+        let width = self.experts();
         // Nearest row first: the stager serves its speculative queue in order.
         for hop in 1..=votes.hops(width) {
             let target = row + hop;

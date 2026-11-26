@@ -9,6 +9,7 @@
 //! driver, so the quiesce always ends.
 
 use super::cache::ZoneFloor;
+use super::card_key::ExpertKey;
 use super::pipeline::PipelineState;
 use super::slot_image::{build_slot_view, slot_offsets};
 use super::types::BoundaryAsk;
@@ -350,7 +351,7 @@ impl PipelineState {
         // displaced survivor is evicted first: the relocation into its slot
         // takes over the slot's bookkeeping.
         let plan = self.inner.retract_zone(target, within);
-        let displaced: Vec<(usize, usize)> = plan
+        let displaced: Vec<ExpertKey> = plan
             .displace
             .iter()
             .filter_map(|&slot_idx| self.inner.evict(slot_idx))
@@ -371,15 +372,15 @@ impl PipelineState {
                 .residency
                 .lock()
                 .map_err(|_| candle::Error::Msg("expert pipeline: residency poisoned".into()))?;
-            for &(row, expert) in &displaced {
-                r.set_vram(row, expert, None);
+            for k in &displaced {
+                r.set_vram(k.row, k.expert, None);
             }
-            for &((row, expert), to) in &moved {
-                r.set_vram(row, expert, Some((to, self.inner.slot_base(to))));
+            for &(k, to) in &moved {
+                r.set_vram(k.row, k.expert, Some((to, self.inner.slot_base(to))));
             }
             for &slot_idx in &plan.evict {
-                if let Some((row, expert)) = self.inner.evict(slot_idx) {
-                    r.set_vram(row, expert, None);
+                if let Some(k) = self.inner.evict(slot_idx) {
+                    r.set_vram(k.row, k.expert, None);
                 }
             }
         }
@@ -548,7 +549,7 @@ impl PipelineState {
     /// which marked it occupied when it built the plan.
     ///
     /// The caller synchronizes the copy stream before any entry names `to`.
-    fn relocate_slot(&mut self, from: usize, to: usize) -> Result<Option<(usize, usize)>> {
+    fn relocate_slot(&mut self, from: usize, to: usize) -> Result<Option<ExpertKey>> {
         let Device::Cuda(cd) = &self.device else {
             return Ok(None);
         };
@@ -556,7 +557,7 @@ impl PipelineState {
             self.inner.zone.release(to);
             return Ok(None);
         };
-        let geom = &self.layer_geometries[key.0];
+        let geom = &self.layer_geometries[key.row];
         let bytes = slot_offsets(geom).3;
         let src = self.inner.slot_base(from);
         let dst = self.inner.slot_base(to);

@@ -20,6 +20,7 @@
 //! - `tests_scores`: tests of score updates and protection.
 //! - `tests_warm`: tests of the reload-tier blend.
 
+use super::card_key::{CardModels, ExpertKey, ModelIx};
 use super::resident::HostBacked;
 #[cfg(feature = "tensor-assert")]
 use super::slot_owners::SlotOwners;
@@ -41,8 +42,13 @@ use std::sync::Arc;
 ///
 /// ```text
 /// Free:     slots[i] = None,  slot_to_key[i] = None
-/// Occupied: slots[i] = Some(ExpertSlot), slot_to_key[i] = Some((moe, exp))
+/// Occupied: slots[i] = Some(ExpertSlot), slot_to_key[i] = Some((model, row, expert))
 /// ```
+///
+/// Every expert is named by its [`ExpertKey`], `(model, row, expert)`, so the
+/// models a card registers share one zone, one set of slots and one victim scan
+/// (`docs/parasite_model.md` §11.2). The flat score tables lie one model after
+/// another, each at its own base ([`CardModels`]).
 ///
 /// ## Where a slot's bytes come from
 ///
@@ -59,43 +65,45 @@ pub struct ExpertCacheInner {
     pub(crate) slots: Vec<Option<ExpertSlot>>,
     /// The addresses, and the free list over them.
     pub(crate) zone: WeightZone,
-    /// Forward lookup: `(moe_layer_idx, expert_idx) -> slot_idx`.
-    pub(crate) key_to_slot: HashMap<(usize, usize), usize>,
+    /// Forward lookup: `(model, row, expert) -> slot_idx`.
+    pub(crate) key_to_slot: HashMap<ExpertKey, usize>,
     /// Per-slot usage timestamp — higher = more recently used.
     /// Kept for recency tie-breaking within score-based eviction.
     pub(crate) last_used: Vec<u32>,
     /// Monotonically increasing counter, bumped on each cache access.
     pub(crate) generation: u32,
-    /// Reverse map: `slot_idx -> (moe_layer_idx, expert_idx)` for eviction.
-    pub(crate) slot_to_key: Vec<Option<(usize, usize)>>,
+    /// Reverse map: `slot_idx -> (model, row, expert)` for eviction.
+    pub(crate) slot_to_key: Vec<Option<ExpertKey>>,
 
     // ── Score-based eviction state ──
-    /// Flat score table: `expert_scores[layer * experts_per_layer + expert]`.
-    /// A lightly-decayed access frequency — higher = more valuable = evicted last.
+    /// The models registered on the card and where each one's experts lie in
+    /// the flat tables below.
+    pub(crate) models: CardModels,
+    /// Flat score table, one entry per expert of every model
+    /// ([`CardModels::flat`]). A lightly-decayed access frequency — higher =
+    /// more valuable = evicted last.
     pub(crate) expert_scores: Vec<f32>,
     /// Long-memory decode reuse, indexed like `expert_scores`: decode hits
     /// only, decayed by [`DECODE_REUSE_DECAY`] a pass. Weighted into
     /// [`Self::score`] by [`DECODE_REUSE_WEIGHT`].
     pub(crate) decode_reuse: Vec<f32>,
-    /// Number of MoE layers (e.g. 48).
-    pub(crate) num_moe_layers: usize,
-    /// Experts per MoE layer (e.g. 128).
-    pub(crate) experts_per_layer: usize,
-    /// Early MoE layers exempt from eviction — [`pinned_layer_count`], fixed
-    /// for the life of the cache and independent of capacity.
+    /// Each model's early MoE rows exempt from eviction — [`pinned_layer_count`]
+    /// of its rows, fixed for the life of the cache and independent of
+    /// capacity. Indexed by model.
     ///
     /// It cannot track the boundary, because these are exactly the experts the
     /// pack and the warm tier do not store: unpinning one would leave it with
     /// nowhere to reload from. The zone's floor ([`minimum_resident_slots`]) is
     /// what guarantees the cache can always afford it.
-    pub(crate) pinned_layers: usize,
-    /// Per `(layer, expert)`: does a host copy hold it that a reload needs no
-    /// pack read for — a resident pinned slot or a pageable warm copy
-    /// (`resident::HostBacked`)? Shared with the stager, which labels the
-    /// pinned slots: written at the startup fill and at pass boundaries.
-    pub(crate) warm_backed: Arc<HostBacked>,
-    /// Flat `layer * experts_per_layer + expert` → did this expert's row route
-    /// it on the row's last visit? Rewritten per row as each is served
+    pinned_rows: Vec<usize>,
+    /// Per model, per `(row, expert)`: does a host copy hold it that a reload
+    /// needs no pack read for — a resident pinned slot or a pageable warm copy
+    /// (`resident::HostBacked`)? Indexed by model; each is shared with that
+    /// model's stager, which labels its pinned slots: written at the startup
+    /// fill and at pass boundaries.
+    pub(crate) warm_backed: Vec<Arc<HostBacked>>,
+    /// Per expert, flat like `expert_scores` → did this expert's row route it
+    /// on the row's last visit? Rewritten per row as each is served
     /// ([`Self::mark_visit`]); what [`RECENCY_PASSES`] splits residents by.
     hit_last: Vec<bool>,
     /// The slot-tenancy tags bucketize's owner check reads, once a device

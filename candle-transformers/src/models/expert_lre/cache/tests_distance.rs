@@ -6,6 +6,8 @@
 //! further back, distance outweighs the small reload-cost tilt, and an expert
 //! its row routed on the last visit goes only after every stale one. A
 //! pinned-layer expert is never a candidate, and ranking alone evicts nothing.
+//! A second model's experts are all maximally behind the forwarding model's
+//! wave, so only their hits keep them.
 
 use super::*;
 
@@ -15,23 +17,24 @@ pub(super) mod tests {
 
     use super::super::tests_floor::tests::cache;
 
-    use super::super::tests_scores::tests::{best_victim, occupy};
+    use super::super::tests_scores::tests::{at, best_victim, k, occupy, occupy_key};
 
     /// The demand-driven choice with every candidate admissible but `protect`:
-    /// rank, then evict and free each victim. Returns the evicted keys.
+    /// rank with the wave at `current` of the fixtures' model, then evict and
+    /// free each victim. Returns the evicted `(row, expert)`s.
     pub(in super::super) fn demand_eviction(
         inner: &mut ExpertCacheInner,
         current: usize,
         count: usize,
         protect: &[usize],
     ) -> Vec<(usize, usize)> {
-        let victims = inner.rank_victims(current, count, |s, _| !protect.contains(&s));
+        let victims = inner.rank_victims(at(current), count, |s, _| !protect.contains(&s));
         victims
             .into_iter()
             .map(|s| {
                 let key = inner.evict(s).expect("a ranked victim holds an expert");
                 inner.zone.release(s);
-                key
+                (key.row, key.expert)
             })
             .collect()
     }
@@ -50,10 +53,10 @@ pub(super) mod tests {
 
         let evicted = demand_eviction(&mut inner, 35, 1, &[]);
         assert_eq!(evicted, vec![(30, 103)], "just-behind expert goes first");
-        assert!(inner.key_to_slot.contains_key(&(10, 101)));
-        assert!(inner.key_to_slot.contains_key(&(20, 102)));
+        assert!(inner.key_to_slot.contains_key(&k(10, 101)));
+        assert!(inner.key_to_slot.contains_key(&k(20, 102)));
         assert!(
-            inner.key_to_slot.contains_key(&(1, 100)),
+            inner.key_to_slot.contains_key(&k(1, 100)),
             "pinned layer was evicted"
         );
         assert_eq!(inner.free_len(), 1, "exactly the demanded count freed");
@@ -81,10 +84,10 @@ pub(super) mod tests {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 32, 100, 1, 1.0); // just behind, pack-only
         occupy(&mut inner, 1, 40, 101, 2, 1.0); // ahead, warm-backed
-        inner.set_warm_backed(&[(40, 101)]);
+        inner.set_warm_backed(ModelIx::FIRST, &[(40, 101)]);
         let evicted = demand_eviction(&mut inner, 35, 1, &[]);
         assert_eq!(evicted, vec![(32, 100)], "the expert just behind goes");
-        assert!(inner.key_to_slot.contains_key(&(40, 101)));
+        assert!(inner.key_to_slot.contains_key(&k(40, 101)));
     }
 
     #[test]
@@ -98,7 +101,7 @@ pub(super) mod tests {
         occupy(&mut inner, 2, 33, 102, 3, 0.4); // L-2, next best → victim
         let evicted = demand_eviction(&mut inner, 35, 1, &[0]);
         assert_eq!(evicted, vec![(33, 102)], "protected hit slot spared");
-        assert!(inner.key_to_slot.contains_key(&(30, 100)));
+        assert!(inner.key_to_slot.contains_key(&k(30, 100)));
     }
 
     #[test]
@@ -112,7 +115,7 @@ pub(super) mod tests {
         occupy(&mut inner, 2, 37, 102, 3, 4.0);
         let evicted = demand_eviction(&mut inner, 35, 1, &[0]);
         assert_eq!(evicted, vec![(20, 101)], "in-flight install spared");
-        assert!(inner.key_to_slot.contains_key(&(36, 100)));
+        assert!(inner.key_to_slot.contains_key(&k(36, 100)));
     }
 
     #[test]
@@ -124,7 +127,10 @@ pub(super) mod tests {
         occupy(&mut inner, 1, 10, 101, 2, 0.2);
         let evicted = demand_eviction(&mut inner, 20, 5, &[]);
         assert_eq!(evicted, vec![(10, 101)]);
-        assert!(inner.key_to_slot.contains_key(&(1, 100)), "pinned survives");
+        assert!(
+            inner.key_to_slot.contains_key(&k(1, 100)),
+            "pinned survives"
+        );
     }
 
     #[test]
@@ -157,7 +163,7 @@ pub(super) mod tests {
         occupy(&mut inner, 0, 11, 100, 1, 1.0); // L+1
         occupy(&mut inner, 1, 7, 101, 2, 1.0); // L-3
         occupy(&mut inner, 2, 9, 102, 3, 1.0); // L-1
-        assert_eq!(inner.rank_victims(10, 3, |_, _| true), vec![2, 1, 0]);
+        assert_eq!(inner.rank_victims(at(10), 3, |_, _| true), vec![2, 1, 0]);
     }
 
     /// **The eviction front moves with the wave, through the wrap.** At the
@@ -170,8 +176,8 @@ pub(super) mod tests {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 47, 100, 1, 1.0);
         occupy(&mut inner, 1, 10, 101, 2, 1.0);
-        assert_eq!(inner.rank_victims(2, 2, |_, _| true), vec![0, 1]);
-        assert_eq!(inner.rank_victims(30, 2, |_, _| true), vec![1, 0]);
+        assert_eq!(inner.rank_victims(at(2), 2, |_, _| true), vec![0, 1]);
+        assert_eq!(inner.rank_victims(at(30), 2, |_, _| true), vec![1, 0]);
     }
 
     /// **Distance steers, frequency decides.** A hot expert just behind the
@@ -184,17 +190,17 @@ pub(super) mod tests {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 29, 100, 1, 9.0); // L-1, hot
         occupy(&mut inner, 1, 31, 101, 2, 0.2); // L+1, near cold
-        assert_eq!(inner.rank_victims(30, 1, |_, _| true), vec![1]);
+        assert_eq!(inner.rank_victims(at(30), 1, |_, _| true), vec![1]);
 
         let mut inner = cache(2);
         occupy(&mut inner, 0, 29, 100, 1, 1.0); // L-1
         occupy(&mut inner, 1, 31, 101, 2, 0.3); // L+1
-        assert_eq!(inner.rank_victims(30, 1, |_, _| true), vec![0]);
+        assert_eq!(inner.rank_victims(at(30), 1, |_, _| true), vec![0]);
 
         let mut inner = cache(2);
         occupy(&mut inner, 0, 10, 100, 1, 4.0); // L-20, hot
         occupy(&mut inner, 1, 31, 101, 2, 0.0); // L+1, never used
-        assert_eq!(inner.rank_victims(30, 1, |_, _| true), vec![1]);
+        assert_eq!(inner.rank_victims(at(30), 1, |_, _| true), vec![1]);
     }
 
     #[test]
@@ -216,10 +222,10 @@ pub(super) mod tests {
         occupy(&mut inner, 0, 10, 50, 1, 1.0); // just hit
         occupy(&mut inner, 1, 10, 51, 2, 3.0); // stale, hot
         occupy(&mut inner, 2, 20, 52, 3, 5.0); // stale, hotter
-        inner.mark_visit(10, &[50]);
-        assert_eq!(inner.rank_victims(30, 3, |_, _| true), vec![1, 2, 0]);
-        inner.mark_visit(10, &[51]);
-        assert_eq!(inner.rank_victims(30, 1, |_, _| true), vec![0]);
+        inner.mark_visit(ModelIx::FIRST, 10, &[50]);
+        assert_eq!(inner.rank_victims(at(30), 3, |_, _| true), vec![1, 2, 0]);
+        inner.mark_visit(ModelIx::FIRST, 10, &[51]);
+        assert_eq!(inner.rank_victims(at(30), 1, |_, _| true), vec![0]);
     }
 
     /// Recency runs above the reload tier: a pack-only stale expert goes before
@@ -229,9 +235,9 @@ pub(super) mod tests {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 10, 50, 1, 1.0); // warm, just hit
         occupy(&mut inner, 1, 10, 51, 2, 0.0); // pack-only, stale
-        inner.set_warm_backed(&[(10, 50)]);
-        inner.mark_visit(10, &[50]);
-        assert_eq!(inner.rank_victims(30, 2, |_, _| true), vec![1, 0]);
+        inner.set_warm_backed(ModelIx::FIRST, &[(10, 50)]);
+        inner.mark_visit(ModelIx::FIRST, 10, &[50]);
+        assert_eq!(inner.rank_victims(at(30), 2, |_, _| true), vec![1, 0]);
     }
 
     /// Within each recency pass both tiers share one order: of four equally
@@ -244,9 +250,9 @@ pub(super) mod tests {
         occupy(&mut inner, 1, 10, 51, 2, 0.0); // warm, just hit
         occupy(&mut inner, 2, 10, 52, 3, 0.0); // pack, stale
         occupy(&mut inner, 3, 10, 53, 4, 0.0); // pack, just hit
-        inner.set_warm_backed(&[(10, 50), (10, 51)]);
-        inner.mark_visit(10, &[51, 53]);
-        assert_eq!(inner.rank_victims(30, 4, |_, _| true), vec![0, 2, 1, 3]);
+        inner.set_warm_backed(ModelIx::FIRST, &[(10, 50), (10, 51)]);
+        inner.mark_visit(ModelIx::FIRST, 10, &[51, 53]);
+        assert_eq!(inner.rank_victims(at(30), 4, |_, _| true), vec![0, 2, 1, 3]);
     }
 
     /// A visit marks exactly the experts it routed in its row, clearing the
@@ -254,11 +260,15 @@ pub(super) mod tests {
     #[test]
     fn a_visit_marks_its_routed_experts_and_clears_the_rest() {
         let mut inner = cache(1);
-        inner.mark_visit(10, &[3, 7]);
-        inner.mark_visit(11, &[3]);
-        inner.mark_visit(10, &[7, 9]);
-        let row10: Vec<usize> = (0..12).filter(|&e| inner.hit_last_visit(10, e)).collect();
-        let row11: Vec<usize> = (0..12).filter(|&e| inner.hit_last_visit(11, e)).collect();
+        inner.mark_visit(ModelIx::FIRST, 10, &[3, 7]);
+        inner.mark_visit(ModelIx::FIRST, 11, &[3]);
+        inner.mark_visit(ModelIx::FIRST, 10, &[7, 9]);
+        let row10: Vec<usize> = (0..12)
+            .filter(|&e| inner.hit_last_visit(k(10, e)))
+            .collect();
+        let row11: Vec<usize> = (0..12)
+            .filter(|&e| inner.hit_last_visit(k(11, e)))
+            .collect();
         assert_eq!((row10, row11), (vec![7, 9], vec![3]));
     }
 
@@ -268,9 +278,35 @@ pub(super) mod tests {
         let mut inner = cache(2);
         occupy(&mut inner, 0, 10, 50, 5, 5.0);
         occupy(&mut inner, 1, 30, 51, 0, 0.0);
-        assert_eq!(inner.rank_victims(20, 2, |_, _| true), vec![1, 0]);
-        assert!(inner.key_to_slot.contains_key(&(10, 50)));
-        assert!(inner.key_to_slot.contains_key(&(30, 51)));
+        assert_eq!(inner.rank_victims(at(20), 2, |_, _| true), vec![1, 0]);
+        assert!(inner.key_to_slot.contains_key(&k(10, 50)));
+        assert!(inner.key_to_slot.contains_key(&k(30, 51)));
         assert_eq!(inner.free_len(), 0);
+    }
+
+    /// **Another model's experts are maximally behind the forwarding model's
+    /// wave**, `n − 1` of their own rows, so they get no position-based
+    /// protection (`docs/parasite_model.md` §11.3): at equal scores the second
+    /// model's expert goes before the forwarding model's expert about to run,
+    /// and the two models' row 10 are two keys, not one.
+    #[test]
+    fn a_second_models_experts_are_maximally_behind() {
+        let mut models = CardModels::one(48, 128);
+        let second = models.register(40, 256);
+        let mut inner = ExpertCacheInner::new(WeightZone::new(1 << 30, 4096, 2, 2, 0), models);
+        occupy(&mut inner, 0, 11, 7, 1, 1.0); // the forwarding model's L+1
+        occupy_key(&mut inner, 1, ExpertKey::new(second, 11, 7), 2, 1.0);
+        assert_eq!(
+            inner.forward_distance(ExpertKey::new(second, 11, 7), at(10)),
+            39
+        );
+        assert_eq!(inner.forward_distance(k(11, 7), at(10)), 1);
+        assert_eq!(inner.rank_victims(at(10), 2, |_, _| true), vec![1, 0]);
+        assert_eq!(inner.key_to_slot.len(), 2);
+        assert_eq!(
+            inner.pinned_slots(),
+            PINNED_LAYERS * 128 + PINNED_LAYERS * 256,
+            "each model's own pinned rows, at its own width"
+        );
     }
 }

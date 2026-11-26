@@ -103,7 +103,7 @@ impl PipelineState {
                 .iter()
                 .map(|&e| (e, summary[e] & SUMMARY_COUNT, decode.contains(&e)))
                 .collect();
-            t.push(row, &routed, row < self.inner.pinned_layers);
+            t.push(row, &routed, row < self.pinned_rows());
         }
         // Claims are judged, and the row's visit recorded, by decode routing
         // alone: a prompt launch routes most of the row, so it would count
@@ -124,7 +124,7 @@ impl PipelineState {
                     s.victim_tag_regretted[t] += v.tag_regretted[t];
                 }
             }
-            self.inner.mark_visit(row, &expert_ids);
+            self.inner.mark_visit(self.model, row, &expert_ids);
         }
 
         // ── Read-ahead precision: of the experts read ahead for this row, the
@@ -146,7 +146,7 @@ impl PipelineState {
             }
             for &eid in &spec_for_layer {
                 if expert_ids.binary_search(&eid).is_ok() {
-                    self.inner.record_prediction_hit(row, eid);
+                    self.inner.record_prediction_hit(self.key(row, eid));
                 }
             }
         }
@@ -229,16 +229,17 @@ impl PipelineState {
         let prompt_room =
             self.inner.zone.limit() * PROMPT_ROOM.1 >= self.inner.total_experts() * PROMPT_ROOM.0;
         for &e in &expert_ids {
-            match self.inner.key_to_slot.get(&(row, e)) {
+            let key = self.key(row, e);
+            match self.inner.key_to_slot.get(&key) {
                 Some(&slot) if self.inner.slots[slot].is_some() => {
                     self.inner.promote(slot);
                     // A decode row's reuse of this expert is near-certain from
                     // one step to the next; a prefill row's is close to zero, so
                     // the two must not bid for residency on equal footing.
                     if decode.contains(&e) {
-                        self.inner.record_hit(row, e);
+                        self.inner.record_hit(key);
                     } else {
-                        self.inner.record_prefill_hit(row, e);
+                        self.inner.record_prefill_hit(key);
                     }
                     hits += 1;
                 }
@@ -251,9 +252,9 @@ impl PipelineState {
                     // eviction.
                     let routed_by_decode = decode.contains(&e);
                     if routed_by_decode {
-                        self.inner.record_decode_miss(row, e);
+                        self.inner.record_decode_miss(key);
                     } else {
-                        self.inner.record_prefill_elevate(row, e);
+                        self.inner.record_prefill_elevate(key);
                     }
                     if !self.promoting.contains(&(row, e)) {
                         unslotted += 1;
@@ -273,8 +274,8 @@ impl PipelineState {
             .capacity()
             .saturating_sub(self.inner.pinned_slots());
         let mut marginal = 0usize;
-        if row >= self.inner.pinned_layers {
-            let base = row * self.inner.experts_per_layer;
+        if row >= self.pinned_rows() {
+            let base = row * self.experts();
             for &e in &expert_ids {
                 marginal += usize::from(self.marginal.caught(base + e, capacity));
             }
@@ -329,11 +330,11 @@ impl PipelineState {
             // back (`trim_ring`).
             if let Some(ring) = &self.promo_ring {
                 let empty_slots = self.inner.free_len() + self.empty_offers(ring);
-                let width = self.inner.experts_per_layer.max(1);
+                let width = self.experts().max(1);
                 let absent: usize = (row + 1..(row + 1 + RING_HORIZON).min(self.num_moe_layers))
                     .map(|r| {
                         (0..width)
-                            .filter(|&e| !self.inner.key_to_slot.contains_key(&(r, e)))
+                            .filter(|&e| !self.inner.key_to_slot.contains_key(&self.key(r, e)))
                             .count()
                     })
                     .sum();
@@ -379,7 +380,7 @@ impl PipelineState {
             // prompt ran 4% faster with it.
             let t = profile_now();
             if !msg.prefill_width && (decode.len() == expert_ids.len() || !prompt_room) {
-                let wide = expert_ids.len() * 2 >= self.inner.experts_per_layer.max(1);
+                let wide = expert_ids.len() * 2 >= self.experts().max(1);
                 // Invocations the device has begun past this one, as of now.
                 let begun_past = self.clock.latest_started().saturating_sub(msg.ticket);
                 self.predict_rows(row, &expert_ids, votes.as_ref(), wide, begun_past)?;
