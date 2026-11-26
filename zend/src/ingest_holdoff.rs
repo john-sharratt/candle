@@ -71,6 +71,13 @@ impl Holdoff {
         let until = self.until.lock().unwrap_or_else(|e| e.into_inner());
         until.is_some_and(|u| now < u)
     }
+
+    /// Whether only a failure's cooldown leaves units at `now`: ingest is on
+    /// here and the cooldown has not run out — a hold that ends by itself,
+    /// which a pass can wait out, where ingest off never does.
+    pub fn cooling_down(&self, now: Instant) -> bool {
+        self.enabled() && self.leaves(now)
+    }
 }
 
 impl Default for Holdoff {
@@ -145,6 +152,21 @@ mod tests {
         assert_eq!(h.cool_down(t0), later + FAILURE_COOLDOWN);
         assert!(h.leaves(t0 + FAILURE_COOLDOWN + Duration::from_secs(60)));
         assert!(!h.leaves(later + FAILURE_COOLDOWN));
+    }
+
+    /// **Only a running cooldown is one a pass waits out**: ingest off is
+    /// never, and a cooldown stops being one when it ends.
+    #[test]
+    fn only_a_running_cooldown_is_waited_out() {
+        let h = Holdoff::new();
+        let t0 = Instant::now();
+        assert!(!h.cooling_down(t0));
+        h.cool_down(t0);
+        assert!(h.cooling_down(t0));
+        assert!(!h.cooling_down(t0 + FAILURE_COOLDOWN));
+        h.set_enabled(false);
+        assert!(h.leaves(t0));
+        assert!(!h.cooling_down(t0));
     }
 
     #[test]
