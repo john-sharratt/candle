@@ -102,6 +102,9 @@ impl Runtime {
     /// stopping) ends it. Idempotent — a character whose task is already
     /// running keeps it.
     pub fn spawn_character(self: &Arc<Self>, npc_id: u64) {
+        // A drone at rest is held before anything of its is scheduled: its
+        // conversations answer nobody, and its loop takes no turn.
+        self.settle_rest(npc_id);
         // What waited on its pair threads while it ran nowhere, or elsewhere:
         // a `Told` pulse is not kept, so nothing else would answer it.
         self.rescan_talks(npc_id);

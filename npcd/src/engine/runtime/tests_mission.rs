@@ -620,6 +620,53 @@ pub(super) mod tests {
         assert!(rt.nudge_for(1).is_some());
     }
 
+    /// **A drone started here is at rest before its first turn**, not from
+    /// the world's next moment: started, with nothing waiting and no moment
+    /// run, it is held and takes no turn whatever reaches it; started carrying
+    /// a mission, it is not.
+    #[tokio::test]
+    async fn a_drone_is_at_rest_from_the_moment_it_starts() {
+        use crate::engine::event::{EventKind, Salience};
+        use crate::engine::mission::{Mission, Origin, Todo};
+        use crate::engine::mission_gen::world::Draw;
+        let rt = vaulted();
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::None));
+        embody(&rt, 1, "m1", "green-room");
+        embody(&rt, 2, "m2", "green-room");
+        waiting(&rt, 1);
+        waiting(&rt, 2);
+        hosted.with_sim(|s| {
+            s.missions.post(
+                Mission::new(
+                    "Read the board.",
+                    vec![Todo::new("go to the dispatch room")],
+                    Origin::Lodged { by: "op".into() },
+                ),
+                Some("m2"),
+            )
+        });
+        rt.assign_work(&hosted);
+        assert!(!rt.scheduler.is_resting(1), "no moment has run");
+
+        rt.spawn_character(1);
+        rt.spawn_character(2);
+        assert!(rt.scheduler.is_resting(1));
+        assert!(!rt.scheduler.is_resting(2), "it carries a mission");
+        rt.scheduler.deliver(
+            1,
+            0,
+            Salience::URGENT,
+            EventKind::Description {
+                text: "Zen came in.".into(),
+            },
+        );
+        assert!(
+            rt.scheduler.begin_tick(1).is_none(),
+            "a drone at rest thought"
+        );
+    }
+
     /// **Work for a suspended drone waits for it.** It is no hand: a mission
     /// for whoever is free passes it by, and one set for it by name stays on
     /// the table until it is resumed.

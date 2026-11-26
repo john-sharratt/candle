@@ -14,10 +14,14 @@
 //! - `discord/webhook/<channel_id>` — the persona webhook of one of those
 //!   channels, which a character without a bot of its own speaks through. Its
 //!   token is sealed for the record ([`crate::discord::seal::Sealer::seal_for`]):
-//!   whoever holds it posts in that channel under any name.
+//!   whoever holds it posts in that channel under any name;
+//! - `discord/character/<npc>` — the channel of a character without a bot of
+//!   its own, `#<name>`, which everyone may read and write in: every person's
+//!   DM with the character is posted there, and a post there is a message to
+//!   it. Its `last_seen_discord` is the channel's, which its DMs share.
 //!
-//! Setting another server, or none, forgets every thread and webhook of the
-//! last: they are its channels.
+//! Setting another server, or none, forgets every thread, webhook and
+//! character's channel of the last: they are its channels.
 
 use std::collections::BTreeMap;
 
@@ -36,15 +40,18 @@ pub const THREAD_PREFIX: &str = "discord/thread/";
 /// Where the webhooks are among a world's records.
 pub const HOOK_PREFIX: &str = "discord/webhook/";
 
-/// Where the channels private threads are made under are among a world's
-/// records: `#dms`, by name.
-pub const PARENT_PREFIX: &str = "discord/parent/";
+/// Where the characters' own channels are among a world's records, by
+/// character.
+pub const CHARACTER_PREFIX: &str = "discord/character/";
 
-/// A channel private threads are made under.
+/// The channel of a character without a bot of its own, shared by everyone
+/// who talks to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Parent {
+pub struct Own {
     pub channel_id: u64,
+    /// The id of the last Discord message taken in from the channel.
+    pub last_seen_discord: u64,
 }
 
 /// A world's Discord server. Read past fields it does not name: the record
@@ -66,8 +73,8 @@ pub enum Kind {
     Channel,
     /// A named group: a text channel only its members see.
     Group,
-    /// A person and a character without a bot of its own: a private thread
-    /// under `#dms`.
+    /// A person and a character without a bot of its own, posted in the
+    /// character's own channel ([`Own`]), which its other DMs share.
     Dm,
     /// A channel a person made in the server: a channel of the world, with
     /// the whole cast on it ([`super::rooms`]).
@@ -78,7 +85,7 @@ pub enum Kind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mirrored {
-    /// The channel, or the private thread, it is posted in.
+    /// The channel it is posted in.
     pub channel_id: u64,
     pub kind: Kind,
     /// The seq of the last message of the thread posted to the channel.
@@ -89,10 +96,6 @@ pub struct Mirrored {
     pub mirrored_part: u32,
     /// The id of the last Discord message taken in from the channel.
     pub last_seen_discord: u64,
-    /// For a private thread, the channel it is under — whose webhook posts
-    /// into it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent: Option<u64>,
     /// A group nobody remains on: kept read-only, and posted to no more.
     #[serde(default, skip_serializing_if = "is_false")]
     pub archived: bool,
@@ -116,15 +119,8 @@ impl Mirrored {
             mirrored_through: from,
             mirrored_part: 0,
             last_seen_discord: seen,
-            parent: None,
             archived: false,
         }
-    }
-
-    /// The channel whose webhook posts here: its parent, for a private
-    /// thread, and itself otherwise.
-    pub fn hook_channel(&self) -> u64 {
-        self.parent.unwrap_or(self.channel_id)
     }
 }
 
@@ -143,7 +139,7 @@ pub struct Mirror {
     guild: Option<Guild>,
     threads: BTreeMap<String, Mirrored>,
     hooks: BTreeMap<u64, Hook>,
-    parents: BTreeMap<String, Parent>,
+    own: BTreeMap<u64, Own>,
 }
 
 /// The record name of thread `thread`'s mirror.
@@ -181,8 +177,8 @@ impl Mirror {
     }
 
     /// Set the world's server, or take it away. Another server than the one
-    /// set forgets every mirrored thread and webhook: they were the last one's
-    /// channels.
+    /// set forgets every mirrored thread, webhook and character's channel:
+    /// they were the last one's channels.
     pub fn set_guild(&mut self, guild: Option<Guild>) {
         let same = matches!(
             (&self.guild, &guild),
@@ -191,34 +187,38 @@ impl Mirror {
         if !same {
             self.threads.clear();
             self.hooks.clear();
-            self.parents.clear();
+            self.own.clear();
         }
         self.guild = guild;
     }
 
-    /// The channel called `name` that private threads are made under.
-    pub fn parent(&self, name: &str) -> Option<u64> {
-        self.parents.get(name).map(|p| p.channel_id)
+    /// Character `npc`'s own channel.
+    pub fn own(&self, npc: u64) -> Option<Own> {
+        self.own.get(&npc).copied()
     }
 
-    /// Record channel `channel_id` as the one called `name` that private
-    /// threads are made under.
-    pub fn put_parent(&mut self, name: &str, channel_id: u64) {
-        self.parents.insert(name.to_string(), Parent { channel_id });
+    /// Write character `npc`'s own channel.
+    pub fn put_own(&mut self, npc: u64, own: Own) {
+        self.own.insert(npc, own);
     }
 
-    /// Every channel private threads are made under, by name.
-    pub fn parents(&self) -> Vec<(String, u64)> {
-        self.parents
+    /// The character whose own channel is `channel_id`.
+    pub fn own_by_channel(&self, channel_id: u64) -> Option<(u64, Own)> {
+        self.own
             .iter()
-            .map(|(name, p)| (name.clone(), p.channel_id))
-            .collect()
+            .find(|(_, o)| o.channel_id == channel_id)
+            .map(|(npc, o)| (*npc, *o))
     }
 
-    /// Forget the channel called `name`: the server no longer has it, so the
-    /// next private thread under that name makes it again.
-    pub fn remove_parent(&mut self, name: &str) {
-        self.parents.remove(name);
+    /// Every character's own channel, by character.
+    pub fn owns(&self) -> Vec<(u64, Own)> {
+        self.own.iter().map(|(npc, o)| (*npc, *o)).collect()
+    }
+
+    /// Forget character `npc`'s own channel: the server no longer has it, so
+    /// the next reconcile makes it again.
+    pub fn remove_own(&mut self, npc: u64) {
+        self.own.remove(&npc);
     }
 
     /// Forget thread `thread`'s mirror: the channel it was posted in is gone.
@@ -244,11 +244,12 @@ impl Mirror {
             .collect()
     }
 
-    /// The thread mirrored into Discord channel `channel_id`.
+    /// The thread mirrored into Discord channel `channel_id`, which is its
+    /// alone: a DM shares its character's channel ([`Self::own_by_channel`]).
     pub fn by_channel(&self, channel_id: u64) -> Option<(String, Mirrored)> {
         self.threads
             .iter()
-            .find(|(_, m)| m.channel_id == channel_id)
+            .find(|(_, m)| m.channel_id == channel_id && m.kind != Kind::Dm)
             .map(|(id, m)| (id.clone(), *m))
     }
 
@@ -287,13 +288,13 @@ impl Mirror {
                 serde_json::to_value(h).expect("a webhook serialises"),
             )
         });
-        let parents = self.parents.iter().map(|(name, p)| {
+        let own = self.own.iter().map(|(npc, o)| {
             (
-                format!("{PARENT_PREFIX}{name}"),
-                serde_json::to_value(p).expect("a parent serialises"),
+                format!("{CHARACTER_PREFIX}{npc}"),
+                serde_json::to_value(o).expect("a character's channel serialises"),
             )
         });
-        guild.chain(threads).chain(hooks).chain(parents).collect()
+        guild.chain(threads).chain(hooks).chain(own).collect()
     }
 
     /// The server, threads and webhooks `records` hold, in place of these:
@@ -314,7 +315,10 @@ impl Mirror {
             .into_iter()
             .filter_map(|(id, h)| Some((id.parse().ok()?, h)))
             .collect();
-        self.parents = decoded(records, PARENT_PREFIX);
+        self.own = decoded::<Own>(records, CHARACTER_PREFIX)
+            .into_iter()
+            .filter_map(|(npc, o)| Some((npc.parse().ok()?, o)))
+            .collect();
     }
 }
 
@@ -351,13 +355,19 @@ mod tests {
     }
 
     /// **A channel a person made is a `room`**, and a channel forgotten, or a
-    /// parent, is gone from the records.
+    /// character's own, is gone from the records.
     #[test]
     fn a_room_is_recorded_and_forgotten() {
         let mut m = Mirror::default();
         m.set_guild(Some(guild(600)));
         m.put_thread("th9", Mirrored::new(7300, Kind::Room, 0, 5));
-        m.put_parent("dms", 7001);
+        m.put_own(
+            7,
+            Own {
+                channel_id: 7001,
+                last_seen_discord: 4,
+            },
+        );
         assert_eq!(
             m.records().get("discord/thread/th9"),
             Some(
@@ -365,9 +375,18 @@ mod tests {
                           "last_seen_discord": 5 })
             )
         );
-        assert_eq!(m.parents(), [("dms".to_string(), 7001)]);
+        assert_eq!(
+            m.owns(),
+            [(
+                7,
+                Own {
+                    channel_id: 7001,
+                    last_seen_discord: 4
+                }
+            )]
+        );
         m.remove_thread("th9");
-        m.remove_parent("dms");
+        m.remove_own(7);
         assert_eq!(m.records().len(), 1);
     }
 
@@ -375,25 +394,49 @@ mod tests {
         Mirrored::new(channel_id, Kind::Channel, 3, 900)
     }
 
-    /// **A private thread names its parent, and an archived group says so**;
-    /// neither field is written when it says nothing.
+    /// **An archived group says so**, and nothing says it when it is not.
     #[test]
-    fn a_private_threads_parent_and_an_archive_are_written_only_when_set() {
-        let mut dm = Mirrored::new(7100, Kind::Dm, 0, 1);
-        dm.parent = Some(7001);
+    fn an_archive_is_written_only_when_set() {
+        let dm = Mirrored::new(7100, Kind::Dm, 0, 1);
         let mut group = Mirrored::new(7200, Kind::Group, 2, 3);
         group.archived = true;
         assert_eq!(
             serde_json::to_value(dm).unwrap(),
             json!({ "channel_id": 7100, "kind": "dm", "mirrored_through": 0,
-                    "last_seen_discord": 1, "parent": 7001 })
+                    "last_seen_discord": 1 })
         );
         assert_eq!(
             serde_json::to_value(group).unwrap(),
             json!({ "channel_id": 7200, "kind": "group", "mirrored_through": 2,
                     "last_seen_discord": 3, "archived": true })
         );
-        assert_eq!((dm.hook_channel(), group.hook_channel()), (7001, 7200));
+    }
+
+    /// **A character's channel is `discord/character/<npc>`, and every DM
+    /// with the character is posted in it**: the channel answers for the
+    /// character, never for one of its DMs.
+    #[test]
+    fn a_characters_channel_is_its_own_record_and_its_dms_share_it() {
+        let mut m = Mirror::default();
+        m.set_guild(Some(guild(600)));
+        let wick = Own {
+            channel_id: 7100,
+            last_seen_discord: 9,
+        };
+        m.put_own(2305926561968248827, wick);
+        m.put_thread("dm:a", Mirrored::new(7100, Kind::Dm, 4, 0));
+        m.put_thread("dm:b", Mirrored::new(7100, Kind::Dm, 6, 0));
+        assert_eq!(
+            m.records().get("discord/character/2305926561968248827"),
+            Some(&json!({ "channel_id": 7100, "last_seen_discord": 9 }))
+        );
+        assert_eq!(m.own_by_channel(7100), Some((2305926561968248827, wick)));
+        assert_eq!(m.by_channel(7100), None, "no one DM is the channel");
+        let mut back = Mirror::default();
+        back.take_in(&m.records());
+        assert_eq!(back, m);
+        m.set_guild(Some(guild(601)));
+        assert!(m.owns().is_empty());
     }
 
     /// **The server is `discord/guild`, a thread `discord/thread/<thid>` and
@@ -465,14 +508,6 @@ mod tests {
         back.put_thread("stale", mirrored(1));
         back.take_in(&records);
         assert_eq!(back, m);
-
-        m.put_parent("dms", 7001);
-        assert_eq!(
-            m.records().get("discord/parent/dms"),
-            Some(&json!({ "channel_id": 7001 }))
-        );
-        back.take_in(&m.records());
-        assert_eq!(back.parent("dms"), Some(7001));
     }
 
     /// **Another server forgets the last one's channels**, and the same one

@@ -3,8 +3,8 @@
 //!
 //! The server is the world's, and what its people make in it is the world's
 //! too: every text channel the mirror did not make itself — not
-//! `#the-channel`, a group's, or the channel private threads are made under —
-//! is a **room**, a standing channel of the world named `#<channel>`, with
+//! `#the-channel`, a group's, or a character's own — is a **room**, a
+//! standing channel of the world named `#<channel>`, with
 //! the whole cast on it, as the cast is on the world's own channel. Its
 //! description is the one Discord gives the channel, and it is what tells a
 //! character what the room is for: each character reads its channels with
@@ -21,8 +21,8 @@
 //!   came into the world since is brought on at its end;
 //! - a room whose channel is gone is closed and forgotten: nobody is offered
 //!   it, and what was said there is kept, as for a closed group;
-//! - a channel private threads were made under that is gone is forgotten, so
-//!   the next private thread makes it again.
+//! - a character's own channel that is gone is forgotten, so the next
+//!   reconcile makes it again.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -58,7 +58,7 @@ fn cast(hosted: &Hosted) -> Vec<Who> {
 }
 
 /// Read `guild`'s channels as `bot`, its listener, and keep `hosted`'s rooms,
-/// descriptions and parents as they stand.
+/// descriptions and characters' channels as they stand.
 pub async fn reconcile(a: &Authored, bot: &Online, hosted: &Hosted, guild: &Guild) {
     let channels = match a.discord.guild_channels(&bot.token, guild.guild_id).await {
         Ok(channels) => channels,
@@ -108,9 +108,9 @@ fn keep(
     cast: &[Who],
 ) -> Vec<((String, u64), bool)> {
     let mut changed = Vec::new();
-    for (name, channel_id) in hosted.mirror(|m| m.parents()) {
-        if !standing.contains_key(&channel_id) {
-            hosted.with_mirror(|m| m.remove_parent(&name));
+    for (npc, own) in hosted.mirror(|m| m.owns()) {
+        if !standing.contains_key(&own.channel_id) {
+            hosted.with_mirror(|m| m.remove_own(npc));
         }
     }
     for (thread, mirrored) in hosted.mirror(|m| m.threads()) {
@@ -129,18 +129,18 @@ fn keep(
                 hosted.with_mirror(|m| m.remove_thread(&thread));
                 changed.push(((thread, mirrored.channel_id), true));
             }
-            // A private thread is no channel of the server's, and a group's
-            // channel deleted by hand is the group's to answer for.
+            // A group's channel deleted by hand is the group's to answer for,
+            // and a DM's is its character's (above).
             (None, _) => {}
         }
     }
-    let parents: BTreeSet<u64> = hosted
-        .mirror(|m| m.parents())
+    let owns: BTreeSet<u64> = hosted
+        .mirror(|m| m.owns())
         .into_iter()
-        .map(|(_, id)| id)
+        .map(|(_, o)| o.channel_id)
         .collect();
     for c in standing.values() {
-        if parents.contains(&c.id) || hosted.mirror(|m| m.by_channel(c.id)).is_some() {
+        if owns.contains(&c.id) || hosted.mirror(|m| m.by_channel(c.id)).is_some() {
             continue;
         }
         let thread = hosted.with_sim(|s| {
@@ -162,6 +162,7 @@ fn keep(
 
 #[cfg(test)]
 mod tests {
+    use super::super::record::Own;
     use super::*;
     use crate::sim::phone::CHANNEL;
 
@@ -176,8 +177,11 @@ mod tests {
         }
     }
 
+    /// Wick's character id.
+    const WICK: u64 = 2;
+
     /// A world with Zen and Wick on its channel, `#the-channel` recorded as
-    /// channel 7000 and `#dms` as 7001.
+    /// channel 7000 and Wick's own, `#wick`, as 7001.
     fn world() -> Hosted {
         let hosted = Hosted::load("creators-vault", ROOMS).unwrap();
         let open = hosted.with_sim(|s| {
@@ -186,7 +190,13 @@ mod tests {
         });
         hosted.with_mirror(|m| {
             m.put_thread(&open, Mirrored::new(7000, Kind::Channel, 0, 1));
-            m.put_parent("dms", 7001);
+            m.put_own(
+                WICK,
+                Own {
+                    channel_id: 7001,
+                    last_seen_discord: 1,
+                },
+            );
         });
         hosted
     }
@@ -218,7 +228,7 @@ mod tests {
         let hosted = world();
         let made = [
             channel(7000, "the-channel", Some("Anything for everyone")),
-            channel(7001, "dms", None),
+            channel(7001, "wick", None),
             channel(7300, "research", Some("Findings, sources, open questions")),
             channel(7301, "ops", None),
         ];
@@ -247,13 +257,14 @@ mod tests {
 
     /// **A room follows its channel**: renamed and described again with it,
     /// a newcomer to the world brought on at its end, and closed and
-    /// forgotten when the channel goes — as is a parent whose channel went.
+    /// forgotten when the channel goes — as is a character's own channel,
+    /// forgotten when it went.
     #[test]
     fn a_room_follows_its_channel_and_closes_with_it() {
         let hosted = world();
         let first = [
             channel(7300, "research", Some("Findings")),
-            channel(7001, "dms", None),
+            channel(7001, "wick", None),
         ];
         let standing: BTreeMap<u64, &GuildChannel> = first.iter().map(|c| (c.id, c)).collect();
         keep(&hosted, &standing, &cast(&hosted));
@@ -263,7 +274,10 @@ mod tests {
             s.threads
                 .join_channel(CHANNEL, &Who::new("npc-3", "Jitter"))
         });
-        let renamed = [channel(7300, "lab", Some("  ")), channel(7001, "dms", None)];
+        let renamed = [
+            channel(7300, "lab", Some("  ")),
+            channel(7001, "wick", None),
+        ];
         let standing: BTreeMap<u64, &GuildChannel> = renamed.iter().map(|c| (c.id, c)).collect();
         assert!(keep(&hosted, &standing, &cast(&hosted)).is_empty());
         let (_, name, topic, members, _) = room_of(&hosted, 7300).unwrap();
@@ -277,6 +291,6 @@ mod tests {
         );
         assert!(hosted.mirror(|m| m.by_channel(7300)).is_none());
         assert!(!hosted.sim(|s| s.threads.get(&thread).unwrap().open));
-        assert!(hosted.mirror(|m| m.parent("dms")).is_none());
+        assert!(hosted.mirror(|m| m.own(WICK)).is_none());
     }
 }

@@ -15,7 +15,7 @@ use crate::discord::world::channels::CHANNEL_NAME;
 use crate::discord::world::record::{hook_name, Guild, Kind};
 use crate::engine::speaking_as;
 use crate::npcs::npc_id_wire;
-use crate::sim::phone::CHANNEL as THE_CHANNEL;
+use crate::sim::phone::{direct_id, CHANNEL as THE_CHANNEL};
 
 /// The world's server, a channel it already has, and the channel the
 /// listener makes for the world's open channel.
@@ -537,19 +537,20 @@ async fn a_group_is_a_channel_only_its_members_see() {
         .contains(&(WREN, 1, VIEW | HISTORY, SEND)));
 }
 
-/// **A person's DM with a character without a bot is a private thread**
-/// under `#dms`: the channel found or made, everyone let see it and write in
-/// none of it but its threads; a thread named for the two of them that the
-/// person is added to. The character's lines are posted into it through
-/// `#dms`'s webhook, and the person's are heard as a message to the
-/// character.
+/// **A character without a bot has a channel of its own that anyone may
+/// talk to it in**: `#wick`, made with everyone let see, read and write in
+/// it. A person's DM with it is posted there — the character's lines
+/// through the channel's webhook, naming whom they answer — and a post
+/// there is a message to the character from whoever wrote it: on their DM
+/// with it, opened by the post when they had none.
 #[tokio::test]
-async fn a_dm_with_a_character_without_a_bot_is_a_private_thread() {
-    use crate::discord::world::members::{HISTORY, LISTENER, SEND, VIEW};
+async fn a_character_without_a_bot_is_talked_to_in_its_own_channel() {
+    use crate::discord::world::members::{LISTENER, MEMBER};
 
     let d = daemon(vec![Script::Serve]).await;
     d.link(OWNER, WREN).await;
-    d.wick();
+    d.link(CREATOR, ADA).await;
+    let wick = d.wick();
     let wren = d.wren();
     let dm = d.hosted.with_sim(|s| {
         let id = s.threads.reach(&wren, &Who::new("wick", "Wick"));
@@ -559,43 +560,40 @@ async fn a_dm_with_a_character_without_a_bot_is_a_private_thread() {
         id
     });
     d.mirroring().await;
-    d.until("the DM opened", |d| {
+    d.until("the DM in Wick's channel", |d| {
         d.hosted.mirror(|m| m.thread(&dm)).is_some()
     })
     .await;
 
-    let dms = d.hosted.mirror(|m| m.parent("dms")).expect("#dms recorded");
-    assert_eq!(
-        d.discord.overwrites_of(dms),
-        [(BOT_USER, 1, LISTENER, 0), (GUILD, 0, VIEW | HISTORY, SEND)]
-    );
-    let mirrored = d.hosted.mirror(|m| m.thread(&dm)).unwrap();
-    assert_eq!(
-        (mirrored.kind, mirrored.parent, mirrored.mirrored_through),
-        (Kind::Dm, Some(dms), 1)
-    );
-    let opened: Vec<(String, Value)> = d
+    let own = d.hosted.mirror(|m| m.own(wick)).expect("#wick recorded");
+    let made: Vec<Value> = d
         .discord
         .seen()
         .into_iter()
-        .filter(|s| s.path.contains("/threads") || s.path.contains("/thread-members/"))
-        .map(|s| (format!("{} {}", s.method, s.path), s.body))
+        .filter(|s| s.method == "POST" && s.path == format!("/guilds/{GUILD}/channels"))
+        .map(|s| s.body)
         .collect();
+    assert!(
+        made.iter().any(|b| b["name"] == "wick"),
+        "#wick was not made: {made:?}"
+    );
+    let overwrites = d.discord.overwrites_of(own.channel_id);
+    assert!(
+        overwrites.contains(&(BOT_USER, 1, LISTENER, 0)),
+        "{overwrites:?}"
+    );
+    assert!(
+        overwrites.contains(&(GUILD, 0, MEMBER, 0)),
+        "{overwrites:?}"
+    );
+    let mirrored = d.hosted.mirror(|m| m.thread(&dm)).unwrap();
     assert_eq!(
-        opened,
-        [
-            (
-                format!("POST /channels/{dms}/threads"),
-                json!({ "name": "Wick & Wren S", "type": 12, "invitable": false })
-            ),
-            (
-                format!(
-                    "PUT /channels/{}/thread-members/{WREN}",
-                    mirrored.channel_id
-                ),
-                Value::Null
-            ),
-        ]
+        (
+            mirrored.kind,
+            mirrored.channel_id,
+            mirrored.mirrored_through
+        ),
+        (Kind::Dm, own.channel_id, 1)
     );
 
     d.hosted.with_sim(|s| {
@@ -603,31 +601,27 @@ async fn a_dm_with_a_character_without_a_bot_is_a_private_thread() {
             .send_on(&dm, "wick", Said::words("hello, Wren"))
             .unwrap()
     });
-    d.until("posted into the thread", |d| {
-        d.discord.seen().iter().any(|s| {
-            s.path
-                == format!(
-                    "/webhooks/{}/{HOOK_TOKEN}?wait=true&thread_id={}",
-                    dms + HOOK_OFFSET,
-                    mirrored.channel_id
-                )
-        })
+    let hook_path = format!(
+        "/webhooks/{}/{HOOK_TOKEN}?wait=true",
+        own.channel_id + HOOK_OFFSET
+    );
+    d.until("posted in Wick's channel", |d| {
+        d.discord.seen().iter().any(|s| s.path == hook_path)
     })
     .await;
     assert_eq!(
         d.hooked(),
-        [("Wick".to_string(), "hello, Wren".to_string())],
+        [("Wick".to_string(), format!("<@{WREN}> hello, Wren"))],
         "what was said before the server was posted"
     );
 
     d.gateway.dispatch(posted_in(
-        mirrored.channel_id,
+        own.channel_id,
         later(),
         WREN,
         "how are the hatchlings?",
     ));
-    d.until("the person heard", |d| d.said_on(&dm).len() == 3)
-        .await;
+    d.until("Wren heard", |d| d.said_on(&dm).len() == 3).await;
     assert_eq!(
         d.said_on(&dm).last(),
         Some(&(
@@ -636,6 +630,15 @@ async fn a_dm_with_a_character_without_a_bot_is_a_private_thread() {
             true
         ))
     );
+
+    // Somebody with no DM with Wick talks to it there: theirs is opened.
+    let ada = public_id(&key_of(&identity(CREATOR)));
+    d.gateway
+        .dispatch(posted_in(own.channel_id, later() + 1, ADA, "Wick, report."));
+    let theirs = direct_id(&ada, "wick");
+    d.until("Ada heard", |d| d.said_on(&theirs).len() == 1)
+        .await;
+    assert_eq!(d.said_on(&theirs)[0].1, "Wick, report.");
 }
 
 /// **Two characters' DM stays in the world**: private to them, it opens
@@ -658,10 +661,6 @@ async fn two_characters_dm_stays_in_the_world() {
     d.reconcile_now().await;
     d.settle().await;
     assert!(d.hosted.mirror(|m| m.thread(&dm)).is_none());
-    assert!(
-        !d.discord.seen().iter().any(|s| s.path.contains("/threads")),
-        "a thread was opened for two characters"
-    );
     assert_eq!(d.hooked(), [], "two characters' DM was posted");
 }
 

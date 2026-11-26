@@ -209,9 +209,75 @@ fn standing<'a>(guild_id: u64, server: &'a str, c: &'a GuildChannel) -> thread::
     }
 }
 
+/// Server `guild_id` has become `hosted`'s world's: every bot's own thread
+/// for one of its channels is closed and its record forgotten, as
+/// [`learned`] does for the world's server on a bot's `GUILD_CREATE`.
+///
+/// **On the write, not on the bot's next connection.** Set while the bots
+/// were connected, the world stood its rooms beside the threads Zen's bot
+/// already had for the same channels, and Zen was offered two
+/// `#sharratt-family-briefing`s — the world's, with the cast on it, and its
+/// own, with nobody — until its bot happened to reconnect.
+pub fn became_the_worlds(hosted: &Hosted, guild_id: u64) {
+    for (npc, channel_id) in hosted.servers(|s| s.channels_in_guild(guild_id)) {
+        gone(hosted, npc, channel_id);
+    }
+}
+
 /// A channel that no longer stands: its thread closed and its record
 /// forgotten.
 fn gone(hosted: &Hosted, npc: u64, channel_id: u64) {
     thread::close(hosted, npc, channel_id);
     hosted.with_servers(|s| s.remove_channel(npc, channel_id));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::slice;
+
+    use super::*;
+    use crate::discord::server::record::Channel;
+    use crate::sim::phone::Who;
+
+    const ROOMS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../npc-map/maps");
+
+    /// **A server that becomes the world's takes every bot's own threads for
+    /// its channels down at once**, and leaves another server's alone.
+    #[test]
+    fn a_server_that_becomes_the_worlds_closes_the_bots_own_threads() {
+        let hosted = Hosted::load("creators-vault", ROOMS).unwrap();
+        let zen = Who::new("npc-1", "Zen");
+        let stand =
+            |name: &str| hosted.with_sim(|s| s.threads.open_standing(name, slice::from_ref(&zen)));
+        let briefing = stand("zenworld #sharratt-family-briefing");
+        let general = stand("zenworld #general");
+        let elsewhere = stand("other #hall");
+        hosted.with_servers(|s| {
+            for (channel_id, guild_id, thread) in [
+                (610, 600, &briefing),
+                (611, 600, &general),
+                (710, 700, &elsewhere),
+            ] {
+                s.put_channel(
+                    42,
+                    channel_id,
+                    Channel {
+                        guild_id,
+                        thread: thread.clone(),
+                        mirrored_through: 0,
+                        mirrored_part: 0,
+                        last_seen_discord: 0,
+                    },
+                );
+            }
+        });
+
+        became_the_worlds(&hosted, 600);
+
+        let open = |t: &str| hosted.sim(|s| s.threads.get(t).unwrap().open);
+        assert!(!open(&briefing) && !open(&general));
+        assert!(open(&elsewhere), "another server's thread stands");
+        assert_eq!(hosted.servers(|s| s.channels_in_guild(600)), []);
+        assert_eq!(hosted.servers(|s| s.channels_in_guild(700)), [(42, 710)]);
+    }
 }

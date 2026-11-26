@@ -78,6 +78,9 @@
 //! - *Striking a walk.* `move_to` is how a character gets anywhere, including
 //!   out of whatever it is stuck on, and is never struck.
 //!
+//! `rest` is never struck while it stops the mind. Refused, it stops nothing,
+//! and the same refusal again is a repeat like any call's ([`STOP`]).
+//!
 //! Acts the game wants repeated — `act` in a fight — skip the guard while
 //! something hostile is here, paced by `cooldown`'s fight rate instead.
 
@@ -100,8 +103,18 @@ const GUARD_EXEMPT: &[&str] = &["act"];
 /// to compare — every sitting writes the piece afresh — and the engine refuses
 /// a sitting over a piece already written itself (`Runtime::compose`). `rest`
 /// is how a mind with no body stops: taken again it comes back the same, and
-/// stopping twice is not a loop.
+/// stopping twice is not a loop — but see [`STOP`].
 const NEVER_STRUCK: &[&str] = &["move_to", "lift_use", "lift_call", "compose", "rest"];
+
+/// The act that stops a mind with no body, never struck only while it stops.
+///
+/// **A refused rest stops nothing.** Refused while a request from the phone
+/// stood, it answered the same refusal, and the refusal brought the mind
+/// straight back for a turn in which to use it: Zen chose `rest` again, and
+/// again, roughly eighty times a minute, never taking the act the refusal
+/// named. Refused, it is judged as any call is — the same refusal again is a
+/// repeat, and `rest` is struck until the mind does something else.
+const STOP: &str = "rest";
 
 /// The acts that put words into a document. A repeat is the same text again —
 /// see [`same_text`].
@@ -156,6 +169,8 @@ pub struct Took {
     /// Whether it was a device call, whose body names things — a path, a line,
     /// a field — and so is the same only when it is identical.
     pub call: bool,
+    /// Whether the world took it. Only [`STOP`] is judged differently for it.
+    pub landed: bool,
 }
 
 impl Took {
@@ -164,7 +179,22 @@ impl Took {
             act: act.into(),
             intent: intent.into(),
             call: false,
+            landed: true,
         }
+    }
+
+    /// The same taking, as the world refused it.
+    pub fn refused(self) -> Took {
+        Took {
+            landed: false,
+            ..self
+        }
+    }
+
+    /// Whether the guard leaves this taking unjudged: an act in
+    /// [`NEVER_STRUCK`], unless it is a [`STOP`] that stopped nothing.
+    fn exempt(&self) -> bool {
+        NEVER_STRUCK.contains(&self.act.as_str()) && (self.landed || self.act != STOP)
     }
 
     /// A device call to `act`, carrying `body`.
@@ -179,6 +209,7 @@ impl Took {
             act: act.into(),
             intent: body.into(),
             call: true,
+            landed: true,
         }
     }
 }
@@ -356,7 +387,7 @@ impl Guard {
         let mut caught = false;
         for took in acts {
             let (act, intent) = (took.act.as_str(), took.intent.as_str());
-            if NEVER_STRUCK.contains(&act) || (fighting && GUARD_EXEMPT.contains(&act)) {
+            if took.exempt() || (fighting && GUARD_EXEMPT.contains(&act)) {
                 continue;
             }
             let spoken = SPEECH.contains(&act);
@@ -463,6 +494,7 @@ mod tests {
             "a line five back is outside the lookback"
         );
     }
+
     use serde_json::json;
 
     fn act(tool: &'static str, args: serde_json::Value) -> Act {
@@ -506,6 +538,32 @@ mod tests {
         let rest = || g.record(1, &[Took::call("rest", "You rested.")], false);
         assert!(!rest() && !rest() && !rest());
         assert!(!struck(&g, 1, "rest"));
+    }
+
+    /// **A refused rest that comes back the same is a loop**, struck until the
+    /// mind does something else; a rest that stops is never struck, and a
+    /// refused walk is still never struck.
+    #[test]
+    fn a_rest_refused_the_same_way_again_is_struck() {
+        let still = "Still yours to do, and nothing comes before it: what John asked of you on \
+                     the phone.";
+        let g = LoopGuards::new();
+        let refused = || g.record(1, &[Took::call("rest", still).refused()], false);
+        assert!(!refused());
+        assert!(refused(), "the same refusal again");
+        assert_eq!(g.cooling(1), ["rest"]);
+
+        let g = LoopGuards::new();
+        assert!(!g.record(1, &[Took::call("rest", still).refused()], false));
+        assert!(!g.record(1, &[Took::call("rest", "You rested.")], false));
+        assert!(!g.record(1, &[Took::call("rest", "You rested.")], false));
+        assert!(g.cooling(1).is_empty(), "{:?}", g.cooling(1));
+
+        let g = LoopGuards::new();
+        for _ in 0..4 {
+            assert!(!g.record(1, &[Took::new("move_to", "the deck").refused()], false));
+        }
+        assert!(g.cooling(1).is_empty(), "{:?}", g.cooling(1));
     }
 
     /// The salient text is the content argument, whichever one carries it.
