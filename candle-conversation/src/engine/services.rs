@@ -237,7 +237,7 @@ impl ConversationEngine {
 
     /// [`Self::infer_raw_token_ids`] with the recurrent state swapped: `prompt`
     /// prefilled on a fresh slot — its K/V and its recurrence both computed
-    /// over it — then the slot's recurrent state replaced by the one
+    /// over it — then the slot's delta-rule layers replaced by the ones
     /// `recurrent_over` leaves when run from zero, then `tail` prefilled and
     /// decoded argmax for up to `max_decode_tokens`. Fresh K/V under another
     /// recurrent state: what it answers says whether the K/V alone carries
@@ -258,12 +258,19 @@ impl ConversationEngine {
                 None => None,
             };
             if let Some(state) = state {
+                // The delta-rule layers alone. The model's other state — the
+                // index over its keys, its per-position history — describes the
+                // K/V this slot holds, which is the prompt's and stays.
+                let layers_only = SharedState {
+                    aux: Arc::from(Vec::new()),
+                    ..SharedState::from(&state)
+                };
                 let (tx, rx) = flume::bounded(1);
                 self.core
                     .scheduler_tx
                     .send(SchedulerRequest::InstallRecurrentState {
                         sequence_ids: vec![sequence_id],
-                        state: SharedState::from(&state),
+                        state: layers_only,
                         response_tx: tx,
                     })
                     .map_err(|_| ConversationError::SchedulerGone)?;
