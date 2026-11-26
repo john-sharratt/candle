@@ -58,7 +58,6 @@ function clusterBacklog(members, tenant) {
     total,
     last_item: busiest.last_item ?? null,
     calibrating: most('calibrating'),
-    facing: most('facing'),
   };
 }
 

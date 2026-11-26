@@ -111,12 +111,6 @@ impl InferenceState {
             n_tools = tool_sections.len(),
             "tool catalog installed (top_k governed by `tools` collection in projection.yaml)",
         );
-        // The seed, rendered from the repositories' roots into the knowledge
-        // base's `seed` optional before any conversation is built: sealed
-        // behind `files_open`, read by every branch checkpoint's recurrence
-        // (docs/provenance_system_collection.md §6.2b).
-        let (seed_repos, _) = crate::branch_ingest::record_branches(&workspace);
-        let seed_read = crate::files::seed::install(&mut proj_builder, &seed_repos)?;
         // The journal collection selects each conversation's own sections by
         // name; scoped before the base conversation is built, so no projection
         // ever reads it any other way.
@@ -597,6 +591,14 @@ impl InferenceState {
         if load_stopped(&engine, "loading repositories") {
             return Ok(None);
         }
+        // The seed, rendered from the repositories' roots into the knowledge
+        // base's `seed` optional before any conversation is built — and only
+        // once the repositories are up to the log, or a fresh substrate's seed
+        // reads no repository at all: sealed behind `files_open`, read by every
+        // branch checkpoint's recurrence (docs/provenance_system_collection.md
+        // §6.2b).
+        let (seed_repos, _) = crate::branch_ingest::record_branches(&workspace);
+        let seed_read = crate::files::seed::install(&mut proj_builder, &seed_repos)?;
 
         let formatted_prompt = builder.format_system_prompt();
         let decoder = engine.token_decoder();

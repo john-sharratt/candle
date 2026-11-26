@@ -279,17 +279,6 @@
             calibrating: Math.min(2, total - n),
           };
         }
-      } else if (window.__ZEND_MOCK_FACES_BACKLOG__) {
-        // A pass between its reading and its sweep: every unit left is a face
-        // still to seal, as the daemon's `facing` counts them.
-        const n = ++this._ingestBacklogCalls;
-        const total = 6;
-        if (n < total) {
-          ingest_backlog = {
-            processed: n, total, last_item: 'src/main.rs (face)',
-            calibrating: 0, facing: total - n,
-          };
-        }
       }
       // `window.__ZEND_MOCK_NORMALIZING__ = true`: the score-normalization
       // replay a load queues, draining a turn per poll from 0 of 4 and gone at

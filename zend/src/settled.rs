@@ -1,11 +1,11 @@
-//! Whether the memory is settled: everything read, faced and calibrated, and
+//! Whether the memory is settled: everything sealed and calibrated, and
 //! every score background learned — the state a measurement of retrieval needs
 //! the member in before it asks anything (`zend/examples/dependency_battery`).
 //!
 //! Four things drain after a deploy or a moved branch, and each is counted
 //! where it runs:
 //!
-//! - the ingest backlog — files read, faced and calibrated by the sweep
+//! - the ingest backlog — files sealed and calibrated by the sweep
 //!   running ([`crate::ingest_backlog`]);
 //! - calibrations owed — units a calibration pass set out to calibrate, a
 //!   failed one included, that no pass has committed since
@@ -63,8 +63,8 @@ pub fn settled(d: &Drains<'_>) -> Settled {
         (d.backlog, d.calibration_owed, d.warming, d.normalizing);
     if let Some(b) = backlog {
         waiting_on.push(format!(
-            "ingest: {} of {} done ({} calibrating, {} facing)",
-            b.processed, b.total, b.calibrating, b.facing
+            "ingest: {} of {} done ({} calibrating)",
+            b.processed, b.total, b.calibrating
         ));
     }
     if calibration_owed > 0 {
@@ -110,7 +110,6 @@ mod tests {
             total: 10,
             last_item: None,
             calibrating: 4,
-            facing: 1,
         };
         assert_eq!(
             settled(&Drains {
@@ -123,7 +122,7 @@ mod tests {
             Settled {
                 settled: false,
                 waiting_on: vec![
-                    "ingest: 3 of 10 done (4 calibrating, 1 facing)".to_string(),
+                    "ingest: 3 of 10 done (4 calibrating)".to_string(),
                     "calibration: 2 owed".to_string(),
                     "warming: 5 of 16 files".to_string(),
                     "normalizing: 1 of 64 turns".to_string(),

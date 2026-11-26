@@ -966,19 +966,6 @@ test.describe('1.14 background ingest bar', () => {
     await expect(bar.locator('.z-ingest-count')).toHaveText('2 left');
   });
 
-  // Between a pass's reading and its sweep the faces are all that is left
-  // (`facing`): the strip says so, rather than showing nothing.
-  test('names the faces a pass seals when they are all that is left', async ({ page }) => {
-    await page.addInitScript(() => { window.__ZEND_MOCK_FACES_BACKLOG__ = true; });
-    await page.setViewportSize({ width: 1280, height: 900 });
-    await boot(page, { conv: '1' });
-    const bar = page.locator('#zend-ingest');
-    await expect(bar).toBeVisible();
-    await expect(bar.locator('.z-ingest-label')).toHaveText('Sealing faces');
-    await expect(bar.locator('.z-ingest-count')).toContainText('left');
-    await expect(bar.locator('.z-ingest-count')).not.toContainText('faces');
-  });
-
   test('mobile shows the count without the last-file label; desktop shows both', async ({ page }) => {
     await page.addInitScript(() => { window.__ZEND_MOCK_INGEST_BACKLOG__ = true; });
     await page.setViewportSize({ width: 390, height: 844 });
@@ -1013,13 +1000,13 @@ test.describe('1.14 background ingest bar', () => {
   // it once the backlog clears.
   test('the ingest backlog outranks the normalization bar', async ({ page }) => {
     await page.addInitScript(() => {
-      window.__ZEND_MOCK_FACES_BACKLOG__ = true;
+      window.__ZEND_MOCK_INGEST_BACKLOG__ = true;
       window.__ZEND_MOCK_NORMALIZING__ = true;
     });
     await page.setViewportSize({ width: 1280, height: 900 });
     await boot(page, { conv: '1' });
     const bar = page.locator('#zend-ingest');
     await expect(bar).toHaveAttribute('data-kind', 'ingest');
-    await expect(bar.locator('.z-ingest-label')).toHaveText('Sealing faces');
+    await expect(bar.locator('.z-ingest-label')).toHaveText(/Indexing|Calibrating/);
   });
 });
