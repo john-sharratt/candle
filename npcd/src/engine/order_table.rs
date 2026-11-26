@@ -25,19 +25,13 @@ fn text(args: &Map<String, Value>, key: &str) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
-/// The arguments of a template post — the `args` string, one `name: value` to a
-/// line — as a map. A line with no `:` is skipped, and the fill then names the
-/// argument it did not get.
-fn parse_args(args: &Map<String, Value>) -> BTreeMap<String, String> {
-    let Some(s) = text(args, "args") else {
-        return BTreeMap::new();
-    };
-    s.lines()
-        .filter_map(|line| {
-            let (k, v) = line.split_once(':')?;
-            let (k, v) = (k.trim(), v.trim());
-            (!k.is_empty()).then(|| (k.to_string(), v.to_string()))
-        })
+/// The arguments of a post of a standing job taking `params`: each its own
+/// field of the call, by its name, as choosing the job brought it
+/// (`tools::DECLARED`). One not given is left out, and the fill names it.
+fn job_args(params: &[String], args: &Map<String, Value>) -> BTreeMap<String, String> {
+    params
+        .iter()
+        .filter_map(|p| Some((p.clone(), text(args, p)?)))
         .collect()
 }
 
@@ -75,7 +69,7 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
                     "There is no standing job called \"{id}\" to post."
                 ));
             };
-            match routine.fill(&parse_args(args)) {
+            match routine.fill(&job_args(&routine.params, args)) {
                 Ok(filled) => filled,
                 Err(e) => return Outcome::Refused(sentence(e)),
             }
@@ -611,9 +605,9 @@ mod tests {
         );
     }
 
-    /// **A standing job that takes arguments is filled when it is posted** — its
-    /// `{name}`s replaced in the brief and steps — and a missing argument is
-    /// refused by name.
+    /// **A standing job that takes arguments is filled when it is posted** —
+    /// each argument its own field of the call, its `{name}`s replaced in the
+    /// brief and steps — and a missing or blank argument is refused by name.
     #[test]
     fn a_job_is_posted_with_its_arguments() {
         let h = vault();
@@ -630,7 +624,8 @@ mod tests {
             "zen",
             &args(json!({
                 "job": "play-a-film",
-                "args": "title: Dune\ndevice: the living room TV"
+                "title": "Dune",
+                "device": "the living room TV"
             })),
         )
         .happened());
@@ -646,14 +641,17 @@ mod tests {
                 "go back to the table in the command room and report it"
             ]
         );
-        assert_eq!(
-            post(
-                &h,
-                "zen",
-                &args(json!({"job": "play-a-film", "args": "title: Dune"})),
-            ),
-            Outcome::Refused("The mission `play-a-film` needs an argument for `device`.".into())
-        );
+        for missing in [
+            json!({"job": "play-a-film", "title": "Dune"}),
+            json!({"job": "play-a-film", "title": "Dune", "device": "  "}),
+        ] {
+            assert_eq!(
+                post(&h, "zen", &args(missing)),
+                Outcome::Refused(
+                    "The mission `play-a-film` needs an argument for `device`.".into()
+                )
+            );
+        }
     }
 
     /// **What came back is read at the table, once**: the reports since the

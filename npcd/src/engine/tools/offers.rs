@@ -85,13 +85,71 @@ pub(super) fn brought_choice(tool: &str, value: &str, field: &str) -> Option<Cho
         .map(|(_, _, _, c)| *c)
 }
 
-/// The fields each value of `t.param` brings, as the grammar's own. See
-/// [`BRINGS`].
+/// The choices whose every value brings the parameters the world declares for
+/// it, rather than fields of the act's own. `(tool, param)`.
+///
+/// **A standing job's arguments are its own fields.** They were one free
+/// `args` string of `name: value` lines, which the grammar let close empty and
+/// nothing told the model how to fill: asked to post `coding-task`, Zen wrote
+/// `"args": ""` on nine trials of twelve. Chosen as the job, `coding-task`
+/// brings `what` and `repository`, each required, and the call cannot close
+/// without them.
+pub(super) const DECLARED: &[(&str, &str)] = &[("order_post", "job")];
+
+/// The fields each value of `t.param` brings, as the grammar's own: those
+/// [`BRINGS`] names, and for a [`DECLARED`] choice the parameters the world
+/// declares for each value.
 pub(super) fn value_shapes(
     t: &Tool,
     param: &str,
     within: &Within,
 ) -> Vec<(String, Vec<StencilParam>)> {
+    let mut shapes = brought_shapes(t, param, within);
+    shapes.extend(declared_shapes(t, param, within));
+    shapes
+}
+
+/// The parameters each standing job declares, as the fields choosing it as
+/// `t.param` brings — required free strings, bounded as an act's are. A
+/// parameter named as one of the act's own fields is that field, already
+/// offered, and is not brought again.
+fn declared_shapes(t: &Tool, param: &str, within: &Within) -> Vec<(String, Vec<StencilParam>)> {
+    if !DECLARED.contains(&(t.name, param)) {
+        return Vec::new();
+    }
+    within
+        .job_params
+        .iter()
+        .map(|(job, params)| {
+            let fields = params
+                .iter()
+                .filter(|p| !t.params.iter().any(|own| own.name == p.as_str()))
+                .map(|p| StencilParam {
+                    name: p.clone(),
+                    ty: ParamType::String,
+                    required: true,
+                    enum_values: None,
+                    items: None,
+                    min_items: 0,
+                    max_items: None,
+                    properties: None,
+                    nullable: false,
+                    minimum: None,
+                    maximum: None,
+                    max_tokens: Some(ACT_VALUE_TOKENS),
+                    requires: Vec::new(),
+                    shapes: Vec::new(),
+                    pick: Pick::None,
+                    pattern: None,
+                })
+                .collect();
+            (job.clone(), fields)
+        })
+        .collect()
+}
+
+/// The fields [`BRINGS`] names for each value of `t.param`.
+fn brought_shapes(t: &Tool, param: &str, within: &Within) -> Vec<(String, Vec<StencilParam>)> {
     BRINGS
         .iter()
         .filter(|(tool, p, _)| *tool == t.name && *p == param)

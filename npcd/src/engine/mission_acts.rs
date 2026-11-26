@@ -136,7 +136,8 @@ pub const ORDER_POST: Tool = Tool {
             ty: "string",
             required: false,
             description: "One of the standing jobs, by its name: posted with its own brief and \
-                          steps, so you need give neither.",
+                          steps, so you need give neither. A job that takes arguments asks for \
+                          each by name once you choose it.",
         },
         Param {
             name: "brief",
@@ -160,13 +161,6 @@ pub const ORDER_POST: Tool = Tool {
             description: "Who is to carry it, by name. Left out, it goes to whoever has been \
                           free longest.",
         },
-        Param {
-            name: "args",
-            ty: "string",
-            required: false,
-            description: "When you post a standing job that takes arguments, its arguments — one \
-                          \"name: value\" to a line — filled into its brief and steps.",
-        },
     ],
     examples: &[
         Example {
@@ -177,10 +171,11 @@ pub const ORDER_POST: Tool = Tool {
                       and only thought about is not.",
         },
         Example {
-            situation: "The family asked for a film on the television, and \"play-a-film\" is one \
-                        of the standing jobs.",
-            call: r#"{"job":"play-a-film","args":"title: Dune\ndevice: the living room TV"}"#,
-            because: "A standing job carries its own steps; you give only what it is about.",
+            situation: "The ward needs its night watch kept, and \"ward-shift\" is one of the \
+                        standing jobs.",
+            call: r#"{"job":"ward-shift"}"#,
+            because: "A standing job carries its own brief and steps; whatever it needs from you, \
+                      it asks for by name once you choose it.",
         },
     ],
 };

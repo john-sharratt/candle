@@ -847,6 +847,55 @@ pub(super) mod tests {
             .any(|s| s.name == "message"));
     }
 
+    /// A brought field as a test reads it: its name, whether it is required,
+    /// and its bound.
+    type Field<'a> = (&'a str, bool, Option<u32>);
+
+    /// **A standing job brings its own arguments**: chosen as `order_post`'s
+    /// `job`, `coding-task` brings `what` and `repository`, each required and
+    /// bounded as an act's string is; a job that takes none brings nothing;
+    /// and there is no free `args` field to write them into.
+    #[test]
+    fn a_standing_job_brings_its_own_arguments() {
+        let mut within = Within::among(&[]);
+        within.jobs = vec!["coding-task".into(), "ward-shift".into()];
+        within.job_params = vec![(
+            "coding-task".into(),
+            vec!["what".into(), "repository".into()],
+        )];
+        let params = stencil_params(by_name("order_post").unwrap(), &within);
+        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["job", "brief", "steps", "for"]);
+        let job = &params[0];
+        assert_eq!(
+            job.enum_values.as_deref().unwrap(),
+            ["coding-task".to_string(), "ward-shift".to_string()]
+        );
+        let brought: Vec<(&str, Vec<Field>)> = job
+            .shapes
+            .iter()
+            .map(|(v, fields)| {
+                (
+                    v.as_str(),
+                    fields
+                        .iter()
+                        .map(|f| (f.name.as_str(), f.required, f.max_tokens))
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            brought,
+            [(
+                "coding-task",
+                vec![
+                    ("what", true, Some(ACT_VALUE_TOKENS)),
+                    ("repository", true, Some(ACT_VALUE_TOKENS))
+                ]
+            )]
+        );
+    }
+
     /// **A fold cannot be sent without somewhere to fold to.** The refusal
     /// "A fold needs somewhere to fold to" was a grammar that offered the close
     /// right after `relocate`: each action takes different fields, none of them

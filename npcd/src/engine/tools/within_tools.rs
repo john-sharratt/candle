@@ -37,6 +37,9 @@ pub struct Within {
     pub rooms: Vec<String>,
     /// The world's standing jobs, by name — [`Choices::Jobs`].
     pub jobs: Vec<String>,
+    /// The parameters each standing job that takes any declares, by job: what
+    /// choosing it as `order_post`'s `job` brings as fields of its own.
+    pub job_params: Vec<(String, Vec<String>)>,
     /// The house links in this room, by name — [`Choices::Links`]. Empty in a
     /// room with no network to survey.
     pub links: Vec<String>,
@@ -322,6 +325,13 @@ impl Within {
             .routines()
             .iter()
             .map(|r| r.id.clone())
+            .collect();
+        self.job_params = sim
+            .missions
+            .routines()
+            .iter()
+            .filter(|r| !r.params.is_empty())
+            .map(|r| (r.id.clone(), r.params.clone()))
             .collect();
         self.years = sim
             .missions

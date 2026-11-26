@@ -478,7 +478,7 @@ mod tests {
         assert!(
             said.contains(
                 "`http://local/command/order-table~0/order_post` (takes any of job, brief, steps, \
-                 for, args)"
+                 for)"
             ),
             "{said}"
         );

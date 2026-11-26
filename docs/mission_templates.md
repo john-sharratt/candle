@@ -84,17 +84,28 @@ gate.
 ## 3. Issuing a template
 
 `order_post` already posts a standing job whole by name (`{job}`); it gains one
-thing — arguments:
+thing — arguments, **each its own field of the call**:
 
 ```
-order_post { job: "play-a-film", args: { title: "Dune", device: "the living room TV", room: "the front room" } }
+order_post { job: "play-a-film", title: "Dune", device: "the living room TV", room: "the front room" }
 ```
 
-`post` (`order_table.rs`) fetches the routine by id as it does now, substitutes
-`args` into its brief and steps, and posts the concrete mission. A missing or
-undeclared argument is refused there, with the parameter named, the same way a
-post with no step is refused today. No new post form and no new concept: a
-template *is* a job, and this is the job path taking arguments.
+`job` is a choice among the world's standing jobs, and choosing one brings that
+job's declared parameters as required fields after it (`tools::DECLARED`,
+built from `Within::job_params`), the same way `message`'s `via` brings its
+`to`: the call cannot close until each is written, and a required free string
+cannot close blank (`FreeTextLimits::nonblank`). `post` (`order_table.rs`)
+fetches the routine by id, reads each parameter from its field, substitutes
+them into its brief and steps, and posts the concrete mission. A missing or
+blank argument is refused there, with the parameter named, the same way a post
+with no step is refused today. No new post form and no new concept: a template
+*is* a job, and this is the job path taking arguments.
+
+**Not one `args` string.** The arguments were first one free field of
+`name: value` lines. The grammar could not hold it to its format — a value rule
+admits no escape, so the newline between two arguments could not be written
+under one — and nothing told the model the parameter names: asked to post
+`coding-task`, Zen wrote `args: ""` on nine trials of twelve.
 
 ---
 
@@ -256,7 +267,7 @@ with no GPU and no live devices, fully unit-testable.
    substitution, and the foldered loader (walk `missions/`). Tests assert raw
    produced briefs and step lists, refusal of an undeclared or unfilled
    parameter, and refusal of a malformed file.
-2. **Issue.** `order_post { job, args }` — substitute and post; refuse a bad
+2. **Issue.** `order_post { job, <its parameters> }` — substitute and post; refuse a bad
    argument at the table.
 3. **Authoring.** The built-in `write-template` workflow + a `routine-parses`
    check, and the `mission_write` act that renders the template and opens an
