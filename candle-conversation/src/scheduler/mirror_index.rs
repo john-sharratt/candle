@@ -1,52 +1,43 @@
-//! Rebuilds a slot's per-position index as a projection places it: one page
-//! per piece, pushed in order, instead of the pages its own prefill forwarded
-//! ([`SchedulerRequest::SealPieceIndex`], [`SchedulerRequest::ReplaceIndex`]).
+//! Rebuilds a slot's per-position index as a projection places it, piece by
+//! piece: one sealed page per piece, every earlier piece's page injected
+//! ahead of it ([`SchedulerRequest::IndexPiece`]).
 //!
-//! A projection hands a slot each sealed section's index as a single stored
-//! page, keyed by its bytes; a slot that prefilled the same tokens itself holds
-//! the pages its forwards closed, cut wherever a break token fell. Sealing each
-//! piece's index right after its prefill and pushing those pages back over a
-//! reset index leaves the slot indexed the way a projection would have, so a
-//! slot built by prefill can be compared with a projected one page for page.
+//! A section is sealed on a scratch slot whose prefix arrives as injected
+//! pages; its own tokens are forwarded behind them and sealed, on a block
+//! boundary, as one page — the page a projection later pushes, keyed by its
+//! bytes. A slot that prefills the same pieces itself holds the pages its
+//! forwards closed instead, cut wherever a break token fell. Sealing each
+//! piece's page once it is prefilled, and putting the slot's index back as
+//! every page so far, injected, leaves the slot indexed as a projection
+//! would have placed it before the next piece is forwarded over it.
 
 use super::*;
 
 impl Scheduler {
-    /// The index `slot` has forwarded from `start` on, as one page; `None`
-    /// for a model that keeps no index.
-    ///
-    /// The page is closed first, as a section's is when its ingest ends the
-    /// scratch slot: rows still carried in an open block belong to the piece
-    /// and would otherwise be left out of its page.
-    pub(super) fn seal_piece_index(
+    /// Seal the index `slot` has forwarded since its index was last placed as
+    /// one page, then place the index again as `placed` followed by that
+    /// page, each pushed in order and keyed by its bytes. The new page;
+    /// `None` for a model that keeps no index.
+    pub(super) fn index_piece(
         &self,
         slot: SequenceId,
-        start: usize,
+        placed: &[Vec<u8>],
     ) -> Result<Option<Vec<u8>>, ConversationError> {
-        self.model
-            .close_positional_page(slot.0)
-            .map_err(ConversationError::Model)?;
-        self.model
-            .seal_positional_range(slot.0, start)
-            .map_err(ConversationError::Model)
-    }
-
-    /// Replace `slot`'s index with `pages`, in order, each keyed by its bytes
-    /// as a projection keys a section's page; the tokens the index covers
-    /// afterwards.
-    pub(super) fn replace_index(
-        &self,
-        slot: SequenceId,
-        pages: &[Vec<u8>],
-    ) -> Result<Option<usize>, ConversationError> {
+        let Some(page) = self
+            .model
+            .seal_positional_state(slot.0)
+            .map_err(ConversationError::Model)?
+        else {
+            return Ok(None);
+        };
         self.model
             .reset_positional_state(slot.0)
             .map_err(ConversationError::Model)?;
-        for page in pages {
+        for p in placed.iter().chain(std::iter::once(&page)) {
             self.model
-                .push_positional_state(slot.0, page, &PieceKey::of(page))
+                .push_positional_state(slot.0, p, &PieceKey::of(p))
                 .map_err(ConversationError::Model)?;
         }
-        Ok(self.model.positional_coverage(slot.0))
+        Ok(Some(page))
     }
 }

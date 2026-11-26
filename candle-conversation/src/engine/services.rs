@@ -276,39 +276,27 @@ impl ConversationEngine {
                     .map_err(|_| ConversationError::SchedulerGone)?;
                 rx.recv().map_err(|_| ConversationError::SchedulerGone)?;
             }
-            let mut pages = Vec::new();
-            let mut at = 0;
+            // Mirrored, every piece is forwarded over the pages of the pieces
+            // before it, injected, and its own sealed as one page after it.
+            let mut placed: Vec<Vec<u8>> = Vec::new();
             for (tokens, _) in prompt.iter().filter(|(t, _)| !t.is_empty()) {
                 self.raw_turn(sequence_id, tokens, 0)?;
                 if mirror_index {
                     let (tx, rx) = flume::bounded(1);
                     self.core
                         .scheduler_tx
-                        .send(SchedulerRequest::SealPieceIndex {
+                        .send(SchedulerRequest::IndexPiece {
                             sequence_id,
-                            start: at,
+                            placed: placed.clone(),
                             response_tx: tx,
                         })
                         .map_err(|_| ConversationError::SchedulerGone)?;
                     if let Some(page) =
                         rx.recv().map_err(|_| ConversationError::SchedulerGone)??
                     {
-                        pages.push(page);
+                        placed.push(page);
                     }
                 }
-                at += tokens.len();
-            }
-            if mirror_index {
-                let (tx, rx) = flume::bounded(1);
-                self.core
-                    .scheduler_tx
-                    .send(SchedulerRequest::ReplaceIndex {
-                        sequence_id,
-                        pages,
-                        response_tx: tx,
-                    })
-                    .map_err(|_| ConversationError::SchedulerGone)?;
-                rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
             }
             if quantizes {
                 let spans = prompt

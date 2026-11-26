@@ -119,8 +119,7 @@ impl SchedulerRequest {
             | Self::MemoryCatchUp { sequence_id, .. }
             | Self::ExtractRawKvq { sequence_id, .. }
             | Self::DescribeAtSeal { sequence_id, .. }
-            | Self::SealPieceIndex { sequence_id, .. }
-            | Self::ReplaceIndex { sequence_id, .. }
+            | Self::IndexPiece { sequence_id, .. }
             | Self::SealNatively { sequence_id, .. }
             | Self::QuantizeSpans { sequence_id, .. }
             | Self::ProbeWideSigs { sequence_id, .. }
@@ -187,8 +186,7 @@ impl SchedulerRequest {
             | Self::BranchCheckpointPass { .. }
             | Self::ExtractRawKvq { .. }
             | Self::DescribeAtSeal { .. }
-            | Self::SealPieceIndex { .. }
-            | Self::ReplaceIndex { .. }
+            | Self::IndexPiece { .. }
             | Self::SealNatively { .. }
             | Self::QuantizeSpans { .. }
             | Self::ProbeWideSigs { .. }
