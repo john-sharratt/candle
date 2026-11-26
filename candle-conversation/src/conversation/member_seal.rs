@@ -96,14 +96,25 @@ impl Sequence {
         collection: &str,
         chain: &[MemberSpec],
     ) -> crate::Result<Vec<SealedMember>> {
-        let prefix = self.members_prefix(collection)?;
+        self.seal_members_behind(&self.members_prefix(collection)?, chain)
+    }
+
+    /// Seal `chain` in order, each behind `prefix` and the members before it,
+    /// and return them in the same order: [`Self::seal_members`] behind a
+    /// prefix the caller names — the sections a prompt actually places ahead
+    /// of a file, where the birth prefix leaves some of them out.
+    pub fn seal_members_behind(
+        &self,
+        prefix: &[SectionId],
+        chain: &[MemberSpec],
+    ) -> crate::Result<Vec<SealedMember>> {
         let mut out: Vec<SealedMember> = Vec::with_capacity(chain.len());
         // The state the member just prefilled ended on: where the next one
         // starts. `None` after a restored member, whose end the next one
         // works out from the log.
         let mut handed: Option<SharedState> = None;
         for spec in chain {
-            let sealed = self.seal_member(&prefix, &out, spec, handed.take())?;
+            let sealed = self.seal_member(prefix, &out, spec, handed.take())?;
             handed = sealed.1;
             out.push(sealed.0);
         }

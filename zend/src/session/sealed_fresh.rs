@@ -47,6 +47,7 @@ use candle_conversation::{SamplingConfig, TurnOptions};
 use serde::{Deserialize, Serialize};
 
 use super::sealed_fresh_layout::{compare, piece_chunks, LayoutComparison};
+use super::sealed_fresh_reseal::{prefix_before, reseal_behind};
 use super::ZendSession;
 use crate::files::records;
 
@@ -87,6 +88,11 @@ pub struct SealedFreshReq {
     /// How the fresh side's prompt lies in its slot.
     #[serde(default)]
     pub fresh_layout: Layout,
+    /// Seal the file's members again behind the sections this prompt places
+    /// ahead of them, and place those on the sealed side in place of the
+    /// stored ones (`session/sealed_fresh_reseal.rs`).
+    #[serde(default)]
+    pub reseal: bool,
 }
 
 /// How the fresh side's prompt lies in its slot.
@@ -237,6 +243,9 @@ pub struct SealedFresh {
     /// The two slots' layouts compared piece by piece, when the fresh side
     /// ran in pieces it could be described in.
     pub layout: Option<LayoutComparison>,
+    /// Resealed, whether the prompt with the resealed members placed holds
+    /// exactly the tokens the stored members' prompt did.
+    pub resealed_same_tokens: Option<bool>,
 }
 
 /// The first index where `a` and `b` differ, within the shorter; `None` when
@@ -306,10 +315,11 @@ impl ZendSession {
             .map_or(FilesPin::Empty, |r| FilesPin::Only(r.key()));
         // The placed file's member sections in this process: what the prompt
         // holds that production's recurrence never ran over.
-        let members: HashSet<u32> = record
+        let mut members: HashSet<u32> = record
             .as_ref()
             .map(|r| member_ids(&engine.conversation(), r))
             .unwrap_or_default();
+        let mut probe: Option<FileRecord> = None;
         let mut conv = state
             .base_conv
             .fork_at(DecodePriority::Low)
@@ -320,9 +330,41 @@ impl ZendSession {
         engine.files_pin(timeline, pin);
         let out = (|| {
             let selection = selection();
-            let dump = conv
+            let mut dump = conv
                 .prompt_dump_with(&selection)
                 .context("the sealed side's prompt")?;
+            // Resealed, the file's members are sealed again behind the
+            // sections this prompt places ahead of them and placed in their
+            // stead: the same tokens, read in the context they were computed in.
+            let mut resealed_same_tokens = None;
+            if let (true, Some(record)) = (req.reseal, record.as_ref()) {
+                let conversation = engine.conversation();
+                let heading = conversation
+                    .read()
+                    .owned_section_named(files_owner(), &heading_name(&record.path, &record.blob))
+                    .context("the file's heading is not held here")?;
+                let pieces: Vec<(Option<u32>, usize)> = dump
+                    .pieces
+                    .iter()
+                    .map(|p| (p.section_id, p.token_ids.len()))
+                    .collect();
+                let prefix = prefix_before(&pieces, heading.raw())?;
+                let decode = |ids: &[u32]| {
+                    engine
+                        .tokenizer()
+                        .decode(ids, false)
+                        .map_err(|e| anyhow::anyhow!("decoding a member: {e}"))
+                };
+                let p = reseal_behind(&conversation, &state.base_conv, decode, record, &prefix)?;
+                engine.files_pin(timeline, FilesPin::Only(p.key()));
+                members = member_ids(&conversation, &p);
+                probe = Some(p);
+                let again = conv
+                    .prompt_dump_with(&selection)
+                    .context("the resealed prompt")?;
+                resealed_same_tokens = Some(again.token_ids == dump.token_ids);
+                dump = again;
+            }
             if req.recurrent != Recurrent::Sealed {
                 conv.install_fresh_recurrent_over(dump.token_ids.clone())
                     .map_err(|e| anyhow::anyhow!("the fresh recurrent state: {e}"))?;
@@ -405,9 +447,13 @@ impl ZendSession {
                 sealed_finish: format!("{:?}", resp.stats.finish),
                 fresh_finish,
                 layout,
+                resealed_same_tokens,
             })
         })();
         let _ = engine.tombstone_timeline(timeline);
+        if let Some(p) = &probe {
+            let _ = records::retire(&engine.conversation(), p);
+        }
         out
     }
 }

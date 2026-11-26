@@ -239,6 +239,7 @@ use titler::{retire_titler_timelines, Titler};
 pub mod restore;
 pub mod sealed_fresh;
 pub mod sealed_fresh_layout;
+pub mod sealed_fresh_reseal;
 mod titles;
 
 pub use replay::{
