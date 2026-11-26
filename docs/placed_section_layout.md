@@ -158,26 +158,48 @@ The query of a given token has one position across layers, above the range in
 every one, so every placed section is visible to it in every layer that holds
 it.
 
-### 3.4 Where the scope comes from, and when it changes
+### 3.4 Order: peak index attention, decided per decode step
 
-QSA selection already scores every candidate block of a layer at every step
-and keeps the top ones. Those selections are the hits: a section's hits in a
-layer are the selected blocks of that layer that fall in the section, counted
-over the steps since the last boundary.
+The one signal that orders a relevance-ordered range is a section's **peak
+index attention**: at a decode step, in a layer, the highest score the QSA
+indexer gives any block of the section. Without a QSA index it is the
+section's provenance score (§3.8). Nothing else orders the range — not the
+pool's momentum, not provenance strength, not a hit count.
 
-Scope changes **at reprojection boundaries only** (the probe cadence,
-`reproject_probe_tokens`), never per token:
+- **Peak, not count.** A count of selected blocks grows with a section's
+  length, so a long section out-votes a short one that answers better. The
+  peak is one number per section whatever its length, so sections of every
+  size compete on what they hold.
+- **Per decode step, per layer.** At each step, after the layer's selection,
+  a section that is resident (§3.5) and out of the layer's scope **enters**
+  when its peak crosses the entry threshold: it is placed in front of the
+  sections already in scope (§3.2). A section in scope **leaves** when its
+  peak has stayed below the eviction threshold for the eviction window, and
+  leaves a hole. Hysteresis, as belief selection uses, keeps a section near
+  the line from flapping.
+- **Entering never moves anything.** A step's entries take positions below the
+  lowest placed section; every section already placed keeps its positions,
+  so every relative position a decoded token was formed against holds. The
+  next token sees one more section in front, at positions no earlier token
+  attended. That is why the order is append-in-front: per-step decisions with
+  no re-layout.
+- **The order is the order of entry.** At the opening, the sections the
+  question's prefill selects enter in descending peak, strongest first, so
+  the strongest is at the top, nearest the question. After it, a section's
+  position records the step it entered.
+- **A step's decision applies from the next step.** The scores of step *t*
+  decide the layout step *t* + 1 reads, so a step never reads a layout its own
+  scores changed. With speculative decoding the step is the verified step: a
+  draft and its verify read the layout fixed when the draft began, and the
+  verify's accepted tokens' scores decide the next one (§4.6).
+- **The peaks of sections not in scope come from the shadow scan**, which
+  scores resident, unplaced sections' index rows against the step's queries
+  (`hit_driven_projection.md` §6.3), now every step for the resident set
+  rather than once per boundary for the pool. The pool beyond residency is
+  still scanned at boundaries; a section there enters residency first (§3.5).
 
-- per-token change makes each token's context differ from the last one's, and
-  that churn is where incoherence comes from;
-- a boundary is already where the slot is rebuilt and the host decides;
-- a speculative draft and its verify then always see the same layout, because
-  the layout only changes between drafts.
-
-A section enters a layer's scope when its hits there cross an entry threshold
-and leaves when they stay below an eviction threshold for a boundary —
-hysteresis, as belief selection already uses, so a section near the line does
-not flap.
+Every per-step decision runs on the device (§4.4): the host is not on the
+per-token path.
 
 ### 3.5 Three budgets per section
 
@@ -189,15 +211,15 @@ is a position range.
 
 | Budget | What it bounds | Who reduces into it | Today |
 |---|---|---|---|
-| **Index scan** (`scan`) | The members whose sampled-layer index rows are on the device and scored by the shadow scan each boundary. No K/V moves for them. | Provenance: the gallery scan and the working set's momentum choose whole files. | The pool: `PoolSize::for_card` (2M / 500K / 256K tokens, 72 / 24 / 16 GB), shared across the pool's kinds. |
-| **Residency** (`resident`) | The members whose K/V is hot — on the device, in the KV-regions tenancy — whether placed or not, so the fill can place one at a boundary without a PCIe or redo-log wait. | The index: real and shadow hits rank the scanned members; the strongest stay hot. | Not a budget. A pooled member's K/V stays wherever it is (hot, warm, cold) until the fill places it (§7.2 step 3), and a cold one is placed a boundary late. |
-| **Projection** (`project`) | The tokens placed in the section's range: `R`. The positions the section takes, and the K/V and index rows the selection attends. | The index again: the fill places chunks by `base·(1+gain·h)` under the budget. | The fill's `readings` cap, a share of the room (22.5%, ≈ 52K at a 233K room); tools by count (`budget: {min: 1, max: 5}`). |
+| **Index scan** (`scan`) | The sections whose sampled-layer index rows are on the device and scored by the shadow scan. No K/V moves for them. | Provenance, by section (§3.5c): the gallery scan scores each section of a file as its own case. | The pool: `PoolSize::for_card` (2M / 500K / 256K tokens, 72 / 24 / 16 GB), shared across the pool's kinds, choosing whole files. |
+| **Residency** (`resident`) | The sections whose K/V is hot — on the device, in the KV-regions tenancy — whether placed or not, so one can enter the range at the next step without a PCIe or redo-log wait. | Provenance and the index together: the section's provenance score and its peak index attention from the shadow scan, fused (§3.5c). | Not a budget. A pooled member's K/V stays wherever it is (hot, warm, cold) until the fill places it (§7.2 step 3), and a cold one is placed a boundary late. |
+| **Projection** (`project`) | The tokens placed in the section's range: `R`. The positions the sections take, and the K/V and index rows the selection attends. | The index alone: peak index attention per step (§3.4). | The fill's `readings` cap, a share of the room (22.5%, ≈ 52K at a 233K room), by `base·(1+gain·h)`; tools by count (`budget: {min: 1, max: 5}`). |
 
 `scan ≥ resident ≥ project`, and each stage reduces into the next:
 provenance proposes the scan set from the unbounded corpus, the index
 reduces it to what is kept hot, and the index places the projection from the
 hot set. A member leaving the projection stays resident while it still ranks,
-so it can come back in front (§3.2) at the next boundary at device speed; one
+so it can come back in front (§3.2) at the next step at device speed; one
 leaving the resident set keeps its index rows while it stays scanned, so the
 shadow scan can still raise it.
 
@@ -219,6 +241,95 @@ The room the dialogue's fill has is the slot less the system prompt **with its
 ranges at full size**, so the dialogue's share never depends on what the
 sections hold.
 
+### 3.5b Every section stands alone; some are mandatory
+
+**No section is sealed behind another.** A knowledge-base section is sealed
+behind the prompt up to its range and across the empty range (§3.1b), and
+behind nothing else: not another file, not the earlier sections of its own
+file. There is no cross-reasoning between sections at ingest. It is built
+where the conversation reads them together — in the turns, and above all in
+the thinking blocks, which are decoded over the placed sections and run
+through every layer, the recurrent ones included.
+
+This removes the **seed chain** (`provenance_system_collection.md` §6): the
+seed's files are no longer prefilled as a chain with the recurrence run over
+them and snapshotted. They are sections like any other, sealed alone, and
+the recurrent state a conversation starts from is the prompt checkpoint's,
+which has read no knowledge-base content (§6).
+
+What the seed was for is kept as **mandatory sections**, the concept the tools
+collection already has (`SectionCollection::mandatory`,
+`projection/project/collection.rs`: `file_read` is emitted on every
+projection, outside the selection's budget):
+
+- a mandatory section is resident and in scope from the opening, in every
+  layer, and never leaves;
+- it holds positions in its range like any other — inside `R`, outside the
+  competition — and enters at the opening in peak order with the rest (§3.4);
+- the seed's files — each repository's root listing, README, ARCHITECTURE,
+  AGENTS, CLAUDE (`branch_ingest/prime.rs`) — are the knowledge base's
+  mandatory sections, cut into sections as every file is (§3.5c); the seed
+  dial includes or omits the mandatory set;
+- the range's budget is checked at load to hold the mandatory sections with
+  room for the rest, and refuses to build otherwise.
+
+Sealed alone, a section's address is its own: the prompt's hash with the
+range (§3.1b), and the section's text. A change to a file re-seals only the
+sections whose text changed; nothing after them in the file is re-read.
+
+### 3.5c Sections of a file, and reducing by section
+
+**The cut is `file_read`'s.** A large file is broken where `file_read` already
+pages it: runs of whole parts, at most `PAGE_LINES` lines each
+(`zend-tools/src/tools/file/render.rs` `windows`, the parts from
+`doc_units`). Each run is one section, and its text is the body a live
+`file_read` of that range returns, byte for byte (`render.rs` §1: the ingest
+already drives the same tool call). So a placed section carries what an edit
+needs, exactly as a read does:
+
+- each part a fenced block naming the workspace path, the part's anchor (the
+  part hash `file_edit` addresses, `part=r7Lm`), its lines and its scope;
+- every line behind its number relative to its part (`+1`, `+2`, …), the
+  numbers `file_edit` takes;
+- the closing line naming the file, the lines this section holds of how many,
+  and the range to read next — or that it is the end of the file.
+
+The model therefore edits from a placed section with the same references as
+from a read, and a section and a later read of the same range agree.
+
+**A cut is marked.** Every section but a file's last ends with `...\n`, after
+its closing line, so a section placed without the one after it reads as
+continuing, never as the end of the file. The last section ends at the file's
+end. The marker is sealed with the section; the assembler adds no gap piece
+of its own (`files/render.rs` `GAP` goes), since each section already says
+where it sits.
+
+**The knowledge base's notation changes with it.** Each section is the
+heading `## The content from {path}:` and the section's text. The outer fence
+of Qwen-Agent's snippet goes: the parts are fenced blocks of their own, and a
+fence inside a fence is not well formed. Seams are still checked against the
+tokenizer as `files::cut_lines` checks them, now at the section's
+boundaries.
+
+**Provenance and the index both reduce by section.** Today provenance chooses
+whole files and the index places a leading run of a file too large for its
+cap (`provenance_system_collection.md` D22). Both now work on sections:
+
+- **provenance scores each section as its own case** (`cases: section` in
+  place of `cases: file`): the gallery already holds a member's signatures
+  under its `ChunkKey` (§4 of that doc), so a section's score is its own
+  signatures' agreement. A large file no longer gathers every one of its
+  chunks' votes into one score: each section competes on what it holds, and a
+  large file stops swamping the scan;
+- **the scan set and residency are chosen by section**, by provenance score,
+  and residency fuses in the section's peak index attention from the shadow
+  scan (§3.5);
+- **the projection is chosen by section** on peak index attention alone
+  (§3.4).
+
+The calibration's votes and the working set's momentum move to the section
+key accordingly.
+
 ### 3.6 Two orders: by relevance and by birth
 
 Every piece of provenance the projection places falls under one of two
@@ -236,7 +347,7 @@ What every piece of provenance is, today and under this design:
 |---|---|---|---|
 | Tools | System prompt, `tools` collection | Belief selection, 1–5 signatures, re-chosen at boundaries | Relevance; projection in tokens (§3.5) |
 | Knowledge base: readings, folders, guides, journal notes | System prompt, `files` collection (`provenance_system_collection.md` §4, D19) | Pool → fill under the kind shares | Relevance |
-| The seed | System prompt, before the `files` range | Sealed once, before the files (§6.2b) | Neither: fixed prompt below the range |
+| The seed | System prompt, before the `files` range | A chain with the recurrence run over it, sealed once, before the files (`provenance_system_collection.md` §6, §6.2b) | Relevance: mandatory sections of the knowledge base (§3.5b) |
 | The conversation's journal | System prompt, `journal` collection (pinned), after the grounding and before the tools | A chain of sealed sections; a new entry joins at the next round's head, mid-request included; a fold or a forgotten entry reseals everything after it (`docs/zend_journal.md` §4) | **Birth** |
 | The dialogue's turns, with its inherited lineage | After `system_close` | Floors, then rounds by score; re-chosen at every boundary, mid-reply included, and the slot renumbered under the reply (`docs/hit_driven_projection.md` §7.2 steps 4–5, §7.3) | **Birth** |
 
@@ -390,8 +501,10 @@ counts; it no longer decides positions by concatenation.
 ### 4.6 The drafter
 
 A speculative draft attends the same layout as the turn it drafts for. The
-layout changes only at boundaries (§3.4), between drafts, so a draft never
-spans a change.
+layout changes per verified step (§3.4): a draft and its verify read the
+layout fixed when the draft began, and only the accepted tokens' scores
+decide the next one, so a draft never spans a change and a rejected token
+never changed the layout.
 
 ## 5. Risks
 
@@ -415,11 +528,16 @@ spans a change.
 The 52K-after-the-needle failure turned on the recurrent state: the sealed
 K/V and the sealed index, under a recurrence that had run over the whole
 prompt, read the file; under production's recurrence, which never runs over
-placed sections, it did not. No RoPE layout reaches the DeltaNet layers. That
-gap — placed content the recurrence has never read — needs its own design:
-running the recurrence over placed sections at a projection, or recomputing
-the few tokens whose state deviates most (CacheBlend-style selective
-recompute), are the candidates.
+placed sections, it did not. No RoPE layout reaches the DeltaNet layers.
+
+With the seed chain gone (§3.5b) the recurrence reads no knowledge-base
+content at all: the conversation starts from the prompt checkpoint, and what
+the recurrent layers know of the placed sections is what the turns and the
+thinking decode over them. That is the design's bet — cross-reasoning is built
+in the thinking, not at ingest — and stage 2's gate measures it. If it is not
+enough, the candidates are running the recurrence over placed sections at a
+projection, or recomputing the few tokens whose state deviates most
+(CacheBlend-style selective recompute).
 
 ## 7. Staged plan
 
@@ -457,6 +575,15 @@ files; one question needing two files).
    needle and multi-file cases hold or improve against stage 3.
 5. **On the device** (§4.4). *Gate:* no readback on the per-token path
    (`AGENTS.md` invariants 3–4) and decode throughput within noise of stage 4.
+
+The section cut (§3.5c), standalone sealing and the mandatory set (§3.5b)
+change what the ingest seals, so they land with stage 2's new content
+address, in one re-ingest: sections in `file_read`'s format with the `...`
+marker, sealed alone at the top of the range, scored by provenance per
+section. Stage 2's gate adds an edit made from a placed section by its anchor
+and relative line numbers, checked against the file. Until the per-step
+decision is on the device (stage 5), stages 3–4 take the scope decision at
+boundaries from the steps' peaks, with the same rule.
 
 ## 8. Alternatives considered
 

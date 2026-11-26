@@ -219,6 +219,12 @@ shares are checked (`apply_build.rs:533-557`).
 
 ## 5. Sealing a member
 
+> **Superseded by `docs/placed_section_layout.md` §3.1b, §3.5b, §3.5c when
+> built:** a section is sealed alone — behind the prompt and its section's
+> empty range, at the range's top — never behind the earlier chunks of its
+> file, and its text is `file_read`'s page of that range. This section
+> describes the members the running ingest seals.
+
 A member's K/V is sealed **behind the system prompt before the collection**
 plus the **earlier chunks of its own file**. That prefix is the base
 conversation's projected prompt, as a code reading's is today
@@ -250,6 +256,11 @@ the catalog being the corpus. It is forwarded live with the collection's
 last closing fence, as the close row (§6.2).
 
 ## 6. The seed chain and the close row: the recurrent state
+
+> **Superseded by `docs/placed_section_layout.md` §3.5b when built:** the
+> seed chain is removed. The seed's files are mandatory sections of the
+> knowledge base, sealed alone like every other, and no recurrent state is
+> run over them; the conversation starts from the prompt checkpoint.
 
 The 36 DeltaNet layers of Flash-Next carry state the attention layers' K/V
 does not: what has been read, and in what order. A dynamic member is
@@ -746,7 +757,7 @@ records the change here.
 |---|---|
 | D1 | `FileKey(u64)` is the first 8 bytes of `content_hash` over the content key `v{N}:{path}@{blob}` (a folder: `@{listing hash}`); the path and blob live on the file's record. `ChunkKey { file: FileKey, lines: LineSpan { first, last } }`, 1-based and inclusive, the spans `file_read` pages report. |
 | D2 | The pieces (`candle-conversation/src/files/render.rs`): `files_open` `"\n# Knowledge Base\n\n"`; heading `"## The content from {path}:\n\n```\n"`; a chunk's text, every line ending its `\n`; gap `"...\n\n"`; `closing_join` `"```\n\n"` when another file follows, `closing_last` `"```\n"` for the last. Nothing that follows a chunk opens with a newline: Qwen's pre-tokenizer joins a line's punctuation and the newlines after it into one pre-token, so a piece opening on `\n` would merge with the chunk's last `\n` across the seam. The test `tests/knowledge_pieces_real_vocab.rs` holds every cut on all eight cached Qwen vocabularies, Flash-Next's included. Two bytes differ from Q1's text as the probe wrote it: a file whose text ends in a newline has no blank line before its closing fence, and a gap has one newline before its dots where Qwen-Agent's separator has two. The probe now renders through the same code. |
-| D3 | A chunk is whole lines, up to `PAGE_LINES`, its last line given a `\n` when the file's has none. Every cut is checked against the tokenizer — the tokens of the joined text equal the two parts' tokens joined — and a cut whose seam tokenizes differently moves forward a line at a time until it does not, the chunk running to the end of the file when no cut holds (`files::cut_lines`). |
+| D3 | A chunk is whole lines, up to `PAGE_LINES`, its last line given a `\n` when the file's has none. Every cut is checked against the tokenizer — the tokens of the joined text equal the two parts' tokens joined — and a cut whose seam tokenizes differently moves forward a line at a time until it does not, the chunk running to the end of the file when no cut holds (`files::cut_lines`). Superseded when built by `placed_section_layout.md` §3.5c: the cut is `file_read`'s page, its text `file_read`'s, with a `...` marker after every section but the last. |
 | D4 | A member is sealed behind the default branch's birth prefix up to and including `files_open` (`Sequence::birth_prefix`'s sections before the `files` collection: no collection member, no `depends_on` section, so no tool and no journal; never the seed or the close, which come after). Its K/V prefix is the prefix its recurrent start was computed over. |
 | D5 | A file is a chain: heading → chunk 1 … chunk N, sealed behind D4's prefix, each continuing the one before (its recurrent state run on from the predecessor's end, so a chunk's K/V is computed as the continuation of its file). Gap and the two closing pieces are shared singletons sealed behind D4's prefix. The seed is not members: it is one section of the prompt (§6.2b). Its files are also ordinary files, so each is calibrated behind itself. |
 | D6 | `files_open` is a fixed section of the dialogue's prompt and always emits: an empty knowledge base is the heading alone. Every conversation opens on the branch checkpoint (§6.2b). A prompt without a `files` collection is unchanged. |
@@ -765,7 +776,7 @@ records the change here.
 | D19 | The `repo_map` and `code_reading` layers stay in the schema as the knowledge base's ingest and its kinds: their groups (`structure`, `scopes`, `guides`, `journals`) are the kinds' policies and shares, and `code_reading` carries `calibrate:`. They hold no conversations; their `summary:` blocks are what the schema requires of every layer and run on no turns. A `calibrate:` block on any layer but the files layer calibrates nothing and is refused at load. |
 | D20 | A file record is the planner's unit: its `FileKey::scan_id` stands where a reading's timeline stood, so the plan's tombstone is a record retired and its branch tie a record rewritten. A record whose members this process has not sealed is queued with the pass's new files, and its seal restores each member from its stream (D15). A record written before its members seal never exists: the record is written last. |
 | D21 | A file's calibration is two units, one per frame (`{frame}:{content key}`), each with its own marker and its own calibration conversation, sealed by `seal_framed` in a fork of the dialogue's base pinned to the frame (`FilesPin::Empty` / `FilesPin::Only`), the seed absent. The draft and the thinking are forks of the same base: an ingest base never projects (its first turn lays its fixed frame down), so a pin there places nothing, and the dialogue's base is where a live query's first turn is projected. A pinned knowledge base is placed for any target, a pin taking no share of a room. One draft serves both frames; a frame the draft gives no question takes all of them. Its failures are counted in a keyed object (`calibration/failed/{unit}`). Calibrations are forks of the base, so they run at the dialogue's C5 rather than lossless. |
-| D22 | The fill places a leading run of a file's chunks when the file passes its kind's cap (QSA hit-lift per chunk is not built); a pinned knowledge base places its one file whole whatever the cap. |
+| D22 | The fill places a leading run of a file's chunks when the file passes its kind's cap (QSA hit-lift per chunk is not built); a pinned knowledge base places its one file whole whatever the cap. Superseded when built by `placed_section_layout.md` §3.4, §3.5c: provenance and the index both reduce by section, the projection by peak index attention. |
 | D23 | A file a turn's loop read is withheld from its knowledge base until the next question (`FilesSet::withhold`), cleared where the working set's withholding is. |
 | D24 | Keys move to version 7; a repository's root anchors are keyed as every file is. The priming chain, faces, the reading conversation, the folder summary conversation, the working set's `seeds`, the priming load step and inline calibration of derived layers are removed. |
 
