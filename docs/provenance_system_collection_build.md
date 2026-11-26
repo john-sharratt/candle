@@ -49,7 +49,7 @@ are D2 and D3. Tests: `a_whole_file_renders_as_q1_rendered_it`,
 `tests/knowledge_pieces_real_vocab.rs::assembled_pieces_tokenize_as_the_knowledge_text`
 (token ids, through `tests/common/real_vocab.rs::for_each_tokenizer`).
 
-## Stage 2 — file records, the member seal, signatures on sections (L) — [~]
+## Stage 2 — file records, the member seal, signatures on sections (L) — [x] `5954ea849`
 
 - Split `conversation/submitted_sections.rs`'s `SealJob` (:294-597) into
   `conversation/section_seal/{job,address,start_state}.rs`.
@@ -94,7 +94,7 @@ are D2 and D3. Tests: `a_whole_file_renders_as_q1_rendered_it`,
   `a_member_seal_writes_its_signature_and_index_page`,
   `restore_sections_installs_cold_markers_in_one_request`.
 
-## Stage 3 — the prompt's end: `files_open`, the seed, the close (M)
+## Stage 3 — the prompt's end: `files_open`, the seed, the close (M) — [x] `0ec4a5654`
 
 **Rewritten 2026-11-26 (design §6.2b).** The seed is one section of the
 prompt in a section tree (`seed`: present | absent), after the `files`
@@ -139,7 +139,7 @@ The text below is the plan this replaced, kept for reference:
   `an_opening_state_is_the_frame_state_advanced_by_the_close_row`,
   `a_running_conversations_state_is_the_same_before_and_after_a_reprojection`.
 
-## Stage 4 — the collection in the projection (XL)
+## Stage 4 — the collection in the projection (XL) — [x] `86ae92351`
 
 **4a, schema and emit.**
 - `parse_groups.rs:271-283` lifts the `working_set` refusal for a collection
@@ -213,7 +213,7 @@ The text below is the plan this replaced, kept for reference:
   - ported to `FileKey`: the working set's tests;
   - deleted: the seed tests and the face tests.
 
-## Stage 5 — ingest as chunk prefill; folders as listings (XL)
+## Stage 5 — ingest as chunk prefill; folders as listings (XL) — [x] `8f9b5f97c`
 
 - `zend/src/code_read/process.rs::process_one_file` (:20-455) keeps the
   lease, the binary sniff and the deferred tombstone, and becomes:
@@ -237,7 +237,7 @@ The text below is the plan this replaced, kept for reference:
   `a_superseded_record_is_retired_only_after_the_new_one_commits`,
   `a_binary_file_writes_no_record`.
 
-## Stage 6 — the seed chain's removals (S)
+## Stage 6 — the seed chain's removals (S) — [~] zend side `8f9b5f97c`; the substrate's `SEED_PARENT` and lineage seed remain
 
 **Rewritten 2026-11-26.** The seed is built in Stage 3. What remains here is
 the removal of the old seed lineage listed below; the chain-sealing and
@@ -268,7 +268,7 @@ The text below is the plan this replaced, kept for reference:
   `the_seed_dial_off_opens_on_the_files_open_state`; GPU
   `an_opening_state_is_the_seed_end_snapshot_advanced_by_the_close_row`.
 
-## Stage 7 — calibration: the draft and the alternating frames (L)
+## Stage 7 — calibration: the draft and the alternating frames (L) — [x] `8f9b5f97c`
 
 - `calibrate/run.rs`:
   - units are file records;
@@ -293,7 +293,7 @@ The text below is the plan this replaced, kept for reference:
 - Exit: the end-to-end path runs — depth-1 ingest, calibration,
   normalization, a dialogue whose system prompt holds the knowledge base.
 
-## Stage 8 — prompt text, removals, tools, documents (M)
+## Stage 8 — prompt text, removals, tools, documents (M) — [~] prompt text `39ec63a15`
 
 - `projection.yaml`:
   - `history_stance`, `grounding` and `grounding_no_tools` are rewritten per
