@@ -349,12 +349,20 @@ impl Scheduler {
         // reads. Truncating to 0 drops the slot's Arc refs;
         // the residence keeps the chunks alive for the next
         // projection inject.
-        if let Err(e) = self.session.truncate_sequence_to_blocks(seal_slot.0, 0) {
-            tracing::warn!(
-                "post-seal slot truncate failed for slot {}: {}",
-                seal_slot,
-                e
-            );
+        //
+        // **Only a slot with a projection target is stateless.** A raw
+        // slot has nothing to rebuild its K/V from, and its recurrent
+        // state stays on it either way; emptied, its next turn would
+        // read a recurrence over tokens its attention no longer holds.
+        // Its K/V stays with its state until the slot is freed.
+        if self.slot_targets.contains_key(&seal_slot) {
+            if let Err(e) = self.session.truncate_sequence_to_blocks(seal_slot.0, 0) {
+                tracing::warn!(
+                    "post-seal slot truncate failed for slot {}: {}",
+                    seal_slot,
+                    e
+                );
+            }
         }
         // The slot no longer holds what its last assembly placed.
         if let Some(slot_state) = self.slot_projection_state.get_mut(&seal_slot) {

@@ -315,8 +315,8 @@ impl ConversationEngine {
     /// One raw turn on `sequence_id`: `tokens` prefilled after what the slot
     /// holds, then up to `max_decode_tokens` decoded argmax — none with `0`,
     /// the prefill alone. The scheduler carves a view over the parent's full
-    /// block range and finalizes it onto the parent on Done, so a later turn
-    /// continues from here.
+    /// block range and finalizes it onto the parent on Done; the raw slot keeps
+    /// that K/V through the seal, so a later turn continues from here.
     fn raw_turn(
         &self,
         sequence_id: SequenceId,
@@ -346,7 +346,11 @@ impl ConversationEngine {
                 sampling: SamplingConfig::argmax(),
                 event_tx,
                 reprojection: None,
-                disable_reprojection: false,
+                // A raw slot continues what it holds: the assembly appends onto
+                // a slot that already holds blocks rather than resetting it, so
+                // its K/V stays beside the recurrence that ran over them. A
+                // fresh slot holds nothing and assembles as any raw turn does.
+                disable_reprojection: true,
                 // Raw eval/summarisation path: no tools, no constrained decode.
                 triggers: Arc::new(TriggerRegistry::new()),
                 turn_grammar: None,

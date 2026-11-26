@@ -236,10 +236,10 @@ pub(super) mod tests {
     ///
     /// A recurrence cannot be rebuilt from K/V, so between one turn and the next
     /// the parent's state is the only copy of everything the conversation has
-    /// said — the seal empties the slot's K/V (stateless-slot housekeeping) and
-    /// keeps the state. Three identical turns are driven through the whole loop
-    /// — submit, prefill, view carve, decode, move back, seal — and the parent
-    /// is read after each.
+    /// said — a raw turn's assembly empties the slot's K/V and keeps the state.
+    /// Three identical turns are driven through the whole loop — submit,
+    /// prefill, view carve, decode, move back, seal — and the parent is read
+    /// after each.
     ///
     /// The toy step is affine (`s ← 2s + t·k`), so a turn of `m` forwards is
     /// `f(s) = 2ᵐ·s + C`, and `C = f(0)` is exactly the state after turn one.
@@ -300,8 +300,8 @@ pub(super) mod tests {
             .expect("scheduler running");
         loop_thread.join().expect("the loop exits cleanly");
 
-        // Each turn's K/V is that turn alone (the seal empties the slot), and the
-        // recurrence absorbs exactly that many tokens per turn.
+        // Each turn's K/V is that turn alone (a raw turn's assembly resets the
+        // slot), and the recurrence absorbs exactly that many tokens per turn.
         for (turn, held) in [
             (1, first.stats.context_tokens),
             (2, second.stats.context_tokens),
@@ -350,6 +350,47 @@ pub(super) mod tests {
             step(&state_2),
             "turn 3 did not continue from turn 2's state — the parent's recurrent \
              buffer was not carried into the third turn",
+        );
+    }
+
+    /// **A raw slot keeps its K/V through its turn's seal.** It has no
+    /// projection target, so nothing would rebuild that K/V, and its recurrent
+    /// state stays on it regardless: emptied, the slot's next turn would read a
+    /// recurrence over tokens its attention no longer holds. The slot still
+    /// holds every block and its depth once the seal has answered `Done`.
+    #[test]
+    fn a_raw_slot_keeps_its_kv_through_the_seal() {
+        let (mut scheduler, _tx, _probe) = make_test_scheduler_recurrent();
+        let conversation = crate::projection::Conversation::new();
+        let slot = create_scratch_slot(&mut scheduler, &conversation);
+        forward_on(&mut scheduler, slot.0, &[1, 2, 3, 4, 5]);
+        let blocks = scheduler.session.sequence_block_count(slot.0).unwrap();
+        assert!(blocks > 0, "the slot owns K/V before the seal");
+
+        let (state, events) = boundary_state();
+        scheduler.seal_finished_turn(FinishedTurn {
+            state,
+            answer: TurnText::default(),
+            decode_ms: 0.0,
+            total_ms: 0.0,
+            tokens_generated: 0,
+            tokens_per_second: 0.0,
+            sequence_stats: scheduler.session.get_sequence_stats(slot.0),
+            context_tokens: 5,
+            seal_slot: slot,
+            seal_block_from: 0,
+        });
+        assert!(
+            matches!(events.try_recv(), Ok(TurnEvent::Done(_))),
+            "the seal answers the turn"
+        );
+        assert_eq!(
+            (
+                scheduler.session.sequence_block_count(slot.0),
+                scheduler.session.sequence_offset(slot.0),
+            ),
+            (Some(blocks), Some(5)),
+            "a raw slot's K/V outlives its turn's seal",
         );
     }
 
