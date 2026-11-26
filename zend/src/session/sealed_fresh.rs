@@ -39,7 +39,7 @@ use candle_conversation::files::names::{chunk_name, heading_name};
 use candle_conversation::files::{files_owner, FileRecord, FilesPin};
 use candle_conversation::projection::Conversation;
 use candle_conversation::projection::{
-    DecodePriority, ReprojectionMode, SelectionState, TurnIndex,
+    DecodePriority, OptionalState, ReprojectionMode, SelectionState, TurnIndex, SEED_SELECTOR,
 };
 use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{
@@ -53,6 +53,7 @@ use super::sealed_fresh_layout::{compare, piece_chunks, LayoutComparison};
 use super::sealed_fresh_reseal::{prefix_before, reseal_behind};
 use super::ZendSession;
 use crate::files::records;
+use crate::journal::opening::SeedRead;
 use crate::types::ToolMode;
 
 /// The most tokens either side decodes.
@@ -125,15 +126,59 @@ pub struct SealedFreshReq {
     /// question reads.
     #[serde(default)]
     pub after_tokens: usize,
+    /// The seed as files: the seed section left out (its dial absent) and
+    /// each of its files placed instead as a member of the knowledge base,
+    /// in the seed's order, ahead of the file — each sealed alone behind the
+    /// prompt up to `files_open`, as the file is, none behind another.
+    #[serde(default)]
+    pub seed_as_files: bool,
+}
+
+/// The seed's files in the seed's order: each repository's root listing,
+/// then the documents the seed read from it.
+pub fn seed_paths(read: &SeedRead) -> Vec<String> {
+    let mut out = Vec::new();
+    for repo in &read.listings {
+        out.push(format!("{repo}/"));
+        let prefix = format!("{repo}/");
+        out.extend(
+            read.documents
+                .iter()
+                .filter(|d| d.starts_with(&prefix))
+                .cloned(),
+        );
+    }
+    out
+}
+
+/// The record this process can place for each of `paths`, in order; a path
+/// with none is left out.
+fn placeable_records(conversation: &Conversation, paths: &[String]) -> Vec<FileRecord> {
+    paths
+        .iter()
+        .filter_map(|p| {
+            records::of_path(conversation, p)
+                .into_iter()
+                .find(|r| records::placeable(conversation, r))
+        })
+        .collect()
 }
 
 /// The files placed after `needle` to reach `tokens`: every other path's
 /// record this process can place, one version each, in path order, until
-/// their members' tokens reach `tokens`.
-fn files_after(conversation: &Conversation, needle: &FileRecord, tokens: usize) -> Vec<FileRecord> {
+/// their members' tokens reach `tokens`; `exclude`'s paths are left out.
+fn files_after(
+    conversation: &Conversation,
+    needle: &FileRecord,
+    exclude: &[String],
+    tokens: usize,
+) -> Vec<FileRecord> {
     let mut by_path: BTreeMap<String, FileRecord> = BTreeMap::new();
     for r in records::all(conversation) {
-        if r.path != needle.path && records::placeable(conversation, &r) {
+        if r.path != needle.path
+            && !exclude.contains(&r.path)
+            && records::placeable(conversation, &r)
+        {
             by_path.entry(r.path.clone()).or_insert(r);
         }
     }
@@ -327,6 +372,10 @@ pub struct SealedFresh {
     /// The files placed after the file, in order, and their members' tokens.
     pub after_files: Vec<String>,
     pub after_tokens: usize,
+    /// With the seed as files, the seed's files placed as members, in order,
+    /// and the seed's files this process holds no record of.
+    pub seed_files: Vec<String>,
+    pub seed_missing: Vec<String>,
 }
 
 /// The first index where `a` and `b` differ, within the shorter; `None` when
@@ -364,9 +413,12 @@ fn without_members(dump: &PromptDump, members: &HashSet<u32>) -> Vec<u32> {
 /// The selection the sealed side runs under: the opening its only projection,
 /// every other dial the dialogue's default. Which tools it places is its
 /// projection's ([`SealedFreshReq::tools`]).
-fn selection() -> SelectionState {
+fn selection(seed_as_files: bool) -> SelectionState {
     let mut s = SelectionState::new();
     s.set_reprojection_mode(ReprojectionMode::Opening);
+    if seed_as_files {
+        s.set_optional(SEED_SELECTOR, OptionalState::Absent);
+    }
     s
 }
 
@@ -392,12 +444,21 @@ impl ZendSession {
             ),
         };
         // The files placed after the needle, to `after_tokens`.
+        // The seed's files, placed as members ahead of the file when the seed
+        // is asked for as files.
+        let seed_paths = seed_paths(&state.branch_ingest.seed_read());
+        let seed_files = if req.seed_as_files {
+            placeable_records(&engine.conversation(), &seed_paths)
+        } else {
+            Vec::new()
+        };
         let after = match &record {
-            Some(r) => files_after(&engine.conversation(), r, req.after_tokens),
+            Some(r) => files_after(&engine.conversation(), r, &seed_paths, req.after_tokens),
             None => Vec::new(),
         };
         let pin_of = |needle: &FileRecord| {
-            let mut keys = vec![needle.key()];
+            let mut keys: Vec<_> = seed_files.iter().map(FileRecord::key).collect();
+            keys.push(needle.key());
             keys.extend(after.iter().map(FileRecord::key));
             FilesPin::Only(keys)
         };
@@ -421,7 +482,7 @@ impl ZendSession {
             conv.set_projection(turn_projection(&state, "sealed-fresh", None, mode));
         }
         let out = (|| {
-            let selection = selection();
+            let selection = selection(req.seed_as_files);
             let mut dump = conv
                 .prompt_dump_with(&selection)
                 .context("the sealed side's prompt")?;
@@ -565,6 +626,12 @@ impl ZendSession {
                 resealed_same_tokens,
                 after_files: after.iter().map(|r| r.path.clone()).collect(),
                 after_tokens: after.iter().map(record_tokens).sum(),
+                seed_files: seed_files.iter().map(|r| r.path.clone()).collect(),
+                seed_missing: seed_paths
+                    .iter()
+                    .filter(|p| req.seed_as_files && !seed_files.iter().any(|r| &r.path == *p))
+                    .cloned()
+                    .collect(),
             })
         })();
         let _ = engine.tombstone_timeline(timeline);
@@ -753,8 +820,37 @@ mod tests {
     #[test]
     fn the_sealed_side_holds_its_prompt_to_the_opening() {
         assert_eq!(
-            selection().reprojection_mode(),
+            selection(false).reprojection_mode(),
             Some(ReprojectionMode::Opening)
+        );
+        assert_eq!(selection(false).optional(SEED_SELECTOR), None);
+        assert_eq!(
+            selection(true).optional(SEED_SELECTOR),
+            Some(OptionalState::Absent)
+        );
+    }
+
+    /// **The seed's files read in the seed's order**: each repository's
+    /// listing, then that repository's documents.
+    #[test]
+    fn the_seeds_files_read_in_the_seeds_order() {
+        let read = SeedRead {
+            listings: vec!["candle".into(), "yenbot".into()],
+            documents: vec![
+                "candle/README.md".into(),
+                "yenbot/README.md".into(),
+                "candle/AGENTS.md".into(),
+            ],
+        };
+        assert_eq!(
+            seed_paths(&read),
+            vec![
+                "candle/",
+                "candle/README.md",
+                "candle/AGENTS.md",
+                "yenbot/",
+                "yenbot/README.md"
+            ]
         );
     }
 
