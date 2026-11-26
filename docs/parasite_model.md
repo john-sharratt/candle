@@ -1,8 +1,18 @@
 # Parasite models: one card, a primary model, and the models that borrow it
 
-**Status:** design, not built. It replaces `docs/shared_model_host.md`'s
-single prescribed model (decision 7, §5), and it turns the guest drain
-(`candle-conversation/src/guest/`) into one case of a parasite mount.
+**Status:** being built (2026-11-26). Step 1 is on main (`c7d81a702`): tenants
+name their model and share one engine slot per model. Step 7's move of npcd ran
+ahead of steps 3–6 (`2243691ac`): WhiteWorld runs npcd alone, zend having left it
+for another rollout, so one model on the card needs no parasite. npcd is on
+Qwen3.6-35B from a substrate rebuilt from its cast and kept-object exports, with
+BlackWorld out of npcd's cluster, and npcd ingests on WhiteWorld since no other
+member writes the mind. Step 2's Flash-Next trunk pack is built and tested on
+branch `parasite-trunk-pack` (`7ebe5e309`), held off main until BlackWorld's
+re-prepare is scheduled (§5). Steps 2's Qwen3.6 pack, 3, 4, 5 and 6 are not
+built, nor step 7's measurement of §8.2's constants, which needs step 6's switch
+mode. It replaces `docs/shared_model_host.md`'s single prescribed model
+(decision 7, §5), and it turns the guest drain (`candle-conversation/src/guest/`)
+into one case of a parasite mount.
 
 ## 0. Summary
 
