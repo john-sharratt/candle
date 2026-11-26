@@ -20,7 +20,7 @@ impl Upgrader {
             platform: self.setup.info.platform.clone(),
             log_format: self.setup.info.opens.log_format,
             census: s.census.clone(),
-            model: self.setup.info.opens.model.clone(),
+            models: self.setup.run_models(),
             holds: s
                 .served
                 .iter()

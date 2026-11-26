@@ -1,14 +1,16 @@
 //! `host` — the process a daemon runs in.
 //!
-//! One model, one engine, one HTTP server, and the daemons beside each other as
-//! tenants (`docs/shared_model_host.md`). `zend`, `npcd` and `motherd` are each
+//! One HTTP server, one engine per model the tenants name, and the daemons
+//! beside each other as tenants (`docs/shared_model_host.md`,
+//! `docs/parasite_model.md`). `zend`, `npcd` and `motherd` are each
 //! `host::run([tenant, …])`: the host owns what is the process's — the runtime,
-//! logging, the panic hook, signals, the prescribed model, the shared
-//! endpoints, the web UIs, shutdown — and each tenant keeps its own work.
+//! logging, the panic hook, signals, the engines, the shared endpoints, the web
+//! UIs, shutdown — and each tenant keeps its own work and names its own model.
 //!
 //! | Module | What it owns |
 //! |---|---|
 //! | [`run`] | the one startup path, and the exit |
+//! | [`slots`] | one engine slot per model the tenants name |
 //! | [`tenant`] | the contract a daemon implements |
 //! | [`server`] | one `web::Builder`: the shared and tenant APIs, the UIs by host name |
 //! | [`cluster`] | with `--cluster`, each tenant's app as a cluster member |
@@ -19,7 +21,7 @@
 //! | [`access`] | the estate's role table and `--local-signin` |
 //! | [`ui`] | UIs from disk, `/common/`, the on-disk build id |
 //! | [`substrate_views`] | the substrate inspector's views, served by each tenant over its own substrate |
-//! | [`model`] | the one model every tenant runs |
+//! | [`model`] | a model as the host reports it |
 //! | [`expert_split`] | the CPU expert split's settings, applied before the engine loads |
 //! | [`build_info`] | `--build-info`, and what every binary does first |
 //! | [`calibration`] | the load phase that writes each tool's exemplars, run by every tenant that offers tools |
@@ -52,6 +54,7 @@ pub mod ram_census;
 pub mod run;
 pub mod self_heal;
 pub mod server;
+pub mod slots;
 pub mod starting;
 pub mod stopping;
 pub mod substrate_views;
@@ -62,7 +65,6 @@ pub mod ui;
 
 pub use ::cluster::launch::OneShot;
 pub use cli::HostArgs;
-pub use model::MODEL;
 pub use run::{run, run_seated, HostConfig, Seat};
 pub use server::Listen;
 pub use tenant::{

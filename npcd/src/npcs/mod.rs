@@ -34,13 +34,13 @@ use candle_conversation::persistence::{
     Admit, OpenProgress, SharedSubstrate, SubstratePersistence, SUBSTRATE_DIR,
 };
 use candle_conversation::substrate::Substrate;
-use host::MODEL;
 use serde_json::{json, Value};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::task::block_in_place;
 
 use web::auth::session::Identity;
 
+use crate::model::MODEL;
 use crate::registry::id;
 
 pub use cast::Cast;

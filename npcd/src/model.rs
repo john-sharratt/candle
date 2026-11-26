@@ -1,11 +1,12 @@
-//! The model npcd runs, as its console describes it.
+//! The model npcd runs, and how its console describes it.
 //!
-//! The model itself is the host's to name — one prescribed model for every
-//! tenant of the process ([`host::MODEL`], `docs/shared_model_host.md` §5):
+//! npcd names its own model ([`MODEL`], `docs/parasite_model.md` §4):
 //! **Qwen3.8-Flash-Next**, 250 B total with about 13 B active per token —
 //! gated-DeltaNet layers carrying a recurrent state, attention layers carrying
 //! paged K/V, and routed experts behind the three-tier expert cache. See
-//! `Model::Qwen38_FlashNext`.
+//! `Model::Qwen38_FlashNext`. Its substrate is bound to it
+//! (`docs/shared_model_host.md` §4), so changing it starts npcd on a new
+//! substrate.
 //!
 //! # What a routed model costs this daemon
 //!
@@ -23,7 +24,10 @@
 //! — `Q3_KO` under 64 GiB, `Q4_KO` above. Every rung is the same release, so a
 //! substrate written on one card opens on another.
 
-use host::MODEL;
+use candle_conversation::models::Model;
+
+/// The model npcd runs.
+pub const MODEL: Model = Model::Qwen38_FlashNext;
 
 // # A deployment may be running something else
 //

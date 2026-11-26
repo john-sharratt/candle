@@ -243,6 +243,7 @@ pub(crate) mod test_support {
     use tower::ServiceExt;
     use web::auth::session::Identity;
 
+    use candle_conversation::models::Model;
     use candle_conversation::projection::Conversation;
 
     use crate::loading::LoadingView;
@@ -328,13 +329,13 @@ pub(crate) mod test_support {
             roles: serde_yaml::from_str("people:\n  - sub: boss\n    role: admin\n").unwrap(),
             started_at_ms: 1_700_000_000_000,
             build: "0123456789abcdef".into(),
-            model: ModelView::of_prescribed(),
+            model: ModelView::of_model(&Model::Qwen38_FlashNext),
             tenants: tenants
                 .into_iter()
                 .map(|(n, s)| (n, Arc::new(s) as Arc<dyn Reports>))
                 .collect(),
             log: LogBus::new(&["zend", "npcd"]),
-            telemetry: Telemetry::new(ModelView::of_prescribed()),
+            telemetry: Telemetry::new(ModelView::of_model(&Model::Qwen38_FlashNext)),
             cluster: None,
             stopping: Arc::new(Stopping::new()),
             host: "m1".into(),

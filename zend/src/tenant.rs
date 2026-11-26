@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use candle_conversation::models::DialectType;
+use candle_conversation::models::{DialectType, Model};
 use candle_conversation::persistence::SUBSTRATE_DIR;
 use candle_conversation::projection::Conversation;
 use candle_conversation::Capabilities;
@@ -73,6 +73,10 @@ impl ZendTenant {
 impl Tenant for ZendTenant {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    fn model(&self) -> Model {
+        self.config.model.clone()
     }
 
     fn requires(&self) -> Capabilities {
@@ -365,6 +369,7 @@ mod tests {
     use include_dir::File;
 
     use crate::loading::LoadStep;
+    use crate::model::MODEL;
 
     fn every_file<'a>(dir: &'a Dir<'a>, out: &mut Vec<&'a File<'a>>) {
         out.extend(dir.files());
@@ -459,13 +464,13 @@ mod tests {
         );
     }
 
-    /// The capabilities zend declares are what the prescribed model has — the
-    /// host refuses a model lacking one, naming zend.
+    /// The capabilities zend declares are what its model has — the host
+    /// refuses a model lacking one, naming zend.
     #[test]
     fn zend_needs_the_three_markers_and_the_qwen35_dialect() {
         let r = requires();
         assert_eq!(r.tokens, ["<tool_call>", "<think>", "</think>"]);
         assert_eq!(r.dialect, DialectType::Qwen35);
-        assert_eq!(host::MODEL.spec().chat_format, DialectType::Qwen35);
+        assert_eq!(MODEL.spec().chat_format, DialectType::Qwen35);
     }
 }

@@ -175,6 +175,7 @@ fn upgrader(dir: &TempDir, store: Arc<HeldStore>) -> (Arc<Upgrader>, Arc<AppMemb
     let up = Upgrader::new(
         Setup {
             info: info(),
+            runs: Vec::new(),
             exe: dir.path().join("zend.exe"),
             upgrade_dir: dir.path().join("upgrade"),
             keep_builds: 2,

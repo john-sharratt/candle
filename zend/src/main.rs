@@ -22,9 +22,13 @@ use clap::Parser;
 use cluster::version::info::ZEND;
 #[cfg(feature = "memory-census")]
 use heap_census::Counting;
-use host::build_info::first;
+use host::build_info::{first, AppModels};
 use host::{run, HostArgs, HostConfig, Tenant};
 use zend::cli::ZendArgs;
+use zend::model::MODEL;
+
+/// The app this binary runs, and its model.
+const APPS: AppModels = &[("zend", MODEL)];
 
 /// Every allocation counted by size class, for the memory census
 /// (`docs/memory_census.md`). Built with the `memory-census` feature.
@@ -46,7 +50,7 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
-    first(ZEND);
+    first(ZEND, APPS);
     let cli = Cli::parse();
     let tenant: Box<dyn Tenant> = Box::new(cli.zend.resolve()?);
     run(

@@ -20,7 +20,8 @@ use std::time::Instant;
 use candle::Device;
 use candle_conversation::SequenceConfig;
 use futures::future::join_all;
-use host::MODEL;
+
+use crate::model::MODEL;
 
 use super::answer::Fields;
 use super::config::{Config, READING_CONTEXT};

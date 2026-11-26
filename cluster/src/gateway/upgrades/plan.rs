@@ -192,7 +192,7 @@ pub fn plan(
         let needs = Needs {
             log_format: view.log_format,
             census: view.census.clone(),
-            model: view.model.clone(),
+            models: view.models.clone(),
         };
         let own = view
             .holds

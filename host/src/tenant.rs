@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent::jobs::Jobs;
+use candle_conversation::models::Model;
 use candle_conversation::projection::Conversation;
 use candle_conversation::{Capabilities, EngineSource};
 use futures::future::BoxFuture;
@@ -33,7 +34,11 @@ pub trait Tenant: Send + 'static {
     /// A short name: log attribution, status key, route owner. `"zend"`.
     fn name(&self) -> &'static str;
 
-    /// What this tenant needs of the model, checked against the prescribed one
+    /// The model this tenant runs (`docs/parasite_model.md` §4). Its engine is
+    /// the one built for this model, and its substrate is bound to it.
+    fn model(&self) -> Model;
+
+    /// What this tenant needs of its model, checked against [`Self::model`]
     /// when its engine is attached.
     fn requires(&self) -> Capabilities;
 

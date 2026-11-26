@@ -6,6 +6,7 @@
 //! The answer is this structure's JSON on one line, fields in declaration
 //! order, so one build has one answer.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 
 use serde::{Deserialize, Serialize};
@@ -46,16 +47,19 @@ pub struct BuildInfo {
 }
 
 /// What a build can open (§3.9): the substrate's log format, the record types
-/// it decodes, and the model it runs. An agent opens no substrate and runs no
-/// model.
+/// it decodes, and the model each of its apps runs. An agent opens no
+/// substrate and runs no model.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Opens {
     /// The redo log's `FILE_FORMAT_VERSION`.
     pub log_format: Option<u32>,
     /// The tag of every record type it decodes, ascending.
     pub record_tags: Vec<u8>,
-    /// The name of the model it is prescribed (`host::MODEL`'s preset).
-    pub model: Option<String>,
+    /// Each app the binary runs, by name, and the preset of the model that
+    /// app's tenant names (`docs/parasite_model.md` §4). Ordered, so one build
+    /// has one answer. Empty for a build that names no app's model.
+    #[serde(default)]
+    pub models: BTreeMap<String, String>,
 }
 
 impl BuildInfo {
@@ -127,7 +131,7 @@ mod tests {
             opens: Opens {
                 log_format: Some(3),
                 record_tags: vec![1, 2, 31],
-                model: Some("Qwen38_FlashNext_Q4KO".into()),
+                models: BTreeMap::from([("zend".into(), "Qwen38_FlashNext".into())]),
             },
         }
     }
@@ -139,7 +143,7 @@ mod tests {
         let want = concat!(
             r#"{"kind":"zend","count":4815,"hash":"9f8e7d6","local":"","#,
             r#""platform":"windows-x86_64","log_format":3,"record_tags":[1,2,31],"#,
-            r#""model":"Qwen38_FlashNext_Q4KO"}"#
+            r#""models":{"zend":"Qwen38_FlashNext"}}"#
         );
         assert_eq!(info().encode(), want);
         assert_eq!(BuildInfo::decode(&format!("{want}\n")), Some(info()));
@@ -163,7 +167,7 @@ mod tests {
         };
         assert!(agent
             .encode()
-            .ends_with(r#""log_format":null,"record_tags":[],"model":null}"#));
+            .ends_with(r#""log_format":null,"record_tags":[],"models":{}}"#));
     }
 
     #[test]

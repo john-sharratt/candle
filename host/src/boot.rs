@@ -117,6 +117,7 @@ mod tests {
 
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
+    use candle_conversation::models::Model;
     use tower::ServiceExt;
 
     use crate::endpoints::test_support::{loading, scripted};
@@ -147,7 +148,7 @@ mod tests {
         let boot = Boot::new(
             1_700_000_000_000,
             "0123456789abcdef".into(),
-            ModelView::of_prescribed(),
+            ModelView::of_model(&Model::Qwen38_FlashNext),
             None,
             vec![
                 ("zend", BootLine::Starting(StartLine::new())),

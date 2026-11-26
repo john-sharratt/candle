@@ -8,6 +8,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use candle_conversation::models::Model;
 use cluster::launch::LaunchSpec;
 use cluster::upgrade::runtime::{InstallJob, Installer, Setup};
 use cluster::version::info::BuildInfo;
@@ -52,11 +53,20 @@ impl Installer for HostInstaller {
     }
 }
 
-/// What a `kind` process launched as `launch` upgrades from: its executable,
-/// its state beside `state_dir`, and its flags.
-pub fn setup(kind: &str, launch: &LaunchSpec, state_dir: &Path, args: &HostArgs) -> Setup {
+/// What a `kind` process whose binary opens `apps` and that runs `runs` of
+/// them, launched as `launch`, upgrades from: its executable, its state beside
+/// `state_dir`, and its flags.
+pub fn setup(
+    kind: &str,
+    apps: &[(&str, Model)],
+    runs: &[&str],
+    launch: &LaunchSpec,
+    state_dir: &Path,
+    args: &HostArgs,
+) -> Setup {
     Setup {
-        info: BuildInfo::of(kind, opens()),
+        info: BuildInfo::of(kind, opens(apps)),
+        runs: runs.iter().map(|a| a.to_string()).collect(),
         exe: launch.exe.clone(),
         upgrade_dir: state_dir.join(UPGRADE_DIR),
         keep_builds: args.keep_builds,

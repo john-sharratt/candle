@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::extract::{Path as UrlPath, Request};
 use axum::Router;
+use candle_conversation::models::Model;
 use cluster::consensus::votes::MemoryVotes;
 use cluster::dispatch::{Dispatch, Merge};
 use cluster::frame::{BuildId, ModelId};
@@ -74,6 +75,7 @@ fn upgrader(dir: &Path) -> Arc<Upgrader> {
                 platform: platform(),
                 opens: Opens::default(),
             },
+            runs: Vec::new(),
             exe: std::env::current_exe().unwrap(),
             upgrade_dir: dir.join("upgrade"),
             keep_builds: 5,
@@ -197,7 +199,7 @@ async fn member(gateway: SocketAddr, node: u64, dir: &Path) -> Member {
     let cluster = Cluster::new(
         settings,
         &["zend"],
-        Telemetry::new(ModelView::of_prescribed()),
+        Telemetry::new(ModelView::of_model(&Model::Qwen38_FlashNext)),
         Handle::current(),
         upgrader(dir),
     )

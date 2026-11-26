@@ -31,7 +31,7 @@ use axum::extract::{ConnectInfo, Request};
 use axum::middleware::{self, Next};
 use axum::Router;
 use candle_conversation::engine_slot::CoreRequests;
-use candle_conversation::models::DialectType;
+use candle_conversation::models::{DialectType, Model};
 use candle_conversation::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENTION;
 use candle_conversation::persistence::{OpenStage, SUBSTRATE_DIR};
 use candle_conversation::Capabilities;
@@ -39,7 +39,7 @@ use clap::{ArgAction, Args};
 use cluster::dispatch::Dispatch;
 use futures::future::BoxFuture;
 use host::guard::{Api, Guarded, Routes};
-use host::{OneShot, Running, Tenant, TenantContext, TenantUi, MODEL};
+use host::{OneShot, Running, Tenant, TenantContext, TenantUi};
 use include_dir::{include_dir, Dir};
 use journals::slug::Slug;
 use serde::Deserialize;
@@ -71,6 +71,7 @@ use crate::images::Images;
 use crate::mind::files::MindFiles;
 use crate::mind::{Mind, MindRepo};
 use crate::mind_store::{self, MindSource};
+use crate::model::MODEL;
 use crate::npcs::{Casting, Npcs};
 use crate::personality_portrait;
 use crate::projection;
@@ -351,6 +352,10 @@ pub struct NpcdTenant {
 impl Tenant for NpcdTenant {
     fn name(&self) -> &'static str {
         NAME
+    }
+
+    fn model(&self) -> Model {
+        MODEL
     }
 
     fn requires(&self) -> Capabilities {

@@ -73,9 +73,9 @@ mod tool_scenarios {
     use candle_conversation::models::Model;
     use candle_conversation::projection::{SectionLoads, SystemItem};
     use candle_conversation::{SamplingConfig, SelectionState};
-    use host::MODEL as PRODUCTION;
     use zend::api::chat::{apply_tools_dial, dial_selection};
     use zend::config::DaemonConfig;
+    use zend::model::MODEL as PRODUCTION;
     use zend::session::{timeline_for, StreamItem, ZendSession};
     use zend::types::{ChatMessage, Role, ToolMode};
     use zend_tools::state::Secrets;

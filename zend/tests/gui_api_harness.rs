@@ -37,6 +37,7 @@ use web::log_file::RotatingFileLog;
 use web::Roots;
 use zend::api;
 use zend::config::DaemonConfig;
+use zend::model::MODEL;
 use zend::session::ZendSession;
 use zend::tenant::{zend_ui, ZendReports, WEB};
 
@@ -73,13 +74,13 @@ async fn boot() -> Harness {
             .unwrap()
             .as_millis() as u64,
         build: build_id(&[&WEB, &COMMON], "harness"),
-        model: ModelView::of_prescribed(),
+        model: ModelView::of_model(&MODEL),
         tenants: vec![(
             "zend",
             Arc::new(ZendReports::new(Arc::clone(&session))) as Arc<dyn Reports>,
         )],
         log: Arc::clone(&log),
-        telemetry: Telemetry::new(ModelView::of_prescribed()),
+        telemetry: Telemetry::new(ModelView::of_model(&MODEL)),
         roles: roles.clone(),
         cluster: None,
         stopping: Arc::new(Stopping::new()),

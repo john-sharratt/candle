@@ -13,9 +13,13 @@ use clap::Parser;
 use cluster::version::info::NPCD;
 #[cfg(feature = "memory-census")]
 use heap_census::Counting;
-use host::build_info::first;
+use host::build_info::{first, AppModels};
 use host::{run, HostArgs, HostConfig, Tenant};
+use npcd::model::MODEL;
 use npcd::tenant::NpcdArgs;
+
+/// The app this binary runs, and its model.
+const APPS: AppModels = &[("npcd", MODEL)];
 
 /// Every allocation counted by size class, for the memory census
 /// (`docs/memory_census.md`). Built with the `memory-census` feature.
@@ -36,7 +40,7 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
-    first(NPCD);
+    first(NPCD, APPS);
     let cli = Cli::parse();
     let tenant: Box<dyn Tenant> = Box::new(cli.npcd.resolve()?);
     run(

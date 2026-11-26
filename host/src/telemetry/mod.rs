@@ -218,8 +218,10 @@ impl Telemetry {
 mod tests {
     use super::*;
 
+    use candle_conversation::models::Model;
+
     fn view() -> ModelView {
-        ModelView::of_prescribed()
+        ModelView::of_model(&Model::Qwen38_FlashNext)
     }
 
     /// The host is real regardless, so a page is never entirely empty; the

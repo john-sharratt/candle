@@ -44,11 +44,12 @@ pub(super) mod projection_schema_tests {
     /// is loaded, beside the workspace it works in.
     #[test]
     fn the_persona_names_the_served_model() {
+        use crate::model::MODEL;
         use crate::repo_scan::shared_prompt_body;
         use host::model::ModelView;
         let builder = build_projection_builder(Path::new("demo-project"));
         let body = shared_prompt_body(&builder);
-        let model = ModelView::of_prescribed();
+        let model = ModelView::of_model(&MODEL);
         let expected = format!(
             "You are Zen, an AI coding assistant running on {}, working in the demo-project\n\
              workspace, which holds one or more repositories.",

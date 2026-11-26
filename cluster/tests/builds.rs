@@ -116,6 +116,7 @@ fn machine(count: u32, kept: &[u32]) -> Machine {
     let up = Upgrader::new(
         Setup {
             info: info(count),
+            runs: Vec::new(),
             exe,
             upgrade_dir: dir.path().join("data").join("upgrade"),
             keep_builds: 5,

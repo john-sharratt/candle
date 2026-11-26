@@ -62,8 +62,19 @@ impl ModelBuilder {
             })?;
         // A prepared model is the release its artifact is built from, at
         // whichever rung this card built it: every rung of it is one model.
+        // Only Flash-Next's lineage is prepared, so its recipe is the only
+        // digest a prepared spec can name; any other arch claiming to be
+        // prepared would be bound under Flash-Next's identity, and is refused.
         let digest = if self.spec.prepared_from_source {
-            engine_model_digest()
+            match self.spec.arch {
+                ModelArch::Qwen4Exp => engine_model_digest(),
+                other => {
+                    return Err(ConversationError::Other(format!(
+                        "{other:?} names a prepared artifact, and only Qwen4Exp has a prepare \
+                         recipe to identify it by"
+                    )))
+                }
+            }
         } else {
             weights.digest().map_err(|e| {
                 ConversationError::Other(format!(

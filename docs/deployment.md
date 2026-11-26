@@ -166,7 +166,8 @@ Notes on the arguments:
   before; it now clears them from any other peer, so an npcd behind the gateway on
   another machine needs `--gateway 192.168.1.2` (BlackWorld) to see who is signed in. A
   member that joins the gateway's cluster (`host:` in `motherd/motherd.yaml`) needs no flag.
-- **`--model`** (zend) is gone: every daemon runs the prescribed model (`host::MODEL`).
+- **`--model`** (zend) is gone: every daemon runs the model its tenant names
+  (`zend::model::MODEL`, `npcd::model::MODEL`).
   A substrate written under another model refuses to open, naming both — start on a new
   `--working-dir`, or move the old substrate aside.
 - **Wiping flags** — `--forget-conversations` (npcd) and `--wipe-substrate` (zend) destroy

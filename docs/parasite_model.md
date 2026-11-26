@@ -184,7 +184,10 @@ fn requires(&self) -> Capabilities; // as today
   - `ModelView` for the prompt's `{model}` placeholder (`zend/src/session/builders.rs:370`).
 - `host/src/build_info.rs:20`'s single `Opens.model` becomes a map from app to
   model override key, so the upgrade compatibility check
-  (`cluster/src/upgrade/compat.rs:41`) compares each app's model.
+  (`cluster/src/upgrade/compat.rs:41`) compares each app's model — for the apps
+  the member runs (`Setup::runs`). A daemon a member leaves out holds no
+  substrate there, so BlackWorld, standing npcd, still takes the build that
+  moves npcd to Qwen3.6 in step 7.
 
 **One slot per model.**
 - `host::run` groups tenants by model and builds one `EngineSlot` per group,
@@ -220,19 +223,48 @@ matrix as its KO twin. This is the vision tower's mechanism
 
   Each model's pack build produces these, as `qwen35/pack_build.rs` already does
   for its family, so the loader reads them as stored.
+
+**How a build makes them.** The pack build runs the code a load used to run, on
+the device, and reads each result back byte for byte
+(`model_pack/built.rs`: a scratch file beside the pack, mapped back when the
+GGUF part is written, since a GGUF part is planned before a byte of it is
+written). What is stored is therefore exactly what the load would have built.
+A tensor that is the twin of one checkpoint tensor keeps that tensor's name;
+one built from several takes a name of its own, and its parts leave the pack.
+Flash-Next's names are `qwen4exp/trunk_names.rs`, shared by the build
+(`qwen4exp/pack_build.rs`) and the load, and its family is
+`PackFamily::Qwen4Exp` (no longer `Routed`, which Qwen3-MoE keeps). The engine
+runs an int8 session on a CUDA card, so the trunk pack is built for an int8
+mode only.
 - **Verbatim, as today:** the embedding (Q8_0, 644 MiB), norms, rotary inputs,
   the QSA indexer sources and the PLE table.
 
-**Fingerprints.** Every `(source → twin)` pair is fingerprinted and re-checked at
-open, as the expert section's are (`self_contained_model_packs.md` §4.2). A pack
-of the old family fails `validate` (`model_pack/family.rs:179`), is judged stale,
-and is rebuilt.
+**Fingerprints.** Every `(source → twin)` pair the built tensors went through is
+fingerprinted on the device and re-checked at open, as the expert section's are
+(`self_contained_model_packs.md` §4.2), under a table of its own
+(`zen.pack.trunk.pairs`; `model_pack/prints.rs` encodes every such table). A
+version, `zen.pack.trunk.version`, covers what no pair fingerprint sees — a
+padding rule, a fold — and moves whenever a stored tensor's content changes at
+an unchanged name, shape and type. A pack of the old family has neither, fails
+`validate` (`model_pack/family.rs`), is judged stale, and is rebuilt.
 
 **The rebuild re-fetches its sources.**
 - The resolver rebuilds the way it always has (`model_pack/resolve.rs`): fetch
   the sources, build, publish, release the fetched sources.
 - For Flash-Next that means re-preparing its artifact on each machine. That is
   once per machine, and the price of keeping one source kind.
+- **A daemon never prepares it.** `resolve_spec` resolves Flash-Next through
+  `prepared_engine_pack`, whose store fetches nothing, because preparing
+  fetches ~190 GB of pinned sources. So the build carrying the trunk pack must
+  not reach a machine before its artifact is prepared there: run the Flash-Next
+  gate (`quantized_qwen38_moe::tests::test_parallel_batched_forwarding`) on the
+  machine first, which prepares the artifact and builds the new pack; a daemon
+  started before that finds its pack stale and an artifact it may not prepare,
+  and refuses to load Flash-Next.
+- **The disk it takes.** The prepare holds the fetched sources (~190 GB) and the
+  artifact at once, beside the old pack (103 GB on WhiteWorld's Q3_KO rung)
+  until the new one replaces it. On 2026-11-26 WhiteWorld's model cache drive
+  (C:) had 144 GiB free, so the prepare cannot run there until room is made.
 - The pack keeps only what a load reads. The original bytes of a twinned tensor
   are not stored beside its twin.
 
@@ -733,10 +765,10 @@ as before. Step 7 moves npcd. It runs once step 6 is proven live.
 
 | # | Step | Delivers |
 |---|---|---|
-| 1 | **Tenants name their model** | `host::MODEL` removed; `Tenant::model`; one slot per model; `Opens.model` per app; the §12 fixes that need no second core (`HELD` keyed by model, `RECLAIM` entries carrying their backing, the prepared-spec digest) |
+| 1 | **Tenants name their model** | `host::MODEL` removed; `Tenant::model`, `zend::model::MODEL`, `npcd::model::MODEL`; one slot per model (`host::slots`); `Opens.models` per app; the §12 fixes that need no second core: `HELD` keyed by engine (its scheduler's channel, held weakly) and prefix, and a prepared spec of another arch refused rather than given Flash-Next's recipe digest. The build that carries it installs through keep on each machine: a member of the previous build reads the new `models` field as no model and strands a self-install |
 | 2 | **Twinned trunk packs** | the trunk family with twinned and built dense tensors; the loader as a copy through `DenseBlock`; packs rebuilt from re-fetched sources on each machine |
 | 3 | **The card's expert cache** | `CardExperts` with one model registered: keys by model, slot and pack strides separated, the card clock, victims carrying their model, rung g for every model |
 | 4 | **The card driver** | `housekeep` and `quanta`; one driver over one core; the per-card calls moved; the wait across channels; the held clock and per-app capacity |
 | 5 | **Guests as mounts** | kept instances, per-mount arenas and heaps, cooldowns, rung c, companions, one tower per model, bands on jobs, the image generator's two stages together where they fit |
-| 6 | **LLM parasites** | `open` / `mount` / `unmount`; the `Ground` placer; the switch mode; rung h; the primary by card size; several cores per driver. Live: BlackWorld unchanged, WhiteWorld with Flash-Next as its parasite |
+| 6 | **LLM parasites** | `open` / `mount` / `unmount`; the `Ground` placer; `RECLAIM` entries carrying their backing (§12), now that two cores compact on one card; the switch mode; rung h; the primary by card size; several cores per driver. Live: BlackWorld unchanged, WhiteWorld with Flash-Next as its parasite |
 | 7 | **npcd on Qwen3.6, on WhiteWorld only** | in this order: (a) BlackWorld leaves npcd's cluster. Its motherd config drops npcd from its apps and `host/machines.yaml` drops its `characters` share, so WhiteWorld is npcd's only member and nothing can replicate the old substrate back. (b) `npcd::tenant::model` becomes `Qwen36_35B_A3B_AntiLoop_StyleTune`. (c) npcd's substrate on WhiteWorld is wiped, and npcd starts on a fresh one under Qwen3.6. The old one was written by Flash-Next and would be refused at open anyway (`shared_model_host.md` §4). (d) §8.2's constants are measured with the cast on Qwen3.6 and zend's overflow mounting Flash-Next beside it. The user approved the wipe and the change of cluster membership in advance (2026-11-25) |
