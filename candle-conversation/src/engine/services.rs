@@ -11,6 +11,7 @@
 use super::*;
 use crate::conversation::run_state;
 use crate::scheduler::exported_state::SharedState;
+use crate::SpanQuant;
 
 /// Live progress of the startup substrate reload (redo-log replay), shared
 /// between the scheduler thread (writer) and the daemon's load-state machine
@@ -242,27 +243,50 @@ impl ConversationEngine {
     /// decoded argmax for up to `max_decode_tokens`. Fresh K/V under another
     /// recurrent state: what it answers says whether the K/V alone carries
     /// what the prompt holds. With `recurrent_over` absent nothing is
-    /// installed, and the slot runs the two raw turns on its own state. With
-    /// `quantize_level`, the prompt's K/V is quantized in place at that level
-    /// before `tail` — the format a collection member's K/V is sealed in.
+    /// installed, and the slot runs the two raw turns on its own state.
+    ///
+    /// `prompt` is the prompt's pieces, each prefilled as a raw turn of its
+    /// own — so each lies in its own chunks and ends in its own partial chunk,
+    /// as a projection lays sealed sections out — and quantized in place under
+    /// its [`SpanQuant`] before `tail`. One piece is the prompt contiguous.
+    /// When any piece is quantized the slot is sealed natively first, so the
+    /// gap quantizes none of it and every format is the piece's own.
     pub fn infer_raw_token_ids_swapped(
         &self,
-        prompt: &[u32],
+        prompt: &[(Vec<u32>, SpanQuant)],
         recurrent_over: Option<Vec<u32>>,
-        quantize_level: Option<u8>,
         tail: &[u32],
         max_decode_tokens: usize,
     ) -> crate::Result<RawDecode> {
         let sequence_id = self.new_raw_sequence()?;
+        let quantizes = prompt.iter().any(|(_, q)| *q != SpanQuant::Native);
         let out = (|| {
-            self.raw_turn(sequence_id, prompt, 0)?;
-            if let Some(level) = quantize_level {
+            if quantizes {
                 let (tx, rx) = flume::bounded(1);
                 self.core
                     .scheduler_tx
-                    .send(SchedulerRequest::QuantizeSlot {
+                    .send(SchedulerRequest::SealNatively {
                         sequence_id,
-                        level,
+                        response_tx: tx,
+                    })
+                    .map_err(|_| ConversationError::SchedulerGone)?;
+                rx.recv().map_err(|_| ConversationError::SchedulerGone)?;
+            }
+            for (tokens, _) in prompt.iter().filter(|(t, _)| !t.is_empty()) {
+                self.raw_turn(sequence_id, tokens, 0)?;
+            }
+            if quantizes {
+                let spans = prompt
+                    .iter()
+                    .filter(|(t, _)| !t.is_empty())
+                    .map(|(t, q)| (t.len(), *q))
+                    .collect();
+                let (tx, rx) = flume::bounded(1);
+                self.core
+                    .scheduler_tx
+                    .send(SchedulerRequest::QuantizeSpans {
+                        sequence_id,
+                        spans,
                         response_tx: tx,
                     })
                     .map_err(|_| ConversationError::SchedulerGone)?;

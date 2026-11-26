@@ -379,14 +379,22 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<bool, ConversationError>>,
     },
 
-    /// Quantize every block `sequence_id` holds, in place, under the adaptive
-    /// policy at `level` — the format a collection member's K/V reaches at its
-    /// seal — so the slot's next turn attends over quantized K/V as production
-    /// does. The slot's depth, recurrent state and index are untouched: only
-    /// the format of the blocks changes. Replies with the blocks it holds.
-    QuantizeSlot {
+    /// Leave `sequence_id`'s blocks native in the gap from here on, so the only
+    /// quantization its K/V takes is a [`Self::QuantizeSpans`] asked for.
+    SealNatively {
         sequence_id: SequenceId,
-        level: u8,
+        response_tx: Sender<()>,
+    },
+
+    /// Quantize the blocks `sequence_id` holds, in place, span by span: each
+    /// `(tokens, policy)` is a piece the slot was prefilled with on its own,
+    /// in its own chunks, and its chunks take that policy — partial final
+    /// blocks included, as a section's seal quantizes them. The slot's depth,
+    /// recurrent state and index are untouched: only the format of the blocks
+    /// changes. Replies with the blocks it holds.
+    QuantizeSpans {
+        sequence_id: SequenceId,
+        spans: Vec<(usize, SpanQuant)>,
         response_tx: Sender<Result<usize, ConversationError>>,
     },
 
@@ -778,7 +786,8 @@ impl SchedulerRequest {
             Self::ArenaGroups { .. } => "req:arena_groups",
             Self::IngestSection { .. } => "req:ingest_section",
             Self::InstallRecurrentState { .. } => "req:install_recurrent_state",
-            Self::QuantizeSlot { .. } => "req:quantize_slot",
+            Self::SealNatively { .. } => "req:seal_natively",
+            Self::QuantizeSpans { .. } => "req:quantize_spans",
             Self::SeedRecurrentFromLineage { .. } => "req:seed_recurrent_from_lineage",
             Self::MemoryCatchUp { .. } => "req:memory_catch_up",
             Self::BranchCheckpointPass { .. } => "req:branch_checkpoint_pass",

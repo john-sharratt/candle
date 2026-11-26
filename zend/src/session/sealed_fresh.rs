@@ -42,7 +42,7 @@ use candle_conversation::projection::{
     TOOLS_ENABLED_SELECTOR,
 };
 use candle_conversation::stencil::TriggerRegistry;
-use candle_conversation::PromptDump;
+use candle_conversation::{PieceKind, PromptDump, SpanQuant};
 use candle_conversation::{SamplingConfig, TurnOptions};
 use serde::{Deserialize, Serialize};
 
@@ -72,12 +72,54 @@ pub struct SealedFreshReq {
     /// run from zero without the placed file's tokens — under the fresh K/V.
     #[serde(default = "fresh")]
     pub fresh_recurrent: Recurrent,
-    /// Quantize the fresh side's prompt K/V in place at this compression level
-    /// before its user half — `4` is a collection member's seal — so the fresh
-    /// side attends over quantized K/V computed in its own context. Absent
-    /// leaves it native.
+    /// Quantize the fresh side's prompt K/V in place before its user half:
+    /// its sections at this level — `4` is a collection member's seal — and,
+    /// laid out in spans, its turns and glue under the session's turn policy,
+    /// so the fresh side attends over quantized K/V computed in its own
+    /// context. Absent leaves it native.
     #[serde(default)]
     pub fresh_quantize: Option<u8>,
+    /// How the fresh side's prompt lies in its slot.
+    #[serde(default)]
+    pub fresh_layout: Layout,
+}
+
+/// How the fresh side's prompt lies in its slot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Layout {
+    /// One prefill: the prompt's tokens packed into whole chunks.
+    #[default]
+    Contiguous,
+    /// One prefill per piece of the prompt — every section, turn and run of
+    /// glue in its own chunks, ending in its own partial chunk — as a
+    /// projection lays sealed sections out.
+    Spans,
+}
+
+/// The fresh side's prompt as the pieces it is prefilled in, each with the
+/// policy it is quantized under.
+fn fresh_pieces(
+    dump: &PromptDump,
+    layout: Layout,
+    level: Option<u8>,
+) -> Vec<(Vec<u32>, SpanQuant)> {
+    let section = level.map_or(SpanQuant::Native, SpanQuant::Level);
+    match layout {
+        Layout::Contiguous => vec![(dump.token_ids.clone(), section)],
+        Layout::Spans => dump
+            .pieces
+            .iter()
+            .map(|p| {
+                let quant = match (&p.kind, level) {
+                    (_, None) => SpanQuant::Native,
+                    (PieceKind::Section, Some(_)) => section,
+                    (_, Some(_)) => SpanQuant::Session,
+                };
+                (p.token_ids.clone(), quant)
+            })
+            .collect(),
+    }
 }
 
 fn fresh() -> Recurrent {
@@ -258,14 +300,15 @@ impl ZendSession {
                 Recurrent::Sealed => Some(without_members(&dump, &members)),
                 Recurrent::Replayed => Some(dump.token_ids.clone()),
             };
-            let one_pass = req.fresh_recurrent == Recurrent::Fresh && req.fresh_quantize.is_none();
+            let one_pass = req.fresh_recurrent == Recurrent::Fresh
+                && req.fresh_quantize.is_none()
+                && req.fresh_layout == Layout::Contiguous;
             let fresh = if one_pass {
                 engine.infer_raw_token_ids(&prompt, req.n)
             } else {
                 engine.infer_raw_token_ids_swapped(
-                    &dump.token_ids,
+                    &fresh_pieces(&dump, req.fresh_layout, req.fresh_quantize),
                     recurrent_over,
-                    req.fresh_quantize,
                     &turn[..user_half],
                     req.n,
                 )
@@ -377,6 +420,39 @@ mod tests {
         let members: HashSet<u32> = [7, 8].into_iter().collect();
         assert_eq!(without_members(&dump, &members), vec![10, 11, 20, 50]);
         assert_eq!(without_members(&dump, &HashSet::new()), dump.token_ids);
+    }
+
+    /// **Laid out in spans, each piece is its own prefill under its own
+    /// policy**: sections at the asked level, glue and turns under the
+    /// session's; contiguous, the prompt is one piece; unquantized, native.
+    #[test]
+    fn the_fresh_prompt_is_cut_into_its_pieces_with_their_policies() {
+        let pieces = vec![
+            piece(Some(1), vec![10, 11]),
+            piece(None, vec![20]),
+            piece(Some(7), vec![30, 31]),
+        ];
+        let dump = PromptDump {
+            token_ids: vec![10, 11, 20, 30, 31],
+            token_count: 5,
+            pieces,
+            text: String::new(),
+        };
+        assert_eq!(
+            fresh_pieces(&dump, Layout::Spans, Some(4)),
+            vec![
+                (vec![10, 11], SpanQuant::Level(4)),
+                (vec![20], SpanQuant::Session),
+                (vec![30, 31], SpanQuant::Level(4)),
+            ]
+        );
+        assert_eq!(
+            fresh_pieces(&dump, Layout::Contiguous, Some(4)),
+            vec![(vec![10, 11, 20, 30, 31], SpanQuant::Level(4))]
+        );
+        assert!(fresh_pieces(&dump, Layout::Spans, None)
+            .iter()
+            .all(|(_, q)| *q == SpanQuant::Native));
     }
 
     /// The sealed side runs with tools off and its opening its only

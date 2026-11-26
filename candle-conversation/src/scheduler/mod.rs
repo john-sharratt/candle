@@ -1119,6 +1119,7 @@ mod construct;
 mod handle_request_now;
 mod perform_seal;
 mod quantize_slot;
+pub use quantize_slot::SpanQuant;
 mod seal_turn;
 mod section_finish;
 mod sections;

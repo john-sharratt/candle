@@ -993,12 +993,21 @@ impl Scheduler {
                 true
             }
 
-            SchedulerRequest::QuantizeSlot {
+            SchedulerRequest::SealNatively {
                 sequence_id,
-                level,
                 response_tx,
             } => {
-                let _ = response_tx.send(self.quantize_slot(sequence_id, level));
+                self.seal_section_natively(sequence_id);
+                let _ = response_tx.send(());
+                true
+            }
+
+            SchedulerRequest::QuantizeSpans {
+                sequence_id,
+                spans,
+                response_tx,
+            } => {
+                let _ = response_tx.send(self.quantize_spans(sequence_id, &spans));
                 true
             }
 

@@ -171,6 +171,7 @@ pub use scheduler::provenance_capture_path_counts;
 pub use scheduler::recurrent_state_cost;
 pub use scheduler::relief_trace;
 pub use scheduler::SettleReport;
+pub use scheduler::SpanQuant;
 pub use scheduler::{MAX_DECODE_WIDTH, MAX_PREFILL_WIDTH};
 pub use sealed_turn::{SealedPages, SealedTurn};
 pub use sequence_handle::SequenceId;
