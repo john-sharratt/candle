@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use candle::engine_events::note;
 
-use crate::files::FileKey;
+use crate::files::{FileKey, FilesPin};
 
 use super::adaptive::AnchorMember;
 use super::dialogue_fill::{self, ContextExchange, DialogueSlot, WorkingPiece};

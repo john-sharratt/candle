@@ -9,6 +9,7 @@ use crate::files::{ChunkRecord, FileKey, FileUnit, FilesPin, LineSpan, MemberRef
 use crate::persistence::content_hash::ContentHash;
 use crate::persistence::streams::ContentAddress;
 use crate::projection::project::{files_splice, ProjectionSegment, SealedKind};
+use crate::projection::SystemPromptItem;
 
 const YAML: &str = r#"
 system_prompt:
@@ -217,6 +218,67 @@ fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
     let empty = files_splice(b.schema(), &mock, |_| 10_000, false);
     assert!(empty.order.is_empty());
     assert!(empty.segments.is_empty());
+}
+
+/// **A pinned knowledge base is placed for a target whose layer declares no
+/// working set** — a calibration's draft and frames fork the files layer's
+/// base, which has none: the pinned file sits after `files_open`, and an
+/// unpinned set on the same target places nothing.
+#[test]
+fn a_pinned_knowledge_base_is_placed_for_a_layer_with_no_working_set() {
+    const PINNED_YAML: &str = r#"
+system_prompt:
+  sections:
+    - id: alpha
+      content: "alpha"
+    - id: files_open
+      content: "kb"
+layers:
+  - name: code_reading
+    window: 4000
+    score_formula: max
+    budget:
+      priority: 20
+    summary:
+      turns:
+        max_tokens: 256
+        user: { system_prompt: c, user_prompt: c }
+        assistant: { system_prompt: c, user_prompt: c }
+    groups:
+      - id: scopes
+        selection: { kind: working_set, share: readings }
+"#;
+    let b = Builder::from_yaml(PINNED_YAML).unwrap();
+    let fa = record("candle/a.rs", &[(1, 10)]);
+    let (mut mock, m) = resolver(&b, std::slice::from_ref(&fa), &[(fa.key(), 900.0)], vec![]);
+    let target = ProjectionTarget {
+        layer: b.id_for_layer("code_reading").unwrap(),
+        group: b.id_for_group("scopes").unwrap(),
+        timeline: TimelineId::for_test(1),
+    };
+    let free = b.project(target, &mock);
+    assert!(
+        free.files_placed.is_empty(),
+        "no working set: provenance places nothing"
+    );
+    mock.files.as_mut().unwrap().pin = FilesPin::Only(fa.key());
+    let proj = b.project(target, &mock);
+    assert_eq!(proj.files_placed, vec![fa.key()]);
+    let heading = m[&heading_name("candle/a.rs", "b")];
+    let sections: Vec<SectionId> = proj
+        .segments
+        .iter()
+        .filter_map(|s| match s {
+            ProjectionSegment::Sealed(SealedKind::Section(r)) => Some(r.id),
+            _ => None,
+        })
+        .collect();
+    let kb = b.schema().system_prompt.items.iter().find_map(|i| match i {
+        SystemPromptItem::Section(s) if s.name == "files_open" => Some(s.id),
+        _ => None,
+    });
+    let at = sections.iter().position(|&s| Some(s) == kb).unwrap();
+    assert_eq!(sections[at + 1], heading, "the file follows files_open");
 }
 
 /// **A kept file keeps its place**: a placed before b, b now stronger — a

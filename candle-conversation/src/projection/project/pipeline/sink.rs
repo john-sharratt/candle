@@ -757,15 +757,25 @@ pub fn run_with_sink<R: ContentResolver>(
             SystemPromptItem::Section(s) if s.name == FILES_OPEN_SECTION => Some(s.id),
             _ => None,
         });
-    if let (Some((ws, trained)), Some(files_open)) = (knowledge_base, files_open) {
+    // A pinned knowledge base — a calibration's frame (§12 D11) — is placed
+    // whatever the target's layer declares: a pin takes no share of a room.
+    let pinned = resolver
+        .files_set()
+        .is_some_and(|s| s.pin != FilesPin::Free);
+    let shares = knowledge_base.map(|(ws, trained)| {
         let room = ws
             .slot_window(trained)
             .window
             .saturating_sub(ws.reserve_tokens)
             .saturating_sub(segment_tokens(&system_prompt_segments, resolver))
             .saturating_sub(decode_pos.unwrap_or(0));
-        let shares = ws.fill_shares.caps(room);
+        ws.fill_shares.caps(room)
+    });
+    if let (true, Some(files_open)) = (shares.is_some() || pinned, files_open) {
         let kind_cap = |share: WorkingSetShare| {
+            let Some(shares) = &shares else {
+                return 0;
+            };
             if !level.places(share_kind(Some(share))) {
                 return 0;
             }
