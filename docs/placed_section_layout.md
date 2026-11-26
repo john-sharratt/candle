@@ -136,18 +136,34 @@ address, replaces those members rather than mixing with them.
   pages stay in the pool, so the shadow scan
   (`docs/hit_driven_projection.md` §7.2) can bring it back; brought back, it
   is placed in front again, at new positions.
-- **The range running out** — the front reaching `B` — is the one case that
-  relays the whole collection out, and only at a reprojection boundary, where
-  the slot is rebuilt anyway.
+- **A full range is a window.** Once the front reaches `B`, an entering
+  section still enters in front, and the placed run slides up by its length
+  to make room: what passes the range's top — the sections that entered
+  earliest — leaves. The run keeps its order and every placed section keeps
+  its position relative to the others; only their distance to the question
+  shortens by the entry's length. This is the one move a relevance range
+  makes under a reply, and it is the same move a sliding window makes: the
+  newest in front, the oldest out of the far end. Holes inside the run slide
+  with it and are closed between requests, when the range is compacted.
 
 A section's position therefore records when it came into scope, not its rank.
-That is the price of never moving anything.
+That is the price of never moving anything until the range is full.
 
 ### 3.3 Per layer
 
+**The scope is shared across layers, decided by the sampled layers.** The
+shadow scan holds index rows for unplaced sections only at the sampled layers
+(`hits.layers`, model layers 19, 31 and 43 on Flash-Next;
+`hit_driven_projection.md` §6.1), so those are the only layers with a peak
+for a section not yet placed. A section's peak is the **largest of its peaks
+across the sampled layers**, and one scope holds for every layer. Per-layer
+scope, below, is built only if the shared scope's measurements call
+for it, at the cost of index rows and a shadow scan at every full-attention
+layer.
+
 K/V is held per layer (one backing per layer) and so is the QSA index (one
-`IndexCache` per full-attention layer, scored at every step). Each
-full-attention layer therefore holds **its own** set of placed sections at
+`IndexCache` per full-attention layer, scored at every step). Under per-layer
+scope each full-attention layer holds **its own** set of placed sections at
 **its own** positions within the range:
 
 - a layer's scope is the sections its own selection has been reading;
@@ -170,13 +186,24 @@ pool's momentum, not provenance strength, not a hit count.
   length, so a long section out-votes a short one that answers better. The
   peak is one number per section whatever its length, so sections of every
   size compete on what they hold.
-- **Per decode step, per layer.** At each step, after the layer's selection,
-  a section that is resident (§3.5) and out of the layer's scope **enters**
-  when its peak crosses the entry threshold: it is placed in front of the
-  sections already in scope (§3.2). A section in scope **leaves** when its
-  peak has stayed below the eviction threshold for the eviction window, and
-  leaves a hole. Hysteresis, as belief selection uses, keeps a section near
-  the line from flapping.
+- **Per decode step.** At each step, after the sampled layers' selection, a
+  section that is resident (§3.5) and out of scope **enters** when its peak
+  crosses the entry bar: it is placed in front of the sections already in
+  scope (§3.2). A section in scope **leaves** when its peak has stayed below
+  the eviction bar for **64 consecutive steps** — one reprojection cadence —
+  and leaves a hole.
+- **The bars are on the normalized band.** A peak is normalized per query to
+  the 0–1000 band the tools' belief selection uses: 0 at the query's cut (the
+  lowest score its real selection kept, which the selection kernel already
+  records per row, `hit_driven_projection.md` §6.3), 1000 at the best score
+  it kept, a peak below the cut negative and one above the best clamped to
+  1000. The band is scale-free across layers, depths and queries, and "would
+  have displaced a block the model read" is any peak above 0. The bars are a
+  pair on it, entry above eviction — hysteresis, so a section near
+  the line does not flap. They are declared per section in `projection.yaml`
+  beside its budgets, as the tools declare `min_score` / `evict_score`
+  (800 / 600), and measured on the needle and multi-file cases before they
+  are fixed.
 - **Entering never moves anything.** A step's entries take positions below the
   lowest placed section; every section already placed keeps its positions,
   so every relative position a decoded token was formed against holds. The
@@ -241,6 +268,14 @@ The room the dialogue's fill has is the slot less the system prompt **with its
 ranges at full size**, so the dialogue's share never depends on what the
 sections hold.
 
+**No kind caps in the range.** Inside the knowledge base's range, peak index
+attention alone decides what enters (§3.4): readings, folders, guides and
+journal notes compete on one band, and the working set's kind shares
+(`working_set.shares`) no longer cap them there. The kinds keep their
+per-kind minimum counts in the scan pool (`PoolSize::per_kind`), so guides
+and journal notes are always scanned however many readings rank, and a
+section of any kind can enter when the question reaches it.
+
 ### 3.5b Every section stands alone; some are mandatory
 
 **No file is sealed behind another; a file's sections are sealed behind its
@@ -259,7 +294,7 @@ earlier sections immediately below it.
 - **The order of placement can break a file's relative positions.** Sections
   enter the range by peak index attention (§3.4), not by line order, so two
   sections of one file can be placed in an order or at a distance other than
-  the one they were sealed at. This is accepted and measured: stage 2's gate
+  the one they were sealed at. This is accepted and measured: §7's tests
   includes a question that needs two sections of one file placed out of line
   order.
 - **Between files there is no cross-reasoning at ingest.** It is built where
@@ -347,6 +382,52 @@ cap (`provenance_system_collection.md` D22). Both now work on sections:
 The calibration's votes and the working set's momentum move to the section
 key accordingly.
 
+### 3.5d Calibration per section
+
+Calibration (`zend/src/calibrate/`, `provenance_system_collection.md` §7)
+writes questions a unit answers and seals them, with the model's thinking
+about each, as signatures that vote for the unit. It moves to the section,
+as provenance and the projection do (§3.5c):
+
+- **A section's questions vote for the section.** `CALIBRATES_KEY` names the
+  section's key, not the file's, so a large file's questions no longer pool
+  into one file-level vote.
+- **The prompts are still chosen by file type.** The profile is matched by
+  path regex as today (`calibrate/profile.rs`), and each of its prompts keeps
+  its own count rule (`per_tokens`, `min`, `max`), applied to the section's
+  tokens instead of the file's. The rules are retuned so a profile averages
+  **about 5 questions per section**: half of today's density. Measured on
+  candle, battle-cities and yenbot after the ingest's ignores (8,464 files,
+  17,024 sections, 2.01 per file), today's rules ask 163,825–194,481
+  questions — about 10 per section, for one-section and many-section files
+  alike — so half is 4.8–5.7 per section, by tokens per byte (4.0–3.0).
+- **The draft sees the section alone.** The draft that writes a section's
+  questions has that section, and nothing else of its file, in the knowledge
+  base's range: its questions are about what the section holds. A draft
+  never rereads a large file per section.
+- **File-level prompts are asked once per file.** A profile's prompts about
+  the file as a whole (`purpose`; `architecture` for documents) are asked in
+  one draft per file, from the file's first section, and each such question
+  votes for every section of the file, its weight split evenly across them.
+  The per-section count of §3.5d's retune excludes them.
+- **Asked once, behind the empty range.** With the seed chain gone there is
+  no seed branch to ask behind, and the questions are no longer split
+  between the empty and the target knowledge base: each is asked once,
+  thinking on, behind the knowledge base's range with nothing placed — the
+  frame a live query is in before it has found the section, which is what
+  provenance must match to pull it in — and sealed there.
+- **Half the decode.** A question costs one thinking decode of `think` (64)
+  tokens and its share of the seal's prefill, so half the questions is half
+  the calibration's time.
+- **Corpus hygiene comes first.** At a count per section, a large generated
+  file is a large share of the budget: `quantized_llama_tokenizer.json` alone
+  is 1.25M lines, 6,255 sections, about 31K questions — a third of the
+  corpus's. Generated and vendored text is kept out of the ingest: the
+  tokenizer JSON, the tracked virtualenv (`candle-nn/tests/.venv/`), the
+  generated CUDA bindings (`third_party/cudarc/src/*/sys/`) and lockfiles
+  (`Cargo.lock`) join the `ignore` list of `motherd/motherd.yaml` and the
+  machine configs.
+
 ### 3.6 Two orders: by relevance and by birth
 
 Every piece of provenance the projection places falls under one of two
@@ -402,7 +483,9 @@ the dialogue is stated in requests, not in boundaries:
   it.
 - **Between requests the region is pruned and re-seated.** Once a request
   ends, and before the next is prefilled, the oldest pieces drop until the
-  region fits its window again, and the region is re-seated at the bottom of
+  region fits its window again — for the dialogue, whole requests, the user's
+  turn with its tool rounds and its reply, so no exchange is left half-shown
+  and each is still reached through its journal entry — and the region is re-seated at the bottom of
   its range. Keys and index rows are stored un-rotated, so re-seating rewrites
   nothing (`hit_driven_projection.md` §4). The next request prefills against a
   stable layout, on rung 1 again. The journal's folds and forgotten entries,
@@ -420,9 +503,11 @@ The regions and their ranges:
   request's reserve of entries. It fills from the bottom, as its chain is
   sealed: each entry is sealed as the continuation of the ones before it at
   the next position, so the range holds the chain exactly as it was computed.
-  An entry a request writes past the range's reserve waits for the next
-  request's prune; the turns it was written from are in the dialogue until
-  then.
+  A full journal range is a window: an entry a request writes past it drops
+  the oldest entry that is not pinned (`pin_tokens` pins the newest), and the
+  entries above it slide down by its length, so the newest is always placed.
+  The dropped entry's turns are reached with `journal_read`, as an entry
+  folded away is.
 - **The dialogue** is the last region and has no range above it: it grows
   into the slot. Its window is its share of the room; the rest of the slot
   above the ranges and the window is the request's reserve.
@@ -434,6 +519,35 @@ than one cadence's append (§4). Older turns are reached through the journal:
 every entry carries the turns it was written from (`journal_read`,
 `zend_journal.md` §4.1). Those sections of `hit_driven_projection.md` are
 amended when this is built.
+
+### 3.7b The sizes
+
+The first build's budgets, on Flash-Next's trained window (`L0` =
+262,144 positions):
+
+| Region | Order | Projection (positions) | Residency | Scan |
+|---|---|---:|---:|---|
+| Journal | Birth | 2K (2,048): `pin_tokens` 1,024 and a request's entries | — (the conversation's own sections, always hot) | — |
+| Tools | Relevance | 8K (8,192) | the catalog | the catalog |
+| Knowledge base | Relevance | 96K (98,304), the mandatory sections inside it | 2× the range: 192K, on every card | the pool, `PoolSize::for_card` |
+| Dialogue window | Birth | 96K (98,304) of past turns at a request's start | — | — |
+| Request reserve | Birth | the rest: `L0` less the ranges, the window and the fixed prompt — ≈ 49K with a ~6K fixed prompt | — | — |
+
+- **The reserve is the request's.** There is no separate `reserve_tokens`
+  margin: what the ranges, the window and the fixed prompt leave is the room a
+  request grows into on rung 1 (§3.7), about twelve 200-line reads. Past it a
+  request runs on the next rung.
+- **Residency is the same on every card.** It is twice the knowledge base's
+  range; on the 16 and 24 GB cards the expert zone gives up the difference.
+- **Tools: the mandatory ones in the range, the rest by score.** `file_read`
+  and the collection's other mandatory members hold positions in the tools
+  range outside the competition, as the knowledge base's mandatory sections
+  do; the belief selection fills the rest by score until the next signature
+  does not fit. Its `min: 1` stays; its `max` is the range.
+- **The mandatory set must fit.** The seed's files were about 37K tokens; as
+  mandatory sections they take that much of the knowledge base's 96K, and
+  the load check (§3.5b) refuses a mandatory set that leaves less than half
+  the range to the competition.
 
 ### 3.8 Models without a QSA index
 
@@ -527,7 +641,7 @@ never changed the layout.
 
 1. **The gap distances the prompt from the question.** Long-distance
    attention is weaker; instructions and persona above the range could lose
-   grip. Measured before anything else (§7 stage 1).
+   grip. Measured by §7's tests against today's answers.
 2. **Positions no longer encode relevance.** A section brought in late sits
    furthest from the question. The opening's order is by relevance, but a long
    turn's later arrivals are not.
@@ -551,56 +665,60 @@ With the seed chain gone (§3.5b) the recurrence reads no knowledge-base
 content at all: the conversation starts from the prompt checkpoint, and what
 the recurrent layers know of the placed sections is what the turns and the
 thinking decode over them. That is the design's bet — cross-reasoning is built
-in the thinking, not at ingest — and stage 2's gate measures it. If it is not
+in the thinking, not at ingest — and §7's needle tests measure it. If it is not
 enough, the candidates are running the recurrence over placed sections at a
 projection, or recomputing the few tokens whose state deviates most
 (CacheBlend-style selective recompute).
 
-## 7. Staged plan
+## 7. Build, wipe, test
 
-Each stage has a gate measured on the sealed-fresh harness, the needle cases
-of §1, and a multi-file case (one question about the fifth of ten placed
-files; one question needing two files).
+**One build.** Everything in §3 and §4 lands together, the per-step decision
+on the device included: explicit positions and the position frontier; every
+range and the gap in the birth prefix; members sealed at the top of their
+range under the new content address; sections in `file_read`'s format with
+the `...` marker, each file's sections a chain; the mandatory set in place of
+the seed chain; provenance, calibration and the projection by section; peak
+index attention per step with append-in-front and the full range as a
+window; the residency budget; the birth-ordered journal and dialogue. Scope
+is shared across layers (§3.3); per-layer scope is the one part left out, and
+is built only if the tests below call for it.
 
-0. **Order alone.** On today's sequential layout, place the most relevant file
-   last against first. *Gate:* whether position moves the 52K-after-needle
-   answer at all.
-1. **Explicit positions** (§4.1, §4.2). *Gate:* unit tests asserting the
-   exact `rope_base` of every chunk and the exact page bases of every window
-   for a layout with a range, a hole and a front insertion; the gate models
-   unchanged when every range is empty.
-2. **The ranges, static, shared across layers** (§3.1, §3.1b, §3.5, §4.7).
-   Both sections' ranges sized by their projection budgets, the gap in the
-   birth prefix, members sealed at the top of their range under the new
-   content address, the tools selected by tokens. *Gate:* no loss on the
-   needle cases and on persona/instruction adherence against today's layout;
-   the sealed-fresh harness with the needle placed first matches a fresh
-   prefill token for token up to the recurrence's divergence.
-3. **Append in front at boundaries, shared across layers, and the residency
-   budget** (§3.2, §3.4, §3.5). *Gate:* the multi-file case improves or
-   holds; nothing placed moves within a turn (asserted from the per-boundary
-   placement record); a member re-entering from the resident set is placed at
-   the boundary it is chosen, not one later.
-3b. **Birth-ordered regions** (§3.7): the journal's range, the dialogue's
-   window, appending only within a request, the reserve and the rung past it,
-   pruning and re-seating between requests. *Gate:* asserted from the
-   per-boundary placement record that no dialogue turn or journal entry
-   leaves or moves within a request, on a multi-round agent request; a
-   request that passes the reserve runs on the next rung and the following
-   request starts on rung 1; the needle and multi-file cases hold.
-4. **Per-layer scope** (§3.3, §4.3). *Gate:* per-layer placement records; the
-   needle and multi-file cases hold or improve against stage 3.
-5. **On the device** (§4.4). *Gate:* no readback on the per-token path
-   (`AGENTS.md` invariants 3–4) and decode throughput within noise of stage 4.
+Every building block is unit-tested as it is written (`AGENTS.md`), against
+exact values: the `rope_base` of every chunk and the page bases of every
+index window for a layout with ranges, a hole, a front insertion and a full
+range's slide; a section's rendered bytes against `file_read`'s for the same
+range; the per-section question counts; the prune of whole requests. The
+gate models pass unchanged with every range empty.
 
-The section cut (§3.5c), standalone sealing and the mandatory set (§3.5b)
-change what the ingest seals, so they land with stage 2's new content
-address, in one re-ingest: sections in `file_read`'s format with the `...`
-marker, each file's sections sealed as a chain ending at the top of the
-range, scored by provenance per section. Stage 2's gate adds an edit made from a placed section by its anchor
-and relative line numbers, checked against the file. Until the per-step
-decision is on the device (stage 5), stages 3–4 take the scope decision at
-boundaries from the steps' peaks, with the same rule.
+**Wipe and ingest narrow.** The substrate's members, calibrations and
+signatures are all sealed under the old layout and address, so none is
+carried:
+
+1. the build green — `fast-test`, the gates — committed and pushed;
+2. zend stopped on BlackWorld through keep;
+3. zend's substrate **deleted**;
+4. `max_depth: 1` set in BlackWorld's machine config, so the first ingest is
+   the repositories' top levels and finishes fast;
+5. the build deployed and zend restarted; the ingest and its calibration
+   waited out to settled;
+6. the tests below run. The full corpus is ingested only once they pass.
+
+**The tests**, on the new system:
+
+- **Sealed-fresh needle cases.** The needle placed first matches a fresh
+  prefill token for token up to the recurrence's divergence; the needle with
+  50K of other files after it, tools on, reads the file — the open failure
+  of §1.
+- **Multi-file and same-file cases.** A question about the fifth of ten
+  placed files; a question needing two files; a question needing two
+  sections of one file placed out of line order (§3.5b).
+- **An edit from a placed section.** An edit made from a placed section by
+  its part anchor and relative line numbers lands where it should, checked
+  against the file.
+- **Stability and throughput.** The placement record shows nothing placed
+  moves within a request until a range is full, and no dialogue turn or
+  journal entry leaves within one; no readback on the per-token path
+  (`AGENTS.md` invariants 3–4); decode throughput within noise of today's.
 
 ## 8. Alternatives considered
 
