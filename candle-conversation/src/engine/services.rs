@@ -241,18 +241,23 @@ impl ConversationEngine {
     /// `recurrent_over` leaves when run from zero, then `tail` prefilled and
     /// decoded argmax for up to `max_decode_tokens`. Fresh K/V under another
     /// recurrent state: what it answers says whether the K/V alone carries
-    /// what the prompt holds.
+    /// what the prompt holds. With `recurrent_over` absent nothing is
+    /// installed, and the slot runs the two raw turns on its own state.
     pub fn infer_raw_token_ids_swapped(
         &self,
         prompt: &[u32],
-        recurrent_over: Vec<u32>,
+        recurrent_over: Option<Vec<u32>>,
         tail: &[u32],
         max_decode_tokens: usize,
     ) -> crate::Result<RawDecode> {
         let sequence_id = self.new_raw_sequence()?;
         let out = (|| {
             self.raw_turn(sequence_id, prompt, 0)?;
-            if let Some(state) = run_state(&self.core.scheduler_tx, None, recurrent_over)? {
+            let state = match recurrent_over {
+                Some(tokens) => run_state(&self.core.scheduler_tx, None, tokens)?,
+                None => None,
+            };
+            if let Some(state) = state {
                 let (tx, rx) = flume::bounded(1);
                 self.core
                     .scheduler_tx

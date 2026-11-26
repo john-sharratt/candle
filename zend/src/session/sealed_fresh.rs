@@ -95,6 +95,11 @@ pub enum Recurrent {
     /// [`Recurrent::Fresh`] does, or the install, not the state, is what the
     /// swapped arms measure; on the sealed side it is [`Recurrent::Fresh`].
     Replayed,
+    /// The fresh side's prompt and user half as two raw turns on one slot,
+    /// nothing installed between them: the control for the slot carrying its
+    /// own K/V and state from one raw turn into the next. On the sealed side
+    /// it is [`Recurrent::Fresh`].
+    Split,
 }
 
 /// The two decodes and where they part.
@@ -244,13 +249,19 @@ impl ZendSession {
                 Recurrent::Fresh => engine.infer_raw_token_ids(&prompt, req.n),
                 Recurrent::Sealed => engine.infer_raw_token_ids_swapped(
                     &dump.token_ids,
-                    without_members(&dump, &members),
+                    Some(without_members(&dump, &members)),
                     &turn[..user_half],
                     req.n,
                 ),
                 Recurrent::Replayed => engine.infer_raw_token_ids_swapped(
                     &dump.token_ids,
-                    dump.token_ids.clone(),
+                    Some(dump.token_ids.clone()),
+                    &turn[..user_half],
+                    req.n,
+                ),
+                Recurrent::Split => engine.infer_raw_token_ids_swapped(
+                    &dump.token_ids,
+                    None,
                     &turn[..user_half],
                     req.n,
                 ),
