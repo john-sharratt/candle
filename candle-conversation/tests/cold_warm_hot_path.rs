@@ -3065,7 +3065,11 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
         .unwrap();
         assert_eq!(report.warm_to_hot, 1, "lifted from the migrated warm copy");
         let lifted = snapshot_turn_images(&conv, &backings, &device, key.timeline, key.index);
-        assert_chunk_images_eq(&sealed, &lifted, "no-policy warm→hot from the pass's warm copy");
+        assert_chunk_images_eq(
+            &sealed,
+            &lifted,
+            "no-policy warm→hot from the pass's warm copy",
+        );
         (key, sealed)
     };
 
@@ -3095,7 +3099,11 @@ fn run_no_policy_metadata_round_trip(device: &Device, n_layers: usize, mini: boo
             Leg::ColdToHot,
         )
     };
-    assert_chunk_images_eq(&sealed, &reference, "no-policy cold→hot against the sealed form");
+    assert_chunk_images_eq(
+        &sealed,
+        &reference,
+        "no-policy cold→hot against the sealed form",
+    );
 
     // Warm→hot leg, from a copy warmed from the log.
     {

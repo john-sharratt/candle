@@ -1,15 +1,18 @@
-//! The streamed text is the full decode for the prescribed model's own
-//! tokenizer — the incremental stream must agree with decoding every id again
+//! The streamed text is the full decode for Flash-Next's own tokenizer — the
+//! model zend and npcd run — the incremental stream must agree with decoding every id again
 //! from the start, which is what it replaced — a landing requirement, so
 //! it fails, never skips, when the tokenizer cannot be had. Ignored by default:
 //! run it with `cargo test --release -p host --test text_stream_model_vocab --
 //! --ignored --nocapture`.
 
+use candle_conversation::models::Model;
 use candle_conversation::text_stream::TextStream;
 use hf_hub::api::sync::Api;
 use hf_hub::{Repo, RepoType};
-use host::MODEL;
 use tokenizers::Tokenizer;
+
+/// The model whose tokenizer the stream is checked against.
+const MODEL: Model = Model::Qwen38_FlashNext;
 
 /// Characters rare enough that a vocabulary spells them in byte tokens; the
 /// first one the model's vocabulary splits goes into the fixture.
@@ -27,8 +30,8 @@ fn fixture(cut: &str) -> String {
 }
 
 #[test]
-#[ignore = "fetches the prescribed model's tokenizer; run before landing Z1"]
-fn the_streamed_text_is_the_full_decode_for_the_prescribed_model() {
+#[ignore = "fetches Flash-Next's tokenizer; run before landing Z1"]
+fn the_streamed_text_is_the_full_decode_for_flash_next() {
     let spec = MODEL.spec();
     let repo = Repo::with_revision(
         spec.tokenizer_repo.clone(),

@@ -199,7 +199,7 @@ efficiencies. §8 replaces each with a measurement before anything is built.
 
 ### 3.1 The expert
 
-Flash-Next (`host::MODEL = Qwen38_FlashNext`, `host/src/model.rs`):
+Flash-Next (`Model::Qwen38_FlashNext`, the model zend and npcd name):
 
 | Item | Value |
 |---|---|

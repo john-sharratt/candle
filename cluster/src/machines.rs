@@ -232,6 +232,21 @@ AlienWorld: {}
         );
     }
 
+    /// **The shipped table puts the whole cast on WhiteWorld**, npcd's only
+    /// member on its primary (`docs/parasite_model.md` §16, step 7): BlackWorld
+    /// hosts no character.
+    #[test]
+    fn the_shipped_table_puts_the_cast_on_whiteworld() {
+        let shipped = MachineTable::from_yaml(include_str!("../../host/machines.yaml")).unwrap();
+        assert_eq!(
+            (
+                shipped.characters("BlackWorld"),
+                shipped.characters("WhiteWorld")
+            ),
+            (0, 1)
+        );
+    }
+
     /// Whether the table takes a unit at all: a conversation or a draw.
     #[test]
     fn a_table_says_whether_any_machine_takes_a_unit() {

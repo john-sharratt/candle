@@ -6,6 +6,8 @@
 //! The body is this structure's JSON, fields in declaration order, so one state
 //! has one encoding.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::replicate::{CatchupView, Phase, Stats};
@@ -54,10 +56,12 @@ pub struct UpgradeView {
     pub kind: String,
     pub platform: String,
     /// What a build must open to replace this one: the log format, every
-    /// record type its substrate holds, the model it runs.
+    /// record type its substrate holds, and the model each app it runs is
+    /// locked to.
     pub log_format: Option<u32>,
     pub census: Vec<u8>,
-    pub model: Option<String>,
+    #[serde(default)]
+    pub models: BTreeMap<String, String>,
     /// Every artifact it can serve.
     pub holds: Vec<HoldLine>,
     /// The builds it keeps in `builds/`.

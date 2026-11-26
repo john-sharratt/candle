@@ -54,6 +54,7 @@ mod tests {
                 platform: "windows-x86_64".into(),
                 opens: Opens::default(),
             },
+            runs: Vec::new(),
             exe: t.path().join("motherd.exe"),
             upgrade_dir: t.path().join("upgrade"),
             keep_builds: 5,

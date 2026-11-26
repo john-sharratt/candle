@@ -15,8 +15,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use candle_conversation::engine_slot::CoreRequests;
+use candle_conversation::models::Model;
 use candle_conversation::profile::set_gpu_span_period;
-use candle_conversation::{EngineSlot, TenantRank};
+use candle_conversation::TenantRank;
 use cluster::launch::{LaunchSpec, OneShot};
 use cluster::reserve::machine as reservation;
 use cluster::reserve::watch::{read_once, watch as watch_guards};
@@ -49,11 +50,12 @@ use crate::logs::LogBus;
 use crate::machines::state_expert_pin;
 #[cfg(feature = "memory-census")]
 use crate::memory_census;
-use crate::model::{ModelView, MODEL};
+use crate::model::ModelView;
 use crate::process::{abort_on_ctrl_c, init_logging, install_panic_hook, stop_signal};
 use crate::ram_census::spawn as spawn_ram_census;
 use crate::self_heal::spawn_watchdog;
 use crate::server::serve;
+use crate::slots::{Seated, Slots, Standing};
 use crate::starting::StartLine;
 use crate::stopping::{Ending, Stopping};
 use crate::syncing::next_syncing_line;
@@ -140,15 +142,34 @@ fn resolved(dir: &Path) -> PathBuf {
 pub enum Seat {
     /// A daemon this process runs.
     Runs(Box<dyn Tenant>),
-    /// A daemon this process leaves out, whose asks of the shared engine still
-    /// count — merged at its rank — so the engine the others get is the one
-    /// built beside it. The RoPE floor is part of each substrate's model key:
-    /// without the asks, an engine built for fewer daemons would refuse the
-    /// substrates they wrote together.
-    Stands {
-        name: &'static str,
-        asks: CoreRequests,
-    },
+    /// A daemon this process leaves out, whose asks of its model's engine
+    /// still count — merged at its rank — when a tenant here runs that model,
+    /// so the engine the others on it get is the one built beside it
+    /// ([`crate::slots`]). Boxed: its model and asks are far larger than a
+    /// running tenant's box.
+    Stands(Box<Stand>),
+}
+
+/// A daemon a process leaves out: its name, its model, and its asks.
+pub struct Stand {
+    pub name: &'static str,
+    pub model: Model,
+    pub asks: CoreRequests,
+}
+
+impl Seat {
+    /// A seat for a daemon this process leaves out.
+    pub fn stands(name: &'static str, model: Model, asks: CoreRequests) -> Self {
+        Seat::Stands(Box::new(Stand { name, model, asks }))
+    }
+
+    /// The app this seat is, and the model it names.
+    fn app(&self) -> (&'static str, Model) {
+        match self {
+            Seat::Runs(tenant) => (tenant.name(), tenant.model()),
+            Seat::Stands(s) => (s.name, s.model.clone()),
+        }
+    }
 }
 
 /// Run `tenants` — ranked in the order given — until the process is told to
@@ -185,12 +206,23 @@ pub fn run_seated(cfg: HostConfig, seats: Vec<Seat>) -> ! {
     if let Some(pid) = cfg.args.after_pid {
         cluster::upgrade::os::wait_until_gone(pid);
     }
+    // Every app the binary seats, run or left out: what its build says it
+    // opens (`build_info`), so the upgrade check holds each app to its model.
+    let apps: Vec<(&'static str, Model)> = seats.iter().map(Seat::app).collect();
     let mut tenants: Vec<(TenantRank, Box<dyn Tenant>)> = Vec::new();
-    let mut standing: Vec<(TenantRank, &'static str, CoreRequests)> = Vec::new();
+    let mut standing: Vec<Standing> = Vec::new();
     for (rank, seat) in ranked(seats).unwrap_or_else(|e| fail_early(&e)) {
         match seat {
             Seat::Runs(tenant) => tenants.push((rank, tenant)),
-            Seat::Stands { name, asks } => standing.push((rank, name, asks)),
+            Seat::Stands(s) => {
+                let Stand { name, model, asks } = *s;
+                standing.push(Standing {
+                    rank,
+                    name,
+                    model,
+                    asks,
+                })
+            }
         }
     }
     let Some((_, first)) = tenants.first() else {
@@ -245,7 +277,7 @@ pub fn run_seated(cfg: HostConfig, seats: Vec<Seat>) -> ! {
     // What this member upgrades from, and how it installs a build (§3.9).
     let stopping = Arc::new(Stopping::new());
     let installer = HostInstaller::new(Arc::clone(&stopping));
-    let upgrade = upgrade_setup(cfg.binary, &launch, &state_dir, &cfg.args);
+    let upgrade = upgrade_setup(cfg.binary, &apps, &names, &launch, &state_dir, &cfg.args);
 
     let mut builder = RuntimeBuilder::new_multi_thread();
     builder.enable_all();
@@ -354,7 +386,7 @@ fn announce_when_ready(reports: Vec<Arc<dyn Reports>>, agent: Option<Arc<Jobs>>)
 async fn serve_tenants(
     cfg: HostConfig,
     tenants: Vec<(TenantRank, Box<dyn Tenant>)>,
-    standing: Vec<(TenantRank, &'static str, CoreRequests)>,
+    standing: Vec<Standing>,
     bus: Arc<LogBus>,
     stopping: Arc<Stopping>,
     installer: Arc<HostInstaller>,
@@ -383,12 +415,23 @@ async fn serve_tenants(
         );
     }
 
-    let model = ModelView::of_prescribed();
-    tracing::info!(
-        model = %MODEL.spec().model_filename,
-        tenants = %names_of(&uis),
-        "starting",
-    );
+    let seated: Vec<Seated> = tenants
+        .iter()
+        .map(|(rank, t)| Seated {
+            rank: *rank,
+            name: t.name(),
+            model: t.model(),
+        })
+        .collect();
+    // What the process reports as its model: the highest-ranked tenant's.
+    let model = ModelView::of_model(&seated[0].model);
+    for t in &seated {
+        tracing::info!(
+            tenant = t.name,
+            model = %t.model.clone().spec().model_filename,
+            "starting",
+        );
+    }
     let telemetry = Telemetry::new(model.clone());
     telemetry.spawn_sampler();
     #[cfg(feature = "memory-census")]
@@ -472,22 +515,12 @@ async fn serve_tenants(
         })
     };
 
-    // Every tenant takes its engine from one slot: the highest-ranked builds it
-    // with every seat's requests merged — a daemon left out still asks — and
-    // the rest attach their substrates.
-    for (_, name, _) in &standing {
-        tracing::info!(
-            daemon = *name,
-            "not run here; its asks of the engine still count"
-        );
-    }
-    let slot = EngineSlot::with_standing(
-        &names,
-        standing
-            .into_iter()
-            .map(|(rank, _, asks)| (rank, asks))
-            .collect(),
-    );
+    // Every tenant takes its engine from its model's slot: the highest-ranked
+    // tenant on that model builds it with every seat's requests merged — a
+    // daemon left out still asks, of its own model's engine — and the rest
+    // attach their substrates. The plan says, of each daemon left out, whether
+    // its asks count.
+    let slot = Slots::plan(&seated, standing);
     let mut reports = Vec::new();
     let mut tenant_routes = Vec::new();
     let mut stops: Vec<(&'static str, Stop)> = Vec::new();
@@ -696,10 +729,6 @@ pub fn merge_routes(host: Routes, tenants: Vec<(&str, Routes)>) -> anyhow::Resul
         owner = format!("{owner}/{name}");
     }
     Ok(all)
-}
-
-fn names_of(uis: &[(&str, TenantUi)]) -> String {
-    uis.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
 }
 
 /// A failed start, once logging is up: say why, and exit.

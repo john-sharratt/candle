@@ -548,13 +548,14 @@ rebuild` — which the member shows on its loading page and in `/v1/status`.
 Per app, not for `agent`. The first member admitted to an empty group records its
 `ModelKey`; every later `HELLO` must be `same_model` with it or is closed 4412 before
 anything else crosses the socket. The lock clears when the group's last member leaves.
-The prescribed model is one value for every daemon (`host/src/model.rs`), so in a
+Each app's model is one value in the tree its tenant is built from
+(`zend::model::MODEL`, `npcd::model::MODEL`, `docs/parasite_model.md` §4), so in a
 group that is all built from the same tree the lock never fires — it exists for the
 member that is not.
 
 **Changing the model is done by hand, not by an upgrade.** A substrate refuses to open
 under another model (`persistence/model_binding.rs`), and its K/V is meaningless
-under other weights. So a build whose `host::MODEL` differs from the app's lock:
+under other weights. So a build whose model for an app differs from that app's lock:
 
 - is never a candidate. It is closed 4412 at the handshake, with both models named in
   the reason, and is never certified, distributed or installed;
@@ -731,16 +732,20 @@ artifacts are:
   `count` and `hash` by the `cluster` crate's `build.rs` (§3.5). The candidate offers
   each binary in its executable's directory that reports the same build. Every binary
   answers `--build-info` with `{ kind, count, hash, local, platform, log_format,
-  record_tags, model }`, which is how the candidate checks. So a `motherd` candidate can
+  record_tags, models }`, which is how the candidate checks. So a `motherd` candidate can
   also upgrade standalone zend and npcd members, if those binaries were built with it.
   The last three say what the build can open:
   - `log_format` is the build's `FILE_FORMAT_VERSION` (`persistence/log_file.rs`, 3 today);
   - `record_tags` is the set of `RecordType` tags it decodes;
-  - `model` is the preset name of `host::MODEL` (`override_key`), the one model it runs
-    (§3.6). A `ModelKey` hashes the weights, which `--build-info` does not load.
+  - `models` maps each app the binary opens — run or left out — to the preset name of the
+    model its tenant names (`override_key`; §3.6). The check holds each app the *member
+    runs* to its own model (`Setup::runs`, `Setup::run_models`); an app the build opens and
+    the member leaves out holds no substrate there and is not checked, and a build that
+    does not open an app the member runs is refused. Which apps a member runs is its
+    config's to say. A `ModelKey` hashes the weights, which `--build-info` does not load.
 
   An agent opens no substrate and runs no model, so its three are `null`, `[]` and
-  `null`. Every main answers `--build-info` before it parses its arguments
+  `{}`. Every main answers `--build-info` before it parses its arguments
   (`host::build_info::first`, `cluster::version::info::answer_if_asked`), so the probe
   never opens a model or a substrate.
 - For each artifact: its kind, platform (OS and CPU architecture), size and SHA-256.

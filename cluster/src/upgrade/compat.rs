@@ -1,18 +1,21 @@
 //! Whether a build can open a member's substrate (§3.9): the same log format,
-//! every record type the substrate holds, and the model the app is locked to.
-//! A build that fails any of them is never installed there: the member is
-//! stranded, with the reason.
+//! every record type the substrate holds, and, for each app the member runs,
+//! the model that app is locked to. A build that fails any of them is never
+//! installed there: the member is stranded, with the reason.
+
+use std::collections::BTreeMap;
 
 use crate::version::info::Opens;
 
 /// What a member's substrate needs of a build: its log's format, the record
-/// types it holds now, and the model its build runs.
+/// types it holds now, and the model each of its apps runs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Needs {
     pub log_format: Option<u32>,
     /// Every record type the substrate holds, by tag.
     pub census: Vec<u8>,
-    pub model: Option<String>,
+    /// Each app the member runs, by name, and its model's preset.
+    pub models: BTreeMap<String, String>,
 }
 
 /// `Ok` when a build that opens `opens` can take over a substrate that
@@ -38,12 +41,25 @@ pub fn check(opens: &Opens, needs: &Needs) -> Result<(), String> {
             lacking.join(", ")
         ));
     }
-    if opens.model != needs.model {
-        return Err(format!(
-            "the build runs {}, the app runs {}: a new model is moved to by hand",
-            opens.model.as_deref().unwrap_or("no model"),
-            needs.model.as_deref().unwrap_or("no model")
-        ));
+    // Only the apps the member runs: an app the build opens and the member
+    // leaves out holds no substrate here, and which apps a member runs is its
+    // config's to say, not the build's.
+    for (app, runs) in &needs.models {
+        match opens.models.get(app) {
+            Some(built) if built == runs => {}
+            Some(built) => {
+                return Err(format!(
+                    "the build runs {app} on {built}, the app runs {runs}: a new model is moved \
+                     to by hand"
+                ))
+            }
+            None => {
+                return Err(format!(
+                    "the build does not run {app}, which this member does: its substrate would \
+                     have no daemon to open it"
+                ))
+            }
+        }
     }
     Ok(())
 }
@@ -56,11 +72,18 @@ fn spell(v: Option<u32>) -> String {
 mod tests {
     use super::*;
 
+    fn models(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(a, m)| (a.to_string(), m.to_string()))
+            .collect()
+    }
+
     fn opens() -> Opens {
         Opens {
             log_format: Some(3),
             record_tags: vec![1, 2, 3, 31],
-            model: Some("Qwen38_FlashNext_Q4KO".into()),
+            models: models(&[("npcd", "Qwen38_FlashNext"), ("zend", "Qwen38_FlashNext")]),
         }
     }
 
@@ -68,7 +91,7 @@ mod tests {
         Needs {
             log_format: Some(3),
             census: vec![1, 31],
-            model: Some("Qwen38_FlashNext_Q4KO".into()),
+            models: models(&[("npcd", "Qwen38_FlashNext"), ("zend", "Qwen38_FlashNext")]),
         }
     }
 
@@ -100,13 +123,63 @@ mod tests {
              invisible to it, then compacted away"
         );
         let other_model = Opens {
-            model: Some("Qwen36_35B".into()),
+            models: models(&[
+                ("npcd", "Qwen36_35B_A3B_AntiLoop_StyleTune"),
+                ("zend", "Qwen38_FlashNext"),
+            ]),
             ..opens()
         };
         assert_eq!(
             check(&other_model, &needs()).unwrap_err(),
-            "the build runs Qwen36_35B, the app runs Qwen38_FlashNext_Q4KO: a new model is \
-             moved to by hand"
+            "the build runs npcd on Qwen36_35B_A3B_AntiLoop_StyleTune, the app runs \
+             Qwen38_FlashNext: a new model is moved to by hand"
         );
+        let without_an_app = Opens {
+            models: models(&[("zend", "Qwen38_FlashNext")]),
+            ..opens()
+        };
+        assert_eq!(
+            check(&without_an_app, &needs()).unwrap_err(),
+            "the build does not run npcd, which this member does: its substrate would have no \
+             daemon to open it"
+        );
+    }
+
+    /// An app the build opens and the member leaves out is not the member's
+    /// to hold to a model: BlackWorld, running zend alone, takes a build that
+    /// moved npcd to another model.
+    #[test]
+    fn an_app_the_member_leaves_out_is_not_held_to_its_model() {
+        let moved = Opens {
+            models: models(&[
+                ("npcd", "Qwen36_35B_A3B_AntiLoop_StyleTune"),
+                ("zend", "Qwen38_FlashNext"),
+            ]),
+            ..opens()
+        };
+        let zend_only = Needs {
+            models: models(&[("zend", "Qwen38_FlashNext")]),
+            ..needs()
+        };
+        assert_eq!(check(&moved, &zend_only), Ok(()));
+    }
+
+    /// Each app is held to its own model: a build that moves one app and
+    /// leaves the other is checked app by app, not as one model for both.
+    #[test]
+    fn two_apps_on_two_models_fit_when_each_matches() {
+        let two = models(&[
+            ("npcd", "Qwen36_35B_A3B_AntiLoop_StyleTune"),
+            ("zend", "Qwen38_FlashNext"),
+        ]);
+        let opens = Opens {
+            models: two.clone(),
+            ..opens()
+        };
+        let needs = Needs {
+            models: two,
+            ..needs()
+        };
+        assert_eq!(check(&opens, &needs), Ok(()));
     }
 }

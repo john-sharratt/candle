@@ -165,6 +165,8 @@ pub fn assemble(head: &Head<'_>, build: &str, tenants: Vec<(&str, TenantStatus)>
 mod tests {
     use super::*;
 
+    use candle_conversation::models::Model;
+
     use crate::endpoints::test_support::{app, get_json, loading, scripted, shared};
 
     /// While zend loads the model, the top level is zend's load and the engine
@@ -188,7 +190,10 @@ mod tests {
         assert_eq!(body["engine_connected"], true);
         assert_eq!(body["tenants"]["zend"]["state"], "loading");
         assert_eq!(body["tenants"]["npcd"]["loading"]["current"], "substrate");
-        assert_eq!(body["model"]["repo"], crate::model::MODEL.spec().model_repo);
+        assert_eq!(
+            body["model"]["repo"],
+            Model::Qwen38_FlashNext.spec().model_repo
+        );
     }
 
     /// Every tenant ready: ready, no load, the engine connected — exactly.

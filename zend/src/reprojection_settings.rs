@@ -40,7 +40,7 @@ impl ReprojectionSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use host::MODEL;
+    use crate::model::MODEL;
 
     #[test]
     fn the_settings_land_on_the_conversation_config() {

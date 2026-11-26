@@ -118,7 +118,7 @@ pub(crate) fn install_branch_states(
         // The scheduler installs from a shared slice, so the layers are
         // materialised once for the branch — held for every later group on it —
         // rather than per slot or per install.
-        let state = shared_held(prefix, &payload);
+        let state = shared_held(scheduler_tx, prefix, &payload);
         let layers = Arc::clone(&state.layers);
         let n_layers = layers.len();
         let n_slots = sequence_ids.len();

@@ -5,8 +5,7 @@
 //! so the substrate's volume and mirror paths do not depend on the working
 //! directory. A mind that arrives after start replaces the empty libraries and
 //! registers in place, instead of restarting the daemon. npcd needs the same
-//! model markers and dialect that zend needs, and the prescribed model provides
-//! them.
+//! model markers and dialect that zend needs, and npcd's model provides them.
 
 use super::*;
 
@@ -128,6 +127,6 @@ pub(super) mod tests {
         let r = requires();
         assert_eq!(r.tokens, ["<tool_call>", "<think>", "</think>"]);
         assert_eq!(r.dialect, DialectType::Qwen35);
-        assert_eq!(host::MODEL.spec().chat_format, DialectType::Qwen35);
+        assert_eq!(MODEL.spec().chat_format, DialectType::Qwen35);
     }
 }

@@ -11,6 +11,8 @@
 
 use super::*;
 
+use crate::model::MODEL;
+
 /// The projection a chat turn runs under: the tools mode's prebuilt view — a
 /// cheap `Arc` clone, no per-turn schema clone — scoped to the conversation's
 /// identity's anchor and facets when it names one (`IdentityBuilders`).
@@ -367,7 +369,7 @@ pub(crate) fn try_projection_builder(workspace: &Path) -> Result<Builder, String
         }
         None => (PROJECTION_SCHEMA_TEMPLATE, "embedded default".to_string()),
     };
-    let model = ModelView::of_prescribed();
+    let model = ModelView::of_model(&MODEL);
     Builder::from_yaml_with_vars_and_dialect(
         yaml,
         &[("workspace", name), ("model", model.release())],

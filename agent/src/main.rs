@@ -81,6 +81,8 @@ async fn main() -> anyhow::Result<()> {
     // The agent upgrades with its app's build (§3.9).
     let setup = Setup {
         info: BuildInfo::of(AGENT, Opens::default()),
+        // An agent runs no app: no substrate holds it to a model.
+        runs: Vec::new(),
         exe: launch.exe.clone(),
         upgrade_dir: cfg.jobs_dir.join(UPGRADE_DIR),
         keep_builds: args.keep_builds,

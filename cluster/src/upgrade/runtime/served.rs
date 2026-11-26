@@ -241,6 +241,7 @@ mod tests {
         fs::write(t.path().join("bin/zend"), b"exe 12").unwrap();
         Setup {
             info: info(12),
+            runs: Vec::new(),
             exe: t.path().join("bin/zend"),
             upgrade_dir: t.path().join("data/upgrade"),
             keep_builds: 5,

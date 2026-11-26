@@ -1,12 +1,12 @@
-//! `motherd` — zend and npcd in one process, on one model.
+//! `motherd` — zend and npcd in one process.
 //!
 //! The same startup path as `zend` and `npcd` — `host::run` — with both tenants,
 //! equal on the scheduler (`docs/shared_model_host.md` §3.6): either daemon's
 //! live conversation outranks both daemons' ingest, and their ingests run side
-//! by side. One model loads, one engine runs, each daemon keeps its own
-//! substrate, and one HTTP server serves both — the API on every name, each UI
-//! on its own (`code.tokera.com` and a bare IP: zend's; `bot.tokera.com`:
-//! npcd's).
+//! by side. Each daemon names its model; daemons on one model share one engine
+//! (`docs/parasite_model.md` §4), each keeps its own substrate, and one HTTP
+//! server serves both — the API on every name, each UI on its own
+//! (`code.tokera.com` and a bare IP: zend's; `bot.tokera.com`: npcd's).
 //!
 //! It reads `motherd.yaml` — the process's settings under `host:`, and each
 //! daemon's under its name, in the same shape as that daemon's own flags:
@@ -45,11 +45,16 @@ use clap::Parser;
 use cluster::version::info::MOTHERD;
 #[cfg(feature = "memory-census")]
 use heap_census::Counting;
-use host::build_info::first;
+use host::build_info::{first, AppModels};
 use host::{run_seated, HostArgs, HostConfig, Seat};
+use npcd::model::MODEL as NPCD_MODEL;
 use npcd::tenant::NpcdArgs;
 use serde::Deserialize;
 use zend::cli::ZendArgs;
+use zend::model::MODEL as ZEND_MODEL;
+
+/// The apps this binary runs, and the model each names.
+const APPS: AppModels = &[("zend", ZEND_MODEL), ("npcd", NPCD_MODEL)];
 
 /// Every allocation counted by size class, for the memory census
 /// (`docs/memory_census.md`): what `/v1/memory` and the `memory census` log
@@ -59,7 +64,7 @@ use zend::cli::ZendArgs;
 static HEAP: Counting = Counting;
 
 #[derive(Parser, Debug)]
-#[command(name = "motherd", about = "zend and npcd in one process, on one model")]
+#[command(name = "motherd", about = "zend and npcd in one process")]
 struct Cli {
     /// The configuration file.
     #[arg(long, default_value = "motherd.yaml")]
@@ -116,7 +121,7 @@ impl Config {
 }
 
 fn main() -> anyhow::Result<()> {
-    first(MOTHERD);
+    first(MOTHERD, APPS);
     let cli = Cli::parse();
     let mut config = Config::load(&cli.config)?;
     config.host.upgrade_failed = cli.upgrade_failed;
@@ -133,18 +138,12 @@ fn main() -> anyhow::Result<()> {
     let zend: Seat = if runs_zend {
         Seat::Runs(Box::new(config.zend.resolve()?))
     } else {
-        Seat::Stands {
-            name: "zend",
-            asks: config.zend.engine_requests()?,
-        }
+        Seat::stands("zend", ZEND_MODEL, config.zend.engine_requests()?)
     };
     let npcd: Seat = if runs_npcd {
         Seat::Runs(Box::new(config.npcd.resolve()?))
     } else {
-        Seat::Stands {
-            name: "npcd",
-            asks: config.npcd.engine_requests(),
-        }
+        Seat::stands("npcd", NPCD_MODEL, config.npcd.engine_requests())
     };
     // Nothing to drop on a relaunch: the one-shot flags cannot be set in
     // `motherd.yaml` (`ZendArgs::ONE_SHOT`, `NpcdArgs::ONE_SHOT`).

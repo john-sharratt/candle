@@ -1,5 +1,7 @@
 //! A forced rollout's plan (§14.1 forced rollout).
 
+use std::collections::BTreeMap;
+
 use super::*;
 use crate::coord::HoldLine;
 use crate::version::info::Opens;
@@ -16,8 +18,12 @@ fn opens(tags: &[u8]) -> Opens {
     Opens {
         log_format: Some(3),
         record_tags: tags.to_vec(),
-        model: Some("M".into()),
+        models: models(),
     }
+}
+
+fn models() -> BTreeMap<String, String> {
+    BTreeMap::from([("zend".to_string(), "M".to_string())])
 }
 
 fn hold(build: &str, kind: &str, platform: &str, source: &str, tags: &[u8]) -> HoldLine {
@@ -38,7 +44,7 @@ fn view(platform: &str, census: &[u8], holds: Vec<HoldLine>) -> UpgradeView {
         platform: platform.into(),
         log_format: Some(3),
         census: census.to_vec(),
-        model: Some("M".into()),
+        models: models(),
         holds,
         ..UpgradeView::default()
     }

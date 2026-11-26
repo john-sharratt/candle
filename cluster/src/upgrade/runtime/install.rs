@@ -281,13 +281,14 @@ impl Upgrader {
             .ok_or(())
     }
 
-    /// What a build must open to replace this one: the log format and model
-    /// its own build opens, and every record type its substrates hold.
+    /// What a build must open to replace this one: the log format its own
+    /// build opens, every record type its substrates hold, and the model of
+    /// each app it runs.
     pub(super) fn needs(&self) -> Needs {
         Needs {
             log_format: self.setup.info.opens.log_format,
             census: self.state().census.clone(),
-            model: self.setup.info.opens.model.clone(),
+            models: self.setup.run_models(),
         }
     }
 

@@ -7,12 +7,12 @@ use candle_conversation::models::{Model, StrataTokens};
 use candle_conversation::persistence::tombstone_expiry::DEFAULT_TOMBSTONE_RETENTION;
 use candle_conversation::EngineSource;
 use host::cluster::Join;
-use host::MODEL;
 use web::auth::Roles;
 use zend_tools::state::Secrets;
 use zend_vfs::Workspace;
 
 use crate::branch_ingest::ignore::Ignore;
+use crate::model::MODEL;
 use crate::reprojection_settings::ReprojectionSettings;
 
 use crate::tenant::requires;
@@ -90,9 +90,9 @@ pub struct DaemonConfig {
     /// reconcile and the background ingest worker — do not run. For a
     /// tool that reads a substrate the running daemon owns, beside it.
     pub read_only_substrate: bool,
-    /// Which model the daemon runs: the host's prescribed one
-    /// ([`host::MODEL`]). A test harness names a small preset instead; the
-    /// daemon has no flag for it.
+    /// Which model the daemon runs: zend's own ([`crate::model::MODEL`]). A
+    /// test harness names a small preset instead; the daemon has no flag for
+    /// it.
     pub model: Model,
     /// Where the engine comes from: built by the highest-ranked tenant of the
     /// process with every tenant's requests merged, or attached to it
@@ -149,8 +149,8 @@ pub struct DaemonConfig {
 
 impl DaemonConfig {
     /// A config serving `workspace` with every flag at its default: no
-    /// secrets, no layer flags, no depth bound, the prescribed model on an
-    /// engine of its own, nobody an admin.
+    /// secrets, no layer flags, no depth bound, zend's model on an engine of
+    /// its own, nobody an admin.
     pub fn new(workspace: Workspace) -> Self {
         Self {
             workspace,
