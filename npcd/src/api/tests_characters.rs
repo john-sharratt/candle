@@ -567,7 +567,8 @@ pub(super) mod tests {
     }
 
     /// **A trial is refused for the first thing standing in its way**: a
-    /// stranger's character is absent, a malformed body says what is wrong,
+    /// stranger's character is absent — though an admin reaches past whose
+    /// it is — a malformed body says what is wrong,
     /// a running character is refused because its context would move under
     /// the trial, and a suspended one reaches the engine — which this daemon
     /// is not running.
@@ -602,6 +603,12 @@ pub(super) mod tests {
 
         let (s, _) = call(engine(), send(&path, "POST", b, trial.clone())).await;
         assert_eq!(s, StatusCode::NOT_FOUND, "a stranger's character is absent");
+        let (s, e) = call(engine(), send(&path, "POST", ADMIN, trial.clone())).await;
+        assert_eq!(
+            (s, e["error"].as_str()),
+            (StatusCode::CONFLICT, Some("npc_not_suspended")),
+            "an admin reaches past ownership: {e}"
+        );
 
         let (s, e) = call(
             engine(),

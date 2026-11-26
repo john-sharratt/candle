@@ -6,8 +6,10 @@
 //! Both are held alike, so a prompt measured on a given frame measures what it
 //! will do as the mind's own: one call of the trial's tools under the same
 //! grammar (`Minds::answer_tree`), compiled before anything else is touched;
-//! the same opening (the dialect's closed think block and `<tool_call>`); and
-//! the character's own think-off sampling at the trial's temperature and seed.
+//! the same opening as a mind's turn at the trial's thinking (the dialect's
+//! closed think block and `<tool_call>`, or an open `<think>` the grammar
+//! steers shut); and the character's own sampling for that thinking, at the
+//! trial's temperature and seed.
 //! What comes back is the text past the opening, on both. Nothing of either is
 //! written back: the fork is never sealed and the given frame's timeline is
 //! tombstoned on every path out.
@@ -33,7 +35,6 @@ use candle_conversation::{AskScope, SamplingConfig, TurnOptions};
 
 use super::think::SEAL_WAIT;
 use super::Minds;
-use crate::engine::identity::Deliberation;
 use crate::engine::prompt::Persona;
 use crate::engine::prose::{decode_framed, FramedTurn};
 use crate::engine::tools::{Mode, Within};
@@ -88,7 +89,7 @@ impl Drop for InFlight<'_> {
 impl Minds {
     /// The grammar a trial's answer is held to, or why its tools make none.
     fn trial_grammar(&self, trial: &Trial) -> Result<Arc<StencilTree>, TrialRefused> {
-        self.answer_tree(&trial.tools)
+        self.answer_tree(&trial.tools, trial.thinking)
             .map_err(|e| TrialRefused::BadTools(format!("{e:#}")))
     }
 
@@ -134,7 +135,7 @@ impl Minds {
                 }
             }
         };
-        let opening = self.opening(Deliberation::None, true);
+        let opening = self.opening(trial.thinking, true);
         let options = TurnOptions {
             assistant_prefill: opening.clone(),
             turn_grammar: Some(TurnGrammar::of(tree)),
@@ -179,7 +180,7 @@ impl Minds {
             history: &frame.history,
             prompt: &trial.turn,
             grammar: self.trial_grammar(trial)?,
-            prefill: self.opening(Deliberation::None, true),
+            prefill: self.opening(trial.thinking, true),
             sampling: self.trial_sampling(trial),
             max_tokens: trial.max_tokens,
             band: DecodePriority::Normal,
@@ -192,9 +193,10 @@ impl Minds {
         })
     }
 
-    /// The character's own think-off row, at the trial's temperature and seed.
+    /// The character's own row for the trial's thinking, at the trial's
+    /// temperature and seed.
     fn trial_sampling(&self, trial: &Trial) -> SamplingConfig {
-        let mut sampling = self.sampling_for(Deliberation::None).with_seed(trial.seed);
+        let mut sampling = self.sampling_for(trial.thinking).with_seed(trial.seed);
         sampling.temperature = trial.temperature;
         sampling
     }

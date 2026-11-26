@@ -101,6 +101,10 @@ pub struct Inbox {
     /// context, identical decode; the character repeated one act until something
     /// outside it changed.
     pub(super) last_nudge_ms: u64,
+    /// World time (ms) a `rest` of this character's last landed: a mind with
+    /// no body stopping, by its own act, until something reaches it — see
+    /// [`Inbox::nudge_due`]. `None` for one that has never rested.
+    pub(super) rested_ms: Option<u64>,
     /// What a person asked of this character that it has not yet told them
     /// the outcome of — see [`Scheduler::ask`].
     pub(super) asked: Option<Asked>,
@@ -160,6 +164,7 @@ impl Inbox {
             replayed: 0,
             last_news_ms: 0,
             last_nudge_ms: 0,
+            rested_ms: None,
             asked: None,
             waker: Arc::new(Notify::new()),
         }
@@ -333,9 +338,23 @@ impl Inbox {
     /// talking to gets it again every tick, at the most recent position in the
     /// window every time. Restating it is meant to keep a long quiet run on
     /// course, not to be the run.
+    ///
+    /// **A mind that rested is not woken to be told to rest.** The task rouses
+    /// a character gone quiet; one that stopped by its own `rest`, with
+    /// nothing reaching it since, has not gone quiet — it is waiting for its
+    /// round, its terminals or a message, each of which is news and wakes it.
+    /// Zen's idle thought tells it to rest, so the task woke it every ninety
+    /// seconds, all night, to read that and rest again.
     pub fn nudge_due(&self, world_ms: u64, after_ms: u64) -> bool {
-        self.quiet_for(world_ms) >= after_ms
+        let resting = self.rested_ms.is_some_and(|r| r >= self.last_news_ms);
+        !resting
+            && self.quiet_for(world_ms) >= after_ms
             && world_ms.saturating_sub(self.last_nudge_ms) >= after_ms
+    }
+
+    /// Note that this character's `rest` landed at `world_ms`.
+    pub fn rested(&mut self, world_ms: u64) {
+        self.rested_ms = Some(self.rested_ms.map_or(world_ms, |r| r.max(world_ms)));
     }
 
     pub fn readiness(&self) -> Readiness {

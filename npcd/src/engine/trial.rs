@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::engine::act;
+use crate::engine::identity::Deliberation;
 use crate::engine::prose::Exchange;
 
 /// A trial's decode cap when its body names none: a call with a paragraph of
@@ -79,6 +80,10 @@ pub struct TrialBody {
     temperature: Option<f32>,
     #[serde(default)]
     seed: Option<u64>,
+    /// How hard the turn thinks before its call: `off` (the default),
+    /// `quick`, `balanced`, `deep` or `exhaustive`.
+    #[serde(default)]
+    thinking: Option<String>,
 }
 
 /// A trial whose body has been checked.
@@ -93,6 +98,10 @@ pub struct Trial {
     pub max_tokens: usize,
     pub temperature: f32,
     pub seed: u64,
+    /// How hard the turn thinks before its call, as a mind's turn would at
+    /// that level: the reasoning block opened and steered shut by the
+    /// grammar, the call after it.
+    pub thinking: Deliberation,
 }
 
 impl TrialBody {
@@ -154,6 +163,12 @@ impl TrialBody {
                 "`temperature` is 0 to {MAX_TEMPERATURE}, not {temperature}"
             ));
         }
+        let thinking = match self.thinking.as_deref() {
+            None => Deliberation::None,
+            Some(named) => Deliberation::named(named).ok_or_else(|| {
+                format!("`thinking` is off, quick, balanced, deep or exhaustive, not `{named}`")
+            })?,
+        };
         Ok(Trial {
             turn: self.turn,
             tools: self.tools,
@@ -161,6 +176,7 @@ impl TrialBody {
             max_tokens,
             temperature,
             seed: self.seed.unwrap_or(0),
+            thinking,
         })
     }
 }
@@ -258,6 +274,20 @@ mod tests {
         assert_eq!(t.max_tokens, 640);
         assert_eq!(t.temperature, 0.0);
         assert_eq!(t.seed, 0);
+        assert_eq!(t.thinking, Deliberation::None);
+    }
+
+    /// **A trial thinks at the level it names**, and a level that is none is
+    /// refused, naming the ones there are.
+    #[test]
+    fn a_trial_thinks_at_the_level_it_names() {
+        let t =
+            body(json!({ "turn": "x", "tools": [answer_tool()], "thinking": "quick" })).unwrap();
+        assert_eq!(t.thinking, Deliberation::Quick);
+        assert_eq!(
+            body(json!({ "turn": "x", "tools": [answer_tool()], "thinking": "hard" })).unwrap_err(),
+            "`thinking` is off, quick, balanced, deep or exhaustive, not `hard`"
+        );
     }
 
     /// A given frame carries its system prompt and its history in order.

@@ -100,7 +100,9 @@ impl Desk for TalkDesk<'_> {
         let tree = match &self.tree {
             Some(tree) => Arc::clone(tree),
             None => {
-                let tree = self.minds.answer_tree(&tool_specs(specs)?)?;
+                let tree = self
+                    .minds
+                    .answer_tree(&tool_specs(specs)?, Deliberation::None)?;
                 self.tree = Some(Arc::clone(&tree));
                 tree
             }
