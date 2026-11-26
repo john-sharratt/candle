@@ -281,8 +281,6 @@ pub(super) struct YamlRecency {
 pub(super) struct YamlWorkingSet {
     pub(super) beta: f32,
     pub(super) min_momentum: f32,
-    #[serde(default)]
-    pub(super) seeds: Vec<String>,
     /// What the slot keeps back for what arrives between two projections:
     /// one cadence of decoded tokens or one prefill chunk.
     pub(super) reserve_tokens: usize,

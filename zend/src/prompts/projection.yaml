@@ -424,36 +424,22 @@ system_prompt:
               content: |+
                 Nobody will answer you on this task. Whoever started it has gone — often a person in a car, whose conversation ended seconds after they asked — and nothing you ask reaches them before your work is judged. So never end on a question. Where a decision is needed, make the one the brief, the design documents and the repository's rules point to, and say in your answer what you decided and why. Land your own result: commit and push it to your branch without asking. Check your work as the brief says before you answer. What only the user may approve — a merge, a deploy, anything that cannot be undone — you do not do: say in your answer that it waits on the user's approval, and stop there.
 
-    # What the model is told about its earlier turns: they are its own, most of
-    # them are reading, and its conversation with the user is the rest.
+    # What the model is told about its earlier turns: they are its own work with
+    # the user, and the files it has read are in the knowledge base below
+    # (`docs/provenance_system_collection.md` §7.2). Files are no longer turns,
+    # so the turns are the conversation and nothing else.
     #
-    # The LINEAGE is reading, and the larger half of it. Every dialogue descends
-    # from the priming chain (`branch_ingest/prime.rs`,
-    # `docs/zend_workspace_execution.md` §6) — a repository's root listing, then
-    # its README / ARCHITECTURE / AGENTS / CLAUDE — held inviolate as the
-    # conversation's earliest turns (`select_conversation`, reason `seed`). So the
-    # split this section draws is reading vs conversation: asked for its own first
-    # question, a chat once quoted the chain's first link, the `candle` root's
-    # summary.
-    #
-    # It says nothing about how a reading is labelled or that placed content
-    # fades. A reading opens on its face (`file=` / `folder=`, `Substrate::face_of`),
-    # which commissions nothing, so there is no request form to disown; and the
-    # fade-and-re-fetch rule that stood beside this section sent the model to
-    # re-read the seed it held — asked with tools off, it quoted ARCHITECTURE.md
-    # and CLAUDE.md from the seed, then re-read both on a codebase tour
+    # It says nothing about placed content fading: the fade-and-re-fetch rule
+    # that stood beside this section sent the model to re-read the seed it held
     # (2026-11-11). Fetching what is not here, and never inventing a file's
     # contents, is `grounding`'s.
     - kind: section
       id: history_stance
       content: |+
-        Earlier turns here are your own work, even where they appear condensed or
-        summarised, so build on what you already read, found and decided instead of
-        repeating it. Most of them are your reading: this conversation descends from
-        the workspace's listings and documents, and more files and folders are placed
-        alongside them. Your conversation with the user is the turns that are not
-        reading; the user's first message is the earliest of those, and what to do now
-        is always the user's latest message.
+        Earlier turns here are your own work with the user, even where they appear
+        condensed or summarised, so build on what you already read, found and decided
+        instead of repeating it. The files you have read are under Knowledge Base at the
+        end of this prompt. What to do now is always the user's latest message.
 
     # Two grounding variants under the same `tools` collection gate — exactly
     # one emits per projection: the tool-aware remedy when tools are configured,
@@ -476,8 +462,8 @@ system_prompt:
       id: grounding
       depends_on_configured: tools
       content: |+
-        Answer from what is actually in this conversation, the reading done before this
-        session began included. Your tools run for real in the
+        Answer from what is actually in this conversation and the files in the knowledge
+        base. Your tools run for real in the
         user's workspace: when you need something that has not appeared yet — a file's
         contents, a search, the time — call the tool that gets it, and its result arrives
         as the next message. Anything that changes over time — the latest version or
@@ -505,8 +491,8 @@ system_prompt:
       id: grounding_no_tools
       depends_on_unconfigured: tools
       content: |+
-        Answer from what is actually in this conversation, the reading done before this
-        session began included. If you need something that has not appeared yet, say so.
+        Answer from what is actually in this conversation and the files in the knowledge
+        base. If you need something that has not appeared yet, say so.
         Never make up a value, a file's contents, or a result.
 
     # ── WHAT THIS SESSION HAS WRITTEN DOWN (per conversation · daemon-filled) ──
@@ -752,12 +738,10 @@ layers:
   - name: repo_map
     persisted_id: 1
     description: |
-      What each directory of the repository IS — one conversation per folder,
-      shaped as a tool round-trip (list the folder, read its README / module
-      doc) that ends in a decoded two-sentence summary of the folder's purpose.
-      Prose, not a tree: a question about "the KV cache paging code" matches a
-      description of that folder, where a bare listing only matches a filename
-      the asker already knew.
+      The folders of the knowledge base (docs/provenance_system_collection.md
+      §12 D14): each folder's listing — its immediate children, a folder with
+      its `/`, a file with its size — prefilled as members of the system
+      prompt's `files` collection, as a file is.
     # Loading-screen unit for this layer's startup ingest ("N / M folders").
     ingest_unit: folders
     # In tool rounds, and outside the dialogue's flexbox: what a dialogue sees
@@ -850,16 +834,17 @@ layers:
   - name: code_reading
     persisted_id: 2
     description: |
-      One hidden conversation per file, forked from the same base a live
-      dialogue turn forks from and driven exactly the same way: real
-      `file_read` tool calls, as many rounds as the file needs, closing in
-      its own decoded summary once the whole file has been read.
+      The files of the knowledge base (docs/provenance_system_collection.md):
+      each file cut into chunks of whole lines and prefilled as members of the
+      system prompt's `files` collection, nothing decoded. Its groups are the
+      collection's kinds, each placed under its share of the slot.
     # Loading-screen unit for this layer's startup ingest.
     ingest_unit: files
-    # Each file's reading writes the questions it answers; prefilled alone,
-    # they stand in the gallery for the file, where its own windows are its
-    # content (`zend::calibrate`). A live probe is a question, and the tool
-    # catalog gained 10.6 points Top-1 when its exemplars became questions.
+    # Each file writes the questions it answers, asked behind the empty
+    # knowledge base and behind the file alone; prefilled, they stand in the
+    # gallery for the file beside its own content (`zend::calibrate`). A live
+    # probe is a question, and the tool catalog gained 10.6 points Top-1 when
+    # its exemplars became questions.
     calibrate:
       # One projection's worth: a turn's first reprojection fires by the
       # 64-token cadence (`reproject_every_n_tokens`), so the probe that
@@ -881,11 +866,11 @@ layers:
       # live question and the §9.12 battery ask; asked in turn, later prompts
       # lost sight of the reading. Each part sees the others and is told to ask
       # nothing already asked. A profile's maxima together stay within the 64
-      # one calibration holds. Each first prompt says the file was just read
-      # and is above: asked instead for questions "that `<<path>>` answers", a
-      # document's draft set out to read it again — "I need to first read the
-      # document", a `file_read` written out — and wrote none, one docs unit in
-      # nine (BlackWorld, 2026-11-15).
+      # one calibration holds. Each first prompt says the file is in the
+      # knowledge base above: asked instead for questions "that `<<path>>`
+      # answers", a document's draft set out to read it again — "I need to
+      # first read the document", a `file_read` written out — and wrote none,
+      # one docs unit in nine (BlackWorld, 2026-11-15).
       profiles:
         # A crate's or package's manifest: what it pulls in, what turns on
         # what — "which crates use `cudarc`?", "what does `tensor-assert`
@@ -897,7 +882,7 @@ layers:
             - name: dependencies
               questions: { per_tokens: 120, min: 3, max: 16 }
               prompt: |
-                Write <<n>> questions someone working in this workspace might ask about what you just read in `<<path>>`. It is above, already read: write from it now, without reading anything again. Each one names, exactly as written there, a dependency, feature, target, script or setting it declares, and asks which package depends on it, what version or source it comes from, what a feature turns on, or what building or running a target needs. Ask about each name only once. Some short, like "which crate pulls in `cudarc`?", some longer.
+                Write <<n>> questions someone working in this workspace might ask about `<<path>>`, which is in the knowledge base above: write from it now, without reading anything again. Each one names, exactly as written there, a dependency, feature, target, script or setting it declares, and asks which package depends on it, what version or source it comes from, what a feature turns on, or what building or running a target needs. Ask about each name only once. Some short, like "which crate pulls in `cudarc`?", some longer.
             - name: dependents
               questions: { per_tokens: 400, min: 1, max: 8 }
               prompt: |
@@ -918,7 +903,7 @@ layers:
             - name: verifies
               questions: { per_tokens: 300, min: 4, max: 32 }
               prompt: |
-                Write <<n>> questions someone working in this workspace might ask about the tests you just read in `<<path>>`. It is above, already read: write from it now, without reading anything again. Each one names, exactly as written there, a function, type, behaviour or case the tests exercise, and asks where it is tested, what a test checks about it, what input or state it is tested with, or what a failing test there means. Name a test by its name, never by a line number. Spread them across as many different things under test as the file has, and ask about each only once. Some short, like "where is `tier_fits` tested?", some longer.
+                Write <<n>> questions someone working in this workspace might ask about the tests in `<<path>>`, which is in the knowledge base above: write from it now, without reading anything again. Each one names, exactly as written there, a function, type, behaviour or case the tests exercise, and asks where it is tested, what a test checks about it, what input or state it is tested with, or what a failing test there means. Name a test by its name, never by a line number. Spread them across as many different things under test as the file has, and ask about each only once. Some short, like "where is `tier_fits` tested?", some longer.
             - name: covers
               questions: { per_tokens: 500, min: 2, max: 16 }
               prompt: |
@@ -936,7 +921,7 @@ layers:
             - name: kernels
               questions: { per_tokens: 300, min: 4, max: 28 }
               prompt: |
-                Write <<n>> questions someone working in this workspace might ask about what you just read in `<<path>>`. Each one names, exactly as written there, a kernel, device function, template, constant or macro it defines, and asks what it computes, what its arguments, layout or tiling are, what types or architectures it is built for, or where it is defined. Spread them across as many different names as the file has, and ask about each name only once. Some short, like "where's `paged_decode_bf16` defined?", some longer.
+                Write <<n>> questions someone working in this workspace might ask about `<<path>>`, which is in the knowledge base above. Each one names, exactly as written there, a kernel, device function, template, constant or macro it defines, and asks what it computes, what its arguments, layout or tiling are, what types or architectures it is built for, or where it is defined. Spread them across as many different names as the file has, and ask about each name only once. Some short, like "where's `paged_decode_bf16` defined?", some longer.
             - name: launches
               questions: { per_tokens: 400, min: 3, max: 24 }
               prompt: |
@@ -955,7 +940,7 @@ layers:
             - name: commands
               questions: { per_tokens: 200, min: 3, max: 24 }
               prompt: |
-                Write <<n>> questions someone working in this workspace might ask about the script you just read, `<<path>>`. It is above, already read: write from it now, without reading anything again. Each one names, exactly as written there, a command it runs, a flag or argument it takes or passes, or a variable, function or file it uses, and asks what it does, what it is set to, or why the script needs it. Spread them across as many different commands, flags and variables as the script has, and ask about each only once.
+                Write <<n>> questions someone working in this workspace might ask about the script `<<path>>`, which is in the knowledge base above: write from it now, without reading anything again. Each one names, exactly as written there, a command it runs, a flag or argument it takes or passes, or a variable, function or file it uses, and asks what it does, what it is set to, or why the script needs it. Spread them across as many different commands, flags and variables as the script has, and ask about each only once.
             - name: outputs
               questions: { per_tokens: 600, min: 0, max: 12 }
               prompt: |
@@ -979,7 +964,7 @@ layers:
             - name: definitions
               questions: { per_tokens: 300, min: 4, max: 28 }
               prompt: |
-                Write up to <<n>> questions someone working in this workspace might ask about what you just read in `<<path>>`. If the file defines fewer names than that, write fewer rather than ask about a name again. Each one names, exactly as written there, a function, type, trait, constant, field or setting it defines, and asks one thing about it: what it is, what it does or returns, what its arguments or fields mean, or where it is defined. For about a third of the names, the one thing asked is where it is defined. Spread them across as many different names as the file has, and ask about each name only once — never a second question about a name already asked about. Ask as different developers would: some short, like "where's `tier_fits` defined?", some longer. Never ask about module visibility, test names or formatting.
+                Write up to <<n>> questions someone working in this workspace might ask about `<<path>>`, which is in the knowledge base above. If the file defines fewer names than that, write fewer rather than ask about a name again. Each one names, exactly as written there, a function, type, trait, constant, field or setting it defines, and asks one thing about it: what it is, what it does or returns, what its arguments or fields mean, or where it is defined. For about a third of the names, the one thing asked is where it is defined. Spread them across as many different names as the file has, and ask about each name only once — never a second question about a name already asked about. Ask as different developers would: some short, like "where's `tier_fits` defined?", some longer. Never ask about module visibility, test names or formatting.
             # "what calls `tier_fits`?", "what breaks if it changes?" — the
             # transitive questions.
             - name: uses
@@ -1005,7 +990,7 @@ layers:
             - name: settings
               questions: { per_tokens: 200, min: 4, max: 32 }
               prompt: |
-                Write <<n>> questions someone working in this workspace might ask about what you just read in `<<path>>`. It is above, already read: write from it now, without reading anything again. Each one names, exactly as written there, a setting, key, section or value it declares, and asks what it is set to, what it controls, what its allowed values or units are, or where it is set. Spread them across as many different settings as the file has, and ask about each only once. Some short, like "where's `window` set for `code_reading`?", some longer.
+                Write <<n>> questions someone working in this workspace might ask about `<<path>>`, which is in the knowledge base above: write from it now, without reading anything again. Each one names, exactly as written there, a setting, key, section or value it declares, and asks what it is set to, what it controls, what its allowed values or units are, or where it is set. Spread them across as many different settings as the file has, and ask about each only once. Some short, like "where's `window` set for `code_reading`?", some longer.
             - name: readers
               questions: { per_tokens: 400, min: 2, max: 20 }
               prompt: |
@@ -1027,7 +1012,7 @@ layers:
             - name: concepts
               questions: { per_tokens: 300, min: 4, max: 28 }
               prompt: |
-                Write <<n>> questions someone working in this workspace might ask about the document you just read, `<<path>>`. It is above, already read: write from it now, without reading anything again. Each one names, exactly as written there, a concept, rule, invariant, decision, procedure, measurement or term the document itself states or defines, and asks what it is, why it holds, what it was decided over, or how to carry it out. Ask about what the document says, not about code it mentions: never ask where a function or type it names is defined. Ask about the subject itself, as a developer would — "why is weapon fire owned by the avatar that fires it?" — never "what does the document say about…". Spread them across as many of its sections as it has, and ask about each only once. Some short, some longer.
+                Write <<n>> questions someone working in this workspace might ask about the document `<<path>>`, which is in the knowledge base above: write from it now, without reading anything again. Each one names, exactly as written there, a concept, rule, invariant, decision, procedure, measurement or term the document itself states or defines, and asks what it is, why it holds, what it was decided over, or how to carry it out. Ask about what the document says, not about code it mentions: never ask where a function or type it names is defined. Ask about the subject itself, as a developer would — "why is weapon fire owned by the avatar that fires it?" — never "what does the document say about…". Spread them across as many of its sections as it has, and ask about each only once. Some short, some longer.
             - name: implements
               questions: { per_tokens: 800, min: 2, max: 16 }
               prompt: |
@@ -1042,7 +1027,7 @@ layers:
             - name: definitions
               questions: { per_tokens: 300, min: 4, max: 32 }
               prompt: |
-                Write <<n>> questions someone working in this workspace might ask about what you just read in `<<path>>`. Each one names, exactly as written there, a function, type, constant, field, setting, command or term it defines or explains, and asks what it is, what it does or returns, what its arguments or fields mean, or where it is defined. Spread them across as many different names as the file has, and ask about each name only once. Ask as different developers would: some short, like "where's `tier_fits` defined?", some longer.
+                Write <<n>> questions someone working in this workspace might ask about `<<path>>`, which is in the knowledge base above. Each one names, exactly as written there, a function, type, constant, field, setting, command or term it defines or explains, and asks what it is, what it does or returns, what its arguments or fields mean, or where it is defined. Spread them across as many different names as the file has, and ask about each name only once. Ask as different developers would: some short, like "where's `tier_fits` defined?", some longer.
             - name: uses
               questions: { per_tokens: 400, min: 3, max: 24 }
               prompt: |
@@ -1058,7 +1043,7 @@ layers:
       guidance:
         questions: { per_tokens: 250, min: 8, max: 64 }
         prompt: |
-          Write <<n>> different questions a worker in the middle of a task might ask itself at the moment it needs what you just read in `<<path>>`. Each is the next step the worker is stuck on, in its own words, as it reasons: "the fix is on main, how do I get it onto BlackWorld?", "the test passes here, what do I check before I deploy?". Vary the task each comes from and the point it is at. Never name the file or call it a guide or a journal.    # In tool rounds, like repo_map: a dialogue sees this layer as its working
+          Write <<n>> different questions a worker in the middle of a task might ask itself at the moment it needs what is in `<<path>>`, in the knowledge base above. Each is the next step the worker is stuck on, in its own words, as it reasons: "the fix is on main, how do I get it onto BlackWorld?", "the test passes here, what do I check before I deploy?". Vary the task each comes from and the point it is at. Never name the file or call it a guide or a journal.    # In tool rounds, like repo_map: a dialogue sees this layer as its working
     # set's files — whole, pinned or by momentum — and the rounds that lean on
     # them must still have them.
     #
@@ -1289,29 +1274,6 @@ layers:
             - '\.(ya?ml|toml|json|jsonc|ini|cfg|conf|env|properties)$'
             - '(^|/)(Cargo\.toml|package\.json|pyproject\.toml|go\.mod)$'
           max_share: 0.15
-      # What a dialogue starts out attending to: each enters provenance at the
-      # momentum of one full-strength hit (1000) when the conversation opens and
-      # fades like any other file it stops attending to. Within `--max-depth 3`.
-      # The priming chain already carries the repository roots, READMEs and
-      # AGENTS.md for good, so they are not listed here.
-      seeds:
-        - candle/zend/
-        - candle/zend/src/
-        - candle/zend-tools/src/
-        - candle/candle-conversation/src/
-        - candle/candle-transformers/src/models/
-        - candle/candle-nn/src/kv_cache/
-        - candle/candle-core/src/
-        - candle/candle-kernels/src/
-        - candle/docs/
-        - candle/Cargo.toml
-        - candle/docs/deployment.md
-        - candle/docs/zend_branch_ingest.md
-        - candle/docs/zend_working_set.md
-        - candle/zend/src/lib.rs
-        - candle/zend/src/main.rs
-        - candle/zend-tools/src/lib.rs
-        - candle/candle-conversation/src/lib.rs
     budget:
       priority: 100
       min_percent: 50    # dialogue keeps at least half its own window

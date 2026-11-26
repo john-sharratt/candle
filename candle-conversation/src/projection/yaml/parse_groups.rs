@@ -131,7 +131,6 @@ pub(super) fn parse_working_set(
     Ok(Some(WorkingSetConfig {
         beta: yw.beta,
         min_momentum: yw.min_momentum,
-        seeds: yw.seeds.clone(),
         reserve_tokens: yw.reserve_tokens,
         type_shares,
         fill_shares,

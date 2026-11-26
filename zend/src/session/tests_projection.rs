@@ -57,6 +57,31 @@ pub(super) mod projection_schema_tests {
         assert!(body.contains(&expected), "{body}");
     }
 
+    /// **The prompt tells the model where the files it has read are**: under
+    /// Knowledge Base at the end of the prompt, the turns being its work with
+    /// the user, and it answers from both (`docs/provenance_system_collection.md`
+    /// §7.2).
+    #[test]
+    fn the_prompt_says_the_files_are_in_the_knowledge_base() {
+        use crate::repo_scan::shared_prompt_body;
+        let builder = build_projection_builder(Path::new("demo-project"));
+        let body = shared_prompt_body(&builder);
+        assert!(
+            body.contains(
+                "Earlier turns here are your own work with the user, even where they appear\n\
+                 condensed or summarised, so build on what you already read, found and decided\n\
+                 instead of repeating it. The files you have read are under Knowledge Base at the\n\
+                 end of this prompt. What to do now is always the user's latest message.\n"
+            ),
+            "{body}"
+        );
+        assert!(body.contains(
+            "Answer from what is actually in this conversation and the files in the knowledge\n\
+             base. Your tools run for real"
+        ));
+        assert!(!body.contains("the reading done before this"));
+    }
+
     /// The embedded schema carries the working set (`docs/zend_working_set.md`)
     /// onto the right nodes: `repo_map/structure` and `code_reading/scopes`
     /// fill from the dialogue's working set, in tool rounds too, with the
@@ -270,8 +295,6 @@ pub(super) mod projection_schema_tests {
         // The persona and the journal are pinned, within 1,024 positions.
         assert!(!schema.system_prompt.pins.is_empty());
         assert_eq!(schema.system_prompt.pins.tokens, 1024);
-        assert_eq!(ws.seeds.len(), 17);
-        assert_eq!(ws.seeds[0], "candle/zend/");
 
         let tools = schema
             .system_prompt
