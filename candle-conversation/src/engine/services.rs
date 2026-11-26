@@ -275,15 +275,19 @@ impl ConversationEngine {
                     .map_err(|_| ConversationError::SchedulerGone)?;
                 rx.recv().map_err(|_| ConversationError::SchedulerGone)?;
             }
-            for (tokens, _) in prompt.iter().filter(|(t, _)| !t.is_empty()) {
+            // The pieces a transplant's `live_tail` leaves out are prefilled
+            // after it, live over what it put in place.
+            let pieces: Vec<&(Vec<u32>, SpanQuant)> =
+                prompt.iter().filter(|(t, _)| !t.is_empty()).collect();
+            let split = pieces
+                .len()
+                .saturating_sub(transplant.map_or(0, |t| t.live_tail));
+            let (head, live) = pieces.split_at(split);
+            for (tokens, _) in head {
                 self.raw_turn(sequence_id, tokens, 0)?;
             }
             if quantizes {
-                let spans = prompt
-                    .iter()
-                    .filter(|(t, _)| !t.is_empty())
-                    .map(|(t, q)| (t.len(), *q))
-                    .collect();
+                let spans = head.iter().map(|(t, q)| (t.len(), *q)).collect();
                 let (tx, rx) = flume::bounded(1);
                 self.core
                     .scheduler_tx
@@ -302,13 +306,16 @@ impl ConversationEngine {
                     .send(SchedulerRequest::Transplant {
                         sequence_id,
                         capture: t.capture,
-                        prompt_tokens: prompt.iter().map(|(p, _)| p.len()).sum(),
+                        prompt_tokens: head.iter().map(|(p, _)| p.len()).sum(),
                         kv: t.kv,
                         index: t.index,
                         response_tx: tx,
                     })
                     .map_err(|_| ConversationError::SchedulerGone)?;
                 rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
+            }
+            for (tokens, _) in live {
+                self.raw_turn(sequence_id, tokens, 0)?;
             }
             let state = match recurrent_over {
                 Some(tokens) => run_state(&self.core.scheduler_tx, None, tokens)?,

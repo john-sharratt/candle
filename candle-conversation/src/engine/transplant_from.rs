@@ -10,4 +10,8 @@ pub struct TransplantFrom {
     pub kv: bool,
     /// Take the captured slot's index pages in place of the slot's own.
     pub index: bool,
+    /// The prompt's last pieces left out of the transplant: prefilled after
+    /// it, live over the K/V and index it put in place, as production
+    /// prefills what follows the sealed sections it places.
+    pub live_tail: usize,
 }

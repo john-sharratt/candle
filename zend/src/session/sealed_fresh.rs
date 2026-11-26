@@ -114,6 +114,12 @@ pub struct SealedFreshReq {
     /// dialogue base's own projection.
     #[serde(default)]
     pub tools: Option<ToolMode>,
+    /// With a transplant, the prompt's last this many pieces are left out of
+    /// it and prefilled live over the transplanted K/V and index — whether
+    /// the prompt's own ending, computed in place, reads what sealed K/V
+    /// before it holds.
+    #[serde(default)]
+    pub live_tail: usize,
 }
 
 /// Which side a part of the fresh slot comes from.
@@ -457,6 +463,7 @@ impl ZendSession {
                     capture: sealed_layout.capture,
                     kv: req.fresh_kv == Source::Sealed,
                     index: req.fresh_index == Source::Sealed,
+                    live_tail: req.live_tail,
                 });
             if transplant.is_none() {
                 engine.release_capture(sealed_layout.capture);
