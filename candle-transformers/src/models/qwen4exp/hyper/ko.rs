@@ -28,7 +28,7 @@ use candle::quantized::{GgmlDType, Int8Mode, QTensor, SumScale};
 use candle::{DType, LiveTensor, Result, Tensor};
 
 use super::{HcProject, HcProjectQ8, HcWeights};
-use crate::models::quantized_matmul::QMatMul;
+use crate::models::quantized_matmul::{QMatMul, WeightResidency};
 use crate::models::qwen4exp::sum_scale::ACT_SUM_SCALE;
 
 /// K tile of the int8 matmul; the padded gate rank is a multiple of it.
@@ -90,9 +90,15 @@ impl HcWeightsKo {
             w.up.clone()
         };
 
+        // On the pool: a module built here is one the pack build stores, or a
+        // test's, and neither is a resident weight of a load.
         let quantize = |t: &Tensor| -> Result<QMatMul> {
-            QMatMul::from_qtensor_with_mode(QTensor::quantize(t, GgmlDType::Q8_0)?, mode)
-                .map(|m| m.with_sum_scale(ACT_SUM_SCALE))
+            QMatMul::from_qtensor_in(
+                QTensor::quantize(t, GgmlDType::Q8_0)?,
+                mode,
+                WeightResidency::Pool,
+            )
+            .map(|m| m.with_sum_scale(ACT_SUM_SCALE))
         };
         Ok(Self {
             norm: w.norm.clone(),
@@ -102,6 +108,37 @@ impl HcWeightsKo {
             inject_col,
             mode,
         })
+    }
+
+    /// A module from its stored projections — the `down` and `up` twins
+    /// [`Self::from_weights`] built, read back as they were stored — and its
+    /// norm gain. `injects` says whether `down` carries inject rows beneath
+    /// the gate's; the padded gate rank is `up`'s width.
+    pub fn from_stored(norm: Tensor, down: QMatMul, up: QMatMul, injects: bool) -> Result<Self> {
+        let mode = down.int8mode();
+        if up.int8mode() != mode {
+            candle::bail!("hc module: its down and up projections were stored for two modes");
+        }
+        let gate_cols = match up.weight_dims()[..] {
+            [_, cols] => cols,
+            ref dims => candle::bail!("hc module: a stored up projection of shape {dims:?}"),
+        };
+        if !gate_cols.is_multiple_of(K_TILE) {
+            candle::bail!("hc module: a stored gate rank of {gate_cols} is not padded to {K_TILE}");
+        }
+        Ok(Self {
+            norm,
+            down: down.with_sum_scale(ACT_SUM_SCALE),
+            up: up.with_sum_scale(ACT_SUM_SCALE),
+            gate_cols,
+            inject_col: injects.then_some(gate_cols),
+            mode,
+        })
+    }
+
+    /// The two projections, for the pack build to store.
+    pub fn stored_projections(&self) -> (&QMatMul, &QMatMul) {
+        (&self.down, &self.up)
     }
 
     /// The `down` and `up` weights and the mode they were built for — what the

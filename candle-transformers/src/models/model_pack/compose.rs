@@ -6,6 +6,7 @@
 //! of resolving all of them into one set of named tensors and one metadata
 //! block: what a load of the finished pack reads, with no second file to open.
 
+use super::built::BuiltSource;
 use super::keys::CHECKPOINT_BYTES;
 use candle::quantized::gguf_file::{Content, Value};
 use candle::quantized::GgmlDType;
@@ -80,19 +81,27 @@ pub fn checkpoint_bytes_of(content: &Content) -> u64 {
         .unwrap_or_else(|| checkpoint_bytes(content))
 }
 
+/// Where a packed tensor's bytes are read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The [`MappedSource`] at this index.
+    Source(usize),
+    /// The family build's [`BuiltSource`].
+    Built,
+}
+
 /// A tensor of the pack's GGUF part.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackedTensor {
     pub name: String,
-    /// Index of the [`MappedSource`] its bytes are read from.
-    pub source: usize,
+    pub origin: Origin,
     /// The type the pack stores it as.
     pub dtype: GgmlDType,
     /// The type its source stores it as: `dtype`, for a tensor copied as it
     /// is, or the source of the KO twin `dtype` names (`model_pack::twins`).
     pub from: GgmlDType,
     pub dims: Vec<usize>,
-    /// Absolute offset of its bytes in that source.
+    /// Absolute offset of its bytes in its origin.
     pub offset: u64,
 }
 
@@ -145,7 +154,7 @@ impl Composition {
             .filter(|(name, _)| keep(name))
             .map(|(name, info)| PackedTensor {
                 name: name.clone(),
-                source: 0,
+                origin: Origin::Source(0),
                 dtype: info.ggml_dtype,
                 from: info.ggml_dtype,
                 dims: info.shape.dims().to_vec(),
@@ -168,17 +177,37 @@ impl Composition {
         })?;
         let t = PackedTensor {
             name: name.to_string(),
-            source,
+            origin: Origin::Source(source),
             dtype: info.ggml_dtype,
             from: info.ggml_dtype,
             dims: info.shape.dims().to_vec(),
             offset: src.content.tensor_data_offset + info.offset,
         };
-        match self.tensors.iter_mut().find(|x| x.name == name) {
+        self.put(t);
+        Ok(())
+    }
+
+    /// Store every tensor of `built` as it was built — replacing this
+    /// composition's own of the same name, adding the rest after it in build
+    /// order.
+    pub fn add_built(&mut self, built: &BuiltSource) {
+        for b in built.tensors() {
+            self.put(PackedTensor {
+                name: b.name.clone(),
+                origin: Origin::Built,
+                dtype: b.dtype,
+                from: b.dtype,
+                dims: b.dims.clone(),
+                offset: b.offset,
+            });
+        }
+    }
+
+    fn put(&mut self, t: PackedTensor) {
+        match self.tensors.iter_mut().find(|x| x.name == t.name) {
             Some(slot) => *slot = t,
             None => self.tensors.push(t),
         }
-        Ok(())
     }
 
     /// Set a metadata entry, replacing the source's value when it has one.
@@ -257,12 +286,48 @@ mod tests {
         let mut c = Composition::from_checkpoint(&sources, &|_| true);
         c.take(&sources, 1, "y").unwrap();
         c.take(&sources, 1, "head").unwrap();
-        let from: Vec<(&str, usize)> = c
+        let from: Vec<(&str, Origin)> = c
             .tensors
             .iter()
-            .map(|t| (t.name.as_str(), t.source))
+            .map(|t| (t.name.as_str(), t.origin))
             .collect();
-        assert_eq!(from, [("x", 0), ("y", 1), ("head", 1)]);
+        assert_eq!(
+            from,
+            [
+                ("x", Origin::Source(0)),
+                ("y", Origin::Source(1)),
+                ("head", Origin::Source(1))
+            ]
+        );
         assert!(c.take(&sources, 0, "missing").is_err());
+    }
+
+    /// A built tensor replaces the checkpoint's own of its name, and one the
+    /// checkpoint lacks is added, in build order, at the type it was built as.
+    #[test]
+    fn a_built_tensor_replaces_or_adds() {
+        use super::super::built::BuiltWriter;
+        let dir = tempfile::tempdir().unwrap();
+        let sources = [source(dir.path(), "a.gguf", &["x", "y"], &[])];
+        let mut w = BuiltWriter::create(dir.path()).unwrap();
+        w.push("z", GgmlDType::F16, &[4], &[0; 8]).unwrap();
+        w.push("x", GgmlDType::F16, &[2], &[0; 4]).unwrap();
+        let built = w.finish().unwrap();
+        let mut c = Composition::from_checkpoint(&sources, &|_| true);
+        c.add_built(&built);
+        let got: Vec<(&str, Origin, GgmlDType, u64)> = c
+            .tensors
+            .iter()
+            .map(|t| (t.name.as_str(), t.origin, t.dtype, t.offset))
+            .collect();
+        let y_at = sources[0].tensor_span("y").unwrap().0;
+        assert_eq!(
+            got,
+            [
+                ("x", Origin::Built, GgmlDType::F16, 8),
+                ("y", Origin::Source(0), GgmlDType::F32, y_at),
+                ("z", Origin::Built, GgmlDType::F16, 0),
+            ]
+        );
     }
 }

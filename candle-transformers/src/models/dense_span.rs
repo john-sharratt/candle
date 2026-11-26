@@ -43,8 +43,6 @@ use candle::quantized::ko_quant::ko_tileable;
 use candle::quantized::{gguf_file, GgmlDType, Int8Mode, QTensor};
 use candle::{Device, Result, Tensor};
 
-use crate::models::quantized_matmul::QMatMul;
-
 /// A model load in progress: open from [`open_for_load`] until the loader that
 /// holds it returns.
 ///
@@ -276,47 +274,6 @@ pub fn bands_from_host(info: &TensorInfo, mode: Int8Mode) -> bool {
     }
     let _ = (info, mode);
     false
-}
-
-/// A projection's KO twin, repacked from its bytes on the host a band at a time
-/// into the dense block (`cuda::repack_ko_from_host`).
-///
-/// The device holds a staging band, the f32 band and the twin, never the source
-/// — the route the qwen35 loader takes for every mapped projection, here for a
-/// load that reads its file by offset. `Ok(None)` when [`bands_from_host`]
-/// refuses the tensor: the caller reads it the ordinary way, and the load
-/// headroom has counted it.
-pub fn twin_from_host(
-    device: &Device,
-    bytes: &[u8],
-    info: &TensorInfo,
-    mode: Int8Mode,
-) -> Result<Option<QMatMul>> {
-    if !bands_from_host(info, mode) {
-        return Ok(None);
-    }
-    #[cfg(feature = "cuda")]
-    {
-        use candle::quantized::cuda::repack_ko_from_host;
-        use candle::quantized::QStorage;
-
-        use crate::models::quantized_matmul::dense_destination_for;
-
-        let Device::Cuda(cuda) = device else {
-            return Ok(None);
-        };
-        let shape = info.shape.clone();
-        let ko = info.ggml_dtype.to_ko(mode)?;
-        let dst = dense_destination_for(device, &shape, ko);
-        let twin = repack_ko_from_host(cuda, bytes, &shape, info.ggml_dtype, ko, dst)?;
-        let qt = QTensor::new(QStorage::Cuda(twin), shape)?;
-        Ok(Some(QMatMul::from_qtensor_view(qt, mode)?))
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        let _ = (device, bytes);
-        Ok(None)
-    }
 }
 
 /// Move a plain tensor a model keeps for its whole life — a norm's gain, a

@@ -224,6 +224,7 @@ pub(crate) fn build_qwen35(
             sources,
             provenance,
             composition,
+            built: None,
             int8_mode: mode,
             narrow,
             checkpoint_bytes: checkpoint,

@@ -16,9 +16,13 @@ pub enum PackFamily {
     /// No section: the checkpoint's tensors, the tokenizer and the provenance.
     Plain,
     /// A routed checkpoint of the qwen lineage, whose experts are the merged
-    /// `blk.{n}.ffn_{gate,up,down}_exps` tensors: an expert section. Qwen3-MoE
-    /// and Qwen3.8-Flash-Next's prepared artifact.
+    /// `blk.{n}.ffn_{gate,up,down}_exps` tensors: an expert section. Qwen3-MoE.
     Routed,
+    /// Qwen3.8-Flash-Next's prepared artifact: the routed family's expert
+    /// section, and the dense trunk stored as the engine runs it — every int8
+    /// matmul weight as its KO twin and every assembled weight in its built
+    /// form (`qwen4exp::pack_build`), so a load copies and builds nothing.
+    Qwen4Exp,
     /// A sparse-latent checkpoint (`latent_moe`): an expert section, with every
     /// expert tensor named through the model's own [`Arch`] — that family never
     /// names a tensor by another model's convention.

@@ -119,7 +119,7 @@ impl GgufModel {
 
     /// A tensor's bytes as the file lays them out — whole blocks, row-major —
     /// read to the host, with its info: what a load that never puts the source
-    /// on the card (`dense_span::place_host_in_dense`, `twin_from_host`) reads.
+    /// on the card (`dense_span::place_host_in_dense`) reads.
     pub fn host_bytes(&self, name: &str) -> Result<(Vec<u8>, TensorInfo)> {
         let (split, offset, info) = self
             .raw_location(name)

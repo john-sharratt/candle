@@ -21,7 +21,7 @@ use candle::direct_io::{
 use candle::quantized::ggml_file::qtensor_from_ggml;
 use candle::quantized::gguf_file::{Content, TensorInfo, Value};
 use candle::quantized::ko_quant::dequant_ko;
-use candle::quantized::{GgmlDType, Int8Mode};
+use candle::quantized::GgmlDType;
 use candle::wave_provenance::WaveTicket;
 use candle::{Device, Result, Tensor};
 
@@ -35,7 +35,7 @@ use super::ple_cache::{PleCacheStats, PleRowCache, PleRowFetch, RECORD_BYTES, RE
 use super::qsa::IndexerWeights;
 use super::record_windows;
 use crate::models::delta_net::{DeltaNetWeights, LayerKind};
-use crate::models::dense_span::{bands_from_host, peak_load_pool_bytes};
+use crate::models::dense_span::peak_load_pool_bytes;
 use crate::models::latent_moe::GgufModel;
 use crate::models::qwen35::attention::{AttentionWeights, RopeTables};
 use crate::models::qwen35::moe::FfnWeights;
@@ -295,7 +295,7 @@ const PLE_TABLE: &str = "per_layer_token_embd.weight";
 pub(crate) const TOKEN_EMBD: &str = "token_embd.weight";
 
 /// The output head's name in the artifact; absent with tied embeddings.
-const OUTPUT: &str = "output.weight";
+pub(crate) const OUTPUT: &str = "output.weight";
 
 /// A tensor's size in the file.
 fn tensor_bytes(info: &TensorInfo) -> usize {
@@ -336,8 +336,7 @@ pub(crate) fn offloaded_bytes(content: &Content) -> Result<u64> {
 ///
 /// The span never grows, so this figure stays outside it for the life of the
 /// process (`docs/driver_model.md` §4): every MiB here is a MiB of expert slots.
-/// Three tensors are therefore left out, each because it never stands on the
-/// card whole:
+/// What never stands on the card whole is therefore left out:
 ///
 /// - the n-gram table, the checkpoint's largest 2-D tensor by two orders of
 ///   magnitude (54 GB against a ~1 GB head), which its row cache reads from
@@ -345,23 +344,19 @@ pub(crate) fn offloaded_bytes(content: &Content) -> Result<u64> {
 /// - the token embedding, copied from the host straight into the dense block
 ///   (`dense_span::place_host_in_dense`) — 644 MiB on Flash-Next, the largest
 ///   tensor the load reads;
-/// - the output head, when its twin is repacked from the host a band at a time
-///   (`dense_span::bands_from_host`) — 644 MiB again.
+/// - every KO twin the pack stores, the LM head's among them, copied from the
+///   host into the dense block the same way.
 ///
-/// Bounded with the embedding and the head, Flash-Next's headroom was 1,384 MiB;
-/// without them it is its largest attention projection (32 MiB) and the
-/// repack's two bands, 128 MiB.
-pub(crate) fn load_headroom_bytes(content: &Content, mode: Int8Mode) -> usize {
-    let head = lm_head_name(content);
+/// What remains is the plain tensors the load reads through the pool — the
+/// indexer's projections the largest — and the bound's repack bands.
+pub(crate) fn load_headroom_bytes(content: &Content) -> usize {
     peak_load_pool_bytes(
         content
             .tensor_infos
             .iter()
             .filter(|(name, info)| {
                 let name = name.as_str();
-                name != PLE_TABLE
-                    && name != TOKEN_EMBD
-                    && !(name == head && bands_from_host(info, mode))
+                name != PLE_TABLE && name != TOKEN_EMBD && !info.ggml_dtype.is_ko()
             })
             .map(|(_, info)| info),
     )
@@ -386,8 +381,9 @@ fn hc_weights(
     device: &Device,
 ) -> Result<HcWeights> {
     // The inject rows are stacked under the down projection, exactly as the
-    // engine loader does it — `HcWeights::down` says why. The oracle has to
-    // build the same layout or it would not be reading the same weight.
+    // engine's pack build does it (`pack_build::hc_module`) — `HcWeights::down`
+    // says why. The oracle has to build the same layout or it would not be
+    // reading the same weight.
     let down = f32t(gguf, &format!("{prefix}_down.weight"), device)?;
     let down = if with_inject {
         let inject = f32t(gguf, &format!("{prefix}_inject.weight"), device)?;
@@ -641,17 +637,22 @@ mod tests {
 
     /// The headroom is the largest 2-D tensor the load reads to the device
     /// whole, plus the repack's two bands — and nothing for the n-gram table,
-    /// which never leaves the file, or the embedding, which is copied from the
-    /// host into the dense block. A head the KO matmul cannot tile is read
-    /// whole in any mode, so it is counted.
+    /// which never leaves the file, the embedding, or a stored KO twin, which
+    /// are copied from the host into the dense block.
     #[test]
     fn the_headroom_counts_only_what_stands_on_the_card_whole() {
         let content = content(&[
-            // 32 × 64 Q8_0: 64 blocks of 34 bytes, larger than the head — and
+            // 32 × 64 Q8_0: 64 blocks of 34 bytes, larger than the rest — and
             // left out.
             (TOKEN_EMBD, info(GgmlDType::Q8_0, &[32, 64])),
-            // 16 × 64 Q8_0: 32 blocks — the largest tensor read whole.
-            (OUTPUT, info(GgmlDType::Q8_0, &[16, 64])),
+            // A stored head twin: 32 × 128 Q8_KO, four chunks of 1,056 bytes —
+            // left out.
+            (OUTPUT, info(GgmlDType::Q8_KO, &[32, 128])),
+            // 16 × 64 F32: 4,096 bytes — the largest tensor read whole.
+            (
+                "blk.0.indexer.q_proj.weight",
+                info(GgmlDType::F32, &[16, 64]),
+            ),
             // 8 × 64 Q8_0: 16 blocks.
             ("blk.0.attn_q.weight", info(GgmlDType::Q8_0, &[8, 64])),
             // Larger than all of them, and left out.
@@ -662,39 +663,9 @@ mod tests {
                 info(GgmlDType::Q8_0, &[4, 64, 64]),
             ),
         ]);
-        for mode in [Int8Mode::Off, Int8Mode::Performance, Int8Mode::Precision] {
-            assert_eq!(
-                load_headroom_bytes(&content, mode),
-                32 * 34 + 2 * REPACK_BAND_BYTES,
-                "{mode:?}"
-            );
-        }
-    }
-
-    /// A head the KO matmul tiles is repacked from the host under an int8 mode
-    /// and left out; at `Off` it has no twin, is read whole, and is counted.
-    /// With tied embeddings the head is the embedding, left out either way.
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn a_banded_head_is_left_out_of_the_headroom() {
-        // 64 × 256 Q8_0: 512 blocks of 34 bytes.
-        let head = info(GgmlDType::Q8_0, &[64, 256]);
-        // 8 × 64 Q8_0: 16 blocks.
-        let q = info(GgmlDType::Q8_0, &[8, 64]);
-        let untied = content(&[(OUTPUT, head.clone()), ("blk.0.attn_q.weight", q.clone())]);
         assert_eq!(
-            load_headroom_bytes(&untied, Int8Mode::Performance),
-            16 * 34 + 2 * REPACK_BAND_BYTES
-        );
-        assert_eq!(
-            load_headroom_bytes(&untied, Int8Mode::Off),
-            512 * 34 + 2 * REPACK_BAND_BYTES
-        );
-        let tied = content(&[(TOKEN_EMBD, head), ("blk.0.attn_q.weight", q)]);
-        assert_eq!(lm_head_name(&tied), TOKEN_EMBD);
-        assert_eq!(
-            load_headroom_bytes(&tied, Int8Mode::Off),
-            16 * 34 + 2 * REPACK_BAND_BYTES
+            load_headroom_bytes(&content),
+            16 * 64 * 4 + 2 * REPACK_BAND_BYTES
         );
     }
 

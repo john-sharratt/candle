@@ -13,6 +13,7 @@ use crate::models::expert_lre::section::{
 };
 use crate::models::layer_stream::section::open_layer_section;
 use crate::models::qwen35::pack_build::{build_qwen35, qwen35_narrowing};
+use crate::models::qwen4exp::pack_build::{build_qwen4exp, check_trunk};
 use candle::quantized::gguf_file::Content;
 use candle::quantized::Int8Mode;
 use candle::{CudaDevice, Device, Result};
@@ -90,6 +91,7 @@ pub(crate) fn build_pack(
                     sources,
                     provenance,
                     composition: Composition::from_checkpoint(sources, &|_| true),
+                    built: None,
                     int8_mode: mode,
                     narrow: None,
                     checkpoint_bytes: checkpoint,
@@ -120,6 +122,7 @@ pub(crate) fn build_pack(
                     sources,
                     provenance,
                     composition: Composition::from_checkpoint(sources, &|n| !names.contains(n)),
+                    built: None,
                     int8_mode: mode,
                     narrow: None,
                     checkpoint_bytes: checkpoint,
@@ -134,6 +137,9 @@ pub(crate) fn build_pack(
         PackFamily::Qwen35 => {
             build_qwen35(request, mode, sources, provenance, tokenizer, device, dir)
         }
+        PackFamily::Qwen4Exp => {
+            build_qwen4exp(request, mode, sources, provenance, tokenizer, device, dir)
+        }
         PackFamily::Twinned(verbatim) => {
             let mut composition = Composition::from_checkpoint(sources, &|_| true);
             twin_tensors(&mut composition, mode, verbatim);
@@ -143,6 +149,7 @@ pub(crate) fn build_pack(
                     sources,
                     provenance,
                     composition,
+                    built: None,
                     int8_mode: mode,
                     narrow: None,
                     checkpoint_bytes: checkpoint,
@@ -166,9 +173,11 @@ pub(crate) fn narrowing(
     device: &Device,
 ) -> Result<Option<usize>> {
     match family {
-        PackFamily::Plain | PackFamily::Routed | PackFamily::Latent(_) | PackFamily::Twinned(_) => {
-            Ok(None)
-        }
+        PackFamily::Plain
+        | PackFamily::Routed
+        | PackFamily::Qwen4Exp
+        | PackFamily::Latent(_)
+        | PackFamily::Twinned(_) => Ok(None),
         PackFamily::Qwen35 => qwen35_narrowing(content, checkpoint_bytes, device),
     }
 }
@@ -177,12 +186,17 @@ pub(crate) fn narrowing(
 /// cannot read is found by the resolver — and rebuilt — rather than by the
 /// load that would have failed on it.
 pub(crate) fn validate(family: PackFamily, pack: &ModelPack, device: &Device) -> Result<()> {
-    let routed = matches!(family, PackFamily::Routed | PackFamily::Latent(_));
+    let routed = matches!(
+        family,
+        PackFamily::Routed | PackFamily::Qwen4Exp | PackFamily::Latent(_)
+    );
     if routed && pack.experts.is_none() {
         candle::bail!("model pack: a routed model's pack has no expert section");
     }
-    if let PackFamily::Twinned(_) = family {
-        check_twins(&pack.content.metadata)?;
+    match family {
+        PackFamily::Twinned(_) => check_twins(&pack.content.metadata)?,
+        PackFamily::Qwen4Exp => check_trunk(&pack.content.metadata, cuda_of(device)?)?,
+        _ => {}
     }
     if let Some(s) = pack.experts {
         let section = open_section(&pack.path, s.offset, cuda_of(device)?)?;

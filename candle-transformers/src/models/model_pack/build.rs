@@ -7,7 +7,8 @@
 //! out once with the offsets at zero, measured, and laid out again with the real
 //! values at an identical length.
 
-use super::compose::{Composition, MappedSource};
+use super::built::{BuiltSource, BuiltTensor};
+use super::compose::{Composition, MappedSource, Origin};
 use super::digest::patch_digests;
 use super::keys::{
     CHECKPOINT_BYTES, EXPERTS_LEN, EXPERTS_OFFSET, GGUF_LEN, INT8_MODE, LAYERS_LEN, LAYERS_OFFSET,
@@ -53,6 +54,9 @@ pub struct PackBuild<'a> {
     /// is published.
     pub provenance: Provenance,
     pub composition: Composition,
+    /// The tensors the family's build computed, which the composition's
+    /// [`Origin::Built`] entries read.
+    pub built: Option<&'a BuiltSource>,
     pub int8_mode: Int8Mode,
     pub narrow: Option<usize>,
     /// Every tensor the checkpoint carries — see [`CHECKPOINT_BYTES`].
@@ -165,7 +169,27 @@ pub fn write_pack(build: PackBuild<'_>, out: &Path) -> Result<()> {
     let t0 = std::time::Instant::now();
     let mut w = GgufStreamWriter::new(plan, BufWriter::with_capacity(16 << 20, file))?;
     for t in &build.composition.tensors {
-        let src = &build.sources[t.source].mmap;
+        let src: &[u8] = match t.origin {
+            Origin::Source(i) => &build.sources[i].mmap,
+            Origin::Built => {
+                let built = build.built.ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                        "model pack: {} is a built tensor, and the build supplied none",
+                        t.name
+                    ))
+                })?;
+                // A built tensor is stored as it was built: its offset is into
+                // the scratch, and its length its own.
+                let mapped = built.bytes(&BuiltTensor {
+                    name: t.name.clone(),
+                    dtype: t.dtype,
+                    dims: t.dims.clone(),
+                    offset: t.offset,
+                })?;
+                w.write_tensor_bytes(mapped)?;
+                continue;
+            }
+        };
         let (at, len) = (t.offset as usize, t.source_len() as usize);
         let bytes = src.get(at..at + len).ok_or_else(|| {
             candle::Error::Msg(format!(

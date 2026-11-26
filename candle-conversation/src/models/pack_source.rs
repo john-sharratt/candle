@@ -51,7 +51,8 @@ impl ResolvedModel {
 /// Which pack build an architecture takes.
 pub(crate) fn pack_family(arch: ModelArch) -> PackFamily {
     match arch {
-        ModelArch::Qwen3Moe | ModelArch::Qwen4Exp => PackFamily::Routed,
+        ModelArch::Qwen3Moe => PackFamily::Routed,
+        ModelArch::Qwen4Exp => PackFamily::Qwen4Exp,
         ModelArch::DeepSeekV4 => PackFamily::Latent(&DEEPSEEK_V4),
         ModelArch::Qwen35Hybrid | ModelArch::Qwen35Dense => PackFamily::Qwen35,
         ModelArch::Qwen3 | ModelArch::Qwen2 | ModelArch::Llama => PackFamily::Plain,
@@ -261,7 +262,7 @@ mod tests {
     #[test]
     fn each_arch_takes_its_familys_build() {
         assert_eq!(pack_family(ModelArch::Qwen3Moe), PackFamily::Routed);
-        assert_eq!(pack_family(ModelArch::Qwen4Exp), PackFamily::Routed);
+        assert_eq!(pack_family(ModelArch::Qwen4Exp), PackFamily::Qwen4Exp);
         assert_eq!(
             pack_family(ModelArch::DeepSeekV4),
             PackFamily::Latent(&DEEPSEEK_V4)

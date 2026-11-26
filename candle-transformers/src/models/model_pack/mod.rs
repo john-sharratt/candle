@@ -20,6 +20,7 @@
 //! ([`resolve::model_pack`]); after that it is the model's only file.
 
 pub mod build;
+pub mod built;
 pub mod cache;
 pub mod compose;
 pub mod digest;
@@ -33,6 +34,7 @@ pub mod keys;
 #[cfg(feature = "cuda")]
 pub mod local;
 pub mod open;
+pub(crate) mod prints;
 pub mod provenance;
 pub mod request;
 #[cfg(feature = "cuda")]

@@ -15,7 +15,8 @@
 //! keep.
 
 use super::compose::Composition;
-use super::keys::{twin_key, TWIN_COUNT};
+use super::keys::TWINS;
+use super::prints::{from_metadata, to_metadata};
 use crate::models::repack_fingerprint::{check_prints, pair_fingerprint_with, PairPrint};
 use candle::quantized::gguf_file::Value;
 use candle::quantized::prepare::{ko_target, write_ko_twin};
@@ -48,7 +49,7 @@ pub fn twin_tensors(composition: &mut Composition, mode: Int8Mode, verbatim: &[&
             fp: twin_fingerprint(src_dtype, dtype),
         })
         .collect();
-    for (k, v) in to_metadata(&prints) {
+    for (k, v) in to_metadata(TWINS, &prints) {
         composition.set_metadata(&k, v);
     }
 }
@@ -62,48 +63,21 @@ fn twin_fingerprint(src: GgmlDType, ko: GgmlDType) -> u64 {
     })
 }
 
-fn to_metadata(prints: &[PairPrint]) -> Vec<(String, Value)> {
-    let mut out = vec![(TWIN_COUNT.to_string(), Value::U32(prints.len() as u32))];
-    for (i, p) in prints.iter().enumerate() {
-        out.push((twin_key(i, "src"), Value::U32(p.src_dtype.to_u32())));
-        out.push((twin_key(i, "dst"), Value::U32(p.dtype.to_u32())));
-        out.push((twin_key(i, "fp"), Value::U64(p.fp)));
-    }
-    out
-}
-
-fn from_metadata(m: &HashMap<String, Value>) -> Result<Vec<PairPrint>> {
-    let get = |key: &str| {
-        m.get(key)
-            .ok_or_else(|| candle::Error::Msg(format!("model pack: no {key}")))
-    };
-    let count = get(TWIN_COUNT)?.to_u32()? as usize;
-    (0..count)
-        .map(|i| {
-            Ok(PairPrint {
-                src_dtype: GgmlDType::from_u32(get(&twin_key(i, "src"))?.to_u32()?)?,
-                dtype: GgmlDType::from_u32(get(&twin_key(i, "dst"))?.to_u32()?)?,
-                fp: get(&twin_key(i, "fp"))?.to_u64()?,
-            })
-        })
-        .collect()
-}
-
 /// Refuse a twinned pack whose twins this build's converter would not write:
 /// one that records no pairs, or a pair whose fingerprint moved.
 pub fn check_twins(metadata: &HashMap<String, Value>) -> Result<()> {
-    check_prints(&from_metadata(metadata)?, twin_fingerprint)
+    check_prints(&from_metadata(TWINS, metadata)?, twin_fingerprint)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::model_pack::compose::PackedTensor;
+    use crate::models::model_pack::compose::{Origin, PackedTensor};
 
     fn tensor(name: &str, from: GgmlDType, dims: &[usize]) -> PackedTensor {
         PackedTensor {
             name: name.into(),
-            source: 0,
+            origin: Origin::Source(0),
             dtype: from,
             from,
             dims: dims.to_vec(),
@@ -143,7 +117,7 @@ mod tests {
         assert_eq!(c.tensors[0].source_len(), 3456 * 1152 * 2);
 
         let m: HashMap<String, Value> = c.metadata.into_iter().collect();
-        assert_eq!(m[TWIN_COUNT].to_u32().unwrap(), 1);
+        assert_eq!(m["zen.pack.twins.count"].to_u32().unwrap(), 1);
         assert_eq!(m["zen.pack.twins.0.src"].to_u32().unwrap(), F16.to_u32());
         assert_eq!(m["zen.pack.twins.0.dst"].to_u32().unwrap(), Q8_KO.to_u32());
         assert!(check_twins(&m).is_ok());
@@ -156,7 +130,7 @@ mod tests {
         twin_tensors(&mut c, Int8Mode::Off, &[]);
         assert!(c.tensors.iter().all(|t| t.dtype == t.from));
         let m: HashMap<String, Value> = c.metadata.into_iter().collect();
-        assert_eq!(m[TWIN_COUNT].to_u32().unwrap(), 0);
+        assert_eq!(m["zen.pack.twins.count"].to_u32().unwrap(), 0);
         assert!(check_twins(&m).is_ok());
     }
 

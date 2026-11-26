@@ -213,6 +213,7 @@ mod tests {
                 sources: &sources,
                 provenance: Provenance::complete(vec![record.clone()]),
                 composition,
+                built: None,
                 int8_mode: Int8Mode::Performance,
                 narrow: Some(64),
                 checkpoint_bytes: 32,

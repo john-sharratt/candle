@@ -58,6 +58,7 @@ use super::engine::GpuLayer;
 use super::hyper::ko::HcWeightsKo;
 use super::hyper::{hc_grouped_norm, hc_mix, HcWeights};
 use super::sum_scale::ACT_SUM_SCALE;
+use super::trunk_names;
 use crate::models::latent_moe::GgufModel;
 use crate::models::quantized_matmul::{QMatMul, WeightResidency};
 use crate::quantized_nn::RmsNorm;
@@ -161,73 +162,105 @@ impl MtpDense {
         }
     }
 
-    /// Load the head's own tensors.
+    /// Build the head's own int8 weights from the checkpoint and hand each to
+    /// `store` under the name the pack keeps it by ([`trunk_names`]): the two
+    /// halves of `eh_proj`, the mixer's projections and the walk's narrower LM
+    /// head, re-read from `head_name` at [`DRAFT_LM_HEAD_FORMAT`].
     ///
-    /// `eps` is the model's RMS epsilon: the head norms in the same arithmetic
-    /// the trunk does, because a drafted position and the wave position that
-    /// later replaces it must agree — or the K/V the draft attended over and the
-    /// K/V the verify wrote disagree on a token both accepted.
-    ///
-    /// `trunk_head` is the trunk's LM head and the tensor it was read from. An
-    /// int8 session re-reads that tensor into the walk's own narrower table
-    /// ([`DRAFT_LM_HEAD_FORMAT`]); a session off the int8 path has no KO twin to
-    /// narrow to, and shares the trunk's.
-    pub fn load(
+    /// Every weight is built on the pool: the pack build stores it and lets it
+    /// go.
+    pub fn build(
         g: &mut GgufModel,
         cfg: &Qwen4ExpConfig,
-        eps: f64,
         int8mode: Int8Mode,
-        trunk_head: (&str, &QMatMul),
+        head_name: &str,
         device: &Device,
-    ) -> Result<Self> {
-        let li = cfg.num_layers;
-        let p = format!("blk.{li}");
+        store: &mut dyn FnMut(&str, &QMatMul) -> Result<()>,
+    ) -> Result<()> {
+        let p = format!("blk.{}", cfg.num_layers);
         let f32t = |g: &mut GgufModel, name: &str| -> Result<Tensor> {
             g.qtensor(name, device)?.dequantize(device)
         };
         // Read on the host so its rows can be cut, then each half uploaded.
         let eh_proj = g.qtensor(&format!("{p}.nextn.eh_proj.weight"), &Device::Cpu)?;
         let (fc_embedding, fc_hidden) = split_columns(&eh_proj, cfg.hidden_size, device)?;
+        store(
+            &trunk_names::eh_proj_embedding(&p),
+            &QMatMul::from_qtensor_in(fc_embedding, int8mode, WeightResidency::Pool)?,
+        )?;
+        store(
+            &trunk_names::eh_proj_hidden(&p),
+            &QMatMul::from_qtensor_in(fc_hidden, int8mode, WeightResidency::Pool)?,
+        )?;
+        let mixer = trunk_names::head_mixer(&p);
+        let ko = HcWeightsKo::from_weights(
+            &HcWeights::from_checkpoint(
+                f32t(g, &format!("{mixer}_norm.weight"))?,
+                f32t(g, &format!("{mixer}_down.weight"))?,
+                f32t(g, &format!("{mixer}_up.weight"))?,
+                cfg.hc.count,
+            )?,
+            int8mode,
+        )?;
+        let (down, up) = ko.stored_projections();
+        store(&trunk_names::hc_down(&mixer), down)?;
+        store(&trunk_names::hc_up(&mixer), up)?;
+        store(
+            trunk_names::DRAFT_LM_HEAD,
+            &QMatMul::from_qtensor_narrowed(
+                g.qtensor(head_name, device)?,
+                int8mode,
+                WeightResidency::Pool,
+                DRAFT_LM_HEAD_FORMAT,
+            )?,
+        )?;
+        Ok(())
+    }
+
+    /// Load the head's own tensors: the int8 weights [`Self::build`] stored,
+    /// through `stored`, which copies each to its destination; the norms as
+    /// the checkpoint has them.
+    ///
+    /// `eps` is the model's RMS epsilon: the head norms in the same arithmetic
+    /// the trunk does, because a drafted position and the wave position that
+    /// later replaces it must agree — or the K/V the draft attended over and the
+    /// K/V the verify wrote disagree on a token both accepted.
+    pub fn load(
+        g: &mut GgufModel,
+        cfg: &Qwen4ExpConfig,
+        eps: f64,
+        device: &Device,
+        stored: &dyn Fn(&GgufModel, &str) -> Result<QMatMul>,
+    ) -> Result<Self> {
+        let li = cfg.num_layers;
+        let p = format!("blk.{li}");
+        let f32t = |g: &mut GgufModel, name: &str| -> Result<Tensor> {
+            g.qtensor(name, device)?.dequantize(device)
+        };
         let input = MtpInput {
             enorm: RmsNorm::from_qtensor(
                 g.qtensor(&format!("{p}.nextn.enorm.weight"), device)?,
                 eps,
             )?,
             hnorm: f32t(g, &format!("{p}.nextn.hnorm.weight"))?,
-            // In the session's mode, as every other projection here is: an int8
-            // session runs them on the KO path, which quantizes each operand
-            // beside the rows it reads — on the phase that prices it — where the
-            // GGML path quantized into a pool scratch on every call.
-            fc_embedding: QMatMul::from_qtensor_with_mode(fc_embedding, int8mode)?
+            // On the KO path, as every other projection here is, which
+            // quantizes each operand beside the rows it reads — on the phase
+            // that prices it.
+            fc_embedding: stored(g, &trunk_names::eh_proj_embedding(&p))?
                 .with_sum_scale(ACT_SUM_SCALE),
-            fc_hidden: QMatMul::from_qtensor_with_mode(fc_hidden, int8mode)?
-                .with_sum_scale(ACT_SUM_SCALE),
+            fc_hidden: stored(g, &trunk_names::eh_proj_hidden(&p))?.with_sum_scale(ACT_SUM_SCALE),
         };
-        let mixer = HcWeightsKo::from_weights(
-            &HcWeights::from_checkpoint(
-                f32t(g, &format!("{p}.nextn.hc_head_norm.weight"))?,
-                f32t(g, &format!("{p}.nextn.hc_head_down.weight"))?,
-                f32t(g, &format!("{p}.nextn.hc_head_up.weight"))?,
-                cfg.hc.count,
-            )?,
-            int8mode,
+        let mixer = trunk_names::head_mixer(&p);
+        let mixer = HcWeightsKo::from_stored(
+            f32t(g, &format!("{mixer}_norm.weight"))?,
+            stored(g, &trunk_names::hc_down(&mixer))?,
+            stored(g, &trunk_names::hc_up(&mixer))?,
+            false,
         )?;
-        let (head_name, trunk_lm_head) = trunk_head;
-        let lm_head = if int8mode.is_int8() {
-            QMatMul::from_qtensor_narrowed(
-                g.qtensor(head_name, device)?,
-                int8mode,
-                WeightResidency::Span,
-                DRAFT_LM_HEAD_FORMAT,
-            )?
-            .with_sum_scale(ACT_SUM_SCALE)
-        } else {
-            trunk_lm_head.clone()
-        };
         Ok(Self {
             input,
             mixer,
-            lm_head,
+            lm_head: stored(g, trunk_names::DRAFT_LM_HEAD)?.with_sum_scale(ACT_SUM_SCALE),
             layer_index: li,
         })
     }

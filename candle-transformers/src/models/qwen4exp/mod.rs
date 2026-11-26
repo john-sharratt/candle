@@ -57,6 +57,9 @@ pub mod model;
 /// The NextN / MTP draft head — the block past the trunk, and the input
 /// assembly that feeds it.
 pub mod mtp;
+/// The pack's build: the dense trunk built as the engine runs it, stored.
+#[cfg(feature = "cuda")]
+pub(crate) mod pack_build;
 pub mod paged_index;
 #[cfg(feature = "cuda")]
 pub mod place;
@@ -92,6 +95,10 @@ pub mod spec;
 pub mod state_slots;
 /// How the model's int8 activations store their block sums.
 pub mod sum_scale;
+#[cfg(all(test, feature = "cuda"))]
+mod tests_pack_build;
+/// Where the pack stores each dense weight it builds.
+pub mod trunk_names;
 #[cfg(feature = "cuda")]
 pub mod wave;
 

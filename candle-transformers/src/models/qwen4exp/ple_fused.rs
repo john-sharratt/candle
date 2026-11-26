@@ -35,7 +35,7 @@ use super::device_operand::{with_operand, Operand};
 use super::model::PleSource;
 use super::ple::{ple_row_ids, PleSpan, PleWeights};
 use super::sum_scale::ACT_SUM_SCALE;
-use crate::models::quantized_matmul::QMatMul;
+use crate::models::quantized_matmul::{QMatMul, WeightResidency};
 use crate::models::wave_buffers::{wave_empty_ticketed, wave_from_vec_ticketed};
 
 /// The int8 matmul's K tile: the projection's input width must be a multiple.
@@ -86,10 +86,13 @@ impl PleFusedWeights {
         } else {
             GgmlDType::F32
         };
+        // On the pool: the stacked projection built here is one the pack build
+        // stores, or a test's, never a resident weight of a load.
         Ok(Self {
-            key_value: QMatMul::from_qtensor_with_mode(
+            key_value: QMatMul::from_qtensor_in(
                 QTensor::quantize(&key_value, dtype)?,
                 mode,
+                WeightResidency::Pool,
             )?
             .with_sum_scale(ACT_SUM_SCALE),
             mode,
@@ -97,6 +100,26 @@ impl PleFusedWeights {
             norm_query: w.norm_query.clone(),
             norm_conv: w.norm_conv.clone(),
             conv_t: w.conv.t()?.contiguous()?,
+        })
+    }
+
+    /// The block's weights from the stacked key|value projection
+    /// [`Self::from_weights`] built, read back as it was stored, and the
+    /// checkpoint's norms and conv weight — the conv transposed here, once.
+    pub fn from_stored(
+        key_value: QMatMul,
+        norm_key: Tensor,
+        norm_query: Tensor,
+        norm_conv: Tensor,
+        conv: &Tensor,
+    ) -> Result<Self> {
+        Ok(Self {
+            mode: key_value.int8mode(),
+            key_value: key_value.with_sum_scale(ACT_SUM_SCALE),
+            norm_key,
+            norm_query,
+            norm_conv,
+            conv_t: conv.t()?.contiguous()?,
         })
     }
 }

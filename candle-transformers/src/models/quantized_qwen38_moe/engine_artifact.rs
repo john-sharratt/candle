@@ -103,7 +103,7 @@ pub fn engine_artifact_dir() -> PathBuf {
 pub fn engine_request(experts: Option<GgmlDType>, mode: Option<Int8Mode>) -> PackRequest {
     let recipe = engine_recipe_at(experts);
     PackRequest::of(
-        PackFamily::Routed,
+        PackFamily::Qwen4Exp,
         (QWEN4EXP_REPO, &recipe.digest(), &recipe.artifact_name()),
         (TOKENIZER_REPO, TOKENIZER_REV),
         mode,

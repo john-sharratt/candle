@@ -5,19 +5,22 @@
 //! The weight split mirrors the oracle's (`docs/qwen38_flash_next.md` §12.8),
 //! moved onto the card:
 //!
-//! - **F32 at load, resident**: the PLE projections, the GDN/attention F32
-//!   constants, and each HC module's norm gain. The PLE injection runs as eager
-//!   F32 tensor ops, so its weights stay the width the oracle computes in — a
-//!   load-time decision, never an in-loop conversion (invariant 1).
-//! - **HC projections KO at load** (`HcWeightsKo`): each module's `down` and
-//!   `up`, zero-padded to the int8 tiling and run on the same matmul as every
-//!   other dense projection. Their F32 form exists only during load.
+//! - **F32, resident**: the PLE norms and conv, the GDN/attention F32
+//!   constants, and each HC module's norm gain — the width the oracle computes
+//!   in, a load-time decision, never an in-loop conversion (invariant 1).
+//! - **HC projections KO** (`HcWeightsKo`): each module's `down` and `up`,
+//!   zero-padded to the int8 tiling and run on the same matmul as every other
+//!   dense projection.
 //! - **The token embedding stays Q8_0, resident** ([`DeviceEmbedding`]): one
 //!   kernel gathers a wave's rows and writes them as F32 straight into the
 //!   wide residual.
-//! - **KO at load**: every dense projection — attention q/k/v/o, the GDN
-//!   projections, routers, shared experts, the LM head — through the same
-//!   `QMatMul` repack every production model uses (Q8_0 → Q8_KO here).
+//! - **KO**: every dense projection — attention q/k/v/o, the GDN projections,
+//!   routers, shared experts, the PLE key|value stack, the LM head (Q8_0 →
+//!   Q8_KO here).
+//!
+//! Every KO weight is stored in the pack as the engine runs it
+//! (`qwen4exp::pack_build`, named by `trunk_names`): the load copies each one
+//! from the host into the dense block, and builds nothing.
 //! - **Routed experts stay KO in the `ExpertCache`**: VRAM hot slots over
 //!   pinned warm and pad RAM over the pack's expert section, the same device-side expert
 //!   forward (`ExpertCache::forward_routed`) DeepSeek-V4 and Qwen3.6-35B run
@@ -30,21 +33,21 @@ use std::path::Path;
 use std::sync::Arc;
 
 use candle::quantized::gguf_file::Value;
-use candle::quantized::{GgmlDType, QTensor};
+use candle::quantized::GgmlDType;
 use candle::{Device, Result, Tensor};
 
 use super::config::Qwen4ExpConfig;
 use super::hyper::ko::HcWeightsKo;
-use super::hyper::HcWeights;
-use super::loader::{
-    lm_head_name, load_headroom_bytes, offloaded_bytes, open_cached_ple, TOKEN_EMBD,
-};
+use super::loader::{load_headroom_bytes, offloaded_bytes, open_cached_ple, OUTPUT, TOKEN_EMBD};
 use super::model::PleSource;
 use super::mtp::{MtpDense, MtpHead};
-use super::ple::PleWeights;
 use super::ple_fused::PleFusedWeights;
 use super::qsa::IndexerWeights;
 use super::sum_scale::ACT_SUM_SCALE;
+use super::trunk_names::{
+    attention_stack, block_kind, delta_net_stack, hc_down, hc_up, ple_key_value, shared_gate,
+    shared_gate_up,
+};
 use crate::models::delta_net::{KvLayerMap, QuantDeltaNetWeights};
 use crate::models::dense_span;
 use crate::models::device_embedding::DeviceEmbedding;
@@ -58,7 +61,7 @@ use crate::models::quantized_mlp::QuantizedMlp;
 use crate::models::quantized_qwen3_moe::SparseMoeBlock;
 use crate::models::qwen35::expert_loader::build_expert_cache_for;
 use crate::models::qwen35::quantized_moe::Qwen35MoeBlock;
-use crate::models::qwen35::quantized_weights::{QuantAttentionWeights, SHARED_GATE_TILE};
+use crate::models::qwen35::quantized_weights::QuantAttentionWeights;
 use crate::models::rotary_layout::RotaryLayout;
 use crate::quantized_nn::RmsNorm;
 
@@ -159,8 +162,7 @@ impl Qwen4ExpGpu {
         // carved into its dense block and the span is sized from the whole card
         // rather than from what a lazily-created span found free mid-load. The
         // guard holds the load window open until this loader returns.
-        let _load =
-            dense_span::open_for_load_sized(device, load_headroom_bytes(content, int8mode))?;
+        let _load = dense_span::open_for_load_sized(device, load_headroom_bytes(content))?;
 
         // A weight the model keeps as loaded, for its whole life: placed in the
         // dense block rather than left on the driver's ground
@@ -168,95 +170,47 @@ impl Qwen4ExpGpu {
         let f32t = |g: &mut GgufModel, name: &str| -> Result<Tensor> {
             dense_span::place_tensor_in_dense(device, g.qtensor(name, device)?.dequantize(device)?)
         };
-        // A weight the load rebuilds into another form — the transient a
-        // repack reads, freed with the load.
+        // A plain tensor the model keeps on the CUDA pool, where the reads
+        // that need it find it: the QSA indexer's weights, the PLE block's
+        // norms and conv, every hyper-connection module's gain.
         let f32_source = |g: &mut GgufModel, name: &str| -> Result<Tensor> {
             g.qtensor(name, device)?.dequantize(device)
         };
-        // A source read whole only to be repacked into a twin in the dense block
-        // is a transient of the load, served from its scratch at the span's top
-        // (`dense_span::transient`); one that stays as read is not.
-        let twins = |g: &GgufModel, names: &[&str]| -> bool {
-            names.iter().all(|n| {
-                g.info(n)
-                    .is_some_and(|info| dense_span::bands_from_host(info, int8mode))
-            })
-        };
-        // Every weight declares the model's activation sum convention, so every
-        // operand quantized for it — by `forward`, a fused producer, or the
-        // wave — stores `Σx` the one way (`sum_scale::ACT_SUM_SCALE`).
-        let qm = |g: &mut GgufModel, name: &str| -> Result<QMatMul> {
-            let read = |g: &mut GgufModel| {
-                QMatMul::from_qtensor_with_mode(g.qtensor(name, device)?, int8mode)
-                    .map(|m| m.with_sum_scale(ACT_SUM_SCALE))
-            };
-            if twins(g, &[name]) {
-                dense_span::transient(|| read(g))
-            } else {
-                read(g)
+        // Every int8 weight is stored as the KO twin the engine runs, in the
+        // form the pack build made it (`trunk_names`): copied from the host
+        // straight into the dense block, so nothing repacks and no source
+        // stands on the card. Every weight declares the model's activation sum
+        // convention, so every operand quantized for it — by `forward`, a fused
+        // producer, or the wave — stores `Σx` the one way
+        // (`sum_scale::ACT_SUM_SCALE`).
+        let stored = |g: &GgufModel, name: &str| -> Result<QMatMul> {
+            let (bytes, info) = g.host_bytes(name)?;
+            if !info.ggml_dtype.is_ko() {
+                candle::bail!(
+                    "qwen4exp engine: {name} is stored as {:?}, not a KO twin — a pack of \
+                     another family",
+                    info.ggml_dtype
+                );
             }
-        };
-        // Several projections that read one activation over one contraction,
-        // row-concatenated into a single weight so the block issues one GEMM
-        // launch instead of N. Exact: an output column depends only on its own
-        // weight row, so the stacked rows *are* the parts.
-        //
-        // **Before the repack, necessarily.** `concat_rows_cuda` is a byte
-        // append over the GGUF block layout, where a row is a contiguous run of
-        // blocks and no scale is shared across the join; after
-        // `from_qtensor_with_mode` the weight is a lane-major KO twin with its
-        // rows interleaved, and the append is refused by name. This engine has
-        // no per-tensor narrowing schedule — every projection takes the mode's
-        // twin — so unlike the qwen35 streaming loader it is free to stack.
-        // The parts and their concatenation are the repack's sources: transients
-        // when every part takes a twin, as the stacked weight then does.
-        let stack = |g: &mut GgufModel, names: &[String]| -> Result<QMatMul> {
-            let read = |g: &mut GgufModel| {
-                let parts = names
-                    .iter()
-                    .map(|n| g.qtensor(n, device))
-                    .collect::<Result<Vec<_>>>()?;
-                let refs: Vec<&QTensor> = parts.iter().collect();
-                QMatMul::from_qtensor_with_mode(QTensor::concat_rows_cuda(&refs)?, int8mode)
-                    .map(|m| m.with_sum_scale(ACT_SUM_SCALE))
-            };
-            let parts: Vec<&str> = names.iter().map(String::as_str).collect();
-            if twins(g, &parts) {
-                dense_span::transient(|| read(g))
-            } else {
-                read(g)
-            }
-        };
-        // The inject rows are stacked under the down projection at load, which
-        // is what makes the read gate and the write weights one GEMM instead of
-        // two over the same operand — see `HcWeights::down` for why that is
-        // exact and what it measures. The `cat` is a load-time cost paid once
-        // per module, not the hot-path copy invariant 2 is about.
-        //
-        // Held KO-quantized (`HcWeightsKo`): the F32 checkpoint form is 26 MB a
-        // module and 2.6 GB across the stack, resident beside a card that
-        // streams its experts. The F32 module is a load-time intermediate.
-        let hc = |g: &mut GgufModel, prefix: &str, with_inject: bool| -> Result<HcWeightsKo> {
-            let down = g
-                .qtensor(&format!("{prefix}_down.weight"), device)?
-                .dequantize(device)?;
-            let down = if with_inject {
-                let inject = g
-                    .qtensor(&format!("{prefix}_inject.weight"), device)?
-                    .dequantize(device)?;
-                Tensor::cat(&[&down, &inject], 0)?.contiguous()?
-            } else {
-                down
-            };
-            let f32_module = HcWeights::from_checkpoint(
-                g.qtensor(&format!("{prefix}_norm.weight"), device)?
-                    .dequantize(device)?,
-                down,
-                g.qtensor(&format!("{prefix}_up.weight"), device)?
-                    .dequantize(device)?,
-                cfg.hc.count,
+            let qt = dense_span::place_host_in_dense(
+                device,
+                &bytes,
+                info.shape.dims(),
+                info.ggml_dtype,
             )?;
-            HcWeightsKo::from_weights(&f32_module, int8mode)
+            Ok(QMatMul::from_qtensor_view(qt, int8mode)?.with_sum_scale(ACT_SUM_SCALE))
+        };
+        // A hyper-connection module: its two projections as the pack built
+        // them — the inject rows stacked under the gate's, the gate's `1/hc`
+        // folded in, both padded to the int8 tiling (`HcWeightsKo`) — and its
+        // norm gain as the checkpoint has it.
+        let hc = |g: &mut GgufModel, prefix: &str, injects: bool| -> Result<HcWeightsKo> {
+            HcWeightsKo::from_stored(
+                f32_source(g, &format!("{prefix}_norm.weight"))?,
+                stored(g, &hc_down(prefix))?,
+                stored(g, &hc_up(prefix))?,
+                injects,
+            )
         };
 
         // Left in the checkpoint's format. Dequantizing it here put a 2.5 GiB
@@ -276,36 +230,17 @@ impl Qwen4ExpGpu {
                 info.ggml_dtype,
             )?)?
         };
-        // Tied embeddings, as the oracle loader handles them: a checkpoint
-        // without `output.weight` projects through the embedding table. Reading
-        // it unconditionally made the engine refuse artifacts the oracle
-        // accepts, which is exactly the pair the oracle-vs-engine diff needs to
-        // be able to run on the same checkpoint.
-        let lm_head_name = lm_head_name(content);
-        // Repacked from the host a band at a time when the KO matmul takes it,
-        // which the headroom counts on; otherwise read the ordinary way, and
-        // counted there.
-        let banded = match gguf
-            .info(lm_head_name)
-            .filter(|info| dense_span::bands_from_host(info, int8mode))
-        {
-            Some(_) => {
-                let (bytes, info) = gguf.host_bytes(lm_head_name)?;
-                dense_span::twin_from_host(device, &bytes, &info, int8mode)?
-            }
-            None => None,
-        };
-        let lm_head = match banded {
-            Some(head) => head.with_sum_scale(ACT_SUM_SCALE),
-            None => qm(&mut gguf, lm_head_name)?,
-        };
+        // The pack stores the head's twin as `output.weight` whether the
+        // checkpoint carries one or projects through its embedding table, as
+        // the oracle reads a checkpoint with tied embeddings.
+        let lm_head = stored(&gguf, OUTPUT)?;
         let out_hc = hc(&mut gguf, "output_hc", false)?;
 
         use crate::models::delta_net::LayerKind;
         let mut trunk: Vec<(HcWeightsKo, HcWeightsKo, GpuLayerMix)> =
             Vec::with_capacity(cfg.num_layers);
         let mut pending: Vec<(QMatMul, QuantizedMlp, QMatMul)> = Vec::with_capacity(cfg.num_layers);
-        let mut ple_w: Option<PleWeights> = None;
+        let mut ple_w: Option<PleFusedWeights> = None;
         // **The draft head is a block of the model, so it loads as one.** It
         // sits at `blk.{num_layers}` under the same tensor names every trunk
         // block uses (`qwen35::mtp`: "it is a layer of the model, not a
@@ -339,11 +274,7 @@ impl Qwen4ExpGpu {
             // which raises nothing and keeps proposals fluent — visible only as
             // an accept rate that never justifies the head.
             let is_head = li >= cfg.num_layers;
-            let kind = if is_head {
-                LayerKind::Attention
-            } else {
-                cfg.layer_kinds[li]
-            };
+            let kind = block_kind(&cfg, li);
             let ratio = if is_head {
                 cfg.head_compress_ratio.unwrap_or_else(|| {
                     cfg.layer_kinds
@@ -358,17 +289,14 @@ impl Qwen4ExpGpu {
                 cfg.compress_ratios[li]
             };
             let mix = match kind {
+                // The input projections read one activation over one
+                // contraction, so the pack stores them row-concatenated into a
+                // single weight and the block issues one GEMM launch instead of
+                // N. Exact: an output column depends only on its own weight
+                // row, so the stacked rows *are* the parts.
                 LayerKind::DeltaNet => GpuLayerMix::DeltaNet(QuantDeltaNetWeights {
-                    proj: vec![stack(
-                        g,
-                        &[
-                            format!("{p}.attn_qkv.weight"),
-                            format!("{p}.attn_gate.weight"),
-                            format!("{p}.ssm_beta.weight"),
-                            format!("{p}.ssm_alpha.weight"),
-                        ],
-                    )?],
-                    w_out: qm(g, &format!("{p}.ssm_out.weight"))?,
+                    proj: vec![stored(g, &delta_net_stack(&p))?],
+                    w_out: stored(g, &format!("{p}.ssm_out.weight"))?,
                     dt_bias: f32t(g, &format!("{p}.ssm_dt.bias"))?,
                     a: f32t(g, &format!("{p}.ssm_a"))?,
                     conv: f32t(g, &format!("{p}.ssm_conv1d.weight"))?,
@@ -376,18 +304,11 @@ impl Qwen4ExpGpu {
                 }),
                 LayerKind::Attention => GpuLayerMix::Attention {
                     w: QuantAttentionWeights {
-                        wqkv: vec![stack(
-                            g,
-                            &[
-                                format!("{p}.attn_q.weight"),
-                                format!("{p}.attn_k.weight"),
-                                format!("{p}.attn_v.weight"),
-                            ],
-                        )?],
+                        wqkv: vec![stored(g, &attention_stack(&p))?],
                         // `q` interleaves `[q|gate]` per head, hence the 2.
                         q_rows: 2 * cfg.attn_head_dim * cfg.num_attention_heads,
                         kv_rows: cfg.attn_head_dim * cfg.num_kv_heads,
-                        wo: qm(g, &format!("{p}.attn_output.weight"))?,
+                        wo: stored(g, &format!("{p}.attn_output.weight"))?,
                         q_norm: RmsNorm::from_qtensor(
                             g.qtensor(&format!("{p}.attn_q_norm.weight"), device)?,
                             eps,
@@ -417,57 +338,52 @@ impl Qwen4ExpGpu {
             };
 
             if li == cfg.ple.layer {
-                // Rebuilt into the fused form below (`PleFusedWeights`).
-                ple_w = Some(PleWeights {
-                    key: f32_source(g, &format!("{p}.ple_key.weight"))?,
-                    value: f32_source(g, &format!("{p}.ple_value.weight"))?,
-                    norm_key: f32_source(g, &format!("{p}.ple_norm_key.weight"))?,
-                    norm_query: f32_source(g, &format!("{p}.ple_norm_query.weight"))?,
-                    norm_conv: f32_source(g, &format!("{p}.ple_norm_conv.weight"))?,
-                    conv: f32_source(g, &format!("{p}.ple_conv1d.weight"))?,
-                });
+                ple_w = Some(PleFusedWeights::from_stored(
+                    stored(g, &ple_key_value(&p))?,
+                    f32_source(g, &format!("{p}.ple_norm_key.weight"))?,
+                    f32_source(g, &format!("{p}.ple_norm_query.weight"))?,
+                    f32_source(g, &format!("{p}.ple_norm_conv.weight"))?,
+                    &f32_source(g, &format!("{p}.ple_conv1d.weight"))?,
+                )?);
             }
 
-            // The shared-expert gate is one row; stored padded to a KO tile and
-            // read back at output 0, exactly as the qwen35 loader stores it.
-            let gate_row = f32_source(g, &format!("{p}.ffn_gate_inp_shexp.weight"))?
-                .reshape((1, cfg.hidden_size))?;
-            let pad = Tensor::zeros(
-                (SHARED_GATE_TILE - 1, cfg.hidden_size),
-                gate_row.dtype(),
-                device,
-            )?;
-            let gate_vec = Tensor::cat(&[&gate_row, &pad], 0)?;
+            // The shared expert: gate and up fused into one weight when the
+            // pack built them so, the pair apart otherwise.
+            let shexp = |s: &str| format!("{p}.ffn_{s}_shexp.weight");
+            let fused = shared_gate_up(&p);
+            let shared = if g.info(&fused).is_some() {
+                QuantizedMlp::from_repacked(
+                    Some(stored(g, &fused)?),
+                    None,
+                    None,
+                    stored(g, &shexp("down"))?,
+                )?
+            } else {
+                QuantizedMlp::from_repacked(
+                    None,
+                    Some(stored(g, &shexp("gate"))?),
+                    Some(stored(g, &shexp("up"))?),
+                    stored(g, &shexp("down"))?,
+                )?
+            };
             // The routed half waits for the cache (built AFTER the dense loop,
             // from the span measurement) — the same pending-then-graft order
-            // the qwen35 loader runs.
+            // the qwen35 loader runs. The shared-expert gate is one row, stored
+            // padded to a KO tile and read back at output 0.
             pending.push((
-                qm(g, &format!("{p}.ffn_gate_inp.weight"))?,
-                QuantizedMlp::from_weights(
-                    g.qtensor(&format!("{p}.ffn_gate_shexp.weight"), device)?,
-                    g.qtensor(&format!("{p}.ffn_up_shexp.weight"), device)?,
-                    g.qtensor(&format!("{p}.ffn_down_shexp.weight"), device)?,
-                    int8mode,
-                )?
-                .with_sum_scale(ACT_SUM_SCALE),
-                QMatMul::from_qtensor_with_mode(
-                    QTensor::quantize(&gate_vec, GgmlDType::F32)?,
-                    int8mode,
-                )?
-                .with_sum_scale(ACT_SUM_SCALE),
+                stored(g, &format!("{p}.ffn_gate_inp.weight"))?,
+                shared.with_sum_scale(ACT_SUM_SCALE),
+                stored(g, &shared_gate(&p))?,
             ));
 
             trunk.push((hc_attn, hc_ffn, mix));
         }
-        let ple_w = PleFusedWeights::from_weights(
-            &ple_w.ok_or_else(|| {
-                candle::Error::Msg(format!(
-                    "qwen4exp engine: PLE layer {} produced no weights",
-                    cfg.ple.layer
-                ))
-            })?,
-            int8mode,
-        )?;
+        let ple_w = ple_w.ok_or_else(|| {
+            candle::Error::Msg(format!(
+                "qwen4exp engine: PLE layer {} produced no weights",
+                cfg.ple.layer
+            ))
+        })?;
 
         let rotary = RotaryLayout::new(cfg.attn_head_dim, cfg.rope_dim, device)?;
         // The TRUNK's layers only. The draft head holds its keys in this same
@@ -482,14 +398,7 @@ impl Qwen4ExpGpu {
         // ahead of the expert-zone measurement below — see [`MtpDense`].
         let mtp_dense = match cfg.num_mtp_layers {
             0 => None,
-            1 => Some(MtpDense::load(
-                &mut gguf,
-                &cfg,
-                eps,
-                int8mode,
-                (lm_head_name, &lm_head),
-                device,
-            )?),
+            1 => Some(MtpDense::load(&mut gguf, &cfg, eps, device, &stored)?),
             n => candle::bail!(
                 "qwen4exp engine: {n} draft-head blocks declared — this engine reads the \
                  one-block NextN form (`mtp_num_hidden_layers: 1`), which is what the \
