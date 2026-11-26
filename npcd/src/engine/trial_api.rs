@@ -15,8 +15,9 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 
 use crate::api::{err, Authored};
+use crate::engine::no_engine;
+use crate::engine::pulse::owned_or_admin;
 use crate::engine::trial::{TrialBody, TrialRefused};
-use crate::engine::{no_engine, owned};
 use crate::suspend;
 
 /// `POST /v1/npc/:nid/trial` — decode one trial turn on a suspended character.
@@ -27,7 +28,9 @@ pub async fn trial(
     body: Result<Json<TrialBody>, JsonRejection>,
 ) -> Response {
     let received = Instant::now();
-    let npc_id = match owned(&s, &headers, &nid).await {
+    // The owner's, or any living character for an admin (`docs/npc_trials.md`
+    // §1): an admin measures the cast, whoever owns it.
+    let npc_id = match owned_or_admin(&s, &headers, &nid).await {
         Ok(id) => id,
         Err(r) => return *r,
     };

@@ -75,7 +75,7 @@ pub struct AllQuery {
 ///
 /// An id that is not a character is 404 either way, so an admin asking about
 /// nothing is told so rather than getting a 503 from an empty scheduler slot.
-pub(super) async fn owned_or_admin(
+pub(crate) async fn owned_or_admin(
     s: &Arc<Authored>,
     headers: &HeaderMap,
     nid: &str,
