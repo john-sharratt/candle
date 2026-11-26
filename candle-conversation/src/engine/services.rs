@@ -209,7 +209,11 @@ impl ConversationEngine {
         tokens: &[u32],
         max_decode_tokens: usize,
     ) -> crate::Result<String> {
-        let (collected, text_from_done) = self.infer_raw(tokens, max_decode_tokens)?;
+        let RawDecode {
+            tokens: collected,
+            text: text_from_done,
+            ..
+        } = self.infer_raw(tokens, max_decode_tokens)?;
         if let Some(t) = text_from_done {
             return Ok(t);
         }
@@ -227,8 +231,8 @@ impl ConversationEngine {
         &self,
         tokens: &[u32],
         max_decode_tokens: usize,
-    ) -> crate::Result<Vec<u32>> {
-        Ok(self.infer_raw(tokens, max_decode_tokens)?.0)
+    ) -> crate::Result<RawDecode> {
+        self.infer_raw(tokens, max_decode_tokens)
     }
 
     /// [`Self::infer_raw_token_ids`] with the recurrent state swapped: `prompt`
@@ -244,7 +248,7 @@ impl ConversationEngine {
         recurrent_over: Vec<u32>,
         tail: &[u32],
         max_decode_tokens: usize,
-    ) -> crate::Result<Vec<u32>> {
+    ) -> crate::Result<RawDecode> {
         let sequence_id = self.new_raw_sequence()?;
         let out = (|| {
             self.raw_turn(sequence_id, prompt, 0)?;
@@ -260,7 +264,7 @@ impl ConversationEngine {
                     .map_err(|_| ConversationError::SchedulerGone)?;
                 rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
             }
-            Ok(self.raw_turn(sequence_id, tail, max_decode_tokens)?.0)
+            self.raw_turn(sequence_id, tail, max_decode_tokens)
         })();
         let _ = self
             .core
@@ -271,11 +275,7 @@ impl ConversationEngine {
 
     /// The decode of [`Self::infer_raw_tokens`]: the ids it produced, and the
     /// text the turn finished with when it finished.
-    fn infer_raw(
-        &self,
-        tokens: &[u32],
-        max_decode_tokens: usize,
-    ) -> crate::Result<(Vec<u32>, Option<String>)> {
+    fn infer_raw(&self, tokens: &[u32], max_decode_tokens: usize) -> crate::Result<RawDecode> {
         let sequence_id = self.new_raw_sequence()?;
         let out = self.raw_turn(sequence_id, tokens, max_decode_tokens);
         // Always release the sequence slot — RULER spawns one sequence per
@@ -317,7 +317,7 @@ impl ConversationEngine {
         sequence_id: SequenceId,
         tokens: &[u32],
         max_decode_tokens: usize,
-    ) -> crate::Result<(Vec<u32>, Option<String>)> {
+    ) -> crate::Result<RawDecode> {
         let (event_tx, event_rx) = flume::unbounded();
         self.core
             .scheduler_tx
@@ -355,12 +355,14 @@ impl ConversationEngine {
         // Drain events until Done / Error.
         let mut collected: Vec<u32> = Vec::with_capacity(max_decode_tokens);
         let mut text_from_done: Option<String> = None;
+        let mut finish = None;
         let mut last_error: Option<ConversationError> = None;
         while let Ok(ev) = event_rx.recv() {
             match ev {
                 TurnEvent::Token(t) => collected.push(t),
                 TurnEvent::Done(resp) => {
                     text_from_done = Some(resp.text);
+                    finish = Some(resp.stats.finish);
                     break;
                 }
                 TurnEvent::Error(e) => {
@@ -373,7 +375,11 @@ impl ConversationEngine {
         if let Some(e) = last_error {
             return Err(e);
         }
-        Ok((collected, text_from_done))
+        Ok(RawDecode {
+            tokens: collected,
+            text: text_from_done,
+            finish,
+        })
     }
 
     /// Get a `TokenDecoder` for decoding token IDs into text.

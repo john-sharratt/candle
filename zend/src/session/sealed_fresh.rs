@@ -114,6 +114,12 @@ pub struct SealedFresh {
     pub agreed: String,
     pub sealed_text: String,
     pub fresh_text: String,
+    /// Tokens each side decoded, and why each stopped: `Stop` for the
+    /// model's own end, `Length` for the budget.
+    pub sealed_decoded: usize,
+    pub fresh_decoded: usize,
+    pub sealed_finish: String,
+    pub fresh_finish: String,
 }
 
 /// The first index where `a` and `b` differ, within the shorter; `None` when
@@ -237,6 +243,8 @@ impl ZendSession {
                 ),
             }
             .map_err(|e| anyhow::anyhow!("the fresh decode: {e}"))?;
+            let fresh_finish = fresh.finish.map_or("none".into(), |f| format!("{f:?}"));
+            let fresh = fresh.tokens;
             let decode = |ids: &[u32]| engine.tokenizer().decode(ids, false).unwrap_or_default();
             let at = first_divergence(&sealed, &fresh);
             let agreed = &sealed[..at.unwrap_or(sealed.len().min(fresh.len()))];
@@ -252,6 +260,10 @@ impl ZendSession {
                 agreed: decode(agreed),
                 sealed_text: decode(&sealed),
                 fresh_text: decode(&fresh),
+                sealed_decoded: sealed.len(),
+                fresh_decoded: fresh.len(),
+                sealed_finish: format!("{:?}", resp.stats.finish),
+                fresh_finish,
             })
         })();
         let _ = engine.tombstone_timeline(timeline);

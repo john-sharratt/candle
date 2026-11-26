@@ -150,7 +150,8 @@ pub use conversation::{
     Sharing, UnsealedAsker, Want,
 };
 pub use engine::{
-    ConversationEngine, EngineAttacher, SubstrateReloadStatus, SubstrateReloader, ThinkSteering,
+    ConversationEngine, EngineAttacher, RawDecode, SubstrateReloadStatus, SubstrateReloader,
+    ThinkSteering,
 };
 pub use engine_slot::{Capabilities, EngineSlot, EngineSource, EngineTicket};
 pub use error::{is_stall_message, ConversationError};

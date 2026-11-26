@@ -674,6 +674,7 @@ mod compile;
 mod creation;
 mod ingest;
 mod metadata;
+mod raw_decode;
 mod retrieval;
 mod services;
 #[cfg(test)]
@@ -682,4 +683,5 @@ mod tiering;
 mod timelines;
 
 pub use compile::*;
+pub use raw_decode::RawDecode;
 pub use services::*;
