@@ -21,7 +21,6 @@ use super::plan::{plan_holding, Below, Done, Held, LiveFiles, Plan, Queued};
 use super::run::{committed, ingest_units, EdgeFiles, UnitJob};
 use super::spec::{LayerSpec, UnitKind};
 use crate::branch_ingest::reader::settles_here;
-use crate::calibrate::CalibrateSpec;
 use crate::ingest_report::IngestReport;
 use crate::refresh_ctx::RefreshContext;
 
@@ -57,9 +56,6 @@ impl Ground {
 pub struct LayerRun<'a> {
     pub spec: &'a LayerSpec,
     pub base: &'a Sequence,
-    /// How the layer's units are calibrated as they commit, for a layer that
-    /// declares a `calibrate:` block.
-    pub calibrate: Option<&'a CalibrateSpec>,
     /// Each lower layer of units whose group is scoped by branch, by layer
     /// name: what a unit of this layer may retrieve from it is what stands
     /// there on a branch the unit's own file is on.
@@ -285,7 +281,7 @@ fn read_queued(
         live: &ground.live,
         known: &known,
     };
-    let report = ingest_units(ctx, spec, &jobs, run.base, Some(&files), run.calibrate)?;
+    let report = ingest_units(ctx, spec, &jobs, run.base, Some(&files))?;
     // What this layer read stands now too, for the layer above.
     let after = settle(ctx.engine, spec, below, ground);
     ground

@@ -5,7 +5,7 @@ use super::*;
 use crate::files::names::{
     chunk_name, heading_name, CLOSING_JOIN_NAME, CLOSING_LAST_NAME, GAP_NAME,
 };
-use crate::files::{ChunkRecord, FileKey, FileUnit, LineSpan, MemberRef};
+use crate::files::{ChunkRecord, FileKey, FileUnit, FilesPin, LineSpan, MemberRef};
 use crate::persistence::content_hash::ContentHash;
 use crate::persistence::streams::ContentAddress;
 use crate::projection::project::{files_splice, ProjectionSegment, SealedKind};
@@ -169,6 +169,54 @@ fn files_are_spliced_strongest_first_each_framed_and_the_last_ends_the_knowledge
     // With the seed after it, the last file joins rather than ends.
     let seeded = files_splice(b.schema(), &mock, |_| 10_000, true);
     assert_eq!(ids(&seeded.segments).last(), Some(&m[CLOSING_JOIN_NAME]));
+}
+
+/// **A pinned knowledge base holds its one file whole, or nothing**: pinned
+/// to a, a's every chunk is placed under a cap that holds none of it, b is
+/// left out though stronger, and a ends the knowledge base; pinned empty,
+/// nothing is placed.
+#[test]
+fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
+    let b = Builder::from_yaml(YAML).unwrap();
+    let fa = record("candle/a.rs", &[(1, 200), (201, 260)]);
+    let fb = record("candle/b.rs", &[(1, 10)]);
+    let records = [fa.clone(), fb.clone()];
+    let (mut mock, m) = resolver(
+        &b,
+        &records,
+        &[(fa.key(), 100.0), (fb.key(), 900.0)],
+        vec![],
+    );
+    mock.files.as_mut().unwrap().pin = FilesPin::Only(fa.key());
+    let splice = files_splice(b.schema(), &mock, |_| 0, false);
+    assert_eq!(splice.order, vec![fa.key()]);
+    assert_eq!(
+        ids(&splice.segments),
+        vec![
+            m[&heading_name("candle/a.rs", "b")],
+            m[&chunk_name(
+                "candle/a.rs",
+                "b",
+                LineSpan {
+                    first: 1,
+                    last: 200
+                }
+            )],
+            m[&chunk_name(
+                "candle/a.rs",
+                "b",
+                LineSpan {
+                    first: 201,
+                    last: 260
+                }
+            )],
+            m[CLOSING_LAST_NAME],
+        ]
+    );
+    mock.files.as_mut().unwrap().pin = FilesPin::Empty;
+    let empty = files_splice(b.schema(), &mock, |_| 10_000, false);
+    assert!(empty.order.is_empty());
+    assert!(empty.segments.is_empty());
 }
 
 /// **A kept file keeps its place**: a placed before b, b now stronger — a

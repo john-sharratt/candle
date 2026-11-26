@@ -1,5 +1,5 @@
-//! The bounded worker pool that reads each queued file into its own hidden
-//! conversation, and the upload path that reads a set of uploaded files.
+//! The bounded worker pool that seals each queued file into the knowledge
+//! base, and the upload path that seals a set of uploaded files.
 //!
 //! Each worker takes the next file from a shared cursor, and each member walks
 //! the queue in an order of its own, so two members planning the same tree meet
@@ -50,15 +50,14 @@ pub(super) fn parallelism() -> usize {
 /// Files whose extension isn't a recognised code language, and files over
 /// [`MAX_FILE_BYTES`], are skipped. Returns whether any file was read, and
 /// how many files' ingest tolerated-failed (e.g. out of KV VRAM), so the
-/// upload can surface a real failure. Each file is calibrated as it commits
-/// when the layer declares a `calibrate:` block (`calibrate`).
+/// upload can surface a real failure. The calibration sweep calibrates them
+/// after, as it does every file (`Session::calibrate_layers`).
 pub fn ingest_files(
     ctx: &RefreshContext<'_>,
     rel_paths: &[String],
     progress: &Arc<LoadProgress>,
     layer_name: &str,
     base: &Sequence,
-    calibrate: Option<&CalibrateSpec>,
 ) -> anyhow::Result<(bool, usize)> {
     let uploads = ctx.tool_ctx.files.repo(UPLOADS_REPO)?;
     let mut jobs = Vec::new();
@@ -99,15 +98,7 @@ pub fn ingest_files(
     ctx.engine.mark_layer_append_only(layer);
 
     let live: HashSet<String> = jobs.iter().map(FileJob::key).collect();
-    let n_failed = ingest_jobs(
-        ctx,
-        &jobs,
-        &live,
-        progress,
-        base,
-        &Mutex::default(),
-        calibrate,
-    )?;
+    let n_failed = ingest_jobs(ctx, &jobs, &live, progress, base, &Mutex::default())?;
     Ok((true, n_failed))
 }
 
@@ -122,9 +113,7 @@ pub fn ingest_files(
 /// `live` is every file key the caller holds current: when a file commits,
 /// each other conversation of its path whose key is not in it is tombstoned.
 /// `binary` remembers the keys found to be binary, so a later pass does not
-/// read them again. With `calibrate`, each worker calibrates its file as soon
-/// as it commits, while the reading is still resident
-/// ([`calibrate_committed`]).
+/// read them again.
 ///
 /// The branch pass and the upload path ([`ingest_files`]) both funnel
 /// through here, so both drive the same `crate::ingest_backlog` counter and
@@ -136,21 +125,18 @@ pub fn ingest_jobs(
     progress: &Arc<LoadProgress>,
     base: &Sequence,
     binary: &Mutex<HashSet<String>>,
-    calibrate: Option<&CalibrateSpec>,
 ) -> anyhow::Result<usize> {
     let n_workers = parallelism();
     let total = jobs.len();
     let keys: Vec<String> = jobs.iter().map(FileJob::key).collect();
-    // One snapshot of the committed keys: a file committed since the caller
-    // planned is not read twice. Finished chains only (see `committed`), so a
-    // file queued for rebuild is not skipped here as present.
-    let present_keys = finished_content_keys(ctx.engine);
+    // One snapshot of the keys sealed here: a file sealed since the caller
+    // planned is not sealed twice.
+    let present_keys = sealed_keys(ctx.engine);
     tracing::info!(
         n_workers = n_workers,
         n_files = total,
         "code_read: per-file ingest across {n_workers} file workers; each file is \
-         a real hidden conversation that reads the file via file_read and answers \
-         with its own summary",
+         cut and prefilled as the knowledge base's members",
     );
 
     // The GUI's merged background-ingest bar counts only files that will
@@ -213,9 +199,7 @@ pub fn ingest_jobs(
                         left: &left,
                         resubmit: may_resubmit.then_some(&resubmit),
                     };
-                    if let Err(e) =
-                        process_one_file(ctx, base, &job, &present_keys, &failures, calibrate)
-                    {
+                    if let Err(e) = process_one_file(ctx, base, &job, &present_keys, &failures) {
                         // An error escaping `process_one_file` is an unexpected
                         // one (its own failure mode records and returns Ok).
                         // Record it so it reaches the report instead of

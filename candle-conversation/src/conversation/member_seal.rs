@@ -60,6 +60,17 @@ fn in_birth_prefix(before: Vec<SectionId>, birth: &[SectionId]) -> Vec<SectionId
 }
 
 impl Sequence {
+    /// The token ids `text` encodes to, as a member's seal encodes it: what a
+    /// chunk cut checks its seams against (`files::cut_lines`).
+    pub fn member_token_ids(&self, text: &str) -> crate::Result<Vec<u32>> {
+        Ok(self
+            .tokenizer
+            .encode(text, false)
+            .map_err(|e| ConversationError::Tokenizer(e.to_string()))?
+            .get_ids()
+            .to_vec())
+    }
+
     /// The sections a member of `collection` is sealed behind: the birth
     /// prefix's sections before the collection, in order.
     pub fn members_prefix(&self, collection: &str) -> crate::Result<Vec<SectionId>> {
@@ -132,8 +143,12 @@ impl Sequence {
             .substrate
             .allocate_owned_section()
             .ok_or_else(|| ConversationError::Other("owned section ids are exhausted".into()))?;
-        self.substrate
-            .register_owned_section(files_owner(), &spec.name, section);
+        // Named only once it holds its K/V: a member whose seal fails leaves
+        // no name resolving to an empty section.
+        let register = || {
+            self.substrate
+                .register_owned_section(files_owner(), &spec.name, section)
+        };
         let member = SealedMember {
             section,
             stream,
@@ -156,6 +171,7 @@ impl Sequence {
             match rx.recv().map_err(|_| ConversationError::SchedulerGone)? {
                 Ok(_) => {
                     self.substrate.record_section_loads(1, 0);
+                    register();
                     return Ok((
                         SealedMember {
                             restored: true,
@@ -201,6 +217,7 @@ impl Sequence {
             .scheduler_tx
             .send(SchedulerRequest::FreeSequence { sequence_id: slot });
         let seal = sealed?;
+        register();
         Ok((member, seal.end_state.as_ref().map(SharedState::from)))
     }
 }

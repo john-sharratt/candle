@@ -154,42 +154,6 @@ pub(crate) fn test_tree(files: &[(&str, &str)]) -> Tree {
     Tree::from_listing(Oid::parse(empty).unwrap(), listing)
 }
 
-/// The folder units of one repository holding `files` — workspace-relative,
-/// the repository their first segment — the layer reading every one of
-/// them, and no manifest giving a hint: what a test that needs units without
-/// a repository builds.
-#[cfg(test)]
-pub(crate) fn test_units(files: &[(&str, Language)]) -> Vec<FolderUnit> {
-    test_units_reading(files, |_| None)
-}
-
-/// As [`test_units`], a manifest's bytes read by its workspace-relative path
-/// through `bytes`.
-#[cfg(test)]
-pub(crate) fn test_units_reading(
-    files: &[(&str, Language)],
-    bytes: impl Fn(&str) -> Option<Vec<u8>>,
-) -> Vec<FolderUnit> {
-    const BLOB: &str = "ce013625030ba8dba906f756967f9e9ca394464a";
-    let repo = files[0].0.split('/').next().unwrap();
-    let inner: Vec<(&str, &str)> = files
-        .iter()
-        .map(|(path, _)| (&path[repo.len() + 1..], BLOB))
-        .collect();
-    let read: Vec<TreeFile> = files
-        .iter()
-        .map(|(path, language)| TreeFile {
-            path: path.to_string(),
-            blob: Oid::parse(BLOB).unwrap(),
-            size: BLOB.len() as u64,
-            language: *language,
-        })
-        .collect();
-    folder_units(repo, &test_tree(&inner), &read, &mut |f: &TreeFile| {
-        super::manifest::hint(basename(&f.path), &bytes(&f.path)?)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

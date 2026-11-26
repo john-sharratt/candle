@@ -1,16 +1,19 @@
-//! Sealing a calibration: its cases prefilled in one turn group of a
-//! conversation of the hidden calibration layer, then archived and distilled
-//! provenance-only, so its K/V is dropped and its signatures stay.
+//! Sealing a calibration: its cases prefilled in one turn group, then
+//! archived and distilled provenance-only, so its K/V is dropped and its
+//! signatures stay.
 //!
-//! A drafted calibration ([`super::run`]) and a use-exemplar
-//! (`crate::guidance`) are sealed the same way; only their cases and their
-//! naming metadata differ.
+//! A file's calibration ([`super::run`]) is prefilled behind the knowledge
+//! base its questions were asked in — a fork of the files layer's base, the
+//! knowledge base pinned to that frame ([`seal_framed`]). A use-exemplar
+//! (`crate::guidance`) is prefilled in a conversation of the hidden
+//! calibration layer under the plain system prompt ([`seal_calibration`]).
 
 use std::collections::BTreeMap;
 
+use candle_conversation::files::FilesPin;
 use candle_conversation::persistence::record::DistillMode;
 use candle_conversation::projection::{DecodePriority, Reserved, SelectionState, TimelineId};
-use candle_conversation::{ConversationEngine, SequenceConfig};
+use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
 
 use super::run::{Frame, TAG};
 
@@ -45,10 +48,46 @@ pub(crate) fn seal_calibration(
             calibration_config(frame.config),
         )
         .map_err(|e| anyhow::anyhow!("calibration conversation: {e}"))?;
-    let timeline = conv.timeline_id();
     // Its K/V is dropped at the distill; written cold, it would be bytes the
     // next compaction deletes.
+    engine
+        .conversation()
+        .mark_timeline_transient(conv.timeline_id());
+    seal_on(engine, &mut conv, meta, cases, SelectionState::new())
+}
+
+/// Prefill `cases` as a calibration named by `meta`, behind the knowledge
+/// base `pin` holds: a fork of `base` — the files layer's — prefilled under
+/// `selection`, then archived and distilled. Returns its timeline. A
+/// calibration that fails to seal is tombstoned.
+pub(crate) fn seal_framed(
+    engine: &ConversationEngine,
+    base: &Sequence,
+    meta: &BTreeMap<String, String>,
+    cases: &[(String, String)],
+    pin: FilesPin,
+    selection: SelectionState,
+) -> anyhow::Result<TimelineId> {
+    let mut conv = base
+        .fork_at(DecodePriority::Low)
+        .map_err(|e| anyhow::anyhow!("calibration conversation: {e}"))?;
+    let timeline = conv.timeline_id();
     engine.conversation().mark_timeline_transient(timeline);
+    engine.set_timeline_summarize(timeline, false);
+    engine.files_pin(timeline, pin);
+    seal_on(engine, &mut conv, meta, cases, selection)
+}
+
+/// Name `conv` by `meta`, prefill `cases` in one turn group under
+/// `selection`, archive and distill it.
+fn seal_on(
+    engine: &ConversationEngine,
+    conv: &mut Sequence,
+    meta: &BTreeMap<String, String>,
+    cases: &[(String, String)],
+    selection: SelectionState,
+) -> anyhow::Result<TimelineId> {
+    let timeline = conv.timeline_id();
     let sealed = conv
         .set_metadata_many(meta)
         .map_err(|e| anyhow::anyhow!("naming the calibration: {e}"))
@@ -58,7 +97,7 @@ pub(crate) fn seal_calibration(
                 .map(|(user, answer)| (user.clone(), answer.clone(), vec![TAG.to_string()]))
                 .collect();
             let (handle, _) = conv
-                .submit_prefilled_turn_group(&tagged, SelectionState::new())
+                .submit_prefilled_turn_group(&tagged, selection)
                 .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
             let resp = handle
                 .wait_cancellable(crate::ingest_cancel::token())

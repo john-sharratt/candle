@@ -42,7 +42,6 @@ use tracing::Level;
 
 use zend::branch_ingest::filter::IngestScope;
 use zend::branch_ingest::{BranchIngest, LayerPass};
-use zend::code_read::read_opening;
 use zend::ingest::IngestMode;
 use zend::loading::LoadProgress;
 use zend::refresh_ctx::RefreshContext;
@@ -286,12 +285,8 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
         config: conv_config,
         formatted_prompt: &formatted_prompt,
         think_triggers,
-        read_opening: read_opening(&engine).expect("file reading's opening call"),
         tool_ctx,
         retrieval: &retrieval,
-        chain_end: None,
-        link_parent: None,
-        band: None,
         think_for: None,
         dialogue: None,
     };
@@ -302,7 +297,6 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
             scope: scope.clone(),
             base: &repo_map_base,
             spec: None,
-            calibrate: None,
             sees: &[],
         },
         LayerPass {
@@ -311,7 +305,6 @@ fn load_daemon(workspace: &Path) -> LoadedDaemon {
             scope: scope.clone(),
             base: &code_read_base,
             spec: None,
-            calibrate: None,
             sees: &[],
         },
     ];

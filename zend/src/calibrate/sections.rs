@@ -17,27 +17,10 @@ use candle_conversation::stencil::{
 const LAYOUT: &str = "Answer every part above, in this order, each under its own heading \
      exactly as written (`## name`), with one question per line and nothing else.";
 
-/// What a priming-chain link's draft is told before the layout: its questions
-/// are about its own file. `<<path>>` is the unit's own path.
-///
-/// **Only a chain link sees other files.** A link — a repository's README,
-/// ARCHITECTURE, AGENTS or CLAUDE — is read behind every link before it
-/// (`branch_ingest::prime`), and its draft, forked from its reading, sees them
-/// all: asked about `yenbot/AGENTS.md`, a draft wrote ten of its fifteen
-/// questions about `battle-cities/AGENTS.md` — Bevy, `i64` world coordinates,
-/// the `sim` crate, none of them in the file (BlackWorld, 2026-11-15). Every
-/// other unit is sealed behind the system prompt alone and is asked without
-/// it. The chain cannot be taken out of the link's draft: the link's K/V was
-/// computed behind it. A link's calibration marker digests this text
-/// ([`super::spec::CalibrateSpec::marker`]), so a change to it calibrates the
-/// links again and no other unit.
-pub const OWN_FILE: &str = "Every question is about `<<path>>` alone, as you just read it. \
-     Other files appear earlier in this conversation; ask nothing about them.";
-
 /// The message asking every `(name, prompt)` part, each under a `## name`
-/// heading, then — for a priming-chain link, the unit at `link` — [`OWN_FILE`],
-/// then the layout.
-pub fn compose(parts: &[(&str, String)], link: Option<&str>) -> String {
+/// heading, then the layout. The draft's knowledge base holds its file alone
+/// (§12 D11), so nothing else is there to be asked about.
+pub fn compose(parts: &[(&str, String)]) -> String {
     let mut out = String::new();
     for (name, prompt) in parts {
         out.push_str("## ");
@@ -45,10 +28,6 @@ pub fn compose(parts: &[(&str, String)], link: Option<&str>) -> String {
         out.push('\n');
         out.push_str(prompt.trim_end());
         out.push_str("\n\n");
-    }
-    if let Some(path) = link {
-        out.push_str(&OWN_FILE.replace("<<path>>", path));
-        out.push(' ');
     }
     out.push_str(LAYOUT);
     out
@@ -215,19 +194,10 @@ mod tests {
             ("uses", "Now write 3 more.".to_string()),
         ];
         assert_eq!(
-            compose(&parts, None),
+            compose(&parts),
             "## definitions\nWrite 4 about `a.rs`.\n\n## uses\nNow write 3 more.\n\n\
              Answer every part above, in this order, each under its own heading exactly as \
              written (`## name`), with one question per line and nothing else."
-        );
-        // A priming-chain link is told its questions are about its own file.
-        assert_eq!(
-            compose(&parts[..1], Some("AGENTS.md")),
-            "## definitions\nWrite 4 about `a.rs`.\n\n\
-             Every question is about `AGENTS.md` alone, as you just read it. Other files \
-             appear earlier in this conversation; ask nothing about them. Answer every part \
-             above, in this order, each under its own heading exactly as written (`## name`), \
-             with one question per line and nothing else."
         );
     }
 

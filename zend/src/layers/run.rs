@@ -31,12 +31,11 @@ use super::plan::{dep_version, Done, LiveFiles};
 use super::spec::LayerSpec;
 use crate::branch_ingest::keys::branches_value;
 use crate::branch_ingest::reader::settles_here;
-use crate::calibrate::{calibrate_committed, CalibrateSpec};
 use crate::ingest_backlog::{self, Work};
 use crate::ingest_holdoff;
 use crate::ingest_lease::{self, Share};
 use crate::ingest_report::{Failures, IngestReport};
-use crate::ingest_snapshots::{finished, Unit};
+use crate::ingest_snapshots::finished;
 use crate::refresh_ctx::RefreshContext;
 use crate::tool_round::{self, Step};
 use crate::tools::{format_tool_responses, ToolResult};
@@ -184,7 +183,6 @@ pub fn ingest_units(
     jobs: &[UnitJob],
     base: &Sequence,
     files: Option<&EdgeFiles<'_>>,
-    calibrate: Option<&CalibrateSpec>,
 ) -> anyhow::Result<IngestReport> {
     let total = jobs.len();
     tracing::info!(
@@ -212,7 +210,7 @@ pub fn ingest_units(
                 let Some(job) = jobs.get(idx) else {
                     return;
                 };
-                if let Err(e) = read_one(ctx, spec, job, base, files, calibrate) {
+                if let Err(e) = read_one(ctx, spec, job, base, files) {
                     // A stalled turn is no flood: a full card stalls every
                     // unit in flight at once.
                     if is_stall_message(&format!("{e:#}")) {
@@ -284,7 +282,6 @@ fn read_one(
     job: &UnitJob,
     base: &Sequence,
     files: Option<&EdgeFiles<'_>>,
-    calibrate: Option<&CalibrateSpec>,
 ) -> anyhow::Result<()> {
     let hold = match ingest_lease::share(&job.key) {
         Share::Theirs => return Ok(()),
@@ -384,21 +381,8 @@ fn read_one(
         anyhow::bail!("the content key was not written: {err:#}");
     }
     ctx.retrieval.mark_stale();
-    // Calibrated while its exchange is still resident, just prefilled; a
-    // failure leaves the unit to the catch-up round ahead of the next pass.
-    if let Some(cal) = calibrate {
-        let calibrated = calibrate_committed(ctx, cal, base, timeline, &job.subject, &key);
-        if let (Err(err), false) = (calibrated, crate::ingest_cancel::cancelled()) {
-            tracing::warn!(
-                target: "zend::layers",
-                layer = %spec.layer,
-                subject = %job.subject,
-                "the unit was not calibrated as it committed: {err:#}",
-            );
-        }
-    }
     let e = ctx.engine;
-    finished(e, timeline, Unit::Layer(&job.subject));
+    finished(e, timeline);
     e.evict_ingest_timeline(timeline);
     tracing::debug!(
         target: "zend::layers",
@@ -431,7 +415,7 @@ pub(super) fn mint_unit(
     let named = (|| {
         {
             let e = ctx.engine;
-            if let Some(parent) = job.parent.or(ctx.chain_end) {
+            if let Some(parent) = job.parent {
                 e.set_forked_from(timeline, parent)
                     .map_err(|err| anyhow::anyhow!("{} unit lineage: {err}", spec.layer))?;
             }

@@ -50,7 +50,21 @@ impl ConversationEngine {
             .update(|s| s.working_set_withhold(target, reads));
     }
 
-    /// Let `target`'s withheld conversations enter its working set again: the
+    /// Keep `files`, which `target`'s turn read for real, out of its knowledge
+    /// base until its next question ([`Self::working_set_clear_withheld`]).
+    pub fn files_withhold(&self, target: TimelineId, files: &[FileKey]) {
+        self.conversation
+            .update(|s| s.files_withhold(target, files));
+    }
+
+    /// Pin what `target`'s knowledge base holds: nothing, or one file whole
+    /// (`docs/provenance_system_collection.md` §12 D11). Set before the
+    /// conversation's first turn, which places it.
+    pub fn files_pin(&self, target: TimelineId, pin: FilesPin) {
+        self.conversation.update(|s| s.files_pin(target, pin));
+    }
+
+    /// Let `target`'s withheld conversations and files be placed again: the
     /// turn that read them has ended.
     pub fn working_set_clear_withheld(&self, target: TimelineId) {
         self.conversation

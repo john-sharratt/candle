@@ -1,12 +1,14 @@
 //! Sealing a read as one more calibration of its unit, and keeping each
 //! unit's newest few.
 
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use candle_conversation::projection::TimelineId;
 use candle_conversation::ConversationEngine;
 
 use crate::calibrate::{calibration_meta, seal_calibration, Frame};
+use crate::files::records;
 
 /// Conversation metadata on a use-exemplar: the content key of the unit it
 /// calibrates. Apart from the drafted calibrations' marker, so a layer's
@@ -49,6 +51,12 @@ pub fn record_use(
         })
         .collect();
     let conversation = engine.conversation();
+    // A unit stands while a record of its file does: the exemplar names the
+    // file's scan id (`FileKey::scan_id`).
+    let standing_files: HashSet<TimelineId> = records::all(&conversation)
+        .iter()
+        .map(|r| r.key().scan_id())
+        .collect();
     let substrate = conversation.read();
     let standing: Vec<Standing> = exemplars
         .into_iter()
@@ -56,9 +64,9 @@ pub fn record_use(
             timeline,
             used_at,
             of_this_unit: of == key,
-            unit_gone: substrate.calibrates(timeline).is_none_or(|unit| {
-                substrate.is_tombstoned(unit) || substrate.timeline_target(unit).is_none()
-            }),
+            unit_gone: substrate
+                .calibrates(timeline)
+                .is_none_or(|unit| !standing_files.contains(&unit)),
         })
         .collect();
     drop(substrate);

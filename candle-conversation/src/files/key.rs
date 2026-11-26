@@ -11,6 +11,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::content_hash::hash_bytes;
+use crate::projection::TimelineId;
 
 /// A file of the knowledge base: the first 8 bytes of [`hash_bytes`] over its
 /// content key, read little-endian — the hash's `lo` lane, the first half of
@@ -40,6 +41,18 @@ impl FileKey {
             return None;
         }
         u64::from_str_radix(hex, 16).ok().map(FileKey)
+    }
+
+    /// The file as the id the scan and the calibration index name it by,
+    /// where a reading's timeline once stood: its key as the raw id, never
+    /// the reserved 0.
+    pub fn scan_id(self) -> TimelineId {
+        TimelineId::from_raw(self.0.max(1)).expect("an id made with max(1) is never the reserved 0")
+    }
+
+    /// The file a [`FileKey::scan_id`] names.
+    pub fn of_scan_id(id: TimelineId) -> FileKey {
+        FileKey(id.raw())
     }
 }
 
@@ -106,6 +119,14 @@ mod tests {
         assert_eq!(FileKey::from_hex("abcdef01234567"), None);
         assert_eq!(FileKey::from_hex("+0abcdef01234567"), None);
         assert_eq!(FileKey::from_hex("00abcdef0123456g"), None);
+    }
+
+    /// **A file's scan id is its key**, and names the file back.
+    #[test]
+    fn a_file_key_round_trips_through_its_scan_id() {
+        let k = FileKey(0x473e_088d_5653_2900);
+        assert_eq!(k.scan_id().raw(), 0x473e_088d_5653_2900);
+        assert_eq!(FileKey::of_scan_id(k.scan_id()), k);
     }
 
     #[test]

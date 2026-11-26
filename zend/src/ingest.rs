@@ -179,6 +179,20 @@ pub fn ingest_layers(
                 (IngestMode::Raw, other, "Loading")
             }
         };
+        // What is calibrated is the knowledge base's files
+        // (`docs/provenance_system_collection.md` §12 D13): a `calibrate:`
+        // block on any other layer calibrates nothing, and says so.
+        let calibrate = match (calibrate, mode) {
+            (Some(_), m) if m != IngestMode::Files => {
+                tracing::error!(
+                    layer = %layer.name,
+                    "`calibrate:` is declared on a layer that is not the knowledge base's \
+                     files — the layer is not calibrated"
+                );
+                None
+            }
+            (calibrate, _) => calibrate,
+        };
         // An `--ingest-dir <layer>=<path>` override replaces the derived folder,
         // relative to the workspace folder.
         let folder = override_dir

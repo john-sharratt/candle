@@ -9,10 +9,24 @@
 //! file it keeps — a newcomer follows the kept ones, and a file let go leaves
 //! the others in their order.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::key::FileKey;
 use crate::projection::GroupId;
+
+/// What a conversation's knowledge base holds, when it is not provenance's
+/// to choose (§12 D11).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FilesPin {
+    /// Provenance chooses: the fill places the set's strongest files.
+    #[default]
+    Free,
+    /// Nothing: `files_open` with no file under it — a calibration's empty
+    /// frame.
+    Empty,
+    /// This file alone, whole — a calibration's draft and its target frame.
+    Only(FileKey),
+}
 
 /// One conversation's files and their momentum.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -21,18 +35,29 @@ pub struct FilesSet {
     pub members: BTreeMap<FileKey, (f32, GroupId)>,
     /// The files placed by the last projection, in the order they sit.
     pub placed_order: Vec<FileKey>,
+    /// Files the turn's own reads hold verbatim in the dialogue: not placed
+    /// until the next question ([`Self::clear_withheld`]), unless already
+    /// placed, which keeps its place.
+    pub withheld: BTreeSet<FileKey>,
+    /// What the knowledge base holds when it is pinned; [`FilesPin::Free`]
+    /// for every dialogue.
+    pub pin: FilesPin,
 }
 
 impl FilesSet {
     /// Fold one scan's fresh scores into the momentum: every member decays by
     /// `beta`, a scored file gains its fresh score, and a file left under
-    /// `min_momentum` leaves the set.
+    /// `min_momentum` leaves the set. A pinned set's knowledge base is not
+    /// provenance's, and folds nothing.
     pub fn observe(
         &mut self,
         fresh: &[(GroupId, Vec<(FileKey, f32)>)],
         beta: f32,
         min_momentum: f32,
     ) {
+        if self.pin != FilesPin::Free {
+            return;
+        }
         for (m, _) in self.members.values_mut() {
             *m *= 1.0 - beta;
         }
@@ -46,12 +71,26 @@ impl FilesSet {
         self.members.retain(|_, (m, _)| *m >= min_momentum);
     }
 
-    /// The set's files of `kind`, strongest first (ties by key).
+    /// Keep `files` from being placed until [`Self::clear_withheld`]: a file
+    /// the turn read stands verbatim in the dialogue, and placed again it
+    /// would be carried twice. One already placed keeps its place.
+    pub fn withhold(&mut self, files: impl IntoIterator<Item = FileKey>) {
+        self.withheld.extend(files);
+    }
+
+    /// Let every withheld file be placed again: a new question starts.
+    pub fn clear_withheld(&mut self) {
+        self.withheld.clear();
+    }
+
+    /// The set's files of `kind` a projection may place, strongest first
+    /// (ties by key): a withheld file only while it is placed.
     pub fn ranked(&self, kind: GroupId) -> Vec<(FileKey, f32)> {
         let mut out: Vec<(FileKey, f32)> = self
             .members
             .iter()
             .filter(|(_, (_, k))| *k == kind)
+            .filter(|(f, _)| !self.withheld.contains(f) || self.placed_order.contains(f))
             .map(|(&f, &(m, _))| (f, m))
             .collect();
         out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -121,5 +160,30 @@ mod tests {
         set.set_placed(first);
         // c now ranks first, a is let go, d arrives: b and c keep their order.
         assert_eq!(set.order(&[c, d, b]), vec![b, c, d]);
+    }
+
+    /// **A pinned set folds no scan.**
+    #[test]
+    fn a_pinned_set_folds_no_scan() {
+        let mut set = FilesSet {
+            pin: FilesPin::Only(FileKey(9)),
+            ..FilesSet::default()
+        };
+        set.observe(&[(kind(1), vec![(FileKey(1), 500.0)])], 0.2, 100.0);
+        assert!(set.members.is_empty());
+    }
+
+    /// **A file the turn read waits until the next question, and a placed one
+    /// keeps its place.**
+    #[test]
+    fn a_withheld_file_waits_and_a_placed_one_stays() {
+        let (a, b) = (FileKey(1), FileKey(2));
+        let mut set = FilesSet::default();
+        set.observe(&[(kind(1), vec![(a, 500.0), (b, 400.0)])], 0.2, 100.0);
+        set.set_placed(vec![a]);
+        set.withhold([a, b]);
+        assert_eq!(set.ranked(kind(1)), vec![(a, 500.0)]);
+        set.clear_withheld();
+        assert_eq!(set.ranked(kind(1)), vec![(a, 500.0), (b, 400.0)]);
     }
 }

@@ -1,14 +1,10 @@
-//! Drives the background ingest of the branch and file layers: priming,
-//! reading and calibration.
+//! Drives the background ingest of the branch and file layers: sealing and
+//! calibration.
 //!
-//! Ingest reads each repository's files into conversations of their own. A
-//! pass reads units without calibrating them, and the sweep that follows
-//! calibrates what was committed and what an earlier pass left, so a file is
-//! read once rather than held back for its whole calibration. The priming chain
-//! is built before ready and becomes this member's seed, so every dialogue
-//! starts with the workspace listing and the anchor documents already read. A
-//! changed chain link is read before the pass, so the links after it do not
-//! keep pointing at a retired one.
+//! Ingest seals each repository's files and folders into the knowledge base.
+//! A pass seals units without calibrating them, and the sweep that follows
+//! calibrates what was sealed and what an earlier pass left, so a file is
+//! sealed once rather than held back for its whole calibration.
 
 use super::*;
 
@@ -23,14 +19,7 @@ impl InferenceState {
             proj_builder: self.refresh_builder.clone(),
             config: self.refresh_config.clone(),
             formatted_prompt: &self.formatted_prompt,
-            // `Off`, as repo_map's folder summaries run: a file read is a tool
-            // round and a description, with no reasoning block between them.
-            // Its calls are held to `file_read`, the one tool it is given.
-            think_triggers: match &self.think_steering {
-                Some(ts) => ts.registry_for(&self.read_stencil, ThinkMode::Off),
-                None => Arc::clone(&self.read_stencil),
-            },
-            read_opening: self.read_opening.clone(),
+            think_triggers: turn_triggers(self, ThinkMode::Off, ToolMode::Restricted),
             // Ingest reads; it runs no job, so it belongs to no lineage.
             tool_ctx: self.tool_host.context_for(
                 ToolMode::Restricted,
@@ -38,9 +27,6 @@ impl InferenceState {
                 "",
             ),
             retrieval: &self.retrieval_scope,
-            chain_end: *self.chain_end.lock().unwrap(),
-            link_parent: None,
-            band: None,
             think_for: Some({
                 let steering = self.think_steering.clone();
                 // A unit decodes under the grammar of the mode whose catalog
@@ -70,7 +56,6 @@ impl InferenceState {
                     scope: scope.clone(),
                     base: self.ingest_base(&il.name)?,
                     spec: il.spec.as_deref(),
-                    calibrate: il.calibrate.as_deref(),
                     sees: self
                         .layer_sees
                         .get(&il.name)
@@ -79,44 +64,6 @@ impl InferenceState {
                 })
             })
             .collect()
-    }
-
-    /// Build the priming chain and make its end this member's **seed**, so
-    /// every dialogue — each records the seed alias as its parent
-    /// (`Substrate::SEED_PARENT`) — starts with the workspace listing, each
-    /// repository's root listing and its anchor documents already read, on
-    /// the chain this member holds now. An analysis layer's unit read after
-    /// this records the same end as its parent (`RefreshContext::chain_end`);
-    /// a `code_reading` file or `repo_map` folder records none.
-    ///
-    /// Conversations a past boot parented on its own base conversation are
-    /// re-pointed at the alias here (`reseed_base_children`): a base is minted
-    /// per boot per member, so such a conversation kept that boot's chain on
-    /// the member that minted it and inherited nothing on any other.
-    pub(super) fn prime(&self, progress: &LoadProgress) -> anyhow::Result<()> {
-        if self.branch_layers.is_empty() {
-            return Ok(());
-        }
-        let passes = self.layer_passes()?;
-        let end =
-            self.branch_ingest
-                .prime(&self.refresh_ctx(), &self.workspace, &passes, progress)?;
-        self.engine.set_seed(end);
-        let base = self.base_conv.timeline_id();
-        self.engine
-            .set_forked_from_seed(base)
-            .map_err(|e| anyhow::anyhow!("base_conv seed parent: {e}"))?;
-        let reseeded = self
-            .engine
-            .reseed_base_children(base)
-            .map_err(|e| anyhow::anyhow!("re-pointing conversations at the seed: {e}"))?;
-        tracing::info!(
-            seed = end.map(|t| t.raw()),
-            reseeded,
-            "priming chain primed: conversations open on its end"
-        );
-        *self.chain_end.lock().unwrap() = end;
-        Ok(())
     }
 
     /// Calibrate every branch layer that declares a `calibrate:` block
@@ -136,15 +83,6 @@ impl InferenceState {
             let Some(spec) = il.calibrate.as_deref() else {
                 continue;
             };
-            let Some(group) = self.refresh_builder.id_for_group(&il.group) else {
-                tracing::error!(
-                    target: "zend::calibrate",
-                    layer = %il.name,
-                    group = %il.group,
-                    "the layer declares a calibration but its group is not in the schema",
-                );
-                continue;
-            };
             let base = match self.ingest_base(&il.name) {
                 Ok(base) => base,
                 Err(e) => {
@@ -158,7 +96,7 @@ impl InferenceState {
             };
             calibrate_layer(
                 &self.engine,
-                &CalibrateLayer { spec, group, base },
+                &CalibrateLayer { spec, base },
                 &CalibrateFrame {
                     system_prompt: &self.formatted_prompt,
                     config: &self.refresh_config,
@@ -331,22 +269,6 @@ impl InferenceState {
         let mut any = false;
         if !self.branch_layers.is_empty() {
             let passes = self.layer_passes()?;
-            // **A changed chain link is read into the chain before the pass.**
-            // The pass reads it as an ordinary unit and retires the old one,
-            // and the link after it — still pointing at the retired one — cut
-            // every dialogue's seed there until the next boot: a diary's first
-            // write named `diaries/` in the memory's root listing, and the seed
-            // lost its first eight links (2026-11-11).
-            if self
-                .branch_ingest
-                .chain_moved(&self.refresh_ctx(), &self.workspace, &passes)
-            {
-                tracing::info!(
-                    target: "zend::priming_chain",
-                    "a chain link changed: priming the chain again before the pass",
-                );
-                self.prime(&progress)?;
-            }
             let ctx = self.refresh_ctx();
             any |= self
                 .branch_ingest

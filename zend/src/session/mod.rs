@@ -80,7 +80,7 @@ use candle_conversation::projection::{
 use candle_conversation::provenance::gallery_arena::GroupSet;
 use candle_conversation::provenance::{encode_wide_sigs, FOLD_GROUPS};
 use candle_conversation::stencil::{
-    compile_action_loop, OpeningCall, ThinkMode, ToolCallEnvelope, ToolSpec, TriggerRegistry,
+    compile_action_loop, ThinkMode, ToolCallEnvelope, ToolSpec, TriggerRegistry,
     MAX_TOOL_CALLS_PER_TURN,
 };
 use candle_conversation::substrate::pcoll::POrdMap;
@@ -146,7 +146,7 @@ use crate::calibrate::thinking::thinking_of;
 use crate::calibrate::{
     calibrate_layer, mark_sealed, Frame as CalibrateFrame, Layer as CalibrateLayer,
 };
-use crate::code_read::{read_opening, reading_tools, PATH_KEY, READ_CALLS_PER_REPLY};
+use crate::code_read::PATH_KEY;
 use crate::coding_sampling;
 use crate::config::{DaemonConfig, SelfCheck};
 use crate::conv_branches::{self, BaseBranches};
@@ -221,8 +221,6 @@ use crate::tools::{
 use crate::turn_claims::{self, NotTaken};
 use crate::types::{ChatMessage, Role, ToolMode, Usage};
 use crate::worker_hop;
-use crate::working_set::coverage::Coverage;
-use crate::working_set::seeds::Seeding;
 use crate::working_set::{corpus, dialogue_config};
 use crate::workspace::UPLOADS_REPO;
 use candle_conversation::vision::tenancy::{holds, note_use, release_timeline};
@@ -301,14 +299,6 @@ struct InferenceState {
     /// so they have no reasoning to protect and stay on their existing
     /// from-scratch construction (`raw_read::ingest_raw`).
     ingest_bases: HashMap<String, Sequence>,
-    /// The priming chain's final link (`BranchIngest::prime`, built at boot
-    /// before `ready` and again whenever a link changes): this member's seed,
-    /// which every dialogue's
-    /// `forked_from` alias resolves to (`Substrate::SEED_PARENT`), and the
-    /// parent every ingest unit's conversation records before its reading
-    /// starts. `None` when there is no chain — no git repository, or no
-    /// ingest layer.
-    chain_end: Mutex<Option<TimelineId>>,
     /// Queue feeding the dedicated titler task. The request path enqueues a
     /// [`TitleJob`] (non-blocking, dropped if the task is backed up) instead
     /// of spawning per submit, so title generation runs in the background —
@@ -363,11 +353,8 @@ struct InferenceState {
     /// (`docs/incremental_chunk_exclusion.md`).
     exclusion_learners: Mutex<HashMap<GroupId, ExclusionLearner>>,
     /// The dialogue layer's working set (`docs/zend_working_set.md`). `None`
-    /// when the schema declares none: nothing is seeded.
+    /// when the schema declares none: nothing is withheld.
     working_set: Option<WorkingSetConfig>,
-    /// Whether each `code_reading` chain read its whole file — asked before a
-    /// file is served or seeded, answered once per chain.
-    read_coverage: Coverage,
     /// The workspace captured at startup — its folder and repositories.
     workspace: Workspace,
     /// The branch a conversation starts on in each git repository — `main`,
@@ -416,14 +403,6 @@ struct InferenceState {
     /// The turn triggers with tools out of the grammar ([`round_triggers`]), by
     /// mode, dial and the tools taken out.
     held_stencils: ArcSwap<HeldStencils>,
-    /// The Restricted stencil with every call held to `file_read` — what a
-    /// file's reading decodes under, so it can call no other tool. Built once
-    /// at startup beside the stencils it narrows.
-    read_stencil: Arc<TriggerRegistry>,
-    /// A file reading's opening call, which its first turn begins inside
-    /// (`RefreshContext::read_opening`). Built once at startup beside
-    /// `read_stencil`.
-    read_opening: Option<OpeningCall>,
     /// Per-effort-dial thinking-block steering trees, compiled once at startup.
     /// `None` when the tokenizer has no single `<think>`/`</think>` token.  Each
     /// turn replaces the `<think>` trigger with the dial's tree (see

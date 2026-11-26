@@ -1,14 +1,13 @@
 //! The dialogue's working set, as the daemon drives it
-//! (`docs/zend_working_set.md`): what it is seeded with ([`seeds`]), which
-//! ingested readings stand for a file ([`corpus`]), and whether a reading
-//! covers its whole file ([`coverage`]).
+//! (`docs/zend_working_set.md`): which files a turn's reads keep out of its
+//! knowledge base ([`corpus`]), and the bodies a turn's tool responses carry
+//! ([`coverage`]).
 //!
 //! The state and the projection rule live in `candle_conversation`; this is
 //! the part that knows about tools, repositories and turns.
 
 pub mod corpus;
 pub mod coverage;
-pub mod seeds;
 
 use candle_conversation::projection::{LayerId, Schema};
 use candle_conversation::working_set::WorkingSetConfig;

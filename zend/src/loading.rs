@@ -15,10 +15,8 @@
 //!    calibrate them.
 //! 6. **Self-check** — with `--self-check`, ask every stored conversation
 //!    whether it is intact (`crate::self_check`).
-//! 7. **Priming** — read the priming chain the base conversation descends
-//!    from (`crate::branch_ingest::prime`).
-//! 8. **Normalizing** — relearn the tool catalog's score-normalization levels.
-//! 9. **Preloading** — decode and place on the GPU what a projection's belief
+//! 7. **Normalizing** — relearn the tool catalog's score-normalization levels.
+//! 8. **Preloading** — decode and place on the GPU what a projection's belief
 //!    scan reads, so the first question asked does not pay for it.
 //!
 //! `LoadProgress` is the single source of truth; the daemon advances it
@@ -64,15 +62,9 @@ pub enum LoadStep {
     Sections,
     CalibratingSections,
     /// Every stored conversation asked whether it is intact (`--self-check`).
-    /// Skipped unless the flag is set. Before the priming chain and every
-    /// ingest, so a conversation it tombstones is read again by them.
+    /// Skipped unless the flag is set. Before every ingest, so a conversation
+    /// it tombstones is read again by them.
     SelfCheck,
-    /// The priming chain (`BranchIngest::prime`): the workspace listing, then
-    /// each repository's root listing and anchor documents, read in order.
-    /// Before `ready`, because the base conversation descends from it — the
-    /// first question asked must already have it. Links read on an earlier
-    /// boot are not read again, so a restart pays for what changed.
-    Priming,
     /// The tool catalog's score-normalization hit levels, relearned from its
     /// corpus. They are runtime-only, so every start pays this — last, once the
     /// corpus is complete, and before `ready`, because a query scored against
@@ -102,7 +94,6 @@ impl LoadStep {
         LoadStep::Sections,
         LoadStep::CalibratingSections,
         LoadStep::SelfCheck,
-        LoadStep::Priming,
         LoadStep::Normalizing,
         LoadStep::Preloading,
     ];
@@ -110,10 +101,7 @@ impl LoadStep {
     /// Whether reaching this step proves the build: every step before it tests
     /// the binary — the model loaded, the substrate opened and caught up, the
     /// tool sections prefilled and calibrated, so real forwards have run — and
-    /// every step from it on is reading whose length is the data's. Priming
-    /// after an ingest key change reads every repository's anchors again: an
-    /// hour, and nothing about the build that the forwards before it did not
-    /// already show.
+    /// every step from it on is work whose length is the data's.
     pub fn proves_the_build(self) -> bool {
         match self {
             LoadStep::Pack
@@ -127,10 +115,7 @@ impl LoadStep {
             | LoadStep::Repositories
             | LoadStep::Sections
             | LoadStep::CalibratingSections => false,
-            LoadStep::SelfCheck
-            | LoadStep::Priming
-            | LoadStep::Normalizing
-            | LoadStep::Preloading => true,
+            LoadStep::SelfCheck | LoadStep::Normalizing | LoadStep::Preloading => true,
         }
     }
 
@@ -149,7 +134,6 @@ impl LoadStep {
             LoadStep::Sections => "sections",
             LoadStep::CalibratingSections => "calibrating_sections",
             LoadStep::SelfCheck => "self_check",
-            LoadStep::Priming => "priming",
             LoadStep::Normalizing => "normalizing",
             LoadStep::Preloading => "preloading",
         }
@@ -170,7 +154,6 @@ impl LoadStep {
             LoadStep::Sections => "Prefilling tool sections",
             LoadStep::CalibratingSections => "Calibrating sections",
             LoadStep::SelfCheck => "Checking conversations",
-            LoadStep::Priming => "Reading the repositories",
             LoadStep::Normalizing => "Normalizing scores",
             LoadStep::Preloading => "Preloading projections",
         }
@@ -201,7 +184,6 @@ impl LoadStep {
             LoadStep::Sections => "",
             LoadStep::CalibratingSections => "",
             LoadStep::SelfCheck => "conversations",
-            LoadStep::Priming => "documents",
             LoadStep::Normalizing => "",
             LoadStep::Preloading => "",
         }
@@ -510,10 +492,6 @@ mod tests {
             assert_eq!(step.proves_the_build(), i > at, "{step:?}");
         }
         assert!(
-            LoadStep::Priming.proves_the_build(),
-            "priming is reading, not the build"
-        );
-        assert!(
             !LoadStep::Sections.proves_the_build(),
             "the first forwards are the build"
         );
@@ -621,7 +599,7 @@ mod tests {
     #[test]
     fn prefill_tokens_count_within_a_step() {
         let p = LoadProgress::new();
-        p.set_step(LoadStep::Priming);
+        p.set_step(LoadStep::SelfCheck);
         p.add_prefill_tokens(300);
         p.add_prefill_tokens(200);
         assert_eq!(p.snapshot().unwrap().prefill_tokens, 500);
@@ -691,7 +669,6 @@ mod tests {
                 "sections",
                 "calibrating_sections",
                 "self_check",
-                "priming",
                 "normalizing",
                 "preloading",
             ]

@@ -521,6 +521,7 @@ impl Substrate {
     /// its set cleared away, and its first question still opens.
     pub fn working_set_clear_withheld(&mut self, target: TimelineId) {
         self.working_set_mut(target).clear_withheld();
+        self.files_clear_withheld(target);
     }
 
     /// Fold one reprojection's per-piece fresh scores into `target`'s pool

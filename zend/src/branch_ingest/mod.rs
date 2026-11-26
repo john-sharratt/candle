@@ -6,8 +6,7 @@
 //! by what it shows ([`keys`]), plan each layer against what it already holds
 //! ([`plan`]), tombstone what no branch holds at any depth, and ingest what
 //! nothing holds yet within the depth bound — each unit read at the commit it
-//! was found on. The pass begins and ends by sealing a face for every file and
-//! folder unit that has none ([`crate::faces`]).
+//! was found on and sealed into the knowledge base (`crate::files`).
 
 pub mod filter;
 pub mod ignore;
@@ -16,9 +15,7 @@ pub mod manifest;
 pub mod monitored;
 pub mod order;
 pub mod plan;
-pub mod prime;
 pub mod reader;
-pub mod tie;
 pub mod units;
 pub mod walk;
 
@@ -26,17 +23,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use candle_conversation::projection::{GroupId, TimelineId};
-use candle_conversation::{ConversationEngine, Sequence};
+use candle_conversation::Sequence;
 use zend_vfs::Workspace;
 
 use self::filter::IngestScope;
 use self::monitored::{keep_monitored, monitored};
 use self::plan::{plan, Committed, Live};
-use self::tie::{backfill_commits, retie};
 use self::walk::{walk, Corpus, FileItem, RepoBranches, TreeCache};
-use crate::calibrate::CalibrateSpec;
 use crate::code_read::{self, is_upload_path, FileJob};
-use crate::faces;
 use crate::ingest::IngestMode;
 use crate::journal::opening::SeedRead;
 use crate::layers::plan::Below;
@@ -75,12 +69,6 @@ pub struct LayerPass<'a> {
     pub base: &'a Sequence,
     /// How a [`IngestMode::Derived`] layer's units are read.
     pub spec: Option<&'a LayerSpec>,
-    /// How a [`IngestMode::Derived`] layer's units are calibrated as they
-    /// commit (`crate::calibrate::calibrate_committed`), for a layer that
-    /// declares a `calibrate:` block. A file layer's units are not: the branch
-    /// pass reads them all first, and `Session::calibrate_layers` calibrates
-    /// them after it.
-    pub calibrate: Option<&'a CalibrateSpec>,
     /// The scoped groups of the layers of units below a derived layer, by
     /// layer name — what its units may retrieve, on their branches.
     pub sees: &'a [(String, GroupId)],
@@ -93,23 +81,24 @@ pub struct BranchIngest {
     trees: Mutex<TreeCache>,
     /// File keys found to be binary: never read again.
     binary: Mutex<HashSet<String>>,
-    /// The key of every link of the chain [`Self::prime`] last built, in
-    /// chain order: what [`Self::chain_moved`] holds the repositories against,
-    /// so a link that changes is read into the chain again before the pass.
-    primed: Mutex<Vec<String>>,
-    /// What that chain read, for the journal's opening
-    /// ([`crate::journal::opening`]).
+    /// What the seed installed into the prompt read, for the journal's
+    /// opening ([`crate::journal::opening`]).
     seed_read: Mutex<SeedRead>,
 }
 
 impl BranchIngest {
-    /// What the chain [`Self::prime`] last built read: empty before the first
-    /// prime, and on a member with no chain.
+    /// What the seed read: empty on a member with no repository.
     pub fn seed_read(&self) -> SeedRead {
         self.seed_read
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Record what the seed installed at startup read
+    /// (`crate::files::seed::install`).
+    pub fn set_seed_read(&self, read: SeedRead) {
+        *self.seed_read.lock().unwrap_or_else(|e| e.into_inner()) = read;
     }
 
     /// The file keys found to be binary: this process's, and every one a
@@ -131,10 +120,6 @@ impl BranchIngest {
         layers: &[LayerPass<'_>],
         progress: &Arc<LoadProgress>,
     ) -> anyhow::Result<bool> {
-        // Faces first for what is already read: a pass can queue thousands of
-        // readings, and a unit that waited for the pass's end to get its face
-        // would be placed with its request for as long as the pass runs.
-        faces::fill(ctx, &readings(ctx, layers));
         let (repos, unreadable) = record_branches(workspace);
         let mut trees = self.trees.lock().unwrap_or_else(|e| e.into_inner());
         let mut corpora: HashMap<IngestScope, (Corpus, Vec<String>)> = HashMap::new();
@@ -186,7 +171,6 @@ impl BranchIngest {
                         let run = LayerRun {
                             spec,
                             base: layer.base,
-                            calibrate: layer.calibrate,
                             sees: layer.sees,
                         };
                         crate::layers::pass_layer(ctx, &run, &mut ground, Reach::Default)?
@@ -206,14 +190,12 @@ impl BranchIngest {
                 let run = LayerRun {
                     spec,
                     base: layer.base,
-                    calibrate: layer.calibrate,
                     sees: layer.sees,
                 };
                 changed |= crate::layers::pass_layer(ctx, &run, &mut ground, Reach::All)?;
             }
         }
         trees.retain_tips(&repos);
-        faces::fill(ctx, &readings(ctx, layers));
         Ok(changed)
     }
 
@@ -242,32 +224,35 @@ impl BranchIngest {
             .into_iter()
             .filter(|c| !in_repos(&c.subject, held_back))
             .collect();
-        // A file a peer has just read stands as read here while its turns
-        // arrive: neither queued again nor tombstoned as a duplicate.
-        let planned: Vec<Committed> = committed
-            .iter()
-            .cloned()
-            .chain(code_read::arriving(ctx.engine))
-            .filter(|c| !in_repos(&c.subject, held_back))
-            .collect();
-        let p = plan(&live, &retain, &planned);
-        tombstone(ctx.engine, layer.name, &p.tombstone);
-        // A held file past the depth bound keeps its branches and its commit
-        // current as well: the full-depth walk found it.
+        let p = plan(&live, &retain, &committed);
+        code_read::retire_planned(ctx.engine, layer.name, &p.tombstone);
+        // A held file past the depth bound keeps its branches current as
+        // well: the full-depth walk found it.
         let branches: HashMap<&str, &[String]> = retained
             .iter()
             .map(|f| (f.key.as_str(), &f.branches[..]))
             .collect();
         let held = still_held(&committed, &p.tombstone);
-        retie(ctx.engine, layer.name, &held, &branches);
-        let found: HashMap<&str, String> = retained
+        code_read::retie_records(ctx.engine, layer.name, &held, &branches);
+        // A file recorded but not sealed in this process — recorded before a
+        // restart, or by another member — is sealed here too: its members are
+        // restored from their streams (§12 D15). The plan queues only what no
+        // record holds.
+        let sealed_here = code_read::sealed_keys(ctx.engine);
+        let unsealed: Vec<usize> = files
             .iter()
-            .map(|f| (f.key.as_str(), f.at.to_string()))
+            .enumerate()
+            .filter(|(i, f)| {
+                !p.queued.contains(i)
+                    && held.iter().any(|c| c.key == f.key)
+                    && !sealed_here.contains(&f.key)
+            })
+            .map(|(i, _)| i)
             .collect();
-        backfill_commits(ctx.engine, layer.name, &held, &found);
         let jobs: Vec<FileJob> = order::in_read_order(
             p.queued
                 .iter()
+                .chain(&unsealed)
                 .map(|&i| files[i])
                 .map(|f| FileJob {
                     path: f.file.path.clone(),
@@ -301,7 +286,6 @@ impl BranchIngest {
                 let run = LayerRun {
                     spec,
                     base: upper.base,
-                    calibrate: upper.calibrate,
                     sees: upper.sees,
                 };
                 crate::layers::sweep_layer(ctx, &run, ground);
@@ -316,7 +300,7 @@ impl BranchIngest {
             // current reading of most files. The layer's calibration pass
             // (`Session::calibrate_layers`) takes the committed units up after
             // this pass, and at the start of every one.
-            code_read::ingest_jobs(ctx, &jobs, &keys, progress, layer.base, &self.binary, None)?;
+            code_read::ingest_jobs(ctx, &jobs, &keys, progress, layer.base, &self.binary)?;
         }
         ground_files(
             ctx, layer.name, &files, &retained, held_back, corpus, ground,
@@ -391,31 +375,6 @@ fn ground_files(
     ground.standing.insert(layer.to_string(), standing);
 }
 
-/// Every committed unit of the file and folder layers among `layers` — what a
-/// dialogue can place, and so what has a face.
-fn readings(
-    ctx: &RefreshContext<'_>,
-    layers: &[LayerPass<'_>],
-) -> Vec<(faces::Reading, Committed)> {
-    let has = |mode: IngestMode| layers.iter().any(|l| l.mode == mode);
-    let mut out = Vec::new();
-    if has(IngestMode::Files) {
-        out.extend(
-            code_read::committed(ctx.engine)
-                .into_iter()
-                .map(|c| (faces::Reading::File, c)),
-        );
-    }
-    if has(IngestMode::Folders) {
-        out.extend(
-            repo_scan::committed(ctx.engine)
-                .into_iter()
-                .map(|c| (faces::Reading::Folder, c)),
-        );
-    }
-    out
-}
-
 /// `items` less the files found to be binary.
 fn readable<'c>(items: &'c [FileItem], binary: &HashSet<String>) -> Vec<&'c FileItem> {
     items.iter().filter(|f| !binary.contains(&f.key)).collect()
@@ -448,7 +407,7 @@ fn units(
         .filter(|c| !in_repos(&c.subject, held_back))
         .collect();
     let p = plan(&live, &retain, &committed);
-    tombstone(ctx.engine, layer.name, &p.tombstone);
+    code_read::retire_planned(ctx.engine, layer.name, &p.tombstone);
     // A held folder past the depth bound keeps its branches current as well.
     let branches: HashMap<&str, &[String]> = corpus
         .retain
@@ -456,16 +415,21 @@ fn units(
         .iter()
         .map(|u| (u.unit.key.as_str(), &u.branches[..]))
         .collect();
-    retie(
-        ctx.engine,
-        layer.name,
-        &still_held(&committed, &p.tombstone),
-        &branches,
-    );
+    let held = still_held(&committed, &p.tombstone);
+    code_read::retie_records(ctx.engine, layer.name, &held, &branches);
+    // A folder recorded but not sealed in this process is sealed here too,
+    // its members restored from their streams (§12 D15).
+    let sealed_here = repo_scan::sealed_folder_keys(ctx.engine);
+    let unsealed = corpus.ingest.units.iter().enumerate().filter(|(i, u)| {
+        !p.queued.contains(i)
+            && held.iter().any(|c| c.key == u.unit.key)
+            && !sealed_here.contains(&u.unit.key)
+    });
     let jobs: Vec<UnitJob> = p
         .queued
         .iter()
         .map(|&i| &corpus.ingest.units[i])
+        .chain(unsealed.map(|(_, u)| u))
         .map(|u| UnitJob {
             unit: u.unit.clone(),
             at: u.at.clone(),
@@ -484,7 +448,7 @@ fn units(
     );
     if !jobs.is_empty() {
         let keys: HashSet<String> = retain.iter().map(|k| k.to_string()).collect();
-        repo_scan::ingest_units(ctx, &jobs, &keys, progress, layer.name, layer.base)?;
+        repo_scan::ingest_units(ctx, &jobs, &keys, progress, layer.base)?;
     }
     Ok(!jobs.is_empty() || !p.tombstone.is_empty())
 }
@@ -545,23 +509,6 @@ fn still_held(committed: &[Committed], tombstoned: &[TimelineId]) -> Vec<Committ
 fn in_repos(subject: &str, repos: &[&str]) -> bool {
     let repo = subject.split('/').next().unwrap_or("");
     repos.contains(&repo)
-}
-
-fn tombstone(engine: &ConversationEngine, layer: &str, timelines: &[TimelineId]) {
-    if timelines.is_empty() {
-        return;
-    }
-    let e = engine;
-    for &tl in timelines {
-        if let Err(err) = e.tombstone_timeline(tl) {
-            tracing::warn!(
-                target: "zend::branch_ingest",
-                layer,
-                timeline = tl.raw(),
-                "tombstone of a unit no branch holds failed: {err:#}",
-            );
-        }
-    }
 }
 
 #[cfg(test)]

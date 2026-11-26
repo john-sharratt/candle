@@ -25,6 +25,7 @@ use crate::config::{EngineConfig, SamplingConfig, SequenceConfig};
 use crate::conversation::{install_branch_states, PendingBranchState, Sequence};
 use crate::engine_attachments::Attachments;
 use crate::error::ConversationError;
+use crate::files::{FileKey, FilesPin};
 use crate::group_scanner::GroupScanner;
 use crate::guest::reach;
 use crate::guest::Guest;

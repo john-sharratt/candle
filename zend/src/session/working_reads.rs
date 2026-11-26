@@ -1,12 +1,10 @@
-//! Keeps the working set consistent with what a turn has read, and seeds it for
-//! a new conversation.
+//! Keeps the knowledge base consistent with what a turn has read.
 //!
-//! A file a round read stands verbatim in the dialogue, so its reading is
-//! withheld from the working set for the rest of the turn. Placing it again
-//! would carry the file twice. Reads of drawn guides and journals are sealed as
+//! A file a round read stands verbatim in the dialogue, so it is withheld from
+//! the knowledge base for the rest of the turn. Placing it again would carry
+//! the file twice. Reads of drawn guides and journals are sealed as
 //! use-exemplars of their unit on a thread of their own, and the turn does not
-//! wait for them. Seeding resolves a conversation's seeds on its own branch and
-//! seeds its provenance with them.
+//! wait for them.
 
 use super::*;
 
@@ -36,8 +34,8 @@ pub(super) async fn withhold_read_files(
     let state = Arc::clone(state);
     let files = Arc::clone(files);
     if let Err(e) = tokio::task::spawn_blocking(move || {
-        let readings = corpus::readings_of_all(&state.engine, &files, &state.workspace, &read);
-        state.engine.working_set_withhold(timeline, &readings);
+        let read_files = corpus::read_files(&files, &state.workspace, &read);
+        state.engine.files_withhold(timeline, &read_files);
     })
     .await
     {
@@ -159,27 +157,4 @@ pub(super) fn calibrate_guidance_reads(
             }
         }
     });
-}
-
-/// Resolve `config`'s seeds for `timeline` on its own branch and seed its
-/// provenance with them. Returns how many were seeded.
-pub(super) fn seed_working_set(
-    state: &InferenceState,
-    timeline: TimelineId,
-    conv_id: &str,
-    files: &RepoFiles,
-    config: &WorkingSetConfig,
-) -> usize {
-    let folder_of = |repo: &str, inner: &str| {
-        state
-            .retrieval_scope
-            .folder_unit(&state.engine, files, conv_id, repo, inner)
-    };
-    Seeding {
-        engine: &state.engine,
-        files,
-        folder_of: &folder_of,
-        coverage: &state.read_coverage,
-    }
-    .apply(timeline, config)
 }

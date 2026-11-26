@@ -25,14 +25,14 @@ use crate::files::FileKey;
 use crate::persistence::streams::StreamId;
 use crate::substrate::{FileGallery, Substrate};
 
-/// The id the scan names `file` by.
+/// The id the scan names `file` by ([`FileKey::scan_id`]).
 pub(crate) fn scan_id(file: FileKey) -> TimelineId {
-    TimelineId::from_raw(file.0.max(1)).expect("an id made with max(1) is never the reserved 0")
+    file.scan_id()
 }
 
 /// The file a scan id names.
 pub(crate) fn file_of(id: TimelineId) -> FileKey {
-    FileKey(id.raw())
+    FileKey::of_scan_id(id)
 }
 
 /// The gallery of a file whose chunks' members are `chunks`, in line order:

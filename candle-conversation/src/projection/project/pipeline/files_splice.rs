@@ -15,7 +15,7 @@ use crate::files::fill::{choose, FilePlacement};
 use crate::files::names::{
     chunk_name, heading_name, CLOSING_JOIN_NAME, CLOSING_LAST_NAME, GAP_NAME,
 };
-use crate::files::{FileKey, FileRecord, LineSpan};
+use crate::files::{FileKey, FileRecord, FilesPin, LineSpan};
 
 /// The files a projection places and the segments they are placed as.
 pub(crate) struct FilesSplice {
@@ -56,27 +56,39 @@ pub(crate) fn files_splice<R: ContentResolver>(
         .into_iter()
         .map(|r| (r.key(), r))
         .collect();
-    // Each kind's choice, then every chosen file ranked by its momentum.
+    // Each kind's choice, then every chosen file ranked by its momentum — or,
+    // pinned, the one file whole or nothing.
     let mut chosen: Vec<(FilePlacement, f32)> = Vec::new();
-    for group in schema
-        .layers
-        .iter()
-        .flat_map(|l| l.groups.iter())
-        .filter(|g| g.is_working_set())
-    {
-        let SelectionRule::WorkingSet { share } = group.selection else {
-            continue;
-        };
-        let ranked = set.ranked(group.id);
-        let momentum: HashMap<FileKey, f32> = ranked.iter().copied().collect();
-        for p in choose(
-            &ranked,
-            |k| records.get(&k),
-            kind_cap(share),
-            closing_tokens,
-        ) {
-            let m = momentum.get(&p.file).copied().unwrap_or(0.0);
-            chosen.push((p, m));
+    match set.pin {
+        FilesPin::Empty => {}
+        FilesPin::Only(file) => {
+            if let Some(record) = records.get(&file) {
+                let chunks = (0..record.chunks.len()).collect();
+                chosen.push((FilePlacement { file, chunks }, 0.0));
+            }
+        }
+        FilesPin::Free => {
+            for group in schema
+                .layers
+                .iter()
+                .flat_map(|l| l.groups.iter())
+                .filter(|g| g.is_working_set())
+            {
+                let SelectionRule::WorkingSet { share } = group.selection else {
+                    continue;
+                };
+                let ranked = set.ranked(group.id);
+                let momentum: HashMap<FileKey, f32> = ranked.iter().copied().collect();
+                for p in choose(
+                    &ranked,
+                    |k| records.get(&k),
+                    kind_cap(share),
+                    closing_tokens,
+                ) {
+                    let m = momentum.get(&p.file).copied().unwrap_or(0.0);
+                    chosen.push((p, m));
+                }
+            }
         }
     }
     chosen.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.file.cmp(&b.0.file)));

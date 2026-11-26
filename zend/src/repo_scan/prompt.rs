@@ -9,6 +9,8 @@
 //! members are chosen at projection, and the walk continues through the nodes
 //! below them as ordinary content.
 
+use candle_conversation::projection;
+
 use super::*;
 
 /// The shared system prompt every ingest layer frames on, wrapped in the

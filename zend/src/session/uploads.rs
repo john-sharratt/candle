@@ -53,11 +53,12 @@ impl InferenceState {
             progress,
             &files_layer.name,
             self.ingest_base(&files_layer.name)?,
-            files_layer.calibrate.as_deref(),
         )?;
         if ingested {
-            // An upload is in every conversation's scope once it is committed.
+            // An upload is in every conversation's scope once it is committed,
+            // and calibrated as every sealed file is.
             self.retrieval_scope.refresh(&self.engine);
+            self.calibrate_layers();
         }
         Ok((ingested, n_failed > 0))
     }

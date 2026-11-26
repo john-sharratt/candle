@@ -24,22 +24,27 @@ use std::collections::{HashMap, HashSet};
 
 use candle_conversation::projection::TimelineId;
 
-/// A unit of the layer: its conversation, what it is of, the marker its
-/// calibration carries, and whether it can be calibrated now — committed,
-/// finished, and every turn holding its content.
+use super::kb_frame::KbFrame;
+
+/// A unit of the layer: one file of the knowledge base asked behind one
+/// frame — the id its calibrations name it by, what it is of, the marker its
+/// calibration carries, and whether it can be calibrated now: recorded, its
+/// members sealed in this process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unit {
+    /// The file's scan id (`FileKey::scan_id`), which its calibrations name.
     pub timeline: TimelineId,
     pub subject: String,
-    /// The content key it is committed under: the unit, whatever it is asked.
+    /// What the unit is, whatever it is asked: `{frame}:{content key}`, so
+    /// each frame's calibration stands and is replaced on its own.
     pub key: String,
+    /// The file's content key.
+    pub content_key: String,
+    pub frame: KbFrame,
     pub marker: String,
     pub ready: bool,
     /// What its calibration's failures have recorded, if any.
     pub prior_failures: Option<String>,
-    /// Read behind a parent — a priming-chain link — so its draft sees the
-    /// links before it ([`super::sections::OWN_FILE`]).
-    pub link: bool,
 }
 
 /// A calibration found carrying one of the layer's markers.
@@ -128,10 +133,11 @@ mod tests {
             timeline: tl(raw),
             subject: format!("s{raw}"),
             key: marker[..1].into(),
+            content_key: marker[..1].into(),
+            frame: KbFrame::Empty,
             marker: marker.into(),
             ready: true,
             prior_failures: None,
-            link: false,
         }
     }
 

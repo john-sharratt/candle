@@ -1,43 +1,45 @@
-//! Calibrating a layer's units: find each ready unit without a calibration,
-//! ask it for its questions, and prefill them as its calibration.
+//! Calibrating the knowledge base's files (`docs/provenance_system_collection.md`
+//! §7 step 3, §7.1, §12 D11–D13): find each sealed file without a
+//! calibration of its current version, ask for its questions, and seal them
+//! as its calibrations.
 //!
-//! A unit is asked in a **draft** — a conversation forked from its layer's
-//! base with the unit as its lineage, so the unit's whole conversation is the
-//! draft's opening and the model writes its questions with what it read in
-//! front of it. The draft is tombstoned once its answer is read: only the
-//! questions are kept.
+//! A file is asked in a **draft** — a fork of the files layer's base, the seed
+//! absent and the knowledge base pinned to the file alone, whole
+//! ([`FilesPin::Only`]) — so the model writes its questions with the file in
+//! front of it, in the notation a dialogue reads files in. The draft is
+//! tombstoned once its answer is read: only the questions are kept.
 //!
-//! Each question is then asked again on its own — a conversation of the
-//! hidden calibration layer, the system prompt every conversation opens with,
-//! nothing projected — with thinking on, and what the model reasons, up to the
-//! layer's `think` budget, is kept ([`super::thinking`]). Every question of a
-//! unit is asked at once, so they decode in one wave, and more units think
-//! than draft at once: only the draft carries the unit's reading.
+//! Each question is then asked again, **alternating between two knowledge
+//! bases** in draft order ([`KbFrame`]): the first, third, fifth… behind the
+//! empty one (`files_open` with nothing under it), the second, fourth… behind
+//! the target (the file alone). Each is a fork of the same base, the seed
+//! absent, thinking on; what the model reasons, up to the layer's `think`
+//! budget, is kept ([`super::thinking`]). A file's questions are asked at
+//! once, so they decode in one wave.
 //!
-//! The questions are calibrated the way a tool's are (`ToolDef::questions`):
-//! every one in ONE prefill, a turn group in a conversation of the hidden
-//! calibration layer, each masked to itself and sealed one turn apiece, its
-//! answer its thinking. A question prefilled alone, under the system prompt
-//! every conversation opens with, and the thinking it starts, are what a live
-//! turn looks like before anything is projected for it — the region a live
-//! probe resembles, where the unit's own windows are its content. The
-//! answer is assistant content, not a reasoning segment, so the seal keeps its
-//! signatures. The calibration carries
-//! [`Substrate::CALIBRATES_KEY`], so its questions vote for the unit wherever
-//! the unit is scored, and is then archived — the commit — and distilled
-//! provenance-only: its K/V is dropped and its signatures stay.
+//! Each frame's questions are then prefilled behind the frame they were asked
+//! in, in ONE turn group of a fork pinned the same way, each masked to itself
+//! and sealed one turn apiece, its answer its thinking: the frame a live query
+//! has before it has found the file, and once the file is in front of it. The
+//! calibration carries [`Substrate::CALIBRATES_KEY`] — the file's scan id
+//! (`FileKey::scan_id`) — so its questions vote for the file wherever it is
+//! scored, and [`CALIBRATION_FRAME_KEY`]; it is then archived — the commit —
+//! and distilled provenance-only: its K/V is dropped and its signatures stay.
+//! Neither frame holds the seed or another file, so nothing bleeds in and a
+//! seed change recalibrates nothing.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use candle_conversation::chain_health::chain_break;
+use candle_conversation::files::names::{chunk_name, heading_name};
+use candle_conversation::files::{files_owner, FileKey, FileRecord, FileUnit, FilesPin};
 use candle_conversation::projection::{
-    DecodePriority, GroupId, OptionalState, Reserved, SelectionState, TimelineId, TurnIndex,
-    TurnKey, NO_THINK_SELECTOR, TOOLS_ENABLED_SELECTOR,
+    Conversation, DecodePriority, OptionalState, SelectionState, TimelineId, NO_THINK_SELECTOR,
+    TOOLS_ENABLED_SELECTOR,
 };
-use candle_conversation::stencil::{ThinkMode, TriggerRegistry, TurnGrammar};
+use candle_conversation::stencil::{TriggerRegistry, TurnGrammar};
 use candle_conversation::substrate::Substrate;
 use candle_conversation::{
     ConversationEngine, FinishOrder, Sequence, SequenceConfig, TurnOptions, MAX_DECODE_WIDTH,
@@ -45,26 +47,24 @@ use candle_conversation::{
 };
 
 use super::ask::Ask;
-use super::draft_sight::reading_held;
+use super::draft_sight::members_held;
+use super::failures;
+use super::kb_frame::{KbFrame, CALIBRATION_FRAME_KEY};
 use super::owed;
 use super::permits::{Permit, Permits};
 use super::plan::{plan, Prior, Unit};
 use super::questions::questions;
 use super::retire_replies::retire_reply_records;
-use super::seal::seal_calibration;
+use super::seal::seal_framed;
 use super::sections::{compose, grammar, split};
 use super::spec::CalibrateSpec;
 use super::thinking::{exemplar, thinking_of};
-use super::windows::{windows, WINDOW_TOKENS};
-use crate::branch_ingest::keys::{key_version, CONTENT_KEY, KEY_VERSION};
-use crate::code_read::PATH_KEY;
+use crate::files::records;
 use crate::ingest_backlog::{self, Work};
 use crate::ingest_holdoff;
 use crate::ingest_lease::{self, Share};
-use crate::layers::keys::{FILE_KEY, SUBJECT_KEY};
+use crate::layers::keys::SUBJECT_KEY;
 use crate::layers::run::{answer_of, LAYER_PARALLELISM};
-use crate::refresh_ctx::RefreshContext;
-use crate::types::ToolMode;
 
 /// The calibration marker a calibration carries ([`CalibrateSpec::marker`]).
 pub const MARKER_KEY: &str = "calibration";
@@ -82,21 +82,18 @@ pub const TAG: &str = "calibration";
 /// a developer's question naming what it asks about running to ~40 tokens.
 const DRAFT_MAX_TOKENS: usize = 4096;
 
-/// On a unit, the marker its calibration last failed under and how many times.
-const FAILED_KEY: &str = "calibration_failed";
-
-/// Passes whose draft may write no question before the unit is left
+/// Passes whose draft may write no question before the file is left
 /// uncalibrated. Four units answered every draft the same way and were asked
-/// again every pass on both members (2026-10-31). A new reading is a new
+/// again every pass on both members (2026-10-31). A new version is a new
 /// marker, and is tried afresh.
 const MAX_FAILURES: u32 = 3;
 
 /// How a calibration that failed for want of a question says so.
 const NO_QUESTION: &str = "the draft wrote no question";
 
-/// Why a draft that holds none of its unit's reading is not asked: its
-/// questions would be the file's name, guessed at (`draft_sight`).
-const BLIND_DRAFT: &str = "the draft holds none of its reading";
+/// Why a draft that holds none of its file is not asked: its questions would
+/// be the file's name, guessed at (`draft_sight`).
+const BLIND_DRAFT: &str = "the draft holds none of its file";
 
 /// How a calibration whose draft stopped short says so.
 const SHORT_DRAFT: &str = "the draft left a part with no question";
@@ -120,14 +117,15 @@ fn empty_parts<'a>(parts: &[(&'a str, usize, usize)]) -> Vec<&'a str> {
         .collect()
 }
 
-/// Whether `error` is the unit's own failure — its draft wrote nothing, or
+/// Whether `error` is the file's own failure — its draft wrote nothing, or
 /// stopped short — which counts against it, rather than a decode lost to a
-/// full card, which says nothing about the unit.
+/// full card, which says nothing about the file.
 fn units_own_failure(error: &str) -> bool {
     error.starts_with(NO_QUESTION) || error.starts_with(SHORT_DRAFT)
 }
 
-/// How many times `marker` has failed, as [`FAILED_KEY`] holds it in `recorded`.
+/// How many times `marker` has failed, as its failure record holds it in
+/// `recorded` ([`failures`]).
 fn failures_of(recorded: Option<&str>, marker: &str) -> u32 {
     recorded
         .and_then(|r| r.rsplit_once(' '))
@@ -136,14 +134,14 @@ fn failures_of(recorded: Option<&str>, marker: &str) -> u32 {
         .unwrap_or(0)
 }
 
-/// Units calibrated at once. A unit's draft forks from its whole reading, so
-/// drafts are held to the width the layer reads at (`LAYER_PARALLELISM`); its
-/// thinking and prefill carry only the system prompt — shared — and a
-/// question, so three times as many units are in flight, and one thinking
-/// does not hold a draft's place. The scheduler's waves pace the decode.
+/// Files calibrated at once. A draft holds its whole file, so drafts are held
+/// to the width the layers read at (`LAYER_PARALLELISM`); a file's thinking
+/// and seal carry at most its file and a question, so three times as many
+/// files are in flight, and one thinking does not hold a draft's place. The
+/// scheduler's waves pace the decode.
 const CALIBRATE_PARALLELISM: usize = 3 * LAYER_PARALLELISM;
 
-/// The places every unit's questions share while they think ([`thoughts`]):
+/// The places every file's questions share while they think ([`thoughts`]):
 /// enough to keep the card full, and few enough that no thinking turn stands
 /// queued for admission long enough to be given up.
 ///
@@ -186,27 +184,27 @@ pub struct Report {
     pub replies: usize,
 }
 
-/// One layer to calibrate: its spec, the group its units are in, and the base
-/// their drafts fork from.
+/// The files layer to calibrate: its spec, and the base its drafts, thinking
+/// and calibrations fork from.
 pub struct Layer<'a> {
     pub spec: &'a CalibrateSpec,
-    pub group: GroupId,
     pub base: &'a Sequence,
 }
 
-/// Where calibrations are prefilled: the system prompt every conversation
-/// opens with, dialect-formatted, the sequence config they run under, and the
-/// steering a question's thinking decodes under — a live dialogue turn's at
-/// the default effort, so its reasoning block opens and closes as one does.
+/// Where a calibration runs: the system prompt every conversation opens with,
+/// dialect-formatted — what a use-exemplar is prefilled under
+/// (`crate::guidance`) — the sequence config, and the steering a question's
+/// thinking decodes under: a live dialogue turn's at the default effort, so
+/// its reasoning block opens and closes as one does.
 pub struct Frame<'a> {
     pub system_prompt: &'a str,
     pub config: &'a SequenceConfig,
     pub thinking: Arc<TriggerRegistry>,
 }
 
-/// Calibrate every unit of `layer` that is ready and not calibrated — those
-/// its ingest did not calibrate as it committed them ([`calibrate_committed`])
-/// — and retire every calibration of a unit no longer there.
+/// Calibrate every file of the knowledge base that is sealed here and not
+/// calibrated behind both frames, and retire every calibration of a file no
+/// longer there.
 pub fn calibrate_layer(
     engine: &ConversationEngine,
     layer: &Layer<'_>,
@@ -221,7 +219,7 @@ pub fn calibrate_layer(
                 report.retired += 1;
             }
         }
-        let units = units(e, layer);
+        let units = units_of(&e.conversation(), spec);
         let priors: Vec<(TimelineId, String, bool)> = e
             .conversations_with_metadata_key(MARKER_KEY)
             .into_iter()
@@ -248,21 +246,20 @@ pub fn calibrate_layer(
     report.done = todo.done;
     report.waiting = todo.waiting;
     owed::global().planned(&spec.layer, todo.run.len(), todo.waiting);
+    let files = by_file(&todo.run);
     tracing::info!(
         target: "zend::calibrate",
         layer = %spec.layer,
         calibrated = todo.done,
         to_calibrate = todo.run.len(),
+        files = files.len(),
         waiting = report.waiting,
         retired = report.retired,
-        "calibrating the layer's units",
+        "calibrating the knowledge base's files",
     );
-    // **The sweep is backlog the bar shows.** A pass reads every file before
-    // it calibrates any, so this
-    // sweep is where a re-read tree spends most of its decode; each unit is
-    // counted until it is sealed, failed or found to be another member's, and
-    // shown as `<path> (calibrated)`.
-    ingest_backlog::add_pending(Work::Calibrating, todo.run.len() as u64);
+    // **The sweep is backlog the bar shows**, each file counted until it is
+    // sealed, failed or found to be another member's, as `<path> (calibrated)`.
+    ingest_backlog::add_pending(Work::Calibrating, files.len() as u64);
     let finished = AtomicUsize::new(0);
     let cursor = AtomicUsize::new(0);
     let sealed = AtomicUsize::new(0);
@@ -270,118 +267,124 @@ pub fn calibrate_layer(
     let cancelled = AtomicUsize::new(0);
     let elsewhere = AtomicUsize::new(0);
     let drafts = Permits::new(LAYER_PARALLELISM);
-    let done = |unit: &Unit| {
+    let done = |subject: &str| {
         finished.fetch_add(1, Ordering::Relaxed);
-        ingest_backlog::item_done(Work::Calibrating, &format!("{} (calibrated)", unit.subject));
+        ingest_backlog::item_done(Work::Calibrating, &format!("{subject} (calibrated)"));
     };
+    let conversation = engine.conversation();
     std::thread::scope(|s| {
-        for _ in 0..CALIBRATE_PARALLELISM.min(todo.run.len()).max(1) {
+        for _ in 0..CALIBRATE_PARALLELISM.min(files.len()).max(1) {
             // Only a shutdown stops it.
             s.spawn(|| loop {
                 if crate::ingest_cancel::cancelled() {
                     return;
                 }
-                let Some(unit) = todo.run.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
+                let Some(units) = files.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
                     return;
                 };
-                // **A unit is leased only once it can start.** Its draft's
-                // permit first, then its lease: a member holds no more units
-                // than it is working on, and the units it has not reached stay
-                // unleased for whichever member reaches them first. Leased
-                // first, every thread of a pass held a unit while most waited
-                // for a draft's place — WhiteWorld (2026-11-11) held 48 at one
-                // unit every 2.5 minutes while BlackWorld, idle, found all 48
-                // `elsewhere`.
+                let subject = units[0].subject.as_str();
+                // **A file is leased only once it can start.** Its draft's
+                // permit first, then its lease: a member holds no more files
+                // than it is working on, and the files it has not reached stay
+                // unleased for whichever member reaches them first.
                 let t_permit = Instant::now();
                 let permit = drafts.acquire();
                 let permit_wait_ms = t_permit.elapsed().as_millis() as u64;
                 if crate::ingest_cancel::cancelled() {
                     return;
                 }
-                // **One member calibrates a unit.** Every member's pass plans
-                // the same units from the same replicated substrate; the one
+                // **One member calibrates a file.** Every member's pass plans
+                // the same files from the same replicated substrate; the one
                 // the vote names asks for them, and a calibration handed back
                 // is looked for again before it is asked for twice.
-                let _lease = match ingest_lease::share_calibration(&unit.marker) {
-                    // Another member's to calibrate: it is owed there, and
-                    // its commit replicates here, so it is owed nothing here.
+                let _lease = match ingest_lease::share_calibration(&units[0].content_key) {
                     Share::Theirs => {
-                        elsewhere.fetch_add(1, Ordering::Relaxed);
-                        owed::global().committed(&spec.layer);
-                        done(unit);
+                        elsewhere.fetch_add(units.len(), Ordering::Relaxed);
+                        for _ in units.iter() {
+                            owed::global().committed(&spec.layer);
+                        }
+                        done(subject);
                         continue;
                     }
-                    Share::Mine(lease) => {
-                        if lease.recheck() && calibrated(engine, &unit.marker) {
-                            elsewhere.fetch_add(1, Ordering::Relaxed);
-                            owed::global().committed(&spec.layer);
-                            done(unit);
-                            continue;
-                        }
-                        lease
-                    }
+                    Share::Mine(lease) => lease,
                 };
-                let outcome = calibrate_one(
+                let owed_here: Vec<Unit> = units
+                    .iter()
+                    .filter(|u| !calibrated(engine, &u.marker))
+                    .cloned()
+                    .collect();
+                if owed_here.is_empty() {
+                    elsewhere.fetch_add(units.len(), Ordering::Relaxed);
+                    for _ in units.iter() {
+                        owed::global().committed(&spec.layer);
+                    }
+                    done(subject);
+                    continue;
+                }
+                let outcome = calibrate_file(
                     engine,
                     spec,
                     layer.base,
                     frame,
                     Some((permit, permit_wait_ms)),
-                    unit,
+                    &owed_here,
                 );
-                done(unit);
+                done(subject);
                 match outcome {
                     Ok(()) => {
-                        sealed.fetch_add(1, Ordering::Relaxed);
-                        owed::global().committed(&spec.layer);
+                        sealed.fetch_add(owed_here.len(), Ordering::Relaxed);
+                        for _ in &owed_here {
+                            owed::global().committed(&spec.layer);
+                        }
                     }
-                    // A draft a shutdown stopped is no failure of the unit's.
+                    // A draft a shutdown stopped is no failure of the file's.
                     Err(_) if crate::ingest_cancel::cancelled() => {
-                        cancelled.fetch_add(1, Ordering::Relaxed);
+                        cancelled.fetch_add(owed_here.len(), Ordering::Relaxed);
                     }
                     Err(e) => {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                        // Only the unit's own failure counts against it: a
+                        failed.fetch_add(owed_here.len(), Ordering::Relaxed);
+                        // Only the file's own failure counts against it: a
                         // decode lost to a full card says nothing about the
-                        // unit, and is simply tried again. The other way
-                        // round for the member: a unit's own failure says
+                        // file, and is simply tried again. The other way
+                        // round for the member: a file's own failure says
                         // nothing about the card, so only the card's holds
-                        // this member off the next unit.
+                        // this member off the next file.
                         let own = units_own_failure(&format!("{e:#}"));
                         if own {
-                            let tries = failures_of(unit.prior_failures.as_deref(), &unit.marker)
-                                .saturating_add(1);
-                            if let Err(err) = engine.set_conversation_metadata(
-                                unit.timeline,
-                                FAILED_KEY,
-                                &format!("{} {tries}", unit.marker),
-                            ) {
-                                tracing::warn!(
-                                    target: "zend::calibrate",
-                                    subject = %unit.subject,
-                                    "a failed calibration could not be counted: {err}",
-                                );
+                            for unit in &owed_here {
+                                let tries =
+                                    failures_of(unit.prior_failures.as_deref(), &unit.marker)
+                                        .saturating_add(1);
+                                if let Err(err) =
+                                    failures::record(&conversation, &unit.key, &unit.marker, tries)
+                                {
+                                    tracing::warn!(
+                                        target: "zend::calibrate",
+                                        subject,
+                                        "a failed calibration could not be counted: {err:#}",
+                                    );
+                                }
                             }
                         }
                         tracing::warn!(
                             target: "zend::calibrate",
                             layer = %spec.layer,
-                            subject = %unit.subject,
+                            subject,
                             "calibration failed: {e:#}",
                         );
                         if !own {
-                            ingest_holdoff::cool_down(&unit.subject, &format!("{e:#}"));
+                            ingest_holdoff::cool_down(subject, &format!("{e:#}"));
                         }
                     }
                 }
             });
         }
     });
-    // A shutdown stops the sweep between units: what it never started is
+    // A shutdown stops the sweep between files: what it never started is
     // handed back, so the bar still reaches zero.
     ingest_backlog::drop_pending(
         Work::Calibrating,
-        todo.run.len().saturating_sub(finished.into_inner()) as u64,
+        files.len().saturating_sub(finished.into_inner()) as u64,
     );
     report.sealed = sealed.into_inner();
     report.failed = failed.into_inner();
@@ -404,6 +407,19 @@ pub fn calibrate_layer(
     report
 }
 
+/// `units` grouped by file, in the order their files first appear: what one
+/// draft calibrates.
+fn by_file(units: &[Unit]) -> Vec<Vec<Unit>> {
+    let mut out: Vec<Vec<Unit>> = Vec::new();
+    for u in units {
+        match out.iter_mut().find(|g| g[0].content_key == u.content_key) {
+            Some(group) => group.push(u.clone()),
+            None => out.push(vec![u.clone()]),
+        }
+    }
+    out
+}
+
 /// Whether a calibration carrying `marker` stands — one another member sealed
 /// and replication has brought here.
 fn calibrated(engine: &ConversationEngine, marker: &str) -> bool {
@@ -413,58 +429,37 @@ fn calibrated(engine: &ConversationEngine, marker: &str) -> bool {
         .any(|(_, m)| m == marker)
 }
 
-/// Every unit of `layer`: each conversation of its group committed under a
-/// content key and naming its subject — ready when its chain finished, every
-/// turn holds its content, and the reading it stands on is of the current
-/// [`KEY_VERSION`].
-///
-/// **A unit standing on an older reading waits.** Its draft forks from that
-/// reading, which the current rendering no longer projects: asked anyway, the
-/// draft saw no file and answered that none had been read, or called a tool,
-/// or wrote questions about nothing. Such a unit is read again under the
-/// current version by the pass a version change starts, and is calibrated
-/// then; its calibration stands until it is.
-fn units(engine: &ConversationEngine, layer: &Layer<'_>) -> Vec<Unit> {
-    let conv = engine.conversation();
-    let substrate = conv.read();
-    units_of(&substrate, layer.group, layer.spec)
-}
-
-/// [`units`] over `substrate`.
-fn units_of(substrate: &Substrate, group: GroupId, spec: &CalibrateSpec) -> Vec<Unit> {
-    let mut units: Vec<Unit> = substrate
-        .active_timelines_for_group(group)
-        .filter(|&tl| substrate.calibrates(tl).is_none())
-        .filter_map(|tl| {
-            let meta = substrate.custom_of(tl)?;
-            let key = meta.get(CONTENT_KEY)?;
-            let subject = meta.get(SUBJECT_KEY).or_else(|| meta.get(PATH_KEY))?;
-            // A file's reading is keyed by its own content key; a unit built
-            // on one records the reading's under `FILE_KEY`.
-            let reading = meta.get(FILE_KEY).unwrap_or(key);
-            let link = meta.contains_key(Substrate::FORKED_FROM_KEY);
-            let marker = spec.marker(key, subject, link);
-            let prior_failures = meta.get(FAILED_KEY).cloned();
-            Some(Unit {
-                timeline: tl,
-                subject: subject.clone(),
-                key: key.clone(),
-                ready: key_version(reading) == KEY_VERSION
-                    && chain_break(substrate, tl).is_none()
-                    && substrate.holds_whole(tl)
-                    && failures_of(prior_failures.as_deref(), &marker) < MAX_FAILURES,
+/// Every file of the knowledge base, behind each frame ([`KbFrame::ALL`]):
+/// ready when its members are sealed in this process — what its draft and its
+/// target frame place — and its own failures have not run out.
+fn units_of(conversation: &Conversation, spec: &CalibrateSpec) -> Vec<Unit> {
+    let mut units = Vec::new();
+    for record in records::all(conversation) {
+        if record.unit != FileUnit::File {
+            continue;
+        }
+        let placeable = records::placeable(conversation, &record);
+        for frame in KbFrame::ALL {
+            let key = format!("{}:{}", frame.as_str(), record.content_key);
+            let marker = spec.marker(&key, &record.path);
+            let prior_failures = failures::recorded(conversation, &key);
+            units.push(Unit {
+                timeline: record.key().scan_id(),
+                subject: record.path.clone(),
+                content_key: record.content_key.clone(),
+                frame,
+                ready: placeable && failures_of(prior_failures.as_deref(), &marker) < MAX_FAILURES,
+                key,
                 marker,
                 prior_failures,
-                link,
-            })
-        })
-        .collect();
-    units.sort_by_key(|u| u.timeline);
+            });
+        }
+    }
     units
 }
 
-/// What names every calibration of `unit`: its kind, the unit it calibrates
-/// ([`Substrate::CALIBRATES_KEY`]), and the unit's subject.
+/// What names every calibration of the file `unit` (its scan id): its kind,
+/// the file it calibrates ([`Substrate::CALIBRATES_KEY`]), and its subject.
 pub(crate) fn calibration_meta(unit: TimelineId, subject: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("kind".to_string(), TAG.to_string()),
@@ -476,71 +471,75 @@ pub(crate) fn calibration_meta(unit: TimelineId, subject: &str) -> BTreeMap<Stri
     ])
 }
 
-/// The selection a draft is asked under: no reasoning, and no tool block.
+/// The selection a draft is asked under: no reasoning, no tool block, and
+/// the seed's absent branch (§12 D11).
 pub(super) fn draft_selection() -> SelectionState {
     let mut selection = SelectionState::new();
     selection.select("thinking_effort", "off");
     selection.set_optional(NO_THINK_SELECTOR, OptionalState::Present);
     selection.set_optional(TOOLS_ENABLED_SELECTOR, OptionalState::Absent);
+    selection.set_seeds(false);
     selection
 }
 
-/// Calibrate a unit the moment its conversation commits, from the ingest
-/// worker that read it: its reading is still resident then — the next step
-/// evicts it to cold — so the draft forked onto it projects the reading from
-/// the card, where a later pass lifts it back from disk first. Its reading
-/// is of the current key version by construction.
-pub fn calibrate_committed(
-    ctx: &RefreshContext<'_>,
-    spec: &CalibrateSpec,
-    base: &Sequence,
-    timeline: TimelineId,
-    subject: &str,
-    key: &str,
-) -> anyhow::Result<()> {
-    let frame = Frame {
-        system_prompt: ctx.formatted_prompt,
-        config: &ctx.config,
-        thinking: ctx.triggers_for(ThinkMode::Balanced, ToolMode::None),
-    };
-    let link = ctx
-        .engine
-        .conversation()
-        .read()
-        .custom_of(timeline)
-        .is_some_and(|meta| meta.contains_key(Substrate::FORKED_FROM_KEY));
-    let unit = Unit {
-        timeline,
-        subject: subject.to_string(),
-        key: key.to_string(),
-        marker: spec.marker(key, subject, link),
-        ready: true,
-        prior_failures: None,
-        link,
-    };
-    calibrate_one(ctx.engine, spec, base, &frame, None, &unit)
+/// The selection a question's thinking, and its calibration's prefill, run
+/// under: a live dialogue turn's, every dial at its default, on the seed's
+/// absent branch.
+pub(super) fn frame_selection() -> SelectionState {
+    let mut selection = SelectionState::new();
+    selection.set_seeds(false);
+    selection
 }
 
-/// Ask `unit` for its questions — holding `draft_permit`, when given with how
-/// long it was waited for, while it does, and handing it back once the draft
-/// is written — and calibrate them.
-fn calibrate_one(
+/// The file `units` — one file's units, a frame apiece — are of, and its
+/// record.
+fn record_of(engine: &ConversationEngine, units: &[Unit]) -> anyhow::Result<FileRecord> {
+    let first = &units[0];
+    records::of_path(&engine.conversation(), &first.subject)
+        .into_iter()
+        .find(|r| r.content_key == first.content_key)
+        .ok_or_else(|| anyhow::anyhow!("{} has no record any more", first.subject))
+}
+
+/// The raw ids of `record`'s members in this process: what a draft that sees
+/// its file holds.
+fn member_ids(conversation: &Conversation, record: &FileRecord) -> HashSet<u32> {
+    let mut names = vec![heading_name(&record.path, &record.blob)];
+    names.extend(
+        record
+            .chunks
+            .iter()
+            .map(|c| chunk_name(&record.path, &record.blob, c.lines)),
+    );
+    names
+        .iter()
+        .filter_map(|n| conversation.owned_section_named(files_owner(), n))
+        .map(|id| id.raw())
+        .collect()
+}
+
+/// Ask the file `units` are of for its questions — holding `draft_permit`,
+/// when given with how long it was waited for, while it does, and handing it
+/// back once the draft is written — and calibrate each unit's frame with its
+/// share of them.
+fn calibrate_file(
     engine: &ConversationEngine,
     spec: &CalibrateSpec,
     base: &Sequence,
     frame: &Frame<'_>,
     draft_permit: Option<(Permit<'_>, u64)>,
-    unit: &Unit,
+    units: &[Unit],
 ) -> anyhow::Result<()> {
     let permit_wait_ms = draft_permit.as_ref().map_or(0, |(_, waited)| *waited);
-    let tokens = engine
-        .conversation()
-        .read()
-        .timeline_token_total(unit.timeline);
+    let first = &units[0];
+    let record = record_of(engine, units)?;
+    let file = record.key();
+    let tokens = record.tokens() as usize;
+    let members = member_ids(&engine.conversation(), &record);
     let (drafted, draft_ms) = {
         let _draft = draft_permit;
         let t_draft = Instant::now();
-        let drafted = draft(engine, spec, base, unit, tokens)?;
+        let drafted = draft(engine, spec, base, file, &first.subject, &members, tokens)?;
         (drafted, t_draft.elapsed().as_millis() as u64)
     };
     let wanted = drafted.wanted;
@@ -550,79 +549,94 @@ fn calibrate_one(
         let opening: String = last.chars().take(160).collect();
         anyhow::bail!("{NO_QUESTION} ({} chars: {opening:?})", last.len());
     }
-    // **A short draft is tried again, but not forever**: on the unit's last
+    // **A short draft is tried again, but not forever**: on the file's last
     // try what it wrote is sealed, which is more than leaving it with none.
-    let last_try =
-        failures_of(unit.prior_failures.as_deref(), &unit.marker).saturating_add(1) >= MAX_FAILURES;
+    let last_try = failures_of(first.prior_failures.as_deref(), &first.marker).saturating_add(1)
+        >= MAX_FAILURES;
     if !drafted.empty.is_empty() && !last_try {
         anyhow::bail!("{SHORT_DRAFT} ({})", drafted.empty.join(", "));
     }
-    let t_think = Instant::now();
-    let thought = thoughts(engine, frame, spec, &found)?;
-    let think_ms = t_think.elapsed().as_millis() as u64;
-    // The exemplars' prefill and seal, the calibration's archive and distill.
-    let t_exemplars = Instant::now();
-    let mut meta = calibration_meta(unit.timeline, &unit.subject);
-    meta.insert(MARKER_KEY.to_string(), unit.marker.clone());
-    let cases: Vec<(String, String)> = found
+    // Each owed frame's questions, in draft order: its alternate share, or —
+    // a draft too short to give the frame one — every question.
+    let asked: Vec<(KbFrame, Vec<usize>)> = units
         .iter()
-        .zip(&thought)
-        .map(|(q, t)| (q.clone(), exemplar(t)))
+        .map(|u| {
+            let share = u.frame.questions_of(found.len());
+            let share = if share.is_empty() {
+                (0..found.len()).collect()
+            } else {
+                share
+            };
+            (u.frame, share)
+        })
         .collect();
-    seal_calibration(engine, frame, &meta, &cases)?;
+    let to_think: Vec<(String, KbFrame)> = asked
+        .iter()
+        .flat_map(|(kb, idx)| idx.iter().map(|&i| (found[i].clone(), *kb)))
+        .collect();
+    let t_think = Instant::now();
+    let thought = thoughts(engine, base, frame, spec, file, &to_think)?;
+    let think_ms = t_think.elapsed().as_millis() as u64;
+    let t_exemplars = Instant::now();
+    let mut at = 0usize;
+    for ((kb, idx), unit) in asked.iter().zip(units) {
+        let cases: Vec<(String, String)> = idx
+            .iter()
+            .enumerate()
+            .map(|(j, &i)| (found[i].clone(), exemplar(&thought[at + j])))
+            .collect();
+        at += idx.len();
+        let mut meta = calibration_meta(unit.timeline, &unit.subject);
+        meta.insert(MARKER_KEY.to_string(), unit.marker.clone());
+        meta.insert(CALIBRATION_FRAME_KEY.to_string(), kb.as_str().to_string());
+        seal_framed(engine, base, &meta, &cases, kb.pin(file), frame_selection())?;
+    }
     tracing::debug!(
         target: "zend::calibrate",
         layer = %spec.layer,
-        subject = %unit.subject,
+        subject = %first.subject,
         tokens,
         wanted,
         questions = found.len(),
+        frames = units.len(),
         permit_wait_ms,
         draft_ms,
         think_ms,
         exemplars_ms = t_exemplars.elapsed().as_millis() as u64,
-        "unit calibrated",
+        "file calibrated",
     );
     Ok(())
 }
 
-/// The selection a question's thinking is decoded under: a live dialogue
-/// turn's, every dial at its default.
-fn thinking_selection() -> SelectionState {
-    SelectionState::new()
-}
-
-/// Each of `questions`' thinking, in order: each question asked alone in a
-/// transient conversation under the frame's system prompt, decoded to the
+/// Each of `asked`'s thinking, in order: each question asked alone in a
+/// transient fork of `base` behind its frame's knowledge base, decoded to the
 /// spec's `think` budget. Each conversation is tombstoned either way. A
-/// question the model did not think about fails the unit, which is calibrated
+/// question the model did not think about fails the file, which is calibrated
 /// again by a later pass.
 ///
-/// **No more in the queue than the scheduler runs.** Every unit's questions
-/// share one gate ([`THINKING`]), as wide as the scheduler runs turns: a unit
+/// **No more in the queue than the scheduler runs.** Every file's questions
+/// share one gate ([`THINKING`]), as wide as the scheduler runs turns: a file
 /// submits a question only while it holds a place, and gives the place back
 /// as the question's turn ends, when it submits its next. Asked every question
 /// at once, a dozen units stood ~550 turns in the queue against 24 run at a
 /// time on BlackWorld (2026-11-15), and a unit none of whose turns moved for a
-/// minute gave its whole calibration up ([`FinishOrder`]) — two units in
-/// three, each redone from its draft by a later pass. A unit holding no place
-/// waits for one; a unit holding some takes more only when one is free
+/// minute gave its whole calibration up ([`FinishOrder`]). A file holding no
+/// place waits for one; a file holding some takes more only when one is free
 /// ([`Permits::next_place`]), so it never waits on places it keeps from
 /// another.
 ///
 /// **A question gives up its conversation the moment its turn ends**, read in
-/// the order the turns finish. A transient conversation's recurrent store is
-/// never parked — it writes no record to park into — so a question waited on
-/// in submit order held its store until every question before it was done: on
-/// BlackWorld (2026-10-29) a hundred finished questions at a time, ~15 GiB of
-/// state beside a dozen running ones.
+/// the order the turns finish, so a finished question's recurrent store is not
+/// held while the questions before it run.
 fn thoughts(
     engine: &ConversationEngine,
+    base: &Sequence,
     frame: &Frame<'_>,
     spec: &CalibrateSpec,
-    questions: &[String],
+    file: FileKey,
+    asked_for: &[(String, KbFrame)],
 ) -> anyhow::Result<Vec<String>> {
-    let n = questions.len();
+    let n = asked_for.len();
     let mut asked: Vec<Option<Sequence>> = Vec::with_capacity(n);
     let mut timelines: Vec<TimelineId> = Vec::with_capacity(n);
     let mut places: Vec<Option<Permit<'static>>> = Vec::with_capacity(n);
@@ -635,30 +649,15 @@ fn thoughts(
                     break;
                 };
                 let i = asked.len();
-                // **Background, as the ingest is.** A sweep thinks dozens of
-                // questions at once; at `Normal` they rode every forward beside
-                // a live turn, where `Low` rows step aside for an `Urgent`
-                // decode (`scheduler::band`, `urgent_hold`).
-                let conv = engine
-                    .new_reserved_conversation(
-                        frame.system_prompt,
-                        Reserved::Calibration,
-                        DecodePriority::Low,
-                        frame.config.clone(),
-                    )
-                    .map_err(|err| anyhow::anyhow!("thinking conversation: {err}"))?;
+                let (question, kb) = &asked_for[i];
+                let conv = framed_fork(engine, base, &spec.layer, kb.pin(file))?;
                 let timeline = conv.timeline_id();
                 asked.push(Some(conv));
                 timelines.push(timeline);
                 places.push(Some(place));
-                engine.conversation().mark_timeline_transient(timeline);
-                engine.set_timeline_summarize(timeline, false);
-                engine
-                    .set_conversation_metadata(timeline, DRAFT_KEY, &spec.layer)
-                    .map_err(|err| anyhow::anyhow!("naming the thinking conversation: {err}"))?;
                 let options = TurnOptions {
                     max_tokens: Some(spec.think),
-                    selection: thinking_selection(),
+                    selection: frame_selection(),
                     triggers: Arc::clone(&frame.thinking),
                     tags: vec![TAG.to_string()],
                     ..Default::default()
@@ -666,7 +665,7 @@ fn thoughts(
                 let handle = asked[i]
                     .as_mut()
                     .expect("the question's conversation was just opened")
-                    .submit_turn_with_options(questions[i].clone(), options)
+                    .submit_turn_with_options(question.clone(), options)
                     .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
                 finished.push(i, handle);
             }
@@ -677,7 +676,7 @@ fn thoughts(
                 return Ok(());
             };
             places[i] = None;
-            let q = &questions[i];
+            let q = &asked_for[i].0;
             let mut conv = asked[i].take().expect("a turn finishes once");
             let thought = resp
                 .map_err(|e| anyhow::anyhow!("decode: {e}"))
@@ -712,17 +711,30 @@ fn thoughts(
     })
 }
 
-/// The path a unit's questions name it by: its file's path within its
-/// repository, as the prompts' `<<path>>` is, or the whole subject for a unit
-/// that is not a file.
-fn unit_path(subject: &str) -> &str {
-    match crate::repo_path::split(subject).1 {
-        "" => subject,
-        path => path,
+/// A transient fork of `base` whose knowledge base is `pin`, named as
+/// `layer`'s draft so a crash's is retired, and decoding at the ingest's
+/// background band. The pin is set before its first turn, which places it.
+fn framed_fork(
+    engine: &ConversationEngine,
+    base: &Sequence,
+    layer: &str,
+    pin: FilesPin,
+) -> anyhow::Result<Sequence> {
+    let conv = base
+        .fork_at(DecodePriority::Low)
+        .map_err(|e| anyhow::anyhow!("calibration conversation: {e}"))?;
+    let timeline = conv.timeline_id();
+    engine.conversation().mark_timeline_transient(timeline);
+    engine.set_timeline_summarize(timeline, false);
+    engine.files_pin(timeline, pin);
+    if let Err(err) = engine.set_conversation_metadata(timeline, DRAFT_KEY, layer) {
+        let _ = engine.tombstone_timeline(timeline);
+        anyhow::bail!("naming the calibration conversation: {err}");
     }
+    Ok(conv)
 }
 
-/// What a unit's draft wrote: its questions from every prompt, in the order
+/// What a file's draft wrote: its questions from every prompt, in the order
 /// asked, how many the prompts asked for, and the last answer, which a draft
 /// that wrote no question is reported by.
 struct Drafted {
@@ -735,226 +747,157 @@ struct Drafted {
     last_answer: String,
 }
 
-/// The unit's answer to its layer's calibration prompts, asked together in
-/// one turn of a draft whose lineage is the unit — each a part under its own
-/// heading ([`super::sections`]), each for as many questions as its rule gives
-/// a unit of `tokens`; the draft is tombstoned either way.
+/// The file's answer to its layer's calibration prompts, asked together in
+/// one turn of a draft whose knowledge base is the file alone, whole — each a
+/// part under its own heading ([`super::sections`]), each for as many
+/// questions as its rule gives a file of `tokens`; the draft is tombstoned
+/// either way.
 ///
-/// **A reading past the lineage cap is drafted over windows**
-/// (`super::windows`): each window's draft holds its turns, is asked for its
-/// share, and the questions of every window are kept once. A part is empty
-/// only when every window left it so.
-fn draft(
-    engine: &ConversationEngine,
-    spec: &CalibrateSpec,
-    base: &Sequence,
-    unit: &Unit,
-    tokens: usize,
-) -> anyhow::Result<Drafted> {
-    if tokens <= Substrate::INHERITED_CHAIN_TOKEN_CAP {
-        return draft_window(engine, spec, base, unit, tokens, None);
-    }
-    let turn_tokens: Vec<usize> = {
-        let conversation = engine.conversation();
-        let read = conversation.read();
-        (0..read.turn_count(unit.timeline))
-            .map(|i| read.turn_token_count_of(unit.timeline, TurnIndex(i)))
-            .collect()
-    };
-    let mut out = Drafted {
-        questions: Vec::new(),
-        wanted: 0,
-        empty: Vec::new(),
-        last_answer: String::new(),
-    };
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut empty: Option<Vec<String>> = None;
-    for window in windows(&turn_tokens, WINDOW_TOKENS) {
-        let held: usize = window.iter().map(|&i| turn_tokens[i as usize]).sum();
-        let keys = window
-            .iter()
-            .map(|&i| TurnKey::new(unit.timeline, TurnIndex(i)))
-            .collect();
-        let drafted = draft_window(engine, spec, base, unit, held, Some(keys))?;
-        out.wanted += drafted.wanted;
-        out.questions.extend(
-            drafted
-                .questions
-                .into_iter()
-                .filter(|q| seen.insert(q.to_lowercase())),
-        );
-        empty = Some(match empty {
-            None => drafted.empty,
-            Some(before) => before
-                .into_iter()
-                .filter(|part| drafted.empty.contains(part))
-                .collect(),
-        });
-        out.last_answer = drafted.last_answer;
-    }
-    out.empty = empty.unwrap_or_default();
-    Ok(out)
-}
-
-/// One draft of a unit's questions, over `window` of its reading — the whole
-/// reading, its inherited chain, when `None` — asked for as many as `tokens`
-/// of reading call for.
-///
-/// **Every part in one turn, with the reading in front of it.** The parts see
+/// **Every part in one turn, with the file in front of it.** The parts see
 /// each other, so a later one can be told to ask nothing an earlier one asked;
 /// a question two parts repeat word for word is kept once. An answer that
 /// carries no headings is read as one list, against the parts' counts
 /// together.
-fn draft_window(
+fn draft(
     engine: &ConversationEngine,
     spec: &CalibrateSpec,
     base: &Sequence,
-    unit: &Unit,
+    file: FileKey,
+    subject: &str,
+    members: &HashSet<u32>,
     tokens: usize,
-    window: Option<Vec<TurnKey>>,
 ) -> anyhow::Result<Drafted> {
-    on_a_draft(
-        engine,
-        &spec.layer,
-        base,
-        unit.timeline,
-        &unit.subject,
-        |conv| {
-            if let Some(window) = window {
-                conv.frame_window(window);
-            }
-            // A draft has no tools, and one that opens a call anyway writes no
-            // question: a file too long for its projection was asked for again
-            // with `file_read`, every pass.
-            let mut sampling = conv.default_sampling();
-            if sampling.tool_call_open_token_id >= 0 {
-                sampling
-                    .banned_tokens
-                    .push(sampling.tool_call_open_token_id);
-            }
-            // A part a unit is asked for none of is left out of the turn.
-            let (asks, wanted): (Vec<&Ask>, Vec<usize>) = spec
-                .asks_for(&unit.subject)
-                .iter()
-                .map(|a| (a, a.questions.for_tokens(tokens)))
-                .filter(|&(_, n)| n > 0)
-                .unzip();
-            let parts: Vec<(&str, String)> = asks
-                .iter()
-                .zip(&wanted)
-                .map(|(a, &n)| (a.name.as_str(), a.prompt_for(&unit.subject, n)))
-                .collect();
-            // Every part's heading is the grammar's, so no part is skipped and
-            // the answer cannot end before the last ([`grammar`]).
-            let headings: Vec<(&str, usize)> = asks
-                .iter()
-                .zip(&wanted)
-                .map(|(a, &n)| (a.name.as_str(), n))
-                .collect();
-            let spec =
-                grammar(&headings).map_err(|e| anyhow::anyhow!("the draft's grammar: {e}"))?;
-            let tree = engine
-                .compile_stencil(&spec)
-                .map_err(|e| anyhow::anyhow!("compiling the draft's grammar: {e}"))?;
-            let options = TurnOptions {
-                max_tokens: Some(DRAFT_MAX_TOKENS),
-                sampling: Some(sampling),
-                turn_grammar: Some(TurnGrammar::of(Arc::new(tree))),
-                selection: draft_selection(),
-                tags: vec![TAG.to_string()],
-                ..Default::default()
-            };
-            // What of the reading the draft is about to be asked in front of.
-            let dump = conv.prompt_dump();
-            let held = dump.as_ref().map(|d| reading_held(d, unit.timeline));
-            tracing::info!(
-                target: "zend::calibrate",
-                subject = %unit.subject,
-                reading = tokens,
-                held = ?held,
-                prompt = ?dump.as_ref().map(|d| d.token_count),
-                "calibration draft projected",
-            );
-            // No dump is a framed first turn — the system prompt alone — and
-            // as blind as one that places nothing of the reading.
-            if held.unwrap_or(0) == 0 {
-                anyhow::bail!("{BLIND_DRAFT} ({tokens} tokens)");
-            }
-            let handle = conv
-                .submit_turn_with_options(
-                    compose(&parts, unit.link.then(|| unit_path(&unit.subject))),
-                    options,
-                )
-                .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
-            let resp = handle
-                .wait_cancellable(crate::ingest_cancel::token())
-                .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-            let answer = answer_of(&resp.answer, 0, &resp.stats.finish);
-            conv.finish_turn(handle, &resp)
-                .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
-            let answer = answer?;
-            let total: usize = wanted.iter().sum();
-            let names: Vec<&str> = asks.iter().map(|a| a.name.as_str()).collect();
-            let mut seen: HashSet<String> = HashSet::new();
-            let mut kept: Vec<String> = Vec::new();
-            let empty: Vec<String> = match split(&answer, &names) {
-                Some(bodies) => {
-                    let mut parts: Vec<(&str, usize, usize)> = Vec::with_capacity(asks.len());
-                    for ((body, &n), ask) in bodies.iter().zip(&wanted).zip(&asks) {
-                        let before = kept.len();
-                        kept.extend(
-                            questions(body, n)
-                                .into_iter()
-                                .filter(|q| seen.insert(q.to_lowercase())),
-                        );
-                        let got = kept.len() - before;
-                        // An optional part is told to stop short rather than
-                        // pad, so writing few is its answer, not a failure.
-                        if ask.questions.min > 0 {
-                            short_of(unit, &ask.name, n, got, body);
-                        }
-                        parts.push((ask.name.as_str(), ask.questions.min, got));
+    let mut conv = framed_fork(engine, base, &spec.layer, FilesPin::Only(file))?;
+    let timeline = conv.timeline_id();
+    let out = (|| {
+        // A draft has no tools, and one that opens a call anyway writes no
+        // question: a file too long for its projection was asked for again
+        // with `file_read`, every pass.
+        let mut sampling = conv.default_sampling();
+        if sampling.tool_call_open_token_id >= 0 {
+            sampling
+                .banned_tokens
+                .push(sampling.tool_call_open_token_id);
+        }
+        // A part a file is asked for none of is left out of the turn.
+        let (asks, wanted): (Vec<&Ask>, Vec<usize>) = spec
+            .asks_for(subject)
+            .iter()
+            .map(|a| (a, a.questions.for_tokens(tokens)))
+            .filter(|&(_, n)| n > 0)
+            .unzip();
+        let parts: Vec<(&str, String)> = asks
+            .iter()
+            .zip(&wanted)
+            .map(|(a, &n)| (a.name.as_str(), a.prompt_for(subject, n)))
+            .collect();
+        // Every part's heading is the grammar's, so no part is skipped and
+        // the answer cannot end before the last ([`grammar`]).
+        let headings: Vec<(&str, usize)> = asks
+            .iter()
+            .zip(&wanted)
+            .map(|(a, &n)| (a.name.as_str(), n))
+            .collect();
+        let grammar_spec =
+            grammar(&headings).map_err(|e| anyhow::anyhow!("the draft's grammar: {e}"))?;
+        let tree = engine
+            .compile_stencil(&grammar_spec)
+            .map_err(|e| anyhow::anyhow!("compiling the draft's grammar: {e}"))?;
+        let options = TurnOptions {
+            max_tokens: Some(DRAFT_MAX_TOKENS),
+            sampling: Some(sampling),
+            turn_grammar: Some(TurnGrammar::of(Arc::new(tree))),
+            selection: draft_selection(),
+            tags: vec![TAG.to_string()],
+            ..Default::default()
+        };
+        // What of the file the draft is about to be asked in front of.
+        let dump = conv.prompt_dump();
+        let held = dump.as_ref().map(|d| members_held(d, members));
+        tracing::info!(
+            target: "zend::calibrate",
+            subject,
+            file = tokens,
+            held = ?held,
+            prompt = ?dump.as_ref().map(|d| d.token_count),
+            "calibration draft projected",
+        );
+        if held.unwrap_or(0) == 0 {
+            anyhow::bail!("{BLIND_DRAFT} ({tokens} tokens)");
+        }
+        let handle = conv
+            .submit_turn_with_options(compose(&parts), options)
+            .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
+        let resp = handle
+            .wait_cancellable(crate::ingest_cancel::token())
+            .map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+        let answer = answer_of(&resp.answer, 0, &resp.stats.finish);
+        conv.finish_turn(handle, &resp)
+            .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
+        let answer = answer?;
+        let total: usize = wanted.iter().sum();
+        let names: Vec<&str> = asks.iter().map(|a| a.name.as_str()).collect();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut kept: Vec<String> = Vec::new();
+        let empty: Vec<String> = match split(&answer, &names) {
+            Some(bodies) => {
+                let mut parts: Vec<(&str, usize, usize)> = Vec::with_capacity(asks.len());
+                for ((body, &n), ask) in bodies.iter().zip(&wanted).zip(&asks) {
+                    let before = kept.len();
+                    kept.extend(
+                        questions(body, n)
+                            .into_iter()
+                            .filter(|q| seen.insert(q.to_lowercase())),
+                    );
+                    let got = kept.len() - before;
+                    // An optional part is told to stop short rather than
+                    // pad, so writing few is its answer, not a failure.
+                    if ask.questions.min > 0 {
+                        short_of(subject, &ask.name, n, got, body);
                     }
-                    empty_parts(&parts)
-                        .into_iter()
-                        .map(str::to_string)
-                        .collect()
+                    parts.push((ask.name.as_str(), ask.questions.min, got));
                 }
-                None => {
-                    kept = questions(&answer, total)
-                        .into_iter()
-                        .filter(|q| seen.insert(q.to_lowercase()))
-                        .collect();
-                    short_of(unit, "all", total, kept.len(), &answer);
-                    let least: usize = asks.iter().map(|a| a.questions.min).sum();
-                    if kept.len() < least {
-                        vec!["all".to_string()]
-                    } else {
-                        Vec::new()
-                    }
+                empty_parts(&parts)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            }
+            None => {
+                kept = questions(&answer, total)
+                    .into_iter()
+                    .filter(|q| seen.insert(q.to_lowercase()))
+                    .collect();
+                short_of(subject, "all", total, kept.len(), &answer);
+                let least: usize = asks.iter().map(|a| a.questions.min).sum();
+                if kept.len() < least {
+                    vec!["all".to_string()]
+                } else {
+                    Vec::new()
                 }
-            };
-            Ok(Drafted {
-                questions: kept,
-                wanted: total,
-                empty,
-                last_answer: answer,
-            })
-        },
-    )
+            }
+        };
+        Ok(Drafted {
+            questions: kept,
+            wanted: total,
+            empty,
+            last_answer: answer,
+        })
+    })();
+    let _ = engine.tombstone_timeline(timeline);
+    out
 }
 
 /// **A part that writes far short of its count is said so, with what it
-/// wrote.** The draft is gone once read, and a unit one of whose parts kept
+/// wrote.** The draft is gone once read, and a file one of whose parts kept
 /// nothing reads like one with a small budget.
-fn short_of(unit: &Unit, part: &str, wanted: usize, got: usize, wrote: &str) {
+fn short_of(subject: &str, part: &str, wanted: usize, got: usize, wrote: &str) {
     if got * 2 >= wanted {
         return;
     }
     let opening: String = wrote.chars().take(240).collect();
     tracing::warn!(
         target: "zend::calibrate",
-        subject = %unit.subject,
+        subject,
         part,
         wanted,
         got,
@@ -963,56 +906,18 @@ fn short_of(unit: &Unit, part: &str, wanted: usize, got: usize, wrote: &str) {
     );
 }
 
-/// Run `f` on a draft: a fork of `base` whose lineage is the unit at `unit` —
-/// so the unit's reading is the draft's opening and its recurrent memory the
-/// one the reading left — named as `layer`'s draft so a crash's is retired.
-/// The draft is tombstoned whatever `f` returns.
-pub(super) fn on_a_draft<T>(
-    engine: &ConversationEngine,
-    layer: &str,
-    base: &Sequence,
-    unit: TimelineId,
-    subject: &str,
-    f: impl FnOnce(&mut Sequence) -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    let mut conv = base
-        .fork()
-        .map_err(|e| anyhow::anyhow!("draft conversation: {e}"))?;
-    let timeline = conv.timeline_id();
-    let named = {
-        let e = engine;
-        e.conversation().mark_timeline_transient(timeline);
-        e.set_timeline_summarize(timeline, false);
-        e.set_conversation_metadata(timeline, DRAFT_KEY, layer)
-            .and_then(|()| e.set_forked_from(timeline, unit))
-            .map_err(|err| anyhow::anyhow!("draft lineage: {err}"))
-    };
-    let out = named.and_then(|()| {
-        if let Err(err) = conv.seed_recurrent_from_lineage() {
-            tracing::warn!(
-                target: "zend::calibrate",
-                subject,
-                "seeding the draft's recurrent memory from its unit failed: {err:#}",
-            );
-        }
-        f(&mut conv)
-    });
-    let _ = engine.tombstone_timeline(timeline);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::ask::RawAsk;
     use super::super::count::QuestionCount;
     use super::super::profile::{Profile, RawProfile};
     use super::*;
-    use candle_conversation::projection::{Conversation, LayerId};
-    use candle_conversation::substrate::TurnPartWrite;
-    use candle_conversation::turn_layout::{KvSpan, TurnLayout, TurnSegment};
-    use candle_conversation::Role;
+    use candle_conversation::files::{ChunkRecord, LineSpan, MemberRef};
+    use candle_conversation::persistence::content_hash::ContentHash;
+    use candle_conversation::persistence::streams::ContentAddress;
+    use candle_conversation::projection::SEED_SELECTOR;
 
-    /// Failures count against the marker they happened under: a new reading
+    /// Failures count against the marker they happened under: a new version
     /// starts again.
     #[test]
     fn a_failure_counts_only_against_its_own_marker() {
@@ -1042,7 +947,7 @@ mod tests {
         assert!(empty_parts(&[]).is_empty());
     }
 
-    /// **Only the unit's own failures count against it**: a draft that wrote
+    /// **Only the file's own failures count against it**: a draft that wrote
     /// nothing or stopped short, not a decode lost to a full card.
     #[test]
     fn only_the_units_own_failures_count_against_it() {
@@ -1057,25 +962,8 @@ mod tests {
         ));
     }
 
-    /// A file unit is named by its path within its repository; a unit that is
-    /// not a file, by its whole subject.
-    #[test]
-    fn a_unit_is_named_by_its_path_within_its_repository() {
-        assert_eq!(unit_path("yenbot/AGENTS.md"), "AGENTS.md");
-        assert_eq!(unit_path("candle/zend/src/lib.rs"), "zend/src/lib.rs");
-        assert_eq!(unit_path("journals"), "journals");
-    }
-
-    /// **Every keyed unit is found; only a whole, finished one is ready.** A
-    /// unit with a turn still to arrive, and one cut off mid-thought, are
-    /// found but not ready; a calibration and an unkeyed conversation of the
-    /// group are not units.
-    #[test]
-    fn a_unit_is_ready_only_whole_and_finished() {
-        let conv = Conversation::ephemeral();
-        let layer = LayerId::from_raw(1).unwrap();
-        let group = GroupId::from_raw(1).unwrap();
-        let spec = CalibrateSpec {
+    fn spec() -> CalibrateSpec {
+        CalibrateSpec {
             layer: "code_reading".into(),
             think: 64,
             profiles: vec![Profile::of(RawProfile {
@@ -1093,98 +981,114 @@ mod tests {
             })
             .unwrap()],
             guidance: None,
-        };
-        let said = |tl: TimelineId, text: &str| {
-            conv.record_turn(
-                tl,
-                Role::User,
-                TurnPartWrite {
-                    layout: TurnLayout::new(vec![TurnSegment::Assistant {
-                        text: Some(text.into()),
-                        kv: KvSpan::new(0, 4),
-                    }]),
-                    token_count: 4,
-                    ..Default::default()
-                },
-                |seqs| Ok(seqs.to_vec()),
-            )
-            .unwrap();
-        };
-        let answered = |tl: TimelineId| said(tl, "It reads the file.");
-        let reading = |path: &str, version: u32| format!("v{version}:{path}@1");
-        let keyed = |tl: TimelineId, path: &str, key: &str| {
-            conv.set_conversation_metadata(tl, CONTENT_KEY, key)
-                .unwrap();
-            conv.set_conversation_metadata(tl, PATH_KEY, path).unwrap();
-        };
-        let [whole, gappy, cal, unkeyed, cut, old, built, built_old] =
-            [11u64, 12, 13, 14, 15, 16, 17, 18].map(|raw| TimelineId::from_raw(raw).unwrap());
-        for tl in [whole, gappy, cal, unkeyed, cut, old, built, built_old] {
-            conv.register_timeline(tl, layer, group);
         }
-        let current = KEY_VERSION;
-        answered(whole);
-        keyed(whole, "candle/a.rs", &reading("candle/a.rs", current));
-        conv.update(|s| s.restore_gap_turn(gappy));
-        answered(gappy);
-        keyed(gappy, "candle/b.rs", &reading("candle/b.rs", current));
-        answered(cal);
-        keyed(cal, "candle/c.rs", &reading("candle/c.rs", current));
-        conv.set_conversation_metadata(cal, Substrate::CALIBRATES_KEY, &whole.raw().to_string())
-            .unwrap();
-        answered(unkeyed);
-        said(cut, "<think>It reads the fi");
-        keyed(cut, "candle/d.rs", &reading("candle/d.rs", current));
-        // Read under the version before: waits to be read again.
-        answered(old);
-        keyed(old, "candle/e.rs", &reading("candle/e.rs", current - 1));
-        // Units built on a reading, keyed apart, judged by the reading's key.
-        for (tl, version) in [(built, current), (built_old, current - 1)] {
-            answered(tl);
-            keyed(tl, "candle/f.rs", &format!("u1:review:{}", tl.raw()));
-            conv.set_conversation_metadata(tl, FILE_KEY, &reading("candle/f.rs", version))
-                .unwrap();
-        }
+    }
 
-        let units = units_of(&conv.read(), group, &spec);
-        let unit = |timeline: TimelineId, subject: &str, key: String, ready: bool| Unit {
-            timeline,
-            subject: subject.into(),
-            marker: spec.marker(&key, subject, false),
-            key,
-            ready,
-            prior_failures: None,
-            link: false,
+    fn record(path: &str, unit: FileUnit) -> FileRecord {
+        let member = MemberRef {
+            address: ContentAddress {
+                prefix_hash: ContentHash { lo: 1, hi: 0 },
+                section_hash: ContentHash { lo: 2, hi: 0 },
+            },
+            tokens: 10,
         };
+        FileRecord {
+            content_key: format!("v7:{path}@1"),
+            path: path.into(),
+            blob: "1".into(),
+            unit,
+            lines: 3,
+            lang: "rs".into(),
+            branches: vec!["main".into()],
+            heading: member,
+            chunks: vec![ChunkRecord {
+                lines: LineSpan { first: 1, last: 3 },
+                member,
+            }],
+        }
+    }
+
+    /// **A file is two units, one a frame, named by the file's scan id; only
+    /// a file sealed here is ready, and a folder is no unit.** Each frame's
+    /// marker is its own, and a file whose failures ran out under a frame's
+    /// marker waits behind that frame alone.
+    #[test]
+    fn a_file_is_a_unit_per_frame_ready_once_sealed_here() {
+        let conv = Conversation::new();
+        let spec = spec();
+        let sealed = record("candle/a.rs", FileUnit::File);
+        let arrived = record("candle/b.rs", FileUnit::File);
+        let folder = record("candle/src/", FileUnit::Folder);
+        for r in [&sealed, &arrived, &folder] {
+            records::put(&conv, r).unwrap();
+        }
+        let id = conv.allocate_owned_section().unwrap();
+        conv.register_owned_section(files_owner(), &heading_name(&sealed.path, &sealed.blob), id);
+        let worn = format!("target:{}", sealed.content_key);
+        failures::record(
+            &conv,
+            &worn,
+            &spec.marker(&worn, &sealed.path),
+            MAX_FAILURES,
+        )
+        .unwrap();
+
+        let units = units_of(&conv, &spec);
+        let got: Vec<(&str, KbFrame, bool)> = units
+            .iter()
+            .map(|u| (u.subject.as_str(), u.frame, u.ready))
+            .collect();
         assert_eq!(
-            units,
+            got,
             vec![
-                unit(whole, "candle/a.rs", reading("candle/a.rs", current), true),
-                unit(gappy, "candle/b.rs", reading("candle/b.rs", current), false),
-                unit(cut, "candle/d.rs", reading("candle/d.rs", current), false),
-                unit(
-                    old,
-                    "candle/e.rs",
-                    reading("candle/e.rs", current - 1),
-                    false
-                ),
-                unit(built, "candle/f.rs", "u1:review:17".into(), true),
-                unit(built_old, "candle/f.rs", "u1:review:18".into(), false),
+                ("candle/a.rs", KbFrame::Empty, true),
+                ("candle/a.rs", KbFrame::Target, false),
+                ("candle/b.rs", KbFrame::Empty, false),
+                ("candle/b.rs", KbFrame::Target, false),
             ]
         );
-    }
-    /// A question's thinking is decoded as a live dialogue turn is: no dial
-    /// is set, so thinking stays on at the dialogue's default effort.
-    #[test]
-    fn a_question_is_thought_about_as_a_live_turn_is() {
-        let s = thinking_selection();
-        assert_eq!(s.get("thinking_effort"), None);
-        assert_eq!(s.optional(NO_THINK_SELECTOR), None);
+        assert_eq!(units[0].timeline, sealed.key().scan_id());
+        assert_eq!(units[0].key, format!("empty:{}", sealed.content_key));
+        assert_ne!(units[0].marker, units[1].marker);
+        assert_eq!(
+            CalibrateSpec::unit_of(&units[1].marker),
+            Some(units[1].key.as_str())
+        );
+        assert_eq!(by_file(&units).len(), 2);
     }
 
-    /// A draft is asked without reasoning and without a tool block.
+    /// **A calibration names its file's scan id, and the frame it was asked
+    /// in.**
     #[test]
-    fn a_draft_neither_reasons_nor_sees_tools() {
+    fn a_calibration_names_its_file_key_and_frame() {
+        let file = FileKey(0x473e_088d_5653_2900);
+        let meta = calibration_meta(file.scan_id(), "candle/a.rs");
+        assert_eq!(
+            meta.get(Substrate::CALIBRATES_KEY).map(String::as_str),
+            Some("5133550028380645632")
+        );
+        assert_eq!(
+            meta.get(SUBJECT_KEY).map(String::as_str),
+            Some("candle/a.rs")
+        );
+        assert_eq!(CALIBRATION_FRAME_KEY, "calibration_frame");
+    }
+
+    /// A question's thinking is decoded as a live dialogue turn is — no dial
+    /// but the seed set, so thinking stays on at the dialogue's default effort
+    /// — and on the seed's absent branch.
+    #[test]
+    fn a_question_is_thought_about_as_a_live_turn_is_without_the_seed() {
+        let s = frame_selection();
+        assert_eq!(s.get("thinking_effort"), None);
+        assert_eq!(s.optional(NO_THINK_SELECTOR), None);
+        assert_eq!(s.optional(SEED_SELECTOR), Some(OptionalState::Absent));
+    }
+
+    /// A draft is asked without reasoning, without a tool block and without
+    /// the seed.
+    #[test]
+    fn a_draft_neither_reasons_nor_sees_tools_nor_the_seed() {
         let s = draft_selection();
         assert_eq!(s.get("thinking_effort"), Some("off"));
         assert_eq!(s.optional(NO_THINK_SELECTOR), Some(OptionalState::Present));
@@ -1192,5 +1096,6 @@ mod tests {
             s.optional(TOOLS_ENABLED_SELECTOR),
             Some(OptionalState::Absent)
         );
+        assert_eq!(s.optional(SEED_SELECTOR), Some(OptionalState::Absent));
     }
 }

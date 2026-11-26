@@ -186,24 +186,6 @@ pub(in super::super) fn run_inference_stream(
             Some((guard, files)) => (Some(guard), Some(files)),
             None => (None, None),
         };
-        // Record the fork's lineage: the seed alias (`Substrate::SEED_PARENT`),
-        // so the priming chain's anchor documents open a brand new
-        // conversation — nothing is copied, and the pointer is persisted
-        // metadata. The alias is resolved where the lineage is read, to the
-        // chain the serving member holds now: a timeline id here named one
-        // boot's chain on one member, and the conversation lost its seed on
-        // every other member and after the chain was rebuilt (2026-11-11).
-        //
-        // Best-effort: a conversation that answers without its inherited
-        // context is far better than one that refuses to open.
-        if minted {
-            if let Err(e) = state.engine.set_forked_from_seed(timeline) {
-                tracing::warn!(
-                    conv_id = %conv_id,
-                    "recording fork lineage failed, conversation starts unprimed: {e}",
-                );
-            }
-        }
         let conv_arc = match forked {
             Ok(arc) => arc,
             Err(e) => {
@@ -227,35 +209,6 @@ pub(in super::super) fn run_inference_stream(
             Some(guard) => guard,
             None => conv_arc.clone().lock_owned().await,
         };
-        // The slot was seeded from this (fresh) timeline before the lineage
-        // above existed; ask again so the conversation opens with the priming
-        // chain's recurrent memory behind it rather than from nothing.
-        //
-        // On a blocking thread: the seed is a scheduler round-trip that waits
-        // on the queue behind whatever wave is running (measured in the
-        // hundreds of ms for its sibling `InstallRecurrentState`), and this
-        // task's contract is that every wait in it is an await — see the note
-        // where it is spawned. Blocking here would pin a runtime worker and
-        // stall every other stream sharing it.
-        //
-        // `cs` is moved into the closure and handed back rather than
-        // re-locked through `conv_arc`: it is already held, and
-        // `OwnedMutexGuard` is not reentrant — a second lock through the same
-        // Arc from this same logical task would deadlock against itself.
-        if minted {
-            let cid = conv_id.clone();
-            cs = tokio::task::spawn_blocking(move || {
-                if let Err(e) = cs.conv.seed_recurrent_from_lineage() {
-                    tracing::warn!(
-                        conv_id = %cid,
-                        "seeding recurrent memory from the priming chain failed: {e}",
-                    );
-                }
-                cs
-            })
-            .await
-            .expect("seed_recurrent_from_lineage task panicked");
-        }
         // What a draft of this conversation's journal is put through, so one can
         // start without its lock: the asker its questions fork from.
         if minted && state.journaling {
@@ -297,26 +250,16 @@ pub(in super::super) fn run_inference_stream(
                 let took = conv_inherit::take(&state.engine, timeline, &files, &mirror, &theirs);
                 tracing::info!(conv_id = %conv_id, %from, took, "a task begins on its starter's work");
             }
-            // Its working set is in-memory and did not survive. The seeds
-            // resolve again on its own branch and enter provenance at the
-            // seeding momentum, and the rest of the momentum rebuilds from
-            // the scan.
-            if let Some(config) = state.working_set.clone() {
+            // Its working set is in-memory and did not survive: it opens
+            // cleared and scoped, and its momentum rebuilds from the scan.
+            if state.working_set.is_some() {
                 let open_state = Arc::clone(&state);
                 let open_conv = conv_id.clone();
-                // The turn's seed dial: off, the conversation opens on no seeds
-                // and its working set is what provenance alone brings in.
-                let seeding = selection.seeds();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     let t_open = Instant::now();
                     open_state.engine.working_set_clear(timeline);
                     let clear_ms = t_open.elapsed().as_millis() as u64;
                     let t_scope = Instant::now();
-                    // Scope it first. A seed is admitted only as the
-                    // conversation's scope offers it, and the scope is
-                    // otherwise first set right before its first submit — after
-                    // this — so every seed was refused: measured 2026-10-24, no
-                    // dialogue had carried a seed since scoping landed.
                     open_state.retrieval_scope.apply(
                         &open_state.engine,
                         timeline,
@@ -324,21 +267,12 @@ pub(in super::super) fn run_inference_stream(
                         &files,
                     );
                     let scope_ms = t_scope.elapsed().as_millis() as u64;
-                    let t_seed = Instant::now();
-                    let seeded = if seeding {
-                        seed_working_set(&open_state, timeline, &open_conv, &files, &config)
-                    } else {
-                        0
-                    };
-                    let seed_ms = t_seed.elapsed().as_millis() as u64;
                     tracing::info!(
                         target: "zend::working_set",
                         timeline = timeline.raw(),
-                        seeded,
                         clear_ms,
                         scope_ms,
-                        seed_ms,
-                        "working set opened: seeds in provenance",
+                        "working set opened",
                     );
                 })
                 .await

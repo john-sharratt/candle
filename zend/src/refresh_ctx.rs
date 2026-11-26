@@ -9,12 +9,11 @@
 
 use std::sync::Arc;
 
-use candle_conversation::projection::{Builder, DecodePriority, GroupId, TimelineId};
-use candle_conversation::stencil::{OpeningCall, ThinkMode, TriggerRegistry};
+use candle_conversation::projection::{Builder, GroupId};
+use candle_conversation::stencil::{ThinkMode, TriggerRegistry};
 use candle_conversation::{ConversationEngine, Sequence, SequenceConfig};
 use zend_tools::ToolContext;
 
-use crate::priming_watch;
 use crate::retrieval_scope::RetrievalScope;
 use crate::types::ToolMode;
 
@@ -38,44 +37,17 @@ pub struct RefreshContext<'a> {
     /// identically to a live dialogue turn (`InferenceState::load`'s
     /// `formatted_prompt`).
     pub formatted_prompt: &'a str,
-    /// Tool-call grammar + `<think>` steering for `ThinkMode::Off`, whose tree
-    /// closes a think block on the token after it opens — the same steering
-    /// repo_map's folder summaries run under. Compiled from the REAL tool
-    /// catalog (not an empty placeholder) — see `turn_triggers`.
+    /// Tool-call grammar + `<think>` steering for `ThinkMode::Off` over the
+    /// restricted tools mode: what an analysis unit runs under when
+    /// [`Self::think_for`] gives none.
     pub think_triggers: Arc<TriggerRegistry>,
-    /// A file reading's opening call: the `<tool_call>` marker and the call
-    /// loop over `file_read` alone, which a file's first turn begins inside
-    /// (`code_read::run_file_conversation`), so the turn reads before it can
-    /// end — measured ending on its first token, `<|im_end|>`, for three files
-    /// whose readings were then replaced by nothing (2026-11-11). `None` when
-    /// the tokenizer has no single `<tool_call>` token, as `think_triggers`
-    /// then holds no call grammar either.
-    pub read_opening: Option<OpeningCall>,
-    /// Tool-execution context a hidden ingest conversation's real `file_read`
-    /// calls run against — read-only grants, the daemon's own workspace
-    /// (`ToolMode::Restricted`'s context, the same one an unprivileged live
-    /// dialogue turn runs tools in). Each unit's conversation runs in a copy
-    /// of it with file stores of its own, as every conversation does.
+    /// Tool-execution context the ingest reads files and folders through —
+    /// read-only grants, the daemon's own workspace (`ToolMode::Restricted`'s
+    /// context). Each unit reads in a copy of it with file stores pinned to
+    /// the commit it was found on.
     pub tool_ctx: Arc<ToolContext>,
     /// Told whenever a unit commits, so the next turn's scope can find it.
     pub retrieval: &'a RetrievalScope,
-    /// The priming chain's end (`crate::branch_ingest::prime`): the conversation
-    /// an analysis layer's unit descends from when its job names no parent of
-    /// its own (`crate::layers`). `None` when there is no chain.
-    pub chain_end: Option<TimelineId>,
-    /// The link before the one being read, while a priming-chain link is read
-    /// (`code_read::ingest_link`, `repo_scan::ingest_link`): recorded as the
-    /// link's parent before its reading starts, so the chain reads in order.
-    /// `None` for every other `code_reading` file and `repo_map` folder, which
-    /// are sealed behind the system prompt alone: a turn's K/V carries the
-    /// context it was computed in, and a file sealed behind the chain was
-    /// measured unreadable by a reader that does not hold the chain directly
-    /// ahead of it (`docs/results/theorem_depth_tests_2026-11-10.md`).
-    pub link_parent: Option<TimelineId>,
-    /// The band a unit's new conversation decodes at in place of its layer's
-    /// ([`Self::fork_unit`]). `None` for the layer's own: only a priming-chain
-    /// link names one ([`PRIMING_BAND`]).
-    pub band: Option<DecodePriority>,
     /// The steering for each thinking level and tools mode, for a unit of a
     /// layer that thinks (`crate::layers`) — the same registry a dialogue turn
     /// at that level and mode runs under, so a unit whose tools only a wider
@@ -90,32 +62,10 @@ pub struct RefreshContext<'a> {
 /// The steering for a thinking level, over a tools mode's call grammar.
 pub type ThinkFor = Arc<dyn Fn(ThinkMode, ToolMode) -> Arc<TriggerRegistry> + Send + Sync>;
 
-/// The band a priming-chain link is read at.
-///
-/// Nothing in this daemon is served until the chain is built, so it is not
-/// background work. At its layer's `Low` it yields 64:1 to any `High` decode on
-/// the device: beside npcd's constant decodes on WhiteWorld (805affbfe,
-/// 2026-10-31) one link's prompt moved only when they paused, four minutes of
-/// 73, and the load took 93 minutes against 12–14 before. `High` splits the
-/// device with them by the work each side holds. `Normal` would not: it yields
-/// 64:1 too.
-pub const PRIMING_BAND: DecodePriority = DecodePriority::High;
-
 impl RefreshContext<'_> {
-    /// `base`'s fork for a new unit, at this context's band.
+    /// `base`'s fork for a new analysis unit.
     pub fn fork_unit(&self, base: &Sequence) -> candle_conversation::Result<Sequence> {
-        match self.band {
-            Some(band) => base.fork_at(band),
-            None => base.fork(),
-        }
-    }
-
-    /// Say a chain link has reached `stage`; a unit read at no band of its own
-    /// is no link.
-    pub fn link_stage(&self, stage: &'static str) {
-        if self.band.is_some() {
-            priming_watch::stage(stage);
-        }
+        base.fork()
     }
 
     /// The steering a turn thinking at `mode` runs under, its tool calls held

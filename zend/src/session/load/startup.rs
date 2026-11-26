@@ -116,7 +116,7 @@ impl InferenceState {
         // behind `files_open`, read by every branch checkpoint's recurrence
         // (docs/provenance_system_collection.md §6.2b).
         let (seed_repos, _) = crate::branch_ingest::record_branches(&workspace);
-        crate::files::seed::install(&mut proj_builder, &seed_repos)?;
+        let seed_read = crate::files::seed::install(&mut proj_builder, &seed_repos)?;
         // The journal collection selects each conversation's own sections by
         // name; scoped before the base conversation is built, so no projection
         // ever reads it any other way.
@@ -406,13 +406,6 @@ impl InferenceState {
         };
         let [none, restricted, comprehensive] = ToolMode::ALL.map(compile);
         let tool_stencils = [none?, restricted?, comprehensive?];
-        // A file's reading calls `file_read` and nothing else, one page a
-        // reply (`docs/hit_driven_projection.md` §8.2): a loop of one call over
-        // that one tool.
-        let read_stencil = engine
-            .compile_tool_stencil(&reading_tools(), READ_CALLS_PER_REPLY)
-            .map_err(|e| anyhow::anyhow!("file reading's tool stencil: {e}"))?;
-        let read_opening = read_opening(&engine)?;
         // The thinking-block steering trees (one per non-off effort dial),
         // compiled once and reused across turns alongside the tool-call base.
         let think_steering = engine
@@ -902,16 +895,6 @@ impl InferenceState {
             )?;
         }
 
-        // Ingest conversations are read, never continued: retire the recurrent
-        // snapshot tails they kept from before the mark existed, and mark each
-        // so no later seal writes another (`crate::ingest_snapshots`).
-        let retired = crate::ingest_snapshots::retire_finished(&engine);
-        if retired > 0 {
-            tracing::info!(
-                retired,
-                "retired the recurrent snapshots of finished ingest conversations"
-            );
-        }
         crate::layers::removed::sweep(&engine);
         for il in &ingest_layers {
             if disabled_layers.contains(&il.name) {
@@ -920,18 +903,14 @@ impl InferenceState {
             if let Some(layer_id) = proj_builder_refresh.id_for_layer(&il.name) {
                 engine.mark_layer_append_only(layer_id);
             }
-            // Retire crashed partials before any pool starts — a half-built chain
-            // still carries its `WideQSig`s, so until it is tombstoned it competes
-            // in the gather with a promiscuous file listing and no summary. Nothing
-            // is in flight at this point, which is why the sweep lives here and not
-            // inside the ingest passes, which can overlap a pool mid-flight.
+            // Retire an analysis layer's crashed partials before any pool
+            // starts. Nothing is in flight at this point, which is why the sweep
+            // lives here and not inside the ingest passes, which can overlap a
+            // pool mid-flight. A file or folder record is written whole, and a
+            // raw record's turns and content hash commit together, so neither
+            // has a half-built state to retire.
             match il.mode {
-                IngestMode::Folders => crate::repo_scan::retire_crashed_partials(&engine),
-                IngestMode::Files => crate::code_read::retire_crashed_partials(&engine),
-                // Raw ingest has no half-built state to retire: a record's turns
-                // are prefilled and its content hash written in the same commit,
-                // so a conversation is either absent or complete.
-                IngestMode::Raw => {}
+                IngestMode::Folders | IngestMode::Files | IngestMode::Raw => {}
                 IngestMode::Derived => {
                     crate::layers::run::retire_crashed_partials(&engine, &il.name)
                 }
@@ -1144,7 +1123,6 @@ impl InferenceState {
             target_layer: base_conv.target_layer_name(),
             base_conv,
             ingest_bases,
-            chain_end: Mutex::new(None),
             titler_tx,
             retitles: PendingRetitles::default(),
             titler_worker: Mutex::new(None),
@@ -1161,7 +1139,6 @@ impl InferenceState {
             learning_exclusions: AtomicBool::new(false),
             exclusion_learners: Mutex::new(HashMap::new()),
             working_set,
-            read_coverage: Coverage::default(),
             refresh_builder: proj_builder_refresh,
             refresh_config: conv_config.clone(),
             formatted_prompt,
@@ -1177,8 +1154,6 @@ impl InferenceState {
             base_branches,
             tool_stencils,
             held_stencils: ArcSwap::default(),
-            read_stencil,
-            read_opening,
             think_steering,
             passthrough: PassthroughCache::new(),
             deletions: Deletions::default(),
@@ -1209,16 +1184,7 @@ impl InferenceState {
                 worker_hop::install(Arc::clone(member), join.derive_key(worker_hop::PURPOSE));
             }
         }
-        // The priming chain, read before `ready` and before the ingest worker's
-        // first pass: the first question asked must already have it, and the
-        // pass must find its links committed rather than read them unparented.
-        progress.set_step(LoadStep::Priming);
-        state.prime(&progress)?;
-        // The chain stops between links on a stop; the links it read are
-        // committed, and the next start reads only the rest.
-        if load_stopped(&state.engine, "priming") {
-            return Ok(None);
-        }
+        state.branch_ingest.set_seed_read(seed_read);
         let worker_state = Arc::clone(&state);
         // Spawned on the daemon's runtime — the loader thread holds an enter
         // guard for exactly this kind of arming (see `start_loading`).

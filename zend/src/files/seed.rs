@@ -15,11 +15,16 @@ use zend_vfs::vfs::Tree;
 use zend_vfs::{GitError, Rev};
 
 use super::listing::listing_text;
-use crate::branch_ingest::prime::ANCHOR_FILES;
 use crate::branch_ingest::walk::RepoBranches;
+use crate::journal::opening::SeedRead;
 
 /// The tree node whose present side the seed is installed into.
 pub const SEED_NODE: &str = "seed";
+
+/// Anchor documents, in seed order after a repository's root listing.
+/// Matched case-insensitively against the repository's own root files —
+/// never a subfolder's.
+pub const ANCHOR_FILES: [&str; 4] = ["README.md", "ARCHITECTURE.md", "AGENTS.md", "CLAUDE.md"];
 
 /// `text` as one chunk of a file: every line ending its `\n`.
 fn whole(text: &str) -> Chunk {
@@ -82,10 +87,23 @@ pub fn seed_text(files: &[RenderedFile]) -> String {
     assemble_pieces(files).into_iter().skip(1).collect()
 }
 
+/// What `files`, the seed's, read: each root listing by its repository, each
+/// anchor by its path — what a dialogue's journal opens by saying it read.
+pub fn seed_read(files: &[RenderedFile]) -> SeedRead {
+    let mut read = SeedRead::default();
+    for f in files {
+        match f.path.strip_suffix('/') {
+            Some(repo) => read.listings.push(repo.to_string()),
+            None => read.documents.push(f.path.clone()),
+        }
+    }
+    read
+}
+
 /// Render the seed from `repos` and install it into `builder`'s `seed`
-/// optional, returning its text's length in bytes. A repository whose tree
-/// cannot be read is left out of the seed, and said so.
-pub fn install(builder: &mut Builder, repos: &[RepoBranches]) -> anyhow::Result<usize> {
+/// optional, returning what it read. A repository whose tree cannot be read
+/// is left out of the seed, and said so.
+pub fn install(builder: &mut Builder, repos: &[RepoBranches]) -> anyhow::Result<SeedRead> {
     let mut files = Vec::new();
     for repo in repos {
         match repo_seed(repo) {
@@ -105,7 +123,7 @@ pub fn install(builder: &mut Builder, repos: &[RepoBranches]) -> anyhow::Result<
         bytes = text.len(),
         "seed installed: the repositories' roots, in the knowledge base",
     );
-    Ok(text.len())
+    Ok(seed_read(&files))
 }
 
 #[cfg(test)]
@@ -164,5 +182,8 @@ mod tests {
              ## The content from r/README.md:\n\n```\n# R\n```\n\n\
              ## The content from r/agents.md:\n\n```\nrules\n```\n"
         );
+        let read = seed_read(&files);
+        assert_eq!(read.listings, ["r"]);
+        assert_eq!(read.documents, ["r/README.md", "r/agents.md"]);
     }
 }
