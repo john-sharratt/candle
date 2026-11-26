@@ -406,6 +406,7 @@ impl Scheduler {
                             );
                             opening.pieces = projection.fill.clone();
                             opening.unpooled = projection.unpooled.clone();
+                            opening.files = projection.files_placed.clone();
                             // Where the knowledge base's files sit, for the
                             // next projection to keep.
                             conversation.update(|s| {

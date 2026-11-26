@@ -8,6 +8,7 @@
 //! "was this file in what the model saw at this point", which the full point
 //! (`/projections/{turn}/{event}`) answers only beside every placed turn's body.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -15,6 +16,7 @@ use axum::{
     http::HeaderMap,
     response::Response,
 };
+use candle_conversation::files::FileKey;
 use candle_conversation::projection::ProjectionEvent;
 use serde::Serialize;
 
@@ -27,6 +29,10 @@ pub struct PointPlacements {
     /// The decoded-token position the point was selected at.
     pub start_token: u32,
     pub placed: Vec<Placed>,
+    /// The knowledge base's files the point placed, by path, in the order they
+    /// sit; a file whose record this member no longer holds is named by its
+    /// key.
+    pub files: Vec<String>,
 }
 
 /// One working piece the point placed turns of.
@@ -40,9 +46,11 @@ pub struct Placed {
     pub tokens: usize,
 }
 
-/// The placements of every point of `turns`, a turn's points in order.
+/// The placements of every point of `turns`, a turn's points in order, each
+/// file named through `paths`.
 pub fn placements_of<'a>(
     turns: impl IntoIterator<Item = impl IntoIterator<Item = &'a ProjectionEvent>>,
+    paths: &HashMap<FileKey, String>,
 ) -> Vec<Vec<PointPlacements>> {
     turns
         .into_iter()
@@ -61,6 +69,11 @@ pub fn placements_of<'a>(
                             tokens: p.placed_tokens,
                         })
                         .collect(),
+                    files: event
+                        .files
+                        .iter()
+                        .map(|f| paths.get(f).cloned().unwrap_or_else(|| f.hex()))
+                        .collect(),
                 })
                 .collect()
         })
@@ -73,7 +86,11 @@ pub async fn get(
     headers: HeaderMap,
 ) -> Response {
     let turns = session.conversation_projections(&id);
-    let placements = placements_of(turns.iter().map(|points| points.iter().map(|p| &p.event)));
+    let paths = session.knowledge_base_paths();
+    let placements = placements_of(
+        turns.iter().map(|points| points.iter().map(|p| &p.event)),
+        &paths,
+    );
     compressed::json(&placements, &headers)
 }
 
@@ -117,17 +134,20 @@ mod tests {
         };
         let later = ProjectionEvent {
             start_token: 128,
+            files: vec![FileKey(0x0a), FileKey(0x0b)],
             ..ProjectionEvent::default()
         };
-        let out = placements_of([vec![&opening, &later]]);
+        let paths = HashMap::from([(FileKey(0x0a), "candle/clippy.toml".to_string())]);
+        let out = placements_of([vec![&opening, &later]], &paths);
         assert_eq!(
             serde_json::to_value(&out).unwrap(),
             json!([[
                 {"start_token": 0, "placed": [
                     {"kind": "Reading", "path": "candle/zend/src/a.rs", "tokens": 900},
                     {"kind": "Journal", "tokens": 40},
-                ]},
-                {"start_token": 128, "placed": []},
+                ], "files": []},
+                {"start_token": 128, "placed": [],
+                 "files": ["candle/clippy.toml", "000000000000000b"]},
             ]])
         );
     }

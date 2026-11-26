@@ -585,6 +585,7 @@ impl Scheduler {
             );
             composition.pieces = projection.fill.clone();
             composition.unpooled = projection.unpooled.clone();
+            composition.files = projection.files_placed.clone();
             // Where the knowledge base's files sit, for the next projection
             // to keep.
             policy.substrate.update(|s| {

@@ -54,6 +54,7 @@ pub fn aggregate(
         groups: Vec::new(),
         pieces: Vec::new(),
         unpooled: Vec::new(),
+        files: Vec::new(),
     }
 }
 
@@ -118,6 +119,7 @@ pub fn staged_ingest_event(
         groups: Vec::new(),
         pieces: Vec::new(),
         unpooled: Vec::new(),
+        files: Vec::new(),
     }
 }
 
@@ -185,5 +187,6 @@ pub fn summary_node_event(
         groups: Vec::new(),
         pieces: Vec::new(),
         unpooled: Vec::new(),
+        files: Vec::new(),
     }
 }

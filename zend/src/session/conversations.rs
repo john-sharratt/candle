@@ -9,7 +9,10 @@
 //! once and leaves compaction to reclaim its records. Listing is gated on the
 //! redo log still existing, so a wiped substrate shows no ghost conversations.
 
+use candle_conversation::files::FileKey;
+
 use super::*;
+use crate::files::records;
 
 /// Sidebar entry surfaced by `GET /v1/conversations`. Built directly from
 /// the substrate — `RecordType::Label` records carry the `conv_id`
@@ -364,6 +367,18 @@ impl ZendSession {
                     })
                     .collect()
             })
+            .collect()
+    }
+
+    /// Every file of the knowledge base this member records, by its key:
+    /// what a projection point's placed files are named by.
+    pub fn knowledge_base_paths(&self) -> HashMap<FileKey, String> {
+        let Some(state) = self.inference.load_full() else {
+            return HashMap::new();
+        };
+        records::all(&state.engine.conversation())
+            .into_iter()
+            .map(|r| (r.key(), r.path))
             .collect()
     }
 }
