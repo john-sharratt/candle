@@ -125,28 +125,48 @@ impl Runtime {
     /// this lets it go, and the turn it then takes rejoins its conversation
     /// from the log and reads what reached it meanwhile, bounded per source.
     pub(crate) fn follow_rest(&self, hosted: &Hosted) {
-        let minds = self.minds.read().unwrap().clone();
         for (npc, body) in self.bodies.in_world(hosted.id()) {
-            if !self.standing.runs(npc) {
-                continue;
+            self.follow_rest_of(hosted, npc, &body);
+        }
+    }
+
+    /// [`Self::follow_rest`] for one character, before anything of its is
+    /// scheduled: called as it is started here and before each turn it would
+    /// begin.
+    ///
+    /// **Rest is decided before the first turn, not on the next moment.** Rest
+    /// is the scheduler's, and a restart starts every character awake; the
+    /// world's moment that puts the drones back at rest comes once its
+    /// authority is taken, seconds later. In between, every drone took a turn
+    /// on what it last knew and its conversations rescanned their threads:
+    /// Wick, at rest, posted his finished mission's "I'm checking the status
+    /// board" to the channel again, and Zen read it as news.
+    pub(crate) fn settle_rest(&self, npc: u64) {
+        if let Some((hosted, body)) = self.body_of(npc) {
+            self.follow_rest_of(&hosted, npc, &body);
+        }
+    }
+
+    fn follow_rest_of(&self, hosted: &Hosted, npc: u64, body: &str) {
+        if !self.standing.runs(npc) {
+            return;
+        }
+        let rest = self.at_rest(hosted, body);
+        if !self.scheduler.rest(npc, rest) {
+            return;
+        }
+        match rest {
+            true => {
+                let minds = self.minds.read().unwrap().clone();
+                let freed = minds.as_ref().is_some_and(|m| m.let_go(npc));
+                tracing::info!(
+                    npc,
+                    freed,
+                    "drone at rest: it carries no mission, and takes no turn until it is given one"
+                );
+                self.tell_whole(hosted, body, "has come to rest, with nothing to carry.");
             }
-            let rest = self.at_rest(hosted, &body);
-            if !self.scheduler.rest(npc, rest) {
-                continue;
-            }
-            match rest {
-                true => {
-                    let freed = minds.as_ref().is_some_and(|m| m.let_go(npc));
-                    tracing::info!(
-                        npc,
-                        freed,
-                        "drone at rest: it carries no mission, and takes no turn until it is \
-                         given one"
-                    );
-                    self.tell_whole(hosted, &body, "has come to rest, with nothing to carry.");
-                }
-                false => tracing::info!(npc, "drone woken: it carries a mission"),
-            }
+            false => tracing::info!(npc, "drone woken: it carries a mission"),
         }
     }
 

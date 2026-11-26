@@ -541,6 +541,10 @@ mod tests {
         let (rt, _s) = daemon(&dir);
         let world = rt.host(WORLD, Path::new(ROOMS)).unwrap();
         rt.hold_world(WORLD, true);
+        // No table to be given work by: with one, a character carrying no
+        // mission is a drone at rest from the moment it wakes, and takes no
+        // turn to be grounded in.
+        rt.set_table_open(false);
         world.with(|w| w.enter("m1", "Maker-01", at("green-room")).unwrap());
         rt.bodies.bind(1, WORLD, "m1").unwrap();
         assert!(world.delta("m1").percept.is_some(), "shown here once");

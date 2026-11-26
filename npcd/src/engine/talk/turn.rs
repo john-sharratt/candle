@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use candle_conversation::projection::DecodePriority;
+use journal_core::entry::Entry;
 use journal_core::journal::Holds;
 use journal_core::workflow::Outcome;
 use journals::actor::Actor;
@@ -26,6 +27,7 @@ use crate::engine::event::{EventKind, Salience, TalkLine};
 use crate::engine::experience::line;
 use crate::engine::mind::{Minds, Talk, TalkTurn};
 use crate::engine::runtime::Runtime;
+use crate::engine::talk::asked::held_request;
 use crate::engine::talk::authority;
 use crate::engine::talk::catchup::{self, CatchUp};
 use crate::engine::talk::clock::{self, Ended, Input};
@@ -544,7 +546,7 @@ impl Runtime {
             }
         }
         if matches!(ended, Ended::Spoke) {
-            if let Some(entry) = self
+            if let Some(kept) = self
                 .journal_turn(
                     &minds,
                     &talk,
@@ -560,10 +562,20 @@ impl Runtime {
                 // **What a person asked, and the character means to do, is
                 // held until it is done and told** (`Scheduler::ask`): the
                 // entry reaches the mind once, and the next thing to wake it
-                // says nothing of it.
-                if party.is_person() && !told && entry.contains(TALK.meaning_to) {
-                    self.scheduler.ask(npc, &seen.party_name, &entry, world_ms);
+                // says nothing of it. Held as their words and the intent —
+                // see `asked`.
+                if party.is_person() && !told {
+                    let said: Vec<&str> = lines
+                        .iter()
+                        .filter(|l| l.from != body)
+                        .map(|l| l.text.as_str())
+                        .collect();
+                    if let Some(request) = held_request(&seen.party_name, &said, &kept) {
+                        self.scheduler
+                            .ask(npc, &seen.party_name, &request, world_ms);
+                    }
                 }
+                let entry = kept.detail(&TALK);
                 elsewhere = vec![entry];
                 // A telling has already woken the mind; its entry is read on
                 // the turn that wake starts.
@@ -604,7 +616,7 @@ impl Runtime {
 
     /// Draft the conversation's journal over the turn just taken — what
     /// `lines` said and what `reply` answered — and keep its record with the
-    /// conversation. The entry as it reads in full when one was kept; `None`
+    /// conversation. The entry, when one was kept; `None`
     /// when nobody spoke, the stretch added nothing, or the draft did not
     /// finish, which costs an entry and nothing else.
     #[allow(clippy::too_many_arguments)]
@@ -618,7 +630,7 @@ impl Runtime {
         reply: &str,
         world_ms: u64,
         band: DecodePriority,
-    ) -> Option<String> {
+    ) -> Option<Entry> {
         let turns = journal::stretch(lines, me, reply, world_ms);
         let newest = turns.last()?.id;
         let mut held = TalkJournal::restore(&minds.talk_meta(talk));
@@ -639,7 +651,7 @@ impl Runtime {
                     "a conversation's journal entry was kept — {}",
                     entry.summary
                 );
-                Some(entry.detail(&journal::TALK))
+                Some(entry)
             }
             Outcome::Nothing { why } => {
                 tracing::info!(npc, "nothing worth a conversation's journal entry — {why}");

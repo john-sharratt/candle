@@ -167,7 +167,10 @@ pub(super) async fn character_loop(rt: Arc<Runtime>, id: u64) {
             // The tick's three phases, with the decode awaited between
             // the first two and the last — [`Scheduler::begin_tick`] /
             // [`Scheduler::end_tick`] are `tick` split at exactly that
-            // seam, so this loop and the scheduler tests run one path.
+            // seam, so this loop and the scheduler tests run one path. A drone
+            // at rest is held first, so `begin_tick` refuses it
+            // (`Runtime::settle_rest`).
+            rt.settle_rest(id);
             let Some(mut start) = rt.scheduler.begin_tick(id) else {
                 rt.end_decision(id);
                 continue;
@@ -329,9 +332,10 @@ pub(super) async fn character_loop(rt: Arc<Runtime>, id: u64) {
                         // keeps `body::NO_REFLECTION` until the
                         // reflection answers.
                         let mut reflecting: Option<(Owed, [String; 3])> = None;
-                        // What each act came back with, in call order: what
-                        // the loop guard judges an act that names nothing by.
-                        let mut came_back: Vec<String> = Vec::new();
+                        // What each act came back with and whether the world
+                        // took it, in call order: what the loop guard judges
+                        // an act that names nothing by.
+                        let mut came_back: Vec<(String, bool)> = Vec::new();
                         for a in &t.parsed.acts {
                             // Made in the world the character stands in,
                             // wherever that world runs — see
@@ -419,7 +423,7 @@ pub(super) async fn character_loop(rt: Arc<Runtime>, id: u64) {
                                     [arg("situation"), arg("inner_thoughts"), arg("feeling")],
                                 ));
                             }
-                            came_back.push(answer.clone());
+                            came_back.push((answer.clone(), took));
                             answers.push(answer);
                             // A pause that landed stops the character
                             // here. Armed after the act rather than
@@ -454,33 +458,42 @@ pub(super) async fn character_loop(rt: Arc<Runtime>, id: u64) {
                             .acts
                             .iter()
                             .zip(&came_back)
-                            .map(|(a, back)| match body::is_device(a.tool) {
-                                true => {
-                                    let path = device_path(
-                                        a.args.get("url").and_then(|v| v.as_str()).unwrap_or(""),
-                                    );
-                                    // An address it was not offered keeps its
-                                    // address in what it meant, so two calls to
-                                    // two different unknown devices are never
-                                    // one call — and `invoke` itself is struck
-                                    // only for the same call made again.
-                                    match within
-                                        .invokable
-                                        .iter()
-                                        .find(|i| device_path(&i.url) == path)
-                                    {
-                                        Some(i) => Took::call(i.act, salient(a)),
-                                        None => {
-                                            Took::call(a.tool, format!("{path} {}", salient(a)))
+                            .map(|(a, (back, landed))| {
+                                let took = match body::is_device(a.tool) {
+                                    true => {
+                                        let path = device_path(
+                                            a.args
+                                                .get("url")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or(""),
+                                        );
+                                        // An address it was not offered keeps its
+                                        // address in what it meant, so two calls to
+                                        // two different unknown devices are never
+                                        // one call — and `invoke` itself is struck
+                                        // only for the same call made again.
+                                        match within
+                                            .invokable
+                                            .iter()
+                                            .find(|i| device_path(&i.url) == path)
+                                        {
+                                            Some(i) => Took::call(i.act, salient(a)),
+                                            None => {
+                                                Took::call(a.tool, format!("{path} {}", salient(a)))
+                                            }
                                         }
                                     }
+                                    false => match salient(a) {
+                                        meant if meant.trim().is_empty() => {
+                                            Took::call(a.tool, back.as_str())
+                                        }
+                                        meant => Took::new(a.tool, meant),
+                                    },
+                                };
+                                match *landed {
+                                    true => took,
+                                    false => took.refused(),
                                 }
-                                false => match salient(a) {
-                                    meant if meant.trim().is_empty() => {
-                                        Took::call(a.tool, back.as_str())
-                                    }
-                                    meant => Took::new(a.tool, meant),
-                                },
                             })
                             .collect();
                         // A fight is the one place the guard lets `act`
