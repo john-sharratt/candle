@@ -15,13 +15,22 @@ use crate::files::fill::{choose, FilePlacement};
 use crate::files::names::{
     chunk_name, heading_name, CLOSING_JOIN_NAME, CLOSING_LAST_NAME, GAP_NAME,
 };
-use crate::files::{FileKey, FileRecord, FilesPin, LineSpan};
+use crate::files::{FileKey, FileRecord, FilesPin, LineSpan, PlacedFile};
 
 /// The files a projection places and the segments they are placed as.
 pub(crate) struct FilesSplice {
-    /// The placed files, in the order they sit.
-    pub order: Vec<FileKey>,
+    /// The placed files, in the order they sit, each with its placed chunks'
+    /// lines.
+    pub placed: Vec<PlacedFile>,
     pub segments: Vec<ProjectionSegment>,
+}
+
+#[cfg(test)]
+impl FilesSplice {
+    /// The placed files' keys, in the order they sit.
+    pub(crate) fn order(&self) -> Vec<FileKey> {
+        self.placed.iter().map(|p| p.file).collect()
+    }
 }
 
 /// The files to place under `kind_cap` — each working-set group of `schema`
@@ -36,7 +45,7 @@ pub(crate) fn files_splice<R: ContentResolver>(
     seeded: bool,
 ) -> FilesSplice {
     let empty = FilesSplice {
-        order: Vec::new(),
+        placed: Vec::new(),
         segments: Vec::new(),
     };
     let Some(set) = resolver.files_set() else {
@@ -135,7 +144,13 @@ pub(crate) fn files_splice<R: ContentResolver>(
         segments.push(section(if ends { last } else { join }));
     }
     FilesSplice {
-        order: resolved.into_iter().map(|(f, _, _)| f).collect(),
+        placed: resolved
+            .into_iter()
+            .map(|(file, _, chunks)| PlacedFile {
+                file,
+                chunks: chunks.into_iter().map(|(lines, _)| lines).collect(),
+            })
+            .collect(),
         segments,
     }
 }

@@ -70,9 +70,9 @@ pub fn placements_of<'a>(
                         })
                         .collect(),
                     files: event
-                        .files
+                        .placed
                         .iter()
-                        .map(|f| paths.get(f).cloned().unwrap_or_else(|| f.hex()))
+                        .map(|p| paths.get(&p.file).cloned().unwrap_or_else(|| p.file.hex()))
                         .collect(),
                 })
                 .collect()
@@ -96,6 +96,7 @@ pub async fn get(
 
 #[cfg(test)]
 mod tests {
+    use candle_conversation::files::PlacedFile;
     use candle_conversation::projection::{PieceReport, Standing};
     use serde_json::json;
 
@@ -134,7 +135,12 @@ mod tests {
         };
         let later = ProjectionEvent {
             start_token: 128,
-            files: vec![FileKey(0x0a), FileKey(0x0b)],
+            placed: [0x0a, 0x0b]
+                .map(|k| PlacedFile {
+                    file: FileKey(k),
+                    chunks: vec![],
+                })
+                .to_vec(),
             ..ProjectionEvent::default()
         };
         let paths = HashMap::from([(FileKey(0x0a), "candle/clippy.toml".to_string())]);

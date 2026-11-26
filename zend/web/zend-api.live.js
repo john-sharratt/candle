@@ -123,13 +123,13 @@
       return Object.assign({ span: body.span }, panelContext(body));
     },
     // The panel context alone, for a point already held in full: `turns` is
-    // its `selection.turns` and the turns of its materialized spine, sent as
-    // they are.
-    async getProjectionContext(convId, turns) {
+    // its `selection.turns` and the turns of its materialized spine, and
+    // `placed` the knowledge base's files it placed, sent as they are.
+    async getProjectionContext(convId, turns, placed) {
       const r = await fetch('/v1/conversations/' + enc(convId) + '/projection-context', {
         method: 'POST',
         headers: { 'content-type': 'application/json', accept: 'application/json' },
-        body: JSON.stringify({ turns: turns || [] }),
+        body: JSON.stringify({ turns: turns || [], placed: placed || [] }),
       });
       if (!r.ok) throw new Error('POST projection-context -> ' + r.status);
       return panelContext(await r.json());
@@ -483,7 +483,7 @@
     (body.section_content || []).forEach((s) => { sectionContent[s.name] = s.content; });
     const turnContent = {};
     (body.turn_content || []).forEach((t) => { turnContent[t.group + '::' + t.timeline + '::' + t.index] = { text: t.text, user: t.user, assistant: t.assistant, layout: t.layout }; });
-    return { glue: body.glue || null, sectionContent, turnContent, targetLayer: body.target_layer || '' };
+    return { glue: body.glue || null, sectionContent, turnContent, targetLayer: body.target_layer || '', files: body.files || [] };
   }
 
   // Parse one upload SSE frame -> the upload handlers.

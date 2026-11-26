@@ -23,7 +23,7 @@ use super::ids::{CollectionId, GroupId, SectionId, TurnIndex, TurnKey};
 use super::project::{ProjectionSegment, SealedKind};
 use super::scan_stats::GroupScan;
 use super::schema::{Schema, SystemPromptItem};
-use crate::files::FileKey;
+use crate::files::PlacedFile;
 use crate::substrate::ContentResolver;
 use crate::summary_tree::{SelectionOrigin, TurnKind};
 
@@ -121,10 +121,11 @@ pub struct ProjectionEvent {
     /// does not hold.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unpooled: Vec<Unpooled>,
-    /// The knowledge base's files this point placed, in the order they sit
+    /// The knowledge base's files this point placed, in the order they sit,
+    /// each with its placed chunks' lines
     /// (`docs/provenance_system_collection.md` §3). Empty when it placed none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub files: Vec<FileKey>,
+    pub placed: Vec<PlacedFile>,
 }
 
 /// One turn group's scan, named for the record.

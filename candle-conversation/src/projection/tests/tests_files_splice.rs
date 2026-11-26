@@ -5,7 +5,7 @@ use super::*;
 use crate::files::names::{
     chunk_name, heading_name, CLOSING_JOIN_NAME, CLOSING_LAST_NAME, GAP_NAME,
 };
-use crate::files::{ChunkRecord, FileKey, FileUnit, FilesPin, LineSpan, MemberRef};
+use crate::files::{ChunkRecord, FileKey, FileUnit, FilesPin, LineSpan, MemberRef, PlacedFile};
 use crate::persistence::content_hash::ContentHash;
 use crate::persistence::streams::ContentAddress;
 use crate::projection::project::{files_splice, ProjectionSegment, SealedKind};
@@ -139,7 +139,24 @@ fn files_are_spliced_strongest_first_each_framed_and_the_last_ends_the_knowledge
         vec![],
     );
     let splice = files_splice(b.schema(), &mock, |_| 10_000, false);
-    assert_eq!(splice.order, vec![fb.key(), fa.key()]);
+    assert_eq!(splice.order(), vec![fb.key(), fa.key()]);
+    // Each placement names the lines of the chunks it placed, in order.
+    assert_eq!(
+        splice.placed[1],
+        PlacedFile {
+            file: fa.key(),
+            chunks: vec![
+                LineSpan {
+                    first: 1,
+                    last: 200
+                },
+                LineSpan {
+                    first: 401,
+                    last: 600
+                }
+            ],
+        }
+    );
     assert_eq!(
         ids(&splice.segments),
         vec![
@@ -190,7 +207,7 @@ fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
     );
     mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key()]);
     let splice = files_splice(b.schema(), &mock, |_| 0, false);
-    assert_eq!(splice.order, vec![fa.key()]);
+    assert_eq!(splice.order(), vec![fa.key()]);
     assert_eq!(
         ids(&splice.segments),
         vec![
@@ -216,7 +233,7 @@ fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
     );
     mock.files.as_mut().unwrap().pin = FilesPin::Empty;
     let empty = files_splice(b.schema(), &mock, |_| 10_000, false);
-    assert!(empty.order.is_empty());
+    assert!(empty.placed.is_empty());
     assert!(empty.segments.is_empty());
 }
 
@@ -237,7 +254,7 @@ fn pinned_files_sit_in_the_pins_order() {
     );
     mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key(), fb.key()]);
     let splice = files_splice(b.schema(), &mock, |_| 0, false);
-    assert_eq!(splice.order, vec![fa.key(), fb.key()]);
+    assert_eq!(splice.order(), vec![fa.key(), fb.key()]);
     let chunk = |path: &str| m[&chunk_name(path, "b", LineSpan { first: 1, last: 10 })];
     assert_eq!(
         ids(&splice.segments),
@@ -302,7 +319,7 @@ layers:
     );
     mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key()]);
     let proj = b.project(target, &mock);
-    assert_eq!(proj.files_placed, vec![fa.key()]);
+    assert_eq!(proj.files_order(), vec![fa.key()]);
     let heading = m[&heading_name("candle/a.rs", "b")];
     let sections: Vec<SectionId> = proj
         .segments
@@ -335,7 +352,7 @@ fn a_kept_file_keeps_its_place_in_the_knowledge_base() {
         vec![fa.key(), fb.key()],
     );
     assert_eq!(
-        files_splice(b.schema(), &mock, |_| 10_000, false).order,
+        files_splice(b.schema(), &mock, |_| 10_000, false).order(),
         vec![fa.key(), fb.key()]
     );
 }

@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use candle::engine_events::note;
 
-use crate::files::{FileKey, FilesPin};
+use crate::files::{FileKey, FilesPin, PlacedFile};
 
 use super::adaptive::AnchorMember;
 use super::dialogue_fill::{self, ContextExchange, DialogueSlot, WorkingPiece};
@@ -150,9 +150,18 @@ pub struct Projection {
     /// hold.
     pub unpooled: Vec<Unpooled>,
     /// The knowledge base's files this projection placed, in the order they
-    /// sit (`docs/provenance_system_collection.md` §3): what the target's
-    /// files set keeps as its placed order once the projection is applied.
-    pub files_placed: Vec<FileKey>,
+    /// sit, each with its placed chunks' lines
+    /// (`docs/provenance_system_collection.md` §3): their keys are what the
+    /// target's files set keeps as its placed order once the projection is
+    /// applied.
+    pub files_placed: Vec<PlacedFile>,
+}
+
+impl Projection {
+    /// The placed files' keys, in the order they sit.
+    pub fn files_order(&self) -> Vec<FileKey> {
+        self.files_placed.iter().map(|p| p.file).collect()
+    }
 }
 
 /// One section-tree selector as resolved for a projection — the selector id and

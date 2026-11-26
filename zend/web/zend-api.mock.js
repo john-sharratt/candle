@@ -1095,7 +1095,17 @@
           ] };
         }
       });
-      return { sectionContent: content, glue, turnContent, targetLayer: 'dialogue' };
+      // The knowledge base's files the point placed, each under its layer:
+      // one file placed in two runs, and a folder listing.
+      const files = [
+        { key: '00000000000000a1', path: 'candle/candle-core/src/tensor.rs', layer: 'code_reading', folder: false,
+          lines: [{ first: 1, last: 200 }, { first: 401, last: 520 }], tokens: 3120,
+          text: J(['## The content from candle/candle-core/src/tensor.rs:', '', '```rust', 'pub struct Tensor { … }', '```', '', '...', '', '```rust', 'impl Tensor { pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> { … } }', '```']) },
+        { key: '00000000000000b2', path: 'candle/candle-nn/src/', layer: 'repo_map', folder: true,
+          lines: [{ first: 1, last: 14 }], tokens: 96,
+          text: J(['## The content from candle/candle-nn/src/:', '', '```', 'kv_cache/', 'layers.rs', 'lib.rs', '```']) },
+      ];
+      return { sectionContent: content, glue, turnContent, targetLayer: 'dialogue', files };
     },
 
     // ── Live logs ──────────────────────────────────────────────────────────

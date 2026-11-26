@@ -439,6 +439,19 @@ test.describe('1.7 projection selection', () => {
     await panel.getByRole('button', { name: 'Copy all' }).click();
     await expect(panel.getByRole('button', { name: 'Copied' })).toBeVisible();
   });
+
+  // A placed file is its layer's contribution: drawn as that layer's card,
+  // with the lines placed, and expanding to the text the model read.
+  test('draws the placed files under their layers', async ({ page }) => {
+    await boot(page, { conv: '1' });
+    await page.locator('.z-projbar').last().click();
+    const panel = page.locator('.z-modal', { hasText: 'Projection selection' });
+    const file = panel.getByText('code_reading · file candle/candle-core/src/tensor.rs · lines 1–200, 401–520');
+    await expect(file).toBeVisible();
+    await expect(panel.getByText('repo_map · folder candle/candle-nn/src/')).toBeVisible();
+    await file.click();
+    await expect(panel.getByText('## The content from candle/candle-core/src/tensor.rs:', { exact: false })).toBeVisible();
+  });
 });
 
 test.describe('1.8 files + upload', () => {

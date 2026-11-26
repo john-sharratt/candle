@@ -303,234 +303,234 @@ impl Scheduler {
                 // Whether a new user message waits for its first boundary — the
                 // turn is a request, read first without the seeds.
                 let mut question_pending = false;
-                let (projected_sections, projected_segments) =
-                    if let (Some(frame), Some(_)) = (frame, slot_target) {
-                        let (sections, segments, turns) = framed_segments(frame);
-                        turn_keys_for_elevate = turns;
-                        (sections, segments)
-                    } else if let (Some(inputs), Some(target)) = (
-                        projection_inputs.as_ref().filter(|_| !skip_projection),
-                        slot_target,
-                    ) {
-                        let conversation = match self.slot_conversations.get(&parent_id) {
-                            Some(c) => c.clone(),
-                            None => {
-                                let _ = event_tx.send(TurnEvent::Error(
-                                    ConversationError::Channel(format!(
+                let (projected_sections, projected_segments) = if let (Some(frame), Some(_)) =
+                    (frame, slot_target)
+                {
+                    let (sections, segments, turns) = framed_segments(frame);
+                    turn_keys_for_elevate = turns;
+                    (sections, segments)
+                } else if let (Some(inputs), Some(target)) = (
+                    projection_inputs.as_ref().filter(|_| !skip_projection),
+                    slot_target,
+                ) {
+                    let conversation = match self.slot_conversations.get(&parent_id) {
+                        Some(c) => c.clone(),
+                        None => {
+                            let _ = event_tx.send(TurnEvent::Error(ConversationError::Channel(
+                                format!(
                                     "submit_turn: no conversation registered for slot {parent_id}"
-                                )),
-                                ));
-                                return true;
-                            }
-                        };
-                        // Target-aware read: the projection sees only
-                        // `target.timeline` within `target.group`,
-                        // masking sibling timelines.
-                        // A request's second reading projects by its first
-                        // reading's scores (`first_reading`); every other
-                        // submit reads the substrate unscored.
-                        let first_reading = self.first_readings.remove(&parent_id);
-                        let view = match &first_reading {
-                            Some(scores) => conversation.read_for_scored(target, scores),
-                            None => conversation.read_for(target),
-                        };
-                        question_pending = ContentResolver::working_set_boundary(&view)
-                            .is_some_and(|b| b.question_pending);
-                        // Prefill mode: section scoring uses the calibrated
-                        // prefill profile (Max / semantic depth, no threshold)
-                        // against the prefill-Q section corpus.  The sink
-                        // captures score-density diagnostics for the test
-                        // harness (§10.8.4) on a substrate-side side-channel.
-                        // Last-write-wins per timeline; the recall test reads
-                        // it via `Conversation::last_selection_diagnostics`
-                        // after `send_turn` returns.  Sink is never invoked
-                        // when the rule-based path runs (no tree on the
-                        // target timeline).
-                        // Submit-time projection seeds from the conversation's belief
-                        // as of its last completed turn (`carried_beliefs`) — empty
-                        // only for a genuinely fresh conversation. The belief then
-                        // evolves through this turn's reprojections and is harvested
-                        // back at seal, so provenance selection is continuous across
-                        // turn boundaries instead of resetting to catalog order.
-                        //
-                        // Decayed at the boundary so it seeds as a SOFT PRIOR, not a
-                        // hard pin: the incoming query has no decode-Q evidence yet
-                        // (its prefill-Q hits the call↔definition domain gap), so a
-                        // full-strength prior would let the previous turn's tool own
-                        // the whole opening window and the model could commit to a
-                        // wrong framing before the correct tool is selected. Halving
-                        // lets the fresh decode-Q overtake a stale tool within a few
-                        // tokens; a real continuation re-accumulates just as fast.
-                        let mut carried_belief = self
-                            .carried_beliefs
-                            .get(&parent_id)
-                            .cloned()
-                            .unwrap_or_default();
-                        carried_belief.decay_scores(CARRIED_BELIEF_TURN_DECAY);
-                        // Choosing the context: the provenance scan and the section-tree walk
-                        // that decide which turns this reply attends over. Pure selection —
-                        // no K/V has moved yet.
-                        let _g_project = profile::span("drain:project");
-                        let projection = inputs.projection.project_with_mode_and_sink(
-                            target,
-                            &view,
-                            ProjectionMode::Prefill,
-                            &inputs.selection,
-                            &carried_belief,
-                            // Opening projection: decode position 0. The early-decode
-                            // window excludes position 0 (its prior is the previous
-                            // turn's decayed belief), so submit selects on the steady
-                            // band; the grace window engages once decode starts.
-                            Some(0),
-                            &mut |diag| {
-                                diag_to_write = Some((target.timeline, diag));
-                            },
-                        );
-                        // Emit the OPENING projection as a timeline event: a POINT at
-                        // token 0 (nothing decoded yet) carrying the initial composition
-                        // this turn decodes against. A projection governs everything
-                        // forward until the next reprojection supersedes it, so even a
-                        // short / no-think turn that never reprojects still gets this one
-                        // clickable record. `start_token`/`seconds` stay 0 — the turn's
-                        // opening point.
-                        {
-                            let mut opening = crate::projection::from_projection_with_origins(
-                                &projection.segments,
-                                &projection.selection_origins,
-                                inputs.projection.schema(),
-                                &view,
-                                &projection.selection_scores,
-                                view.total_token_count(target.timeline) as u32,
-                                0,
-                                0.0,
-                            );
-                            opening.pieces = projection.fill.clone();
-                            opening.unpooled = projection.unpooled.clone();
-                            opening.files = projection.files_placed.clone();
-                            // Where the knowledge base's files sit, for the
-                            // next projection to keep.
-                            conversation.update(|s| {
-                                s.files_placed(target.timeline, projection.files_placed.clone())
-                            });
-                            // The turn's decode state seeds its belief from what this
-                            // opening projection actually selected (the carried belief
-                            // stepped against this turn's selection), so the first
-                            // mid-decode reprojection continues the evolution.
-                            turn_belief = PriorBelief::from_selection(&opening.selection);
-                            opening.materialized = projection_assembler::materialize_conversation(
-                                &projection.segments,
-                                &projection.selection_origins,
-                                &view,
-                                inputs.projection.schema(),
-                                |toks| self.tokenizer.decode(toks, false).unwrap_or_default(),
-                            );
-                            let _ = event_tx.send(TurnEvent::Projection(opening));
+                                ),
+                            )));
+                            return true;
                         }
-                        // The schema's projection is the single source
-                        // of truth for system-side sections — emit
-                        // exactly what the projection picked, in
-                        // declaration order.  The legacy
-                        // "always prepend `system_section_id`" path
-                        // (a monolithic ChatML-wrapped duplicate of
-                        // the schema fragments) has been removed; the
-                        // schema items now compose the full system
-                        // prompt on their own.
-                        // Single walk of `projection.segments` builds three
-                        // outputs:
-                        //   - `projected_sections` / `turn_keys_for_elevate`
-                        //     feed `elevate_to_hot` (per-id form expected
-                        //     by the persistence API).
-                        //   - `segments` carries the same items in
-                        //     declaration order for `apply_projection`.
-                        // Each turn already carries its resolved timeline
-                        // (stamped at projection), so no group→timeline
-                        // resolution happens here.
-                        let mut sections: Vec<SectionId> = Vec::new();
-                        let mut segments: Vec<ProjectionSegment> = Vec::new();
-                        for seg in &projection.segments {
-                            match seg {
-                                ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
-                                    // Any-tier filter — cold-marker
-                                    // sections (post-reload, before
-                                    // elevate) must survive this filter
-                                    // so the `elevate_to_hot` call below
-                                    // can lift them.  Filtering on
-                                    // `section_sealed_of` (hot-only)
-                                    // would silently drop every
-                                    // not-yet-elevated section the
-                                    // projection selected.
-                                    if view.section_tier_state(rs.id).is_some() {
-                                        sections.push(rs.id);
-                                        segments.push(seg.clone());
-                                    }
-                                }
-                                ProjectionSegment::Sealed(SealedKind::Turn(rt, _)) => {
-                                    // The turn carries its conversation (stamped at
-                                    // projection); read it directly — no group→timeline
-                                    // re-derivation.  `elevate_to_hot` below brings
-                                    // cold-marker turns into hot before apply runs; a
-                                    // timeline-less (mock/untracked) turn is skipped.
-                                    let Some(timeline) = rt.timeline else {
-                                        continue;
-                                    };
-                                    turn_keys_for_elevate.push(TurnKey::new(timeline, rt.index()));
-                                    segments.push(seg.clone());
-                                }
-                                ProjectionSegment::Generated { .. }
-                                | ProjectionSegment::NewUserMessage { .. } => {
-                                    // Live-prefill runs and new-user-message
-                                    // captures don't need an elevate side-list
-                                    // entry — their K/V is produced on the
-                                    // slot, not loaded from the substrate.
-                                    segments.push(seg.clone());
-                                }
-                            }
-                        }
-
-                        // **No trailing `Generated(UserStart)`.**
-                        //
-                        // The live turn's opener is now the head of its own prefill
-                        // (`Sequence::submit_prefill_unit`), so it arrives as
-                        // ordinary tail prefill rather than as a glue island the
-                        // engine has to gap-fill. The distinction is the whole
-                        // difference for this lineage: appending at the writer tail
-                        // is prefill, which any model can do; filling a hole in the
-                        // middle of a sequence is gap-fill, which a recurrence
-                        // cannot do even in principle.
-                        //
-                        // It is invisible in the token stream — the same ids in the
-                        // same order — and visible only in whether a gap chunk was
-                        // reserved, which is what `T5a.1` asserts on.
-                        // Build the composition for a staged prefill's per-segment
-                        // projection events now, while the view guard is live. The
-                        // calibration projection is pinned (`SelectionRule::Named`), so
-                        // one composition serves every segment — the wave overrides its
-                        // point `start_token` per emission.
-                        if !projection_offsets.is_empty() {
-                            let total = view.total_token_count(target.timeline) as u32;
-                            staged_composition = Some(crate::projection::from_projection(
-                                &projection.segments,
-                                inputs.projection.schema(),
-                                &view,
-                                &projection.selection_scores,
-                                total,
-                                0,
-                                0.0,
-                            ));
-                        }
-                        // **No live `/no_think` run either.**
-                        //
-                        // The soft-switch is baked into the head of the turn that
-                        // carries it, decided once at submit from the dial that was
-                        // live then. That is *stronger* than re-deciding it every
-                        // projection, not weaker: the leak this used to guard
-                        // against — a past suppressed turn putting a stale switch on
-                        // a later thinking-on turn — cannot happen when each turn's
-                        // grid holds its own.
-                        (sections, segments)
-                    } else {
-                        (Vec::new(), Vec::new())
                     };
+                    // Target-aware read: the projection sees only
+                    // `target.timeline` within `target.group`,
+                    // masking sibling timelines.
+                    // A request's second reading projects by its first
+                    // reading's scores (`first_reading`); every other
+                    // submit reads the substrate unscored.
+                    let first_reading = self.first_readings.remove(&parent_id);
+                    let view = match &first_reading {
+                        Some(scores) => conversation.read_for_scored(target, scores),
+                        None => conversation.read_for(target),
+                    };
+                    question_pending = ContentResolver::working_set_boundary(&view)
+                        .is_some_and(|b| b.question_pending);
+                    // Prefill mode: section scoring uses the calibrated
+                    // prefill profile (Max / semantic depth, no threshold)
+                    // against the prefill-Q section corpus.  The sink
+                    // captures score-density diagnostics for the test
+                    // harness (§10.8.4) on a substrate-side side-channel.
+                    // Last-write-wins per timeline; the recall test reads
+                    // it via `Conversation::last_selection_diagnostics`
+                    // after `send_turn` returns.  Sink is never invoked
+                    // when the rule-based path runs (no tree on the
+                    // target timeline).
+                    // Submit-time projection seeds from the conversation's belief
+                    // as of its last completed turn (`carried_beliefs`) — empty
+                    // only for a genuinely fresh conversation. The belief then
+                    // evolves through this turn's reprojections and is harvested
+                    // back at seal, so provenance selection is continuous across
+                    // turn boundaries instead of resetting to catalog order.
+                    //
+                    // Decayed at the boundary so it seeds as a SOFT PRIOR, not a
+                    // hard pin: the incoming query has no decode-Q evidence yet
+                    // (its prefill-Q hits the call↔definition domain gap), so a
+                    // full-strength prior would let the previous turn's tool own
+                    // the whole opening window and the model could commit to a
+                    // wrong framing before the correct tool is selected. Halving
+                    // lets the fresh decode-Q overtake a stale tool within a few
+                    // tokens; a real continuation re-accumulates just as fast.
+                    let mut carried_belief = self
+                        .carried_beliefs
+                        .get(&parent_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    carried_belief.decay_scores(CARRIED_BELIEF_TURN_DECAY);
+                    // Choosing the context: the provenance scan and the section-tree walk
+                    // that decide which turns this reply attends over. Pure selection —
+                    // no K/V has moved yet.
+                    let _g_project = profile::span("drain:project");
+                    let projection = inputs.projection.project_with_mode_and_sink(
+                        target,
+                        &view,
+                        ProjectionMode::Prefill,
+                        &inputs.selection,
+                        &carried_belief,
+                        // Opening projection: decode position 0. The early-decode
+                        // window excludes position 0 (its prior is the previous
+                        // turn's decayed belief), so submit selects on the steady
+                        // band; the grace window engages once decode starts.
+                        Some(0),
+                        &mut |diag| {
+                            diag_to_write = Some((target.timeline, diag));
+                        },
+                    );
+                    // Emit the OPENING projection as a timeline event: a POINT at
+                    // token 0 (nothing decoded yet) carrying the initial composition
+                    // this turn decodes against. A projection governs everything
+                    // forward until the next reprojection supersedes it, so even a
+                    // short / no-think turn that never reprojects still gets this one
+                    // clickable record. `start_token`/`seconds` stay 0 — the turn's
+                    // opening point.
+                    {
+                        let mut opening = crate::projection::from_projection_with_origins(
+                            &projection.segments,
+                            &projection.selection_origins,
+                            inputs.projection.schema(),
+                            &view,
+                            &projection.selection_scores,
+                            view.total_token_count(target.timeline) as u32,
+                            0,
+                            0.0,
+                        );
+                        opening.pieces = projection.fill.clone();
+                        opening.unpooled = projection.unpooled.clone();
+                        opening.placed = projection.files_placed.clone();
+                        // Where the knowledge base's files sit, for the
+                        // next projection to keep.
+                        conversation
+                            .update(|s| s.files_placed(target.timeline, projection.files_order()));
+                        // The turn's decode state seeds its belief from what this
+                        // opening projection actually selected (the carried belief
+                        // stepped against this turn's selection), so the first
+                        // mid-decode reprojection continues the evolution.
+                        turn_belief = PriorBelief::from_selection(&opening.selection);
+                        opening.materialized = projection_assembler::materialize_conversation(
+                            &projection.segments,
+                            &projection.selection_origins,
+                            &view,
+                            inputs.projection.schema(),
+                            |toks| self.tokenizer.decode(toks, false).unwrap_or_default(),
+                        );
+                        let _ = event_tx.send(TurnEvent::Projection(opening));
+                    }
+                    // The schema's projection is the single source
+                    // of truth for system-side sections — emit
+                    // exactly what the projection picked, in
+                    // declaration order.  The legacy
+                    // "always prepend `system_section_id`" path
+                    // (a monolithic ChatML-wrapped duplicate of
+                    // the schema fragments) has been removed; the
+                    // schema items now compose the full system
+                    // prompt on their own.
+                    // Single walk of `projection.segments` builds three
+                    // outputs:
+                    //   - `projected_sections` / `turn_keys_for_elevate`
+                    //     feed `elevate_to_hot` (per-id form expected
+                    //     by the persistence API).
+                    //   - `segments` carries the same items in
+                    //     declaration order for `apply_projection`.
+                    // Each turn already carries its resolved timeline
+                    // (stamped at projection), so no group→timeline
+                    // resolution happens here.
+                    let mut sections: Vec<SectionId> = Vec::new();
+                    let mut segments: Vec<ProjectionSegment> = Vec::new();
+                    for seg in &projection.segments {
+                        match seg {
+                            ProjectionSegment::Sealed(SealedKind::Section(rs)) => {
+                                // Any-tier filter — cold-marker
+                                // sections (post-reload, before
+                                // elevate) must survive this filter
+                                // so the `elevate_to_hot` call below
+                                // can lift them.  Filtering on
+                                // `section_sealed_of` (hot-only)
+                                // would silently drop every
+                                // not-yet-elevated section the
+                                // projection selected.
+                                if view.section_tier_state(rs.id).is_some() {
+                                    sections.push(rs.id);
+                                    segments.push(seg.clone());
+                                }
+                            }
+                            ProjectionSegment::Sealed(SealedKind::Turn(rt, _)) => {
+                                // The turn carries its conversation (stamped at
+                                // projection); read it directly — no group→timeline
+                                // re-derivation.  `elevate_to_hot` below brings
+                                // cold-marker turns into hot before apply runs; a
+                                // timeline-less (mock/untracked) turn is skipped.
+                                let Some(timeline) = rt.timeline else {
+                                    continue;
+                                };
+                                turn_keys_for_elevate.push(TurnKey::new(timeline, rt.index()));
+                                segments.push(seg.clone());
+                            }
+                            ProjectionSegment::Generated { .. }
+                            | ProjectionSegment::NewUserMessage { .. } => {
+                                // Live-prefill runs and new-user-message
+                                // captures don't need an elevate side-list
+                                // entry — their K/V is produced on the
+                                // slot, not loaded from the substrate.
+                                segments.push(seg.clone());
+                            }
+                        }
+                    }
+
+                    // **No trailing `Generated(UserStart)`.**
+                    //
+                    // The live turn's opener is now the head of its own prefill
+                    // (`Sequence::submit_prefill_unit`), so it arrives as
+                    // ordinary tail prefill rather than as a glue island the
+                    // engine has to gap-fill. The distinction is the whole
+                    // difference for this lineage: appending at the writer tail
+                    // is prefill, which any model can do; filling a hole in the
+                    // middle of a sequence is gap-fill, which a recurrence
+                    // cannot do even in principle.
+                    //
+                    // It is invisible in the token stream — the same ids in the
+                    // same order — and visible only in whether a gap chunk was
+                    // reserved, which is what `T5a.1` asserts on.
+                    // Build the composition for a staged prefill's per-segment
+                    // projection events now, while the view guard is live. The
+                    // calibration projection is pinned (`SelectionRule::Named`), so
+                    // one composition serves every segment — the wave overrides its
+                    // point `start_token` per emission.
+                    if !projection_offsets.is_empty() {
+                        let total = view.total_token_count(target.timeline) as u32;
+                        staged_composition = Some(crate::projection::from_projection(
+                            &projection.segments,
+                            inputs.projection.schema(),
+                            &view,
+                            &projection.selection_scores,
+                            total,
+                            0,
+                            0.0,
+                        ));
+                    }
+                    // **No live `/no_think` run either.**
+                    //
+                    // The soft-switch is baked into the head of the turn that
+                    // carries it, decided once at submit from the dial that was
+                    // live then. That is *stronger* than re-deciding it every
+                    // projection, not weaker: the leak this used to guard
+                    // against — a past suppressed turn putting a stale switch on
+                    // a later thinking-on turn — cannot happen when each turn's
+                    // grid holds its own.
+                    (sections, segments)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
 
                 // **What the projection will put on the device is priced here, and
                 // put there only when admission takes the turn** (`submit_admit`).

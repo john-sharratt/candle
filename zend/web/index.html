@@ -597,6 +597,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     substrateTargetLayer: '',      // the dialogue/target layer name (for message prefixes)
     substrateGlue: null,           // dialect framing markers (system/user/assistant start/end)
     substrateGroupOpen: {},        // group key → open? (default closed/collapsed)
+    substrateFiles: [],            // the knowledge base's files the open point placed, each under its layer
     substrateExpanded: {},         // section key → expanded (show content)?
     filesOpen: false,
     // The working-journal dock (docs/zend_journal.md §8): the journal of the
@@ -2460,7 +2461,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
     // Snapshot the bubble (shallow copy) so the panel is a point-in-time view: the
     // streaming message is now mutated in place (see `patchStream`), so holding a
     // live ref would let the panel's content/spans drift as more tokens arrive.
-    setState({ substrateOpen: true, substrateNode: node, substrateLoading: true, substrateError: null, substrateMsg: msg ? Object.assign({}, msg) : null, substrateUserMsg: userMsg, substrateHistory: hist, substrateExpanded: {}, substrateGroupOpen: {} });
+    setState({ substrateOpen: true, substrateNode: node, substrateLoading: true, substrateError: null, substrateMsg: msg ? Object.assign({}, msg) : null, substrateUserMsg: userMsg, substrateHistory: hist, substrateExpanded: {}, substrateGroupOpen: {}, substrateFiles: [] });
     loadSubstrate(node);
   }
   // Fetch what the panel shows for `node`. A point from a loaded history is
@@ -2482,11 +2483,12 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
       // ingest unit's opening by its face, which the selection names as the
       // unit and the spine — which the cards are drawn from — as the face.
       : API.getProjectionContext(conv.id, ((node.selection && node.selection.turns) || [])
-          .concat((node.materialized || []).filter((p) => p.kind === 'turn' && p.turn).map((p) => p.turn)))
+          .concat((node.materialized || []).filter((p) => p.kind === 'turn' && p.turn).map((p) => p.turn)),
+          node.placed || [])
           .then((ctx) => ({ full: node, ctx }));
     req.then((r) => {
       if (!S.substrateOpen || S.substrateNode !== node) return;
-      setState({ substrateNode: r.full, substrateLoading: false, substrateContent: r.ctx.sectionContent || {}, substrateTurnContent: r.ctx.turnContent || {}, substrateGlue: r.ctx.glue || null, substrateTargetLayer: r.ctx.targetLayer || '' });
+      setState({ substrateNode: r.full, substrateLoading: false, substrateContent: r.ctx.sectionContent || {}, substrateTurnContent: r.ctx.turnContent || {}, substrateGlue: r.ctx.glue || null, substrateTargetLayer: r.ctx.targetLayer || '', substrateFiles: r.ctx.files || [] });
     }).catch((e) => {
       if (!S.substrateOpen || S.substrateNode !== node) return;
       setState({ substrateLoading: false, substrateError: (e && e.message) || String(e) });
@@ -4457,6 +4459,16 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
         : (isSummary ? (tc.assistant || tc.user || '') : ((tc.user || '') + (tc.assistant || '')));
       pushMsg('assistant', full, { layer: t.layer || targetLayer, key: 'conv::' + t.group + '::' + t.timeline + '::' + t.index, kind: t.kind, reason: t.reason, noGlue: true, colorize: true, layout: tc.layout, label: isSummary ? 'summary' : 'turn', tokens: t.tokens });
     };
+    // The knowledge base's files this point placed, each in its own layer's
+    // place — a file `code_reading` read, a folder `repo_map` listed — ahead of
+    // the dialogue, in the order they sit. They are spliced into the system
+    // prompt, but they are what those layers contribute, so they are drawn as
+    // the layers' cards rather than inside the system block.
+    (S.substrateFiles || []).forEach((f) => {
+      const spans = (f.lines || []).map((l) => l.first === l.last ? String(l.first) : l.first + '–' + l.last).join(', ');
+      const what = f.folder ? 'folder ' + f.path : 'file ' + f.path + (spans ? ' · lines ' + spans : '');
+      pushMsg('assistant', f.text || '', { layer: f.layer || 'files', key: 'file::' + f.key, noGlue: true, label: what, tokens: f.tokens });
+    });
     const materialized = (node && node.materialized) || [];
     if (materialized.length) {
       // Walk the injected spine for turn ORDER; each turn renders its own glue in
@@ -4528,7 +4540,7 @@ import { decideStatus, bootRetry, unreachableReason } from './status-poll.js';
   function substrateOverlay() {
     const inputs = [S.substrateNode, S.substrateExpanded, S.substrateGroupOpen, S.substrateContent,
       S.substrateTurnContent, S.substrateLoading, S.substrateError, S.substrateMsg, S.substrateUserMsg,
-      S.substrateGlue, S.substrateTargetLayer, S.effortLevel];
+      S.substrateGlue, S.substrateTargetLayer, S.substrateFiles, S.effortLevel];
     const same = _substrate.inputs && inputs.every((v, i) => v === _substrate.inputs[i]);
     if (!same) {
       const el = buildSubstrate();

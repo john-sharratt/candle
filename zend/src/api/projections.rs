@@ -28,6 +28,7 @@ use axum::{
     response::Response,
     Json,
 };
+use candle_conversation::files::PlacedFile;
 use candle_conversation::projection::{MaterializedPiece, ProjectionEvent, TimelineId};
 use candle_conversation::turn_layout::TurnLayout;
 use candle_conversation::GlueMarkers;
@@ -35,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use super::compressed;
 use crate::projection_event::ProjectionEventOut;
+use crate::session::placed_files::PlacedFileContent;
 use crate::session::ZendSession;
 
 pub async fn get(
@@ -52,7 +54,13 @@ pub async fn get(
         .nth(turn)
         .and_then(|points| points.into_iter().nth(event))
         .ok_or(StatusCode::NOT_FOUND)?;
-    let context = panel_context(&session, &id, glue, panel_turns(&span.event));
+    let context = panel_context(
+        &session,
+        &id,
+        glue,
+        panel_turns(&span.event),
+        &span.event.placed,
+    );
     Ok(compressed::json(&DetailBody { span, context }, &headers))
 }
 
@@ -65,7 +73,7 @@ pub async fn context(
     let glue = session
         .glue_markers()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let context = panel_context(&session, &id, glue, query.turns.into_iter());
+    let context = panel_context(&session, &id, glue, query.turns.into_iter(), &query.placed);
     Ok(compressed::json(&context, &headers))
 }
 
@@ -95,8 +103,10 @@ fn panel_context(
     conv_id: &str,
     glue: GlueMarkers,
     turns: impl Iterator<Item = TurnKey>,
+    placed: &[PlacedFile],
 ) -> PanelContext {
     PanelContext {
+        files: session.placed_file_contents(placed),
         glue: Glue::from(glue),
         section_content: session
             .section_content(conv_id)
@@ -163,6 +173,9 @@ fn turn_bodies(session: &ZendSession, turns: impl Iterator<Item = TurnKey>) -> V
 #[derive(Deserialize)]
 pub struct ContextQuery {
     pub turns: Vec<TurnKey>,
+    /// The knowledge base's files the point placed, as its event carries them.
+    #[serde(default)]
+    pub placed: Vec<PlacedFile>,
 }
 
 /// A selected turn's identity — the fields of `SelectedTurn` that key its body.
@@ -198,6 +211,9 @@ pub struct PanelContext {
     /// The target layer's name (e.g. `dialogue`) — the panel prefixes the
     /// conversation messages with it.
     pub target_layer: String,
+    /// The knowledge base's files the point placed, each under its layer,
+    /// with the lines placed and their text, in the order they sit.
+    pub files: Vec<PlacedFileContent>,
 }
 
 /// One projected turn's body, read from the substrate on demand. `text` is the

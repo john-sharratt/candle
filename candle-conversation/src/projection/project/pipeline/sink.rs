@@ -737,7 +737,7 @@ pub fn run_with_sink<R: ContentResolver>(
     // weighed, so an opening, which has none yet, places them too. The fill
     // below counts the system prompt without them: the kinds' caps and the
     // dialogue's share are shares of one room.
-    let mut files_placed: Vec<FileKey> = Vec::new();
+    let mut files_placed: Vec<PlacedFile> = Vec::new();
     let mut files_tokens = 0usize;
     let knowledge_base = schema
         .layers
@@ -784,7 +784,7 @@ pub fn run_with_sink<R: ContentResolver>(
         if let (Some(at), false) = (at, splice.segments.is_empty()) {
             files_tokens = segment_tokens(&splice.segments, resolver);
             system_prompt_segments.splice(at..at, splice.segments);
-            files_placed = splice.order;
+            files_placed = splice.placed;
         }
     }
 
