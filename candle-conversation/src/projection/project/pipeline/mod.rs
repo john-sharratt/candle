@@ -38,8 +38,10 @@ pub fn run<R: ContentResolver>(
     )
 }
 
+mod files_anchor;
 mod files_splice;
 mod sink;
 
+pub(crate) use files_anchor::files_position;
 pub(crate) use files_splice::files_splice;
 pub use sink::*;

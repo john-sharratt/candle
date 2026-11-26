@@ -11,9 +11,6 @@
 
 use super::*;
 
-/// The system-prompt section the knowledge base's files are spliced after.
-const FILES_OPEN_SECTION: &str = "files_open";
-
 /// The fill kind a working-set group's members count toward.
 fn share_kind(share: Option<WorkingSetShare>) -> Kind {
     match share {
@@ -749,14 +746,7 @@ pub fn run_with_sink<R: ContentResolver>(
         .and_then(|l| l.working_set.as_ref())
         .zip(resolver.trained_window())
         .filter(|_| !schema.focus);
-    let files_open = schema
-        .system_prompt
-        .items
-        .iter()
-        .find_map(|item| match item {
-            SystemPromptItem::Section(s) if s.name == FILES_OPEN_SECTION => Some(s.id),
-            _ => None,
-        });
+    let files_at = files_position(schema);
     // A pinned knowledge base — a calibration's frame (§12 D11) — is placed
     // whatever the target's layer declares: a pin takes no share of a room.
     let pinned = resolver
@@ -771,7 +761,7 @@ pub fn run_with_sink<R: ContentResolver>(
             .saturating_sub(decode_pos.unwrap_or(0));
         ws.fill_shares.caps(room)
     });
-    if let (true, Some(files_open)) = (shares.is_some() || pinned, files_open) {
+    if let (true, Some(files_at)) = (shares.is_some() || pinned, files_at) {
         let kind_cap = |share: WorkingSetShare| {
             let Some(shares) = &shares else {
                 return 0;
@@ -786,13 +776,14 @@ pub fn run_with_sink<R: ContentResolver>(
                 WorkingSetShare::Journals => shares.journals,
             }
         };
-        let splice = files_splice(schema, resolver, kind_cap, effective_selection.seeds());
-        let at = system_prompt_segments.iter().position(|seg| {
-            matches!(seg, ProjectionSegment::Sealed(SealedKind::Section(s)) if s.id == files_open)
-        });
+        // The last file joins a seed placed after it, and ends the knowledge
+        // base when none is.
+        let seeded = effective_selection.seeds() && files_at.seed_follows;
+        let splice = files_splice(schema, resolver, kind_cap, seeded);
+        let at = files_at.insert_at(&system_prompt_segments);
         if let (Some(at), false) = (at, splice.segments.is_empty()) {
             files_tokens = segment_tokens(&splice.segments, resolver);
-            system_prompt_segments.splice(at + 1..at + 1, splice.segments);
+            system_prompt_segments.splice(at..at, splice.segments);
             files_placed = splice.order;
         }
     }

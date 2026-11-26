@@ -222,17 +222,24 @@ fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
 
 /// **A pinned knowledge base is placed for a target whose layer declares no
 /// working set** — a calibration's draft and frames fork the files layer's
-/// base, which has none: the pinned file sits after `files_open`, and an
-/// unpinned set on the same target places nothing.
+/// base, which has none: the pinned file sits where the `files` collection is
+/// declared, after `files_open`, and an unpinned set on the same target places
+/// nothing.
 #[test]
 fn a_pinned_knowledge_base_is_placed_for_a_layer_with_no_working_set() {
     const PINNED_YAML: &str = r#"
 system_prompt:
-  sections:
-    - id: alpha
+  items:
+    - kind: section
+      id: alpha
       content: "alpha"
-    - id: files_open
+    - kind: section
+      id: files_open
       content: "kb"
+    - kind: collection
+      name: files
+      selection: { kind: always_visible }
+      sections: []
 layers:
   - name: code_reading
     window: 4000

@@ -124,14 +124,18 @@ are). Everything the collection holds arrives per projection.
   are small sections of the collection, sealed as members are (§5). Every
   file, the last included, seals its own closing fence, so the collection
   ends `\n```\n` and the close row is `<|im_end|>\n` (§6.2).
-- The **dynamic members** come first and the **seed** last, nearest the
-  question, in its chain's fixed order (§6).
+- The **seed** comes first, in its chain's fixed order (§6), and the
+  **dynamic members** after it, nearest the question. The seed is sealed
+  once, with no file ahead of it, so placed after the files its K/V
+  describes a prompt that holds none of them; measured, a placed file was
+  read only once the seed after it was prefilled live (§6.2b).
 - **Dynamic order is strongest first, and stable once placed (decided
   2026-11-26).** The opening places its files in fill order, best-ranked
   first, the order every probe arm used. From then on a placed file keeps
   its place relative to the others: a reprojection never reorders what it
   keeps. A file it adds goes after the kept ones, at the end of the dynamic
-  run before the seed, and a file it drops leaves the others in their order.
+  run before the close, and a file it drops leaves the others in their
+  order.
   Reordering placed content during a decode has been seen to unsettle it;
   rank decides what is placed, not where a kept file moves to.
 
@@ -426,9 +430,9 @@ build puts the seed and the close *into the prompt*:
 ```
 … tools_close
 files_open          fixed section — in the birth prefix
+seed                section tree, option present | absent (the `seed` dial)
 files               collection, no schema members — the dynamic members,
                     placed by the fill, attended only
-seed                section tree, option present | absent (the `seed` dial)
 system_close        fixed section — the close
 ```
 
@@ -443,9 +447,18 @@ system_close        fixed section — the close
   state of a prompt that has read the seed and its close. A running
   conversation never receives it again; nothing is forwarded at a
   projection, and no conversation's live state is touched (§6.2's property).
-- The **dynamic members** sit between `files_open` and the seed, outside
-  the birth prefix as tool members are: placed at projection time, attended
-  only, never in any recurrent state (§8).
+- The **dynamic members** sit between the seed and the close, outside the
+  birth prefix as tool members are: placed at projection time, where the
+  schema declares the `files` collection, attended only, never in any
+  recurrent state (§8). They are sealed behind the prompt before the
+  collection, the seed included.
+- **The seed precedes the files** because a sealed section placed after
+  placed content never saw it. With the seed after the files, the
+  sealed-fresh transplant (`docs/results/files_collection_rollout_2026-11-26.md`)
+  showed the fault followed the sealed K/V, not the index, and that the file
+  was read once the 37K-token seed after it was prefilled live over the
+  sealed file — its sealed K/V, computed with no file ahead of it, told the
+  question the file's content was not in the prompt.
 - The **`seed` dial** selects the tree's branch, so seed-on and seed-off are
   two checkpoints, each exact — finer than §6.1's one chain behind the
   default branch.

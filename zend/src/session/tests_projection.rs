@@ -380,10 +380,12 @@ pub(super) mod projection_schema_tests {
     }
 
     /// **The system prompt ends on the knowledge base**: `files_open`, the
-    /// `files` collection with no schema member, the `seed` optional present
-    /// by default, then the close — so the birth prefix and every branch
+    /// `seed` optional present by default, the `files` collection with no
+    /// schema member, then the close — so the birth prefix and every branch
     /// checkpoint end `files_open, seed, system_close`, the dynamic members
-    /// outside them (docs/provenance_system_collection.md §6.2b).
+    /// outside them, and the placed files come after the seed, the last
+    /// knowledge the question reads (docs/provenance_system_collection.md
+    /// §6.2b).
     #[test]
     fn the_system_prompt_ends_on_the_knowledge_base() {
         use candle_conversation::projection::SystemPromptItem;
@@ -407,8 +409,8 @@ pub(super) mod projection_schema_tests {
             tail,
             vec![
                 "section files_open",
-                "collection files (0 members)",
                 "tree seed [present|absent]",
+                "collection files (0 members)",
                 "section system_close",
             ]
         );
