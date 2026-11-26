@@ -66,7 +66,7 @@ impl PipelineState {
     /// prediction, which its listing is vetted from now (`list_row`) and again
     /// as the stager lands what it stages ahead for it (`list_landed`).
     pub(super) fn predict_ahead(&mut self, row: usize, experts: &[usize]) -> Result<()> {
-        if row < self.inner.pinned_layers {
+        if row < self.pinned_rows() {
             return Ok(());
         }
         self.predicted[row] = experts.to_vec();
@@ -79,7 +79,7 @@ impl PipelineState {
     pub(super) fn is_held(&self, row: usize, e: usize) -> bool {
         self.inner
             .key_to_slot
-            .get(&(row, e))
+            .get(&self.key(row, e))
             .is_some_and(|&s| self.inner.slots[s].is_some())
             || self.promoting.contains(&(row, e))
     }
@@ -89,10 +89,10 @@ impl PipelineState {
     /// first, at most `cap`: what the zone let go of and the next step is
     /// likely to want back.
     pub(super) fn scored_absent(&self, row: usize, min: f32, cap: usize) -> Vec<usize> {
-        let mut cands: Vec<(usize, f32)> = (0..self.inner.experts_per_layer)
-            .filter(|&e| !self.inner.key_to_slot.contains_key(&(row, e)))
+        let mut cands: Vec<(usize, f32)> = (0..self.experts())
+            .filter(|&e| !self.inner.key_to_slot.contains_key(&self.key(row, e)))
             .filter_map(|e| {
-                let s = self.inner.score(row, e);
+                let s = self.inner.score(self.key(row, e));
                 (s >= min).then_some((e, s))
             })
             .collect();
@@ -151,7 +151,7 @@ impl PipelineState {
         wide: bool,
         begun_past: u64,
     ) -> Result<()> {
-        let width = self.inner.experts_per_layer;
+        let width = self.experts();
         let voted_hops = votes.map_or(0, |v| v.hops(width));
         for hop in 1..=HOPS {
             let target = row + hop;
@@ -255,12 +255,13 @@ impl PipelineState {
         if empty < window {
             return false;
         }
-        let width = self.inner.experts_per_layer;
+        let width = self.experts();
         let mut absent = 0usize;
-        for row in self.inner.pinned_layers..self.num_moe_layers {
+        for row in self.pinned_rows()..self.num_moe_layers {
             for e in 0..width {
-                if self.inner.score(row, e) >= RECENT_MIN_SCORE
-                    && !self.inner.key_to_slot.contains_key(&(row, e))
+                let key = self.key(row, e);
+                if self.inner.score(key) >= RECENT_MIN_SCORE
+                    && !self.inner.key_to_slot.contains_key(&key)
                 {
                     absent += 1;
                     if absent >= window {

@@ -78,7 +78,7 @@ impl PipelineState {
             }
             if let Some(((vr, ve), _)) = offer.victim {
                 let evicted = self.inner.evict(offer.slot);
-                if evicted != Some((vr, ve)) {
+                if evicted != Some(self.key(vr, ve)) {
                     candle::bail!(
                         "expert pipeline: ring slot {} was offered holding ({vr}, {ve}) but held \
                          {evicted:?} when the device claimed it",
@@ -165,7 +165,7 @@ impl PipelineState {
             if self
                 .inner
                 .key_to_slot
-                .get(&(p.row, p.expert))
+                .get(&self.key(p.row, p.expert))
                 .is_some_and(|&s| self.inner.slots[s].is_some())
             {
                 if let Some(ring) = &self.promo_ring {
@@ -177,7 +177,8 @@ impl PipelineState {
             let base = self.inner.slot_base(p.slot);
             // SAFETY: the invocation whose workers filled the slot has completed.
             let view = unsafe { build_slot_view(&self.layer_geometries[p.row], &cd, base)? };
-            self.inner.install(p.slot, p.row, p.expert, view);
+            let key = self.key(p.row, p.expert);
+            self.inner.install(p.slot, key, view);
             self.residency()?
                 .set_vram(p.row, p.expert, Some((p.slot, base)));
             // The mark only after the VRAM entry is published: a bucketize that

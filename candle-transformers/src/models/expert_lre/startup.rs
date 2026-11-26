@@ -6,6 +6,7 @@
 //! so the fill borrows it as its landing ring.
 
 use super::cache::ExpertCacheInner;
+use super::card_key::{ExpertKey, ModelIx};
 use super::pack::{ExpertPack, PackRead, RecordLayout};
 use super::pad::Pad;
 use super::pinned::{ExpertResidency, LayerGeometry};
@@ -21,6 +22,9 @@ use cudarc::driver::CudaEvent;
 /// argument for it instead of seven.
 pub(crate) struct StartupTargets<'a> {
     pub inner: &'a mut ExpertCacheInner,
+    /// The model whose experts the fill installs, among those `inner`
+    /// registers.
+    pub model: ModelIx,
     pub warm: &'a mut WarmTier,
     pub residency: &'a mut [Vec<ExpertResidency>],
     /// Warm slot `i` holds `membership[i]`, decided once by the stratified draw.
@@ -273,7 +277,8 @@ pub(crate) fn startup_from_pack(
                     .map_err(at("the pack"))?
             }
         };
-        t.inner.install(slot_idx, moe_idx, expert_idx, slot);
+        t.inner
+            .install(slot_idx, ExpertKey::new(t.model, moe_idx, expert_idx), slot);
         t.residency[moe_idx][expert_idx].vram = Some(slot_idx);
         vram_count += 1;
         if let Some(report) = progress {

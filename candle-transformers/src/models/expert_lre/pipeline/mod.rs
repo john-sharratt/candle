@@ -21,6 +21,7 @@
 use super::ahead_pins::{AheadPins, Candidate};
 use super::blend::{cell_axes, gather, CellTable, MARKOV_MIN_CONF};
 use super::cache::{ExpertCacheInner, DECODE_RECENCY_DECAY};
+use super::card_key::{ExpertKey, ModelIx};
 use super::cpu_pool::params::shared as cpu_params;
 use super::dispatch::{AbortWord, PassState, SummaryRing};
 use super::fault::FaultWord;
@@ -107,6 +108,9 @@ const SUMMARY_DECODE: u32 = 1 << 31;
 pub(crate) struct PipelineState {
     /// VRAM slots, eviction scores, the zone and its free list.
     pub(crate) inner: ExpertCacheInner,
+    /// The model whose routing this thread serves, among those `inner`
+    /// registers: every key it builds names it.
+    pub(crate) model: ModelIx,
     pub(crate) device: Device,
     /// The boundary moves' relocation copies.
     pub(crate) copy_stream: Arc<CudaStream>,
@@ -206,6 +210,7 @@ impl PipelineState {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         inner: ExpertCacheInner,
+        model: ModelIx,
         device: Device,
         copy_stream: Arc<CudaStream>,
         residency: Arc<Mutex<Residency>>,
@@ -227,7 +232,7 @@ impl PipelineState {
         read_ahead: Arc<ReadAheadGate>,
     ) -> Result<Self> {
         let num_moe_layers = layer_geometries.len();
-        let experts = inner.experts_per_layer;
+        let experts = inner.experts(model);
         let ring_cap = promo_ring.as_ref().map_or(0, |r| r.cap());
         let image_bytes = layer_geometries
             .iter()
@@ -242,6 +247,7 @@ impl PipelineState {
         }
         Ok(Self {
             inner,
+            model,
             device,
             copy_stream,
             residency,
@@ -289,6 +295,24 @@ impl PipelineState {
             stats,
             pinned_stash: None,
         })
+    }
+
+    /// The key of expert `expert` of row `row` of the model this thread serves.
+    #[inline]
+    pub(crate) fn key(&self, row: usize, expert: usize) -> ExpertKey {
+        ExpertKey::new(self.model, row, expert)
+    }
+
+    /// Experts per row of the model this thread serves.
+    #[inline]
+    pub(crate) fn experts(&self) -> usize {
+        self.inner.experts(self.model)
+    }
+
+    /// The pinned rows of the model this thread serves.
+    #[inline]
+    pub(crate) fn pinned_rows(&self) -> usize {
+        self.inner.pinned_rows(self.model)
     }
 
     pub(crate) fn residency(&self) -> Result<MutexGuard<'_, Residency>> {

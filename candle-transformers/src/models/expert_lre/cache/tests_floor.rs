@@ -16,22 +16,25 @@ pub(super) mod tests {
 
     use super::super::tests_scores::tests::{best_victim, occupy};
 
-    /// A cache of `n` slots over a zone with no device behind it.
+    /// A cache of `n` slots over a zone with no device behind it, for one model
+    /// of 48 rows of 128.
     ///
     /// The zone is pure arithmetic — addresses and indices — so the whole
     /// eviction policy still exercises with no GPU and no model load, exactly as
     /// it did when the free list was a local `Vec`.
     /// Pins the standard head layers, as every cache now does.
     pub(in super::super) fn cache(n: usize) -> ExpertCacheInner {
-        ExpertCacheInner::new(WeightZone::new(1 << 30, 4096, n, n, 0), 48, 128)
+        ExpertCacheInner::new(
+            WeightZone::new(1 << 30, 4096, n, n, 0),
+            CardModels::one(48, 128),
+        )
     }
 
     /// A cache sized as the loader would size it.
     pub(in super::super) fn sized_cache(n: usize, experts_per_layer: usize) -> ExpertCacheInner {
         ExpertCacheInner::new(
             WeightZone::new(1 << 30, 4096, n, n, 0),
-            48,
-            experts_per_layer,
+            CardModels::one(48, experts_per_layer),
         )
     }
 
@@ -95,14 +98,18 @@ pub(super) mod tests {
             ] {
                 let inner = sized_cache(capacity, experts_per_layer);
                 assert_eq!(
-                    inner.pinned_layers, PINNED_LAYERS,
+                    inner.pinned_rows(ModelIx::FIRST),
+                    PINNED_LAYERS,
                     "{capacity} slots at {experts_per_layer}/layer changed the pinned depth"
                 );
             }
         }
         // A model with fewer layers than the constant pins all of them.
-        let tiny = ExpertCacheInner::new(WeightZone::new(1 << 30, 4096, 64, 64, 0), 1, 8);
-        assert_eq!(tiny.pinned_layers, 1);
+        let tiny = ExpertCacheInner::new(
+            WeightZone::new(1 << 30, 4096, 64, 64, 0),
+            CardModels::one(1, 8),
+        );
+        assert_eq!(tiny.pinned_rows(ModelIx::FIRST), 1);
     }
 
     /// **A zone at the floor still has a victim**, which is the entire reason
@@ -183,7 +190,7 @@ pub(super) mod tests {
         inner.put_free(0);
         inner.expert_scores[15] = 0.5; // slot 5: pack-only, colder
         inner.expert_scores[14] = 9.0; // slot 4: warm-backed and hot
-        inner.set_warm_backed(&[(14, 0)]);
+        inner.set_warm_backed(ModelIx::FIRST, &[(14, 0)]);
 
         let plan = inner.retract_zone(4, ZoneFloor::Serving);
         assert_eq!(plan.relocate, vec![(4, 0)]);
@@ -195,8 +202,14 @@ pub(super) mod tests {
     /// copy to come back from. Serving, the same ask stops at the floor.
     #[test]
     fn a_paused_concession_keeps_exactly_the_pinned_set() {
-        let mut inner = ExpertCacheInner::new(WeightZone::new(1 << 30, 4096, 6, 6, 4), 48, 1);
-        let p = inner.pinned_layers;
+        let paused = || {
+            ExpertCacheInner::new(
+                WeightZone::new(1 << 30, 4096, 6, 6, 4),
+                CardModels::one(48, 1),
+            )
+        };
+        let mut inner = paused();
+        let p = inner.pinned_rows(ModelIx::FIRST);
         assert_eq!(inner.pinned_slots(), p);
         assert_eq!(p, 2, "the fixture prices two pinned layers");
         for slot in 0..4 {
@@ -209,7 +222,7 @@ pub(super) mod tests {
         assert_eq!(inner.zone.capacity(), 4, "serving, the stated floor holds");
         assert!(serving.evict.iter().all(|&s| s >= 4));
 
-        let mut inner = ExpertCacheInner::new(WeightZone::new(1 << 30, 4096, 6, 6, 4), 48, 1);
+        let mut inner = paused();
         for slot in 0..4 {
             occupy(&mut inner, slot, p + slot, 0, slot as u32, 9.0);
         }
@@ -238,7 +251,7 @@ pub(super) mod tests {
     #[test]
     fn a_full_concession_displaces_the_coldest_unpinned_survivor() {
         let mut inner = sized_cache(6, 1);
-        let p = inner.pinned_layers;
+        let p = inner.pinned_rows(ModelIx::FIRST);
         assert!(p >= 1, "the fixture needs a pinned layer");
         occupy(&mut inner, 0, 0, 0, 0, 0.0); // pinned, coldest of all
         occupy(&mut inner, 1, p + 1, 0, 1, 0.1); // the coldest unpinned survivor

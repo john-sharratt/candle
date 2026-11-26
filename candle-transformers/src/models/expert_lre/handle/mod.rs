@@ -19,6 +19,7 @@
 #[cfg(feature = "cuda")]
 use super::boundary::{grow_note, spare_for_growth, GrowOutcome};
 use super::cache::{minimum_resident_slots, pinned_layer_count, ExpertCacheInner};
+use super::card_key::CardModels;
 #[cfg(feature = "cuda")]
 use super::cpu_pool::attach::start as start_cpu_service;
 #[cfg(feature = "cuda")]

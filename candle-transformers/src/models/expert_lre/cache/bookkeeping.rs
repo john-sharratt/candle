@@ -5,20 +5,24 @@
 //! free list, and an eviction only drops the tables and the views, because the
 //! cold pack holds a valid copy of every expert and nothing needs writing back.
 //! A victim is ranked by its frequency scaled by how far behind the wave its
-//! layer lies and by a small protection for a pack-only reload, all in one key;
+//! row lies and by a small protection for a pack-only reload, all in one key;
 //! only whether its row routed it last time runs as a pass ahead of that key.
 //! Free slots are taken rightmost, which keeps live experts packed away from the
 //! boundary the KV side pushes against.
+//!
+//! Every expert is keyed `(model, row, expert)` ([`ExpertKey`]). Distance behind
+//! the wave is defined within the model that is forwarding: a row of any other
+//! model is maximally behind, so only its hits keep it (`docs/parasite_model.md`
+//! §11.3).
 
 use super::*;
 
 impl ExpertCacheInner {
-    /// Create a new empty cache over `zone`'s slots.
-    ///
-    /// * `num_moe_layers` — total MoE layers (e.g. 48)
-    /// * `experts_per_layer` — experts per layer (e.g. 128)
-    pub(crate) fn new(zone: WeightZone, num_moe_layers: usize, experts_per_layer: usize) -> Self {
+    /// Create a new empty cache over `zone`'s slots, for the models `models`
+    /// registers.
+    pub(crate) fn new(zone: WeightZone, models: CardModels) -> Self {
         let num_slots = zone.capacity();
+        let total = models.total();
         Self {
             slots: (0..num_slots).map(|_| None).collect(),
             zone,
@@ -26,13 +30,18 @@ impl ExpertCacheInner {
             last_used: vec![0u32; num_slots],
             generation: 0,
             slot_to_key: vec![None; num_slots],
-            expert_scores: vec![0.0f32; num_moe_layers * experts_per_layer],
-            decode_reuse: vec![0.0f32; num_moe_layers * experts_per_layer],
-            num_moe_layers,
-            experts_per_layer,
-            pinned_layers: pinned_layer_count(num_moe_layers),
-            warm_backed: Arc::new(HostBacked::new(num_moe_layers, experts_per_layer)),
-            hit_last: vec![false; num_moe_layers * experts_per_layer],
+            expert_scores: vec![0.0f32; total],
+            decode_reuse: vec![0.0f32; total],
+            pinned_rows: models
+                .iter()
+                .map(|(_, s)| pinned_layer_count(s.rows))
+                .collect(),
+            warm_backed: models
+                .iter()
+                .map(|(_, s)| Arc::new(HostBacked::new(s.rows, s.experts)))
+                .collect(),
+            hit_last: vec![false; total],
+            models,
             #[cfg(feature = "tensor-assert")]
             owners: None,
         }
@@ -43,8 +52,8 @@ impl ExpertCacheInner {
     #[cfg(feature = "tensor-assert")]
     pub(crate) fn attach_owners(&mut self, owners: Arc<SlotOwners>) {
         for (slot, key) in self.slot_to_key.iter().enumerate() {
-            if let Some((row, expert)) = *key {
-                owners.set(slot, row, expert);
+            if let Some(k) = *key {
+                owners.set(slot, k.row, k.expert);
             }
         }
         self.owners = Some(owners);
@@ -53,48 +62,50 @@ impl ExpertCacheInner {
     /// Slot `slot` gained the tenant `slot_to_key` names: write its tag.
     #[cfg(feature = "tensor-assert")]
     pub(crate) fn mirror_tenant(&self, slot: usize) {
-        if let (Some(owners), Some((row, expert))) = (&self.owners, self.slot_to_key[slot]) {
-            owners.set(slot, row, expert);
+        if let (Some(owners), Some(k)) = (&self.owners, self.slot_to_key[slot]) {
+            owners.set(slot, k.row, k.expert);
         }
     }
 
-    /// Record which experts the warm tier holds — each a resident pinned slot
-    /// or a pageable copy — once the startup fill is decided; the stager keeps
-    /// it current from then on.
-    pub(crate) fn set_warm_backed(&mut self, membership: &[(usize, usize)]) {
-        self.warm_backed.clear();
-        for &(layer, expert) in membership {
-            self.warm_backed.set(layer, expert, true);
+    /// Record which of `model`'s experts the warm tier holds — each a resident
+    /// pinned slot or a pageable copy — once the startup fill is decided; the
+    /// stager keeps it current from then on.
+    pub(crate) fn set_warm_backed(&mut self, model: ModelIx, membership: &[(usize, usize)]) {
+        let backed = &self.warm_backed[model.index()];
+        backed.clear();
+        for &(row, expert) in membership {
+            backed.set(row, expert, true);
         }
     }
 
-    /// Row `layer` was served, routing `routed`: those of its experts are now
-    /// the ones it hit on its last visit, and no others.
-    pub(crate) fn mark_visit(&mut self, layer: usize, routed: &[usize]) {
-        let row = layer * self.experts_per_layer;
-        self.hit_last[row..row + self.experts_per_layer].fill(false);
+    /// `model`'s row `row` was served, routing `routed`: those of its experts
+    /// are now the ones it hit on its last visit, and no others.
+    pub(crate) fn mark_visit(&mut self, model: ModelIx, row: usize, routed: &[usize]) {
+        let span = self.models.row_span(model, row);
+        let base = span.start;
+        self.hit_last[span].fill(false);
         for &e in routed {
-            self.hit_last[row + e] = true;
+            self.hit_last[base + e] = true;
         }
     }
 
-    /// Whether `layer`'s row routed `expert` on its last visit.
+    /// Whether `key`'s row routed it on its last visit.
     #[inline]
-    pub(crate) fn hit_last_visit(&self, layer: usize, expert: usize) -> bool {
-        self.hit_last[layer * self.experts_per_layer + expert]
+    pub(crate) fn hit_last_visit(&self, key: ExpertKey) -> bool {
+        self.hit_last[self.models.flat(key)]
     }
 
-    /// Whether a warm (host) copy backs `(layer, expert)` — its cheap reload.
+    /// Whether a warm (host) copy backs `key` — its cheap reload.
     #[inline]
-    pub(crate) fn is_warm_backed(&self, layer: usize, expert: usize) -> bool {
-        self.reload_tier(layer, expert) == ReloadTier::Warm
+    pub(crate) fn is_warm_backed(&self, key: ExpertKey) -> bool {
+        self.reload_tier(key) == ReloadTier::Warm
     }
 
-    /// Where `(layer, expert)` reloads from after an eviction — see
-    /// [`ReloadTier`] for how eviction weighs it.
+    /// Where `key` reloads from after an eviction — see [`ReloadTier`] for how
+    /// eviction weighs it.
     #[inline]
-    pub(super) fn reload_tier(&self, layer: usize, expert: usize) -> ReloadTier {
-        if self.warm_backed.get(layer, expert) {
+    pub(super) fn reload_tier(&self, key: ExpertKey) -> ReloadTier {
+        if self.warm_backed[key.model.index()].get(key.row, key.expert) {
             ReloadTier::Warm
         } else {
             ReloadTier::Nvme
@@ -131,15 +142,42 @@ impl ExpertCacheInner {
         self.zone.capacity()
     }
 
-    /// Experts in the model — every MoE layer's full complement.
+    /// Experts of every registered model — each model's every MoE row's full
+    /// complement.
     pub(crate) fn total_experts(&self) -> usize {
-        self.num_moe_layers * self.experts_per_layer
+        self.models.total()
     }
 
-    /// Slots the pinned layers fill — experts with no copy in the pack or the
-    /// warm tier, which no retraction may drop ([`ZoneFloor::Paused`]'s floor).
+    /// `model`'s MoE rows.
+    pub(crate) fn rows(&self, model: ModelIx) -> usize {
+        self.models.shape(model).rows
+    }
+
+    /// `model`'s experts per MoE row.
+    pub(crate) fn experts(&self, model: ModelIx) -> usize {
+        self.models.shape(model).experts
+    }
+
+    /// `model`'s first rows, which are never evicted ([`pinned_layer_count`]).
+    pub(crate) fn pinned_rows(&self, model: ModelIx) -> usize {
+        self.pinned_rows[model.index()]
+    }
+
+    /// Whether `key` lies in its model's pinned rows: an expert with no copy in
+    /// the pack or the warm tier, which no eviction or retraction may drop.
+    #[inline]
+    pub(crate) fn is_pinned(&self, key: ExpertKey) -> bool {
+        key.row < self.pinned_rows[key.model.index()]
+    }
+
+    /// Slots every model's pinned rows fill — experts with no copy in the pack
+    /// or the warm tier, which no retraction may drop ([`ZoneFloor::Paused`]'s
+    /// floor).
     pub(crate) fn pinned_slots(&self) -> usize {
-        self.pinned_layers * self.experts_per_layer
+        self.models
+            .iter()
+            .map(|(m, s)| self.pinned_rows[m.index()] * s.experts)
+            .sum()
     }
 
     /// Slots not currently holding an expert.
@@ -216,35 +254,30 @@ impl ExpertCacheInner {
             target.max(floor) >= self.pinned_slots().min(self.zone.capacity()),
             "retraction target is below the fixed pinned set"
         );
-        // Keep key: a pinned-layer expert above everything — it has nowhere to
+        // Keep key: a pinned-row expert above everything — it has nowhere to
         // reload from, and a zone retracted to the pinned set holds exactly it —
         // then the eviction key without its position: the score scaled by the
         // reload-cost tilt, so a hot warm-backed expert outlasts a pack-only one
         // nobody routes. The same key decides which survivor below the frontier
-        // a hotter doomed expert displaces; a pinned-layer expert is never
+        // a hotter doomed expert displaces; a pinned-row expert is never
         // displaced.
-        let pinned_layers = self.pinned_layers;
         let keep: Vec<(bool, f32)> = (0..self.zone.capacity())
             .map(|i| {
-                self.slot_to_key[i].map_or((false, 0.0), |(layer, expert)| {
+                self.slot_to_key[i].map_or((false, 0.0), |k| {
                     (
-                        layer < pinned_layers,
-                        Self::protected_by(
-                            self.score(layer, expert),
-                            tier_protection(self.reload_tier(layer, expert)),
-                        ),
+                        self.is_pinned(k),
+                        Self::protected_by(self.score(k), tier_protection(self.reload_tier(k))),
                     )
                 })
             })
             .collect();
+        let evictable: Vec<bool> = (0..self.zone.capacity())
+            .map(|i| self.slot_to_key[i].is_some_and(|k| !self.is_pinned(k)))
+            .collect();
         let before = self.zone.capacity();
-        let slot_to_key = &self.slot_to_key;
-        let plan = self.zone.retract_within(
-            target,
-            floor,
-            |i| keep[i],
-            |i| slot_to_key[i].is_some_and(|(layer, _)| layer >= pinned_layers),
-        );
+        let plan = self
+            .zone
+            .retract_within(target, floor, |i| keep[i], |i| evictable[i]);
         // Keyed on the CAPACITY changing, not on the plan being non-empty: a
         // concession of slots that happened to be free moves the boundary just
         // the same, while asking nothing to be relocated or evicted.
@@ -291,8 +324,8 @@ impl ExpertCacheInner {
 
     /// Evict a slot: drop its contents and remove it from the lookup tables.
     ///
-    /// Returns the evicted `(moe_layer, expert_idx)` key, or `None` if the slot
-    /// was already empty.
+    /// Returns the evicted expert's key, or `None` if the slot was already
+    /// empty.
     ///
     /// **Eviction moves no bytes.** The cold tier holds a valid copy of every
     /// expert at all times, so there is nothing to write back and nowhere to
@@ -300,7 +333,7 @@ impl ExpertCacheInner {
     /// copy into pinned RAM, and that copy duplicated data the pack file
     /// already held. Dropping the slot here releases the three `QMatMul` views;
     /// the zone owns the bytes and keeps them.
-    pub(crate) fn evict(&mut self, slot_idx: usize) -> Option<(usize, usize)> {
+    pub(crate) fn evict(&mut self, slot_idx: usize) -> Option<ExpertKey> {
         let evicted = self.slot_to_key[slot_idx];
         if let Some(evict_key) = evicted {
             self.key_to_slot.remove(&evict_key);
@@ -312,23 +345,17 @@ impl ExpertCacheInner {
 
     // ── Score update methods ─────────────────────────────────────────
 
-    /// Index into `expert_scores` for a given (layer, expert) pair.
+    /// Get the current score for `key`.
     #[inline]
-    pub(super) fn score_idx(&self, layer: usize, expert: usize) -> usize {
-        layer * self.experts_per_layer + expert
-    }
-
-    /// Get the current score for a (layer, expert) pair.
-    #[inline]
-    pub(crate) fn score(&self, layer: usize, expert: usize) -> f32 {
-        let idx = self.score_idx(layer, expert);
+    pub(crate) fn score(&self, key: ExpertKey) -> f32 {
+        let idx = self.models.flat(key);
         self.expert_scores[idx] + DECODE_REUSE_WEIGHT * self.decode_reuse[idx]
     }
 
     /// Record a decode hit: +1.0, and +1.0 of long-memory decode reuse.
     #[inline]
-    pub(crate) fn record_hit(&mut self, layer: usize, expert: usize) {
-        let idx = self.score_idx(layer, expert);
+    pub(crate) fn record_hit(&mut self, key: ExpertKey) {
+        let idx = self.models.flat(key);
         self.expert_scores[idx] += 1.0;
         self.decode_reuse[idx] += 1.0;
     }
@@ -337,16 +364,16 @@ impl ExpertCacheInner {
     /// step, which near-certainly routes to it again — but no decode reuse
     /// until it is hit.
     #[inline]
-    pub(crate) fn record_decode_miss(&mut self, layer: usize, expert: usize) {
-        let idx = self.score_idx(layer, expert);
+    pub(crate) fn record_decode_miss(&mut self, key: ExpertKey) {
+        let idx = self.models.flat(key);
         self.expert_scores[idx] += 1.0;
     }
 
     /// Record a prefill-attributed hit on an already-resident expert:
     /// [`PREFILL_HIT_SCORE`] (+0.1) rather than the full decode weight.
     #[inline]
-    pub(crate) fn record_prefill_hit(&mut self, layer: usize, expert: usize) {
-        let idx = self.score_idx(layer, expert);
+    pub(crate) fn record_prefill_hit(&mut self, key: ExpertKey) {
+        let idx = self.models.flat(key);
         self.expert_scores[idx] += PREFILL_HIT_SCORE;
     }
 
@@ -370,20 +397,20 @@ impl ExpertCacheInner {
     /// happens to load it: its score is −0.1 plus [`DECODE_REUSE_WEIGHT`] × its
     /// reuse.
     #[inline]
-    pub(crate) fn record_prefill_elevate(&mut self, layer: usize, expert: usize) {
-        let idx = self.score_idx(layer, expert);
+    pub(crate) fn record_prefill_elevate(&mut self, key: ExpertKey) {
+        let idx = self.models.flat(key);
         self.expert_scores[idx] = PREFILL_ELEVATE_PENALTY;
     }
 
     /// Record a successful speculative prediction: +0.3.
     #[inline]
-    pub(crate) fn record_prediction_hit(&mut self, layer: usize, expert: usize) {
-        let idx = self.score_idx(layer, expert);
+    pub(crate) fn record_prediction_hit(&mut self, key: ExpertKey) {
+        let idx = self.models.flat(key);
         self.expert_scores[idx] += 0.3;
     }
 
-    /// End-of-pass exponential decay: multiply all scores by `factor` (e.g. 0.85),
-    /// and decode reuse by [`DECODE_REUSE_DECAY`].
+    /// End-of-pass exponential decay: multiply every model's scores by
+    /// `factor` (e.g. 0.85), and decode reuse by [`DECODE_REUSE_DECAY`].
     pub(crate) fn decay_scores(&mut self, factor: f32) {
         for s in self.expert_scores.iter_mut() {
             *s *= factor;
@@ -393,15 +420,23 @@ impl ExpertCacheInner {
         }
     }
 
-    /// Forward (wrapped) distance from `current_layer` to `layer`: how many
-    /// layers until the wave reaches `layer` again. Distance 0 = the layer being
-    /// computed right now; distance `n-1` = the layer that just executed.
+    /// Forward (wrapped) distance from the row `current` is serving to `key`'s
+    /// row: how many rows until the wave reaches it again. Distance 0 = the row
+    /// being computed right now; distance `n-1` = the row that just executed.
+    ///
+    /// Defined only within the forwarding model's cycle: a row of any other
+    /// model is maximally behind, `n-1` of its own `n` rows, so it gets no
+    /// position-based protection.
     #[inline]
-    pub(super) fn forward_distance(&self, layer: usize, current_layer: usize) -> usize {
-        if layer >= current_layer {
-            layer - current_layer
+    pub(super) fn forward_distance(&self, key: ExpertKey, current: (ModelIx, usize)) -> usize {
+        let n = self.rows(key.model);
+        let (model, row) = current;
+        if key.model != model {
+            n.saturating_sub(1)
+        } else if key.row >= row {
+            key.row - row
         } else {
-            self.num_moe_layers - current_layer + layer
+            n - row + key.row
         }
     }
 
@@ -409,16 +444,16 @@ impl ExpertCacheInner {
     /// [`RECENCY_PASSES`] pass: a later pass only for what the earlier ones
     /// could not supply. Best victim first.
     ///
-    /// `weight(slot_idx, moe_layer, dist)` admits a non-pinned occupied slot
-    /// by returning the protection factor its frequency is scaled by, or `None`
-    /// to skip it. The reload tier's factor ([`tier_protection`]) multiplies
-    /// in, and the product goes through [`Self::protected_by`], so an elevated
+    /// `weight(slot_idx, key, dist)` admits a non-pinned occupied slot by
+    /// returning the protection factor its frequency is scaled by, or `None` to
+    /// skip it. The reload tier's factor ([`tier_protection`]) multiplies in,
+    /// and the product goes through [`Self::protected_by`], so an elevated
     /// expert's negative score is not inverted.
     pub(super) fn batch_victims(
         &self,
-        current_layer: usize,
+        current: (ModelIx, usize),
         count: usize,
-        weight: impl Fn(usize, usize, usize) -> Option<f32>,
+        weight: impl Fn(usize, ExpertKey, usize) -> Option<f32>,
     ) -> Vec<usize> {
         let mut victims = Vec::with_capacity(count);
         for hit in RECENCY_PASSES {
@@ -431,16 +466,16 @@ impl ExpertCacheInner {
                 .iter()
                 .enumerate()
                 .filter_map(|(idx, key)| {
-                    let (layer, expert) = (*key)?;
-                    if layer < self.pinned_layers || self.hit_last_visit(layer, expert) != hit {
+                    let k = (*key)?;
+                    if self.is_pinned(k) || self.hit_last_visit(k) != hit {
                         return None;
                     }
-                    let dist = self.forward_distance(layer, current_layer);
-                    let tier = self.reload_tier(layer, expert);
-                    let factor = weight(idx, layer, dist)? * tier_protection(tier);
+                    let dist = self.forward_distance(k, current);
+                    let tier = self.reload_tier(k);
+                    let factor = weight(idx, k, dist)? * tier_protection(tier);
                     Some(VictimKey {
                         slot: idx,
-                        score: Self::protected_by(self.score(layer, expert), factor),
+                        score: Self::protected_by(self.score(k), factor),
                         dist,
                         warm: tier == ReloadTier::Warm,
                         lru: self.last_used[idx],
@@ -463,16 +498,19 @@ impl ExpertCacheInner {
     /// rule: an expert whose row is still being computed cannot give up its
     /// slot) and evicts the ones it takes with [`Self::evict`].
     ///
+    /// `current` is the model forwarding and the row it is serving.
+    ///
     /// ## Victim key: `frequency × behind_protection × tier_protection`
     ///
     /// Lowest key first. The protection fades with how far behind the wave a
-    /// layer is ([`behind_protection`]): L−1 is scaled by [`FADE_FLOOR`] and
-    /// each layer further back a little more, wrapping round to the layers about
-    /// to run, which keep nearly their whole score. So the wave protects what
-    /// is ahead of it at the expense of what is behind, and an expert just
-    /// behind survives one about to run only with about `1 / FADE_FLOOR` its
-    /// score — enough to steer churn behind the wave, not enough to evict a hot
-    /// expert the next pass needs for a cold one ahead.
+    /// row is ([`behind_protection`]): L−1 is scaled by [`FADE_FLOOR`] and each
+    /// row further back a little more, wrapping round to the rows about to run,
+    /// which keep nearly their whole score. So the wave protects what is ahead
+    /// of it at the expense of what is behind, and an expert just behind
+    /// survives one about to run only with about `1 / FADE_FLOOR` its score —
+    /// enough to steer churn behind the wave, not enough to evict a hot expert
+    /// the next pass needs for a cold one ahead. Another model's rows are all
+    /// maximally behind ([`Self::forward_distance`]).
     ///
     /// A pack-only expert's key is doubled ([`PACK_ONLY_PROTECTION`]) for the
     /// drive read its reload costs. That is a tilt inside the one order, not a
@@ -481,44 +519,37 @@ impl ExpertCacheInner {
     /// warm-backed one it keeps routing.
     ///
     /// Demand and read-ahead claims spend the same ranked offers, so a read-ahead
-    /// copy for a row ahead is bought from the layers the wave has left, not
-    /// from the ones it is about to route.
+    /// copy for a row ahead is bought from the rows the wave has left, not from
+    /// the ones it is about to route.
     ///
     /// The policy runs once per recency pass ([`RECENCY_PASSES`]) — the experts
     /// the row did not route on its last visit, then the ones it did — and the
     /// second only for the shortfall.
     ///
     /// Ties break farther-first, then warm-backed, then LRU, so a never-used
-    /// expert goes from the layer just behind first. Pinned layers are never
-    /// candidates. `admit(slot, layer)` refuses a slot outright.
+    /// expert goes from the row just behind first. Pinned rows are never
+    /// candidates. `admit(slot, key)` refuses a slot outright.
     ///
     /// One O(slots) scan + an O(n) `select_nth` partition per recency pass.
     pub(crate) fn rank_victims(
         &self,
-        current_layer: usize,
+        current: (ModelIx, usize),
         count: usize,
-        admit: impl Fn(usize, usize) -> bool,
+        admit: impl Fn(usize, ExpertKey) -> bool,
     ) -> Vec<usize> {
         if count == 0 {
             return Vec::new();
         }
-        let n = self.num_moe_layers;
-        self.batch_victims(current_layer, count, |idx, layer, dist| {
-            admit(idx, layer).then(|| behind_protection(dist, n))
+        self.batch_victims(current, count, |idx, key, dist| {
+            admit(idx, key).then(|| behind_protection(dist, self.rows(key.model)))
         })
     }
 
     /// Install an expert into a slot and update all lookup tables.
-    pub(crate) fn install(
-        &mut self,
-        slot_idx: usize,
-        moe_idx: usize,
-        expert_idx: usize,
-        slot: ExpertSlot,
-    ) {
+    pub(crate) fn install(&mut self, slot_idx: usize, key: ExpertKey, slot: ExpertSlot) {
         self.slots[slot_idx] = Some(slot);
-        self.key_to_slot.insert((moe_idx, expert_idx), slot_idx);
-        self.slot_to_key[slot_idx] = Some((moe_idx, expert_idx));
+        self.key_to_slot.insert(key, slot_idx);
+        self.slot_to_key[slot_idx] = Some(key);
         #[cfg(feature = "tensor-assert")]
         self.mirror_tenant(slot_idx);
         self.promote(slot_idx);

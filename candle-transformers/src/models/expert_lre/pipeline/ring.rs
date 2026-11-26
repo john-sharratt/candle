@@ -146,20 +146,25 @@ impl PipelineState {
         let keys = &self.inner.slot_to_key;
         let offered = &self.offered;
         let promoting = &self.promoting;
-        let width = self.inner.experts_per_layer;
+        let width = self.experts();
+        let model = self.model;
+        // A victim is retargeted in this model's live table, so only this
+        // model's experts are offered.
         let candidate = |slot: usize| {
             !offered.contains(&slot)
-                && keys[slot].is_some_and(|(r, e)| !promoting.contains(&(r, e)))
+                && keys[slot]
+                    .is_some_and(|k| k.model == model && !promoting.contains(&(k.row, k.expert)))
         };
         let ask = 2 * n;
+        let current = (model, row);
         let mut slots = self
             .inner
-            .rank_victims(row, ask, |slot, layer| !upcoming[layer] && candidate(slot));
+            .rank_victims(current, ask, |slot, k| !upcoming[k.row] && candidate(slot));
         if slots.len() < ask {
             let more = self
                 .inner
-                .rank_victims(row, ask - slots.len(), |slot, layer| {
-                    upcoming[layer] && candidate(slot)
+                .rank_victims(current, ask - slots.len(), |slot, k| {
+                    upcoming[k.row] && candidate(slot)
                 });
             slots.extend(more);
         }
@@ -174,7 +179,8 @@ impl PipelineState {
             if chosen.len() == n {
                 break;
             }
-            let Some((r, e)) = keys[slot] else { continue };
+            let Some(k) = keys[slot] else { continue };
+            let (r, e) = (k.row, k.expert);
             let Some((retarget, fallback)) = places.displaced_entries(r, e) else {
                 continue;
             };
@@ -355,9 +361,9 @@ impl PipelineState {
         let served = self.last_summary.map_or(row, |(_, r)| r);
         VictimTag {
             predicted: prediction_band(best),
-            hit_last: self.inner.hit_last_visit(row, e),
+            hit_last: self.inner.hit_last_visit(self.key(row, e)),
             ahead: just_ahead(row, served, n),
-            warm: self.inner.is_warm_backed(row, e),
+            warm: self.inner.is_warm_backed(self.key(row, e)),
         }
     }
 
