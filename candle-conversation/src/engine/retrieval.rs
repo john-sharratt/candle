@@ -61,7 +61,8 @@ impl ConversationEngine {
     /// (`docs/provenance_system_collection.md` §12 D11). Set before the
     /// conversation's first turn, which places it.
     pub fn files_pin(&self, target: TimelineId, pin: FilesPin) {
-        self.conversation.update(|s| s.files_pin(target, pin));
+        self.conversation
+            .update(|s| s.files_pin(target, pin.clone()));
     }
 
     /// Let `target`'s withheld conversations and files be placed again: the

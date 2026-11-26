@@ -769,7 +769,7 @@ fn draft(
     members: &HashSet<u32>,
     tokens: usize,
 ) -> anyhow::Result<Drafted> {
-    let mut conv = framed_fork(engine, base, &spec.layer, FilesPin::Only(file))?;
+    let mut conv = framed_fork(engine, base, &spec.layer, FilesPin::Only(vec![file]))?;
     let timeline = conv.timeline_id();
     let out = (|| {
         // A draft has no tools, and one that opens a call anyway writes no

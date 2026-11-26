@@ -16,7 +16,7 @@ use crate::projection::GroupId;
 
 /// What a conversation's knowledge base holds, when it is not provenance's
 /// to choose (§12 D11).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum FilesPin {
     /// Provenance chooses: the fill places the set's strongest files.
     #[default]
@@ -24,8 +24,9 @@ pub enum FilesPin {
     /// Nothing: `files_open` with no file under it — a calibration's empty
     /// frame.
     Empty,
-    /// This file alone, whole — a calibration's draft and its target frame.
-    Only(FileKey),
+    /// These files alone, each whole, in this order — a calibration's draft
+    /// and its target frame hold one.
+    Only(Vec<FileKey>),
 }
 
 /// One conversation's files and their momentum.
@@ -166,7 +167,7 @@ mod tests {
     #[test]
     fn a_pinned_set_folds_no_scan() {
         let mut set = FilesSet {
-            pin: FilesPin::Only(FileKey(9)),
+            pin: FilesPin::Only(vec![FileKey(9)]),
             ..FilesSet::default()
         };
         set.observe(&[(kind(1), vec![(FileKey(1), 500.0)])], 0.2, 100.0);

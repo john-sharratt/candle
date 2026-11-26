@@ -57,14 +57,16 @@ pub(crate) fn files_splice<R: ContentResolver>(
         .map(|r| (r.key(), r))
         .collect();
     // Each kind's choice, then every chosen file ranked by its momentum — or,
-    // pinned, the one file whole or nothing.
+    // pinned, the pinned files whole, in the pin's order, or nothing.
     let mut chosen: Vec<(FilePlacement, f32)> = Vec::new();
-    match set.pin {
+    match &set.pin {
         FilesPin::Empty => {}
-        FilesPin::Only(file) => {
-            if let Some(record) = records.get(&file) {
-                let chunks = (0..record.chunks.len()).collect();
-                chosen.push((FilePlacement { file, chunks }, 0.0));
+        FilesPin::Only(files) => {
+            for &file in files {
+                if let Some(record) = records.get(&file) {
+                    let chunks = (0..record.chunks.len()).collect();
+                    chosen.push((FilePlacement { file, chunks }, 0.0));
+                }
             }
         }
         FilesPin::Free => {
@@ -89,9 +91,9 @@ pub(crate) fn files_splice<R: ContentResolver>(
                     chosen.push((p, m));
                 }
             }
+            chosen.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.file.cmp(&b.0.file)));
         }
     }
-    chosen.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.file.cmp(&b.0.file)));
     let keys: Vec<FileKey> = chosen.iter().map(|(p, _)| p.file).collect();
     let order = set.order(&keys);
     let placement: HashMap<FileKey, &FilePlacement> =

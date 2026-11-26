@@ -188,7 +188,7 @@ fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
         &[(fa.key(), 100.0), (fb.key(), 900.0)],
         vec![],
     );
-    mock.files.as_mut().unwrap().pin = FilesPin::Only(fa.key());
+    mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key()]);
     let splice = files_splice(b.schema(), &mock, |_| 0, false);
     assert_eq!(splice.order, vec![fa.key()]);
     assert_eq!(
@@ -218,6 +218,38 @@ fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
     let empty = files_splice(b.schema(), &mock, |_| 10_000, false);
     assert!(empty.order.is_empty());
     assert!(empty.segments.is_empty());
+}
+
+/// **Pinned files sit in the pin's order, whatever their momentum**: a
+/// weaker file pinned first stays first, each whole, and the last ends the
+/// knowledge base.
+#[test]
+fn pinned_files_sit_in_the_pins_order() {
+    let b = Builder::from_yaml(YAML).unwrap();
+    let fa = record("candle/a.rs", &[(1, 10)]);
+    let fb = record("candle/b.rs", &[(1, 10)]);
+    let records = [fa.clone(), fb.clone()];
+    let (mut mock, m) = resolver(
+        &b,
+        &records,
+        &[(fa.key(), 100.0), (fb.key(), 900.0)],
+        vec![],
+    );
+    mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key(), fb.key()]);
+    let splice = files_splice(b.schema(), &mock, |_| 0, false);
+    assert_eq!(splice.order, vec![fa.key(), fb.key()]);
+    let chunk = |path: &str| m[&chunk_name(path, "b", LineSpan { first: 1, last: 10 })];
+    assert_eq!(
+        ids(&splice.segments),
+        vec![
+            m[&heading_name("candle/a.rs", "b")],
+            chunk("candle/a.rs"),
+            m[CLOSING_JOIN_NAME],
+            m[&heading_name("candle/b.rs", "b")],
+            chunk("candle/b.rs"),
+            m[CLOSING_LAST_NAME],
+        ]
+    );
 }
 
 /// **A pinned knowledge base is placed for a target whose layer declares no
@@ -268,7 +300,7 @@ layers:
         free.files_placed.is_empty(),
         "no working set: provenance places nothing"
     );
-    mock.files.as_mut().unwrap().pin = FilesPin::Only(fa.key());
+    mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key()]);
     let proj = b.project(target, &mock);
     assert_eq!(proj.files_placed, vec![fa.key()]);
     let heading = m[&heading_name("candle/a.rs", "b")];

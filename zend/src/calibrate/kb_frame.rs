@@ -42,7 +42,7 @@ impl KbFrame {
     pub fn pin(self, file: FileKey) -> FilesPin {
         match self {
             KbFrame::Empty => FilesPin::Empty,
-            KbFrame::Target => FilesPin::Only(file),
+            KbFrame::Target => FilesPin::Only(vec![file]),
         }
     }
 
@@ -95,7 +95,7 @@ mod tests {
     fn an_empty_frame_is_the_heading_alone_and_a_target_its_file() {
         let f = FileKey(42);
         assert_eq!(KbFrame::Empty.pin(f), FilesPin::Empty);
-        assert_eq!(KbFrame::Target.pin(f), FilesPin::Only(f));
+        assert_eq!(KbFrame::Target.pin(f), FilesPin::Only(vec![f]));
         for frame in KbFrame::ALL {
             assert_eq!(KbFrame::parse(frame.as_str()), Some(frame));
         }

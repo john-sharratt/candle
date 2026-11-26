@@ -31,7 +31,7 @@
 //! prompt the same way — the control that must answer as the plain fresh side
 //! does before either swap is read.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -120,6 +120,47 @@ pub struct SealedFreshReq {
     /// before it holds.
     #[serde(default)]
     pub live_tail: usize,
+    /// Other knowledge-base files placed after the file, in path order, until
+    /// their tokens reach this — the file no longer the last thing the
+    /// question reads.
+    #[serde(default)]
+    pub after_tokens: usize,
+}
+
+/// The files placed after `needle` to reach `tokens`: every other path's
+/// record this process can place, one version each, in path order, until
+/// their members' tokens reach `tokens`.
+fn files_after(conversation: &Conversation, needle: &FileRecord, tokens: usize) -> Vec<FileRecord> {
+    let mut by_path: BTreeMap<String, FileRecord> = BTreeMap::new();
+    for r in records::all(conversation) {
+        if r.path != needle.path && records::placeable(conversation, &r) {
+            by_path.entry(r.path.clone()).or_insert(r);
+        }
+    }
+    take_to(by_path.into_values(), tokens)
+}
+
+/// The leading `records` whose members' tokens reach `tokens`.
+fn take_to(records: impl Iterator<Item = FileRecord>, tokens: usize) -> Vec<FileRecord> {
+    let mut out = Vec::new();
+    let mut held = 0usize;
+    for r in records {
+        if held >= tokens {
+            break;
+        }
+        held += record_tokens(&r);
+        out.push(r);
+    }
+    out
+}
+
+/// A record's members' tokens: its heading and every chunk.
+fn record_tokens(r: &FileRecord) -> usize {
+    r.heading.tokens as usize
+        + r.chunks
+            .iter()
+            .map(|c| c.member.tokens as usize)
+            .sum::<usize>()
 }
 
 /// Which side a part of the fresh slot comes from.
@@ -283,6 +324,9 @@ pub struct SealedFresh {
     /// Resealed, whether the prompt with the resealed members placed holds
     /// exactly the tokens the stored members' prompt did.
     pub resealed_same_tokens: Option<bool>,
+    /// The files placed after the file, in order, and their members' tokens.
+    pub after_files: Vec<String>,
+    pub after_tokens: usize,
 }
 
 /// The first index where `a` and `b` differ, within the shorter; `None` when
@@ -347,9 +391,17 @@ impl ZendSession {
                     .with_context(|| format!("no record of {path}"))?,
             ),
         };
-        let pin = record
-            .as_ref()
-            .map_or(FilesPin::Empty, |r| FilesPin::Only(r.key()));
+        // The files placed after the needle, to `after_tokens`.
+        let after = match &record {
+            Some(r) => files_after(&engine.conversation(), r, req.after_tokens),
+            None => Vec::new(),
+        };
+        let pin_of = |needle: &FileRecord| {
+            let mut keys = vec![needle.key()];
+            keys.extend(after.iter().map(FileRecord::key));
+            FilesPin::Only(keys)
+        };
+        let pin = record.as_ref().map_or(FilesPin::Empty, pin_of);
         // The placed file's member sections in this process: what the prompt
         // holds that production's recurrence never ran over.
         let mut members: HashSet<u32> = record
@@ -408,7 +460,7 @@ impl ZendSession {
                     &prefix,
                     kind,
                 )?;
-                engine.files_pin(timeline, FilesPin::Only(p.key()));
+                engine.files_pin(timeline, pin_of(&p));
                 members = member_ids(&conversation, &p);
                 probe = Some(p);
                 let again = conv
@@ -511,6 +563,8 @@ impl ZendSession {
                 fresh_finish,
                 layout,
                 resealed_same_tokens,
+                after_files: after.iter().map(|r| r.path.clone()).collect(),
+                after_tokens: after.iter().map(record_tokens).sum(),
             })
         })();
         let _ = engine.tombstone_timeline(timeline);
@@ -523,6 +577,9 @@ impl ZendSession {
 
 #[cfg(test)]
 mod tests {
+    use candle_conversation::files::{ChunkRecord, FileUnit, LineSpan, MemberRef};
+    use candle_conversation::persistence::content_hash::ContentHash;
+    use candle_conversation::persistence::streams::ContentAddress;
     use candle_conversation::{PieceKind, PromptPiece};
     use candle_nn::kv_cache::ArenaFormatTag;
 
@@ -699,6 +756,54 @@ mod tests {
             selection().reprojection_mode(),
             Some(ReprojectionMode::Opening)
         );
+    }
+
+    fn record_of(path: &str, heading: u32, chunks: &[u32]) -> FileRecord {
+        let member = |tokens| MemberRef {
+            address: ContentAddress {
+                prefix_hash: ContentHash::ZERO,
+                section_hash: ContentHash::ZERO,
+            },
+            tokens,
+        };
+        FileRecord {
+            content_key: format!("v1:{path}@b"),
+            path: path.into(),
+            blob: "b".into(),
+            unit: FileUnit::File,
+            lines: 1,
+            lang: "rs".into(),
+            branches: vec![],
+            heading: member(heading),
+            chunks: chunks
+                .iter()
+                .map(|&t| ChunkRecord {
+                    lines: LineSpan { first: 1, last: 1 },
+                    member: member(t),
+                })
+                .collect(),
+        }
+    }
+
+    /// **Files are taken until their tokens reach the ask**, the one that
+    /// crosses it included, and none past it.
+    #[test]
+    fn files_are_taken_until_their_tokens_reach_the_ask() {
+        let records = [
+            record_of("a", 10, &[90]),
+            record_of("b", 10, &[40, 50]),
+            record_of("c", 5, &[5]),
+        ];
+        assert_eq!(record_tokens(&records[1]), 100);
+        let paths = |n: usize| -> Vec<String> {
+            take_to(records.clone().into_iter(), n)
+                .into_iter()
+                .map(|r| r.path)
+                .collect()
+        };
+        assert_eq!(paths(0), Vec::<String>::new());
+        assert_eq!(paths(150), vec!["a", "b"]);
+        assert_eq!(paths(10_000), vec!["a", "b", "c"]);
     }
 
     /// **Tools are the dialogue base's unless the request names a mode.**
