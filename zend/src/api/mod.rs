@@ -288,10 +288,11 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             post(scan::scan).body_limit(scan::BODY_LIMIT),
         )
         // One question decoded sealed and fresh over the same tokens, on the
-        // member asked: its card does both.
+        // member asked: its card does both. A user's, as the diagnostic
+        // decode is: it reads nothing of anyone else's.
         .route(
             "/v1/substrate/zend/sealed-fresh",
-            Role::Admin,
+            Role::User,
             Dispatch::Best,
             post(sealed_fresh::run),
         )
@@ -562,7 +563,7 @@ mod tests {
                 ("/v1/substrate/zend/timeline/:tl/selection", "admin"),
                 ("/v1/substrate/zend/project", "admin"),
                 ("/v1/substrate/zend/scan", "admin"),
-                ("/v1/substrate/zend/sealed-fresh", "admin"),
+                ("/v1/substrate/zend/sealed-fresh", "user"),
                 ("/v1/agents", "admin"),
                 ("/v1/agents/:node", "admin"),
                 ("/v1/agents/:node/jobs/:id", "admin"),
