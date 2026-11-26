@@ -89,6 +89,7 @@ mod submitted_sections;
 mod turn_bans;
 
 pub use member_seal::{MemberSpec, SealedMember};
+pub(crate) use prefix_state::run_state;
 use prefix_state::{checkpoint, shared_held, state_after};
 pub use prompt_dump::{PieceKind, PromptDump, PromptPiece};
 pub use sharing::{is_shared_stream_name, shared_stream_name, Sharing, SHARED_SECTION_NAME_PREFIX};

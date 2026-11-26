@@ -9,6 +9,8 @@
 //! flushes the redo log before the process exits.
 
 use super::*;
+use crate::conversation::run_state;
+use crate::scheduler::exported_state::SharedState;
 
 /// Live progress of the startup substrate reload (redo-log replay), shared
 /// between the scheduler thread (writer) and the daemon's load-state machine
@@ -229,6 +231,44 @@ impl ConversationEngine {
         Ok(self.infer_raw(tokens, max_decode_tokens)?.0)
     }
 
+    /// [`Self::infer_raw_token_ids`] with the recurrent state swapped: `prompt`
+    /// prefilled on a fresh slot — its K/V and its recurrence both computed
+    /// over it — then the slot's recurrent state replaced by the one
+    /// `recurrent_over` leaves when run from zero, then `tail` prefilled and
+    /// decoded argmax for up to `max_decode_tokens`. Fresh K/V under another
+    /// recurrent state: what it answers says whether the K/V alone carries
+    /// what the prompt holds.
+    pub fn infer_raw_token_ids_swapped(
+        &self,
+        prompt: &[u32],
+        recurrent_over: Vec<u32>,
+        tail: &[u32],
+        max_decode_tokens: usize,
+    ) -> crate::Result<Vec<u32>> {
+        let sequence_id = self.new_raw_sequence()?;
+        let out = (|| {
+            self.raw_turn(sequence_id, prompt, 0)?;
+            if let Some(state) = run_state(&self.core.scheduler_tx, None, recurrent_over)? {
+                let (tx, rx) = flume::bounded(1);
+                self.core
+                    .scheduler_tx
+                    .send(SchedulerRequest::InstallRecurrentState {
+                        sequence_ids: vec![sequence_id],
+                        state: SharedState::from(&state),
+                        response_tx: tx,
+                    })
+                    .map_err(|_| ConversationError::SchedulerGone)?;
+                rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
+            }
+            Ok(self.raw_turn(sequence_id, tail, max_decode_tokens)?.0)
+        })();
+        let _ = self
+            .core
+            .scheduler_tx
+            .send(SchedulerRequest::FreeSequence { sequence_id });
+        out
+    }
+
     /// The decode of [`Self::infer_raw_tokens`]: the ids it produced, and the
     /// text the turn finished with when it finished.
     fn infer_raw(
@@ -236,7 +276,20 @@ impl ConversationEngine {
         tokens: &[u32],
         max_decode_tokens: usize,
     ) -> crate::Result<(Vec<u32>, Option<String>)> {
-        // 1. Allocate a sequence.
+        let sequence_id = self.new_raw_sequence()?;
+        let out = self.raw_turn(sequence_id, tokens, max_decode_tokens);
+        // Always release the sequence slot — RULER spawns one sequence per
+        // sample and never reuses it, so without this the KV pool leaks
+        // until OOM.
+        let _ = self
+            .core
+            .scheduler_tx
+            .send(SchedulerRequest::FreeSequence { sequence_id });
+        out
+    }
+
+    /// A fresh slot bound to nothing: no projection, no substrate write.
+    fn new_raw_sequence(&self) -> crate::Result<SequenceId> {
         let (resp_tx, resp_rx) = flume::bounded(1);
         self.core
             .scheduler_tx
@@ -249,15 +302,22 @@ impl ConversationEngine {
                 response_tx: resp_tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
-        let sequence_id = resp_rx
+        resp_rx
             .recv()
-            .map_err(|_| ConversationError::SchedulerGone)??;
+            .map_err(|_| ConversationError::SchedulerGone)?
+    }
 
-        // 2. Submit the turn with raw tokens.  The scheduler carves a
-        //    view over the parent's full block range and auto-finalizes
-        //    on Done — for a fresh parent with no blocks the view
-        //    borrows nothing and decoded blocks transfer back on
-        //    finalize.
+    /// One raw turn on `sequence_id`: `tokens` prefilled after what the slot
+    /// holds, then up to `max_decode_tokens` decoded argmax — none with `0`,
+    /// the prefill alone. The scheduler carves a view over the parent's full
+    /// block range and finalizes it onto the parent on Done, so a later turn
+    /// continues from here.
+    fn raw_turn(
+        &self,
+        sequence_id: SequenceId,
+        tokens: &[u32],
+        max_decode_tokens: usize,
+    ) -> crate::Result<(Vec<u32>, Option<String>)> {
         let (event_tx, event_rx) = flume::unbounded();
         self.core
             .scheduler_tx
@@ -292,7 +352,7 @@ impl ConversationEngine {
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
 
-        // 3. Drain events until Done / Error.
+        // Drain events until Done / Error.
         let mut collected: Vec<u32> = Vec::with_capacity(max_decode_tokens);
         let mut text_from_done: Option<String> = None;
         let mut last_error: Option<ConversationError> = None;
@@ -310,15 +370,6 @@ impl ConversationEngine {
                 _ => {}
             }
         }
-
-        // 4. Always release the sequence slot — RULER spawns one sequence per
-        //    sample and never reuses it, so without this the KV pool leaks
-        //    until OOM.
-        let _ = self
-            .core
-            .scheduler_tx
-            .send(SchedulerRequest::FreeSequence { sequence_id });
-
         if let Some(e) = last_error {
             return Err(e);
         }

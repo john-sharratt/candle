@@ -20,16 +20,27 @@
 //! turn, under its own sealed K/V. Answering as fresh does, the sealed K/V is
 //! read correctly and the recurrence is what differs; answering as sealed
 //! does, the K/V differs.
+//!
+//! **The reverse swap** (`fresh_recurrent: sealed`): the fresh side prefills
+//! the prompt's K/V afresh, then takes the recurrent state production's
+//! recurrence has — the prompt run from zero without the placed file's member
+//! sections — before its user half. Answering correctly, fresh K/V alone
+//! suffices; answering as sealed does, the recurrence the file never reached
+//! matters too.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context;
-use candle_conversation::files::{FileKey, FilesPin};
+use candle_conversation::files::names::{chunk_name, heading_name};
+use candle_conversation::files::{files_owner, FileRecord, FilesPin};
+use candle_conversation::projection::Conversation;
 use candle_conversation::projection::{
     DecodePriority, OptionalState, ReprojectionMode, SelectionState, TurnIndex,
     TOOLS_ENABLED_SELECTOR,
 };
 use candle_conversation::stencil::TriggerRegistry;
+use candle_conversation::PromptDump;
 use candle_conversation::{SamplingConfig, TurnOptions};
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +64,16 @@ pub struct SealedFreshReq {
     /// The recurrent state the sealed side's turn starts from.
     #[serde(default)]
     pub recurrent: Recurrent,
+    /// The recurrent state the fresh side's turn starts from:
+    /// [`Recurrent::Fresh`], its own prefill's, by default;
+    /// [`Recurrent::Sealed`] the one production's recurrence has — the prompt
+    /// run from zero without the placed file's tokens — under the fresh K/V.
+    #[serde(default = "fresh")]
+    pub fresh_recurrent: Recurrent,
+}
+
+fn fresh() -> Recurrent {
+    Recurrent::Fresh
 }
 
 /// Where the sealed side's recurrent state comes from: the swap that tells a
@@ -74,6 +95,8 @@ pub enum Recurrent {
 pub struct SealedFresh {
     /// The recurrent state the sealed side started from.
     pub recurrent: Recurrent,
+    /// The recurrent state the fresh side started from.
+    pub fresh_recurrent: Recurrent,
     /// Tokens of the prompt both decoded over: the projection's, then the
     /// turn's own user half.
     pub prompt_tokens: usize,
@@ -99,6 +122,32 @@ pub fn first_divergence(a: &[u32], b: &[u32]) -> Option<usize> {
     a.iter().zip(b).position(|(x, y)| x != y)
 }
 
+/// The raw ids of `record`'s member sections in this process.
+fn member_ids(conversation: &Conversation, record: &FileRecord) -> HashSet<u32> {
+    let mut names = vec![heading_name(&record.path, &record.blob)];
+    names.extend(
+        record
+            .chunks
+            .iter()
+            .map(|c| chunk_name(&record.path, &record.blob, c.lines)),
+    );
+    names
+        .iter()
+        .filter_map(|n| conversation.owned_section_named(files_owner(), n))
+        .map(|id| id.raw())
+        .collect()
+}
+
+/// `dump`'s ids without the pieces that are `members`: the prompt as
+/// production's recurrence has run over it.
+fn without_members(dump: &PromptDump, members: &HashSet<u32>) -> Vec<u32> {
+    dump.pieces
+        .iter()
+        .filter(|p| !p.section_id.is_some_and(|id| members.contains(&id)))
+        .flat_map(|p| p.token_ids.iter().copied())
+        .collect()
+}
+
 /// The selection the sealed side runs under: tools off, the opening its only
 /// projection, every other dial the dialogue's default.
 fn selection() -> SelectionState {
@@ -120,16 +169,24 @@ impl ZendSession {
             .load_full()
             .context("the model is not loaded")?;
         let engine = &state.engine;
-        let pin = match &req.file {
-            None => FilesPin::Empty,
-            Some(path) => {
-                let record = records::of_path(&engine.conversation(), path)
+        let record = match &req.file {
+            None => None,
+            Some(path) => Some(
+                records::of_path(&engine.conversation(), path)
                     .into_iter()
                     .next()
-                    .with_context(|| format!("no record of {path}"))?;
-                FilesPin::Only(FileKey::of(&record.content_key))
-            }
+                    .with_context(|| format!("no record of {path}"))?,
+            ),
         };
+        let pin = record
+            .as_ref()
+            .map_or(FilesPin::Empty, |r| FilesPin::Only(r.key()));
+        // The placed file's member sections in this process: what the prompt
+        // holds that production's recurrence never ran over.
+        let members: HashSet<u32> = record
+            .as_ref()
+            .map(|r| member_ids(&engine.conversation(), r))
+            .unwrap_or_default();
         let mut conv = state
             .base_conv
             .fork_at(DecodePriority::Low)
@@ -170,14 +227,22 @@ impl ZendSession {
             let mut prompt = dump.token_ids.clone();
             prompt.extend_from_slice(&turn[..user_half]);
             let sealed: Vec<u32> = resp.token_ids.to_vec();
-            let fresh = engine
-                .infer_raw_token_ids(&prompt, req.n)
-                .map_err(|e| anyhow::anyhow!("the fresh decode: {e}"))?;
+            let fresh = match req.fresh_recurrent {
+                Recurrent::Fresh => engine.infer_raw_token_ids(&prompt, req.n),
+                Recurrent::Sealed => engine.infer_raw_token_ids_swapped(
+                    &dump.token_ids,
+                    without_members(&dump, &members),
+                    &turn[..user_half],
+                    req.n,
+                ),
+            }
+            .map_err(|e| anyhow::anyhow!("the fresh decode: {e}"))?;
             let decode = |ids: &[u32]| engine.tokenizer().decode(ids, false).unwrap_or_default();
             let at = first_divergence(&sealed, &fresh);
             let agreed = &sealed[..at.unwrap_or(sealed.len().min(fresh.len()))];
             Ok(SealedFresh {
                 recurrent: req.recurrent,
+                fresh_recurrent: req.fresh_recurrent,
                 prompt_tokens: prompt.len(),
                 sealed_prompt_tokens: resp.stats.prefill_token_count,
                 same_prompt: prompt.len() == resp.stats.prefill_token_count,
@@ -196,6 +261,8 @@ impl ZendSession {
 
 #[cfg(test)]
 mod tests {
+    use candle_conversation::{PieceKind, PromptPiece};
+
     use super::*;
 
     /// **The first divergence is the first index the two disagree at**, and
@@ -217,6 +284,52 @@ mod tests {
         let req: SealedFreshReq =
             serde_json::from_str(r#"{"question":"q","n":8,"recurrent":"fresh"}"#).unwrap();
         assert_eq!(req.recurrent, Recurrent::Fresh);
+        assert_eq!(req.fresh_recurrent, Recurrent::Fresh);
+        let req: SealedFreshReq =
+            serde_json::from_str(r#"{"question":"q","n":8,"fresh_recurrent":"sealed"}"#).unwrap();
+        assert_eq!(req.fresh_recurrent, Recurrent::Sealed);
+    }
+
+    fn piece(section_id: Option<u32>, token_ids: Vec<u32>) -> PromptPiece {
+        PromptPiece {
+            kind: if section_id.is_some() {
+                PieceKind::Section
+            } else {
+                PieceKind::Glue
+            },
+            name: String::new(),
+            section_id,
+            timeline: None,
+            index: None,
+            role: None,
+            score: 0.0,
+            qualified: false,
+            token_count: token_ids.len(),
+            token_ids,
+            text: String::new(),
+        }
+    }
+
+    /// **Production's recurrence runs over every piece but the placed
+    /// file's members**, in order, glue and the seed included.
+    #[test]
+    fn the_sealed_recurrence_skips_only_the_members() {
+        let pieces = vec![
+            piece(Some(1), vec![10, 11]),
+            piece(None, vec![20]),
+            piece(Some(7), vec![30, 31, 32]),
+            piece(Some(8), vec![40]),
+            piece(Some(2), vec![50]),
+        ];
+        let dump = PromptDump {
+            token_ids: pieces.iter().flat_map(|p| p.token_ids.clone()).collect(),
+            token_count: 8,
+            pieces,
+            text: String::new(),
+        };
+        let members: HashSet<u32> = [7, 8].into_iter().collect();
+        assert_eq!(without_members(&dump, &members), vec![10, 11, 20, 50]);
+        assert_eq!(without_members(&dump, &HashSet::new()), dump.token_ids);
     }
 
     /// The sealed side runs with tools off and its opening its only
