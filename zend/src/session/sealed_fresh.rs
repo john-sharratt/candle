@@ -26,7 +26,9 @@
 //! recurrence has — the prompt run from zero without the placed file's member
 //! sections — before its user half. Answering correctly, fresh K/V alone
 //! suffices; answering as sealed does, the recurrence the file never reached
-//! matters too.
+//! matters too. `fresh_recurrent: replayed` installs the state of the whole
+//! prompt the same way — the control that must answer as the plain fresh side
+//! does before either swap is read.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -88,6 +90,11 @@ pub enum Recurrent {
     /// A fresh prefill's: the prompt's ids run through every layer from zero,
     /// installed on the sealed slot before its turn, under the sealed K/V.
     Fresh,
+    /// The whole prompt's ids run from zero and installed over the slot's
+    /// own state: the swap's control. On the fresh side it must decode as
+    /// [`Recurrent::Fresh`] does, or the install, not the state, is what the
+    /// swapped arms measure; on the sealed side it is [`Recurrent::Fresh`].
+    Replayed,
 }
 
 /// The two decodes and where they part.
@@ -206,7 +213,7 @@ impl ZendSession {
             let dump = conv
                 .prompt_dump_with(&selection)
                 .context("the sealed side's prompt")?;
-            if req.recurrent == Recurrent::Fresh {
+            if req.recurrent != Recurrent::Sealed {
                 conv.install_fresh_recurrent_over(dump.token_ids.clone())
                     .map_err(|e| anyhow::anyhow!("the fresh recurrent state: {e}"))?;
             }
@@ -238,6 +245,12 @@ impl ZendSession {
                 Recurrent::Sealed => engine.infer_raw_token_ids_swapped(
                     &dump.token_ids,
                     without_members(&dump, &members),
+                    &turn[..user_half],
+                    req.n,
+                ),
+                Recurrent::Replayed => engine.infer_raw_token_ids_swapped(
+                    &dump.token_ids,
+                    dump.token_ids.clone(),
                     &turn[..user_half],
                     req.n,
                 ),
@@ -300,6 +313,9 @@ mod tests {
         let req: SealedFreshReq =
             serde_json::from_str(r#"{"question":"q","n":8,"fresh_recurrent":"sealed"}"#).unwrap();
         assert_eq!(req.fresh_recurrent, Recurrent::Sealed);
+        let req: SealedFreshReq =
+            serde_json::from_str(r#"{"question":"q","n":8,"fresh_recurrent":"replayed"}"#).unwrap();
+        assert_eq!(req.fresh_recurrent, Recurrent::Replayed);
     }
 
     fn piece(section_id: Option<u32>, token_ids: Vec<u32>) -> PromptPiece {
