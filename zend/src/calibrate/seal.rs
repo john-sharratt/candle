@@ -3,7 +3,7 @@
 //! signatures stay.
 //!
 //! A file's calibration ([`super::run`]) is prefilled behind the knowledge
-//! base its questions were asked in — a fork of the files layer's base, the
+//! base its questions were asked in — a fork of the dialogue's base, the
 //! knowledge base pinned to that frame ([`seal_framed`]). A use-exemplar
 //! (`crate::guidance`) is prefilled in a conversation of the hidden
 //! calibration layer under the plain system prompt ([`seal_calibration`]).
@@ -57,7 +57,7 @@ pub(crate) fn seal_calibration(
 }
 
 /// Prefill `cases` as a calibration named by `meta`, behind the knowledge
-/// base `pin` holds: a fork of `base` — the files layer's — prefilled under
+/// base `pin` holds: a fork of `base` — the dialogue's — prefilled under
 /// `selection`, then archived and distilled. Returns its timeline. A
 /// calibration that fails to seal is tombstoned.
 pub(crate) fn seal_framed(

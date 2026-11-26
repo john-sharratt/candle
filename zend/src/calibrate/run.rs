@@ -3,8 +3,9 @@
 //! calibration of its current version, ask for its questions, and seal them
 //! as its calibrations.
 //!
-//! A file is asked in a **draft** — a fork of the files layer's base, the seed
-//! absent and the knowledge base pinned to the file alone, whole
+//! A file is asked in a **draft** — a fork of the dialogue's base, projected
+//! as a dialogue's first turn is, the seed absent and the knowledge base
+//! pinned to the file alone, whole
 //! ([`FilesPin::Only`]) — so the model writes its questions with the file in
 //! front of it, in the notation a dialogue reads files in. The draft is
 //! tombstoned once its answer is read: only the questions are kept.
@@ -185,7 +186,8 @@ pub struct Report {
 }
 
 /// The files layer to calibrate: its spec, and the base its drafts, thinking
-/// and calibrations fork from.
+/// and calibrations fork from — the dialogue's, so each projects as a live
+/// query's first turn does.
 pub struct Layer<'a> {
     pub spec: &'a CalibrateSpec,
     pub base: &'a Sequence,

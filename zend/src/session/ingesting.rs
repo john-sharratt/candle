@@ -83,20 +83,17 @@ impl InferenceState {
             let Some(spec) = il.calibrate.as_deref() else {
                 continue;
             };
-            let base = match self.ingest_base(&il.name) {
-                Ok(base) => base,
-                Err(e) => {
-                    tracing::error!(
-                        target: "zend::calibrate",
-                        layer = %il.name,
-                        "the layer declares a calibration but cannot be calibrated: {e:#}",
-                    );
-                    continue;
-                }
-            };
+            // A calibration is asked where a live query is: a fork of the
+            // dialogue's base, projected as a dialogue's first turn is, its
+            // knowledge base pinned to its frame (§7.1, §12 D11). An ingest
+            // base never projects — its first turn lays its fixed frame down —
+            // so a pin on a fork of one places nothing.
             calibrate_layer(
                 &self.engine,
-                &CalibrateLayer { spec, base },
+                &CalibrateLayer {
+                    spec,
+                    base: &self.base_conv,
+                },
                 &CalibrateFrame {
                     system_prompt: &self.formatted_prompt,
                     config: &self.refresh_config,
