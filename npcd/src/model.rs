@@ -1,10 +1,12 @@
 //! The model npcd runs, and how its console describes it.
 //!
 //! npcd names its own model ([`MODEL`], `docs/parasite_model.md` §4):
-//! **Qwen3.8-Flash-Next**, 250 B total with about 13 B active per token —
-//! gated-DeltaNet layers carrying a recurrent state, attention layers carrying
-//! paged K/V, and routed experts behind the three-tier expert cache. See
-//! `Model::Qwen38_FlashNext`. Its substrate is bound to it
+//! **Qwen3.6-35B-A3B AntiLoop with the StyleTune head**, 35 B total with about
+//! 3 B active per token — gated-DeltaNet layers carrying a recurrent state,
+//! attention layers carrying paged K/V, and routed experts behind the three-tier
+//! expert cache. See `Model::Qwen36_35B_A3B_AntiLoop_StyleTune`. It is
+//! WhiteWorld's primary (`docs/parasite_model.md` §3), and npcd runs on
+//! WhiteWorld alone (§16, step 7). Its substrate is bound to it
 //! (`docs/shared_model_host.md` §4), so changing it starts npcd on a new
 //! substrate.
 //!
@@ -18,16 +20,20 @@
 //! are what fill what is left. [`Model::Qwen35_9B_Q6`] stays in the registry for
 //! a cast large enough that the room matters more than the model.
 //!
-//! # The card's rung
+//! # The checkpoint
 //!
-//! The trunk is `Q8_0` on every card; the routed experts are at the card's rung
-//! — `Q3_KO` under 64 GiB, `Q4_KO` above. Every rung is the same release, so a
-//! substrate written on one card opens on another.
+//! A published GGUF, read as it is: no artifact is prepared on the machine
+//! (`ModelSpec::prepared_from_source` is false), so a card starts it without a
+//! pack build.
 
 use candle_conversation::models::Model;
 
 /// The model npcd runs.
-pub const MODEL: Model = Model::Qwen38_FlashNext;
+pub const MODEL: Model = Model::Qwen36_35B_A3B_AntiLoop_StyleTune;
+
+/// The parameters of [`MODEL`], all of them and those a token passes through, as
+/// the console shows them.
+const PARAMS: (&str, &str) = ("35B", "3B");
 
 // # A deployment may be running something else
 //
@@ -47,9 +53,8 @@ pub struct ModelSpec {
     pub name: &'static str,
     pub quant: &'static str,
     pub params_total: &'static str,
-    /// The parameters a token actually passes through — about 13 B of the
-    /// 250 B, which is what the console's two figures side by side say at a
-    /// glance.
+    /// The parameters a token actually passes through — about 3 B of the 35 B,
+    /// which is what the console's two figures side by side say at a glance.
     pub params_active: &'static str,
     pub repo: &'static str,
     pub filename: &'static str,
@@ -98,8 +103,8 @@ pub fn spec() -> ModelSpec {
     ModelSpec {
         name: Box::leak(name.into_boxed_str()),
         quant: quant_of(filename),
-        params_total: "250B",
-        params_active: "13B",
+        params_total: PARAMS.0,
+        params_active: PARAMS.1,
         repo: Box::leak(s.model_repo.into_boxed_str()),
         filename,
         bytes: s.model_bytes,
@@ -111,26 +116,26 @@ mod tests {
     use super::*;
     use candle_conversation::models::ModelArch;
 
-    /// **Flash-Next's arch.** The arch is what routes the load — each loader
+    /// **Qwen3.6's arch.** The arch is what routes the load — each loader
     /// refuses the others' checkpoints — so it is asserted rather than assumed.
     #[test]
-    fn npcd_runs_flash_next() {
+    fn npcd_runs_qwen36() {
         assert!(
-            matches!(MODEL.spec().arch, ModelArch::Qwen4Exp),
-            "arch {:?} routes to a loader that refuses Flash-Next's pack",
+            matches!(MODEL.spec().arch, ModelArch::Qwen35Hybrid),
+            "arch {:?} routes to a loader that refuses Qwen3.6's checkpoint",
             MODEL.spec().arch
         );
     }
 
-    /// **Prepared on this machine, at the card's rung.** The preset names the
-    /// release, not a rung, so its file name carries no quant the console could
-    /// claim.
+    /// **A published checkpoint, read as it is**, with the StyleTune head as its
+    /// one tensor override: nothing is prepared on the machine.
     #[test]
-    fn the_preset_is_prepared_and_names_no_rung() {
+    fn the_preset_reads_its_checkpoint_with_the_styletune_head() {
         let s = MODEL.preset_spec();
-        assert!(s.prepared_from_source);
-        assert_eq!(quant_of(&s.model_filename), "?");
-        assert!(s.tensor_overrides.is_empty());
+        assert!(!s.prepared_from_source);
+        assert_eq!(s.model_filename, "Qwen3.6-35B-A3B-AntiLoop.Q4_K_M.gguf");
+        assert_eq!(quant_of(&s.model_filename), "Q4_K_M");
+        assert_eq!(s.tensor_overrides.len(), 1);
     }
 
     /// **The console's figures come from the resolved spec, override and all.**
@@ -215,12 +220,12 @@ mod tests {
     ///
     /// The override file deliberately cannot reach `arch`, and this is the
     /// consequence worth asserting: whatever checkpoint a deployment substitutes
-    /// still loads through Flash-Next's path. A file that could swap the
+    /// still loads through Qwen3.6's path. A file that could swap the
     /// architecture would let a local edit route npcd into a loader that refuses
     /// its checkpoint, with nothing in the repository changed to explain it.
     #[test]
     fn an_override_cannot_move_npcd_off_the_arch() {
-        assert!(matches!(MODEL.spec().arch, ModelArch::Qwen4Exp));
+        assert!(matches!(MODEL.spec().arch, ModelArch::Qwen35Hybrid));
         assert_eq!(MODEL.spec().arch, MODEL.preset_spec().arch);
     }
 
