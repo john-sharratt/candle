@@ -10,7 +10,9 @@
 //! sequence, but it can absorb an append, so a splice catches memory up over the
 //! adopted turns.
 
+use super::prefix_state::run_state;
 use super::*;
+use crate::scheduler::exported_state::SharedState;
 
 /// One code scope to ingest in parallel — the `(user, assistant)` pair a single
 /// A client-side conversation handle.
@@ -561,6 +563,25 @@ impl Sequence {
         self.scheduler_tx
             .send(SchedulerRequest::SeedRecurrentFromLineage {
                 sequence_id: self.id,
+                response_tx: tx,
+            })
+            .map_err(|_| ConversationError::SchedulerGone)?;
+        replied(&rx).map_err(|_| ConversationError::SchedulerGone)?
+    }
+
+    /// Run `tokens` through every layer from zero and give this slot the
+    /// recurrent state they leave, before its first turn: the state a fresh
+    /// prefill of `tokens` has, under whatever K/V the slot's turn is
+    /// projected onto. `Ok(false)` when the model carries no recurrent state.
+    pub fn install_fresh_recurrent_over(&self, tokens: Vec<u32>) -> crate::Result<bool> {
+        let Some(state) = run_state(&self.scheduler_tx, None, tokens)? else {
+            return Ok(false);
+        };
+        let (tx, rx) = flume::bounded(1);
+        self.scheduler_tx
+            .send(SchedulerRequest::InstallRecurrentState {
+                sequence_ids: vec![self.id],
+                state: SharedState::from(&state),
                 response_tx: tx,
             })
             .map_err(|_| ConversationError::SchedulerGone)?;
