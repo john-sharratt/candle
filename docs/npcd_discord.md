@@ -3,15 +3,15 @@
 **Discord is where people talk to the characters.** A person talks with the cast in the
 world's server, and DMs a character there as they would a friend: a character its owner
 has given a Discord bot of its own is DMed as that bot, and every other character is
-"DMed" in a private thread in the world's server, where it speaks through the persona
-webhook (§3.1). The console and an assistant's `bot_message_send` remain ways in, but
+talked to in a channel of its own in the world's server, `#<name>`, open to anyone, where
+it speaks through the persona webhook (§3.1). The console and an assistant's `bot_message_send` remain ways in, but
 the secondary ones.
 
 **The substrate stays the record.** What is said is kept in the world, where the
 characters hear it, answer it and remember it, and Discord mirrors it in both
 directions: each group a character is in is a Discord channel, each direct message
 between a person and a character is a Discord DM with that character's bot or, for a
-character without one, a private thread, and a person who writes on Discord is heard in
+character without one, posted in that character's own channel, and a person who writes on Discord is heard in
 the world exactly as one who writes in the console. Background jobs keep the two in step through restarts, gaps and authority
 moves. §1.1 says why Discord is not the record.
 
@@ -22,7 +22,7 @@ bot runtime of §3.3 and §6 (`gateway/` — `protocol`, `guild`, `shard` — `s
 channels (§3.4, `server/`), the posting both share (`post/`), and seeing what the bridge
 did (§5.5, `trace/`, with `bot_discord_read` and `bot_thread_read` in `npcd/src/mcp/`),
 and part three: the world's own server mirrored — its open channel, groups,
-private-thread DMs and the channels its people make there — with the reconcile, the
+each bot-less character's own channel and the channels its people make there — with the reconcile, the
 carry-over of its cursors, and typing (§4.4, §5.3–5.4, `world/`, `discord/dm/typing.rs`); and
 how a character knows its channels and chooses where to speak (§3.5,
 `engine/channels.rs`). §8 records the order it was built in. It sits on npcd's
@@ -134,8 +134,8 @@ window in `discord/limit.rs`):
   │ Guild "Life" (the world's server) │            │ discord::Bridge (a world with a guild) │
   │  #the-channel   ◄──────────────── │◄── post ───│  outbound: per-thread cursor, beat    │
   │  #<group>  (one per named group)  │            │  inbound:  listener events → WorldOp  │
-  │  #dms ▸ private thread: person ↔  │──events───►│  reconcile: channels, members, gaps   │
-  │         Drone-Kettle (webhook)    │            │                                        │
+  │  #<character> (one per character  │──events───►│  reconcile: channels, members, gaps   │
+  │   without a bot; anyone; webhook) │            │                                        │
   └──────────────────────────────────┘             └──────────────────────────────────────┘
 ```
 
@@ -158,9 +158,13 @@ In a world with a server:
   permission overwrites admit exactly the thread's members: each member character's bot
   and each member person's Discord account.
 - **A person ↔ character DM** is a Discord DM between that person and that character's
-  bot, when its owner has given it one — with or without a world server; otherwise a
-  private thread in the world's server, holding the person and the world's listener, in
-  which the character speaks through the persona webhook (§3.1).
+  bot, when its owner has given it one — with or without a world server; otherwise it is
+  posted in the character's own channel in the world's server, `#<name>`, which everyone
+  may read and write in and every person's DM with the character shares. The character
+  speaks there through the persona webhook, each line it says to a person beginning with
+  a mention of them (one that pings nobody), and a post there is a message to the
+  character from whoever wrote it, on their DM with it (§3.1). In the world each
+  person's DM stays their own: its thread, its conversation and its journal.
 - **A character ↔ character DM** is private to the two characters and stays in the
   world: nothing of it is mirrored, to their owners or anyone.
 - **A channel a person made in the server** — any text channel the bridge did not make
@@ -185,22 +189,23 @@ the console (§4.3); nothing assumes that every character has one, and most need
 - **A character without a bot** is on Discord only in a world with a server (§4.4).
   There — not provisioned, or past the team's 75 — it speaks in
   channels, groups and its "DMs" through the guild's **persona webhook**, one per
-  channel, with its name and portrait per message. Its DMs are **private threads** in
-  the world's server: a person who wants to talk to it alone is added to a private
-  thread under a `#dms` channel, which the bridge opens (with Create Private Threads)
-  and in which the character's lines are webhook posts and the person's are their own.
-  A webhook cannot DM (§2); a private thread is the nearest thing a server has.
+  channel, with its name and portrait per message. A webhook cannot DM (§2), so the
+  character is talked to in **a channel of its own**, `#<name>`, which the bridge makes
+  open to everyone: anyone who wants to talk to it joins it there. Every person's DM
+  with the character is posted in it — the character's lines as webhook posts, each led
+  by a mention of the person it answers, the person's as their own — and a post there is
+  a message to the character from its author.
 - **A person writing on Discord** — the usual case — is already there; the bridge only
   carries the message into the world (§5.2).
 - **A person writing through a secondary way in** — the console, or an assistant's
   `bot_message_send` — is mirrored into a group by the persona webhook under the
   person's own name, into a bot's DM by the character's bot as a quoted line
   (`> John (console): …`) — a bot cannot post as a person, and a webhook cannot DM — and
-  into a private thread by the webhook under the person's name, as in a group.
+  into a character's own channel by the webhook under the person's name, as in a group.
 - **Reading** a guild's channels is done by **one bot per world** — the world's
   *listener*, the character its `discord/guild` record names (§4.4), with
   `MESSAGE_CONTENT` on — so a message is received once, not once per bot in the channel.
-  The listener hears the private threads too, so a world with a server needs one
+  The listener hears the characters' own channels too, so a world with a server needs one
   provisioned bot at least. Every bot also hears the channels of the servers it is in
   (§3.4); in the world's server, the listener's shard takes the mirrored channels and
   every other bot drops them.
@@ -449,8 +454,8 @@ record):
 | Record | Holds |
 |---|---|
 | `discord/guild` | `{ guild_id, name, listener: <npc_id> }` — the world's server (§4.4), and its name as Discord last gave it |
-| `discord/thread/<thid>` | `{ channel_id, kind, mirrored_through: seq, last_seen_discord: message_id, parent?, archived? }` — a thread of the world mirrored into its server; `kind` is `channel` for `#the-channel`, `group`, `dm` for a private thread under `#dms`, or `room` for a channel a person made (§3); `parent` the channel a private thread is under, whose webhook posts into it; `archived` a group nobody remains on |
-| `discord/parent/<name>` | `{ channel_id }` — `#dms`, the channel private threads are made under; forgotten when the server no longer has it, so the next private thread makes it again |
+| `discord/thread/<thid>` | `{ channel_id, kind, mirrored_through: seq, last_seen_discord: message_id, archived? }` — a thread of the world mirrored into its server; `kind` is `channel` for `#the-channel`, `group`, `dm` for a person's DM with a character without a bot, posted in that character's own channel, or `room` for a channel a person made (§3); `archived` a group nobody remains on. A `dm`'s `last_seen_discord` is unused: its channel is its character's, read by the character's record |
+| `discord/character/<npc_id>` | `{ channel_id, last_seen_discord }` — the own channel of a character without a bot, `#<name>`, open to everyone, which every person's DM with it shares; forgotten when the server no longer has it, so the next reconcile makes it again |
 | `discord/webhook/<channel_id>` | `{ webhook_id, token }` — a mirrored channel's persona webhook (§3.1), its token sealed for this record as a bot token is (§4.3) |
 | `discord/dm/<npc_id>/<account>` | `{ channel_id, user_id, mirrored_through, last_seen_discord }` — a bot's DM with a linked person, keyed by the person's account key, not their display name |
 | `discord/channel/<npc_id>/<channel_id>` | `{ guild_id, thread, mirrored_through, last_seen_discord }` — a server channel the bot is in, and its thread (§3.4) |
@@ -499,10 +504,10 @@ A token Discord refuses is `400 {"error": "discord_token_rejected"}` (a user's t
 `discord_not_a_bot`); a rate limit is `429 discord_rate_limited` with `retry_after` and a
 `Retry-After` header; any other failure is `502`. None is retried, for the per-IP limit
 (§2), and nothing is written unless every call succeeded. `invite_url` is
-`https://discord.com/oauth2/authorize?client_id=<application_id>&scope=bot&permissions=344402807888`:
+`https://discord.com/oauth2/authorize?client_id=<application_id>&scope=bot&permissions=805424208`:
 View Channels, Send Messages, Read Message History, Embed Links, Attach Files, Add
-Reactions, Send Messages in Threads, Create Private Threads, Manage Webhooks, and — for
-a listener mirroring a world (§4.4) — Manage Channels and Manage Roles
+Reactions, Manage Webhooks, and — for a listener mirroring a world (§4.4) — Manage
+Channels and Manage Roles
 (`npcd/src/discord/invite.rs`).
 
 In the console it is the **Discord** panel at the top of the character's Messages tab.
@@ -816,23 +821,28 @@ channel, group and webhook halves of §5, and it is built first and alone.
    role is said on the channel (`WorldOp::Channel` with its `origin`); anyone
    else's, and any bot's or webhook's, is dropped and said in the trace. Every
    other bot in the world's server keeps its server record — what lets it post
-   there as itself — and stands no channel threads of its own. A webhook Discord
+   there as itself — and stands no channel threads of its own: a server set while its
+   bots are connected closes the threads they had for its channels at once
+   (`server::guild::became_the_worlds`), not on their next connection. A webhook Discord
    no longer has (`404`) is forgotten and made again. The listener's `READY`
    reads what the mirrored channels missed. Tests against the fake gateway and
    REST API: the channel made or found, its webhook sealed, each speaker,
    inbound from each kind of author, a bot that is not the listener, and the
    routes' three checks.
-10. **Built:** groups as channels, persona webhooks and private-thread "DMs", and the
+10. **Built:** groups as channels, persona webhooks, characters' own channels, and the
    reconcile (§5.3). A group's channel is always made, never found by name, with
-   `@everyone` denied it, the listener let in with Manage Webhooks and Create Private
-   Threads, and each member on Discord — a character's bot, a linked person — let see,
-   read and write; the reconcile lets in a new member, takes out one who left, and
-   archives a group nobody remains on (its members keep reading it, may not write, and
-   nothing more is posted). A linked person's DM with a character without a bot is a
-   private thread under `#dms` (everyone may see `#dms`, nobody may write in it but in
-   its threads), named `<character> & <person>`, the person added; the character's lines
-   are posted into it through `#dms`'s webhook (`?thread_id=`), and the person's are a
-   message to the character (`WorldOp::Message`). On a group a linked member's post is
+   `@everyone` denied it, the listener let in with Manage Webhooks, and each member on
+   Discord — a character's bot, a linked person — let see, read and write; the reconcile
+   lets in a new member, takes out one who left, and archives a group nobody remains on
+   (its members keep reading it, may not write, and nothing more is posted). Every
+   character of the world without a bot has a channel of its own, `#<name>`, found or
+   made with everyone let see, read and write; every linked person's DM with it is
+   posted there, the character's lines through the channel's webhook, each led by a
+   mention of the person it answers, and a post there from anyone linked is a message to
+   the character (`WorldOp::Message`), on their DM with it. The channel keeps its own
+   `last_seen_discord`, which its DMs share. A per-person private thread under `#dms`
+   was built first and replaced: it left the server a list of "Wick & Johnathan"
+   threads nobody else could join. On a group a linked member's post is
    said on the thread (`WorldOp::Mirrored`). The reconcile runs on the first beat after
    a member takes the world and every five minutes, and also reads every mirrored
    channel's gap and renames or repictures a bot whose character changed — a bot's
@@ -848,8 +858,7 @@ channel, group and webhook halves of §5, and it is built first and alone.
    channel of the world with the cast on it, described as Discord describes it, read on
    the reconcile and on the beat after a channel event (§3, §5.3); a person's message
    there brings them on and is said to the character it names (`WorldOp::Mirrored`'s
-   `to`). Every line in a private thread is posted through its parent's webhook, a
-   character's with its own bot too, since a bot is no member of the thread.
+   `to`).
    Character-to-character DMs are not mirrored (§3).
 13. **Built:** typing. While a person's DM from Discord is the last thing said to the
    character and under two minutes old, its bot shows typing in that DM

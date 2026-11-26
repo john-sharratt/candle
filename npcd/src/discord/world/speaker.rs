@@ -50,9 +50,8 @@ pub fn of<'a>(
 }
 
 /// The webhook, posting what member `from` said under their name and
-/// portrait — whoever they are. What a private thread is posted by: a bot is
-/// no member of one, and may not write there.
-pub fn hooked<'a>(a: &Authored, hosted: &Hosted, (from, name): (&str, &str)) -> Speaker<'a> {
+/// portrait — whoever they are.
+fn hooked<'a>(a: &Authored, hosted: &Hosted, (from, name): (&str, &str)) -> Speaker<'a> {
     let npc = members::character(a, hosted, from);
     Speaker::Hook {
         username: webhook_name(name),

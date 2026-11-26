@@ -21,15 +21,13 @@ pub const VIEW: u64 = 1 << 10;
 pub const SEND: u64 = 1 << 11;
 pub const HISTORY: u64 = 1 << 16;
 pub const MANAGE_WEBHOOKS: u64 = 1 << 29;
-pub const CREATE_PRIVATE_THREADS: u64 = 1 << 36;
-pub const SEND_IN_THREADS: u64 = 1 << 38;
 
 /// What a member of a channel is let do in it: see and read it, and write.
 pub const MEMBER: u64 = VIEW | SEND | HISTORY;
 
 /// What the listener is let do in a channel it mirrors into: a member's,
-/// and its webhooks and private threads.
-pub const LISTENER: u64 = MEMBER | MANAGE_WEBHOOKS | CREATE_PRIVATE_THREADS | SEND_IN_THREADS;
+/// and its webhooks.
+pub const LISTENER: u64 = MEMBER | MANAGE_WEBHOOKS;
 
 /// An overwrite for one member.
 pub fn member(user_id: u64, allow: u64, deny: u64) -> Overwrite {

@@ -17,13 +17,14 @@
 //! - **in** ([`inbound`]): what the listener's shard heard in a mirrored
 //!   channel is said in the world: on the open channel by a linked person
 //!   with the Creator role, as the console's route would say it; on a group
-//!   by a linked member of it; in a DM's private thread by its person, as a
-//!   message to the character.
+//!   by a linked member of it; in a character's own channel by any linked
+//!   person, as a message to the character on their DM with it.
 //!
 //! Every five minutes, and on the first beat after a member takes the world,
 //! the reconcile ([`reconcile`]) opens what the world has that the server
-//! does not — a group's channel ([`groups`]), a DM's private thread
-//! ([`dms`]) — keeps each group's members in step, archives a group nobody
+//! does not — a group's channel ([`groups`]), the own channel of each
+//! character without a bot ([`dms`]) — keeps each group's members in step,
+//! posts each DM in its character's channel, archives a group nobody
 //! remains on, reads what the channels missed, and names and pictures the
 //! bots. It also takes in what the server has that the world does not: each
 //! channel a person made there is a channel of the world, with the
@@ -37,13 +38,13 @@
 //!
 //! | Module | What it owns |
 //! |---|---|
-//! | [`record`] | `discord/guild`, `discord/thread/…` and `discord/webhook/…`, as the world keeps them |
+//! | [`record`] | `discord/guild`, `discord/thread/…`, `discord/webhook/…` and `discord/character/…`, as the world keeps them |
 //! | [`routes`] | `GET`/`PUT`/`DELETE /v1/world/:wid/discord` |
 //! | [`channels`] | the mirrored channels, found or made, and their webhooks |
 //! | [`hold`] | how long the mirror holds off after Discord refused it |
 //! | [`members`] | who a thread's members are on Discord, and what a channel lets them do |
 //! | [`groups`] | the named groups as channels only their members see |
-//! | [`dms`] | a person's DM with a character without a bot, as a private thread |
+//! | [`dms`] | each character without a bot's own channel, and the DMs posted in it |
 //! | [`rooms`] | the channels people made in the server, as channels of the world |
 //! | [`reconcile`] | the five-minute pass: channels, members, gaps, bots |
 //! | [`speaker`] | who posts a message, and as whom |

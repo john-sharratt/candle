@@ -125,6 +125,16 @@ impl Servers {
             .collect()
     }
 
+    /// Every character's channels in server `guild_id`, as `(character,
+    /// channel id)`.
+    pub fn channels_in_guild(&self, guild_id: u64) -> Vec<(u64, u64)> {
+        self.channels
+            .iter()
+            .filter(|(_, c)| c.guild_id == guild_id)
+            .map(|((npc, id), _)| (*npc, *id))
+            .collect()
+    }
+
     /// Character `npc_id`'s server `guild_id`.
     pub fn server(&self, npc_id: u64, guild_id: u64) -> Option<Server> {
         self.servers.get(&(npc_id, guild_id)).cloned()

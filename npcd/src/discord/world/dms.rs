@@ -1,23 +1,26 @@
-//! A person's DM with a character that has no bot of its own, as a private
-//! thread in the world's server (`docs/npcd_discord.md` §3, §3.1).
+//! The channel of each character that has no bot of its own, and the DMs
+//! posted in it (`docs/npcd_discord.md` §3, §3.1).
 //!
-//! A webhook cannot DM, so a private thread is the nearest thing a server
-//! has: under a `#dms` channel the listener finds or makes — everyone may see
-//! it, nobody may write in it but in its threads — the listener opens a
-//! private thread for each such DM, named for the two of them, that nobody
-//! on it may invite to, and adds the person. The character's lines are posted
-//! there through `#dms`'s webhook; the person's are their own, heard as a
-//! message to the character (`WorldOp::Message`), as a DM to a bot is.
+//! A webhook cannot DM, so a character without a bot is talked to in a
+//! channel of the world's server named for it, `#<name>`, that everyone may
+//! read and write in. Every linked person's DM with the character is posted
+//! there — the character's lines through the channel's webhook, each naming
+//! whom it answers, and a person's as their own — and a post there is a
+//! message to the character (`WorldOp::Message`), as a DM to a bot is, from
+//! whoever wrote it. In the world each person's DM stays their own: its own
+//! thread, conversation and journal.
 //!
-//! A DM is opened once both are there to talk: the person linked, the
-//! character in the world with no bot. Its cursor starts at the thread's
-//! end, so what was said in the console before is not posted.
+//! **One channel for a character, not one per person.** A private thread per
+//! DM, under a `#dms` channel, left the server a list of "Wick & Johnathan"
+//! threads nobody else could join; a character's channel is open to anyone
+//! who wants to talk to it. Its cursor starts at the end of what each DM
+//! holds, so what was said before is not posted again.
 
 use std::collections::BTreeMap;
 
 use super::channels::{find_or_make_with, last_seq};
-use super::members::{character, everyone, member, HISTORY, LISTENER, SEND, VIEW};
-use super::record::{Guild, Kind, Mirrored};
+use super::members::{character, everyone, member, LISTENER, MEMBER};
+use super::record::{Guild, Kind, Mirrored, Own};
 use crate::api::{now_ms, Authored};
 use crate::discord::message::snowflake_at;
 use crate::discord::online::Online;
@@ -27,28 +30,45 @@ use crate::discord::trace::{failed, note};
 use crate::sim::phone::{Kind as ThreadKind, Member};
 use crate::world::Hosted;
 
-/// What the channel the DMs are made under is called.
-pub const DMS: &str = "dms";
-
-/// The longest name Discord takes on a thread.
+/// The longest name Discord takes on a channel.
 const NAME_MAX: usize = 100;
 
-/// What a DM's private thread is called: the character and the person.
-pub fn thread_name(character: &str, person: &str) -> String {
-    format!("{character} & {person}")
-        .chars()
-        .take(NAME_MAX)
+/// What character `name`'s channel is called, as Discord keeps a text
+/// channel's name: lower case, each run of anything but a letter or a digit
+/// one `-`, none at either end.
+pub fn channel_name(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.trim().chars().flat_map(char::to_lowercase) {
+        match c.is_alphanumeric() {
+            true => out.push(c),
+            false if !out.is_empty() && !out.ends_with('-') => out.push('-'),
+            false => {}
+        }
+    }
+    out.trim_end_matches('-').chars().take(NAME_MAX).collect()
+}
+
+/// The characters of `hosted` without a bot of their own, by character, with
+/// their names.
+fn botless(a: &Authored, hosted: &Hosted) -> Vec<(u64, String)> {
+    let Some(rt) = a.runtime.as_ref() else {
+        return Vec::new();
+    };
+    let shared = a.npcs.substrate();
+    rt.bodies
+        .in_world(hosted.id())
+        .into_iter()
+        .filter(|(npc, body)| !body.starts_with("visitor:") && store::get(&shared, *npc).is_none())
+        .filter_map(|(npc, body)| {
+            let name = hosted.read(|w| w.actor(&body).map(|x| x.name.clone()))?;
+            Some((npc, name))
+        })
         .collect()
 }
 
 /// The world's direct threads between a linked person, of `people` (by
-/// handle), and a character without a bot: `(thread, character's name,
-/// person's name, their user)`.
-fn dms(
-    a: &Authored,
-    hosted: &Hosted,
-    people: &BTreeMap<String, u64>,
-) -> Vec<(String, String, String, u64)> {
+/// handle), and a character without a bot: `(thread, character)`.
+fn dms(a: &Authored, hosted: &Hosted, people: &BTreeMap<String, u64>) -> Vec<(String, u64)> {
     let pairs: Vec<(String, Vec<Member>)> = hosted.sim(|s| {
         s.threads
             .iter()
@@ -60,20 +80,17 @@ fn dms(
     pairs
         .into_iter()
         .filter_map(|(thread, members)| {
-            let (who, user) = members
-                .iter()
-                .find_map(|m| people.get(&m.id).map(|u| (m.clone(), *u)))?;
-            let other = members.iter().find(|m| m.id != who.id)?.clone();
+            let who = members.iter().find(|m| people.contains_key(&m.id))?;
+            let other = members.iter().find(|m| m.id != who.id)?;
             let npc = character(a, hosted, &other.id)?;
-            store::get(&shared, npc)
-                .is_none()
-                .then_some((thread, other.name, who.name, user))
+            store::get(&shared, npc).is_none().then_some((thread, npc))
         })
         .collect()
 }
 
-/// Every DM of `hosted` that should be a private thread, opened when it is
-/// not one; `bot` the listener and `people` every linked person.
+/// Every character of `hosted` without a bot has its channel, and every DM
+/// with one is posted in it; `bot` the listener and `people` every linked
+/// person.
 pub async fn reconcile(
     a: &Authored,
     bot: &Online,
@@ -81,95 +98,81 @@ pub async fn reconcile(
     guild: &Guild,
     people: &BTreeMap<String, u64>,
 ) {
-    let waiting: Vec<_> = dms(a, hosted, people)
-        .into_iter()
-        .filter(|(thread, ..)| hosted.mirror(|m| m.thread(thread)).is_none())
-        .collect();
-    if waiting.is_empty() {
-        return;
-    }
-    let Some(parent) = parent(a, bot, hosted, guild).await else {
-        return;
-    };
-    for (thread, character, person, user) in waiting {
-        let opened = a
-            .discord
-            .create_private_thread(&bot.token, parent, &thread_name(&character, &person))
-            .await;
-        let channel_id = match opened {
-            Ok(id) => id,
-            Err(e) => {
-                said(a, bot, parent, &thread, &format!("dm not opened: {e}"));
-                continue;
-            }
-        };
-        if let Err(e) = a
-            .discord
-            .add_thread_member(&bot.token, channel_id, user)
-            .await
-        {
-            said(
-                a,
-                bot,
-                channel_id,
-                &thread,
-                &format!("person not added: {e}"),
-            );
+    for (npc, name) in botless(a, hosted) {
+        if hosted.mirror(|m| m.own(npc)).is_some() {
             continue;
         }
-        let mut mirrored = Mirrored::new(
+        let overwrites = [
+            everyone(guild.guild_id, MEMBER, 0),
+            member(bot.user_id, LISTENER, 0),
+        ];
+        let channel_id =
+            match find_or_make_with(a, bot, guild, &channel_name(&name), &overwrites).await {
+                Ok(id) => id,
+                Err(e) => {
+                    failed(
+                        a,
+                        bot.npc,
+                        Note::new(
+                            now_ms(),
+                            Direction::Out,
+                            "mirror",
+                            &format!("character channel not made: {e}"),
+                        )
+                        .guild(guild.guild_id),
+                    );
+                    continue;
+                }
+            };
+        let own = Own {
             channel_id,
-            Kind::Dm,
-            last_seq(hosted, &thread),
-            snowflake_at(now_ms()),
+            last_seen_discord: snowflake_at(now_ms()),
+        };
+        hosted.with_mirror(|m| m.put_own(npc, own));
+        note(
+            a,
+            bot.npc,
+            Note::new(now_ms(), Direction::Out, "mirror", "character_channel")
+                .guild(guild.guild_id)
+                .channel(channel_id),
         );
-        mirrored.parent = Some(parent);
+    }
+    for (thread, npc) in dms(a, hosted, people) {
+        let Some(own) = hosted.mirror(|m| m.own(npc)) else {
+            continue;
+        };
+        let was = hosted.mirror(|m| m.thread(&thread));
+        if was.is_some_and(|w| w.channel_id == own.channel_id && w.kind == Kind::Dm) {
+            continue;
+        }
+        let from = was.map_or_else(|| last_seq(hosted, &thread), |w| w.mirrored_through);
+        let mirrored = Mirrored::new(own.channel_id, Kind::Dm, from, own.last_seen_discord);
         hosted.with_mirror(|m| m.put_thread(&thread, mirrored));
         note(
             a,
             bot.npc,
-            Note::new(now_ms(), Direction::Out, "mirror", "dm_opened")
-                .channel(channel_id)
-                .thread(&thread),
+            Note::new(
+                now_ms(),
+                Direction::Out,
+                "mirror",
+                "dm_in_character_channel",
+            )
+            .channel(own.channel_id)
+            .thread(&thread),
         );
     }
-}
-
-/// `#dms`, found or made — everyone may see it and nobody may write in it
-/// but in its threads — and recorded.
-async fn parent(a: &Authored, bot: &Online, hosted: &Hosted, guild: &Guild) -> Option<u64> {
-    if let Some(id) = hosted.mirror(|m| m.parent(DMS)) {
-        return Some(id);
-    }
-    let overwrites = [
-        everyone(guild.guild_id, VIEW | HISTORY, SEND),
-        member(bot.user_id, LISTENER, 0),
-    ];
-    let id = find_or_make_with(a, bot, guild, DMS, &overwrites)
-        .await
-        .ok()?;
-    hosted.with_mirror(|m| m.put_parent(DMS, id));
-    Some(id)
-}
-
-fn said(a: &Authored, bot: &Online, channel_id: u64, thread: &str, outcome: &str) {
-    failed(
-        a,
-        bot.npc,
-        Note::new(now_ms(), Direction::Out, "mirror", outcome)
-            .channel(channel_id)
-            .thread(thread),
-    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// **A DM's thread is named for the two of them**, cut to Discord's 100.
+    /// **A character's channel is named as Discord keeps a channel's name.**
     #[test]
-    fn a_dms_thread_is_named_for_the_two_of_them() {
-        assert_eq!(thread_name("Wick", "Wren S"), "Wick & Wren S");
-        assert_eq!(thread_name(&"x".repeat(95), "Wren S").chars().count(), 100);
+    fn a_characters_channel_is_named_as_discord_keeps_it() {
+        assert_eq!(channel_name("Wick"), "wick");
+        assert_eq!(channel_name("  Ilsa Varn "), "ilsa-varn");
+        assert_eq!(channel_name("Zenling (Stinger) #2"), "zenling-stinger-2");
+        assert_eq!(channel_name(&"x".repeat(120)).chars().count(), 100);
     }
 }

@@ -655,7 +655,7 @@ export const MockAPI = {
     mockBots[id] = {
       connected: true, application_id: '1300000000000000001', user_id: '1300000000000000002',
       username: n.name, connected_ms: Date.now(),
-      invite_url: 'https://discord.com/oauth2/authorize?client_id=1300000000000000001&scope=bot&permissions=344402807888',
+      invite_url: 'https://discord.com/oauth2/authorize?client_id=1300000000000000001&scope=bot&permissions=805424208',
       status: intentOff ? 'needs_content_intent' : 'online',
       ...(intentOff ? {} : { world: 'Life' }),
     };

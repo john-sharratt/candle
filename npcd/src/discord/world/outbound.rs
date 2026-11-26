@@ -4,9 +4,10 @@
 //! Each beat, for each mirrored thread not archived: every message past its
 //! `mirrored_through` that came from no outside origin is posted, in order,
 //! by its speaker ([`speaker`]) — a character's own bot, or the channel's
-//! webhook under the speaker's name, and for a private thread its parent
-//! channel's webhook into the thread — each cut to Discord's 2,000
-//! characters. The cursor moves past a message only once all of it was
+//! webhook under the speaker's name — each cut to Discord's 2,000
+//! characters. A DM shares its character's channel with the character's
+//! other DMs, so the character's lines there begin by naming whom they
+//! answer ([`addressed`]). The cursor moves past a message only once all of it was
 //! posted; a failure leaves it for the next beat, so a gap is retried, never
 //! skipped. A webhook Discord no longer has (`404`) is forgotten, and the
 //! next beat makes another. A post Discord forbids leaves the thread where it is and is said
@@ -19,7 +20,8 @@ use std::time::Duration;
 
 use super::channels::hook;
 use super::hold::{after, FAILED_FOR, REFUSED_FOR};
-use super::record::Guild;
+use super::members::linked_people;
+use super::record::{Guild, Kind};
 use super::speaker::{self, Speaker};
 use crate::api::Authored;
 use crate::discord::online::Online;
@@ -41,13 +43,15 @@ pub async fn post(
 ) -> Option<Duration> {
     let mut hold: Option<Duration> = None;
     let mut held = |wait: Duration| hold = Some(hold.map_or(wait, |h| h.max(wait)));
+    let people = linked_people(a);
     'threads: for (thread, mirrored) in hosted.mirror(|m| m.threads()) {
         if mirrored.archived {
             continue;
         }
         // Every line as it was said — a character's voiced, a person's as
-        // written — with the name of who said it.
-        let waiting: Vec<(Message, String)> = hosted.sim(|s| {
+        // written — with the name of who said it and, in a DM, the Discord
+        // user of the person a character's line answers.
+        let waiting: Vec<(Message, String, Option<u64>)> = hosted.sim(|s| {
             s.threads
                 .get(&thread)
                 .filter(|t| t.open)
@@ -57,14 +61,22 @@ pub async fn post(
                         .filter(|m| m.seq > mirrored.mirrored_through && m.origin.is_none())
                         .map(|m| {
                             let by = t.member(&m.from).map_or(m.from.clone(), |w| w.name.clone());
-                            (m.clone(), by)
+                            let answers = match mirrored.kind {
+                                Kind::Dm => t
+                                    .members
+                                    .iter()
+                                    .find(|w| w.id != m.from)
+                                    .and_then(|w| people.get(&w.id).copied()),
+                                _ => None,
+                            };
+                            (m.clone(), by, answers)
                         })
                         .collect()
                 })
                 .unwrap_or_default()
         });
         let mut part_from = mirrored.mirrored_part;
-        for (m, by) in waiting {
+        for (m, by, answers) in waiting {
             let at = |part: u32| Target {
                 kind: "mirror",
                 channel: mirrored.channel_id,
@@ -72,11 +84,8 @@ pub async fn post(
                 seq: m.seq,
                 part,
             };
-            let who = match mirrored.parent {
-                Some(_) => speaker::hooked(a, hosted, (&m.from, &by)),
-                None => speaker::of(a, hosted, guild.guild_id, (&m.from, &by), online),
-            };
-            let parts = split(&m.text, LIMIT);
+            let who = speaker::of(a, hosted, guild.guild_id, (&m.from, &by), online);
+            let parts = split(&addressed(&m.text, answers), LIMIT);
             let mut last = 0;
             // **Each part is cursored**, so a long line that failed part-way
             // resumes at the part it stopped at: a webhook post carries no
@@ -90,17 +99,15 @@ pub async fn post(
                         username,
                         avatar_url,
                     } => {
-                        let webhook =
-                            match hook(a, bot, hosted, guild, mirrored.hook_channel()).await {
-                                Ok(webhook) => webhook,
-                                Err(e) => {
-                                    held(after(&e));
-                                    continue 'threads;
-                                }
-                            };
+                        let webhook = match hook(a, bot, hosted, guild, mirrored.channel_id).await {
+                            Ok(webhook) => webhook,
+                            Err(e) => {
+                                held(after(&e));
+                                continue 'threads;
+                            }
+                        };
                         let as_who = (username.as_str(), avatar_url.as_deref());
-                        let in_thread = mirrored.parent.is_some();
-                        post_hook(a, bot, &webhook, as_who, in_thread, to, part).await
+                        post_hook(a, bot, &webhook, as_who, to, part).await
                     }
                 };
                 match sent {
@@ -117,7 +124,7 @@ pub async fn post(
                     // beat makes another.
                     Ok(Post::Gone) => {
                         if matches!(who, Speaker::Hook { .. }) {
-                            hosted.with_mirror(|m| m.remove_hook(mirrored.hook_channel()));
+                            hosted.with_mirror(|m| m.remove_hook(mirrored.channel_id));
                         }
                         continue 'threads;
                     }
@@ -143,4 +150,30 @@ pub async fn post(
         }
     }
     hold
+}
+
+/// `text` as posted in a channel several DMs share: led by a mention of
+/// `answers`, the Discord user the line is said to, when it is said to one.
+/// The webhook's mentions ping nobody; it shows whom the line answers.
+fn addressed(text: &str, answers: Option<u64>) -> String {
+    match answers {
+        Some(user) => format!("<@{user}> {text}"),
+        None => text.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **A line said to someone in a shared channel names them first**; a
+    /// line said to nobody in particular is posted as it is.
+    #[test]
+    fn a_line_to_someone_in_a_shared_channel_names_them() {
+        assert_eq!(
+            addressed("The ward is quiet.", Some(1566050542650658966)),
+            "<@1566050542650658966> The ward is quiet."
+        );
+        assert_eq!(addressed("Hello.", None), "Hello.");
+    }
 }

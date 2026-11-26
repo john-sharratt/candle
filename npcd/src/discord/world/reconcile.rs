@@ -3,8 +3,9 @@
 //!
 //! - **Channels.** Every named group has its channel and every channel's
 //!   overwrites are its thread's members; a group nobody remains on is
-//!   archived ([`super::groups`]). Every person's DM with a character
-//!   without a bot has its private thread ([`super::dms`]). Every channel a
+//!   archived ([`super::groups`]). Every character without a bot has its
+//!   own channel, and every person's DM with it is posted there
+//!   ([`super::dms`]). Every channel a
 //!   person made in the server is a channel of the world, described as
 //!   Discord describes it, and every mirrored channel's description is its
 //!   thread's ([`super::rooms`]).

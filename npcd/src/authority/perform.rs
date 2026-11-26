@@ -23,6 +23,7 @@ use super::ops::{ActSource, Decided, OpReply, Voiced, WorldOp};
 use crate::api::now_ms;
 use crate::bridge;
 use crate::discord::server::apply::channel_message;
+use crate::discord::server::guild::became_the_worlds;
 use crate::discord::world::apply::mirrored_message;
 use crate::effector::reshape::reshape_here;
 use crate::engine::act::Act;
@@ -238,7 +239,11 @@ impl Runtime {
             },
             WorldOp::Guild { guild } => OpReply::Done {
                 ok: self.hosted.get(world).is_some_and(|hosted| {
+                    let taken = guild.as_ref().map(|g| g.guild_id);
                     hosted.with_mirror(|m| m.set_guild(guild));
+                    if let Some(guild_id) = taken {
+                        became_the_worlds(&hosted, guild_id);
+                    }
                     true
                 }),
             },

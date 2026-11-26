@@ -409,48 +409,12 @@ impl Client {
         .await
     }
 
-    /// Make a private thread called `name` under channel `channel_id`,
-    /// that only who is added to it sees and nobody on it may invite to; its
-    /// id.
-    pub async fn create_private_thread(
-        &self,
-        token: &str,
-        channel_id: u64,
-        name: &str,
-    ) -> Result<u64, DiscordError> {
-        let made: Made = self
-            .call(
-                Method::POST,
-                &format!("/channels/{channel_id}/threads"),
-                token,
-                Some(json!({ "name": name, "type": 12, "invitable": false })),
-            )
-            .await?;
-        Ok(made.id)
-    }
-
     /// Show the bot typing in channel `channel_id`, for the next ten seconds
     /// or until it posts there.
     pub async fn trigger_typing(&self, token: &str, channel_id: u64) -> Result<(), DiscordError> {
         self.call_empty(
             Method::POST,
             &format!("/channels/{channel_id}/typing"),
-            token,
-            None,
-        )
-        .await
-    }
-
-    /// Add Discord user `user_id` to thread `thread_id`.
-    pub async fn add_thread_member(
-        &self,
-        token: &str,
-        thread_id: u64,
-        user_id: u64,
-    ) -> Result<(), DiscordError> {
-        self.call_empty(
-            Method::PUT,
-            &format!("/channels/{thread_id}/thread-members/{user_id}"),
             token,
             None,
         )
@@ -475,16 +439,15 @@ impl Client {
     }
 
     /// Post `content` through webhook `hook` under the name `username`, with
-    /// the picture at `avatar_url` when there is one, into `thread` of the
-    /// webhook's channel when one is named; the message's id. Asked to
-    /// `wait`, so Discord answers with the message it made. Authorised by the
-    /// webhook's own token in the path, not a bot's.
+    /// the picture at `avatar_url` when there is one; the message's id. Asked
+    /// to `wait`, so Discord answers with the message it made. Authorised by
+    /// the webhook's own token in the path, not a bot's. A mention in it is
+    /// shown and pings nobody.
     pub async fn execute_webhook(
         &self,
         hook: &Webhook,
         username: &str,
         avatar_url: Option<&str>,
-        thread: Option<u64>,
         content: &str,
     ) -> Result<u64, DiscordError> {
         let mut body = json!({
@@ -495,11 +458,10 @@ impl Client {
         if let Some(url) = avatar_url {
             body["avatar_url"] = Value::from(url);
         }
-        let into = thread.map_or_else(String::new, |t| format!("&thread_id={t}"));
         let made: Made = self
             .call_unauthorised(
                 Method::POST,
-                &format!("/webhooks/{}/{}?wait=true{into}", hook.id, hook.token),
+                &format!("/webhooks/{}/{}?wait=true", hook.id, hook.token),
                 body,
             )
             .await?;
@@ -827,12 +789,12 @@ mod tests {
         );
         assert_eq!(
             client
-                .execute_webhook(&hook, "Wick", Some("https://a/p.png"), None, "hello")
+                .execute_webhook(&hook, "Wick", Some("https://a/p.png"), "hello")
                 .await,
             Ok(fake::FIRST_POSTED)
         );
         client
-            .execute_webhook(&hook, "Wren S", None, None, "hi")
+            .execute_webhook(&hook, "Wren S", None, "hi")
             .await
             .unwrap();
 
