@@ -12,7 +12,7 @@ use anyhow::Context;
 use candle_conversation::files::names::{chunk_name, heading_name};
 use candle_conversation::files::{files_owner, ChunkRecord, FileRecord, MemberRef};
 use candle_conversation::projection::{Conversation, SectionId};
-use candle_conversation::{MemberSpec, Sequence};
+use candle_conversation::{MemberSpec, SealAs, Sequence};
 
 use crate::files::records;
 
@@ -59,17 +59,21 @@ fn member_texts(
         .collect()
 }
 
-/// Seal `record`'s members again behind `prefix`, under a probe record of
-/// it, and write that record; the probe record.
+/// Seal `record`'s members again behind `prefix` under `kind`'s policy, under
+/// a probe record of it, and write that record; the probe record.
 pub fn reseal_behind(
     conversation: &Conversation,
     base: &Sequence,
     decode: impl Fn(&[u32]) -> anyhow::Result<String>,
     record: &FileRecord,
     prefix: &[SectionId],
+    kind: SealAs,
 ) -> anyhow::Result<FileRecord> {
     let texts = member_texts(conversation, base, decode, record)?;
-    let blob = probe_blob(&record.blob);
+    let blob = match kind {
+        SealAs::Member => probe_blob(&record.blob),
+        SealAs::Boundary => format!("{}~q8", probe_blob(&record.blob)),
+    };
     let mut specs = vec![MemberSpec {
         name: heading_name(&record.path, &blob),
         content: texts[0].clone(),
@@ -85,14 +89,14 @@ pub fn reseal_behind(
             }),
     );
     let sealed = base
-        .seal_members_behind(prefix, &specs)
+        .seal_members_behind(prefix, &specs, kind)
         .map_err(|e| anyhow::anyhow!("sealing the probe's members: {e}"))?;
     let member = |i: usize| MemberRef {
         address: sealed[i].address,
         tokens: sealed[i].tokens as u32,
     };
     let probe = FileRecord {
-        content_key: format!("{}~probe", record.content_key),
+        content_key: format!("{}~{blob}", record.content_key),
         blob,
         heading: member(0),
         chunks: record

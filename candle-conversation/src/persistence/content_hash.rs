@@ -289,6 +289,18 @@ pub fn shared_section_prefix(prefix: ContentHash) -> ContentHash {
     h.finish()
 }
 
+/// The prefix hash a knowledge-base member **sealed under the boundary
+/// policy** is addressed under: [`shared_section_prefix`]'s chain, in a domain
+/// of its own. Its stream holds Q8 K/V where a member's holds the adaptive
+/// policy's, so the two must not share an address — a seal would otherwise
+/// restore the other's bytes.
+pub fn boundary_member_prefix(prefix: ContentHash) -> ContentHash {
+    let mut h = ContentHasher::new();
+    h.update(b"boundary-member");
+    h.update(&prefix.to_bytes());
+    h.finish()
+}
+
 /// The snapshot stream a section's **end state** is kept under — the
 /// recurrent state the section's seal ended on, for the section a chain
 /// continues it with (`docs/shared_journal_sections.md` §4.1, §5). A third
@@ -306,6 +318,18 @@ pub fn section_end_state_stream_id(section: StreamId) -> StreamId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A boundary-sealed member is addressed apart from a member** over the
+    /// same chain: the hash of its own domain, then the chain.
+    #[test]
+    fn a_boundary_member_is_addressed_apart_from_a_member() {
+        let chain = hash_bytes(b"chain");
+        let mut h = ContentHasher::new();
+        h.update(b"boundary-member");
+        h.update(&chain.to_bytes());
+        assert_eq!(boundary_member_prefix(chain), h.finish());
+        assert_ne!(boundary_member_prefix(chain), shared_section_prefix(chain));
+    }
 
     /// A shared section's prefix is the hash of exactly these bytes: the
     /// domain, then the chain — no owner, no name.

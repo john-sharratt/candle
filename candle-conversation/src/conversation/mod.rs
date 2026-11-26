@@ -88,7 +88,7 @@ mod sharing;
 mod submitted_sections;
 mod turn_bans;
 
-pub use member_seal::{MemberSpec, SealedMember};
+pub use member_seal::{MemberSpec, SealAs, SealedMember};
 pub(crate) use prefix_state::run_state;
 use prefix_state::{checkpoint, shared_held, state_after};
 pub use prompt_dump::{PieceKind, PromptDump, PromptPiece};

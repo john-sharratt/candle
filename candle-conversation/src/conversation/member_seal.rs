@@ -20,7 +20,9 @@ use super::prefix_state::{chain_of, continue_state, state_after};
 use super::{alloc_scratch_slot_on, Sequence};
 use crate::error::ConversationError;
 use crate::files::{files_owner, member_stream_name};
-use crate::persistence::content_hash::{hash_tokens, section_stream_id, shared_section_prefix};
+use crate::persistence::content_hash::{
+    boundary_member_prefix, hash_tokens, section_stream_id, shared_section_prefix,
+};
 use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::projection::{prefix_before_collection, DecodePriority, SectionId};
 use crate::scheduler::exported_state::SharedState;
@@ -33,6 +35,16 @@ use crate::token_buffer::TokenBuffer;
 pub struct MemberSpec {
     pub name: String,
     pub content: String,
+}
+
+/// The policy a member's K/V is sealed under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SealAs {
+    /// A collection member's: the adaptive member policy.
+    Member,
+    /// A boundary section's: Q8 K and V, addressed apart from a member's
+    /// ([`boundary_member_prefix`]).
+    Boundary,
 }
 
 /// A member sealed into the substrate.
@@ -96,17 +108,19 @@ impl Sequence {
         collection: &str,
         chain: &[MemberSpec],
     ) -> crate::Result<Vec<SealedMember>> {
-        self.seal_members_behind(&self.members_prefix(collection)?, chain)
+        self.seal_members_behind(&self.members_prefix(collection)?, chain, SealAs::Member)
     }
 
     /// Seal `chain` in order, each behind `prefix` and the members before it,
-    /// and return them in the same order: [`Self::seal_members`] behind a
-    /// prefix the caller names — the sections a prompt actually places ahead
-    /// of a file, where the birth prefix leaves some of them out.
+    /// under `kind`'s policy, and return them in the same order:
+    /// [`Self::seal_members`] behind a prefix the caller names — the sections a
+    /// prompt actually places ahead of a file, where the birth prefix leaves
+    /// some of them out.
     pub fn seal_members_behind(
         &self,
         prefix: &[SectionId],
         chain: &[MemberSpec],
+        kind: SealAs,
     ) -> crate::Result<Vec<SealedMember>> {
         let mut out: Vec<SealedMember> = Vec::with_capacity(chain.len());
         // The state the member just prefilled ended on: where the next one
@@ -114,7 +128,7 @@ impl Sequence {
         // works out from the log.
         let mut handed: Option<SharedState> = None;
         for spec in chain {
-            let sealed = self.seal_member(prefix, &out, spec, handed.take())?;
+            let sealed = self.seal_member(prefix, &out, spec, handed.take(), kind)?;
             handed = sealed.1;
             out.push(sealed.0);
         }
@@ -130,6 +144,7 @@ impl Sequence {
         before: &[SealedMember],
         spec: &MemberSpec,
         handed: Option<SharedState>,
+        kind: SealAs,
     ) -> crate::Result<(SealedMember, Option<SharedState>)> {
         let encoding = self
             .tokenizer
@@ -145,8 +160,12 @@ impl Sequence {
         let earlier: Vec<SectionId> = before.iter().map(|m| m.section).collect();
         let mut sealed_after = prefix.to_vec();
         sealed_after.extend(&earlier);
+        let chain = chain_of(&self.substrate, &sealed_after).0;
         let address = ContentAddress {
-            prefix_hash: shared_section_prefix(chain_of(&self.substrate, &sealed_after).0),
+            prefix_hash: match kind {
+                SealAs::Member => shared_section_prefix(chain),
+                SealAs::Boundary => boundary_member_prefix(chain),
+            },
             section_hash: hash_tokens(&tokens),
         };
         let stream = section_stream_id(address);
@@ -217,7 +236,7 @@ impl Sequence {
                 tokens,
                 address,
                 debug_name: member_stream_name(&spec.name),
-                in_collection: true,
+                in_collection: kind == SealAs::Member,
                 start,
                 band: DecodePriority::Low,
                 response_tx: tx,

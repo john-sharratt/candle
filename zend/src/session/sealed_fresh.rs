@@ -42,7 +42,9 @@ use candle_conversation::projection::{
     TOOLS_ENABLED_SELECTOR,
 };
 use candle_conversation::stencil::TriggerRegistry;
-use candle_conversation::{format_name, ChunkLayout, PieceKind, PromptDump, SlotLayout, SpanQuant};
+use candle_conversation::{
+    format_name, ChunkLayout, PieceKind, PromptDump, SealAs, SlotLayout, SpanQuant,
+};
 use candle_conversation::{SamplingConfig, TurnOptions};
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +95,10 @@ pub struct SealedFreshReq {
     /// stored ones (`session/sealed_fresh_reseal.rs`).
     #[serde(default)]
     pub reseal: bool,
+    /// Resealed, seal the file's members under a boundary section's policy —
+    /// Q8 K and V, the seed's — instead of a member's.
+    #[serde(default)]
+    pub reseal_boundary: bool,
 }
 
 /// How the fresh side's prompt lies in its slot.
@@ -355,7 +361,19 @@ impl ZendSession {
                         .decode(ids, false)
                         .map_err(|e| anyhow::anyhow!("decoding a member: {e}"))
                 };
-                let p = reseal_behind(&conversation, &state.base_conv, decode, record, &prefix)?;
+                let kind = if req.reseal_boundary {
+                    SealAs::Boundary
+                } else {
+                    SealAs::Member
+                };
+                let p = reseal_behind(
+                    &conversation,
+                    &state.base_conv,
+                    decode,
+                    record,
+                    &prefix,
+                    kind,
+                )?;
                 engine.files_pin(timeline, FilesPin::Only(p.key()));
                 members = member_ids(&conversation, &p);
                 probe = Some(p);
