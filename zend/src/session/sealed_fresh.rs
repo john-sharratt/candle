@@ -8,7 +8,8 @@
 //!
 //! The sealed side is a fork of the dialogue's base, its knowledge base pinned
 //! (one file, or none — the seed alone), reprojection held to the opening and
-//! tools off, so the prompt it decodes over is fixed and is the one
+//! its tools the request's mode, so the prompt it decodes over is fixed and is
+//! the one
 //! [`Sequence::prompt_dump_with`] lays out before the turn. The fresh side is
 //! that prompt's ids and the turn's own user half — the ids the sealed turn
 //! was prefilled with — run through every layer in order. Both decode argmax
@@ -38,8 +39,7 @@ use candle_conversation::files::names::{chunk_name, heading_name};
 use candle_conversation::files::{files_owner, FileRecord, FilesPin};
 use candle_conversation::projection::Conversation;
 use candle_conversation::projection::{
-    DecodePriority, OptionalState, ReprojectionMode, SelectionState, TurnIndex,
-    TOOLS_ENABLED_SELECTOR,
+    DecodePriority, ReprojectionMode, SelectionState, TurnIndex,
 };
 use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{
@@ -48,10 +48,12 @@ use candle_conversation::{
 use candle_conversation::{SamplingConfig, TurnOptions};
 use serde::{Deserialize, Serialize};
 
+use super::builders::turn_projection;
 use super::sealed_fresh_layout::{compare, piece_chunks, LayoutComparison};
 use super::sealed_fresh_reseal::{prefix_before, reseal_behind};
 use super::ZendSession;
 use crate::files::records;
+use crate::types::ToolMode;
 
 /// The most tokens either side decodes.
 pub const MAX_TOKENS: usize = 512;
@@ -107,6 +109,11 @@ pub struct SealedFreshReq {
     /// slot's index pages transplanted in their place.
     #[serde(default)]
     pub fresh_index: Source,
+    /// The tools mode the sealed side projects under, as a chat turn's dial
+    /// sets it — `none` places no tool block at all; absent keeps the
+    /// dialogue base's own projection.
+    #[serde(default)]
+    pub tools: Option<ToolMode>,
 }
 
 /// Which side a part of the fresh slot comes from.
@@ -304,11 +311,11 @@ fn without_members(dump: &PromptDump, members: &HashSet<u32>) -> Vec<u32> {
         .collect()
 }
 
-/// The selection the sealed side runs under: tools off, the opening its only
-/// projection, every other dial the dialogue's default.
+/// The selection the sealed side runs under: the opening its only projection,
+/// every other dial the dialogue's default. Which tools it places is its
+/// projection's ([`SealedFreshReq::tools`]).
 fn selection() -> SelectionState {
     let mut s = SelectionState::new();
-    s.set_optional(TOOLS_ENABLED_SELECTOR, OptionalState::Absent);
     s.set_reprojection_mode(ReprojectionMode::Opening);
     s
 }
@@ -352,6 +359,9 @@ impl ZendSession {
         engine.conversation().mark_timeline_transient(timeline);
         engine.set_timeline_summarize(timeline, false);
         engine.files_pin(timeline, pin);
+        if let Some(mode) = req.tools {
+            conv.set_projection(turn_projection(&state, "sealed-fresh", None, mode));
+        }
         let out = (|| {
             let selection = selection();
             let mut dump = conv
@@ -675,15 +685,22 @@ mod tests {
         );
     }
 
-    /// The sealed side runs with tools off and its opening its only
-    /// projection.
+    /// The sealed side's opening is its only projection.
     #[test]
     fn the_sealed_side_holds_its_prompt_to_the_opening() {
-        let s = selection();
         assert_eq!(
-            s.optional(TOOLS_ENABLED_SELECTOR),
-            Some(OptionalState::Absent)
+            selection().reprojection_mode(),
+            Some(ReprojectionMode::Opening)
         );
-        assert_eq!(s.reprojection_mode(), Some(ReprojectionMode::Opening));
+    }
+
+    /// **Tools are the dialogue base's unless the request names a mode.**
+    #[test]
+    fn the_tools_mode_is_the_requests_when_named() {
+        let req: SealedFreshReq = serde_json::from_str(r#"{"question":"q","n":8}"#).unwrap();
+        assert_eq!(req.tools, None);
+        let req: SealedFreshReq =
+            serde_json::from_str(r#"{"question":"q","n":8,"tools":"none"}"#).unwrap();
+        assert_eq!(req.tools, Some(ToolMode::None));
     }
 }
