@@ -14,11 +14,18 @@ use super::*;
 impl Scheduler {
     /// The index `slot` has forwarded from `start` on, as one page; `None`
     /// for a model that keeps no index.
+    ///
+    /// The page is closed first, as a section's is when its ingest ends the
+    /// scratch slot: rows still carried in an open block belong to the piece
+    /// and would otherwise be left out of its page.
     pub(super) fn seal_piece_index(
         &self,
         slot: SequenceId,
         start: usize,
     ) -> Result<Option<Vec<u8>>, ConversationError> {
+        self.model
+            .close_positional_page(slot.0)
+            .map_err(ConversationError::Model)?;
         self.model
             .seal_positional_range(slot.0, start)
             .map_err(ConversationError::Model)
