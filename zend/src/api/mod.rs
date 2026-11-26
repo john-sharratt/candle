@@ -52,6 +52,7 @@ mod repo_map;
 pub mod restore;
 pub mod resume;
 pub mod scan;
+pub mod sealed_fresh;
 pub mod substrate;
 pub mod worker_continue;
 
@@ -285,6 +286,14 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             Role::Admin,
             Dispatch::Best,
             post(scan::scan).body_limit(scan::BODY_LIMIT),
+        )
+        // One question decoded sealed and fresh over the same tokens, on the
+        // member asked: its card does both.
+        .route(
+            "/v1/substrate/zend/sealed-fresh",
+            Role::Admin,
+            Dispatch::Best,
+            post(sealed_fresh::run),
         )
         // Every member reaches every agent through its gateway, so any one
         // answers for them.
@@ -553,6 +562,7 @@ mod tests {
                 ("/v1/substrate/zend/timeline/:tl/selection", "admin"),
                 ("/v1/substrate/zend/project", "admin"),
                 ("/v1/substrate/zend/scan", "admin"),
+                ("/v1/substrate/zend/sealed-fresh", "admin"),
                 ("/v1/agents", "admin"),
                 ("/v1/agents/:node", "admin"),
                 ("/v1/agents/:node/jobs/:id", "admin"),
@@ -671,6 +681,7 @@ mod tests {
             ),
             ("DELETE", "/v1/substrate/zend/timeline/7", Dispatch::Best),
             ("POST", "/v1/substrate/zend/scan", Dispatch::Best),
+            ("POST", "/v1/substrate/zend/sealed-fresh", Dispatch::Best),
             ("GET", "/v1/substrate/zend/system-prompt", Dispatch::Any),
             ("DELETE", "/v1/substrate/zend/system-prompt", Dispatch::Best),
             (

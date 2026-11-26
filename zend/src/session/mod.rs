@@ -237,6 +237,7 @@ mod titler;
 use prewarm::Prewarm;
 use titler::{retire_titler_timelines, Titler};
 pub mod restore;
+pub mod sealed_fresh;
 mod titles;
 
 pub use replay::{

@@ -207,6 +207,35 @@ impl ConversationEngine {
         tokens: &[u32],
         max_decode_tokens: usize,
     ) -> crate::Result<String> {
+        let (collected, text_from_done) = self.infer_raw(tokens, max_decode_tokens)?;
+        if let Some(t) = text_from_done {
+            return Ok(t);
+        }
+        // Fallback: decode whatever tokens we collected.
+        self.core
+            .tokenizer
+            .decode(&collected, true)
+            .map_err(|e| ConversationError::Channel(format!("decode failed: {e}")))
+    }
+
+    /// [`Self::infer_raw_tokens`]'s decode as token ids: `tokens` prefilled
+    /// on a fresh slot — every layer, the recurrent ones included, run over
+    /// them in order — and decoded argmax for up to `max_decode_tokens`.
+    pub fn infer_raw_token_ids(
+        &self,
+        tokens: &[u32],
+        max_decode_tokens: usize,
+    ) -> crate::Result<Vec<u32>> {
+        Ok(self.infer_raw(tokens, max_decode_tokens)?.0)
+    }
+
+    /// The decode of [`Self::infer_raw_tokens`]: the ids it produced, and the
+    /// text the turn finished with when it finished.
+    fn infer_raw(
+        &self,
+        tokens: &[u32],
+        max_decode_tokens: usize,
+    ) -> crate::Result<(Vec<u32>, Option<String>)> {
         // 1. Allocate a sequence.
         let (resp_tx, resp_rx) = flume::bounded(1);
         self.core
@@ -293,15 +322,7 @@ impl ConversationEngine {
         if let Some(e) = last_error {
             return Err(e);
         }
-        if let Some(t) = text_from_done {
-            return Ok(t);
-        }
-
-        // Fallback: decode whatever tokens we collected.
-        self.core
-            .tokenizer
-            .decode(&collected, true)
-            .map_err(|e| ConversationError::Channel(format!("decode failed: {e}")))
+        Ok((collected, text_from_done))
     }
 
     /// Get a `TokenDecoder` for decoding token IDs into text.

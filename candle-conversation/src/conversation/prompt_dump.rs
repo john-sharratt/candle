@@ -16,7 +16,8 @@ use super::{Frame, Sequence};
 use crate::projection::event::{group_name_of, role_str};
 use crate::projection::{
     GroupId, ProjectionMode, ProjectionSegment, ResolvedTurn, Schema, SealedKind,
-    SectionCollection, SectionId, SelectionScores, SystemPromptItem, TimelineId, TurnIndex,
+    SectionCollection, SectionId, SelectionScores, SelectionState, SystemPromptItem, TimelineId,
+    TurnIndex,
 };
 
 /// What a piece of the prompt is.
@@ -225,6 +226,12 @@ impl Sequence {
     /// (`Frame`), every piece unscored; `None` for one past its first turn,
     /// whose prompt is the slot it has appended to, not a selection.
     pub fn prompt_dump(&self) -> Option<PromptDump> {
+        self.prompt_dump_with(&self.selection)
+    }
+
+    /// [`Self::prompt_dump`] under `selection`: what a turn submitted with
+    /// `selection` would be projected onto, before it is submitted.
+    pub fn prompt_dump_with(&self, selection: &SelectionState) -> Option<PromptDump> {
         let scores = self.last_turn_belief_scores(true);
         let resolver = self.substrate.read_for_scored(self.target, &scores);
         let (segments, selection_scores) = if self.config.disable_reprojection {
@@ -241,7 +248,7 @@ impl Sequence {
                 self.target,
                 &resolver,
                 ProjectionMode::Decode,
-                &self.selection,
+                selection,
             );
             (projection.segments, projection.selection_scores)
         };
