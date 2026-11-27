@@ -100,6 +100,13 @@ JSON schema.
   makes required). The effector's `invoke` uses it: `url` brings the `body` its
   address takes (`the_effector.md` §11), which is what lets one tree type every
   address a character can reach without a second compile per address.
+  - **An optional enum decides too.** Written, its value goes on to the fields
+    it brings and the fields it requires, then the gates over the optionals
+    after it, from the standing the object had reached (`builder::value_tails`
+    with an `Owed`); left out, the object goes on as if it had no shapes. Only a
+    required enum once decided: npcd's `order_post` takes `job` or a `brief`,
+    so `job` is optional, and choosing `coding-task` brought nothing — Zen
+    wrote a `brief` beside it and the post was refused for want of `what`.
   - **Equal shapes share one tail.** The spec is a DAG and the compile memoises on
     `(spec node, left context)`, so values whose field lists are equal point at
     one tail `SpecId` and lower it once. The tree grows with the number of

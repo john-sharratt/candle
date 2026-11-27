@@ -12,6 +12,9 @@ use super::*;
 
 #[cfg(test)]
 pub(super) mod tests {
+    use std::collections::HashSet;
+    use std::iter::once;
+
     use serde_json::json;
 
     use super::*;
@@ -573,6 +576,86 @@ pub(super) mod tests {
         let plain = tool.params.iter().find(|p| p.name == "data").unwrap();
         assert_eq!(plain.pattern, None, "the other values keep it free");
         assert!(compile_tool_call_tree(&[tool], &ToolCallEnvelope::qwen3()).is_ok());
+    }
+
+    /// Every literal reachable from `from` in `spec`: each static's text and
+    /// each arm's, through every kind of node.
+    fn reachable(spec: &TreeSpec, from: SpecId) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut todo = vec![from];
+        let mut texts = Vec::new();
+        while let Some(id) = todo.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            match spec.node(id) {
+                NodeSpec::Static { text, next } => {
+                    texts.push(text.clone());
+                    todo.push(*next);
+                }
+                NodeSpec::Branch { arms } => {
+                    for (text, next) in arms {
+                        texts.push(text.clone());
+                        todo.push(*next);
+                    }
+                }
+                NodeSpec::FreeText { next, .. } | NodeSpec::Value { next, .. } => todo.push(*next),
+                NodeSpec::Element { forks, next, .. } => {
+                    todo.extend(forks.iter().copied());
+                    todo.push(*next);
+                }
+                NodeSpec::End => {}
+            }
+        }
+        texts
+    }
+
+    /// **An optional field whose value decides the rest brings that value's
+    /// fields**, as a required one does: `order_post`'s optional `job`, chosen
+    /// as `coding-task`, goes on to `what`; the other job does not; and a call
+    /// that leaves `job` out writes its `brief` as before.
+    #[test]
+    fn an_optional_field_brings_the_fields_of_the_value_chosen() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "job": {"type": "string", "enum": ["coding-task", "ward-shift"]},
+                "brief": {"type": "string"},
+                "what": {"type": "string"}
+            }
+        });
+        let mut tool = ToolSpec::from_json_schema("order_post", &schema);
+        let what = tool
+            .params
+            .iter()
+            .find(|p| p.name == "what")
+            .unwrap()
+            .clone();
+        tool.params.retain(|p| p.name != "what");
+        let job = tool.params.iter_mut().find(|p| p.name == "job").unwrap();
+        assert!(!job.required);
+        job.shapes = vec![("coding-task".to_string(), vec![what])];
+        let spec = compile_tool_call_tree(&[tool], &ToolCallEnvelope::qwen3()).unwrap();
+        let arm = |value: &str| {
+            spec.nodes
+                .iter()
+                .find_map(|n| match n {
+                    NodeSpec::Branch { arms } => arms
+                        .iter()
+                        .find(|(t, _)| t.starts_with(&format!(" \"{value}\"")))
+                        .map(|(t, next)| (t.clone(), *next)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no arm for {value}"))
+        };
+        let (text, next) = arm("coding-task");
+        let after: Vec<String> = once(text).chain(reachable(&spec, next)).collect();
+        assert!(after.iter().any(|t| t.contains("\"what\"")), "{after:?}");
+        let (text, next) = arm("ward-shift");
+        let after: Vec<String> = once(text).chain(reachable(&spec, next)).collect();
+        assert!(!after.iter().any(|t| t.contains("\"what\"")), "{after:?}");
+        let opens: Vec<String> = reachable(&spec, spec.root);
+        assert!(opens.iter().any(|t| t.contains("\"brief\"")), "{opens:?}");
     }
 
     pub(in super::super) fn picked(rule: &str) -> ToolSpec {
