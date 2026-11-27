@@ -370,8 +370,8 @@ pub(super) mod tests {
         rt.moment(&hosted);
         let told = waiting(&rt, 1);
         assert!(
-            told.iter()
-                .any(|l| l.starts_with("Wick has reported it done: Read the board")),
+            told.iter().any(|l| l
+                .starts_with("Wick has reported it done: Read the board. What Wick reported: \"two jobs stalled\"")),
             "{told:?}"
         );
     }

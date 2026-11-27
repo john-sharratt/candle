@@ -568,10 +568,14 @@ impl Runtime {
                     true => " The table is empty: nothing you posted waits to be taken.",
                     false => "",
                 };
+                // **The report is the news, so it is told.** Pointed at the
+                // order table for it, Zen read "Wick has reported it done:"
+                // with the brief after it, took the brief for the work still
+                // owed, and told the family it was still waiting on Wick.
                 let line = format!(
-                    "{carrier} has {how}: {}. The report is at the order table — \
-                     `order_results`.{empty}",
-                    filed.brief.trim_end_matches('.')
+                    "{carrier} has {how}: {}. What {carrier} reported: \"{}\"{empty}",
+                    filed.brief.trim_end_matches('.'),
+                    filed.notes.trim()
                 );
                 for npc_id in posters {
                     tell(npc_id, line.clone());
