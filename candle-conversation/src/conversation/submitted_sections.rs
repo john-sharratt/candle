@@ -35,8 +35,8 @@ use crate::persistence::content_hash::{
 };
 use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::projection::{
-    prefix_before_collection, Builder, CollectionId, Conversation, DecodePriority, SectionId,
-    TimelineId,
+    prefix_before_collection, Builder, CollectionId, Conversation, DecodePriority, PrefixItem,
+    SectionId, TimelineId,
 };
 use crate::scheduler::exported_state::SharedState;
 use crate::scheduler::SchedulerRequest;
@@ -300,8 +300,8 @@ struct SealJob {
     section: SectionId,
     name: String,
     content: String,
-    /// The schema's sections before the collection.
-    prefix: Vec<SectionId>,
+    /// The schema's prompt before the collection, earlier ranges as holes.
+    prefix: Vec<PrefixItem>,
     /// This conversation's sections the section continues, in order — see
     /// [`Sequence::submit_section`].
     after: Vec<SectionRef>,
@@ -380,7 +380,7 @@ impl SealJob {
 
     /// The sections the section is sealed against, in order: the schema's
     /// prefix, then the sections it continues — once each of those has sealed.
-    fn sealed_prefix(&self) -> crate::Result<Vec<SectionId>> {
+    fn sealed_prefix(&self) -> crate::Result<Vec<PrefixItem>> {
         let mut ids = self.prefix.clone();
         for before in &self.after {
             before.wait().map_err(|e| {
@@ -390,7 +390,7 @@ impl SealJob {
                     before.name()
                 ))
             })?;
-            ids.push(before.section_id());
+            ids.push(PrefixItem::Section(before.section_id()));
         }
         Ok(ids)
     }
@@ -418,19 +418,26 @@ impl SealJob {
         }
         let at_collection =
             state_after(&self.scheduler_tx, &self.substrate, &self.prompt_prefix())?;
-        let after: Vec<SectionId> = self.after.iter().map(SectionRef::section_id).collect();
+        let after: Vec<PrefixItem> = self
+            .after
+            .iter()
+            .map(|s| PrefixItem::Section(s.section_id()))
+            .collect();
         continue_state(&self.scheduler_tx, &self.substrate, at_collection, &after)
     }
 
-    /// The schema's prefix sections a recurrence runs through: collection
-    /// members left out, as the content address leaves them out, because a
-    /// projection picks among them at runtime.
-    fn prompt_prefix(&self) -> Vec<SectionId> {
+    /// The schema's prefix a recurrence runs through: collection members left
+    /// out, as the content address leaves them out, because a projection picks
+    /// among them at runtime; earlier ranges kept as holes.
+    fn prompt_prefix(&self) -> Vec<PrefixItem> {
         let system = &self.schema.schema().system_prompt;
         self.prefix
             .iter()
             .copied()
-            .filter(|&id| !system.is_collection_member(id))
+            .filter(|item| {
+                item.section()
+                    .is_none_or(|id| !system.is_collection_member(id))
+            })
             .collect()
     }
 
@@ -519,7 +526,7 @@ impl SealJob {
             .send(SchedulerRequest::IngestSection {
                 sequence_id: slot,
                 section_id: self.section,
-                prefix_section_ids: sealed_prefix,
+                prefix: sealed_prefix,
                 tokens,
                 address,
                 debug_name: if self.sharing.is_shared() {
@@ -572,7 +579,11 @@ impl SealJob {
     /// section from the same text sealed after none, or after others.
     fn prefix_hash(&self) -> ContentHash {
         let mut ids = self.prompt_prefix();
-        ids.extend(self.after.iter().map(SectionRef::section_id));
+        ids.extend(
+            self.after
+                .iter()
+                .map(|s| PrefixItem::Section(s.section_id())),
+        );
         chain_of(&self.substrate, &ids).0
     }
 
@@ -660,13 +671,15 @@ impl Sequence {
         let collection_id = base.id_for_system_collection(collection).ok_or_else(|| {
             ConversationError::Other(format!("the schema has no collection {collection:?}"))
         })?;
-        let prefix = prefix_before_collection(&base.schema().system_prompt.items, collection_id)
-            .ok_or_else(|| {
-                ConversationError::Other(format!(
-                    "collection {collection:?} is inside a section tree, which seals each \
+        let native = self.substrate.read().trained_window();
+        let prefix =
+            prefix_before_collection(&base.schema().system_prompt.items, collection_id, native)
+                .ok_or_else(|| {
+                    ConversationError::Other(format!(
+                        "collection {collection:?} is inside a section tree, which seals each \
                      member once per branch; submit to a top-level collection"
-                ))
-            })?;
+                    ))
+                })?;
 
         if let Some(at) = self.submitted.position_of_name(name) {
             let earlier = self.submitted.entries.remove(at);

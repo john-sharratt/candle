@@ -10,6 +10,7 @@
 
 use super::*;
 use crate::conversation::run_state;
+use crate::projection::TokenRun;
 use crate::scheduler::exported_state::SharedState;
 use crate::{SlotLayout, SpanQuant, TransplantFrom};
 
@@ -318,7 +319,11 @@ impl ConversationEngine {
                 self.raw_turn(sequence_id, tokens, 0)?;
             }
             let state = match recurrent_over {
-                Some(tokens) => run_state(&self.core.scheduler_tx, None, tokens)?,
+                Some(tokens) => run_state(
+                    &self.core.scheduler_tx,
+                    None,
+                    vec![TokenRun { hole: 0, tokens }],
+                )?,
                 None => None,
             };
             if let Some(state) = state {

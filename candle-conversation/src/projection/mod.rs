@@ -223,6 +223,7 @@ mod persisted_ids;
 mod pins;
 mod plain_prompt;
 mod policy;
+mod prefix_item;
 mod project;
 mod prompt_tokens;
 mod reconcile;
@@ -290,6 +291,7 @@ pub use owned_sections::{OwnedSection, OwnedSections};
 pub use pins::{within_budget, Pin, PinSet};
 pub use plain_prompt::PlainPromptFrames;
 pub use policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
+pub use prefix_item::{prefix_sections, runs_are_empty, sections_prefix, PrefixItem, TokenRun};
 pub(crate) use project::turn_belief_key;
 pub use project::{
     GeneratedIdentity, GroupKey, OptionalState, PriorBelief, Projection, ProjectionLevel,
@@ -306,8 +308,8 @@ pub use resolver::{
 };
 pub use schema::{
     Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, Draws, GatherScope,
-    GroupSchema, LayerDials, LayerSchema, LayerSummary, Recency, Schema, ScoreFormula,
-    SectionCollection, SectionSchema, SectionTree, SelectionRule, SystemPromptItem,
+    GroupSchema, LayerDials, LayerSchema, LayerSummary, RangeFill, Recency, ReservedRange, Schema,
+    ScoreFormula, SectionCollection, SectionSchema, SectionTree, SelectionRule, SystemPromptItem,
     SystemPromptSchema, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary, WorkingSetShare,
     LINEAGE_BASE,
 };

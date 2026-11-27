@@ -47,27 +47,20 @@ pub(super) fn turn_projection(
     proj
 }
 
-/// The non-template content sections that precede the `tools` collection in the
-/// dialogue layer. This is the prefix the tool sections are sealed against (the
-/// summariser excludes collection members + templates from the prefix chain), so
-/// sealing the tool-summary section with the *same* prefix puts its KV exactly
-/// where "just before the tools" is.
-pub(super) fn pre_tools_section_ids(builder: &Builder) -> Vec<SectionId> {
-    let mut ids = Vec::new();
-    for item in &builder.schema().system_prompt.items {
-        match item {
-            SystemPromptItem::Section(s) if !s.is_template => ids.push(s.id),
-            // Section-tree variants are sealed (not live templates), and
-            // `pre_collection_prelude` bakes their default content into the
-            // prefix — so the tool summary must seal against the same default
-            // variant ids to land at the right position.
-            SystemPromptItem::SectionTree(t) => ids.extend(t.default_present_ids.iter().copied()),
-            // The dialogue layer's only collection is `tools`; stop at it.
-            SystemPromptItem::Collection(_) => break,
-            SystemPromptItem::Section(_) => {}
-        }
-    }
-    ids
+/// What the `tools` collection is sealed behind: the prompt the creation walk
+/// lays down before it (`prefix_before_collection`) — bare sections, the
+/// default branch of each section tree, and each earlier reserved range as a
+/// hole of its size on an engine trained to `native` positions. Sealing the
+/// tool-summary section behind the *same* prefix puts its KV exactly where
+/// "just before the tools" is. Empty when the schema declares no `tools`
+/// collection.
+pub(super) fn pre_tools_prefix(builder: &Builder, native: Option<usize>) -> Vec<PrefixItem> {
+    builder
+        .id_for_system_collection("tools")
+        .and_then(|tools| {
+            prefix_before_collection(&builder.schema().system_prompt.items, tools, native)
+        })
+        .unwrap_or_default()
 }
 
 /// The reserved section holding `mode`'s tool-catalog summary; `None` projects

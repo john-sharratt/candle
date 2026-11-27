@@ -218,10 +218,10 @@ use crate::projection::event::{group_name_of, layer_name_of_group};
 use crate::projection::scan_census::take as take_scan_census;
 use crate::projection::Content;
 use crate::projection::{
-    decode_events, encode_events, summary_node_event, Builder, CompressionPrompt, Conversation,
-    GroupKey, Observe, PriorBelief, ProjectionMode, ProjectionSegment, ProjectionTarget,
-    ResolvedSection, ResolvedTurn, SealedKind, SectionId, SelectionState, SystemPromptItem,
-    TimelineId, TurnId, TurnIndex, TurnKey,
+    decode_events, encode_events, prefix_sections, runs_are_empty, summary_node_event, Builder,
+    CompressionPrompt, Conversation, GroupKey, Observe, PrefixItem, PriorBelief, ProjectionMode,
+    ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedTurn, SealedKind, SectionId,
+    SelectionState, SystemPromptItem, TimelineId, TokenRun, TurnId, TurnIndex, TurnKey,
 };
 use crate::projection::{
     CollectionWarm, DecodePriority, GalleryPreload, GroupId, GroupVotes, LayerId, Schema,
@@ -1134,6 +1134,8 @@ pub use quantize_slot::SpanQuant;
 mod slot_layout;
 mod transplant;
 pub use slot_layout::{format_name, ChunkLayout, IndexPage, SlotLayout};
+mod prefix_run;
+use prefix_run::PrefixRun;
 mod seal_turn;
 mod section_finish;
 mod sections;

@@ -136,6 +136,7 @@ impl Builder {
                 default: None,
                 budget_adaptive: None,
                 mandatory: Vec::new(),
+                range: None,
             }));
         self.name_maps
             .collection_names

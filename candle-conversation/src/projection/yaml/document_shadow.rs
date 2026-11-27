@@ -120,6 +120,26 @@ pub(super) fn pinned_names(items: &[YamlSystemPromptItem]) -> Vec<String> {
     out
 }
 
+/// A collection's `range:` — positions on a model whose native context is
+/// 128K or more, and on a smaller one, and which end the members stand at.
+///
+/// ```yaml
+/// range: { tokens: 8192, small_context: 2048, fill: bottom }
+/// ```
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct YamlReservedRange {
+    pub(super) tokens: usize,
+    /// Positions on a model whose native context is below 128K. The full size
+    /// when not given.
+    #[serde(default)]
+    pub(super) small_context: Option<usize>,
+    /// `top` (default): the members end at the range's top, the hole ahead of
+    /// them. `bottom`: they start at its bottom, the hole after them.
+    #[serde(default)]
+    pub(super) fill: Option<String>,
+}
+
 #[derive(Deserialize)]
 pub(super) struct YamlSection {
     pub(super) id: String,
@@ -262,6 +282,10 @@ pub(super) enum YamlSystemPromptItem {
         /// Concept B: mass-driven member-budget extension.
         #[serde(default)]
         budget_adaptive: Option<YamlMemberBudgetAdaptive>,
+        /// The positions the collection always takes — its members at the top
+        /// of them, a hole ahead (`docs/placed_section_layout.md` §3.1).
+        #[serde(default)]
+        range: Option<YamlReservedRange>,
     },
     /// An ordered, individually-toggleable tree of sealed sections.  Each node
     /// is a `section` (mandatory), an `optional` (binary toggle), or a

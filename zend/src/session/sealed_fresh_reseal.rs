@@ -11,8 +11,8 @@
 use anyhow::Context;
 use candle_conversation::files::names::{chunk_name, heading_name};
 use candle_conversation::files::{files_owner, ChunkRecord, FileRecord, MemberRef};
-use candle_conversation::projection::{Conversation, SectionId};
-use candle_conversation::{MemberSpec, SealAs, Sequence};
+use candle_conversation::projection::{Conversation, PrefixItem, SectionId};
+use candle_conversation::{MemberSpec, MembersPrefix, SealAs, Sequence};
 
 use crate::files::records;
 
@@ -66,7 +66,7 @@ pub fn reseal_behind(
     base: &Sequence,
     decode: impl Fn(&[u32]) -> anyhow::Result<String>,
     record: &FileRecord,
-    prefix: &[SectionId],
+    prefix: &[PrefixItem],
     kind: SealAs,
 ) -> anyhow::Result<FileRecord> {
     let texts = member_texts(conversation, base, decode, record)?;
@@ -88,8 +88,14 @@ pub fn reseal_behind(
                 content: text.clone(),
             }),
     );
+    // The prompt as placed already holds the hole ahead of the file, so the
+    // members are sealed straight after it, as they were placed.
+    let behind = MembersPrefix {
+        prefix: prefix.to_vec(),
+        range: None,
+    };
     let sealed = base
-        .seal_members_behind(prefix, &specs, kind)
+        .seal_members_behind(&behind, &specs, kind)
         .map_err(|e| anyhow::anyhow!("sealing the probe's members: {e}"))?;
     let member = |i: usize| MemberRef {
         address: sealed[i].address,
@@ -114,19 +120,30 @@ pub fn reseal_behind(
     Ok(probe)
 }
 
-/// The sections `dump`-ordered `pieces` place ahead of the first of `members`:
-/// the prompt before the file.
-pub fn prefix_before(
-    pieces: &[(Option<u32>, usize)],
-    first_member: u32,
-) -> anyhow::Result<Vec<SectionId>> {
+/// One piece of a dumped prompt as the reseal reads it: the section it is,
+/// or the hole of positions it leaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DumpedPiece {
+    Section(u32),
+    Hole(usize),
+    /// Glue or a turn: neither sealed ahead of a file nor a hole.
+    Other,
+}
+
+/// What `dump`-ordered `pieces` place ahead of the first of `members`: the
+/// prompt before the file, its sections and its holes.
+pub fn prefix_before(pieces: &[DumpedPiece], first_member: u32) -> anyhow::Result<Vec<PrefixItem>> {
     let at = pieces
         .iter()
-        .position(|(id, _)| *id == Some(first_member))
+        .position(|p| *p == DumpedPiece::Section(first_member))
         .context("the file's heading is not in the prompt")?;
     Ok(pieces[..at]
         .iter()
-        .filter_map(|(id, _)| id.map(SectionId::new))
+        .filter_map(|p| match *p {
+            DumpedPiece::Section(id) => Some(PrefixItem::Section(SectionId::new(id))),
+            DumpedPiece::Hole(positions) => Some(PrefixItem::Hole(positions)),
+            DumpedPiece::Other => None,
+        })
         .collect())
 }
 
@@ -134,20 +151,25 @@ pub fn prefix_before(
 mod tests {
     use super::*;
 
-    /// **The prefix is every section ahead of the file's heading**, in order,
-    /// glue left out.
+    /// **The prefix is every section and hole ahead of the file's heading**,
+    /// in order, glue left out.
     #[test]
-    fn the_prefix_is_every_section_ahead_of_the_heading() {
+    fn the_prefix_is_every_section_and_hole_ahead_of_the_heading() {
         let pieces = [
-            (Some(1), 3),
-            (None, 2),
-            (Some(5), 9),
-            (Some(7), 4),
-            (Some(8), 1),
+            DumpedPiece::Section(1),
+            DumpedPiece::Other,
+            DumpedPiece::Hole(500),
+            DumpedPiece::Section(5),
+            DumpedPiece::Section(7),
+            DumpedPiece::Section(8),
         ];
         assert_eq!(
             prefix_before(&pieces, 7).unwrap(),
-            vec![SectionId::new(1), SectionId::new(5)]
+            vec![
+                PrefixItem::Section(SectionId::new(1)),
+                PrefixItem::Hole(500),
+                PrefixItem::Section(SectionId::new(5)),
+            ]
         );
         assert!(prefix_before(&pieces, 99).is_err());
     }

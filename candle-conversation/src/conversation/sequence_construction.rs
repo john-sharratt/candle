@@ -279,6 +279,7 @@ impl Sequence {
             substrate,
             target,
             birth_prefix: Arc::new(Vec::new()),
+            birth_ranges: Vec::new(),
             frame: None,
             frame_window: None,
             branch_spans: Vec::new(),
@@ -327,11 +328,15 @@ impl Sequence {
         // is live-prefilled at projection-apply time under the actual
         // runtime context, so substrate carries no entries for them
         // and they contribute nothing to the prefix here.
-        let mut linear_prefix: Vec<SectionId> = Vec::new();
+        let mut linear_prefix: Vec<PrefixItem> = Vec::new();
         // Mirrors `linear_prefix` but excludes Collection members and
         // `depends_on`-gated sections — the birth prefix: the empty-collection
         // layout an append-only conversation's first turn is framed by.
-        let mut fixed_prefix: Vec<SectionId> = Vec::new();
+        let mut fixed_prefix: Vec<PrefixItem> = Vec::new();
+        // Where each reserved range's hole stands in `fixed_prefix`.
+        let mut birth_ranges: Vec<BirthRange> = Vec::new();
+        // The engine's trained window, which picks each range's size.
+        let native = conv.substrate.read().trained_window();
         // Where each section tree's emitted ids land inside `fixed_prefix`, as
         // `(start, len)` — the windows the branch-checkpoint pass rewrites per
         // leaf, one per declared tree in item order. Empty when the layer
@@ -438,7 +443,7 @@ impl Sequence {
             match item {
                 SystemPromptItem::Section(s) => {
                     conv.insert_section_with_prefix(s.id, s.content.as_str(), &linear_prefix)?;
-                    linear_prefix.push(s.id);
+                    linear_prefix.push(PrefixItem::Section(s.id));
                     // Sections with `depends_on` are conditional — they
                     // only emit when the named collection materialises —
                     // so they must NOT contribute to the birth prefix
@@ -447,12 +452,21 @@ impl Sequence {
                     // nothing for it, so the frame must not name it either,
                     // or the two lists disagree about what the slot holds.
                     if s.depends_on.is_none() && !s.content.is_empty() {
-                        fixed_prefix.push(s.id);
+                        fixed_prefix.push(PrefixItem::Section(s.id));
                     }
                     done_bytes += s.content.len() as u64;
                     report(done_bytes);
                 }
                 SystemPromptItem::Collection(coll) => {
+                    // A reserved range: everything after it is sealed behind it
+                    // left empty; a range filled from the top seals each member
+                    // ending at its top, one filled from the bottom straight
+                    // after the prompt before it.
+                    let range = coll.range.map(|r| r.positions(native));
+                    let sealed_at_top = coll
+                        .range
+                        .filter(|r| r.fill == RangeFill::Top)
+                        .map(|r| r.positions(native));
                     let batch: Vec<(SectionId, &str)> = coll
                         .sections
                         .iter()
@@ -473,6 +487,7 @@ impl Sequence {
                         conv.insert_section_collection_with_progress(
                             &batch,
                             &linear_prefix,
+                            sealed_at_top,
                             true, // schema Collection: members get the
                             // aggressive turn-level quantize policy
                             |_sid, content_len| {
@@ -481,8 +496,22 @@ impl Sequence {
                             },
                         )?;
                     }
-                    // Extend the live linear_prefix with every
-                    // collection member so subsequent sections see
+                    if let Some(positions) = range {
+                        // The range, empty, in both prefixes: the sections
+                        // after it are sealed and read past it, whatever a
+                        // projection places in it.
+                        birth_ranges.push(BirthRange {
+                            collection: coll.id,
+                            at: fixed_prefix.len(),
+                            positions,
+                            fill: coll.range.map_or(RangeFill::Top, |r| r.fill),
+                        });
+                        linear_prefix.push(PrefixItem::Hole(positions));
+                        fixed_prefix.push(PrefixItem::Hole(positions));
+                        continue;
+                    }
+                    // Without a range, extend the live linear_prefix with
+                    // every collection member so subsequent sections see
                     // them at projection time, but do NOT add them
                     // to fixed_prefix — the birth prefix must be
                     // coherent for the empty-collection case.
@@ -500,7 +529,7 @@ impl Sequence {
                         if sec.is_template {
                             continue;
                         }
-                        linear_prefix.push(sec.id);
+                        linear_prefix.push(PrefixItem::Section(sec.id));
                     }
                 }
                 SystemPromptItem::SectionTree(tree) => {
@@ -525,7 +554,7 @@ impl Sequence {
                             if let Some(branch_list) = tc.variants.first() {
                                 for (bi, bvar) in branch_list.iter().enumerate() {
                                     let mut prefix = linear_prefix.clone();
-                                    prefix.extend_from_slice(&bvar.in_tree_prefix);
+                                    prefix.extend(sections_prefix(&bvar.in_tree_prefix));
                                     let batch: Vec<(SectionId, &str)> = members
                                         .iter()
                                         .enumerate()
@@ -539,6 +568,7 @@ impl Sequence {
                                         conv.insert_section_collection_with_progress(
                                             &batch,
                                             &prefix,
+                                            None,
                                             true,
                                             |_sid, content_len| {
                                                 *done_bytes_ref += content_len as u64;
@@ -570,7 +600,7 @@ impl Sequence {
                         for option in &node.options {
                             for v in &option.variants {
                                 let mut prefix = linear_prefix.clone();
-                                prefix.extend_from_slice(&v.in_tree_prefix);
+                                prefix.extend(sections_prefix(&v.in_tree_prefix));
                                 conv.insert_section_with_prefix(
                                     v.id,
                                     option.content.as_str(),
@@ -592,8 +622,8 @@ impl Sequence {
                     // several trees, and each owns its own window.
                     branch_spans.push((fixed_prefix.len(), tree.default_present_ids.len()));
                     for id in &tree.default_present_ids {
-                        linear_prefix.push(*id);
-                        fixed_prefix.push(*id);
+                        linear_prefix.push(PrefixItem::Section(*id));
+                        fixed_prefix.push(PrefixItem::Section(*id));
                     }
                 }
             }
@@ -624,6 +654,7 @@ impl Sequence {
         // that first turn selects a different branch, `submit_turn_with_options`
         // rebuilds from exactly these inputs.
         conv.birth_prefix = Arc::new(fixed_prefix);
+        conv.birth_ranges = birth_ranges;
         conv.frame = conv
             .submitter
             .config
@@ -693,14 +724,18 @@ impl Sequence {
     /// Collection members are skipped, for the same reason the section-ingest
     /// chain skips them: projection picks a subset at runtime, so a prefix that
     /// counted them would change whenever the catalog did.
+    ///
+    /// A reserved range is a hole in `birth` and stays one: the prompt's tokens
+    /// come back as runs, each after the hole ahead of it, and the content
+    /// prefix names the holes as well as the sections.
     pub(super) fn prompt_branch(
         &self,
-        birth: &[SectionId],
+        birth: &[PrefixItem],
         branch_spans: &[(usize, usize)],
-    ) -> (ContentHash, Vec<u32>) {
+    ) -> (ContentHash, Vec<TokenRun>) {
         let schema = self.projection.schema();
         let trees: Vec<&SectionTree> = schema.system_prompt.section_trees().collect();
-        let mut ids: Vec<SectionId> = Vec::with_capacity(birth.len());
+        let mut ids: Vec<PrefixItem> = Vec::with_capacity(birth.len());
         // Walk the windows in order, copying the untouched runs between them
         // and re-deriving each tree's own run. `cursor` is where the last
         // window ended, so an out-of-order or out-of-range span is caught
@@ -715,7 +750,11 @@ impl Sequence {
                 }
                 ids.extend_from_slice(&birth[cursor..start]);
                 let selection = tree.selection(|id| self.selection.get(id));
-                ids.extend(tree.branch_prefix_ids(&selection));
+                ids.extend(
+                    tree.branch_prefix_ids(&selection)
+                        .into_iter()
+                        .map(PrefixItem::Section),
+                );
                 cursor = start + len;
             }
         }
@@ -727,21 +766,11 @@ impl Sequence {
             ids = birth.to_vec();
         }
 
-        let view = self.substrate.read();
-        let mut chain = ContentChain::new();
-        let mut tokens: Vec<u32> = Vec::new();
-        for id in ids {
-            if schema.system_prompt.is_collection_member(id) {
-                continue;
-            }
-            let section = view.section_tokens_of(id);
-            if section.is_empty() {
-                continue;
-            }
-            chain.push_section(&section);
-            tokens.extend_from_slice(&section);
-        }
-        (chain.prefix(), tokens)
+        ids.retain(|item| {
+            item.section()
+                .is_none_or(|id| !schema.system_prompt.is_collection_member(id))
+        });
+        chain_of(&self.substrate, &ids)
     }
 
     /// Compute and persist this conversation's prompt branch checkpoint (§4.6).
@@ -772,18 +801,18 @@ impl Sequence {
     /// conversation is an outage.
     pub(super) fn build_branch_checkpoint(
         &self,
-        birth: &[SectionId],
+        birth: &[PrefixItem],
         branch_spans: &[(usize, usize)],
     ) -> crate::Result<Option<(ContentHash, Option<Arc<BranchCheckpointPayload>>)>> {
-        let (prefix, tokens) = self.prompt_branch(birth, branch_spans);
-        if tokens.is_empty() {
+        let (prefix, runs) = self.prompt_branch(birth, branch_spans);
+        if runs_are_empty(&runs) {
             return Ok(None);
         }
         // An already-durable checkpoint comes back decoded rather than being
         // dropped: `read_branch_checkpoint` reads the whole ~63 MiB record off
         // the log, and returning `None` here made `restore_branch_checkpoint`
         // read and decode the identical record a moment later.
-        match checkpoint(&self.scheduler_tx, &self.substrate, prefix, tokens) {
+        match checkpoint(&self.scheduler_tx, &self.substrate, prefix, runs) {
             Ok(Some((payload, computed))) => {
                 if computed {
                     note_branch_checkpoint_computed();

@@ -40,9 +40,10 @@ use crate::persistence::content_hash::{
 use crate::persistence::record::BranchCheckpointPayload;
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
-    decode_events, decode_points, from_projection_with_origins, Builder, Conversation,
-    DecodePriority, Observe, ProjectionEvent, ProjectionMode, ProjectionPoint, ProjectionTarget,
-    SectionId, SectionTree, SelectionState, SystemPromptItem, TimelineId, TurnIndex, TurnKey,
+    decode_events, decode_points, from_projection_with_origins, runs_are_empty, sections_prefix,
+    Builder, Conversation, DecodePriority, Observe, PrefixItem, ProjectionEvent, ProjectionMode,
+    ProjectionPoint, ProjectionTarget, RangeFill, SectionId, SectionTree, SelectionState,
+    SystemPromptItem, TimelineId, TokenRun, TurnIndex, TurnKey,
 };
 use crate::provenance::gallery_arena::BeliefArena;
 use crate::provenance::{decode_wide_sigs, WideQSig};
@@ -76,7 +77,9 @@ use std::sync::{Arc, Mutex};
 
 mod carried;
 pub use carried::{Carried, Linking, Want};
+mod birth_range;
 mod ephemeral_turn;
+pub(crate) use birth_range::BirthRange;
 mod frame;
 mod member_seal;
 pub use ephemeral_turn::{AskScope, UnsealedAsker};
@@ -88,9 +91,9 @@ mod sharing;
 mod submitted_sections;
 mod turn_bans;
 
-pub use member_seal::{MemberSpec, SealAs, SealedMember};
+pub use member_seal::{MemberSpec, MembersPrefix, SealAs, SealedMember};
 pub(crate) use prefix_state::run_state;
-use prefix_state::{checkpoint, shared_held, state_after};
+use prefix_state::{chain_of, checkpoint, shared_held, state_after};
 pub use prompt_dump::{PieceKind, PromptDump, PromptPiece};
 pub use sharing::{is_shared_stream_name, shared_stream_name, Sharing, SHARED_SECTION_NAME_PREFIX};
 use submitted_sections::SubmittedSections;
@@ -222,7 +225,13 @@ pub struct Sequence {
     /// One window per [`SectionTree`] the schema declares, in item order: a
     /// schema may declare several (zend's does), each contributing its own
     /// run of ids to the birth list.
-    birth_prefix: Arc<Vec<SectionId>>,
+    ///
+    /// Each reserved range is a hole in it, left empty, so everything after a
+    /// range is sealed and read at the positions it has however full the range
+    /// is (`docs/placed_section_layout.md` §3.1).
+    birth_prefix: Arc<Vec<PrefixItem>>,
+    /// Where each reserved range stands in [`Self::birth_prefix`].
+    birth_ranges: Vec<BirthRange>,
     /// The sections of the frame an append-only conversation's first turn
     /// lays onto an empty slot: [`Self::birth_prefix`], sent with the first
     /// submit — its lineage's turns after them ([`Frame::of`]) — and gone after
@@ -231,7 +240,7 @@ pub struct Sequence {
     /// fork carries its parent's, so a unit forked from an ingest base that
     /// never ran a turn is framed exactly as the base would have been, behind
     /// whatever lineage it has been given by its first submit.
-    frame: Option<Arc<Vec<SectionId>>>,
+    frame: Option<Arc<Vec<PrefixItem>>>,
     /// The turns the pending frame lays down in place of the inherited chain
     /// ([`Self::frame_window`]); `None` lays down the chain.
     frame_window: Option<Vec<TurnKey>>,

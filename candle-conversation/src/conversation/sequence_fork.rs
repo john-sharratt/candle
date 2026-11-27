@@ -482,6 +482,7 @@ impl Sequence {
             substrate: self.substrate.clone(),
             target: fork_target,
             birth_prefix: Arc::clone(&self.birth_prefix),
+            birth_ranges: self.birth_ranges.clone(),
             // A fork of a slot that holds K/V borrows it and never reads this;
             // one of an empty slot (an ingest base that never ran a turn) is
             // framed as its parent would have been.
@@ -574,7 +575,8 @@ impl Sequence {
     /// prefill of `tokens` has, under whatever K/V the slot's turn is
     /// projected onto. `Ok(false)` when the model carries no recurrent state.
     pub fn install_fresh_recurrent_over(&self, tokens: Vec<u32>) -> crate::Result<bool> {
-        let Some(state) = run_state(&self.scheduler_tx, None, tokens)? else {
+        let run = TokenRun { hole: 0, tokens };
+        let Some(state) = run_state(&self.scheduler_tx, None, vec![run])? else {
             return Ok(false);
         };
         let (tx, rx) = flume::bounded(1);

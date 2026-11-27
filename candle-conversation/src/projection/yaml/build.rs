@@ -382,11 +382,13 @@ pub(super) fn build_system_prompt(
                 member_glue,
                 default: coll_default,
                 budget_adaptive: coll_budget_adaptive,
+                range: coll_range,
             } => {
                 let cid = *collections
                     .get(name)
                     .expect("first-pass pre-allocated every collection id");
                 let label = format!("{}/{}", owner, name);
+                let range = parse_reserved_range(&label, coll_range.as_ref())?;
                 let coll_selection = parse_collection_selection(&label, selection)?;
                 if *score_threshold < 0.0 {
                     return Err(ConstructionError::NegativeScoreThreshold {
@@ -456,6 +458,7 @@ pub(super) fn build_system_prompt(
                         coll_budget_adaptive.as_ref(),
                     )?,
                     mandatory: Vec::new(),
+                    range,
                 }));
             }
             YamlSystemPromptItem::SectionTree { nodes } => {

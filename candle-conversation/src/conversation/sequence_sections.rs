@@ -9,6 +9,7 @@
 //! is tokenised, and a shutdown ends the wait instead of holding the process.
 
 use super::*;
+use crate::scheduler::exported_state::SharedState;
 
 /// Allocate a scratch slot on `scheduler_tx` — see
 /// [`Sequence::alloc_scratch_slot`].
@@ -68,22 +69,21 @@ impl Sequence {
     }
 
     /// Cumulative-prefix variant of [`Self::insert_section`].  Every
-    /// section in `prefix_section_ids` is Arc-injected onto the
-    /// scratch slot before this section's prefill, so the model's
-    /// forward pass attends to the real preceding context.  Used by
-    /// the schema-driven system_prompt loop to walk
+    /// section in `prefix` is Arc-injected onto the scratch slot before this
+    /// section's prefill, and every hole in it left empty, so the model's
+    /// forward pass attends to the real preceding context at the positions it
+    /// is read at.  Used by the schema-driven system_prompt loop to walk
     /// declaration-order sections cumulatively.
     pub fn insert_section_with_prefix(
         &mut self,
         section: SectionId,
         content: &str,
-        prefix_section_ids: &[SectionId],
+        prefix: &[PrefixItem],
     ) -> crate::Result<()> {
         if content.is_empty() {
             return Ok(());
         }
-        let mut results =
-            self.insert_section_collection(&[(section, content)], prefix_section_ids, false)?;
+        let mut results = self.insert_section_collection(&[(section, content)], prefix, false)?;
         results.pop();
         Ok(())
     }
@@ -106,12 +106,13 @@ impl Sequence {
     pub fn insert_section_collection(
         &mut self,
         sections: &[(SectionId, &str)],
-        prefix_section_ids: &[SectionId],
+        prefix: &[PrefixItem],
         in_collection: bool,
     ) -> crate::Result<Vec<(SectionId, usize)>> {
         self.insert_section_collection_with_progress(
             sections,
-            prefix_section_ids,
+            prefix,
+            None,
             in_collection,
             |_, _| {},
         )
@@ -133,10 +134,17 @@ impl Sequence {
     /// `insert_section_with_prefix` always pass `false` because the
     /// model needs near-lossless K/V on the role markers / opening
     /// and closing tags every later token attends back over.
+    ///
+    /// `range` is the collection's reserved range, in positions, when it has
+    /// one: each section is then sealed at the range's top, behind `prefix` and
+    /// the part of the range above its own tokens left empty
+    /// (`docs/placed_section_layout.md` §3.1b), so its address names that hole
+    /// too.
     pub fn insert_section_collection_with_progress<F>(
         &mut self,
         sections: &[(SectionId, &str)],
-        prefix_section_ids: &[SectionId],
+        prefix: &[PrefixItem],
+        range: Option<usize>,
         in_collection: bool,
         mut on_section_done: F,
     ) -> crate::Result<Vec<(SectionId, usize)>>
@@ -239,11 +247,19 @@ impl Sequence {
             return Ok(out_skip);
         }
 
-        let prefix_hash = {
+        let base_chain = {
             let mut chain = ContentChain::new();
             let view = self.substrate.read();
             let schema = self.projection.schema();
-            for &pid in prefix_section_ids {
+            for &item in prefix {
+                let pid = match item {
+                    PrefixItem::Section(pid) => pid,
+                    // Everything after a hole is read past it.
+                    PrefixItem::Hole(positions) => {
+                        chain.push_hole(positions);
+                        continue;
+                    }
+                };
                 // Skip collection members of the shared prompt — they don't
                 // advance the content chain.
                 if schema.system_prompt.is_collection_member(pid) {
@@ -259,6 +275,23 @@ impl Sequence {
                 }
                 chain.push_section(&pre_tokens);
             }
+            chain
+        };
+        // A member of a range is sealed at its top: behind the prefix and the
+        // part of the range above its own tokens. Without a range, behind the
+        // prefix alone.
+        let member_hole = |tokens: usize| range.map_or(0, |r| r.saturating_sub(tokens));
+        let member_prefix = |tokens: usize| {
+            let mut items = prefix.to_vec();
+            match member_hole(tokens) {
+                0 => {}
+                hole => items.push(PrefixItem::Hole(hole)),
+            }
+            items
+        };
+        let prefix_hash_of = |tokens: usize| {
+            let mut chain = base_chain.clone();
+            chain.push_hole(member_hole(tokens));
             chain.prefix()
         };
         // ── Pass 2: triage what's left into two buckets ────────────────
@@ -277,7 +310,7 @@ impl Sequence {
             }
             let token_count = tokens.len();
             let address = ContentAddress {
-                prefix_hash,
+                prefix_hash: prefix_hash_of(token_count),
                 section_hash: hash_tokens(&tokens),
             };
             let debug_name = self.section_debug_name(section_id);
@@ -382,16 +415,24 @@ impl Sequence {
         // is computed as it is read, straight after that prefix. They do not
         // attend to one another, and do not continue one another's state: a
         // projection picks among them.
-        let start = if in_collection && !to_ingest.is_empty() {
+        //
+        // In a range every member is read across a hole of its own, so the
+        // state it starts from is computed behind that hole; the holes do not
+        // change what the recurrence reads, only where the attention it feeds
+        // reads it from.
+        let start_of = |tokens: usize| -> crate::Result<Option<SharedState>> {
+            if !in_collection {
+                return Ok(None);
+            }
             let system = &self.projection.schema().system_prompt;
-            let prompt: Vec<SectionId> = prefix_section_ids
-                .iter()
-                .copied()
-                .filter(|&id| !system.is_collection_member(id))
+            let prompt: Vec<PrefixItem> = member_prefix(tokens)
+                .into_iter()
+                .filter(|item| {
+                    item.section()
+                        .is_none_or(|id| !system.is_collection_member(id))
+                })
                 .collect();
-            state_after(&self.scheduler_tx, &self.substrate, &prompt)?
-        } else {
-            None
+            state_after(&self.scheduler_tx, &self.substrate, &prompt)
         };
         let band = self.band();
         let mut slot_ids: Vec<SequenceId> = Vec::with_capacity(to_ingest.len());
@@ -421,17 +462,28 @@ impl Sequence {
         for (slot_id, item) in slots.by_ref().zip(to_ingest) {
             let (tx, rx) = flume::bounded(1);
             let content_len = item.content.len();
+            let start = match start_of(item.token_count) {
+                Ok(start) => start,
+                Err(e) => {
+                    self.free_scratch_slot(slot_id);
+                    for slot in slots {
+                        self.free_scratch_slot(slot);
+                    }
+                    self.drain_and_free(&mut pending);
+                    return Err(e);
+                }
+            };
             if self
                 .scheduler_tx
                 .send(SchedulerRequest::IngestSection {
                     sequence_id: slot_id,
                     section_id: item.section_id,
-                    prefix_section_ids: prefix_section_ids.to_vec(),
+                    prefix: member_prefix(item.token_count),
                     tokens: item.tokens,
                     address: item.address,
                     debug_name: item.debug_name,
                     in_collection,
-                    start: start.clone(),
+                    start,
                     // At the conversation's own band: whoever waits on its
                     // first turn waits on its frame sealing first.
                     band,

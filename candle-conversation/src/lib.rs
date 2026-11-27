@@ -146,8 +146,8 @@ pub use config::{
 };
 pub use conversation::{
     is_shared_stream_name, AskScope, Carried, ChainRound, GlueMarkers, Linking, MemberSpec,
-    PieceKind, Probed, PromptDump, PromptPiece, SealAs, SealedMember, SectionRef, SectionState,
-    Sequence, Sharing, UnsealedAsker, Want,
+    MembersPrefix, PieceKind, Probed, PromptDump, PromptPiece, SealAs, SealedMember, SectionRef,
+    SectionState, Sequence, Sharing, UnsealedAsker, Want,
 };
 pub use engine::{
     ConversationEngine, EngineAttacher, RawDecode, SubstrateReloadStatus, SubstrateReloader,

@@ -444,7 +444,7 @@ pub(super) mod tests {
         assert!(sched.handle_request(SchedulerRequest::IngestSection {
             sequence_id: slot,
             section_id: SectionId::new(1),
-            prefix_section_ids: Vec::new(),
+            prefix: Vec::new(),
             tokens: TokenBuffer::from(vec![1u32; tokens]),
             address: ContentAddress::default(),
             debug_name: "s".into(),

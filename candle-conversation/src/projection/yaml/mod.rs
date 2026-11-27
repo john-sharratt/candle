@@ -36,10 +36,10 @@ use super::policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 use super::project::OptionalState;
 use super::schema::{
     Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, Draws, GatherScope,
-    GroupSchema, LayerDials, LayerSchema, LayerSummary, Recency, Schema, SectionCollection,
-    SectionSchema, SectionTree, SelectionDefault, SelectionRule, SystemPromptItem,
-    SystemPromptSchema, TreeCollection, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary,
-    WorkingSetShare, LINEAGE_BASE,
+    GroupSchema, LayerDials, LayerSchema, LayerSummary, RangeFill, Recency, ReservedRange, Schema,
+    SectionCollection, SectionSchema, SectionTree, SelectionDefault, SelectionRule,
+    SystemPromptItem, SystemPromptSchema, TreeCollection, TreeDim, TreeNode, TreeOption,
+    TreeVariant, TurnSummary, WorkingSetShare, LINEAGE_BASE,
 };
 use super::swap_cap::DEFAULT_MAX_SWAPS;
 use crate::summary_tree::scope::Scope;
@@ -49,6 +49,7 @@ mod build;
 mod document_shadow;
 mod layer_group_shadow;
 mod parse_groups;
+mod parse_range;
 mod section_tree;
 mod yaml_ids;
 mod yaml_policy;
@@ -57,6 +58,7 @@ pub use build::*;
 use document_shadow::*;
 use layer_group_shadow::*;
 use parse_groups::*;
+use parse_range::*;
 use section_tree::*;
 pub use yaml_ids::*;
 use yaml_policy::*;

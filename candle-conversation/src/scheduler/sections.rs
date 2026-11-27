@@ -239,18 +239,14 @@ impl Scheduler {
                 return Err(Box::new((s, ConversationError::Model(e))));
             }
         }
-        let seal_block_from = match self.prepare_section_ingest(
-            s.sequence_id,
-            s.section_id,
-            &s.prefix_section_ids,
-            &s.tokens,
-        ) {
-            Ok(from) => from,
-            Err(e) => {
-                let _ = s.response_tx.send(Err(e));
-                return Ok(());
-            }
-        };
+        let seal_block_from =
+            match self.prepare_section_ingest(s.sequence_id, s.section_id, &s.prefix, &s.tokens) {
+                Ok(from) => from,
+                Err(e) => {
+                    let _ = s.response_tx.send(Err(e));
+                    return Ok(());
+                }
+            };
         if s.tokens.is_empty() {
             let result = self
                 .perform_seal_and_write(
@@ -296,9 +292,10 @@ impl Scheduler {
         &mut self,
         sequence_id: SequenceId,
         #[cfg_attr(not(feature = "context-dump"), allow(unused_variables))] section_id: SectionId,
-        prefix_section_ids: &[SectionId],
+        prefix: &[PrefixItem],
         #[cfg_attr(not(feature = "context-dump"), allow(unused_variables))] tokens: &TokenBuffer,
     ) -> Result<usize, ConversationError> {
+        let prefix_section_ids = prefix_sections(prefix);
         // A section's blocks stay native until its seal: its build attends
         // them first.
         self.seal_section_natively(sequence_id);
@@ -316,8 +313,9 @@ impl Scheduler {
             .reset_positional_state(sequence_id.0)
             .map_err(ConversationError::Model)?;
 
-        // 2. Inject substrate-pinned prefix sections (zero-copy Arc clone).
-        let has_prefix = !prefix_section_ids.is_empty();
+        // 2. Inject substrate-pinned prefix sections (zero-copy Arc clone), and
+        //    leave the prefix's holes where they fall.
+        let has_prefix = !prefix.is_empty();
         if has_prefix {
             if let Some(conversation) = self.slot_conversations.get(&sequence_id).cloned() {
                 // Ensure every prefix section is hot-resident before reading its
@@ -338,7 +336,7 @@ impl Scheduler {
                             &device,
                             ring,
                             &mut self.cold_load_stager,
-                            prefix_section_ids,
+                            &prefix_section_ids,
                             &no_turns,
                         )
                     });
@@ -350,16 +348,29 @@ impl Scheduler {
                     }
                 }
                 let n_layers = self.session.num_layers();
-                let mut per_layer_chunks: Vec<Vec<candle_nn::kv_cache::SealedChunk>> =
-                    (0..n_layers).map(|_| Vec::new()).collect();
-                let mut per_layer_token_count: Vec<usize> = vec![0; n_layers];
-                let chunk_size = self.chunk_size;
+                let mut run = PrefixRun::new(n_layers);
                 // Prefix sections whose stored layers disagree, retired below
                 // once the read guard is gone — retiring takes the write lock.
                 let mut skewed: Vec<(SectionId, StreamId)> = Vec::new();
                 {
                     let view = conversation.read();
-                    for &prefix_id in prefix_section_ids {
+                    for &item in prefix {
+                        let prefix_id = match item {
+                            PrefixItem::Section(id) => id,
+                            PrefixItem::Hole(positions) => {
+                                // The sections before the hole go in as one
+                                // run; the hole is left on the K/V and on the
+                                // index, so what follows is read past it.
+                                self.inject_prefix_run(sequence_id, &mut run)?;
+                                self.session
+                                    .push_sequence_position_gap(sequence_id.0, positions)
+                                    .map_err(ConversationError::Model)?;
+                                self.model
+                                    .push_positional_gap(sequence_id.0, positions)
+                                    .map_err(ConversationError::Model)?;
+                                continue;
+                            }
+                        };
                         let Some(sealed) = view.section_sealed_of(prefix_id) else {
                             tracing::warn!(
                                 "prepare_section_ingest: prefix section {:?} has no sealed substrate entry — skipping",
@@ -402,11 +413,7 @@ impl Scheduler {
                             );
                             skewed.push((prefix_id, stream));
                         }
-                        for layer_idx in 0..n_layers {
-                            let layer_seq = &source[layer_idx];
-                            per_layer_chunks[layer_idx].extend(layer_seq.chunks.iter().cloned());
-                            per_layer_token_count[layer_idx] += layer_seq.token_count;
-                        }
+                        run.push(source);
                         // The one thing borrowing the chunks does not bring
                         // along. Pushed in prefix order, so the pages sit at
                         // the positions their K/V does.
@@ -429,35 +436,7 @@ impl Scheduler {
                         );
                     }
                 }
-                let total_tokens = per_layer_token_count.first().copied().unwrap_or(0);
-                if total_tokens > 0 {
-                    let per_layer_sealed: Vec<candle_nn::kv_cache::SealedSequence> =
-                        per_layer_chunks
-                            .into_iter()
-                            .zip(per_layer_token_count)
-                            .map(|(chunks, toks)| candle_nn::kv_cache::SealedSequence {
-                                chunks,
-                                token_count: toks,
-                                chunk_size,
-                                location: candle_nn::kv_cache::ArenaLocation::Gpu,
-                            })
-                            .collect();
-                    let injected = self
-                        .session
-                        .inject_sealed_at_tail(sequence_id.0, &per_layer_sealed)
-                        .map_err(ConversationError::Model)?;
-                    // Every section was reconciled before it was joined, so
-                    // the whole can only disagree if the join itself did.
-                    if injected.was_cut() {
-                        return Err(ConversationError::Other(format!(
-                            "prepare_section_ingest: the joined prefix of {} section(s) was \
-                             cut by {} chunk(s) although each section's layers agreed — the \
-                             join misaligned them",
-                            prefix_section_ids.len(),
-                            injected.cut_chunks
-                        )));
-                    }
-                }
+                self.inject_prefix_run(sequence_id, &mut run)?;
             }
         }
 

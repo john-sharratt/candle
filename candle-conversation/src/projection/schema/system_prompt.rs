@@ -499,6 +499,10 @@ pub struct SectionCollection {
     /// member at runtime (`Builder::set_collection_member_mandatory`), e.g. from
     /// a tool definition's `mandatory: true`.
     pub mandatory: Vec<SectionId>,
+    /// The positions the collection always takes, its members at the top of
+    /// them and a hole ahead (`docs/placed_section_layout.md` §3.1). A
+    /// collection with none takes exactly what its members do.
+    pub range: Option<ReservedRange>,
 }
 
 impl Default for SectionCollection {
@@ -516,6 +520,7 @@ impl Default for SectionCollection {
             default: None,
             budget_adaptive: None,
             mandatory: Vec::new(),
+            range: None,
         }
     }
 }

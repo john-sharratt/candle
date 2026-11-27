@@ -11,6 +11,7 @@
 //!
 //! - `group`: a group's gates, budget and draw rules.
 //! - `layer`: a cognitive layer, its window, rank and decode priority.
+//! - `reserved_range`: a placed section's fixed range of positions.
 //! - `selection`: the rule that picks a group's surviving turns.
 //! - `summary`: the compression prompts for the summary tree.
 //! - `system_prompt`: the shared prompt, its collections and selector trees.
@@ -113,6 +114,7 @@ impl Schema {
 
 mod group;
 mod layer;
+mod reserved_range;
 mod selection;
 mod summary;
 mod system_prompt;
@@ -121,6 +123,7 @@ mod tests_group;
 
 pub use group::*;
 pub use layer::*;
+pub use reserved_range::*;
 pub use selection::*;
 pub use summary::*;
 pub use system_prompt::*;

@@ -37,9 +37,9 @@ use super::pins::{within_budget, Pin};
 use super::prompt_tokens::segment_tokens;
 use super::reconcile::{flexbox_distribute, FlexItem};
 use super::schema::{
-    GroupSchema, LayerSchema, Schema, ScoreFormula, SectionCollection, SectionSchema,
-    SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, WorkingSetShare,
-    LINEAGE_BASE,
+    GroupSchema, LayerSchema, RangeFill, ReservedRange, Schema, ScoreFormula, SectionCollection,
+    SectionSchema, SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection,
+    WorkingSetShare, LINEAGE_BASE,
 };
 use super::selection::LINEAGE_RANK_STEP;
 use super::selection::{apply_selection, trim_to_budget_low_score_first};

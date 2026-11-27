@@ -197,7 +197,26 @@ impl ContentChain {
             section_hash,
         }
     }
+
+    /// Append a hole of `positions` empty positions: what comes after is read
+    /// that much further on, so its K/V — and so its address — depends on it
+    /// (`docs/placed_section_layout.md` §3.1b). A hole of none leaves the chain
+    /// as it was.
+    pub fn push_hole(&mut self, positions: usize) {
+        if positions == 0 {
+            return;
+        }
+        let mut h = ContentHasher::new();
+        h.update(&self.prev.to_bytes());
+        h.update(HOLE_TAG);
+        h.update(&(positions as u64).to_le_bytes());
+        self.prev = h.finish();
+    }
 }
+
+/// What a hole hashes as ahead of its size, so no section's tokens can hash
+/// as one.
+const HOLE_TAG: &[u8] = b"\xffhole";
 
 /// Derive the [`StreamId`] of a content-addressed prompt-section stream.
 ///
@@ -318,6 +337,31 @@ pub fn section_end_state_stream_id(section: StreamId) -> StreamId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A hole hashes as exactly these bytes**: the chain so far, the hole's
+    /// tag, its size little-endian. A hole of none is no hole.
+    #[test]
+    fn a_hole_hashes_the_documented_bytes() {
+        let mut chain = ContentChain::new();
+        chain.push_section(&[1, 2, 3]);
+        let before = chain.prefix();
+        chain.push_hole(100);
+        let mut raw: Vec<u8> = Vec::new();
+        raw.extend_from_slice(&before.to_bytes());
+        raw.extend_from_slice(b"\xffhole");
+        raw.extend_from_slice(&100u64.to_le_bytes());
+        assert_eq!(chain.prefix(), hash_bytes(&raw));
+
+        let mut none = ContentChain::new();
+        none.push_section(&[1, 2, 3]);
+        none.push_hole(0);
+        assert_eq!(none.prefix(), before, "a hole of none changes nothing");
+
+        let mut other = ContentChain::new();
+        other.push_section(&[1, 2, 3]);
+        other.push_hole(99);
+        assert_ne!(other.prefix(), chain.prefix(), "the size is in the address");
+    }
 
     /// **A boundary-sealed member is addressed apart from a member** over the
     /// same chain: the hash of its own domain, then the chain.

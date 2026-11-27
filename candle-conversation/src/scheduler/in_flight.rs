@@ -400,7 +400,8 @@ pub(super) fn resolve_seal_range(
 pub(in super::super) struct QueuedSection {
     pub(in super::super) sequence_id: SequenceId,
     pub(in super::super) section_id: SectionId,
-    pub(in super::super) prefix_section_ids: Vec<SectionId>,
+    /// See [`SchedulerRequest::IngestSection::prefix`].
+    pub(in super::super) prefix: Vec<PrefixItem>,
     pub(in super::super) tokens: TokenBuffer,
     pub(in super::super) address: ContentAddress,
     pub(in super::super) debug_name: String,

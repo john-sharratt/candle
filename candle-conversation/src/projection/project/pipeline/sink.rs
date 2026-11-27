@@ -782,8 +782,10 @@ pub fn run_with_sink<R: ContentResolver>(
         let splice = files_splice(schema, resolver, kind_cap, seeded);
         let at = files_at.insert_at(&system_prompt_segments);
         if let (Some(at), false) = (at, splice.segments.is_empty()) {
-            files_tokens = segment_tokens(&splice.segments, resolver);
-            system_prompt_segments.splice(at..at, splice.segments);
+            let tokens = segment_tokens(&splice.segments, resolver);
+            // What the files add to the prompt: none in their range, whose
+            // full size the prompt already counts.
+            files_tokens = place_files(&mut system_prompt_segments, at, splice.segments, tokens);
             files_placed = splice.placed;
         }
     }

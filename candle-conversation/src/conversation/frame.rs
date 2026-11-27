@@ -21,8 +21,8 @@
 use std::sync::Arc;
 
 use crate::projection::{
-    LayerId, ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedTurn, SealedKind,
-    SectionId, TimelineId, TurnId, TurnIndex, TurnKey,
+    LayerId, PrefixItem, ProjectionSegment, ProjectionTarget, ResolvedSection, ResolvedTurn,
+    SealedKind, TimelineId, TurnId, TurnIndex, TurnKey,
 };
 use crate::substrate::Substrate;
 use crate::Role;
@@ -30,8 +30,9 @@ use crate::Role;
 /// The sections and turns a first turn lays onto an empty slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Frame {
-    /// The system prompt's fixed sections, each tree at its default branch.
-    pub sections: Arc<Vec<SectionId>>,
+    /// The system prompt's fixed sections, each tree at its default branch,
+    /// and its reserved ranges as holes.
+    pub sections: Arc<Vec<PrefixItem>>,
     /// Every turn of the conversation's lineage that carries K/V, oldest first,
     /// the conversation's own last.
     pub lineage: Vec<ResolvedTurn>,
@@ -53,7 +54,7 @@ impl Frame {
     /// chain's cap (`Sequence::frame_window`).
     pub(crate) fn of(
         substrate: &Substrate,
-        sections: Arc<Vec<SectionId>>,
+        sections: Arc<Vec<PrefixItem>>,
         target: ProjectionTarget,
         window: Option<&[TurnKey]>,
     ) -> Self {
@@ -101,11 +102,17 @@ impl Frame {
         }
     }
 
-    /// The frame as segments: each section, then each turn, sealed, in order.
+    /// The frame as segments: each section sealed and each range a hole, then
+    /// each turn, sealed, in order.
     pub(crate) fn segments(&self) -> Vec<ProjectionSegment> {
         self.sections
             .iter()
-            .map(|&id| ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(id))))
+            .map(|&item| match item {
+                PrefixItem::Section(id) => {
+                    ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(id)))
+                }
+                PrefixItem::Hole(positions) => ProjectionSegment::Hole { positions },
+            })
             .chain(
                 self.lineage
                     .iter()
@@ -150,7 +157,7 @@ pub(crate) fn lineage_turns(
 mod tests {
     use super::*;
 
-    use crate::projection::GroupId;
+    use crate::projection::{GroupId, SectionId};
 
     fn tl(n: u64) -> TimelineId {
         TimelineId::from_raw(n).unwrap()
@@ -205,15 +212,25 @@ mod tests {
         let layer = LayerId::from_raw(2).unwrap();
         let group = GroupId::from_raw(5).unwrap();
         let frame = Frame {
-            sections: Arc::new(vec![SectionId::new(7), SectionId::new(2)]),
+            sections: Arc::new(vec![
+                PrefixItem::Section(SectionId::new(7)),
+                PrefixItem::Hole(64),
+                PrefixItem::Section(SectionId::new(2)),
+            ]),
             lineage: vec![turn(layer, group, 10, 0), turn(layer, group, 10, 1)],
         };
-        let sealed: Vec<SealedKind> = frame
-            .segments()
+        let segments = frame.segments();
+        assert_eq!(segments.len(), 5);
+        assert!(matches!(
+            &segments[1],
+            ProjectionSegment::Hole { positions: 64 }
+        ));
+        let sealed: Vec<SealedKind> = segments
             .into_iter()
-            .map(|s| match s {
-                ProjectionSegment::Sealed(kind) => kind,
-                other => panic!("a frame segment is sealed, got {other:?}"),
+            .filter_map(|s| match s {
+                ProjectionSegment::Sealed(kind) => Some(kind),
+                ProjectionSegment::Hole { .. } => None,
+                other => panic!("a frame segment is sealed or a hole, got {other:?}"),
             })
             .collect();
         assert_eq!(
@@ -238,7 +255,7 @@ mod tests {
     #[test]
     fn no_lineage_frames_the_sections_alone() {
         let frame = Frame {
-            sections: Arc::new(vec![SectionId::new(4)]),
+            sections: Arc::new(vec![PrefixItem::Section(SectionId::new(4))]),
             lineage: Vec::new(),
         };
         assert_eq!(frame.segments().len(), 1);

@@ -24,7 +24,9 @@ use crate::persistence::content_hash::{
     boundary_member_prefix, hash_tokens, section_stream_id, shared_section_prefix,
 };
 use crate::persistence::streams::{ContentAddress, StreamId};
-use crate::projection::{prefix_before_collection, DecodePriority, SectionId};
+use crate::projection::{
+    prefix_before_collection, sections_prefix, DecodePriority, PrefixItem, SectionId,
+};
 use crate::scheduler::exported_state::SharedState;
 use crate::scheduler::SchedulerRequest;
 use crate::token_buffer::TokenBuffer;
@@ -62,16 +64,53 @@ pub struct SealedMember {
     pub restored: bool,
 }
 
-/// The sections of `before` — everything the schema declares ahead of a
-/// collection — that the birth prefix holds, in `before`'s order: collection
-/// members, `depends_on` sections and empty ones left out, as the birth prefix
-/// leaves them out.
-fn in_birth_prefix(before: Vec<SectionId>, birth: &[SectionId]) -> Vec<SectionId> {
-    let birth: HashSet<SectionId> = birth.iter().copied().collect();
-    before.into_iter().filter(|s| birth.contains(s)).collect()
+/// What of `before` — everything the schema declares ahead of a collection —
+/// the birth prefix holds, in `before`'s order: collection members,
+/// `depends_on` sections and empty ones left out, as the birth prefix leaves
+/// them out, and every earlier range's hole kept.
+fn in_birth_prefix(before: Vec<PrefixItem>, birth: &[PrefixItem]) -> Vec<PrefixItem> {
+    let birth: HashSet<SectionId> = birth.iter().filter_map(|i| i.section()).collect();
+    before
+        .into_iter()
+        .filter(|item| item.section().is_none_or(|s| birth.contains(&s)))
+        .collect()
+}
+
+/// What a collection's members are sealed behind, and its reserved range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembersPrefix {
+    /// The prompt before the collection, holes of earlier ranges included.
+    pub prefix: Vec<PrefixItem>,
+    /// The collection's range in positions, when it has one: a run of
+    /// members is sealed at its top.
+    pub range: Option<usize>,
+}
+
+impl MembersPrefix {
+    /// What a member is sealed behind when its run's members up to and
+    /// including it take `through` positions and `earlier` of them precede
+    /// it: the prompt, the part of the range above the run left empty, then
+    /// the earlier members.
+    fn behind(&self, through: usize, earlier: &[SectionId]) -> Vec<PrefixItem> {
+        let mut out = self.prefix.clone();
+        if let Some(range) = self.range {
+            let hole = range.saturating_sub(through);
+            if hole > 0 {
+                out.push(PrefixItem::Hole(hole));
+            }
+        }
+        out.extend(earlier.iter().copied().map(PrefixItem::Section));
+        out
+    }
 }
 
 impl Sequence {
+    /// The trained window of the engine this conversation runs on, which picks
+    /// each reserved range's size; `None` before an engine reports one.
+    pub fn native_context(&self) -> Option<usize> {
+        self.substrate.read().trained_window()
+    }
+
     /// The token ids `text` encodes to, as a member's seal encodes it: what a
     /// chunk cut checks its seams against (`files::cut_lines`).
     pub fn member_token_ids(&self, text: &str) -> crate::Result<Vec<u32>> {
@@ -83,21 +122,32 @@ impl Sequence {
             .to_vec())
     }
 
-    /// The sections a member of `collection` is sealed behind: the birth
-    /// prefix's sections before the collection, in order.
-    pub fn members_prefix(&self, collection: &str) -> crate::Result<Vec<SectionId>> {
+    /// What a member of `collection` is sealed behind: the birth prefix
+    /// before the collection, in order — up to its range's hole when it has a
+    /// range, holes of the ranges before it included — and the range.
+    pub fn members_prefix(&self, collection: &str) -> crate::Result<MembersPrefix> {
         let base = &self.base_projection;
         let id = base.id_for_system_collection(collection).ok_or_else(|| {
             ConversationError::Other(format!("the schema has no collection {collection:?}"))
         })?;
-        let before =
-            prefix_before_collection(&base.schema().system_prompt.items, id).ok_or_else(|| {
+        if let Some(range) = self.birth_ranges.iter().find(|r| r.collection == id) {
+            return Ok(MembersPrefix {
+                prefix: range.member_prefix(&self.birth_prefix, range.positions),
+                range: range.sealed_at_top(),
+            });
+        }
+        let native = self.substrate.read().trained_window();
+        let before = prefix_before_collection(&base.schema().system_prompt.items, id, native)
+            .ok_or_else(|| {
                 ConversationError::Other(format!(
                     "collection {collection:?} is inside a section tree; its members are \
                      sealed behind the prompt before it, which a tree branches"
                 ))
             })?;
-        Ok(in_birth_prefix(before, &self.birth_prefix))
+        Ok(MembersPrefix {
+            prefix: in_birth_prefix(before, &self.birth_prefix),
+            range: None,
+        })
     }
 
     /// Seal `chain` as members of `collection`, in order, each behind the
@@ -116,9 +166,13 @@ impl Sequence {
     /// [`Self::seal_members`] behind a prefix the caller names — the sections a
     /// prompt actually places ahead of a file, where the birth prefix leaves
     /// some of them out.
+    ///
+    /// With a range, the chain is sealed at the range's top: each member
+    /// behind the part of the range above the chain through it left empty, so
+    /// the chain ends at the top (`docs/placed_section_layout.md` §3.1b).
     pub fn seal_members_behind(
         &self,
-        prefix: &[SectionId],
+        prefix: &MembersPrefix,
         chain: &[MemberSpec],
         kind: SealAs,
     ) -> crate::Result<Vec<SealedMember>> {
@@ -140,7 +194,7 @@ impl Sequence {
     /// prefill ended on.
     fn seal_member(
         &self,
-        prefix: &[SectionId],
+        prefix: &MembersPrefix,
         before: &[SealedMember],
         spec: &MemberSpec,
         handed: Option<SharedState>,
@@ -158,8 +212,8 @@ impl Sequence {
             )));
         }
         let earlier: Vec<SectionId> = before.iter().map(|m| m.section).collect();
-        let mut sealed_after = prefix.to_vec();
-        sealed_after.extend(&earlier);
+        let through = before.iter().map(|m| m.tokens).sum::<usize>() + tokens.len();
+        let sealed_after = prefix.behind(through, &earlier);
         let chain = chain_of(&self.substrate, &sealed_after).0;
         let address = ContentAddress {
             prefix_hash: match kind {
@@ -221,8 +275,19 @@ impl Sequence {
         let start = match handed {
             Some(state) => Some(state),
             None => {
-                let at_collection = state_after(&self.scheduler_tx, &self.substrate, prefix)?;
-                continue_state(&self.scheduler_tx, &self.substrate, at_collection, &earlier)?
+                // The state behind the prompt and the empty part of the range,
+                // then run on over the earlier members.
+                let at_collection = state_after(
+                    &self.scheduler_tx,
+                    &self.substrate,
+                    &prefix.behind(through, &[]),
+                )?;
+                continue_state(
+                    &self.scheduler_tx,
+                    &self.substrate,
+                    at_collection,
+                    &sections_prefix(&earlier),
+                )?
             }
         };
         let slot = alloc_scratch_slot_on(&self.scheduler_tx, &self.substrate)?;
@@ -232,7 +297,7 @@ impl Sequence {
             .send(SchedulerRequest::IngestSection {
                 sequence_id: slot,
                 section_id: section,
-                prefix_section_ids: sealed_after,
+                prefix: sealed_after,
                 tokens,
                 address,
                 debug_name: member_stream_name(&spec.name),
@@ -266,8 +331,41 @@ mod tests {
     /// prefix holds after it (8, 9) are never in `before`.
     #[test]
     fn a_member_is_sealed_behind_the_birth_prefix_before_its_collection() {
-        let before = ids(&[1, 2, 5, 6, 7]);
-        let birth = ids(&[1, 2, 7, 8, 9]);
-        assert_eq!(in_birth_prefix(before, &birth), ids(&[1, 2, 7]));
+        let mut before = sections_prefix(&ids(&[1, 2, 5]));
+        before.push(PrefixItem::Hole(64));
+        before.extend(sections_prefix(&ids(&[6, 7])));
+        let birth = sections_prefix(&ids(&[1, 2, 7, 8, 9]));
+        let mut want = sections_prefix(&ids(&[1, 2]));
+        want.push(PrefixItem::Hole(64));
+        want.extend(sections_prefix(&ids(&[7])));
+        assert_eq!(in_birth_prefix(before, &birth), want);
+    }
+
+    /// **A chain in a range ends at its top**: each member behind the prompt,
+    /// the part of the range above the chain through it, and its earlier
+    /// members.
+    #[test]
+    fn a_chain_in_a_range_ends_at_its_top() {
+        let prompt = sections_prefix(&ids(&[1, 2]));
+        let ranged = MembersPrefix {
+            prefix: prompt.clone(),
+            range: Some(1_000),
+        };
+        let mut want = prompt.clone();
+        want.push(PrefixItem::Hole(600));
+        want.extend(sections_prefix(&ids(&[10, 11])));
+        assert_eq!(ranged.behind(400, &ids(&[10, 11])), want);
+        // A chain past the range leaves no hole.
+        let mut full = prompt.clone();
+        full.extend(sections_prefix(&ids(&[10])));
+        assert_eq!(ranged.behind(1_200, &ids(&[10])), full);
+        // Without a range, the prompt and the earlier members alone.
+        let plain = MembersPrefix {
+            prefix: prompt.clone(),
+            range: None,
+        };
+        let mut bare = prompt;
+        bare.extend(sections_prefix(&ids(&[10])));
+        assert_eq!(plain.behind(400, &ids(&[10])), bare);
     }
 }

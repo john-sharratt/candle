@@ -777,7 +777,7 @@ impl Scheduler {
             SchedulerRequest::IngestSection {
                 sequence_id,
                 section_id,
-                prefix_section_ids,
+                prefix,
                 tokens,
                 address,
                 debug_name,
@@ -789,7 +789,7 @@ impl Scheduler {
                 let section = QueuedSection {
                     sequence_id,
                     section_id,
-                    prefix_section_ids,
+                    prefix,
                     tokens,
                     address,
                     debug_name,
@@ -913,10 +913,10 @@ impl Scheduler {
 
             SchedulerRequest::BranchCheckpointPass {
                 start,
-                tokens,
+                runs,
                 response_tx,
             } => {
-                let result = self.handle_branch_checkpoint_pass(start.as_ref(), &tokens);
+                let result = self.handle_branch_checkpoint_pass(start.as_ref(), &runs);
                 let _ = response_tx.send(result);
                 true
             }

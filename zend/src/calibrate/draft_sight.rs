@@ -40,6 +40,7 @@ mod tests {
             score: 0.0,
             qualified: false,
             token_count: tokens,
+            positions: tokens,
             token_ids: Vec::new(),
             text: String::new(),
         }

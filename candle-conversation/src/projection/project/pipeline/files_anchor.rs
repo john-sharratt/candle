@@ -72,6 +72,34 @@ impl FilesPosition {
     }
 }
 
+/// Put `files`, taking `tokens` positions, into `segments` at `at`. A
+/// collection with a reserved range emitted its range there as one hole
+/// (`emit_in_range`, filled from the top): the files go after it, at the
+/// range's top, and the hole gives up the positions they take
+/// (`docs/placed_section_layout.md` §3.1). With no hole there, the files are
+/// inserted at `at` as they are.
+///
+/// Returns the positions the files add to the prompt: none in a range, whose
+/// full size the prompt already counts, and their tokens outside one.
+pub(crate) fn place_files(
+    segments: &mut Vec<ProjectionSegment>,
+    at: usize,
+    files: Vec<ProjectionSegment>,
+    tokens: usize,
+) -> usize {
+    match segments.get_mut(at) {
+        Some(ProjectionSegment::Hole { positions }) => {
+            *positions = positions.saturating_sub(tokens);
+            segments.splice(at + 1..at + 1, files);
+            0
+        }
+        _ => {
+            segments.splice(at..at, files);
+            tokens
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +188,42 @@ layers:
             segment(section_id(&b, "close")),
         ];
         assert_eq!(at.insert_at(&segments), Some(1));
+    }
+
+    /// **Files go after their range's hole, at its top, and the hole gives up
+    /// what they take**; with no hole they go in where asked.
+    #[test]
+    fn files_go_to_the_top_of_their_range() {
+        let b = builder(&[OPEN, FILES, CLOSE]);
+        let open = segment(section_id(&b, "files_open"));
+        let close = segment(section_id(&b, "close"));
+        let file = segment(SectionId::new(900));
+        let mut segments = vec![
+            open.clone(),
+            ProjectionSegment::Hole { positions: 1_000 },
+            close.clone(),
+        ];
+        assert_eq!(
+            place_files(&mut segments, 1, vec![file.clone()], 300),
+            0,
+            "in its range the files add no positions"
+        );
+        assert!(matches!(
+            segments.as_slice(),
+            [
+                ProjectionSegment::Sealed(_),
+                ProjectionSegment::Hole { positions: 700 },
+                ProjectionSegment::Sealed(SealedKind::Section(f)),
+                ProjectionSegment::Sealed(_),
+            ] if f.id == SectionId::new(900)
+        ));
+        let mut plain = vec![open, close];
+        assert_eq!(place_files(&mut plain, 1, vec![file], 300), 300);
+        assert!(matches!(
+            plain.as_slice(),
+            [_, ProjectionSegment::Sealed(SealedKind::Section(f)), _]
+                if f.id == SectionId::new(900)
+        ));
     }
 
     /// **A schema without the collection places no files.**

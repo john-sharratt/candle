@@ -8,7 +8,7 @@
 //! first turn pays the lift of what it lays down and no projection.
 
 use crate::conversation::Frame;
-use crate::projection::{ProjectionSegment, SectionId, TurnKey};
+use crate::projection::{prefix_sections, ProjectionSegment, SectionId, TurnKey};
 
 /// Whether a submit lays its frame down in place of projecting: an
 /// append-only conversation (`disable_reprojection`) whose slot is still
@@ -18,11 +18,16 @@ pub(super) fn frames(disable_reprojection: bool, slot_holds_blocks: bool) -> boo
 }
 
 /// The sections and turns to lift and the segments to inject for `frame`, in
-/// frame order: every section, then every turn of its lineage, sealed.
+/// frame order: every section sealed and every range a hole, then every turn
+/// of its lineage, sealed.
 pub(super) fn framed_segments(
     frame: &Frame,
 ) -> (Vec<SectionId>, Vec<ProjectionSegment>, Vec<TurnKey>) {
-    (frame.sections.to_vec(), frame.segments(), frame.turn_keys())
+    (
+        prefix_sections(&frame.sections),
+        frame.segments(),
+        frame.turn_keys(),
+    )
 }
 
 #[cfg(test)]
@@ -31,7 +36,7 @@ mod tests {
 
     use super::*;
     use crate::projection::{
-        GroupId, LayerId, ResolvedTurn, SealedKind, TimelineId, TurnId, TurnIndex,
+        GroupId, LayerId, PrefixItem, ResolvedTurn, SealedKind, TimelineId, TurnId, TurnIndex,
     };
 
     /// **A frame is laid down whole**: its sections to lift and inject, then
@@ -48,15 +53,27 @@ mod tests {
             timeline: Some(timeline),
         };
         let frame = Frame {
-            sections: Arc::new(vec![SectionId::new(7), SectionId::new(2)]),
+            sections: Arc::new(vec![
+                PrefixItem::Section(SectionId::new(7)),
+                PrefixItem::Hole(32),
+                PrefixItem::Section(SectionId::new(2)),
+            ]),
             lineage: vec![reading],
         };
         let (sections, segments, turns) = framed_segments(&frame);
-        assert_eq!(sections, vec![SectionId::new(7), SectionId::new(2)]);
+        assert_eq!(
+            sections,
+            vec![SectionId::new(7), SectionId::new(2)],
+            "a hole has nothing to lift"
+        );
         assert_eq!(turns, vec![TurnKey::new(timeline, TurnIndex(1))]);
-        assert_eq!(segments.len(), 3);
+        assert_eq!(segments.len(), 4);
         assert!(matches!(
-            &segments[2],
+            &segments[1],
+            ProjectionSegment::Hole { positions: 32 }
+        ));
+        assert!(matches!(
+            &segments[3],
             ProjectionSegment::Sealed(SealedKind::Turn(t, _)) if *t == reading
         ));
     }

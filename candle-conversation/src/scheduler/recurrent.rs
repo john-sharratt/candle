@@ -265,16 +265,20 @@ impl Scheduler {
     ///
     /// With `start`, the stream continues from that state: it is staged on the
     /// slot before the first token, so what comes back is the state after the
-    /// prefix `start` describes and then `tokens`.
+    /// prefix `start` describes and then `runs`.
+    ///
+    /// Each run goes in after the hole ahead of it, left on the K/V and the
+    /// index alike, so every token is read at the position the prompt puts it
+    /// at and the state is the one the prompt leaves.
     pub(super) fn handle_branch_checkpoint_pass(
         &mut self,
         start: Option<&SharedState>,
-        tokens: &[u32],
+        runs: &[TokenRun],
     ) -> Result<Option<ExportedState>, ConversationError> {
         if !self.model.carries_recurrent_state() {
             return Ok(None);
         }
-        if tokens.is_empty() {
+        if runs_are_empty(runs) {
             return Ok(None);
         }
         let seq = self
@@ -286,11 +290,29 @@ impl Scheduler {
             None => Ok(()),
         };
         let result = staged
-            .and_then(|()| self.prefill_tokens_on(seq, tokens, &[]))
+            .and_then(|()| self.prefill_runs_on(seq, runs))
             .and_then(|()| self.export_state_of(seq));
         let _ = self.model.release_sequence(seq);
         let _ = self.session.free_sequence(seq);
         result
+    }
+
+    /// Run `runs` through the model on `seq`, each after the hole ahead of it.
+    fn prefill_runs_on(&mut self, seq: usize, runs: &[TokenRun]) -> Result<(), ConversationError> {
+        for run in runs {
+            if run.hole > 0 {
+                self.session
+                    .push_sequence_position_gap(seq, run.hole)
+                    .map_err(ConversationError::Model)?;
+                self.model
+                    .push_positional_gap(seq, run.hole)
+                    .map_err(ConversationError::Model)?;
+            }
+            if !run.tokens.is_empty() {
+                self.prefill_tokens_on(seq, &run.tokens, &[])?;
+            }
+        }
+        Ok(())
     }
 
     /// Stage `state` on `seq`, for the slot to take as its own the first time

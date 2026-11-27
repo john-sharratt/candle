@@ -32,6 +32,9 @@ pub enum PieceKind {
     Glue,
     /// The user message of the turn being submitted.
     UserMessage,
+    /// Positions left empty: no token, no K/V (`docs/placed_section_layout.md`
+    /// §3.1). Its size is the piece's [`PromptPiece::positions`].
+    Hole,
 }
 
 /// One piece of the prompt, in injection order.
@@ -54,6 +57,8 @@ pub struct PromptPiece {
     /// filled in to a budget.
     pub qualified: bool,
     pub token_count: usize,
+    /// The positions the piece takes: its tokens, or a hole's size.
+    pub positions: usize,
     #[serde(skip)]
     pub token_ids: Vec<u32>,
     pub text: String,
@@ -116,13 +121,16 @@ pub(crate) fn lay_out(
                 tokens.as_ref().clone(),
                 source,
             ),
-            // Positions with no token: named, and nothing in the text.
-            ProjectionSegment::Hole { positions } => piece_of(
-                PieceKind::Glue,
-                format!("hole of {positions} positions"),
-                Vec::new(),
-                source,
-            ),
+            // Positions with no token: sized, and nothing in the text.
+            ProjectionSegment::Hole { positions } => PromptPiece {
+                positions: *positions,
+                ..piece_of(
+                    PieceKind::Hole,
+                    format!("hole of {positions} positions"),
+                    Vec::new(),
+                    source,
+                )
+            },
         };
         pieces.push(piece);
     }
@@ -154,6 +162,7 @@ fn piece_of(
         score: 0.0,
         qualified: false,
         token_count: token_ids.len(),
+        positions: token_ids.len(),
         text: (source.decode)(&token_ids),
         token_ids,
     }

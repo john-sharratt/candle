@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use candle_conversation::files::names::{chunk_name, heading_name};
-use candle_conversation::files::{files_owner, FileRecord, FilesPin};
+use candle_conversation::files::{files_owner, FileKey, FileRecord, FilesPin};
 use candle_conversation::projection::Conversation;
 use candle_conversation::projection::{
     DecodePriority, OptionalState, ReprojectionMode, SelectionState, TurnIndex, SEED_SELECTOR,
@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 
 use super::builders::turn_projection;
 use super::sealed_fresh_layout::{compare, piece_chunks, LayoutComparison};
-use super::sealed_fresh_reseal::{prefix_before, reseal_behind};
+use super::sealed_fresh_reseal::{prefix_before, reseal_behind, DumpedPiece};
 use super::ZendSession;
 use crate::files::records;
 use crate::journal::opening::SeedRead;
@@ -132,6 +132,31 @@ pub struct SealedFreshReq {
     /// prompt up to `files_open`, as the file is, none behind another.
     #[serde(default)]
     pub seed_as_files: bool,
+    /// Place the file after the other files (`after_tokens`), nearest the
+    /// question, rather than before them (`docs/placed_section_layout.md` §7
+    /// stage 0: whether position alone moves the answer).
+    #[serde(default)]
+    pub needle_last: bool,
+}
+
+/// The order the knowledge base is pinned in: the seed's files, then the
+/// needle and the files placed after it — or, `needle_last`, those files and
+/// then the needle.
+pub fn pin_order(
+    seed: &[FileKey],
+    needle: FileKey,
+    others: &[FileKey],
+    needle_last: bool,
+) -> Vec<FileKey> {
+    let mut keys = seed.to_vec();
+    if needle_last {
+        keys.extend_from_slice(others);
+        keys.push(needle);
+    } else {
+        keys.push(needle);
+        keys.extend_from_slice(others);
+    }
+    keys
 }
 
 /// The seed's files in the seed's order: each repository's root listing,
@@ -456,11 +481,15 @@ impl ZendSession {
             Some(r) => files_after(&engine.conversation(), r, &seed_paths, req.after_tokens),
             None => Vec::new(),
         };
+        let seed_keys: Vec<FileKey> = seed_files.iter().map(FileRecord::key).collect();
+        let after_keys: Vec<FileKey> = after.iter().map(FileRecord::key).collect();
         let pin_of = |needle: &FileRecord| {
-            let mut keys: Vec<_> = seed_files.iter().map(FileRecord::key).collect();
-            keys.push(needle.key());
-            keys.extend(after.iter().map(FileRecord::key));
-            FilesPin::Only(keys)
+            FilesPin::Only(pin_order(
+                &seed_keys,
+                needle.key(),
+                &after_keys,
+                req.needle_last,
+            ))
         };
         let pin = record.as_ref().map_or(FilesPin::Empty, pin_of);
         // The placed file's member sections in this process: what the prompt
@@ -496,10 +525,14 @@ impl ZendSession {
                     .read()
                     .owned_section_named(files_owner(), &heading_name(&record.path, &record.blob))
                     .context("the file's heading is not held here")?;
-                let pieces: Vec<(Option<u32>, usize)> = dump
+                let pieces: Vec<DumpedPiece> = dump
                     .pieces
                     .iter()
-                    .map(|p| (p.section_id, p.token_ids.len()))
+                    .map(|p| match (p.kind, p.section_id) {
+                        (PieceKind::Hole, _) => DumpedPiece::Hole(p.positions),
+                        (_, Some(id)) => DumpedPiece::Section(id),
+                        (_, None) => DumpedPiece::Other,
+                    })
                     .collect();
                 let prefix = prefix_before(&pieces, heading.raw())?;
                 let decode = |ids: &[u32]| {
@@ -699,6 +732,7 @@ mod tests {
             score: 0.0,
             qualified: false,
             token_count: token_ids.len(),
+            positions: token_ids.len(),
             token_ids,
             text: String::new(),
         }
@@ -828,6 +862,15 @@ mod tests {
             selection(true).optional(SEED_SELECTOR),
             Some(OptionalState::Absent)
         );
+    }
+
+    /// **The needle sits before the files after it, or — last — after them**,
+    /// the seed's files ahead either way.
+    #[test]
+    fn the_needle_is_pinned_first_or_last() {
+        let (s, n, a, b) = (FileKey(1), FileKey(9), FileKey(2), FileKey(3));
+        assert_eq!(pin_order(&[s], n, &[a, b], false), vec![s, n, a, b]);
+        assert_eq!(pin_order(&[s], n, &[a, b], true), vec![s, a, b, n]);
     }
 
     /// **The seed's files read in the seed's order**: each repository's

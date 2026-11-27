@@ -83,6 +83,52 @@ pub(super) mod projection_schema_tests {
         assert!(!body.contains("the reading done before this"));
     }
 
+    /// **The placed sections take their reserved ranges**
+    /// (`docs/placed_section_layout.md` §3.7b): the journal 8K (2K below a
+    /// 128K native context) from the bottom, the tools 8K and the knowledge
+    /// base 96K from the top.
+    #[test]
+    fn embedded_schema_reserves_the_placed_sections_ranges() {
+        use candle_conversation::projection::{RangeFill, ReservedRange, SystemPromptItem};
+        let builder = build_projection_builder(Path::new("demo-project"));
+        let range = |name: &str| {
+            builder
+                .schema()
+                .system_prompt
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    SystemPromptItem::Collection(c) if c.name == name => Some(c.range),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("collection {name} present"))
+        };
+        assert_eq!(
+            range("journal"),
+            Some(ReservedRange {
+                tokens: 8_192,
+                small_context: 2_048,
+                fill: RangeFill::Bottom,
+            })
+        );
+        assert_eq!(
+            range("tools"),
+            Some(ReservedRange {
+                tokens: 8_192,
+                small_context: 8_192,
+                fill: RangeFill::Top,
+            })
+        );
+        assert_eq!(
+            range("files"),
+            Some(ReservedRange {
+                tokens: 98_304,
+                small_context: 98_304,
+                fill: RangeFill::Top,
+            })
+        );
+    }
+
     /// The embedded schema carries the working set (`docs/zend_working_set.md`)
     /// onto the right nodes: `repo_map/structure` and `code_reading/scopes`
     /// fill from the dialogue's working set, in tool rounds too, with the

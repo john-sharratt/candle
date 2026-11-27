@@ -36,6 +36,60 @@ pub(super) mod tests {
 
     use super::super::tests_forks::tests::fork_log_scheduler;
 
+    impl Scheduler {
+        /// The checkpoint pass over one run of `tokens`, with no hole.
+        fn checkpoint_pass(
+            &mut self,
+            start: Option<&SharedState>,
+            tokens: &[u32],
+        ) -> Result<Option<ExportedState>, ConversationError> {
+            let run = TokenRun {
+                hole: 0,
+                tokens: tokens.to_vec(),
+            };
+            self.handle_branch_checkpoint_pass(start, &[run])
+        }
+    }
+
+    /// **A hole before a run is left on the slot before the run is read**:
+    /// the pass's state over `[a] hole [b]` is what the model leaves having
+    /// read `a`, then `b` past the hole — the gap lands between the two in the
+    /// order they are pushed.
+    #[test]
+    fn a_hole_is_left_on_the_slot_between_its_runs() {
+        let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
+        let runs = [
+            TokenRun {
+                hole: 0,
+                tokens: vec![1, 2],
+            },
+            TokenRun {
+                hole: 100,
+                tokens: vec![3, 4],
+            },
+        ];
+        sched
+            .handle_branch_checkpoint_pass(None, &runs)
+            .expect("pass ran")
+            .expect("a model that carries state returns some");
+        let gaps: Vec<usize> = probe
+            .pushed
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .filter_map(|p| match p {
+                Pushed::Gap(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            gaps,
+            vec![100],
+            "the one hole reached the per-position state"
+        );
+    }
+
     /// **A branch checkpoint is staged on its slots, not restored into them.**
     /// Restored at install, every new conversation held a whole recurrent store
     /// before its turn was admitted, and a window of them took the span from
@@ -148,7 +202,7 @@ pub(super) mod tests {
     fn the_branch_checkpoint_pass_returns_state_the_tokens_produced() {
         let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
         let state = sched
-            .handle_branch_checkpoint_pass(None, &[1, 2, 3, 4])
+            .checkpoint_pass(None, &[1, 2, 3, 4])
             .expect("pass ran")
             .expect("a model that carries state returns some");
         assert_eq!(state.schedule_hash, DummyRecurrentModel::SCHEDULE_HASH);
@@ -172,9 +226,7 @@ pub(super) mod tests {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
         let before = probe.len();
         for _ in 0..4 {
-            sched
-                .handle_branch_checkpoint_pass(None, &[7, 7, 7])
-                .expect("pass ran");
+            sched.checkpoint_pass(None, &[7, 7, 7]).expect("pass ran");
         }
         assert_eq!(
             probe.len(),
@@ -194,7 +246,7 @@ pub(super) mod tests {
         let (mut sched, _tx) = make_test_scheduler();
         assert!(
             sched
-                .handle_branch_checkpoint_pass(None, &[1, 2, 3])
+                .checkpoint_pass(None, &[1, 2, 3])
                 .expect("pass ran")
                 .is_none(),
             "a model with no recurrent state must not run a prefill for a \
@@ -214,7 +266,7 @@ pub(super) mod tests {
 
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
         let state = sched
-            .handle_branch_checkpoint_pass(None, &[5, 6, 7, 8])
+            .checkpoint_pass(None, &[5, 6, 7, 8])
             .expect("pass ran")
             .expect("state");
         let computed = state.layers.clone();
@@ -262,7 +314,7 @@ pub(super) mod tests {
     fn a_branch_checkpoint_under_a_foreign_schedule_is_refused() {
         let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
         let state = sched
-            .handle_branch_checkpoint_pass(None, &[3, 1, 4])
+            .checkpoint_pass(None, &[3, 1, 4])
             .expect("pass ran")
             .expect("state");
         let slot = sched.session.create_sequence().expect("slot");
@@ -281,7 +333,7 @@ pub(super) mod tests {
     fn install_recurrent_state_request_installs_onto_the_named_slot() {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
         let state = sched
-            .handle_branch_checkpoint_pass(None, &[2, 4, 6])
+            .checkpoint_pass(None, &[2, 4, 6])
             .expect("pass ran")
             .expect("state");
         let slot = SequenceId(sched.session.create_sequence().expect("slot"));
@@ -310,11 +362,11 @@ pub(super) mod tests {
     fn a_pass_continued_from_a_state_runs_on_from_it() {
         let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
         let head = sched
-            .handle_branch_checkpoint_pass(None, &[1, 2, 3, 4])
+            .checkpoint_pass(None, &[1, 2, 3, 4])
             .expect("pass ran")
             .expect("state");
         let continued = sched
-            .handle_branch_checkpoint_pass(Some(&SharedState::from(&head)), &[5, 6, 7, 8, 9])
+            .checkpoint_pass(Some(&SharedState::from(&head)), &[5, 6, 7, 8, 9])
             .expect("pass ran")
             .expect("state");
         let cells = |s: &ExportedState| -> Vec<f32> {
@@ -341,7 +393,7 @@ pub(super) mod tests {
     fn a_section_seal_starts_from_the_state_it_is_given() {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
         let start = sched
-            .handle_branch_checkpoint_pass(None, &[2, 4, 6])
+            .checkpoint_pass(None, &[2, 4, 6])
             .expect("pass ran")
             .expect("state");
         let slot = SequenceId(sched.session.create_sequence().expect("slot"));
@@ -349,7 +401,7 @@ pub(super) mod tests {
         let queued = QueuedSection {
             sequence_id: slot,
             section_id: SectionId::new(1),
-            prefix_section_ids: Vec::new(),
+            prefix: Vec::new(),
             tokens: TokenBuffer::from(vec![1u32; 4]),
             address: ContentAddress::default(),
             debug_name: "s".into(),
@@ -403,7 +455,7 @@ pub(super) mod tests {
         let (mut sched, _tx, _probe) = make_test_scheduler_recurrent();
         let tokens = [1u32, 2, 3, 4, 5, 6, 7];
         let state = sched
-            .handle_branch_checkpoint_pass(None, &tokens)
+            .checkpoint_pass(None, &tokens)
             .expect("pass ran")
             .expect("state");
         assert!(!state.layers.is_empty(), "no delta-rule layers");
@@ -437,7 +489,7 @@ pub(super) mod tests {
             let n = (2 * TOY_INDEX_RATIO + extra) as usize;
             let tokens: Vec<u32> = (0..n as u32).collect();
             let state = sched
-                .handle_branch_checkpoint_pass(None, &tokens)
+                .checkpoint_pass(None, &tokens)
                 .expect("pass ran")
                 .expect("state");
 
@@ -467,7 +519,7 @@ pub(super) mod tests {
     fn install_recurrent_state_request_installs_the_aux_blob_too() {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
         let state = sched
-            .handle_branch_checkpoint_pass(None, &[2, 4, 6, 8, 10])
+            .checkpoint_pass(None, &[2, 4, 6, 8, 10])
             .expect("pass ran")
             .expect("state");
         let slot = SequenceId(sched.session.create_sequence().expect("slot"));
@@ -574,9 +626,7 @@ pub(super) mod tests {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
         let before = probe.index.lock().unwrap().len();
         for _ in 0..4 {
-            sched
-                .handle_branch_checkpoint_pass(None, &[7, 7, 7])
-                .expect("pass ran");
+            sched.checkpoint_pass(None, &[7, 7, 7]).expect("pass ran");
         }
         assert_eq!(
             probe.index.lock().unwrap().len(),
@@ -595,7 +645,7 @@ pub(super) mod tests {
     fn install_recurrent_state_request_installs_onto_every_named_slot() {
         let (mut sched, _tx, probe) = make_test_scheduler_recurrent();
         let state = sched
-            .handle_branch_checkpoint_pass(None, &[2, 4, 6])
+            .checkpoint_pass(None, &[2, 4, 6])
             .expect("pass ran")
             .expect("state");
         let slots: Vec<SequenceId> = (0..3)

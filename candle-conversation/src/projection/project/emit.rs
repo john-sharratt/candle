@@ -189,7 +189,10 @@ pub(super) fn emit_system_prompt_items<R: ContentResolver>(
                     if let Some(sum_id) = pending_summaries.remove(&coll.id) {
                         emit_summary(&mut out, sum_id, resolver, selection_state);
                     }
-                    out.extend(selected);
+                    match &coll.range {
+                        Some(range) => emit_in_range(&mut out, coll, range, selected, resolver),
+                        None => out.extend(selected),
+                    }
                 }
             }
             SystemPromptItem::SectionTree(tree) => {
@@ -270,6 +273,45 @@ pub(super) fn emit_system_prompt_items<R: ContentResolver>(
         }
     }
     out
+}
+
+/// Emit a collection's `selected` members in its reserved range: what they do
+/// not fill is a hole, ahead of them in a range filled from the top, after
+/// them in one filled from the bottom, so the range always takes its full size
+/// on an engine trained to the resolver's window (`docs/placed_section_layout.md`
+/// §3.1). Members past the range are emitted whole and the range runs over,
+/// which is the fill's to prevent, and is warned of.
+pub(super) fn emit_in_range<R: ContentResolver>(
+    out: &mut Vec<ProjectionSegment>,
+    coll: &SectionCollection,
+    range: &ReservedRange,
+    selected: Vec<ProjectionSegment>,
+    resolver: &R,
+) {
+    let native = resolver.trained_window();
+    let used = segment_tokens(&selected, resolver);
+    let reserved = range.positions(native);
+    if used > reserved {
+        tracing::warn!(
+            collection = %coll.name,
+            used,
+            reserved,
+            "a range's members take more than the range: everything after it moves"
+        );
+    }
+    let hole = ProjectionSegment::Hole {
+        positions: range.hole(native, used),
+    };
+    match range.fill {
+        RangeFill::Top => {
+            out.push(hole);
+            out.extend(selected);
+        }
+        RangeFill::Bottom => {
+            out.extend(selected);
+            out.push(hole);
+        }
+    }
 }
 
 /// Emit a single [`SectionSchema`] as a [`ProjectionSegment::Sealed`] — its

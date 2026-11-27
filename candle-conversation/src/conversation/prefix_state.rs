@@ -23,10 +23,9 @@ use flume::{Sender, WeakSender};
 use crate::error::ConversationError;
 use crate::persistence::content_hash::{ContentChain, ContentHash};
 use crate::persistence::record::{BranchCheckpointPayload, SnapshotLayer};
-use crate::projection::{Conversation, SectionId};
+use crate::projection::{runs_are_empty, Conversation, PrefixItem, TokenRun};
 use crate::scheduler::exported_state::{ExportedState, SharedState};
 use crate::scheduler::SchedulerRequest;
-use crate::token_buffer::TokenBuffer;
 use candle_transformers::models::delta_net::ExportedLayerState;
 
 /// The state a stored checkpoint describes, as a slot is given it.
@@ -52,19 +51,20 @@ pub(crate) fn shared(payload: &BranchCheckpointPayload) -> SharedState {
     }
 }
 
-/// Run `tokens` through the model from `start` (from zero with `None`) and
-/// return the state they leave. `Ok(None)` when the model carries no recurrent
-/// state, so a caller asks unconditionally.
+/// Run `runs` through the model from `start` (from zero with `None`), each
+/// after the hole ahead of it, and return the state they leave. `Ok(None)`
+/// when the model carries no recurrent state, so a caller asks
+/// unconditionally.
 pub(crate) fn run_state(
     scheduler_tx: &Sender<SchedulerRequest>,
     start: Option<SharedState>,
-    tokens: Vec<u32>,
+    runs: Vec<TokenRun>,
 ) -> crate::Result<Option<ExportedState>> {
     let (tx, rx) = flume::bounded(1);
     scheduler_tx
         .send(SchedulerRequest::BranchCheckpointPass {
             start,
-            tokens: TokenBuffer::from(tokens),
+            runs,
             response_tx: tx,
         })
         .map_err(|_| ConversationError::SchedulerGone)?;
@@ -72,8 +72,9 @@ pub(crate) fn run_state(
 }
 
 /// The checkpoint for the prompt prefix `prefix`, whose ordered tokens are
-/// `tokens`: the stored one, or one computed now and stored — and which of the
-/// two. `Ok(None)` when the model carries no recurrent state.
+/// `runs`, each after its hole: the stored one, or one computed now and stored
+/// — and which of the two. `Ok(None)` when the model carries no recurrent
+/// state.
 ///
 /// A computed payload is handed back in memory and memoised as well as
 /// enqueued, because the durable write is fire-and-forget: a read issued
@@ -82,7 +83,7 @@ pub(crate) fn checkpoint(
     scheduler_tx: &Sender<SchedulerRequest>,
     substrate: &Conversation,
     prefix: ContentHash,
-    tokens: Vec<u32>,
+    runs: Vec<TokenRun>,
 ) -> crate::Result<Option<(Arc<BranchCheckpointPayload>, bool)>> {
     match substrate.read_branch_checkpoint(prefix) {
         Ok(Some(p)) => return Ok(Some((p, false))),
@@ -90,7 +91,7 @@ pub(crate) fn checkpoint(
         // Present but unreadable: computed again over it.
         Err(e) => tracing::warn!("checkpoint unreadable, recomputing: {e}"),
     }
-    let Some(state) = run_state(scheduler_tx, None, tokens)? else {
+    let Some(state) = run_state(scheduler_tx, None, runs)? else {
         return Ok(None);
     };
     let payload = Arc::new(BranchCheckpointPayload {
@@ -104,24 +105,42 @@ pub(crate) fn checkpoint(
     Ok(Some((payload, true)))
 }
 
-/// The ordered tokens of `sections` and the content chain they make, leaving
-/// out any with no tokens.
+/// The ordered tokens of `prefix` as runs between its holes, and the content
+/// chain it makes, leaving out any section with no tokens.
 pub(crate) fn chain_of(
     substrate: &Conversation,
-    sections: &[SectionId],
-) -> (ContentHash, Vec<u32>) {
+    prefix: &[PrefixItem],
+) -> (ContentHash, Vec<TokenRun>) {
     let view = substrate.read();
     let mut chain = ContentChain::new();
-    let mut tokens = Vec::new();
-    for &id in sections {
-        let section = view.section_tokens_of(id);
-        if section.is_empty() {
-            continue;
+    let mut runs = vec![TokenRun::default()];
+    for &item in prefix {
+        match item {
+            PrefixItem::Section(id) => {
+                let section = view.section_tokens_of(id);
+                if section.is_empty() {
+                    continue;
+                }
+                chain.push_section(&section);
+                let run = runs.last_mut().expect("never empty");
+                run.tokens.extend_from_slice(&section);
+            }
+            PrefixItem::Hole(0) => {}
+            PrefixItem::Hole(positions) => {
+                chain.push_hole(positions);
+                match runs.last_mut() {
+                    // A hole straight after another, or at the start, adds to
+                    // the one already pending.
+                    Some(run) if run.tokens.is_empty() => run.hole += positions,
+                    _ => runs.push(TokenRun {
+                        hole: positions,
+                        tokens: Vec::new(),
+                    }),
+                }
+            }
         }
-        chain.push_section(&section);
-        tokens.extend_from_slice(&section);
     }
-    (chain.prefix(), tokens)
+    (chain.prefix(), runs)
 }
 
 /// How many states [`state_after`] holds decoded in this process. One per
@@ -200,40 +219,41 @@ pub(crate) fn shared_held(
     state
 }
 
-/// The state after the sealed `sections`, in order — `Ok(None)` before any
-/// token, where the state is zero, and for a model with no recurrent state.
+/// The state after the sealed sections of `items`, in order and past its
+/// holes — `Ok(None)` before any token, where the state is zero, and for a
+/// model with no recurrent state.
 pub(crate) fn state_after(
     scheduler_tx: &Sender<SchedulerRequest>,
     substrate: &Conversation,
-    sections: &[SectionId],
+    items: &[PrefixItem],
 ) -> crate::Result<Option<SharedState>> {
-    let (prefix, tokens) = chain_of(substrate, sections);
-    if tokens.is_empty() {
+    let (prefix, runs) = chain_of(substrate, items);
+    if runs_are_empty(&runs) {
         return Ok(None);
     }
     if let Some(state) = held(scheduler_tx, prefix) {
         return Ok(Some(state));
     }
-    let state = checkpoint(scheduler_tx, substrate, prefix, tokens)?.map(|(p, _)| shared(&p));
+    let state = checkpoint(scheduler_tx, substrate, prefix, runs)?.map(|(p, _)| shared(&p));
     if let Some(state) = &state {
         hold(scheduler_tx, prefix, state.clone());
     }
     Ok(state)
 }
 
-/// The state after `start` and then the sealed `sections`, computed now and
-/// not kept. `start` itself when `sections` hold no tokens.
+/// The state after `start` and then the sealed sections of `items`, computed
+/// now and not kept. `start` itself when they hold no tokens.
 pub(crate) fn continue_state(
     scheduler_tx: &Sender<SchedulerRequest>,
     substrate: &Conversation,
     start: Option<SharedState>,
-    sections: &[SectionId],
+    items: &[PrefixItem],
 ) -> crate::Result<Option<SharedState>> {
-    let (_, tokens) = chain_of(substrate, sections);
-    if tokens.is_empty() {
+    let (_, runs) = chain_of(substrate, items);
+    if runs_are_empty(&runs) {
         return Ok(start);
     }
-    Ok(run_state(scheduler_tx, start, tokens)?.map(SharedState::from))
+    Ok(run_state(scheduler_tx, start, runs)?.map(SharedState::from))
 }
 
 #[cfg(test)]

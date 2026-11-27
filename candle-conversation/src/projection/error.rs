@@ -83,6 +83,11 @@ pub enum ConstructionError {
     #[error("{0}")]
     InvalidPins(String),
 
+    /// A collection `range:` no member could stand in: zero positions, or a
+    /// small-context size past the full one.
+    #[error("{0}")]
+    InvalidRange(String),
+
     // ── Construction-time ─────────────────────────────────────────────────────
     /// Sum of declared `min_percent` across siblings exceeds 100. Statically
     /// infeasible — the configured floors cannot all be honoured.

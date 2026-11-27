@@ -306,19 +306,17 @@ pub(crate) enum SchedulerRequest {
     IngestSection {
         sequence_id: SequenceId,
         section_id: SectionId,
-        /// Substrate-pinned sections to Arc-clone onto the scratch slot
-        /// **before** prefilling `tokens` — the cumulative-ingest
-        /// prefix.  Each prefix section's `SealedSequence` is fetched
-        /// from substrate and injected via `inject_sealed_at_tail`
-        /// (pure metadata clone, no DMA).  After all prefix sections
-        /// are injected, the handler force-pushes a fresh empty
-        /// writer chunk so the upcoming prefill writes into a
-        /// writer-owned chunk instead of extending the prefix's
-        /// shared partial tail.
+        /// What the scratch slot holds **before** prefilling `tokens` — the
+        /// cumulative-ingest prefix, in order: substrate-pinned sections,
+        /// each Arc-cloned onto the slot via `inject_sealed_at_tail` (pure
+        /// metadata clone, no DMA), and holes, each left empty on the K/V
+        /// and the index alike (`docs/placed_section_layout.md` §3.1b).
+        /// After the whole prefix, the handler force-pushes a fresh empty
+        /// writer chunk so the upcoming prefill writes into a writer-owned
+        /// chunk instead of extending the prefix's shared partial tail.
         ///
-        /// Empty `Vec` ⇒ isolated ingest (no prefix), identical to
-        /// the original section-ingest flow.
-        prefix_section_ids: Vec<SectionId>,
+        /// Empty `Vec` ⇒ isolated ingest (no prefix).
+        prefix: Vec<PrefixItem>,
         tokens: TokenBuffer,
         /// Content-addressed `(prefix_hash, section_hash)` for this
         /// section, computed by the caller via a `ContentChain` walked
@@ -477,9 +475,10 @@ pub(crate) enum SchedulerRequest {
         /// the prompt, the state at its first token for one that continues it.
         start: Option<SharedState>,
         /// The ordered token stream — every sealed section of the system prompt
-        /// under one selector assignment, concatenated, or the sections a
-        /// continuation runs on from `start`.
-        tokens: TokenBuffer,
+        /// under one selector assignment, or the sections a continuation runs
+        /// on from `start` — as runs, each after the hole ahead of it, so the
+        /// state is the one the prompt leaves read at its positions.
+        runs: Vec<TokenRun>,
         response_tx: Sender<Result<Option<ExportedState>, ConversationError>>,
     },
 

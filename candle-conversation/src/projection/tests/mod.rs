@@ -464,6 +464,7 @@ mod tests_files_splice;
 mod tests_layers_and_scores;
 #[cfg(test)]
 mod tests_optional_groups;
+mod tests_ranges;
 mod tests_schema_validation;
 mod tests_section_tree_basics;
 #[cfg(test)]

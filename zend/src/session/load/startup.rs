@@ -689,7 +689,7 @@ impl InferenceState {
         // the text is rebuilt and its section prefilled on every startup, exactly
         // like the tool sections themselves.
         {
-            let prelude = pre_tools_section_ids(&proj_builder_refresh);
+            let prelude = pre_tools_prefix(&proj_builder_refresh, base_conv.native_context());
             let summary_for = |mode: ToolMode| {
                 let offered = crate::tools::offered_tool_names(mode);
                 let sections: Vec<crate::tool_summary::InstalledTool> = tool_sections
@@ -727,8 +727,10 @@ impl InferenceState {
             // The lines saying a tool is out for now, each sealed after the
             // summary they follow, so a round picks any set of them for nothing.
             let mut after_summary = prelude;
-            after_summary
-                .extend(tool_summary_section(ToolMode::Comprehensive).map(SectionId::reserved));
+            after_summary.extend(
+                tool_summary_section(ToolMode::Comprehensive)
+                    .map(|r| PrefixItem::Section(SectionId::reserved(r))),
+            );
             for (sid, line) in crate::tool_availability::line_sections() {
                 let text = format!("\n{line}");
                 if let Err(e) = base_conv.insert_section_with_prefix(sid, &text, &after_summary) {
