@@ -377,6 +377,8 @@ impl Scheduler {
                 // `ProbeWideSigs` to drain. The turn seals nothing (`SealAction::None`).
                 // A slot asked to be described is described here, where it
                 // holds the prompt and the turn and nothing has been sealed.
+                // The capture is kept only for an asker still listening: one
+                // whose receiver is gone could never release it.
                 if let Some(tx) = self.describe_at_seal.remove(&seal_slot) {
                     let described = self.describe_slot(seal_slot).map(|(mut layout, capture)| {
                         self.last_capture += 1;
@@ -384,7 +386,12 @@ impl Scheduler {
                         self.captures.insert(self.last_capture, capture);
                         layout
                     });
-                    let _ = tx.send(described);
+                    let kept = described.as_ref().ok().map(|l| l.capture);
+                    if tx.send(described).is_err() {
+                        if let Some(id) = kept {
+                            self.captures.remove(&id);
+                        }
+                    }
                 }
                 if self.ephemeral_slots.contains(&seal_slot) {
                     let bc = self.session.sequence_block_count(seal_slot.0).unwrap_or(0);

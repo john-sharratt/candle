@@ -446,7 +446,7 @@ fn selection() -> SelectionState {
 /// A run's sealed side, decoded once ([`ZendSession::sealed_half`]): the
 /// prompt, the sealed decode and its slot's capture, which every fresh side —
 /// one run's, or each cell of a sweep — compares against and transplants from.
-/// Held until [`SealedHalf::close`] releases the capture and the fork.
+/// Its capture and fork are released when it is dropped.
 pub struct SealedHalf {
     state: Arc<InferenceState>,
     _conv: Sequence,
@@ -469,10 +469,7 @@ pub struct SealedHalf {
 impl ZendSession {
     /// Decode `req` sealed and fresh over the same tokens ([`SealedFresh`]).
     pub fn sealed_fresh(&self, req: &SealedFreshReq) -> anyhow::Result<SealedFresh> {
-        let half = self.sealed_half(req)?;
-        let out = half.fresh(req);
-        half.close();
-        out
+        self.sealed_half(req)?.fresh(req)
     }
 
     /// Decode `req`'s sealed side once ([`SealedHalf`]); its fresh sides are
@@ -531,6 +528,9 @@ impl ZendSession {
             .unwrap_or_default();
         members.extend(&seed_members);
         let mut probe: Option<FileRecord> = None;
+        // The sealed slot's capture once its description is in: released here
+        // if the run fails after it, by the [`SealedHalf`] otherwise.
+        let mut made: Option<u64> = None;
         let mut conv = state
             .base_conv
             .fork_at(DecodePriority::Low)
@@ -619,13 +619,21 @@ impl ZendSession {
             let handle = conv
                 .submit_turn_with_options(req.question.clone(), options)
                 .map_err(|e| anyhow::anyhow!("submit: {e}"))?;
-            let resp = handle
-                .wait()
-                .map_err(|e| anyhow::anyhow!("the sealed decode: {e}"))?;
+            let resp = match handle.wait() {
+                Ok(resp) => resp,
+                Err(e) => {
+                    // A turn that failed after its seal still made a capture.
+                    if let Ok(Ok(layout)) = sealed_described.try_recv() {
+                        engine.release_capture(layout.capture);
+                    }
+                    anyhow::bail!("the sealed decode: {e}");
+                }
+            };
             let sealed_layout = sealed_described
                 .recv()
                 .context("the sealed slot's description")?
                 .map_err(|e| anyhow::anyhow!("describing the sealed slot: {e}"))?;
+            made = Some(sealed_layout.capture);
             conv.finish_turn(handle, &resp)
                 .map_err(|e| anyhow::anyhow!("finish: {e}"))?;
             let turn = engine
@@ -647,6 +655,9 @@ impl ZendSession {
             match out {
                 Ok(o) => o,
                 Err(e) => {
+                    if let Some(capture) = made {
+                        engine.release_capture(capture);
+                    }
                     let _ = engine.tombstone_timeline(timeline);
                     if let Some(p) = &probe {
                         let _ = records::retire(&engine.conversation(), p);
@@ -801,10 +812,13 @@ impl SealedHalf {
             seed_missing: self.seed_missing.clone(),
         })
     }
+}
 
-    /// Release the capture, end the fork's timeline and retire a resealed
-    /// probe's record.
-    pub fn close(self) {
+/// Dropped — a run's end, a sweep's, or an error on the way — the sealed side
+/// releases its capture, ends the fork's timeline and retires a resealed
+/// probe's record.
+impl Drop for SealedHalf {
+    fn drop(&mut self) {
         let engine = &self.state.engine;
         engine.release_capture(self.layout.capture);
         let _ = engine.tombstone_timeline(self.timeline);

@@ -600,6 +600,9 @@ impl Scheduler {
         // reached — and the reason a compaction could poison a sequence that was not
         // even resident when it ran.
         let mut projections = std::mem::take(&mut self.slot_projection_state);
+        // **So are the described slots' captures**, held past their seals for
+        // transplants (`transplant.rs`) — taken out and put back the same way.
+        let mut captures = std::mem::take(&mut self.captures);
         // A detached tenant's substrate, out of the attached set but still
         // holding its resident KV until its last handle goes — held alive for
         // the pass and let go after it (`Detached::alive`).
@@ -640,6 +643,9 @@ impl Scheduler {
                 for state in projections.values_mut() {
                     swept += state.rewrite_for_compaction(sweep)?;
                 }
+                for capture in captures.values_mut() {
+                    swept += capture.rewrite_for_compaction(sweep)?;
+                }
                 projections_us += t.elapsed().as_micros();
                 let t = std::time::Instant::now();
                 for substrate in &detached {
@@ -658,6 +664,7 @@ impl Scheduler {
         // ran is freed here, outside it.
         drop(detached);
         self.slot_projection_state = projections;
+        self.captures = captures;
         // **The interval is stamped by a pass that ran, never by one that was
         // refused.** `MIN_INTERVAL` exists to bound the census, and a contended pass
         // pays no census — it refuses on a `try_` acquisition and returns. Stamping

@@ -346,13 +346,24 @@ impl ConversationEngine {
                     .map_err(|_| ConversationError::SchedulerGone)?;
                 rx.recv().map_err(|_| ConversationError::SchedulerGone)??;
             }
+            // Described for its layout alone: no transplant takes from this
+            // slot, so its capture is released as soon as the description is
+            // in — on a failed turn too, when the seal got as far as making one.
             let described = self.describe_at_seal(sequence_id)?;
-            let mut decoded = self.raw_turn(sequence_id, tail, max_decode_tokens)?;
-            decoded.layout = Some(
-                described
-                    .recv()
-                    .map_err(|_| ConversationError::SchedulerGone)??,
-            );
+            let mut decoded = match self.raw_turn(sequence_id, tail, max_decode_tokens) {
+                Ok(d) => d,
+                Err(e) => {
+                    if let Ok(Ok(layout)) = described.try_recv() {
+                        self.release_capture(layout.capture);
+                    }
+                    return Err(e);
+                }
+            };
+            let layout = described
+                .recv()
+                .map_err(|_| ConversationError::SchedulerGone)??;
+            self.release_capture(layout.capture);
+            decoded.layout = Some(layout);
             Ok(decoded)
         })();
         let _ = self

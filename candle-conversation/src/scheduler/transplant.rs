@@ -9,7 +9,7 @@
 //! captured chunks in place of its own, the captured pages in place of its
 //! index, or both, before its own turn decodes over them.
 
-use candle_nn::kv_cache::SealedSequence;
+use candle_nn::kv_cache::{rewrite_sealed, SealedSequence, Sweep};
 
 use super::*;
 
@@ -18,6 +18,27 @@ use super::*;
 pub(super) struct SlotCapture {
     pub(super) layers: Vec<SealedSequence>,
     pub(super) pages: Vec<(usize, Vec<u8>)>,
+}
+
+impl SlotCapture {
+    /// Install the sweep's replacement for the captured chunks, if any of them
+    /// moved. **A capture is a holder like any other**: it keeps its chunks
+    /// alive past the slot's seal for as long as transplants may ask for it, so
+    /// a compaction that does not visit it copies those chunks, finds nobody
+    /// naming the copies, and plans the same moves again on the next pass. The
+    /// index pages name no chunk and do not move.
+    pub(super) fn rewrite_for_compaction(
+        &mut self,
+        sweep: &mut Sweep<'_>,
+    ) -> candle::Result<usize> {
+        match rewrite_sealed(&self.layers, sweep)? {
+            Some(next) => {
+                self.layers = next;
+                Ok(1)
+            }
+            None => Ok(0),
+        }
+    }
 }
 
 /// How many of the leading items, of the token widths `widths`, make exactly
@@ -157,6 +178,53 @@ mod tests {
         assert_eq!(leading_covering(&[32, 8, 0, 5, 20], 40).unwrap(), 2);
         assert_eq!(leading_covering(&[32, 8, 5], 45).unwrap(), 3);
         assert_eq!(leading_covering(&[3, 273], 0).unwrap(), 0);
+    }
+
+    /// **A capture is a holder the sweep reaches**: a captured chunk that moved
+    /// comes back naming its destination, and the sweep counts it rewritten — so
+    /// the pass that moved it does not find it unwitnessed and plan it again.
+    #[test]
+    fn a_capture_is_swept() {
+        use std::sync::Arc;
+
+        use candle_nn::kv_cache::{
+            ArenaLocation, ChunkGid, CompactionMap, HeadGids, SealedChunk, GID_STRIDE,
+        };
+
+        use crate::substrate::residence::own_device_frees;
+
+        own_device_frees();
+        let at = |raw: i64| SealedSequence {
+            chunks: vec![SealedChunk {
+                gids: HeadGids::uniform(ChunkGid::detached(raw), 1),
+                offset: 0,
+                token_count: 32,
+                k_pal: Arc::new(Vec::new()),
+                v_pal: Arc::new(Vec::new()),
+                k_scale: Arc::new(Vec::new()),
+                v_scale: Arc::new(Vec::new()),
+                k_fmt: Arc::new(Vec::new()),
+                v_fmt: Arc::new(Vec::new()),
+                byte_size: 0,
+                meta: None,
+                q_sign: None,
+            }],
+            token_count: 32,
+            chunk_size: 32,
+            location: ArenaLocation::Gpu,
+        };
+        let src = (5 * GID_STRIDE + 2) as i64;
+        let dst = (GID_STRIDE + 1) as i64;
+        let mut capture = SlotCapture {
+            layers: vec![at(src)],
+            pages: Vec::new(),
+        };
+        let mut map = CompactionMap::new();
+        map.insert(src, ChunkGid::detached(dst), 0x4000);
+        let mut sweep = Sweep::new(&map);
+        assert_eq!(capture.rewrite_for_compaction(&mut sweep).unwrap(), 1);
+        assert_eq!(capture.layers[0].chunks[0].gids.as_slice()[0].raw(), dst);
+        assert_eq!(sweep.allocations_rewritten(), 1);
     }
 
     /// **The named chunks are the slot's own, every other the capture's**, cut

@@ -73,42 +73,39 @@ impl ZendSession {
             !req.heads.is_empty() && !req.tails.is_empty(),
             "a sweep needs at least one head and one tail"
         );
+        // Dropped on every way out, releasing the capture the cells share.
         let half = self.sealed_half(&req.base)?;
-        let out = (|| {
-            let reference = half.fresh(&SealedFreshReq {
-                fresh_kv: Source::Fresh,
-                anchor_head: 0,
-                anchor_tail: 0,
+        let reference = half.fresh(&SealedFreshReq {
+            fresh_kv: Source::Fresh,
+            anchor_head: 0,
+            anchor_tail: 0,
+            ..req.base.clone()
+        })?;
+        let mut cells = Vec::new();
+        for (head, tail) in grid(&req.heads, &req.tails) {
+            let run = half.fresh(&SealedFreshReq {
+                fresh_kv: Source::Sealed,
+                anchor_head: head,
+                anchor_tail: tail,
                 ..req.base.clone()
             })?;
-            let mut cells = Vec::new();
-            for (head, tail) in grid(&req.heads, &req.tails) {
-                let run = half.fresh(&SealedFreshReq {
-                    fresh_kv: Source::Sealed,
-                    anchor_head: head,
-                    anchor_tail: tail,
-                    ..req.base.clone()
-                })?;
-                let agrees_for = common_prefix_chars(&run.fresh_text, &reference.fresh_text);
-                cells.push(AnchorCell {
-                    head,
-                    tail,
-                    anchored_chunks: run.anchored_chunks,
-                    same_as_reference: run.fresh_text == reference.fresh_text,
-                    agrees_for,
-                    text: run.fresh_text,
-                });
-            }
-            Ok(AnchorSweep {
-                sealed_text: half.sealed_text(),
-                reference_text: reference.fresh_text,
-                prompt_tokens: reference.prompt_tokens,
-                after_tokens: half.after_tokens(),
-                cells,
-            })
-        })();
-        half.close();
-        out
+            let agrees_for = common_prefix_chars(&run.fresh_text, &reference.fresh_text);
+            cells.push(AnchorCell {
+                head,
+                tail,
+                anchored_chunks: run.anchored_chunks,
+                same_as_reference: run.fresh_text == reference.fresh_text,
+                agrees_for,
+                text: run.fresh_text,
+            });
+        }
+        Ok(AnchorSweep {
+            sealed_text: half.sealed_text(),
+            reference_text: reference.fresh_text,
+            prompt_tokens: reference.prompt_tokens,
+            after_tokens: half.after_tokens(),
+            cells,
+        })
     }
 }
 
