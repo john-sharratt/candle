@@ -721,6 +721,9 @@ system_prompt:
       name: files
       selection: { kind: always_visible }
       range: { tokens: 98304 }
+      # Sealed at C5, as the knowledge base is everywhere
+      # (docs/npc_mind_layout.md §3): a collection that declares none is C4.
+      kv_level: 5
       sections: []
 
     - kind: template

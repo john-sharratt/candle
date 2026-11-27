@@ -347,6 +347,13 @@ pub(super) fn parse_selection(
                 lineage_base,
             })
         }
+        "birth" => match ys.window {
+            Some(window) if window > 0 => Ok(SelectionRule::Birth { window }),
+            _ => Err(ConstructionError::InvalidPolicy {
+                name: name.to_string(),
+                reason: "a birth selection needs a window of at least one token".to_string(),
+            }),
+        },
         "working_set" => {
             let share = match ys.share.as_deref() {
                 Some("readings") => WorkingSetShare::Readings,

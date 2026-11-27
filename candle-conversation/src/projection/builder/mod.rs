@@ -28,6 +28,7 @@ use super::schema::{
     Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, GatherScope,
     GroupSchema, LayerDials, LayerSchema, LayerSummary, Schema, SectionCollection, SectionSchema,
     SelectionRule, SystemPromptItem, SystemPromptSchema, TreeCollection, TreeVariant, TurnSummary,
+    MEMBER_KV_LEVEL,
 };
 use super::script::ProjectionScript;
 use super::swap_cap::DEFAULT_MAX_SWAPS;

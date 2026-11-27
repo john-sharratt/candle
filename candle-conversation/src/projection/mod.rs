@@ -311,7 +311,7 @@ pub use schema::{
     GroupSchema, LayerDials, LayerSchema, LayerSummary, RangeFill, Recency, ReservedRange, Schema,
     ScoreFormula, SectionCollection, SectionSchema, SectionTree, SelectionRule, SystemPromptItem,
     SystemPromptSchema, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary, WorkingSetShare,
-    LINEAGE_BASE,
+    LINEAGE_BASE, MAX_KV_LEVEL, MEMBER_KV_LEVEL,
 };
 pub use script::{recorded_dials, ProjectionScript};
 pub use working_set_pick::{SlotBoundary, WorkingSetMembers};

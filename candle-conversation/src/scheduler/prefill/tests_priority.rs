@@ -319,7 +319,7 @@ layers:
             seal_block_from: 0,
             address: ContentAddress::default(),
             debug_name: "s".into(),
-            in_collection: true,
+            seal: SectionSeal::Member { level: 4 },
             export_end: false,
             band,
             response_tx,

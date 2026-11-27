@@ -10,6 +10,7 @@
 
 use super::*;
 use crate::scheduler::exported_state::SharedState;
+use crate::SectionSeal;
 
 /// Allocate a scratch slot on `scheduler_tx` — see
 /// [`Sequence::alloc_scratch_slot`].
@@ -63,7 +64,8 @@ impl Sequence {
         if content.is_empty() {
             return Ok(());
         }
-        let mut results = self.insert_section_collection(&[(section, content)], &[], false)?;
+        let mut results =
+            self.insert_section_collection(&[(section, content)], &[], SectionSeal::Boundary)?;
         results.pop();
         Ok(())
     }
@@ -83,7 +85,8 @@ impl Sequence {
         if content.is_empty() {
             return Ok(());
         }
-        let mut results = self.insert_section_collection(&[(section, content)], prefix, false)?;
+        let mut results =
+            self.insert_section_collection(&[(section, content)], prefix, SectionSeal::Boundary)?;
         results.pop();
         Ok(())
     }
@@ -107,15 +110,9 @@ impl Sequence {
         &mut self,
         sections: &[(SectionId, &str)],
         prefix: &[PrefixItem],
-        in_collection: bool,
+        seal: SectionSeal,
     ) -> crate::Result<Vec<(SectionId, usize)>> {
-        self.insert_section_collection_with_progress(
-            sections,
-            prefix,
-            None,
-            in_collection,
-            |_, _| {},
-        )
+        self.insert_section_collection_with_progress(sections, prefix, None, seal, |_, _| {})
     }
 
     /// Same as [`Self::insert_section_collection`] but fires
@@ -125,15 +122,14 @@ impl Sequence {
     /// its progress bar at section granularity instead of waiting for
     /// the whole batch.
     ///
-    /// `in_collection = true` when the caller is materialising a
-    /// schema `Collection` (tools in a tool catalog, hits in a
-    /// retrieval list, …): every section in `sections` becomes a
-    /// collection member, and the scheduler picks the more
-    /// aggressive turn-level compression policy for them.  `false`
-    /// is for boundary sections — `insert_section` and
-    /// `insert_section_with_prefix` always pass `false` because the
-    /// model needs near-lossless K/V on the role markers / opening
-    /// and closing tags every later token attends back over.
+    /// `seal` is [`SectionSeal::Member`] at the collection's level when the
+    /// caller is materialising a schema `Collection` (tools in a tool catalog,
+    /// the knowledge base's sections, …): every section in `sections` becomes
+    /// a collection member, quantized adaptively at that level.
+    /// [`SectionSeal::Boundary`] is for boundary sections — `insert_section`
+    /// and `insert_section_with_prefix` always pass it because the model needs
+    /// near-lossless K/V on the role markers / opening and closing tags every
+    /// later token attends back over.
     ///
     /// `range` is the collection's reserved range, in positions, when it has
     /// one: each section is then sealed at the range's top, behind `prefix` and
@@ -145,7 +141,7 @@ impl Sequence {
         sections: &[(SectionId, &str)],
         prefix: &[PrefixItem],
         range: Option<usize>,
-        in_collection: bool,
+        seal: SectionSeal,
         mut on_section_done: F,
     ) -> crate::Result<Vec<(SectionId, usize)>>
     where
@@ -421,7 +417,7 @@ impl Sequence {
         // change what the recurrence reads, only where the attention it feeds
         // reads it from.
         let start_of = |tokens: usize| -> crate::Result<Option<SharedState>> {
-            if !in_collection {
+            if !seal.is_member() {
                 return Ok(None);
             }
             let system = &self.projection.schema().system_prompt;
@@ -482,7 +478,7 @@ impl Sequence {
                     tokens: item.tokens,
                     address: item.address,
                     debug_name: item.debug_name,
-                    in_collection,
+                    seal,
                     start,
                     // At the conversation's own band: whoever waits on its
                     // first turn waits on its frame sealing first.

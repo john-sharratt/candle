@@ -300,19 +300,13 @@ impl Scheduler {
                 // / asynchronous attempts corrupt sysprompt K/V.
                 if !self.pending_section_quantize.is_empty() {
                     let _g = profile::span("seal:section_quantize");
-                    if let Some(turn_policy) = self.session.compression_policy() {
-                        let boundary_policy = Self::section_compression_policy_boundary();
-                        let member_policy = Self::section_compression_policy_member(&turn_policy);
+                    if self.session.compression_policy().is_some() {
                         // Non-fatal: the turn's decl/tokens/chunks were already
                         // recorded above and do not depend on section
                         // requantization — a quantize failure (e.g. a model
                         // whose head_dim the palette4 path doesn't support)
                         // must not abort the turn seal.
-                        if let Err(e) = self.quantize_pending_sections(
-                            &conversation,
-                            &boundary_policy,
-                            &member_policy,
-                        ) {
+                        if let Err(e) = self.quantize_pending_sections(&conversation) {
                             // The failed batch was this substrate's alone and has
                             // left the queue; every other substrate's stays.
                             tracing::warn!(
@@ -621,7 +615,7 @@ impl Scheduler {
                 tokens,
                 address,
                 debug_name,
-                in_collection,
+                seal,
             } => {
                 let delta_gpu = slice_per_layer_sealed(&sealed_per_layer, block_from, block_to)?;
                 let stream_id = section_stream_id(*address);
@@ -667,7 +661,7 @@ impl Scheduler {
                     self.pending_section_quantize.push(PendingSectionQuantize {
                         substrate: conversation.substrate_ref(),
                         section_id: *section_id,
-                        in_collection: *in_collection,
+                        seal: *seal,
                     });
                 }
                 // **A shared section is quantized at its own seal**
@@ -679,28 +673,17 @@ impl Scheduler {
                 // at once, too, rather than at a turn's seal that a run sealed
                 // ahead of any conversation never has.
                 if policy_active && is_shared_stream_name(debug_name) {
-                    if let Some(turn_policy) = self.session.compression_policy() {
-                        let boundary_policy = Self::section_compression_policy_boundary();
-                        let member_policy = Self::section_compression_policy_member(&turn_policy);
-                        let (now, keep): (Vec<_>, Vec<_>) =
-                            take(&mut self.pending_section_quantize)
-                                .into_iter()
-                                .partition(|p| {
-                                    p.section_id == *section_id && p.substrate.is(&conversation)
-                                });
-                        self.pending_section_quantize = keep;
-                        if let Err(e) = self.quantize_section_batch(
-                            &conversation,
-                            now,
-                            &boundary_policy,
-                            &member_policy,
-                            false,
-                        ) {
-                            tracing::warn!(
-                                section = %debug_name,
-                                "a shared section's quantize at its seal failed: {e}"
-                            );
-                        }
+                    let (now, keep): (Vec<_>, Vec<_>) = take(&mut self.pending_section_quantize)
+                        .into_iter()
+                        .partition(|p| {
+                            p.section_id == *section_id && p.substrate.is(&conversation)
+                        });
+                    self.pending_section_quantize = keep;
+                    if let Err(e) = self.quantize_section_batch(&conversation, now, false) {
+                        tracing::warn!(
+                            section = %debug_name,
+                            "a shared section's quantize at its seal failed: {e}"
+                        );
                     }
                 }
                 // A transient section — a throwaway conversation's frame — is

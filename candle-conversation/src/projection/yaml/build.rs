@@ -383,12 +383,22 @@ pub(super) fn build_system_prompt(
                 default: coll_default,
                 budget_adaptive: coll_budget_adaptive,
                 range: coll_range,
+                kv_level,
             } => {
                 let cid = *collections
                     .get(name)
                     .expect("first-pass pre-allocated every collection id");
                 let label = format!("{}/{}", owner, name);
                 let range = parse_reserved_range(&label, coll_range.as_ref())?;
+                let kv_level = kv_level.unwrap_or(MEMBER_KV_LEVEL);
+                if kv_level > MAX_KV_LEVEL {
+                    return Err(ConstructionError::InvalidPolicy {
+                        name: label.clone(),
+                        reason: format!(
+                            "kv_level is a compression level, C0 to C{MAX_KV_LEVEL}: got {kv_level}"
+                        ),
+                    });
+                }
                 let coll_selection = parse_collection_selection(&label, selection)?;
                 if *score_threshold < 0.0 {
                     return Err(ConstructionError::NegativeScoreThreshold {
@@ -459,6 +469,7 @@ pub(super) fn build_system_prompt(
                     )?,
                     mandatory: Vec::new(),
                     range,
+                    kv_level,
                 }));
             }
             YamlSystemPromptItem::SectionTree { nodes } => {

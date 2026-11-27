@@ -15,6 +15,7 @@ pub fn fmt_selection(rule: &SelectionRule) -> String {
             historical_top_k,
             lineage_base,
         } => format!("recent {recent} + top {historical_top_k}, lineage from {lineage_base}"),
+        SelectionRule::Birth { window } => format!("by birth, window {window}"),
         SelectionRule::WorkingSet { share } => match share {
             WorkingSetShare::Readings => "working set (readings)".to_string(),
             WorkingSetShare::Folders => "working set (folders)".to_string(),
@@ -54,6 +55,10 @@ mod tests {
                 lineage_base: 1000.0,
             }),
             "recent 16 + top 8, lineage from 1000"
+        );
+        assert_eq!(
+            fmt_selection(&SelectionRule::Birth { window: 73_728 }),
+            "by birth, window 73728"
         );
         assert_eq!(
             fmt_selection(&SelectionRule::WorkingSet {

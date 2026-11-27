@@ -95,7 +95,7 @@ impl Scheduler {
             match q {
                 SpanQuant::Native => None,
                 SpanQuant::Level(level) => Some(CompressionPolicy::new(level)),
-                SpanQuant::Boundary => Some(Self::section_compression_policy_boundary()),
+                SpanQuant::Boundary => Some(SectionSeal::Boundary.policy()),
                 SpanQuant::Session => session_policy,
             }
         };

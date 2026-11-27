@@ -448,7 +448,7 @@ pub(super) mod tests {
             tokens: TokenBuffer::from(vec![1u32; tokens]),
             address: ContentAddress::default(),
             debug_name: "s".into(),
-            in_collection: false,
+            seal: SectionSeal::Boundary,
             start: None,
             band,
             response_tx,

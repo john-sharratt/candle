@@ -488,8 +488,10 @@ impl Sequence {
                             &batch,
                             &linear_prefix,
                             sealed_at_top,
-                            true, // schema Collection: members get the
-                            // aggressive turn-level quantize policy
+                            // A schema collection's members, at its level.
+                            SectionSeal::Member {
+                                level: coll.kv_level,
+                            },
                             |_sid, content_len| {
                                 *done_bytes_ref += content_len as u64;
                                 report_ref(*done_bytes_ref);
@@ -569,7 +571,9 @@ impl Sequence {
                                             &batch,
                                             &prefix,
                                             None,
-                                            true,
+                                            SectionSeal::Member {
+                                                level: tc.collection.kv_level,
+                                            },
                                             |_sid, content_len| {
                                                 *done_bytes_ref += content_len as u64;
                                                 report_ref(*done_bytes_ref);

@@ -31,6 +31,7 @@ use crate::provenance::boundaries::BoundaryRule;
 use crate::recorded_reply::{recorded_reply, RecordedReply};
 use crate::recovered::recovered_from;
 use crate::recovered_message::{RecoveredMessage, TOOL_RESPONSE_OPEN};
+use crate::SectionSeal;
 use candle::engine_events::note;
 use candle_transformers::models::delta_net::ExportedLayerState;
 

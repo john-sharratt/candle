@@ -1178,7 +1178,10 @@ done before step 3.
    carried to the others would be lost from a single export — save `GET
    /v1/substrate/zend/objects/export` and `GET
    /v1/substrate/npcd/objects/export` (§12 item 17), and once
-   `GET /v1/npcs/export` (the cast), to files outside the data folders. Read
+   `GET /v1/npcs/export` (the cast: every character's record and the
+   portraits they name, the `npc-cast` JSON Lines `substrate_inspect
+   export-cast` writes — a portrait is a blob only its record names, so the
+   kept objects never carry one), to files outside the data folders. Read
    each back to confirm its line count.
    They hold everything the substrates keep that no model computed:
    accounts, MCP threads, workers and OAuth tokens, journal text, Discord

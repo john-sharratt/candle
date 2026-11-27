@@ -137,6 +137,7 @@ impl Builder {
                 budget_adaptive: None,
                 mandatory: Vec::new(),
                 range: None,
+                kv_level: MEMBER_KV_LEVEL,
             }));
         self.name_maps
             .collection_names

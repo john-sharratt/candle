@@ -26,10 +26,12 @@ use crate::persistence::content_hash::{
 use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::projection::{
     prefix_before_collection, sections_prefix, DecodePriority, PrefixItem, SectionId,
+    SystemPromptItem, MEMBER_KV_LEVEL,
 };
 use crate::scheduler::exported_state::SharedState;
 use crate::scheduler::SchedulerRequest;
 use crate::token_buffer::TokenBuffer;
+use crate::SectionSeal;
 
 /// One member to seal: the name it is declared under (after
 /// `shared/files/`) and its text.
@@ -84,6 +86,9 @@ pub struct MembersPrefix {
     /// The collection's range in positions, when it has one: a run of
     /// members is sealed at its top.
     pub range: Option<usize>,
+    /// The compression level a member is sealed at: its collection's
+    /// [`kv_level`](crate::projection::SectionCollection::kv_level).
+    pub level: u8,
 }
 
 impl MembersPrefix {
@@ -129,10 +134,12 @@ impl Sequence {
         let id = base.id_for_system_collection(collection).ok_or_else(|| {
             ConversationError::Other(format!("the schema has no collection {collection:?}"))
         })?;
+        let level = self.collection_kv_level(collection);
         if let Some(range) = self.birth_ranges.iter().find(|r| r.collection == id) {
             return Ok(MembersPrefix {
                 prefix: range.member_prefix(&self.birth_prefix, range.positions),
                 range: range.sealed_at_top(),
+                level,
             });
         }
         let native = self.substrate.read().trained_window();
@@ -146,7 +153,23 @@ impl Sequence {
         Ok(MembersPrefix {
             prefix: in_birth_prefix(before, &self.birth_prefix),
             range: None,
+            level,
         })
+    }
+
+    /// The level `collection`'s members are sealed at: what the schema
+    /// declares for it, [`MEMBER_KV_LEVEL`] for a collection it does not hold.
+    pub fn collection_kv_level(&self, collection: &str) -> u8 {
+        self.base_projection
+            .schema()
+            .system_prompt
+            .items
+            .iter()
+            .find_map(|item| match item {
+                SystemPromptItem::Collection(c) if c.name == collection => Some(c.kv_level),
+                _ => None,
+            })
+            .unwrap_or(MEMBER_KV_LEVEL)
     }
 
     /// Seal `chain` as members of `collection`, in order, each behind the
@@ -300,7 +323,12 @@ impl Sequence {
                 tokens,
                 address,
                 debug_name: member_stream_name(&spec.name),
-                in_collection: kind == SealAs::Member,
+                seal: match kind {
+                    SealAs::Member => SectionSeal::Member {
+                        level: prefix.level,
+                    },
+                    SealAs::Boundary => SectionSeal::Boundary,
+                },
                 start,
                 band: DecodePriority::Low,
                 response_tx: tx,
@@ -349,6 +377,7 @@ mod tests {
         let ranged = MembersPrefix {
             prefix: prompt.clone(),
             range: Some(1_000),
+            level: MEMBER_KV_LEVEL,
         };
         let mut want = prompt.clone();
         want.push(PrefixItem::Hole(600));
@@ -362,6 +391,7 @@ mod tests {
         let plain = MembersPrefix {
             prefix: prompt.clone(),
             range: None,
+            level: MEMBER_KV_LEVEL,
         };
         let mut bare = prompt;
         bare.extend(sections_prefix(&ids(&[10])));

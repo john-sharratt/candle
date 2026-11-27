@@ -396,7 +396,7 @@ impl Scheduler {
                 Arc::new(tokens.to_vec()),
                 address,
                 "summary_system_prompt".to_string(),
-                false,
+                SectionSeal::Boundary,
                 false,
             )?;
             Ok(())

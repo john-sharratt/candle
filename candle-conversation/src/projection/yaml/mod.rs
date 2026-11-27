@@ -39,7 +39,7 @@ use super::schema::{
     GroupSchema, LayerDials, LayerSchema, LayerSummary, RangeFill, Recency, ReservedRange, Schema,
     SectionCollection, SectionSchema, SectionTree, SelectionDefault, SelectionRule,
     SystemPromptItem, SystemPromptSchema, TreeCollection, TreeDim, TreeNode, TreeOption,
-    TreeVariant, TurnSummary, WorkingSetShare, LINEAGE_BASE,
+    TreeVariant, TurnSummary, WorkingSetShare, LINEAGE_BASE, MAX_KV_LEVEL, MEMBER_KV_LEVEL,
 };
 use super::swap_cap::DEFAULT_MAX_SWAPS;
 use crate::summary_tree::scope::Scope;

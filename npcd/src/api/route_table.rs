@@ -340,7 +340,8 @@ pub fn api(roles: Roles) -> Api<Arc<Authored>> {
             "/v1/npcs/import",
             Role::Admin,
             Dispatch::Best,
-            post(import_npcs),
+            // It carries the portraits, so it is as large as the objects'.
+            post(import_npcs).body_limit(IMPORT_BODY_LIMIT),
         )
         // Who owns what, and handing a character to another account. Admin:
         // the listing reads every owner's cast, and the reassignment is the one

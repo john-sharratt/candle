@@ -547,6 +547,7 @@ pub(super) fn build_section_tree<'a>(
                     // A prefix-transparent tree collection takes no positions
                     // of its own in the prompt below it.
                     range: None,
+                    kv_level: MEMBER_KV_LEVEL,
                 };
                 // Capture the branch templates so runtime member additions
                 // (the tool catalog) can seal ×branch without re-deriving them.

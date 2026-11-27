@@ -328,15 +328,9 @@ pub(crate) enum SchedulerRequest {
         /// Section's symbolic name (schema item id or tool name) used
         /// purely as diagnostic metadata on the SectionDecl record.
         debug_name: String,
-        /// `true` when this section is a member of a schema
-        /// `Collection` (e.g. one tool inside a tool catalog) — its
-        /// K/V can absorb more aggressive quantization because the
-        /// projection's top-k selection downsamples collection
-        /// members at every turn, so per-member precision matters
-        /// less than for boundary sections (role markers, opening /
-        /// closing tags) which the slot always carries.  Drives
-        /// section-quantize policy selection at seal time.
-        in_collection: bool,
+        /// How its K/V is sealed: a collection member at its collection's
+        /// level, a boundary section near-lossless ([`SectionSeal`]).
+        seal: SectionSeal,
         /// The recurrent state at the section's first token — the state the
         /// prefix leaves behind. Staged on the scratch slot before the prefill,
         /// so the section's recurrence continues from its prefix rather than

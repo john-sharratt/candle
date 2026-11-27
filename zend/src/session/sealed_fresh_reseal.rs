@@ -14,7 +14,7 @@ use candle_conversation::files::{files_owner, ChunkRecord, FileRecord, MemberRef
 use candle_conversation::projection::{Conversation, PrefixItem, SectionId};
 use candle_conversation::{MemberSpec, MembersPrefix, SealAs, Sequence};
 
-use crate::files::records;
+use crate::files::{records, FILES_COLLECTION};
 
 /// The blob a probe record of `blob` is named under.
 pub fn probe_blob(blob: &str) -> String {
@@ -83,6 +83,7 @@ pub fn reseal_behind(
     let behind = MembersPrefix {
         prefix: prefix.to_vec(),
         range: None,
+        level: base.collection_kv_level(FILES_COLLECTION),
     };
     let sealed = base
         .seal_members_behind(&behind, &specs, kind)

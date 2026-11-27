@@ -782,7 +782,7 @@ impl Scheduler {
                 tokens,
                 address,
                 debug_name,
-                in_collection,
+                seal,
                 start,
                 band,
                 response_tx,
@@ -794,7 +794,7 @@ impl Scheduler {
                     tokens,
                     address,
                     debug_name,
-                    in_collection,
+                    seal,
                     start,
                     band,
                     response_tx,
@@ -872,17 +872,11 @@ impl Scheduler {
                 response_tx,
             } => {
                 let result = (|| -> Result<(), ConversationError> {
-                    if let Some(turn_policy) = self.session.compression_policy() {
-                        let boundary_policy = Self::section_compression_policy_boundary();
-                        let member_policy = Self::section_compression_policy_member(&turn_policy);
+                    if self.session.compression_policy().is_some() {
                         // Quantize just the prefix-transparent members + flag
                         // them for offload; boundary sections stay pending for
                         // the turn-seal boundary.
-                        self.quantize_pending_collection_members(
-                            &conversation,
-                            &boundary_policy,
-                            &member_policy,
-                        )?;
+                        self.quantize_pending_collection_members(&conversation)?;
                     }
                     // Block on a full persistence pass so the members' cold
                     // copies land and `install_cold` frees their VRAM before the
