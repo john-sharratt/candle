@@ -129,19 +129,10 @@ fn empty(file: &str, doc: &Doc) -> String {
 /// edit's without arithmetic.
 pub fn lines_read(repo: &str, path: &str, doc: &Doc, from: usize, to: usize) -> String {
     let file = format!("{repo}/{path}");
-    let units = doc.units();
-    if units.is_empty() {
+    if doc.units().is_empty() {
         return empty(&file, doc);
     }
-    let first = units
-        .iter()
-        .position(|u| u.end >= from)
-        .unwrap_or(units.len() - 1);
-    let end = units[first..]
-        .iter()
-        .position(|u| u.start >= to)
-        .map_or(units.len(), |k| first + k)
-        .clamp(first + 1, fitting(doc, first));
+    let units = doc.units();
     let note = match from == to {
         true => match doc.unit_at(from - 1) {
             Some(i) => format!(
@@ -156,8 +147,29 @@ pub fn lines_read(repo: &str, path: &str, doc: &Doc, from: usize, to: usize) -> 
         },
         false => String::new(),
     };
+    format!("{note}{}", range_read(repo, path, doc, from, to))
+}
+
+/// The parts a read of lines `from`..=`to` holds and its closing line —
+/// [`lines_read`] without the note a one-line read opens with. What the
+/// knowledge base seals a section of a file as, one per [`windows`] range.
+pub fn range_read(repo: &str, path: &str, doc: &Doc, from: usize, to: usize) -> String {
+    let file = format!("{repo}/{path}");
+    let units = doc.units();
+    if units.is_empty() {
+        return empty(&file, doc);
+    }
+    let first = units
+        .iter()
+        .position(|u| u.end >= from)
+        .unwrap_or(units.len() - 1);
+    let end = units[first..]
+        .iter()
+        .position(|u| u.start >= to)
+        .map_or(units.len(), |k| first + k)
+        .clamp(first + 1, fitting(doc, first));
     format!(
-        "{note}{}{}",
+        "{}{}",
         blocks(doc, first..end, source(&file, path)),
         closing(&file, doc, first, end)
     )
@@ -278,6 +290,28 @@ mod tests {
         let last = lines_read("r", "a.md", &doc, 301, 450);
         assert_eq!(last.matches("```markdown").count(), 50);
         assert!(last.ends_with("end of r/a.md lines 301-450 of 450 — the end of the file\n"));
+    }
+
+    /// **A range read is the lines read without its note**: the same parts
+    /// and closing line, whatever the range's length.
+    #[test]
+    fn a_range_read_is_the_lines_read_without_its_note() {
+        let doc = Doc::new("a.rs", "use x;\n\nfn go() {\n    1\n}\n");
+        assert_eq!(
+            range_read("r", "a.rs", &doc, 1, 5),
+            lines_read("r", "a.rs", &doc, 1, 5)
+        );
+        let one = Doc::new("a.md", "only\n");
+        assert_eq!(
+            range_read("r", "a.md", &one, 1, 1),
+            format!(
+                "```markdown file=r/a.md part={} lines=1\n +1 only\n```\n\
+                 end of r/a.md lines 1 of 1 — the end of the file\n",
+                anchors(&one)[0]
+            )
+        );
+        assert!(lines_read("r", "a.md", &one, 1, 1).starts_with("line 1 is part="));
+        assert!(lines_read("r", "a.rs", &doc, 4, 4).ends_with(&range_read("r", "a.rs", &doc, 4, 4)));
     }
 
     /// **A one-line read names the part and its line**, a blank line names

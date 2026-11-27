@@ -9,12 +9,13 @@
 //! and read by the branch checkpoint's recurrence, it is the part of the
 //! knowledge base every conversation's recurrent state has read.
 
-use candle_conversation::files::{assemble_pieces, Chunk, LineSpan, RenderedFile};
+use candle_conversation::files::{assemble_pieces, FileUnit, RenderedFile};
 use candle_conversation::projection::Builder;
 use zend_vfs::vfs::Tree;
-use zend_vfs::{GitError, Rev};
+use zend_vfs::Rev;
 
 use super::listing::listing_text;
+use super::sections::sections;
 use crate::branch_ingest::walk::RepoBranches;
 use crate::journal::opening::SeedRead;
 
@@ -26,27 +27,11 @@ pub const SEED_NODE: &str = "seed";
 /// never a subfolder's.
 pub const ANCHOR_FILES: [&str; 4] = ["README.md", "ARCHITECTURE.md", "AGENTS.md", "CLAUDE.md"];
 
-/// `text` as one chunk of a file: every line ending its `\n`.
-fn whole(text: &str) -> Chunk {
-    let text = if text.is_empty() || text.ends_with('\n') {
-        text.to_string()
-    } else {
-        format!("{text}\n")
-    };
-    let lines = text.matches('\n').count() as u32;
-    Chunk {
-        lines: LineSpan {
-            first: 1,
-            last: lines.max(1),
-        },
-        text,
-    }
-}
-
 /// The seed's files of one repository: its root listing, then each anchor
 /// document its default branch holds at the root, matched case-insensitively,
-/// in [`ANCHOR_FILES`] order. A repository with no branch contributes nothing.
-pub fn repo_seed(repo: &RepoBranches) -> Result<Vec<RenderedFile>, GitError> {
+/// in [`ANCHOR_FILES`] order, each cut into the knowledge base's sections. A
+/// repository with no branch contributes nothing.
+pub fn repo_seed(repo: &RepoBranches) -> anyhow::Result<Vec<RenderedFile>> {
     let Some(tip) = repo.tips.first() else {
         return Ok(Vec::new());
     };
@@ -55,9 +40,10 @@ pub fn repo_seed(repo: &RepoBranches) -> Result<Vec<RenderedFile>, GitError> {
     };
     let tree = Tree::read(&repo.repo, &tree_id)?;
     let children = tree.children("");
+    let root = format!("{}/", repo.name);
     let mut out = vec![RenderedFile {
-        path: format!("{}/", repo.name),
-        chunks: vec![whole(&listing_text(&children))],
+        chunks: sections(&root, FileUnit::Folder, &listing_text(&children))?,
+        path: root,
     }];
     for anchor in ANCHOR_FILES {
         let found = children
@@ -73,16 +59,17 @@ pub fn repo_seed(repo: &RepoBranches) -> Result<Vec<RenderedFile>, GitError> {
             continue;
         };
         let text = String::from_utf8_lossy(&bytes);
+        let path = format!("{}/{path}", repo.name);
         out.push(RenderedFile {
-            path: format!("{}/{path}", repo.name),
-            chunks: vec![whole(&text)],
+            chunks: sections(&path, FileUnit::File, &text)?,
+            path,
         });
     }
     Ok(out)
 }
 
-/// The seed's text: `files`' snippets as the knowledge base places them after
-/// `files_open`, the last ending on its closing fence, which the close follows.
+/// The seed's text: `files`' sections as the knowledge base places them after
+/// `files_open`.
 pub fn seed_text(files: &[RenderedFile]) -> String {
     assemble_pieces(files).into_iter().skip(1).collect()
 }
@@ -167,20 +154,26 @@ mod tests {
     }
 
     /// **The seed renders a repository's root listing and its anchor
-    /// documents, in Q1's notation**: the listing first, then README and the
-    /// lower-case `agents.md` matched as AGENTS, a subfolder's README left
-    /// out; the text is what follows `files_open`, ending on the last fence.
+    /// documents, in the knowledge base's notation**: the listing first, then
+    /// README and the lower-case `agents.md` matched as AGENTS, a subfolder's
+    /// README left out; each a section, its text what follows `files_open`.
     #[test]
     fn the_seed_renders_its_files_in_the_knowledge_bases_notation() {
         let (_tmp, repo) = repo();
         let files = repo_seed(&repo).unwrap();
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, ["r/", "r/README.md", "r/agents.md"]);
-        assert_eq!(
-            seed_text(&files),
-            "## The content from r/:\n\n```\nREADME.md 4\nagents.md 5\ndocs/\nsrc/\n```\n\n\
-             ## The content from r/README.md:\n\n```\n# R\n```\n\n\
-             ## The content from r/agents.md:\n\n```\nrules\n```\n"
+        let text = seed_text(&files);
+        assert!(
+            text.starts_with(
+                "## The content from r/:\n\n```\nREADME.md 4\nagents.md 5\ndocs/\nsrc/\n```\n\n\
+                 ## The content from r/README.md:\n\n```markdown file=r/README.md part="
+            ),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("end of r/agents.md lines 1 of 1 — the end of the file\n\n"),
+            "{text}"
         );
         let read = seed_read(&files);
         assert_eq!(read.listings, ["r"]);

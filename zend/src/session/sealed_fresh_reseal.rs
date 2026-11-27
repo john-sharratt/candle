@@ -4,12 +4,12 @@
 //! A knowledge-base member is sealed behind the birth prefix up to
 //! `files_open`, which leaves the tool catalog's members out; the prompt that
 //! reads it places them ahead of it. Sealed again behind the sections the
-//! prompt places before the file — same text, same chunks, same policies —
+//! prompt places before the file — same text, same sections, same policies —
 //! under a probe version of its record, the member's K/V is computed in the
 //! context it is read in, and nothing else about the prompt changes.
 
 use anyhow::Context;
-use candle_conversation::files::names::{chunk_name, heading_name};
+use candle_conversation::files::names::chunk_name;
 use candle_conversation::files::{files_owner, ChunkRecord, FileRecord, MemberRef};
 use candle_conversation::projection::{Conversation, PrefixItem, SectionId};
 use candle_conversation::{MemberSpec, MembersPrefix, SealAs, Sequence};
@@ -30,19 +30,14 @@ fn member_texts(
     decode: impl Fn(&[u32]) -> anyhow::Result<String>,
     record: &FileRecord,
 ) -> anyhow::Result<Vec<String>> {
-    let mut names = vec![heading_name(&record.path, &record.blob)];
-    names.extend(
-        record
-            .chunks
-            .iter()
-            .map(|c| chunk_name(&record.path, &record.blob, c.lines)),
-    );
-    names
+    record
+        .chunks
         .iter()
+        .map(|c| chunk_name(&record.path, &record.blob, c.lines))
         .map(|name| {
             let id = conversation
                 .read()
-                .owned_section_named(files_owner(), name)
+                .owned_section_named(files_owner(), &name)
                 .with_context(|| format!("member {name} is not held here"))?;
             let ids = conversation.read().section_tokens_of(id).to_vec();
             let text = decode(&ids)?;
@@ -74,20 +69,15 @@ pub fn reseal_behind(
         SealAs::Member => probe_blob(&record.blob),
         SealAs::Boundary => format!("{}~q8", probe_blob(&record.blob)),
     };
-    let mut specs = vec![MemberSpec {
-        name: heading_name(&record.path, &blob),
-        content: texts[0].clone(),
-    }];
-    specs.extend(
-        record
-            .chunks
-            .iter()
-            .zip(&texts[1..])
-            .map(|(c, text)| MemberSpec {
-                name: chunk_name(&record.path, &blob, c.lines),
-                content: text.clone(),
-            }),
-    );
+    let specs: Vec<MemberSpec> = record
+        .chunks
+        .iter()
+        .zip(&texts)
+        .map(|(c, text)| MemberSpec {
+            name: chunk_name(&record.path, &blob, c.lines),
+            content: text.clone(),
+        })
+        .collect();
     // The prompt as placed already holds the hole ahead of the file, so the
     // members are sealed straight after it, as they were placed.
     let behind = MembersPrefix {
@@ -97,21 +87,19 @@ pub fn reseal_behind(
     let sealed = base
         .seal_members_behind(&behind, &specs, kind)
         .map_err(|e| anyhow::anyhow!("sealing the probe's members: {e}"))?;
-    let member = |i: usize| MemberRef {
-        address: sealed[i].address,
-        tokens: sealed[i].tokens as u32,
-    };
     let probe = FileRecord {
         content_key: format!("{}~{blob}", record.content_key),
         blob,
-        heading: member(0),
         chunks: record
             .chunks
             .iter()
-            .enumerate()
-            .map(|(i, c)| ChunkRecord {
+            .zip(&sealed)
+            .map(|(c, m)| ChunkRecord {
                 lines: c.lines,
-                member: member(i + 1),
+                member: MemberRef {
+                    address: m.address,
+                    tokens: m.tokens as u32,
+                },
             })
             .collect(),
         ..record.clone()
@@ -136,7 +124,7 @@ pub fn prefix_before(pieces: &[DumpedPiece], first_member: u32) -> anyhow::Resul
     let at = pieces
         .iter()
         .position(|p| *p == DumpedPiece::Section(first_member))
-        .context("the file's heading is not in the prompt")?;
+        .context("the file's first section is not in the prompt")?;
     Ok(pieces[..at]
         .iter()
         .filter_map(|p| match *p {
@@ -151,10 +139,10 @@ pub fn prefix_before(pieces: &[DumpedPiece], first_member: u32) -> anyhow::Resul
 mod tests {
     use super::*;
 
-    /// **The prefix is every section and hole ahead of the file's heading**,
-    /// in order, glue left out.
+    /// **The prefix is every section and hole ahead of the file's first
+    /// section**, in order, glue left out.
     #[test]
-    fn the_prefix_is_every_section_and_hole_ahead_of_the_heading() {
+    fn the_prefix_is_every_section_and_hole_ahead_of_the_first_section() {
         let pieces = [
             DumpedPiece::Section(1),
             DumpedPiece::Other,

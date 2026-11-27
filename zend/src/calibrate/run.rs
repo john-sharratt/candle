@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use candle_conversation::files::names::{chunk_name, heading_name};
+use candle_conversation::files::names::chunk_name;
 use candle_conversation::files::{files_owner, FileKey, FileRecord, FileUnit, FilesPin};
 use candle_conversation::projection::{
     Conversation, DecodePriority, OptionalState, SelectionState, TimelineId, NO_THINK_SELECTOR,
@@ -523,16 +523,11 @@ fn record_of(engine: &ConversationEngine, units: &[Unit]) -> anyhow::Result<File
 /// The raw ids of `record`'s members in this process: what a draft that sees
 /// its file holds.
 fn member_ids(conversation: &Conversation, record: &FileRecord) -> HashSet<u32> {
-    let mut names = vec![heading_name(&record.path, &record.blob)];
-    names.extend(
-        record
-            .chunks
-            .iter()
-            .map(|c| chunk_name(&record.path, &record.blob, c.lines)),
-    );
-    names
+    record
+        .chunks
         .iter()
-        .filter_map(|n| conversation.owned_section_named(files_owner(), n))
+        .map(|c| chunk_name(&record.path, &record.blob, c.lines))
+        .filter_map(|n| conversation.owned_section_named(files_owner(), &n))
         .map(|id| id.raw())
         .collect()
 }
@@ -1019,7 +1014,6 @@ mod tests {
             lines: 3,
             lang: "rs".into(),
             branches: vec!["main".into()],
-            heading: member,
             chunks: vec![ChunkRecord {
                 lines: LineSpan { first: 1, last: 3 },
                 member,
@@ -1042,7 +1036,11 @@ mod tests {
             records::put(&conv, r).unwrap();
         }
         let id = conv.allocate_owned_section().unwrap();
-        conv.register_owned_section(files_owner(), &heading_name(&sealed.path, &sealed.blob), id);
+        conv.register_owned_section(
+            files_owner(),
+            &chunk_name(&sealed.path, &sealed.blob, sealed.chunks[0].lines),
+            id,
+        );
         let worn = format!("target:{}", sealed.content_key);
         failures::record(
             &conv,

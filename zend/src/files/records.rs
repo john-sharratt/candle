@@ -9,7 +9,7 @@
 //! has sealed or restored them is asked of the names they register under
 //! ([`placeable`]).
 
-use candle_conversation::files::names::heading_name;
+use candle_conversation::files::names::chunk_name;
 use candle_conversation::files::{files_owner, path_prefix, FileRecord, FILES_PREFIX};
 use candle_conversation::persistence::record::CustomObjectPayload;
 use candle_conversation::projection::Conversation;
@@ -49,16 +49,21 @@ pub fn retire(conversation: &Conversation, record: &FileRecord) -> anyhow::Resul
     Ok(())
 }
 
-/// Whether this process holds `record`'s members: its heading registered,
-/// which a file's seal does last of nothing and first of its chain, so a
-/// record whose chain this process sealed or restored. A record that arrived
-/// from another member, or survived a restart, is not until the ingest's
-/// walk seals its chain here (§12 D15).
+/// Whether this process holds `record`'s members: its last section
+/// registered, which a file's seal does last of its chain, so a record whose
+/// chain this process sealed or restored whole. A record that arrived from
+/// another member, or survived a restart, is not until the ingest's walk
+/// seals its chain here (§12 D15).
 pub fn placeable(conversation: &Conversation, record: &FileRecord) -> bool {
-    conversation
-        .read()
-        .owned_section_named(files_owner(), &heading_name(&record.path, &record.blob))
-        .is_some()
+    record.chunks.last().is_some_and(|last| {
+        conversation
+            .read()
+            .owned_section_named(
+                files_owner(),
+                &chunk_name(&record.path, &record.blob, last.lines),
+            )
+            .is_some()
+    })
 }
 
 #[cfg(test)]
@@ -85,7 +90,6 @@ mod tests {
             lines: 3,
             lang: "rs".into(),
             branches: vec!["main".into()],
-            heading: member,
             chunks: vec![ChunkRecord {
                 lines: LineSpan { first: 1, last: 3 },
                 member,
@@ -110,16 +114,16 @@ mod tests {
         assert_eq!(all(&conversation).len(), 2);
     }
 
-    /// **A record is placeable only once this process has named its
-    /// heading**: one read from the substrate alone is not.
+    /// **A record is placeable only once this process has named its last
+    /// section**: one read from the substrate alone is not.
     #[test]
-    fn a_record_is_placeable_once_its_heading_is_named_here() {
+    fn a_record_is_placeable_once_its_last_section_is_named_here() {
         let conversation = Conversation::new();
         let r = record("candle/a.rs", "aa");
         put(&conversation, &r).unwrap();
         assert!(!placeable(&conversation, &r));
         let section = conversation.allocate_owned_section().expect("an owned id");
-        conversation.register_owned_section(files_owner(), "candle/a.rs@aa#heading", section);
+        conversation.register_owned_section(files_owner(), "candle/a.rs@aa#1-3", section);
         assert!(placeable(&conversation, &r));
     }
 }

@@ -2,9 +2,7 @@
 //! (`docs/provenance_system_collection.md` §3, §4).
 
 use super::*;
-use crate::files::names::{
-    chunk_name, heading_name, CLOSING_JOIN_NAME, CLOSING_LAST_NAME, GAP_NAME,
-};
+use crate::files::names::chunk_name;
 use crate::files::{ChunkRecord, FileKey, FileUnit, FilesPin, LineSpan, MemberRef, PlacedFile};
 use crate::persistence::content_hash::ContentHash;
 use crate::persistence::streams::ContentAddress;
@@ -63,7 +61,6 @@ fn record(path: &str, spans: &[(u32, u32)]) -> FileRecord {
         lines: spans.last().map_or(0, |s| s.1),
         lang: "rs".into(),
         branches: vec![],
-        heading: member(10),
         chunks: spans
             .iter()
             .map(|&(first, last)| ChunkRecord {
@@ -89,11 +86,7 @@ fn resolver(
         next += 1;
         members.insert(name, SectionId::new(next));
     };
-    for name in [GAP_NAME, CLOSING_JOIN_NAME, CLOSING_LAST_NAME] {
-        id(name.to_string(), &mut members);
-    }
     for r in records {
-        id(heading_name(&r.path, &r.blob), &mut members);
         for c in &r.chunks {
             id(chunk_name(&r.path, &r.blob, c.lines), &mut members);
         }
@@ -107,8 +100,6 @@ fn resolver(
     mock.files = Some(set);
     mock.file_records = records.to_vec();
     mock.members = members.clone();
-    mock.section_tokens
-        .insert(members[CLOSING_JOIN_NAME].raw(), 2);
     (mock, members)
 }
 
@@ -122,12 +113,11 @@ fn ids(segments: &[ProjectionSegment]) -> Vec<SectionId> {
         .collect()
 }
 
-/// **The files sit strongest first at the opening, each its heading, its
-/// chunks with a gap between runs and its closing piece, the last closing the
-/// knowledge base**: b (900) whole, then a (800), whose two chunks are not
-/// contiguous, ending on `closing_last`.
+/// **The files sit strongest first at the opening, each its placed sections
+/// in line order and nothing between them**: b (900) whole, then a (800),
+/// whose two sections are not contiguous — each says where it sits.
 #[test]
-fn files_are_spliced_strongest_first_each_framed_and_the_last_ends_the_knowledge_base() {
+fn files_are_spliced_strongest_first_as_their_sections() {
     let b = Builder::from_yaml(YAML).unwrap();
     let fa = record("candle/a.rs", &[(1, 200), (401, 600)]);
     let fb = record("candle/b.rs", &[(1, 50)]);
@@ -138,7 +128,7 @@ fn files_are_spliced_strongest_first_each_framed_and_the_last_ends_the_knowledge
         &[(fa.key(), 800.0), (fb.key(), 900.0)],
         vec![],
     );
-    let splice = files_splice(b.schema(), &mock, |_| 10_000, false);
+    let splice = files_splice(b.schema(), &mock, |_| 10_000);
     assert_eq!(splice.order(), vec![fb.key(), fa.key()]);
     // Each placement names the lines of the chunks it placed, in order.
     assert_eq!(
@@ -160,10 +150,7 @@ fn files_are_spliced_strongest_first_each_framed_and_the_last_ends_the_knowledge
     assert_eq!(
         ids(&splice.segments),
         vec![
-            m[&heading_name("candle/b.rs", "b")],
             m[&chunk_name("candle/b.rs", "b", LineSpan { first: 1, last: 50 })],
-            m[CLOSING_JOIN_NAME],
-            m[&heading_name("candle/a.rs", "b")],
             m[&chunk_name(
                 "candle/a.rs",
                 "b",
@@ -172,7 +159,6 @@ fn files_are_spliced_strongest_first_each_framed_and_the_last_ends_the_knowledge
                     last: 200
                 }
             )],
-            m[GAP_NAME],
             m[&chunk_name(
                 "candle/a.rs",
                 "b",
@@ -181,18 +167,13 @@ fn files_are_spliced_strongest_first_each_framed_and_the_last_ends_the_knowledge
                     last: 600
                 }
             )],
-            m[CLOSING_LAST_NAME],
         ]
     );
-    // With the seed after it, the last file joins rather than ends.
-    let seeded = files_splice(b.schema(), &mock, |_| 10_000, true);
-    assert_eq!(ids(&seeded.segments).last(), Some(&m[CLOSING_JOIN_NAME]));
 }
 
 /// **A pinned knowledge base holds its one file whole, or nothing**: pinned
-/// to a, a's every chunk is placed under a cap that holds none of it, b is
-/// left out though stronger, and a ends the knowledge base; pinned empty,
-/// nothing is placed.
+/// to a, a's every section is placed under a cap that holds none of it, b is
+/// left out though stronger; pinned empty, nothing is placed.
 #[test]
 fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
     let b = Builder::from_yaml(YAML).unwrap();
@@ -206,12 +187,11 @@ fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
         vec![],
     );
     mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key()]);
-    let splice = files_splice(b.schema(), &mock, |_| 0, false);
+    let splice = files_splice(b.schema(), &mock, |_| 0);
     assert_eq!(splice.order(), vec![fa.key()]);
     assert_eq!(
         ids(&splice.segments),
         vec![
-            m[&heading_name("candle/a.rs", "b")],
             m[&chunk_name(
                 "candle/a.rs",
                 "b",
@@ -228,18 +208,16 @@ fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
                     last: 260
                 }
             )],
-            m[CLOSING_LAST_NAME],
         ]
     );
     mock.files.as_mut().unwrap().pin = FilesPin::Empty;
-    let empty = files_splice(b.schema(), &mock, |_| 10_000, false);
+    let empty = files_splice(b.schema(), &mock, |_| 10_000);
     assert!(empty.placed.is_empty());
     assert!(empty.segments.is_empty());
 }
 
 /// **Pinned files sit in the pin's order, whatever their momentum**: a
-/// weaker file pinned first stays first, each whole, and the last ends the
-/// knowledge base.
+/// weaker file pinned first stays first, each whole.
 #[test]
 fn pinned_files_sit_in_the_pins_order() {
     let b = Builder::from_yaml(YAML).unwrap();
@@ -253,19 +231,12 @@ fn pinned_files_sit_in_the_pins_order() {
         vec![],
     );
     mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key(), fb.key()]);
-    let splice = files_splice(b.schema(), &mock, |_| 0, false);
+    let splice = files_splice(b.schema(), &mock, |_| 0);
     assert_eq!(splice.order(), vec![fa.key(), fb.key()]);
     let chunk = |path: &str| m[&chunk_name(path, "b", LineSpan { first: 1, last: 10 })];
     assert_eq!(
         ids(&splice.segments),
-        vec![
-            m[&heading_name("candle/a.rs", "b")],
-            chunk("candle/a.rs"),
-            m[CLOSING_JOIN_NAME],
-            m[&heading_name("candle/b.rs", "b")],
-            chunk("candle/b.rs"),
-            m[CLOSING_LAST_NAME],
-        ]
+        vec![chunk("candle/a.rs"), chunk("candle/b.rs")]
     );
 }
 
@@ -320,7 +291,7 @@ layers:
     mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key()]);
     let proj = b.project(target, &mock);
     assert_eq!(proj.files_order(), vec![fa.key()]);
-    let heading = m[&heading_name("candle/a.rs", "b")];
+    let first = m[&chunk_name("candle/a.rs", "b", LineSpan { first: 1, last: 10 })];
     let sections: Vec<SectionId> = proj
         .segments
         .iter()
@@ -334,7 +305,7 @@ layers:
         _ => None,
     });
     let at = sections.iter().position(|&s| Some(s) == kb).unwrap();
-    assert_eq!(sections[at + 1], heading, "the file follows files_open");
+    assert_eq!(sections[at + 1], first, "the file follows files_open");
 }
 
 /// **A kept file keeps its place**: a placed before b, b now stronger — a
@@ -352,7 +323,7 @@ fn a_kept_file_keeps_its_place_in_the_knowledge_base() {
         vec![fa.key(), fb.key()],
     );
     assert_eq!(
-        files_splice(b.schema(), &mock, |_| 10_000, false).order(),
+        files_splice(b.schema(), &mock, |_| 10_000).order(),
         vec![fa.key(), fb.key()]
     );
 }

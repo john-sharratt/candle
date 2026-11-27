@@ -3,13 +3,10 @@
 //!
 //! - [`key`] — what names a file ([`FileKey`]) and a run of its lines
 //!   ([`LineSpan`], [`ChunkKey`]);
-//! - [`chunk`] and [`cut`] — a file cut into chunks of whole lines whose
-//!   seams tokenize as the whole file does;
-//! - [`render`] — the notation, Qwen-Agent's, and the pieces the prompt seals
-//!   it as.
+//! - [`chunk`] — a section of a file: the lines it holds and its text;
+//! - [`render`] — the notation, and the pieces the prompt seals it as.
 
 pub mod chunk;
-pub mod cut;
 pub mod fill;
 pub mod key;
 pub mod names;
@@ -21,7 +18,6 @@ pub mod set;
 pub mod stream_name;
 
 pub use chunk::Chunk;
-pub use cut::cut_lines;
 pub use key::{content_key, ChunkKey, FileKey, LineSpan};
 pub use owner::files_owner;
 pub use placed::PlacedFile;

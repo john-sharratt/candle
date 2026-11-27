@@ -776,10 +776,7 @@ pub fn run_with_sink<R: ContentResolver>(
                 WorkingSetShare::Journals => shares.journals,
             }
         };
-        // The last file joins a seed placed after it, and ends the knowledge
-        // base when none is.
-        let seeded = effective_selection.seeds() && files_at.seed_follows;
-        let splice = files_splice(schema, resolver, kind_cap, seeded);
+        let splice = files_splice(schema, resolver, kind_cap);
         let at = files_at.insert_at(&system_prompt_segments);
         if let (Some(at), false) = (at, splice.segments.is_empty()) {
             let tokens = segment_tokens(&splice.segments, resolver);

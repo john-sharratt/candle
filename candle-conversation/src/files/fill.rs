@@ -2,22 +2,17 @@
 //! (`docs/provenance_system_collection.md` §4).
 //!
 //! The kind's files go strongest first under the kind's share of the room. A
-//! file that fits is placed whole — its heading, every chunk, its closing — as
-//! the probes placed files; one that does not fit is placed as many of its
-//! leading chunks as fit, the file's own opening first, and the next file is
-//! tried in what remains. A file none of whose chunks fit is not placed.
+//! file that fits is placed whole — every section; one that does not fit is
+//! placed as many of its leading sections as fit, the file's own opening
+//! first, and the next file is tried in what remains. A file none of whose
+//! sections fit is not placed. Each section carries its own heading and
+//! closing line, so a placed file costs its sections' tokens and nothing more.
 
 use super::key::FileKey;
 use super::record::FileRecord;
 
-/// The tokens a placed file costs beyond its chunks: its heading and its
-/// closing piece.
-pub fn frame_tokens(record: &FileRecord, closing: u32) -> usize {
-    record.heading.tokens as usize + closing as usize
-}
-
 /// One file as a projection places it: its key and the indices of its
-/// chunks placed, in line order.
+/// sections placed, in line order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilePlacement {
     pub file: FileKey,
@@ -25,12 +20,11 @@ pub struct FilePlacement {
 }
 
 /// The files of `ranked` — strongest first, each found in `record_of` — placed
-/// under `cap` tokens, a closing piece costing `closing` tokens.
+/// under `cap` tokens.
 pub fn choose<'a>(
     ranked: &[(FileKey, f32)],
     record_of: impl Fn(FileKey) -> Option<&'a FileRecord>,
     cap: usize,
-    closing: u32,
 ) -> Vec<FilePlacement> {
     let mut left = cap;
     let mut out = Vec::new();
@@ -38,11 +32,7 @@ pub fn choose<'a>(
         let Some(record) = record_of(file) else {
             continue;
         };
-        let frame = frame_tokens(record, closing);
-        if left <= frame {
-            continue;
-        }
-        let mut room = left - frame;
+        let mut room = left;
         let mut chunks = Vec::new();
         for (i, c) in record.chunks.iter().enumerate() {
             let t = c.member.tokens as usize;
@@ -87,7 +77,6 @@ mod tests {
             lines: 1,
             lang: "rs".into(),
             branches: vec![],
-            heading: member(10),
             chunks: chunks
                 .iter()
                 .enumerate()
@@ -102,18 +91,18 @@ mod tests {
         }
     }
 
-    /// **Strongest first, whole when it fits, its leading chunks when it does
-    /// not, and the next file tried in what remains**: under 1,000 tokens, a
-    /// (10 + 300 + 300 + 2 = 612) whole; b's first chunk (10 + 200 + 2) fits
-    /// the 388 left and its second does not; c (10 + 500 + 2) no longer fits.
+    /// **Strongest first, whole when it fits, its leading sections when it
+    /// does not, and the next file tried in what remains**: under 1,000
+    /// tokens, a (300 + 300) whole; b's first section (200) fits the 400 left
+    /// and its second (400) does not; c (500) no longer fits the 200 left.
     #[test]
-    fn files_are_placed_strongest_first_whole_or_by_their_leading_chunks() {
+    fn files_are_placed_strongest_first_whole_or_by_their_leading_sections() {
         let a = record("a.rs", &[300, 300]);
         let b = record("b.rs", &[200, 400]);
         let c = record("c.rs", &[500]);
         let records = [a.clone(), b.clone(), c.clone()];
         let ranked = [(a.key(), 900.0), (b.key(), 800.0), (c.key(), 700.0)];
-        let placed = choose(&ranked, |k| records.iter().find(|r| r.key() == k), 1_000, 2);
+        let placed = choose(&ranked, |k| records.iter().find(|r| r.key() == k), 1_000);
         assert_eq!(
             placed,
             vec![
@@ -127,7 +116,7 @@ mod tests {
                 },
             ]
         );
-        assert!(choose(&ranked, |_| None, 1_000, 2).is_empty());
-        assert!(choose(&ranked, |k| records.iter().find(|r| r.key() == k), 12, 2).is_empty());
+        assert!(choose(&ranked, |_| None, 1_000).is_empty());
+        assert!(choose(&ranked, |k| records.iter().find(|r| r.key() == k), 12).is_empty());
     }
 }

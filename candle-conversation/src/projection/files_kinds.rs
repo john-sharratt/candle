@@ -69,7 +69,6 @@ mod tests {
             lines: 1,
             lang: "rs".into(),
             branches: vec!["main".into()],
-            heading: member,
             chunks: vec![ChunkRecord {
                 lines: LineSpan { first: 1, last: 1 },
                 member,

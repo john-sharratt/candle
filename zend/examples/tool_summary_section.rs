@@ -12,7 +12,9 @@
 //! ```
 
 use candle_conversation::models::Model;
-use candle_conversation::projection::{Builder, Reserved, SectionId, SystemPromptItem};
+use candle_conversation::projection::{
+    sections_prefix, Builder, Reserved, SectionId, SystemPromptItem,
+};
 use candle_conversation::{ConversationEngine, SequenceConfig};
 use zend::tools::install_tool_catalog;
 
@@ -113,7 +115,7 @@ fn main() -> anyhow::Result<()> {
             .new_conversation_with_projection(&formatted, proj, dialogue, group, cfg)
             .map_err(|e| anyhow::anyhow!("base conv: {e}"))?;
 
-        base.insert_section_with_prefix(sid, FAKE_SUMMARY, &prelude)
+        base.insert_section_with_prefix(sid, FAKE_SUMMARY, &sections_prefix(&prelude))
             .map_err(|e| anyhow::anyhow!("seal summary section: {e}"))?;
 
         let conv = engine.conversation();
@@ -136,7 +138,7 @@ fn main() -> anyhow::Result<()> {
             .new_conversation_with_projection(&formatted, proj, dialogue, group, cfg)
             .map_err(|e| anyhow::anyhow!("base conv: {e}"))?;
         // Same text + same prefix → same content address → restore (no re-prefill).
-        base.insert_section_with_prefix(sid, FAKE_SUMMARY, &prelude)
+        base.insert_section_with_prefix(sid, FAKE_SUMMARY, &sections_prefix(&prelude))
             .map_err(|e| anyhow::anyhow!("restore summary section: {e}"))?;
         let conv = engine.conversation();
         let sealed = conv.read().section_sealed_of(sid).is_some();

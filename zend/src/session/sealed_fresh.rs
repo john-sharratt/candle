@@ -35,7 +35,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context;
-use candle_conversation::files::names::{chunk_name, heading_name};
+use candle_conversation::files::names::chunk_name;
 use candle_conversation::files::{files_owner, FileKey, FileRecord, FilesPin};
 use candle_conversation::projection::Conversation;
 use candle_conversation::projection::{
@@ -224,13 +224,9 @@ fn take_to(records: impl Iterator<Item = FileRecord>, tokens: usize) -> Vec<File
     out
 }
 
-/// A record's members' tokens: its heading and every chunk.
+/// A record's members' tokens: every section.
 fn record_tokens(r: &FileRecord) -> usize {
-    r.heading.tokens as usize
-        + r.chunks
-            .iter()
-            .map(|c| c.member.tokens as usize)
-            .sum::<usize>()
+    r.tokens() as usize
 }
 
 /// Which side a part of the fresh slot comes from.
@@ -411,16 +407,11 @@ pub fn first_divergence(a: &[u32], b: &[u32]) -> Option<usize> {
 
 /// The raw ids of `record`'s member sections in this process.
 fn member_ids(conversation: &Conversation, record: &FileRecord) -> HashSet<u32> {
-    let mut names = vec![heading_name(&record.path, &record.blob)];
-    names.extend(
-        record
-            .chunks
-            .iter()
-            .map(|c| chunk_name(&record.path, &record.blob, c.lines)),
-    );
-    names
+    record
+        .chunks
         .iter()
-        .filter_map(|n| conversation.owned_section_named(files_owner(), n))
+        .map(|c| chunk_name(&record.path, &record.blob, c.lines))
+        .filter_map(|n| conversation.owned_section_named(files_owner(), &n))
         .map(|id| id.raw())
         .collect()
 }
@@ -521,10 +512,16 @@ impl ZendSession {
             let mut resealed_same_tokens = None;
             if let (true, Some(record)) = (req.reseal, record.as_ref()) {
                 let conversation = engine.conversation();
-                let heading = conversation
-                    .read()
-                    .owned_section_named(files_owner(), &heading_name(&record.path, &record.blob))
-                    .context("the file's heading is not held here")?;
+                let opening = record
+                    .chunks
+                    .first()
+                    .and_then(|c| {
+                        conversation.read().owned_section_named(
+                            files_owner(),
+                            &chunk_name(&record.path, &record.blob, c.lines),
+                        )
+                    })
+                    .context("the file's first section is not held here")?;
                 let pieces: Vec<DumpedPiece> = dump
                     .pieces
                     .iter()
@@ -534,7 +531,7 @@ impl ZendSession {
                         (_, None) => DumpedPiece::Other,
                     })
                     .collect();
-                let prefix = prefix_before(&pieces, heading.raw())?;
+                let prefix = prefix_before(&pieces, opening.raw())?;
                 let decode = |ids: &[u32]| {
                     engine
                         .tokenizer()
@@ -897,7 +894,7 @@ mod tests {
         );
     }
 
-    fn record_of(path: &str, heading: u32, chunks: &[u32]) -> FileRecord {
+    fn record_of(path: &str, chunks: &[u32]) -> FileRecord {
         let member = |tokens| MemberRef {
             address: ContentAddress {
                 prefix_hash: ContentHash::ZERO,
@@ -913,7 +910,6 @@ mod tests {
             lines: 1,
             lang: "rs".into(),
             branches: vec![],
-            heading: member(heading),
             chunks: chunks
                 .iter()
                 .map(|&t| ChunkRecord {
@@ -929,9 +925,9 @@ mod tests {
     #[test]
     fn files_are_taken_until_their_tokens_reach_the_ask() {
         let records = [
-            record_of("a", 10, &[90]),
-            record_of("b", 10, &[40, 50]),
-            record_of("c", 5, &[5]),
+            record_of("a", &[100]),
+            record_of("b", &[50, 50]),
+            record_of("c", &[10]),
         ];
         assert_eq!(record_tokens(&records[1]), 100);
         let paths = |n: usize| -> Vec<String> {

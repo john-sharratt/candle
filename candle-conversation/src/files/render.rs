@@ -1,20 +1,20 @@
-//! The knowledge base's notation: Qwen-Agent's (`qwen_agent/agents/
-//! assistant.py`, `KNOWLEDGE_TEMPLATE_EN` and `KNOWLEDGE_SNIPPET_EN`), and the
-//! pieces the system prompt seals it as.
+//! The knowledge base's notation and the pieces the system prompt seals it as
+//! (`docs/placed_section_layout.md` §3.5c).
 //!
-//! The knowledge base is `# Knowledge Base`, then each file placed as one
-//! snippet — its heading, its placed text in a fence — the snippets joined by
-//! a blank line. [`knowledge_text`] is that text; [`assemble_pieces`] is the
-//! same text cut into the pieces the prompt seals, each tokenized on its own.
+//! The knowledge base is `# Knowledge Base`, then each placed section of a
+//! file: its heading, `## The content from {path}:`, a blank line, and its
+//! text — for a file, the body a `file_read` of the section's range returns,
+//! byte for byte, so a placed section carries the part anchors and relative
+//! line numbers an edit names. Every section but a file's last ends with the
+//! [`CUT_MARKER`] after its closing line, so a section placed without the one
+//! after it reads as continuing. Each section ends on a blank line, which
+//! parts it from whatever follows.
 //!
-//! Where a piece meets a chunk is where its tokens could merge across the
-//! join, so every piece is cut where Qwen's vocabulary does not merge: a line
-//! keeps its own `\n` (a punctuation mark and the newlines after it are one
-//! pre-token, so a `}` cannot be parted from its `\n`), and nothing that
-//! follows a chunk starts with a newline (it would join the chunk's last one).
-//! So the fence that closes a file opens its piece with the backticks, the gap
-//! between two runs of a file opens with its dots, and a chunk's last line,
-//! ending in `\n`, puts the fence on a line of its own.
+//! A section is sealed on its own, so its tokens are its text's alone. Where
+//! two sections meet is where their tokens could merge across the join: every
+//! section therefore ends on its blank line's `\n\n` and opens on its
+//! heading's `##`, which Qwen's vocabulary never merges, and the knowledge
+//! base's title ends on a blank line too.
 
 use super::chunk::Chunk;
 
@@ -26,93 +26,68 @@ pub const KNOWLEDGE_BASE: &str = "# Knowledge Base\n\n";
 /// own line.
 pub const FILES_OPEN: &str = "\n# Knowledge Base\n\n";
 
-/// The piece between two runs of one file's placed lines that are not
-/// contiguous: the dots on a line of their own, then a blank line.
-pub const GAP: &str = "...\n\n";
+/// What ends every section of a file but its last, after its closing line.
+pub const CUT_MARKER: &str = "...\n";
 
-/// The fence that closes a file's text.
-pub const FENCE_CLOSE: &str = "```";
+/// The blank line every section ends on.
+pub const SECTION_END: &str = "\n";
 
-/// The piece that closes a file another file follows: the fence, then the
-/// blank line the snippets are joined by.
-pub const CLOSING_JOIN: &str = "```\n\n";
-
-/// The piece that closes the last file: the fence, ending its line.
-pub const CLOSING_LAST: &str = "```\n";
-
-/// What joins two snippets in [`knowledge_text`].
-pub const SNIPPET_JOIN: &str = "\n\n";
-
-/// The heading piece of the file at `path`: its source line, a blank line, and
-/// the fence its text opens in.
+/// The heading every section of the file at `path` opens with: its source
+/// line, then a blank line.
 pub fn heading(path: &str) -> String {
-    format!("## The content from {path}:\n\n```\n")
+    format!("## The content from {path}:\n\n")
 }
 
-/// A file as the knowledge base places it: its workspace path, and the chunks
-/// of it placed, in line order and not overlapping.
+/// A section of the file at `path`: its [`heading`], `body` — whole lines,
+/// the last ending its `\n` — the [`CUT_MARKER`] unless it is the file's
+/// `last`, and the blank line it ends on.
+pub fn section_text(path: &str, body: &str, last: bool) -> String {
+    debug_assert!(
+        body.ends_with('\n'),
+        "{path}: a section's body ends its line"
+    );
+    let marker = if last { "" } else { CUT_MARKER };
+    format!("{}{body}{marker}{SECTION_END}", heading(path))
+}
+
+/// The one section of the folder at `path`: its listing, every line ending
+/// its `\n`, in a fence.
+pub fn listing_section(path: &str, listing: &str) -> String {
+    let listing = if listing.is_empty() || listing.ends_with('\n') {
+        listing.to_string()
+    } else {
+        format!("{listing}\n")
+    };
+    section_text(path, &format!("```\n{listing}```\n"), true)
+}
+
+/// A file as the knowledge base places it: its workspace path, and the
+/// sections of it placed, each a [`Chunk`] whose text is the whole section.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RenderedFile {
     pub path: String,
     pub chunks: Vec<Chunk>,
 }
 
-/// `file`'s placed text as pieces: its chunks in order, a [`GAP`] between two
-/// that are not contiguous. A contiguous run is the file's own text, since its
-/// chunks are consecutive slices of it.
-fn body_pieces(file: &RenderedFile) -> Vec<&str> {
-    let mut out = Vec::new();
-    for (i, chunk) in file.chunks.iter().enumerate() {
-        if i > 0 {
-            let before = file.chunks[i - 1].lines;
-            debug_assert!(
-                chunk.lines.first > before.last,
-                "{}: chunks out of line order",
-                file.path
-            );
-            if !chunk.lines.continues(before) {
-                out.push(GAP);
-            }
-        }
-        out.push(chunk.text.as_str());
-    }
-    out
-}
-
-/// The knowledge base as Qwen-Agent writes it: [`KNOWLEDGE_BASE`], then each
-/// file as `## The content from {path}:`, a blank line, and its placed text
-/// in a fence, the snippets joined by a blank line. No leading newline and no
-/// trailing one: [`assemble_pieces`] adds both.
+/// The knowledge base: [`KNOWLEDGE_BASE`], then every placed section of
+/// `files`, in order. No leading newline: [`assemble_pieces`] adds it.
 pub fn knowledge_text(files: &[RenderedFile]) -> String {
-    let snippets: Vec<String> = files
+    let sections: String = files
         .iter()
-        .map(|f| {
-            format!(
-                "{}{}{FENCE_CLOSE}",
-                heading(&f.path),
-                body_pieces(f).concat()
-            )
-        })
+        .flat_map(|f| f.chunks.iter().map(|c| c.text.as_str()))
         .collect();
-    format!("{KNOWLEDGE_BASE}{}", snippets.join(SNIPPET_JOIN))
+    format!("{KNOWLEDGE_BASE}{sections}")
 }
 
 /// The pieces the system prompt seals the knowledge base as: [`FILES_OPEN`],
-/// then per file its [`heading`], its chunks with a [`GAP`] between runs that
-/// are not contiguous, and [`CLOSING_JOIN`], or [`CLOSING_LAST`] for the last.
-/// Joined, they are `"\n" + knowledge_text(files) + "\n"`.
+/// then each placed section. Joined, they are `"\n" + knowledge_text(files)`.
 pub fn assemble_pieces(files: &[RenderedFile]) -> Vec<String> {
     let mut out = vec![FILES_OPEN.to_string()];
-    for (i, f) in files.iter().enumerate() {
-        out.push(heading(&f.path));
-        out.extend(body_pieces(f).into_iter().map(str::to_string));
-        let closing = if i + 1 == files.len() {
-            CLOSING_LAST
-        } else {
-            CLOSING_JOIN
-        };
-        out.push(closing.to_string());
-    }
+    out.extend(
+        files
+            .iter()
+            .flat_map(|f| f.chunks.iter().map(|c| c.text.clone())),
+    );
     out
 }
 
@@ -128,93 +103,54 @@ mod tests {
         }
     }
 
-    fn file(path: &str, chunks: Vec<Chunk>) -> RenderedFile {
-        RenderedFile {
-            path: path.to_string(),
-            chunks,
-        }
-    }
-
-    /// **A file placed whole renders as Q1 rendered it** — `{body}` then `\n`
-    /// and the fence, Q1's body being the file's text short of the `\n` that
-    /// ends its last line — and its pieces join to the same text, a newline
-    /// either side.
+    /// **A section is its heading, its body, the marker unless it is the
+    /// file's last, and a blank line.**
     #[test]
-    fn a_whole_file_renders_as_q1_rendered_it() {
-        let f = file(
-            "candle/a.rs",
-            vec![chunk(1, 1, "fn x() {\n"), chunk(2, 2, "}\n")],
-        );
-        let q1 = "# Knowledge Base\n\n## The content from candle/a.rs:\n\n```\nfn x() {\n}\n```";
-        assert_eq!(knowledge_text(std::slice::from_ref(&f)), q1);
+    fn a_section_is_its_heading_body_marker_and_blank_line() {
         assert_eq!(
-            assemble_pieces(std::slice::from_ref(&f)),
-            vec![
-                "\n# Knowledge Base\n\n",
-                "## The content from candle/a.rs:\n\n```\n",
-                "fn x() {\n",
-                "}\n",
-                "```\n",
-            ]
-        );
-        assert_eq!(assemble_pieces(&[f]).concat(), format!("\n{q1}\n"));
-    }
-
-    /// **A file with a gap keeps one heading and marks the gap** between the
-    /// two runs, a contiguous run joined as the file's own text.
-    #[test]
-    fn a_file_with_a_gap_keeps_one_heading_and_marks_the_gap() {
-        let f = file(
-            "b.md",
-            vec![
-                chunk(1, 2, "one\ntwo\n"),
-                chunk(3, 3, "three\n"),
-                chunk(9, 9, "nine\n"),
-            ],
+            section_text("r/a.rs", "body\nend of r/a.rs lines 1-2 of 9\n", false),
+            "## The content from r/a.rs:\n\nbody\nend of r/a.rs lines 1-2 of 9\n...\n\n"
         );
         assert_eq!(
-            knowledge_text(std::slice::from_ref(&f)),
-            "# Knowledge Base\n\n## The content from b.md:\n\n```\none\ntwo\nthree\n...\n\nnine\n```"
-        );
-        assert_eq!(
-            assemble_pieces(&[f]),
-            vec![
-                "\n# Knowledge Base\n\n",
-                "## The content from b.md:\n\n```\n",
-                "one\ntwo\n",
-                "three\n",
-                "...\n\n",
-                "nine\n",
-                "```\n",
-            ]
+            section_text("r/a.rs", "tail\n", true),
+            "## The content from r/a.rs:\n\ntail\n\n"
         );
     }
 
-    /// **Files are joined by a blank line and the last ends on its fence**:
-    /// the first file's closing piece carries the blank line, the last's ends
-    /// the fence's line and nothing more.
+    /// **A folder is one section, its listing in a fence**, its last line
+    /// given its `\n`.
     #[test]
-    fn files_are_joined_by_a_blank_line_and_the_last_ends_on_its_fence() {
+    fn a_folder_is_one_section_its_listing_fenced() {
+        assert_eq!(
+            listing_section("r/src/", "a.rs 12\nb/"),
+            "## The content from r/src/:\n\n```\na.rs 12\nb/\n```\n\n"
+        );
+    }
+
+    /// **The pieces join to the knowledge text**, a newline ahead: the title,
+    /// then every section of every file in order.
+    #[test]
+    fn the_pieces_join_to_the_knowledge_text() {
         let files = [
-            file("a.rs", vec![chunk(1, 1, "one\n")]),
-            file("b/c.rs", vec![chunk(1, 1, "tw\n")]),
+            RenderedFile {
+                path: "r/a.rs".into(),
+                chunks: vec![
+                    chunk(1, 2, &section_text("r/a.rs", "one\n", false)),
+                    chunk(3, 4, &section_text("r/a.rs", "two\n", true)),
+                ],
+            },
+            RenderedFile {
+                path: "r/b/".into(),
+                chunks: vec![chunk(1, 1, &listing_section("r/b/", "c.rs 3\n"))],
+            },
         ];
-        let text = "# Knowledge Base\n\n## The content from a.rs:\n\n```\none\n```\n\n\
-                    ## The content from b/c.rs:\n\n```\ntw\n```";
+        let text = "# Knowledge Base\n\n\
+                    ## The content from r/a.rs:\n\none\n...\n\n\
+                    ## The content from r/a.rs:\n\ntwo\n\n\
+                    ## The content from r/b/:\n\n```\nc.rs 3\n```\n\n";
         assert_eq!(knowledge_text(&files), text);
-        assert_eq!(
-            assemble_pieces(&files),
-            vec![
-                "\n# Knowledge Base\n\n",
-                "## The content from a.rs:\n\n```\n",
-                "one\n",
-                "```\n\n",
-                "## The content from b/c.rs:\n\n```\n",
-                "tw\n",
-                "```\n",
-            ]
-        );
-        assert_eq!(assemble_pieces(&files).concat(), format!("\n{text}\n"));
+        assert_eq!(assemble_pieces(&files).concat(), format!("\n{text}"));
+        assert_eq!(assemble_pieces(&files).len(), 4);
     }
 
     /// With no file placed, the knowledge base is its title alone.

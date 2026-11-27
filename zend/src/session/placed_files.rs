@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use candle_conversation::files::names::{chunk_name, heading_name, GAP_NAME};
+use candle_conversation::files::names::chunk_name;
 use candle_conversation::files::{
     files_owner, FileKey, FileRecord, FileUnit, LineSpan, PlacedFile,
 };
@@ -31,10 +31,9 @@ pub struct PlacedFileContent {
     pub folder: bool,
     /// The lines of it placed, in the order they sit.
     pub lines: Vec<LineSpan>,
-    /// The tokens its heading and placed chunks hold.
+    /// The tokens its placed sections hold.
     pub tokens: usize,
-    /// Its heading and placed chunks as the model read them, the gap piece
-    /// between runs that are not contiguous.
+    /// Its placed sections as the model read them, each with its heading.
     pub text: String,
 }
 
@@ -52,17 +51,12 @@ pub fn layer_of(unit: FileUnit, layers: &[IngestLayer]) -> String {
         .unwrap_or_default()
 }
 
-/// The names of `record`'s members `lines` places, in order — its heading,
-/// then each chunk, the gap piece between two runs that are not contiguous.
+/// The names of `record`'s members `lines` places, in order: each section.
 pub fn placed_member_names(record: &FileRecord, lines: &[LineSpan]) -> Vec<String> {
-    let mut names = vec![heading_name(&record.path, &record.blob)];
-    for (i, &span) in lines.iter().enumerate() {
-        if i > 0 && !span.continues(lines[i - 1]) {
-            names.push(GAP_NAME.to_string());
-        }
-        names.push(chunk_name(&record.path, &record.blob, span));
-    }
-    names
+    lines
+        .iter()
+        .map(|&span| chunk_name(&record.path, &record.blob, span))
+        .collect()
 }
 
 impl ZendSession {
@@ -139,32 +133,21 @@ mod tests {
             lines: 600,
             lang: "rs".into(),
             branches: vec![],
-            heading: member,
             chunks: [span(1, 200), span(201, 400), span(401, 600)]
                 .map(|lines| ChunkRecord { lines, member })
                 .to_vec(),
         }
     }
 
-    /// **A placement reads as its heading and chunks, a gap between runs**:
-    /// contiguous chunks join, a skipped run puts the gap piece in.
+    /// **A placement reads as its sections**, contiguous or not: each section
+    /// says where it sits, so nothing goes between them.
     #[test]
-    fn a_placement_reads_as_heading_chunks_and_gaps() {
+    fn a_placement_reads_as_its_sections() {
         let r = record();
-        assert_eq!(
-            placed_member_names(&r, &[span(1, 200), span(201, 400)]),
-            vec![
-                heading_name("candle/a.rs", "b"),
-                chunk_name("candle/a.rs", "b", span(1, 200)),
-                chunk_name("candle/a.rs", "b", span(201, 400)),
-            ]
-        );
         assert_eq!(
             placed_member_names(&r, &[span(1, 200), span(401, 600)]),
             vec![
-                heading_name("candle/a.rs", "b"),
                 chunk_name("candle/a.rs", "b", span(1, 200)),
-                GAP_NAME.to_string(),
                 chunk_name("candle/a.rs", "b", span(401, 600)),
             ]
         );

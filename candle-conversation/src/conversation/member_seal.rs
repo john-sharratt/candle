@@ -1,13 +1,13 @@
-//! Sealing the knowledge base's members: a file's pieces, in order, as shared
-//! sections no conversation owns (`docs/provenance_system_collection.md` §5).
+//! Sealing the knowledge base's members: a file's sections, in order, as
+//! shared sections no conversation owns (`docs/provenance_system_collection.md`
+//! §5, `docs/placed_section_layout.md` §3.5b).
 //!
 //! A chain is sealed behind the prompt before the `files` collection — the
 //! birth prefix's sections up to and including `files_open`, so no tool, no
-//! journal entry, and never the seed or the close that follow the collection
-//! (§12 D4) — and each member behind the members before it: chunk *k* of a
-//! file is sealed after its heading and chunks 1…*k*−1, its recurrence run on
-//! from where chunk *k*−1's ended, so its K/V is computed as the continuation
-//! of its file. A member's address is its content and everything it is sealed
+//! journal entry, and never the close that follows the collection (§12 D4) —
+//! and each member behind the members before it: section *k* of a file is
+//! sealed after sections 1…*k*−1, its recurrence run on from where section
+//! *k*−1's ended, so its K/V is computed as the continuation of its file. A member's address is its content and everything it is sealed
 //! after, so the same text after other text is another member, and a member
 //! whose stream is already on disk is restored rather than prefilled again.
 //!
@@ -111,8 +111,7 @@ impl Sequence {
         self.substrate.read().trained_window()
     }
 
-    /// The token ids `text` encodes to, as a member's seal encodes it: what a
-    /// chunk cut checks its seams against (`files::cut_lines`).
+    /// The token ids `text` encodes to, as a member's seal encodes it.
     pub fn member_token_ids(&self, text: &str) -> crate::Result<Vec<u32>> {
         Ok(self
             .tokenizer

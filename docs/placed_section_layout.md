@@ -336,10 +336,10 @@ before it, and every other file, are untouched.
 **The cut is `file_read`'s.** A large file is broken where `file_read` already
 pages it: runs of whole parts, at most `PAGE_LINES` lines each
 (`zend-tools/src/tools/file/render.rs` `windows`, the parts from
-`doc_units`). Each run is one section, and its text is the body a live
-`file_read` of that range returns, byte for byte (`render.rs` §1: the ingest
-already drives the same tool call). So a placed section carries what an edit
-needs, exactly as a read does:
+`doc_units`). Each run is one section, and its text is the parts and closing
+line a live `file_read` of that range returns, byte for byte (`render.rs`
+`range_read`, which `lines_read` opens with its one-line note ahead of). So a
+placed section carries what an edit needs, exactly as a read does:
 
 - each part a fenced block naming the workspace path, the part's anchor (the
   part hash `file_edit` addresses, `part=r7Lm`), its lines and its scope;
@@ -359,11 +359,15 @@ of its own (`files/render.rs` `GAP` goes), since each section already says
 where it sits.
 
 **The knowledge base's notation changes with it.** Each section is the
-heading `## The content from {path}:` and the section's text. The outer fence
-of Qwen-Agent's snippet goes: the parts are fenced blocks of their own, and a
-fence inside a fence is not well formed. Seams are still checked against the
-tokenizer as `files::cut_lines` checks them, now at the section's
-boundaries.
+heading `## The content from {path}:`, a blank line, the section's text, and
+a blank line it ends on (`files/render.rs` `section_text`); a folder is one
+section, its listing in a fence. The outer fence of Qwen-Agent's snippet
+goes: the parts are fenced blocks of their own, and a fence inside a fence is
+not well formed. With it go the file's heading member and the shared gap and
+closing pieces: a section is placed alone, so it carries its own heading.
+Every seam is a section's closing `\n\n` meeting the next heading's `##`,
+which the vocabulary never merges; `tests/knowledge_pieces_real_vocab.rs`
+checks it on every cached Qwen vocabulary, sections in and out of line order.
 
 **Provenance and the index both reduce by section.** Today provenance chooses
 whole files and the index places a leading run of a file too large for its

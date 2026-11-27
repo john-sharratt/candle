@@ -1,12 +1,13 @@
 //! The knowledge base's pieces on every cached Qwen vocabulary: sealed one by
 //! one, they must hold exactly the tokens the assembled text holds, or a seam
 //! shows the model a sequence it never saw
-//! (`docs/provenance_system_collection.md` §3, §12 D2–D3).
+//! (`docs/placed_section_layout.md` §3.5c).
 
 #[path = "common/real_vocab.rs"]
 mod real_vocab;
 
-use candle_conversation::files::{assemble_pieces, cut_lines, Chunk, LineSpan, RenderedFile};
+use candle_conversation::files::render::{listing_section, section_text};
+use candle_conversation::files::{assemble_pieces, Chunk, LineSpan, RenderedFile};
 use tokenizers::Tokenizer;
 
 use real_vocab::for_each_tokenizer;
@@ -18,10 +19,10 @@ fn ids(tok: &Tokenizer, text: &str) -> Vec<u32> {
         .to_vec()
 }
 
-fn chunk(first: u32, last: u32, text: &str) -> Chunk {
+fn chunk(first: u32, last: u32, text: String) -> Chunk {
     Chunk {
         lines: LineSpan { first, last },
-        text: text.to_string(),
+        text,
     }
 }
 
@@ -37,66 +38,46 @@ fn assert_pieces_hold(name: &str, tok: &Tokenizer, files: &[RenderedFile]) {
     );
 }
 
-/// **The assembled pieces tokenize as the knowledge text**: a file placed
-/// whole, a file with a gap between two runs, and two files, on every cached
+/// **The assembled pieces tokenize as the knowledge text**: a file of two
+/// sections in `file_read`'s format, the first ending on the cut marker, a
+/// section placed alone out of its file's order, and a folder, on every cached
 /// Qwen vocabulary.
 #[test]
 fn assembled_pieces_tokenize_as_the_knowledge_text() {
     for_each_tokenizer(|name, tok| {
+        let path = "candle/zend/src/ingest_lease.rs";
+        let first = section_text(
+            path,
+            "```rust file=candle/zend/src/ingest_lease.rs part=a1B2 lines=1-3\n \
+             +1 //! Leases.\n +2 \n +3 use std::time::Duration;\n```\n\
+             end of candle/zend/src/ingest_lease.rs lines 1-3 of 6 — next: lines=4-6\n",
+            false,
+        );
+        let second = section_text(
+            path,
+            "```rust file=candle/zend/src/ingest_lease.rs part=c3D4 lines=4-6 scope=\"fn claim_worker\"\n \
+             +1 pub fn claim_worker() -> Share {\n +2     ask().unwrap_or(Share::Theirs)\n +3 }\n```\n\
+             end of candle/zend/src/ingest_lease.rs lines 4-6 of 6 — the end of the file\n",
+            true,
+        );
         let rust = RenderedFile {
-            path: "candle/zend/src/ingest_lease.rs".into(),
-            chunks: vec![
-                chunk(1, 3, "//! Leases.\n\nuse std::time::Duration;\n"),
-                chunk(
-                    4,
-                    6,
-                    "pub fn claim_worker() -> Share {\n    ask().unwrap_or(Share::Theirs)\n}\n",
-                ),
-            ],
+            path: path.into(),
+            chunks: vec![chunk(1, 3, first.clone()), chunk(4, 6, second.clone())],
         };
-        let gapped = RenderedFile {
-            path: "candle/docs/design.md".into(),
-            chunks: vec![
-                chunk(1, 2, "# Design\n\nThe close row.\n"),
-                chunk(40, 41, "| a | b |\n|---|---|\n"),
-            ],
+        let out_of_order = RenderedFile {
+            path: path.into(),
+            chunks: vec![chunk(4, 6, second), chunk(1, 3, first)],
         };
         let folder = RenderedFile {
             path: "candle/zend/src/".into(),
-            chunks: vec![chunk(1, 3, "api/\ncalibrate/\nlib.rs 2459\n")],
+            chunks: vec![chunk(
+                1,
+                3,
+                listing_section("candle/zend/src/", "api/\ncalibrate/\nlib.rs 2459\n"),
+            )],
         };
         assert_pieces_hold(name, tok, std::slice::from_ref(&rust));
-        assert_pieces_hold(name, tok, std::slice::from_ref(&gapped));
-        assert_pieces_hold(name, tok, &[rust, gapped, folder]);
+        assert_pieces_hold(name, tok, std::slice::from_ref(&out_of_order));
+        assert_pieces_hold(name, tok, &[rust, folder]);
     });
-}
-
-/// **Chunks the cut makes hold their seams on the real vocabulary**: a file
-/// with blank lines at every cut is cut where the seams tokenize alike, and
-/// its chunks, assembled, tokenize as the file does.
-#[test]
-fn a_cut_file_assembles_as_its_text_tokenizes() {
-    for_each_tokenizer(|name, tok| {
-        let text = "fn a() {}\n\nfn b() {}\n\n\nfn c() {}\n    \n}\n";
-        let chunks = cut_lines(text, 1, |s| ids(tok, s));
-        assert_eq!(chunks.concat_text(), text, "{name}: the cut lost text");
-        assert_pieces_hold(
-            name,
-            tok,
-            &[RenderedFile {
-                path: "candle/a.rs".into(),
-                chunks,
-            }],
-        );
-    });
-}
-
-trait ConcatText {
-    fn concat_text(&self) -> String;
-}
-
-impl ConcatText for Vec<Chunk> {
-    fn concat_text(&self) -> String {
-        self.iter().map(|c| c.text.as_str()).collect()
-    }
 }

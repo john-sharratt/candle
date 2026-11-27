@@ -56,9 +56,7 @@ pub struct FileRecord {
     pub lang: String,
     /// The branches the blob was read on.
     pub branches: Vec<String>,
-    /// The heading member: `## The content from {path}:` and the fence.
-    pub heading: MemberRef,
-    /// The chunks in line order.
+    /// The sections in line order, each sealed behind the ones before it.
     pub chunks: Vec<ChunkRecord>,
 }
 
@@ -90,9 +88,9 @@ impl FileRecord {
         serde_json::from_value(obj.blob.clone()).ok()
     }
 
-    /// The tokens every member of the record holds, heading included.
+    /// The tokens every section of the record holds.
     pub fn tokens(&self) -> u32 {
-        self.heading.tokens + self.chunks.iter().map(|c| c.member.tokens).sum::<u32>()
+        self.chunks.iter().map(|c| c.member.tokens).sum::<u32>()
     }
 }
 
@@ -134,7 +132,6 @@ mod tests {
             lines: 260,
             lang: "rs".into(),
             branches: vec!["main".into()],
-            heading: member(1, 12),
             chunks: vec![
                 ChunkRecord {
                     lines: LineSpan {
@@ -166,14 +163,13 @@ mod tests {
         assert_eq!(
             json,
             format!(
-                r#"{{"content_key":"v1:candle/a.rs@ab12","path":"candle/a.rs","blob":"ab12","unit":"file","lines":260,"lang":"rs","branches":["main"],"heading":{{"address":{},"tokens":12}},"chunks":[{{"lines":{{"first":1,"last":200}},"member":{{"address":{},"tokens":2900}}}},{{"lines":{{"first":201,"last":260}},"member":{{"address":{},"tokens":700}}}}]}}"#,
-                address(1),
+                r#"{{"content_key":"v1:candle/a.rs@ab12","path":"candle/a.rs","blob":"ab12","unit":"file","lines":260,"lang":"rs","branches":["main"],"chunks":[{{"lines":{{"first":1,"last":200}},"member":{{"address":{},"tokens":2900}}}},{{"lines":{{"first":201,"last":260}},"member":{{"address":{},"tokens":700}}}}]}}"#,
                 address(3),
                 address(5)
             )
         );
         assert_eq!(FileRecord::from_object(&obj), Some(r.clone()));
-        assert_eq!(r.tokens(), 12 + 2900 + 700);
+        assert_eq!(r.tokens(), 2900 + 700);
         assert_eq!(r.key(), FileKey::of("v1:candle/a.rs@ab12"));
     }
 

@@ -1,7 +1,6 @@
 //! Where the knowledge base's files are placed in the system prompt: at the
 //! `files` collection's declared position (`docs/provenance_system_collection.md`
-//! §3) — after every section the schema declares ahead of it — and whether a
-//! seed declared after it follows them.
+//! §3) — after every section the schema declares ahead of it.
 //!
 //! The files stand where the schema puts the collection, so moving an item
 //! across it in the schema moves the files with it: a seed declared before the
@@ -21,8 +20,6 @@ pub(crate) struct FilesPosition {
     /// Every section id declared ahead of the collection: its sections and
     /// every variant of its trees.
     before: HashSet<SectionId>,
-    /// Whether a seed tree is declared after the collection.
-    pub seed_follows: bool,
 }
 
 /// The `files` collection's place in `schema`; `None` when it declares none.
@@ -47,14 +44,7 @@ pub(crate) fn files_position(schema: &Schema) -> Option<FilesPosition> {
             SystemPromptItem::Collection(c) => before.extend(c.sections.iter().map(|s| s.id)),
         }
     }
-    let seed_follows = items[at + 1..].iter().any(|it| {
-        matches!(it, SystemPromptItem::SectionTree(t)
-            if t.nodes.iter().any(|n| n.name == SEED_SELECTOR))
-    });
-    Some(FilesPosition {
-        before,
-        seed_follows,
-    })
+    Some(FilesPosition { before })
 }
 
 impl FilesPosition {
@@ -161,12 +151,11 @@ layers:
     }
 
     /// **A seed declared before the collection is placed before the files**:
-    /// they go after it, and no seed follows them.
+    /// they go after it.
     #[test]
     fn files_go_after_a_seed_declared_before_them() {
         let b = builder(&[OPEN, SEED, FILES, CLOSE]);
         let at = files_position(b.schema()).unwrap();
-        assert!(!at.seed_follows);
         let segments = [
             segment(section_id(&b, "files_open")),
             segment(seed_id(&b)),
@@ -181,7 +170,6 @@ layers:
     fn files_go_before_a_seed_declared_after_them() {
         let b = builder(&[OPEN, FILES, SEED, CLOSE]);
         let at = files_position(b.schema()).unwrap();
-        assert!(at.seed_follows);
         let segments = [
             segment(section_id(&b, "files_open")),
             segment(seed_id(&b)),

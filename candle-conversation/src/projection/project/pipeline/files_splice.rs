@@ -5,16 +5,13 @@
 //! ([`choose`]), strongest first. The files of every kind then sit in the
 //! order the conversation's files set keeps: at the opening strongest first,
 //! afterwards every kept file where it was and every newcomer after them. Each
-//! file is its heading, its placed chunks — a gap piece between two runs that
-//! are not contiguous — and its closing piece: `closing_join` when anything of
-//! the knowledge base follows it, `closing_last` when it ends the knowledge
-//! base, the close coming next.
+//! file is its placed sections in line order; every section carries its own
+//! heading, closing line and, short of the file's end, the cut marker
+//! (`docs/placed_section_layout.md` §3.5c), so nothing is placed between them.
 
 use super::*;
 use crate::files::fill::{choose, FilePlacement};
-use crate::files::names::{
-    chunk_name, heading_name, CLOSING_JOIN_NAME, CLOSING_LAST_NAME, GAP_NAME,
-};
+use crate::files::names::chunk_name;
 use crate::files::{FileKey, FileRecord, FilesPin, LineSpan, PlacedFile};
 
 /// The files a projection places and the segments they are placed as.
@@ -35,31 +32,19 @@ impl FilesSplice {
 
 /// The files to place under `kind_cap` — each working-set group of `schema`
 /// a kind, its cap the tokens its share allows — and the segments they are
-/// placed as; `seeded` when the seed follows them in the knowledge base.
-/// Empty when the target has no files set, or no file's members are held in
-/// this process.
+/// placed as. Empty when the target has no files set, or no file's members
+/// are held in this process.
 pub(crate) fn files_splice<R: ContentResolver>(
     schema: &Schema,
     resolver: &R,
     kind_cap: impl Fn(WorkingSetShare) -> usize,
-    seeded: bool,
 ) -> FilesSplice {
-    let empty = FilesSplice {
-        placed: Vec::new(),
-        segments: Vec::new(),
-    };
     let Some(set) = resolver.files_set() else {
-        return empty;
+        return FilesSplice {
+            placed: Vec::new(),
+            segments: Vec::new(),
+        };
     };
-    let pieces = (
-        resolver.member_section(GAP_NAME),
-        resolver.member_section(CLOSING_JOIN_NAME),
-        resolver.member_section(CLOSING_LAST_NAME),
-    );
-    let (Some(gap), Some(join), Some(last)) = pieces else {
-        return empty;
-    };
-    let closing_tokens = resolver.section_token_count(join) as u32;
     let records: HashMap<FileKey, FileRecord> = resolver
         .files_records()
         .into_iter()
@@ -90,12 +75,7 @@ pub(crate) fn files_splice<R: ContentResolver>(
                 };
                 let ranked = set.ranked(group.id);
                 let momentum: HashMap<FileKey, f32> = ranked.iter().copied().collect();
-                for p in choose(
-                    &ranked,
-                    |k| records.get(&k),
-                    kind_cap(share),
-                    closing_tokens,
-                ) {
+                for p in choose(&ranked, |k| records.get(&k), kind_cap(share)) {
                     let m = momentum.get(&p.file).copied().unwrap_or(0.0);
                     chosen.push((p, m));
                 }
@@ -107,15 +87,13 @@ pub(crate) fn files_splice<R: ContentResolver>(
     let order = set.order(&keys);
     let placement: HashMap<FileKey, &FilePlacement> =
         chosen.iter().map(|(p, _)| (p.file, p)).collect();
-    // Every file whose members this process holds, its heading and its placed
-    // chunks' lines and sections resolved; a file with any member missing is
-    // not placed.
-    let resolved: Vec<(FileKey, SectionId, Vec<(LineSpan, SectionId)>)> = order
+    // Every file whose members this process holds, its placed sections' lines
+    // and ids resolved; a file with any member missing is not placed.
+    let resolved: Vec<(FileKey, Vec<(LineSpan, SectionId)>)> = order
         .iter()
         .filter_map(|file| {
             let record = records.get(file)?;
             let p = placement.get(file)?;
-            let heading = resolver.member_section(&heading_name(&record.path, &record.blob))?;
             let chunks = p
                 .chunks
                 .iter()
@@ -126,27 +104,18 @@ pub(crate) fn files_splice<R: ContentResolver>(
                         .map(|id| (lines, id))
                 })
                 .collect::<Option<Vec<_>>>()?;
-            Some((*file, heading, chunks))
+            Some((*file, chunks))
         })
         .collect();
-    let section =
-        |id: SectionId| ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(id)));
-    let mut segments = Vec::new();
-    for (i, (_, heading, chunks)) in resolved.iter().enumerate() {
-        segments.push(section(*heading));
-        for (j, &(lines, id)) in chunks.iter().enumerate() {
-            if j > 0 && !lines.continues(chunks[j - 1].0) {
-                segments.push(section(gap));
-            }
-            segments.push(section(id));
-        }
-        let ends = i + 1 == resolved.len() && !seeded;
-        segments.push(section(if ends { last } else { join }));
-    }
+    let segments = resolved
+        .iter()
+        .flat_map(|(_, chunks)| chunks.iter())
+        .map(|&(_, id)| ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(id))))
+        .collect();
     FilesSplice {
         placed: resolved
             .into_iter()
-            .map(|(file, _, chunks)| PlacedFile {
+            .map(|(file, chunks)| PlacedFile {
                 file,
                 chunks: chunks.into_iter().map(|(lines, _)| lines).collect(),
             })
