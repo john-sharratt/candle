@@ -208,8 +208,10 @@ fn the_opening_places_the_strongest_at_the_top() {
 }
 
 /// **A pinned knowledge base holds its one file whole, or nothing**: pinned
-/// to a, a's every section is placed under a cap that holds none of it, b is
-/// left out though stronger; pinned empty, nothing is placed.
+/// to a, a's every section is placed under a cap that holds none of it, in
+/// relevance order — its first section (100) beside the question, its second
+/// (99.999) in front — b is left out though stronger; pinned empty, nothing is
+/// placed.
 #[test]
 fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
     let b = Builder::from_yaml(YAML).unwrap();
@@ -232,19 +234,26 @@ fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
                 "candle/a.rs",
                 "b",
                 LineSpan {
-                    first: 1,
-                    last: 200
+                    first: 201,
+                    last: 260
                 }
             )],
             m[&chunk_name(
                 "candle/a.rs",
                 "b",
                 LineSpan {
-                    first: 201,
-                    last: 260
+                    first: 1,
+                    last: 200
                 }
             )],
         ]
+    );
+    let scope = splice
+        .scope
+        .expect("a pinned knowledge base keeps its range");
+    assert!(
+        scope.sections().all(|e| e.mandatory),
+        "no pinned section leaves"
     );
     mock.files.as_mut().unwrap().pin = FilesPin::Empty;
     let empty = files_splice(b.schema(), &mock, |_| 10_000, true);
@@ -252,10 +261,12 @@ fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
     assert!(empty.segments.is_empty());
 }
 
-/// **Pinned files sit in the pin's order, whatever their momentum**: a
-/// weaker file pinned first stays first, each whole.
+/// **Pinned files sit in relevance order, not the pin's**: a pinned in
+/// front of b, but a (900) stronger than b (100), so a takes the top beside
+/// the question and b the front; with no momentum to rank them the pin's
+/// order stands, its last file at the top.
 #[test]
-fn pinned_files_sit_in_the_pins_order() {
+fn pinned_files_sit_in_relevance_order() {
     let b = Builder::from_yaml(YAML).unwrap();
     let fa = record("candle/a.rs", &[(1, 10)]);
     let fb = record("candle/b.rs", &[(1, 10)]);
@@ -263,17 +274,23 @@ fn pinned_files_sit_in_the_pins_order() {
     let (mut mock, m) = resolver(
         &b,
         &records,
-        &[(fa.key(), 100.0), (fb.key(), 900.0)],
+        &[(fa.key(), 900.0), (fb.key(), 100.0)],
         vec![],
     );
-    mock.files.as_mut().unwrap().pin =
-        FilesPin::Only([fa.section_keys(), fb.section_keys()].concat());
+    let pin = FilesPin::Only([fa.section_keys(), fb.section_keys()].concat());
+    mock.files.as_mut().unwrap().pin = pin.clone();
     let splice = files_splice(b.schema(), &mock, |_| 0, true);
-    assert_eq!(splice.order(), vec![fa.key(), fb.key()]);
+    assert_eq!(splice.order(), vec![fb.key(), fa.key()]);
     let chunk = |path: &str| m[&chunk_name(path, "b", LineSpan { first: 1, last: 10 })];
     assert_eq!(
         ids(&splice.segments),
-        vec![chunk("candle/a.rs"), chunk("candle/b.rs")]
+        vec![chunk("candle/b.rs"), chunk("candle/a.rs")]
+    );
+    let (mut unranked, _) = resolver(&b, &records, &[], vec![]);
+    unranked.files.as_mut().unwrap().pin = pin;
+    assert_eq!(
+        files_splice(b.schema(), &unranked, |_| 0, true).order(),
+        vec![fa.key(), fb.key()]
     );
 }
 
@@ -345,11 +362,11 @@ layers:
     assert_eq!(sections[at + 1], first, "the file follows files_open");
 }
 
-/// **A kept section keeps its place and a newcomer enters in front**: a at
-/// the top and b in front of it, b now stronger — both stay where they are;
-/// c, new, enters in front of b.
+/// **Kept sections and newcomers alike sit by relevance**: a at the top and
+/// b in front of it, b now stronger, and c, new and strongest — c takes the
+/// top, then b, then a at the front.
 #[test]
-fn a_kept_section_keeps_its_place_and_a_newcomer_enters_in_front() {
+fn kept_sections_and_newcomers_sit_by_relevance() {
     let b = Builder::from_yaml(YAML).unwrap();
     let fa = record("candle/a.rs", &[(1, 10)]);
     let fb = record("candle/b.rs", &[(1, 10)]);
@@ -363,15 +380,15 @@ fn a_kept_section_keeps_its_place_and_a_newcomer_enters_in_front() {
     );
     assert_eq!(
         files_splice(b.schema(), &mock, |_| 10_000, true).order(),
-        vec![fc.key(), fb.key(), fa.key()]
+        vec![fa.key(), fb.key(), fc.key()]
     );
 }
 
 /// **The mandatory files open a free knowledge base, whole and outside the
-/// caps, and the seed dial leaves them out**: m, weaker than a and bigger
-/// than the cap, takes the top, whole; under a 150-token cap a's one section
-/// fits, in front of it; with the dial off, a alone. A pinned knowledge base
-/// holds its pin alone.
+/// caps, ordered like the rest, and the seed dial leaves them out**: m, bigger
+/// than the cap, is placed whole but, weaker than a, at the front, a's one
+/// section (under a 150-token cap) at the top; with the dial off, a alone. A
+/// pinned knowledge base holds its pin alone.
 #[test]
 fn the_mandatory_files_open_a_free_knowledge_base() {
     let b = Builder::from_yaml(YAML).unwrap();
@@ -381,8 +398,8 @@ fn the_mandatory_files_open_a_free_knowledge_base() {
     let (mut mock, _) = resolver(&b, &records, &[(fm.key(), 10.0), (fa.key(), 900.0)], vec![]);
     mock.mandatory_files = vec!["candle/README.md".into(), "candle/AGENTS.md".into()];
     let on = files_splice(b.schema(), &mock, |_| 150, true);
-    assert_eq!(on.order(), vec![fa.key(), fm.key()]);
-    assert_eq!(on.placed[1].chunks.len(), 2, "whole, whatever the cap");
+    assert_eq!(on.order(), vec![fm.key(), fa.key()]);
+    assert_eq!(on.placed[0].chunks.len(), 2, "whole, whatever the cap");
     assert!(
         on.scope
             .as_ref()

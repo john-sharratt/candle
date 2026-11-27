@@ -1,15 +1,15 @@
 //! A reserved range's places, top first (`docs/placed_section_layout.md`
 //! §3.2).
 //!
-//! The top of the range is nearest the question. The first section to enter
-//! takes the top; each one after enters **in front** — immediately below the
-//! lowest placed — so nothing already placed moves. A section that leaves
-//! leaves a hole where it stood. A full range is a window: an entry still
-//! enters in front, and what passes the top — the earliest-entered places
-//! that may go, holes and sections alike — leaves, the run sliding up by what
-//! they freed. A mandatory section never leaves and never slides out. Between
-//! requests the range is compacted: its holes close, the sections moving up
-//! in order.
+//! The top of the range is nearest the question, and the range is held in
+//! relevance order: the strongest at the top, each weaker one further from
+//! the question ([`RangeScope::reorder`], by each section's momentum). A
+//! section enters **in front** — immediately below the lowest placed — and the
+//! next reorder takes it to its rank. A section that leaves leaves a hole
+//! where it stood, closed by the next reorder. A full range makes room from
+//! its front: the places furthest from the question that may go, holes and
+//! sections alike, leave. A mandatory section never leaves, but is ordered
+//! like any other.
 
 use super::place::{Entry, Place};
 use crate::files::key::SectionKey;
@@ -61,9 +61,10 @@ impl RangeScope {
     }
 
     /// Enter `key`, of `tokens` positions, in front of every placed section,
-    /// and return the sections a full range slid out to make room, top first.
-    /// `None`, and nothing changed, when it cannot fit even with every place
-    /// that may go gone, or it is already placed.
+    /// and return the sections a full range let go from its front to make
+    /// room, furthest from the question first. `None`, and nothing changed,
+    /// when it cannot fit even with every place that may go gone, or it is
+    /// already placed.
     pub fn enter(
         &mut self,
         key: SectionKey,
@@ -89,7 +90,7 @@ impl RangeScope {
             let at = self
                 .places
                 .iter()
-                .position(|p| p.section().is_none_or(|e| !e.mandatory))
+                .rposition(|p| p.section().is_none_or(|e| !e.mandatory))
                 .expect("the movable places cover the entry");
             let gone = self.places.remove(at);
             free += gone.positions();
@@ -102,6 +103,51 @@ impl RangeScope {
             tokens,
             mandatory,
         }));
+        Some(out)
+    }
+
+    /// Enter `key`, of `tokens` positions and score `value`, at its rank by
+    /// `score`, and return the sections it pushed out, furthest from the
+    /// question first. A full range makes room from its front, but only past
+    /// what scores under `value`: holes and weaker sections go, a mandatory
+    /// section or one at least as strong stops it. `None`, and nothing
+    /// changed, when it cannot make room so, or it is already placed.
+    pub fn enter_over(
+        &mut self,
+        key: SectionKey,
+        tokens: usize,
+        value: f32,
+        score: impl Fn(SectionKey) -> Option<f32>,
+    ) -> Option<Vec<SectionKey>> {
+        if self.holds(key) {
+            return None;
+        }
+        let mut free = self.positions.saturating_sub(self.used());
+        let mut cut = self.places.len();
+        while tokens > free {
+            let at = cut.checked_sub(1)?;
+            let p = &self.places[at];
+            if let Some(e) = p.section() {
+                if e.mandatory || score(e.key).unwrap_or(0.0) >= value {
+                    return None;
+                }
+            }
+            free += p.positions();
+            cut = at;
+        }
+        let out: Vec<SectionKey> = self
+            .places
+            .drain(cut..)
+            .rev()
+            .filter_map(|p| p.section().map(|e| e.key))
+            .collect();
+        self.places.push(Place::Section(Entry {
+            key,
+            tokens,
+            mandatory: false,
+        }));
+        let rank = |k: SectionKey| if k == key { Some(value) } else { score(k) };
+        self.reorder(rank, 0.0);
         Some(out)
     }
 
@@ -154,6 +200,25 @@ impl RangeScope {
     /// Close every hole: each section moves up toward the top, in order.
     pub fn compact(&mut self) {
         self.places.retain(|p| matches!(p, Place::Section(_)));
+    }
+
+    /// Order the range by `score`, strongest at the top, and close its holes;
+    /// whether anything moved. A section passes the one above it only when its
+    /// score beats that one's by more than `margin`, so two a hair apart keep
+    /// their places; a section with no score yet counts as 0. Mandatory
+    /// sections are ordered like any other.
+    pub fn reorder(&mut self, score: impl Fn(SectionKey) -> Option<f32>, margin: f32) -> bool {
+        let before = self.places.clone();
+        self.compact();
+        let s = |p: &Place| p.section().map_or(0.0, |e| score(e.key).unwrap_or(0.0));
+        for i in 1..self.places.len() {
+            let mut j = i;
+            while j > 0 && s(&self.places[j]) > s(&self.places[j - 1]) + margin {
+                self.places.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+        self.places != before
     }
 
     /// The range from its bottom to its top, as the prompt holds it: the
@@ -226,11 +291,11 @@ mod tests {
         assert!(!s.leave(SectionKey(9)));
     }
 
-    /// **A full range slides**: the entry enters in front and the
-    /// earliest-entered places that may go pass the top — b, then the hole c
-    /// left — the run moving up by what they freed; a, mandatory, stays.
+    /// **A full range makes room from its front**: the places furthest from
+    /// the question that may go leave — d, then the hole c left — and the
+    /// entry takes the front; a, mandatory, stays.
     #[test]
-    fn a_full_range_slides_and_a_mandatory_section_stays() {
+    fn a_full_range_makes_room_from_its_front() {
         let mut s = RangeScope::new(100);
         s.enter(SectionKey(0), 30, true);
         s.enter(SectionKey(1), 20, false);
@@ -238,18 +303,73 @@ mod tests {
         s.enter(SectionKey(3), 20, false);
         s.leave(SectionKey(2));
         assert_eq!(s.used(), 100);
-        // 25 more: b (20) and then the 30-position hole pass the top.
-        assert_eq!(s.enter(SectionKey(4), 25, false), Some(vec![SectionKey(1)]));
-        assert_eq!(shape(&s), vec![('_', 25), ('e', 25), ('d', 20), ('a', 30)]);
-        // 40 more: d passes the top; a, mandatory, stays.
-        assert_eq!(s.enter(SectionKey(5), 40, false), Some(vec![SectionKey(3)]));
-        assert_eq!(shape(&s), vec![('_', 5), ('f', 40), ('e', 25), ('a', 30)]);
+        // 25 more: d (20) at the front, then the 30-position hole, go.
+        assert_eq!(s.enter(SectionKey(4), 25, false), Some(vec![SectionKey(3)]));
+        assert_eq!(shape(&s), vec![('_', 25), ('e', 25), ('b', 20), ('a', 30)]);
+        // 40 more: e, now the front, goes; a, mandatory, stays.
+        assert_eq!(s.enter(SectionKey(5), 40, false), Some(vec![SectionKey(4)]));
+        assert_eq!(shape(&s), vec![('_', 10), ('f', 40), ('b', 20), ('a', 30)]);
         // Nothing fits that would need the mandatory section's room.
         assert_eq!(s.enter(SectionKey(6), 71, false), None);
-        assert_eq!(keys(&s), vec![0, 4, 5]);
+        assert_eq!(keys(&s), vec![0, 1, 5]);
         assert!(!s.leave(SectionKey(0)), "a mandatory section never leaves");
         assert!(s.forget(SectionKey(0)), "unless it is no longer held");
-        assert_eq!(keys(&s), vec![4, 5]);
+        assert_eq!(keys(&s), vec![1, 5]);
+    }
+
+    /// **The range is ordered strongest at the top, the mandatory section
+    /// with the rest, its holes closed**: a (mandatory, 100), b (900), c
+    /// (500), with a hole where d left, reorder to b, c, a.
+    #[test]
+    fn the_range_is_ordered_strongest_at_the_top() {
+        let mut s = RangeScope::new(100);
+        s.enter(SectionKey(0), 10, true);
+        s.enter(SectionKey(1), 10, false);
+        s.enter(SectionKey(3), 10, false);
+        s.enter(SectionKey(2), 10, false);
+        s.leave(SectionKey(3));
+        let score = |k: SectionKey| match k.0 {
+            0 => Some(100.0),
+            1 => Some(900.0),
+            2 => Some(500.0),
+            _ => None,
+        };
+        assert!(s.reorder(score, 50.0));
+        assert_eq!(keys(&s), vec![1, 2, 0]);
+        assert_eq!(shape(&s), vec![('_', 70), ('a', 10), ('c', 10), ('b', 10)]);
+        assert!(!s.reorder(score, 50.0), "an ordered range does not move");
+    }
+
+    /// **A section passes the one above it only by more than the margin**:
+    /// b at 540 stays under a at 500 with a margin of 50, and passes it at
+    /// 551; one with no score yet counts as 0 and sinks below a scored one.
+    #[test]
+    fn a_section_passes_only_by_more_than_the_margin() {
+        let mut s = RangeScope::new(100);
+        s.enter(SectionKey(0), 10, false);
+        s.enter(SectionKey(1), 10, false);
+        s.enter(SectionKey(2), 10, false);
+        let near = |k: SectionKey| match k.0 {
+            0 => Some(500.0),
+            1 => Some(540.0),
+            _ => Some(0.0),
+        };
+        assert!(!s.reorder(near, 50.0));
+        assert_eq!(keys(&s), vec![0, 1, 2]);
+        let past = |k: SectionKey| match k.0 {
+            0 => Some(500.0),
+            1 => Some(551.0),
+            2 => Some(60.0),
+            _ => None,
+        };
+        assert!(s.reorder(past, 50.0));
+        assert_eq!(keys(&s), vec![1, 0, 2]);
+        let unscored = |k: SectionKey| match k.0 {
+            0 => None,
+            _ => Some(100.0),
+        };
+        assert!(s.reorder(unscored, 50.0));
+        assert_eq!(keys(&s), vec![1, 2, 0]);
     }
 
     /// **Compaction closes every hole**, the sections keeping their order.

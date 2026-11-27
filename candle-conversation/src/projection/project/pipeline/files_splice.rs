@@ -3,9 +3,9 @@
 //! `docs/placed_section_layout.md` §3.5c).
 //!
 //! Each kind's sections are chosen under the kind's share of the room
-//! ([`choose`]), strongest first. The sections of every kind then sit in the
-//! order the conversation's files set keeps: at the opening strongest first,
-//! afterwards every kept section where it was and every newcomer after them.
+//! ([`choose`]), strongest first. The sections of every kind, the mandatory
+//! files among them, then sit in relevance order by the set's momentum: the
+//! strongest at the top beside the question, each weaker one further away.
 //! Every section carries its own heading, closing line and, short of its
 //! file's end, the cut marker, so nothing is placed between them.
 //!
@@ -19,7 +19,7 @@ use super::files_anchor::FILES_COLLECTION;
 use super::*;
 use crate::files::fill::choose;
 use crate::files::names::chunk_name;
-use crate::files::scope::{Candidate, Entry, Place, RangeScope};
+use crate::files::scope::{Candidate, Place, RangeScope};
 use crate::files::{
     mandatory_records, FileKey, FileRecord, FilesPin, LineSpan, PlacedFile, SectionKey,
 };
@@ -33,8 +33,8 @@ pub(crate) struct FilesSplice {
     /// range to its top.
     pub sections: Vec<SectionKey>,
     pub segments: Vec<ProjectionSegment>,
-    /// The range a free knowledge base now holds, for the files set to keep;
-    /// `None` for a pinned one.
+    /// The range the knowledge base now holds, free or pinned, for the files
+    /// set to keep and the decode to reorder; `None` when it places nothing.
     pub scope: Option<RangeScope>,
 }
 
@@ -104,21 +104,38 @@ pub(crate) fn files_splice<R: ContentResolver>(
             tokens: record.chunks[i].member.tokens as usize,
         })
     };
-    // Pinned, the pinned sections in the pin's order, or nothing; free, the
+    // Pinned, the pinned sections held in relevance order like a free range's
+    // — the pin says what is placed, never the order — or nothing; free, the
     // range as it stood with what enters it now.
     let places: Vec<Place> = match &set.pin {
         FilesPin::Empty => Vec::new(),
-        FilesPin::Only(sections) => sections
-            .iter()
-            .filter_map(|&k| candidate(k))
-            .map(|c| {
-                Place::Section(Entry {
-                    key: c.key,
-                    tokens: c.tokens,
-                    mandatory: false,
-                })
-            })
-            .collect(),
+        FilesPin::Only(sections) => {
+            let pinned: Vec<Candidate> = sections.iter().filter_map(|&k| candidate(k)).collect();
+            let positions = files_positions(schema, resolver.trained_window());
+            let same = |s: &RangeScope| {
+                s.positions == positions
+                    && s.sections().count() == pinned.len()
+                    && pinned.iter().all(|c| s.holds(c.key))
+            };
+            // The range the decode has been ordering, while it still holds
+            // exactly the pin; otherwise the pin opened afresh, each section
+            // held as a mandatory one, so none leaves, and ordered by the set's
+            // momentum. The pin lists the range from its front to its top, so
+            // it opens last first: where nothing ranks them, the pin's own
+            // order stands, its last section beside the question.
+            let scope = match &set.scope {
+                Some(s) if same(s) => s.clone(),
+                _ => {
+                    let top_first: Vec<Candidate> = pinned.iter().rev().copied().collect();
+                    let mut s = RangeScope::new(positions);
+                    s.open(&top_first, &[]);
+                    s.reorder(|k| set.momentum_of(k), 0.0);
+                    s
+                }
+            };
+            let places = scope.places().iter().rev().copied().collect();
+            return emit(places, &index, &member, Some(scope));
+        }
         FilesPin::Free => {
             let paths = match mandatory {
                 true => resolver.files_mandatory(),
@@ -191,6 +208,11 @@ pub(crate) fn files_splice<R: ContentResolver>(
                     scope.enter(c.key, c.tokens, false);
                 }
             }
+            // The first token reads the range in relevance order: strongest
+            // beside the question, the mandatory files among the rest, by the
+            // set's momentum (`docs/placed_section_layout.md` §3.2). The decode
+            // reorders it by its own momentum from there.
+            scope.reorder(|k| set.momentum_of(k), 0.0);
             let places = scope.places().iter().rev().copied().collect();
             return emit(places, &index, &member, Some(scope));
         }
