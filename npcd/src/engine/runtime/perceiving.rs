@@ -169,7 +169,11 @@ impl Runtime {
         // takes the acts that need it out of the grammar, which is how a world
         // without hostiles ends up without `engage`.
         let place = hosted.place_of(&body);
-        let within = hosted.sim(|sim| base.clone().from_sim(sim, &body, &place));
+        let mut within = hosted.sim(|sim| base.clone().from_sim(sim, &body, &place));
+        // Whom one who gives orders may set work for: those who take them.
+        if hosted.sim(|s| s.missions.is_unordered(&body)) {
+            within.takers = order_takers(&hosted);
+        }
         if !bodiless {
             return within;
         }

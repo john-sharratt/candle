@@ -250,7 +250,7 @@ fn hands(hosted: &Hosted) -> usize {
 }
 
 /// The names of the characters who take orders here.
-fn order_takers(hosted: &Hosted) -> Vec<String> {
+pub(crate) fn order_takers(hosted: &Hosted) -> Vec<String> {
     hosted
         .read(|w| {
             w.actors()

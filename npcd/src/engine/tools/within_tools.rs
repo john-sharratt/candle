@@ -46,6 +46,9 @@ pub struct Within {
     pub rooms: Vec<String>,
     /// The world's standing jobs, by name — [`Choices::Jobs`].
     pub jobs: Vec<String>,
+    /// Those who take this character's orders, by name — [`Choices::Takers`].
+    /// Empty for one who gives none.
+    pub takers: Vec<String>,
     /// The parameters each standing job that takes any declares, by job: what
     /// choosing it as `order_post`'s `job` brings as fields of its own.
     pub job_params: Vec<(String, Vec<JobParam>)>,

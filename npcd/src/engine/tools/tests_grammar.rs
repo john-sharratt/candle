@@ -904,6 +904,7 @@ pub(super) mod tests {
     fn a_standing_job_brings_its_own_arguments() {
         let mut within = Within::among(&[]);
         within.jobs = vec!["coding-task".into(), "ward-shift".into()];
+        within.takers = vec!["Wick".into(), "Umbra".into()];
         within.job_params = vec![(
             "coding-task".into(),
             vec![
@@ -920,6 +921,18 @@ pub(super) mod tests {
         let params = stencil_params(by_name("order_post").unwrap(), &within);
         let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["job", "brief", "steps", "for"]);
+        assert_eq!(
+            params[3].enum_values,
+            Some(vec!["Wick".to_string(), "Umbra".to_string()]),
+            "`for` is one of those who take the orders"
+        );
+        let mut alone = within.clone();
+        alone.takers.clear();
+        let names: Vec<String> = stencil_params(by_name("order_post").unwrap(), &alone)
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["job", "brief", "steps"], "nobody to name, no `for`");
         let job = &params[0];
         assert_eq!(
             job.enum_values.as_deref().unwrap(),

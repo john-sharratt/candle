@@ -70,6 +70,10 @@ pub enum Choices {
     /// post whole (`docs/zen_moon_mind.md` §8.3). Empty in a world with none,
     /// which takes the argument out and leaves the post to say its own steps.
     Jobs,
+    /// One of those who take this character's orders, by name — whom
+    /// `order_post` may set its work for. Empty for one who gives none, which
+    /// takes the argument out and leaves the work to whoever is free first.
+    Takers,
     /// A house link in this room — what `survey_network` surveys from. Empty
     /// where there is none, which takes the act away.
     Links,
@@ -485,6 +489,10 @@ pub(super) const LIVE: &[(&str, &str, Choices)] = &[
     ("move_to", "destination", Choices::Reachable),
     ("focus", "on", Choices::Rooms),
     ("order_post", "job", Choices::Jobs),
+    // **Whom work is for is named, not written.** Free, Zen's conversation set
+    // a coding task "for" "Drone", and the table refused it: nobody is called
+    // that.
+    ("order_post", "for", Choices::Takers),
     // An agenda's own acts (`engine::agenda`): added at a priority, and
     // changed, dropped or closed by title.
     ("mission_add", "priority", Choices::Priorities),

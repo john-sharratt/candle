@@ -142,6 +142,10 @@ impl Within {
                 true => self.jobs.clone(),
                 false => Vec::new(),
             },
+            takers: match posts {
+                true => self.takers.clone(),
+                false => Vec::new(),
+            },
             job_params: match posts {
                 true => self.job_params.clone(),
                 false => Vec::new(),
@@ -224,6 +228,7 @@ mod tests {
             Invokable::new(post, POSTING),
         ];
         zen.jobs = vec!["coding-task".into()];
+        zen.takers = vec!["Wick".into(), "Umbra".into()];
         zen.job_params = vec![(
             "coding-task".into(),
             vec![JobParam {
@@ -238,6 +243,7 @@ mod tests {
         let within = zen.on_thread(&owner);
         assert_eq!(within.invokable, [Invokable::new(post, POSTING)]);
         assert_eq!(within.jobs, ["coding-task"]);
+        assert_eq!(within.takers, ["Wick", "Umbra"]);
         assert_eq!(within.job_params, zen.job_params);
         let specs = specs_within(Catalog::THREAD.mode, &within);
         let invoke = specs.iter().find(|s| s.name == INVOKE).expect("offered");

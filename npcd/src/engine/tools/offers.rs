@@ -259,6 +259,7 @@ pub(super) fn live_values(choice: Choices, within: &Within) -> Vec<String> {
         Choices::Years => within.years.clone(),
         Choices::Rooms => within.rooms.clone(),
         Choices::Jobs => within.jobs.clone(),
+        Choices::Takers => within.takers.clone(),
         Choices::Links => within.links.clone(),
         Choices::Sonos => within.sonos.clone(),
         Choices::Receiver => within.receiver.clone(),
