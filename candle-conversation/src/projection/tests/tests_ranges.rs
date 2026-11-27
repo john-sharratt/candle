@@ -133,6 +133,33 @@ fn a_ranged_collection_is_filled_by_tokens() {
     assert!(!got.contains(&(Some(id("tool_c")), None)), "{got:?}");
 }
 
+/// **A full range filled from the bottom is a window**: the oldest member
+/// goes, the newest stay — in a 40-position range, a (30) is dropped and b
+/// (25) and c (10) are placed, the hole the 5 they leave.
+#[test]
+fn a_full_bottom_range_drops_its_oldest_member() {
+    let yaml = yaml("bottom")
+        .replace(
+            "selection: { kind: top_k, k: 2 }",
+            "selection: { kind: always_visible }",
+        )
+        .replace(
+            "range: { tokens: 100, small_context: 40, fill: bottom }",
+            "range: { tokens: 40, fill: bottom }",
+        );
+    let b = Builder::from_yaml(&yaml).unwrap();
+    let id = |n: &str| b.id_for_system_section(n).unwrap();
+    let resolver = MockResolver::new()
+        .with_section_tokens(id("tool_a"), 30)
+        .with_section_tokens(id("tool_b"), 25)
+        .with_section_tokens(id("tool_c"), 10);
+    let got = places(&project(&b, &resolver));
+    assert!(!got.contains(&(Some(id("tool_a")), None)), "{got:?}");
+    assert!(got.contains(&(Some(id("tool_b")), None)), "{got:?}");
+    assert!(got.contains(&(Some(id("tool_c")), None)), "{got:?}");
+    assert!(got.contains(&(None, Some(5))), "{got:?}");
+}
+
 /// **A range filled from the bottom holds its members at the bottom**, the
 /// hole after them.
 #[test]

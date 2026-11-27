@@ -11,11 +11,12 @@
 //!   unit competes on the one band. A reading's momentum in the pool orders
 //!   only the minimum ([`FillInput::minimum`]); each unit carries how much the
 //!   model's selection read its turns, which orders what leaves;
-//! - **the dialogue** (§8.3): its newest exchange as the current one — its
-//!   first turn, its newest tool turn and its last kept, its older tool turns
-//!   shed first — its first exchange's floor, and its `recent` exchanges before
-//!   the current one, whole, as floors; every older exchange as its floor,
-//!   scored, and its tool turns, each scored and entering only with the floor.
+//! - **the dialogue**, by birth (`docs/placed_section_layout.md` §3.7): its
+//!   current exchange and the newest past exchanges its window holds, every
+//!   turn of each, none shed and none re-chosen by score — the same at every
+//!   boundary of a request, since the window is the room before the request
+//!   appended anything and the past exchanges are sealed. Between requests
+//!   the oldest whole exchanges drop out of the window's far end.
 //!
 //! - **every other group** of the projection: each selected exchange whole, at
 //!   its selection score, under its layer's window.
@@ -54,8 +55,11 @@ pub struct ContextExchange {
 pub struct DialogueSlot {
     pub room: usize,
     pub caps: Caps,
-    /// Exchanges before the current one that hold their seats whole.
-    pub recent: usize,
+    /// The dialogue's window: what its past exchanges and its lineage take at
+    /// a request's start (`docs/placed_section_layout.md` §3.7). The same at
+    /// every boundary of a request — the room before the request appended
+    /// anything — so the exchanges it holds hold for the request.
+    pub window: usize,
     /// The inherited lineage's exchanges, each with its score, in order.
     pub lineage: Vec<(Vec<TurnKey>, f32)>,
     pub working: Vec<WorkingPiece>,
@@ -105,6 +109,27 @@ impl Units {
         self.of.push((part, rounds));
         Unit { id, ..u }
     }
+}
+
+/// The first of `own`'s exchanges — oldest first, the last the current one —
+/// the dialogue's window holds: the current exchange always, then the newest
+/// past exchanges, whole, while they fit `window` tokens. Past exchanges are
+/// sealed, so a request's every boundary answers the same.
+fn window_from(own: &[Vec<TurnKey>], window: usize, tokens: &impl Fn(TurnKey) -> usize) -> usize {
+    let Some(current) = own.len().checked_sub(1) else {
+        return 0;
+    };
+    let mut left = window;
+    let mut from = current;
+    for e in (0..current).rev() {
+        let t: usize = own[e].iter().map(|&k| tokens(k)).sum();
+        if t > left {
+            break;
+        }
+        left -= t;
+        from = e;
+    }
+    from
 }
 
 /// An exchange's floor: its first turn and its last, or the one turn of a
@@ -207,66 +232,33 @@ pub fn plan(
         }
     }
 
-    // The dialogue's own exchanges.
-    let n_ex = slot.own.len();
-    let current = n_ex.checked_sub(1);
-    let recent_from = current.map_or(0, |c| c.saturating_sub(slot.recent));
-    for (e, ex) in slot.own.iter().enumerate() {
-        let n = ex.len();
-        if n == 0 {
-            continue;
-        }
+    // The dialogue's own exchanges, by birth (`docs/placed_section_layout.md`
+    // §3.7): the current one and the newest past ones its window holds, every
+    // turn of each, none shed — during a request nothing leaves and nothing
+    // moves; what grows past the window burns the reserve, then a rung. The
+    // lineage is the window's floor, ahead of it.
+    let lineage_tokens: usize = slot
+        .lineage
+        .iter()
+        .map(|(ex, _)| ex.iter().map(|&k| tokens(k)).sum::<usize>())
+        .sum();
+    let from = window_from(
+        &slot.own,
+        slot.window.saturating_sub(lineage_tokens),
+        &tokens,
+    );
+    let mut kept: Vec<Unit> = Vec::new();
+    for (e, ex) in slot.own.iter().enumerate().skip(from) {
         let pid = piece();
         let part = Part::Own(e);
-        let one = |units: &mut Units, r: usize| {
-            units.add(part, vec![r], unit(ex, &[r], pid, Kind::Dialogue))
-        };
-        let tools: Vec<usize> = (1..n.saturating_sub(1)).collect();
-        if Some(e) == current {
-            // Its first turn, its newest tool turn and its last are kept; the
-            // older tool turns go first.
-            let mut kept: Vec<Unit> = floor_rounds(n)
-                .into_iter()
-                .map(|r| one(&mut units, r))
-                .collect();
-            if let Some(&newest) = tools.last() {
-                kept.push(one(&mut units, newest));
-            }
-            let older = tools[..tools.len().saturating_sub(1)]
-                .iter()
-                .map(|&r| one(&mut units, r))
-                .collect();
-            input.current = FloorExchange {
-                kept,
-                rounds: older,
-            };
-            continue;
-        }
-        let fr = floor_rounds(n);
-        let pair = units.add(part, fr.clone(), unit(ex, &fr, pid, Kind::Dialogue));
-        if e >= recent_from {
-            // A recent exchange holds every turn it has.
-            let rounds = tools.iter().map(|&r| one(&mut units, r)).collect();
-            input.recent.push(FloorExchange {
-                kept: vec![pair],
-                rounds,
-            });
-            continue;
-        }
-        if e == 0 {
-            // The dialogue's first exchange's floor.
-            input.first_request = Some(pair);
-        } else {
-            input.scored.push(pair);
-        }
-        input.piece_floors.insert(pid, vec![pair]);
-        for r in tools {
-            let u = one(&mut units, r);
-            input.scored.push(u);
+        for r in 0..ex.len() {
+            kept.push(units.add(part, vec![r], unit(ex, &[r], pid, Kind::Dialogue)));
         }
     }
-    // Floors run newest first.
-    input.recent.reverse();
+    input.current = FloorExchange {
+        kept,
+        rounds: Vec::new(),
+    };
 
     // A unit is held when the slot holds every turn of it.
     let exchange_of = |part: Part| -> &[TurnKey] {
@@ -395,7 +387,7 @@ mod tests {
         DialogueSlot {
             room,
             caps,
-            recent: 0,
+            window: room,
             lineage: vec![],
             working,
             own: vec![],
@@ -411,7 +403,7 @@ mod tests {
         let slot = DialogueSlot {
             room: 10_000,
             caps: caps(),
-            recent: 16,
+            window: 10_000,
             lineage: vec![(vec![k(9, 0)], 1_000.0)],
             working: vec![reading()],
             own: vec![vec![k(1, 0)], vec![k(1, 1), k(1, 2)]],
@@ -474,28 +466,44 @@ mod tests {
         assert_eq!(p.working, vec![vec![], vec![k(6, 0), k(6, 1), k(6, 3)]]);
     }
 
-    /// An older exchange the room has no place for leaves whole; the current
-    /// exchange and the first exchange's floor stay.
+    /// **The window holds the newest past exchanges whole, the current one
+    /// always; the oldest drop out of its far end** (`docs/placed_section_
+    /// layout.md` §3.7): a 20-token window holds the newest past exchange and
+    /// the current one, whatever they score, and the first drops whole.
     #[test]
-    fn an_older_exchange_leaves_whole() {
+    fn the_window_holds_the_newest_exchanges_whole() {
         let slot = DialogueSlot {
             own: vec![vec![k(1, 0)], vec![k(1, 1)], vec![k(1, 2)]],
-            ..slot(40, caps(), vec![])
+            window: 20,
+            ..slot(1_000, caps(), vec![])
         };
-        let p = plan(&slot, |_| 0.0, twenty, |_| 0.0);
-        assert_eq!(p.own, vec![k(1, 0), k(1, 2)]);
+        let p = plan(
+            &slot,
+            |t| if t == k(1, 0) { 900.0 } else { 0.0 },
+            twenty,
+            |_| 0.0,
+        );
+        assert_eq!(p.own, vec![k(1, 1), k(1, 2)]);
+        assert_eq!(window_from(&slot.own, 20, &twenty), 1);
+        assert_eq!(
+            window_from(&slot.own, 0, &twenty),
+            2,
+            "the current one always"
+        );
+        assert_eq!(window_from(&[], 20, &twenty), 0);
     }
 
-    /// The current exchange past the room sheds its older tool turns, oldest
-    /// first, and keeps its first turn, its newest tool turn and its last.
+    /// **Nothing of a request is shed**: the current exchange past the room
+    /// keeps every turn, and the slot runs over the room by what it passes.
     #[test]
-    fn the_current_exchange_sheds_its_oldest_tool_turns() {
+    fn nothing_of_a_request_is_shed() {
         let slot = DialogueSlot {
             own: vec![vec![k(1, 0), k(1, 1), k(1, 2), k(1, 3), k(1, 4)]],
             ..slot(80, caps(), vec![])
         };
         let p = plan(&slot, |_| 0.0, twenty, |_| 0.0);
-        assert_eq!(p.own, vec![k(1, 0), k(1, 2), k(1, 3), k(1, 4)]);
+        assert_eq!(p.own, vec![k(1, 0), k(1, 1), k(1, 2), k(1, 3), k(1, 4)]);
+        assert_eq!(p.over_room, 20);
     }
 
     /// **A reading the slot holds keeps its pages at a boundary with an

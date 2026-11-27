@@ -1080,18 +1080,14 @@ pub fn run_with_sink<R: ContentResolver>(
                 segment_tokens(&system_prompt_segments, resolver).saturating_sub(files_tokens),
             )
             .saturating_sub(decode_pos.unwrap_or(0));
-        let (recent, lineage_base) = group_states
+        let lineage_base = group_states
             .iter()
             .find(|gs| gs.schema.id == target.group)
             .and_then(|gs| match gs.schema.selection {
-                SelectionRule::Sequence {
-                    recent,
-                    lineage_base,
-                    ..
-                } => Some((recent, lineage_base)),
+                SelectionRule::Sequence { lineage_base, .. } => Some(lineage_base),
                 _ => None,
             })
-            .unwrap_or((0, LINEAGE_BASE));
+            .unwrap_or(LINEAGE_BASE);
         let exchanges_of = |keys: &[TurnKey]| -> Vec<Vec<TurnKey>> {
             let mut ex = resolver.group_exchanges(keys);
             ex.sort_by_key(|e| e.first().copied());
@@ -1200,10 +1196,14 @@ pub fn run_with_sink<R: ContentResolver>(
         // with no allowance (§7.2 step 5).
         let boundary = resolver.working_set_boundary().unwrap_or_default();
         let allowance = (!boundary.opening).then(|| caps.allowance());
+        // The dialogue's window: its share of the room before the request
+        // appended anything — the system prompt's ranges are their full size
+        // whatever they hold, so the same at every boundary of the request.
+        let window = ws.fill_shares.caps(room + decode_pos.unwrap_or(0)).dialogue;
         let slot = DialogueSlot {
             room,
             caps,
-            recent,
+            window,
             lineage,
             working,
             own: exchanges_of(&own_keys),

@@ -74,7 +74,7 @@ fn random_case(rng: &mut StdRng) -> Case {
     let mut slot = DialogueSlot {
         room: rng.random_range(0..=600),
         caps,
-        recent: rng.random_range(0..=3),
+        window: rng.random_range(0..=400),
         lineage,
         working,
         own,
@@ -203,30 +203,28 @@ fn every_carving_of_a_random_slot_keeps_whole_turns_and_its_caps() {
                 "case {case_no}: {kind:?} placed {used} past its cap {cap}"
             );
         }
-        // The current exchange keeps its first turn, its newest tool turn and
-        // its last; the dialogue's first exchange keeps its floor unless it is
-        // one of the recent exchanges, which give way.
+        // The dialogue's exchanges by birth: the current one and every past
+        // one from the window's first, each whole; none before it.
         let n_own = slot.own.len();
-        let recent_from = n_own.saturating_sub(1).saturating_sub(slot.recent);
+        let lineage_tokens: usize = slot.lineage.iter().map(|(ex, _)| tokens_of(ex)).sum();
+        let mut left = slot.window.saturating_sub(lineage_tokens);
+        let mut from = n_own.saturating_sub(1);
+        for e in (0..n_own.saturating_sub(1)).rev() {
+            let t = tokens_of(&slot.own[e]);
+            if t > left {
+                break;
+            }
+            left -= t;
+            from = e;
+        }
         for (e, ex) in slot.own.iter().enumerate() {
             let placed = check(ex, &format!("own {e}"));
-            if e + 1 == n_own {
-                assert!(
-                    !placed.is_empty(),
-                    "case {case_no}: the current exchange stays"
-                );
-                if ex.len() >= 3 {
-                    assert!(
-                        placed.contains(&ex[ex.len() - 2]),
-                        "case {case_no}: the current exchange keeps its newest tool turn"
-                    );
-                }
-            } else if e == 0 && e < recent_from {
-                assert!(
-                    !placed.is_empty(),
-                    "case {case_no}: the first exchange's floor stays"
-                );
-            }
+            let want = if e >= from { ex.len() } else { 0 };
+            assert_eq!(
+                placed.len(),
+                want,
+                "case {case_no}: own {e} is whole inside the window and gone outside it"
+            );
         }
 
         // What is placed fits the room, but for what floors carried past it.

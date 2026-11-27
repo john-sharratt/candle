@@ -525,6 +525,17 @@ At each boundary:
 
 ### 7.3 Membership and positions
 
+**Amended by `docs/placed_section_layout.md` §3.7.** The dialogue's own
+exchanges are placed by birth, not re-chosen by score: at every boundary of a
+request the slot holds the current exchange and the newest past exchanges its
+window holds — its share of the room before the request appended anything,
+the same at every boundary since the system prompt's ranges are their full
+size whatever they hold — every turn of each, none shed
+(`projection/dialogue_fill.rs`). Between requests the oldest whole exchanges
+drop out of the window's far end. Step 4's floors, `recent` and scored older
+rounds no longer apply to the dialogue's own exchanges; the knowledge base
+is placed by relevance in its own range (§3.1–§3.5 there).
+
 The slot's membership changes only at a boundary, and a reply crosses many of
 them. Between two boundaries the slot's positions are fixed; at a boundary the
 slot may be renumbered under a reply in progress, as reprojection does today,

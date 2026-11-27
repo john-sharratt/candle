@@ -279,8 +279,14 @@ pub(super) fn emit_system_prompt_items<R: ContentResolver>(
 /// not fill is a hole, ahead of them in a range filled from the top, after
 /// them in one filled from the bottom, so the range always takes its full size
 /// on an engine trained to the resolver's window (`docs/placed_section_layout.md`
-/// §3.1). Members past the range are emitted whole and the range runs over,
-/// which is the fill's to prevent, and is warned of.
+/// §3.1).
+///
+/// A range filled from the bottom holds its members in the order they were
+/// written, and a full one is a window (§3.7): the oldest go, their glue with
+/// them, until the rest fit — the newest always placed, the survivors sliding
+/// down by what left. Members past a range filled from the top are emitted
+/// whole and the range runs over, which the fill is there to prevent, and is
+/// warned of.
 pub(super) fn emit_in_range<R: ContentResolver>(
     out: &mut Vec<ProjectionSegment>,
     coll: &SectionCollection,
@@ -289,8 +295,16 @@ pub(super) fn emit_in_range<R: ContentResolver>(
     resolver: &R,
 ) {
     let native = resolver.trained_window();
-    let used = segment_tokens(&selected, resolver);
     let reserved = range.positions(native);
+    let mut selected = selected;
+    if range.fill == RangeFill::Bottom {
+        let mut used = segment_tokens(&selected, resolver);
+        while used > reserved && selected.len() > 1 {
+            used -= segment_tokens(&selected[..1], resolver);
+            selected.remove(0);
+        }
+    }
+    let used = segment_tokens(&selected, resolver);
     if used > reserved {
         tracing::warn!(
             collection = %coll.name,
