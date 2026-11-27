@@ -41,11 +41,15 @@ people:
   # `docs/zenj.md` §5.2).
   - sub: "service:zenj"
     role: user
-  # Zen, as npcd's drones call zend for it over their member's socket
-  # (`docs/zen_memory_and_guides.md` D8): it starts and steers tasks as the
-  # person `zen`, and grants nothing — `approval_grant` is an admin's.
+  # Zen, as npcd calls zend for it over its member's socket — its cluster
+  # terminal and its drones' tasks (`docs/zen_memory_and_guides.md` D8,
+  # `docs/zen_everywhere.md` §5): it starts and steers tasks as the person
+  # `zen`, and its terminal reads the audit and what each machine runs and
+  # starts build and test jobs, each an admin's. What Zen itself may call is
+  # the terminal's to offer: npcd names every act, and none decides for the
+  # cluster. Its drones' tasks run as an admin's too, with an admin's tools.
   - sub: "service:zen"
-    role: user
+    role: admin
   # The dependency battery (`zend/examples/dependency_battery`), asking its
   # questions on conversations of its own so a run can be swept without
   # touching anyone else's (`docs/unbounded_agents.md` §9.12).
