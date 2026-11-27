@@ -1,0 +1,211 @@
+# The depth-1 battery: the knowledge base's sealed reading, on the production
+# path, over what an ingest at `max_depth: 1` holds — the workspace
+# repositories' root files (docs/placed_section_layout.md §7). Asked with the
+# production arm (C1) alone, against `--repo` the candle checkout; another
+# repository's file is named from it (`../yenbot/Cargo.toml`).
+#
+#   direct         — one file answers it, and the question names it
+#   transitive     — two files answer it together; neither named by its file
+#                    name where the answer turns on telling them apart
+#   architectural  — the seed's documents, the knowledge base's mandatory files
+#
+# Every expected item was read from the file it names when this was written;
+# the format is `battery.yaml`'s.
+
+categories: { direct: 15, transitive: 3, architectural: 6 }
+
+questions:
+  # ── Direct ────────────────────────────────────────────────────────────────
+  - id: k01
+    category: direct
+    question: >-
+      In the yenbot repository's Cargo.toml, which version of serde is declared, and which feature does it enable?
+    expect: ["1.0.228", "derive"]
+    files: [../yenbot/Cargo.toml]
+    names_file: true
+
+  - id: k02
+    category: direct
+    question: >-
+      Which version of serde does the candle workspace's Cargo.toml declare?
+    expect: ["1.0.171"]
+    files: [Cargo.toml]
+    names_file: true
+
+  - id: k03
+    category: direct
+    question: >-
+      Which version of axum does yenbot's Cargo.toml declare, and with which features?
+    expect: ["0.7.9", "macros", "ws"]
+    files: [../yenbot/Cargo.toml]
+    names_file: true
+
+  - id: k04
+    category: direct
+    question: >-
+      Which rusqlite version does yenbot's Cargo.toml declare, and which features does it turn on?
+    expect: ["0.31.0", "bundled", "backup"]
+    files: [../yenbot/Cargo.toml]
+    names_file: true
+
+  - id: k05
+    category: direct
+    question: >-
+      Which version of the tokenizers crate does the candle workspace's Cargo.toml declare?
+    expect: ["0.21.0"]
+    files: [Cargo.toml]
+    names_file: true
+
+  - id: k06
+    category: direct
+    question: >-
+      What package version and Rust edition does the candle workspace's Cargo.toml give its members?
+    expect: ["0.9.1", "2021"]
+    files: [Cargo.toml]
+    names_file: true
+
+  - id: k07
+    category: direct
+    question: >-
+      According to INSTALL.md, which CUDA Toolkit version must zend be built with?
+    expect: ["12.9"]
+    files: [INSTALL.md]
+    names_file: true
+
+  - id: k08
+    category: direct
+    question: >-
+      According to INSTALL.md, what nvcc error does CUDA 12.4 give when building the kernels?
+    expect: ["compute_120"]
+    files: [INSTALL.md]
+    names_file: true
+
+  - id: k09
+    category: direct
+    question: >-
+      According to INSTALL.md, what value is CUDARC_CUDA_VERSION set to?
+    expect: ["12090"]
+    files: [INSTALL.md]
+    names_file: true
+
+  - id: k10
+    category: direct
+    question: >-
+      Which items in the candle TODO.md are already marked done?
+    expect: ["journal tool", "compacting"]
+    files: [TODO.md]
+    names_file: true
+
+  - id: k11
+    category: direct
+    question: >-
+      In the candle Makefile, which directories does the clean-ptx target remove?
+    expect: ["precompiled", "staged"]
+    files: [Makefile]
+    names_file: true
+
+  - id: k12
+    category: direct
+    question: >-
+      According to clippy.toml, which function must every CUDA graph capture begin through?
+    expect: ["capture::begin"]
+    files: [clippy.toml]
+    names_file: true
+
+  - id: k13
+    category: direct
+    question: >-
+      According to the candle CHANGELOG, which 7b model was added in v0.3.0, together with a quantized version of it?
+    expect: ["Mistral"]
+    files: [CHANGELOG.md]
+    names_file: true
+
+  - id: k14
+    category: direct
+    question: >-
+      Which Rust toolchain channel does battle-cities' rust-toolchain.toml select?
+    expect: ["nightly"]
+    files: [../battle-cities/rust-toolchain.toml]
+    names_file: true
+
+  - id: k15
+    category: direct
+    question: >-
+      Which Rust edition does the battle-cities workspace's Cargo.toml declare?
+    expect: ["2024"]
+    files: [../battle-cities/Cargo.toml]
+    names_file: true
+
+  # ── Transitive ────────────────────────────────────────────────────────────
+  - id: k16
+    category: transitive
+    question: >-
+      Which serde versions do the candle workspace and yenbot each declare in their manifests?
+    expect: ["1.0.171", "1.0.228"]
+    files: [Cargo.toml, ../yenbot/Cargo.toml]
+    names_file: false
+
+  - id: k17
+    category: transitive
+    question: >-
+      Which Rust editions do the candle and battle-cities workspace manifests declare?
+    expect: ["2021", "2024"]
+    files: [Cargo.toml, ../battle-cities/Cargo.toml]
+    names_file: false
+
+  - id: k18
+    category: transitive
+    question: >-
+      INSTALL.md names a cudarc version pinned in the workspace; which cudarc version does candle's Cargo.toml actually declare?
+    expect: ["0.17.3"]
+    files: [INSTALL.md, Cargo.toml]
+    names_file: true
+
+  # ── Architectural: the seed's documents ───────────────────────────────────
+  - id: k19
+    category: architectural
+    question: >-
+      According to AGENTS.md, what prefill and decode throughput do the hot-path invariants target?
+    expect: ["1000", "50"]
+    files: [AGENTS.md]
+    names_file: true
+
+  - id: k20
+    category: architectural
+    question: >-
+      According to AGENTS.md, which fine-scale formats protect the first four attention-sink tokens?
+    expect: ["Q4_KS", "Q8_KS"]
+    files: [AGENTS.md]
+    names_file: true
+
+  - id: k21
+    category: architectural
+    question: >-
+      According to AGENTS.md, what latency must an MCP tool that runs no model meet at the 95th percentile?
+    expect: ["30 ms|30ms"]
+    files: [AGENTS.md]
+    names_file: true
+
+  - id: k22
+    category: architectural
+    question: >-
+      According to ARCHITECTURE.md, how long does the provenance scan take on the RTX 4090 Laptop GPU?
+    expect: ["9.5"]
+    files: [ARCHITECTURE.md]
+    names_file: true
+
+  - id: k23
+    category: architectural
+    question: >-
+      According to the README, what Markov expert prediction hit rate was measured on Qwen3-30B-A3B?
+    expect: ["69"]
+    files: [README.md]
+    names_file: true
+
+  - id: k24
+    category: architectural
+    question: >-
+      According to the README, what aggregate decode rate does DeepSeek-V4-Flash reach on one 72 GB card?
+    expect: ["114.4"]
+    files: [README.md]
+    names_file: true

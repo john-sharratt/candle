@@ -22,6 +22,8 @@
 # file name, or a distinctive stem); the split is fixed here, before any run,
 # and `battery.rs` checks each flag against its text.
 
+categories: { direct: 43, transitive: 43, architectural: 42 }
+
 questions:
   # ── Direct ────────────────────────────────────────────────────────────────
   - id: d01

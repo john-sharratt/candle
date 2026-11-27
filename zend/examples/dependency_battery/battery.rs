@@ -1,21 +1,21 @@
-//! The battery's questions as `battery.yaml` commits them, and the checks
-//! that hold them to the design (`docs/unbounded_agents.md` §9.12): the
-//! category proportions, ids unique, every answer file present in the
-//! repository, no expected item spelled in its own question, and each
+//! A battery's questions as its file commits them, and the checks that hold
+//! them to the design (`docs/unbounded_agents.md` §9.12): the category
+//! proportions the file declares, ids unique, every answer file present in
+//! the repository, no expected item spelled in its own question, and each
 //! question's `names_file` flag the one its text gives.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use anyhow::{bail, Context};
 use serde::Deserialize;
 
-/// The three categories, and how many of each the battery holds.
-pub const CATEGORIES: [(&str, usize); 3] =
-    [("direct", 43), ("transitive", 43), ("architectural", 42)];
-
 #[derive(Deserialize)]
 pub struct Battery {
+    /// Each category and how many questions of it the battery holds, fixed
+    /// before any run: `battery.yaml`'s 43 direct, 43 transitive and 42
+    /// architectural, or a smaller battery's own.
+    pub categories: BTreeMap<String, usize>,
     pub questions: Vec<Question>,
 }
 
@@ -59,11 +59,11 @@ pub fn names_any(question: &str, files: &[String]) -> bool {
 /// Every way `battery` breaks the design, one line each; empty when it holds.
 pub fn violations(battery: &Battery, repo: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    for (category, want) in CATEGORIES {
+    for (category, &want) in &battery.categories {
         let got = battery
             .questions
             .iter()
-            .filter(|q| q.category == category)
+            .filter(|q| &q.category == category)
             .count();
         if got != want {
             out.push(format!("{got} {category} questions, not {want}"));
@@ -74,7 +74,7 @@ pub fn violations(battery: &Battery, repo: &Path) -> Vec<String> {
         if !ids.insert(q.id.as_str()) {
             out.push(format!("{}: id repeated", q.id));
         }
-        if !CATEGORIES.iter().any(|(c, _)| *c == q.category) {
+        if !battery.categories.contains_key(&q.category) {
             out.push(format!("{}: no category `{}`", q.id, q.category));
         }
         if q.expect.is_empty() {
@@ -157,7 +157,42 @@ mod tests {
         let path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/dependency_battery/battery.yaml");
         let battery = Battery::load(&path).unwrap();
+        let want: BTreeMap<String, usize> =
+            [("architectural", 42), ("direct", 43), ("transitive", 43)]
+                .into_iter()
+                .map(|(c, n)| (c.to_string(), n))
+                .collect();
+        assert_eq!(battery.categories, want);
         let v = violations(&battery, &repo());
         assert!(v.is_empty(), "{}", v.join("\n"));
+    }
+
+    /// **The depth-1 battery holds to its design**: 15, 3 and 6 questions over
+    /// the workspace's root files, its other repositories' named from the
+    /// candle checkout.
+    #[test]
+    fn the_depth1_battery_holds_to_its_design() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/dependency_battery/battery_depth1.yaml");
+        let battery = Battery::load(&path).unwrap();
+        assert_eq!(battery.questions.len(), 24);
+        let v = violations(&battery, &repo());
+        assert!(v.is_empty(), "{}", v.join("\n"));
+    }
+
+    /// **A question in a category the battery does not declare, or a count
+    /// off the declared one, breaks it.**
+    #[test]
+    fn a_category_off_its_declared_count_breaks_the_battery() {
+        let battery: Battery = serde_yaml::from_str(
+            "categories: { direct: 2 }\nquestions:\n  - { id: a, category: direct, question: q, expect: [x], files: [Cargo.toml], names_file: false }\n  - { id: b, category: odd, question: q, expect: [y], files: [Cargo.toml], names_file: false }\n",
+        )
+        .unwrap();
+        let v = violations(&battery, &repo());
+        assert!(
+            v.contains(&"1 direct questions, not 2".to_string()),
+            "{v:?}"
+        );
+        assert!(v.contains(&"b: no category `odd`".to_string()), "{v:?}");
     }
 }
