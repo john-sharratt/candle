@@ -878,6 +878,22 @@ impl Scheduler {
                     if fires {
                         Self::queue_reprojection(&mut self.pending_reprojections, seq_id);
                     }
+                    // Every step, the placed sections' hit rates: one that
+                    // stayed under the bar leaves its range, and the next wave
+                    // reprojects without it (`docs/placed_section_layout.md`
+                    // §3.4).
+                    if let Some(p) = state.reprojection.as_ref() {
+                        let slot = self.turn_views.get(&seq_id).map_or(seq_id, |v| v.parent_id);
+                        let left = step_sections(
+                            self.model.as_mut(),
+                            self.slot_projection_state.get_mut(&slot),
+                            slot,
+                            p,
+                        );
+                        if left {
+                            Self::queue_reprojection(&mut self.pending_reprojections, seq_id);
+                        }
+                    }
                 }
             }
         }

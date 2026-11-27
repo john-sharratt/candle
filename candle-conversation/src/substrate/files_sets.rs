@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use super::Substrate;
 use crate::files::scope::RangeScope;
-use crate::files::{FileKey, FilesPin, FilesSet, FreshSection};
+use crate::files::{FileKey, FilesPin, FilesSet, FreshSection, SectionKey};
 use crate::projection::{GroupId, TimelineId};
 
 impl Substrate {
@@ -34,6 +34,15 @@ impl Substrate {
     /// Record `scope` as the range a projection of `target` placed.
     pub fn files_scope(&mut self, target: TimelineId, scope: RangeScope) {
         Arc::make_mut(self.files_sets.entry(target).or_default()).set_scope(scope);
+    }
+
+    /// `sections` leave `target`'s range until its next question
+    /// ([`FilesSet::evict`]); whether any left.
+    pub fn files_evict(&mut self, target: TimelineId, sections: &[SectionKey]) -> bool {
+        match self.files_sets.get_mut(&target) {
+            Some(set) => Arc::make_mut(set).evict(sections),
+            None => false,
+        }
     }
 
     /// Keep `files`, read by `target`'s turn, from being placed until its

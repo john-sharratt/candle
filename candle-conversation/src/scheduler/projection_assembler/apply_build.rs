@@ -589,7 +589,9 @@ pub(in super::super) fn apply_segments_build(
     // the rounds the shadow scan reads (§6.3).
     let (hit_keys, hit_ranges, pooled) = {
         let conv = ctx.conversation.read();
-        let (mut keys, ranges) = hit_rounds_of(&pieces, &state.placed_pieces, &conv);
+        let sections = kb_sections(&conv, ctx.slot_target);
+        state.kb_rounds = sections.values().map(|&k| (k.scan_id(), k)).collect();
+        let (mut keys, ranges) = hit_rounds_of(&pieces, &state.placed_pieces, &conv, &sections);
         let placed: HashSet<RoundKey> = keys.iter().copied().collect();
         let (pooled_keys, pooled) = pooled_rounds(&state.pool, &placed, |tl| conv.exchanges_of(tl));
         keys.extend(pooled_keys);

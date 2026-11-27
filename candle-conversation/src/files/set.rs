@@ -51,6 +51,9 @@ pub struct FilesSet {
     /// The knowledge base's range as the last projection placed it; `None`
     /// before the opening.
     pub scope: Option<RangeScope>,
+    /// Sections whose hit rate evicted them during this request: none comes
+    /// back by momentum before the next question.
+    pub evicted: BTreeSet<SectionKey>,
     /// Files the turn's own reads hold verbatim in the dialogue: none of
     /// their sections placed until the next question
     /// ([`Self::clear_withheld`]), unless already placed, which keeps its
@@ -106,9 +109,26 @@ impl FilesSet {
     /// (`docs/placed_section_layout.md` §3.2).
     pub fn clear_withheld(&mut self) {
         self.withheld.clear();
+        self.evicted.clear();
         if let Some(scope) = self.scope.as_mut() {
             scope.compact();
         }
+    }
+
+    /// `sections` leave the range, each leaving a hole, and stay out until
+    /// the next question; whether any left.
+    pub fn evict(&mut self, sections: &[SectionKey]) -> bool {
+        let Some(scope) = self.scope.as_mut() else {
+            return false;
+        };
+        let mut any = false;
+        for &s in sections {
+            if scope.leave(s) {
+                self.evicted.insert(s);
+                any = true;
+            }
+        }
+        any
     }
 
     /// Whether `section` is placed.
@@ -187,6 +207,24 @@ mod tests {
         set.clear_withheld();
         assert_eq!(set.scope.as_ref().unwrap().used(), 40);
         assert!(set.places(SectionKey(3)) && !set.places(SectionKey(2)));
+    }
+
+    /// **An evicted section leaves a hole and stays out until the next
+    /// question**, which closes the hole.
+    #[test]
+    fn an_evicted_section_stays_out_until_the_next_question() {
+        let mut scope = RangeScope::new(100);
+        scope.enter(SectionKey(1), 30, false);
+        scope.enter(SectionKey(2), 20, false);
+        let mut set = FilesSet::default();
+        set.set_scope(scope);
+        assert!(set.evict(&[SectionKey(1)]));
+        assert!(!set.evict(&[SectionKey(9)]));
+        assert_eq!(set.scope.as_ref().unwrap().used(), 50, "the hole stays");
+        assert!(set.evicted.contains(&SectionKey(1)));
+        set.clear_withheld();
+        assert!(set.evicted.is_empty());
+        assert_eq!(set.scope.as_ref().unwrap().used(), 20);
     }
 
     /// **A pinned set folds no scan.**

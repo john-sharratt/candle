@@ -28,15 +28,31 @@
 
 use std::ops::Range;
 
+use crate::files::SectionKey;
 use crate::projection::{TimelineId, TurnIndex};
 
 /// One round of one exchange: its `index`-th turn.
+///
+/// A placed section of the knowledge base is one round too
+/// (`docs/placed_section_layout.md` §3.4): named by its scan id as the
+/// timeline, its only round ([`RoundKey::of_section`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RoundKey {
     pub timeline: TimelineId,
     /// The exchange's first turn.
     pub head: TurnIndex,
     pub index: u32,
+}
+
+impl RoundKey {
+    /// The one round of the knowledge-base section `section`.
+    pub fn of_section(section: SectionKey) -> RoundKey {
+        RoundKey {
+            timeline: section.scan_id(),
+            head: TurnIndex(0),
+            index: 0,
+        }
+    }
 }
 
 /// The round `turn` is in the exchange `turns`, or `None` for a turn not in it.

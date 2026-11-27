@@ -11,8 +11,6 @@ pub struct Entry {
     /// A mandatory section (`files::mandatory`): in scope from the opening,
     /// it never leaves and never slides out.
     pub mandatory: bool,
-    /// Consecutive steps its hit rate has stayed below the eviction bar.
-    pub below: u32,
 }
 
 /// One place in a range.
@@ -52,7 +50,6 @@ mod tests {
             key: SectionKey(1),
             tokens: 40,
             mandatory: false,
-            below: 0,
         };
         assert_eq!(Place::Section(e).positions(), 40);
         assert_eq!(Place::Hole(12).positions(), 12);

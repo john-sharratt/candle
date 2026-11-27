@@ -1,13 +1,12 @@
-//! A range's decisions from its sections' hit rates
+//! A range's entries from its sections' hit rates
 //! (`docs/placed_section_layout.md` §3.4).
 //!
 //! **The opening** places the mandatory sections, then the sections the
 //! question's prefill selects in descending rate, each that fits — the first
-//! at the top, nearest the question. **Each step after it**, a placed section
-//! under the eviction bar counts the step against it and leaves once it has
-//! stayed there [`Bars::evict_steps`] steps; a section out of scope at or
-//! above the entry bar enters in front, strongest first, sliding a full range.
-//! A step's decision is the layout the next step reads.
+//! at the top, nearest the question. **At a step after it**, a section out of
+//! scope at or above the entry bar enters in front, strongest first, sliding a
+//! full range; which sections leave is the [`super::watch`]'s to say. A step's
+//! decision is the layout the next step reads.
 
 use super::bars::Bars;
 use super::range_scope::RangeScope;
@@ -59,37 +58,19 @@ impl RangeScope {
         change
     }
 
-    /// One step: every placed section's rate against the eviction bar, then
-    /// every candidate's against the entry bar.
-    pub fn step(
+    /// Admit every candidate out of scope at or above the entry bar, strongest
+    /// first, each in front; a section a full range slid out this step does
+    /// not come back in it.
+    pub fn admit(
         &mut self,
         rate: impl Fn(SectionKey) -> f32,
         candidates: &[Candidate],
         bars: &Bars,
     ) -> StepChange {
         let mut change = StepChange::default();
-        let mut leaving = Vec::new();
-        for e in self.entries_mut() {
-            if e.mandatory {
-                continue;
-            }
-            if rate(e.key) < bars.evict {
-                e.below += 1;
-            } else {
-                e.below = 0;
-            }
-            if e.below >= bars.evict_steps {
-                leaving.push(e.key);
-            }
-        }
-        for key in leaving {
-            if self.leave(key) {
-                change.left.push(key);
-            }
-        }
         let mut entering: Vec<(Candidate, f32)> = candidates
             .iter()
-            .filter(|c| !self.holds(c.key) && !change.left.contains(&c.key))
+            .filter(|c| !self.holds(c.key))
             .map(|&c| (c, rate(c.key)))
             .filter(|&(_, r)| r >= bars.entry)
             .collect();
@@ -122,12 +103,6 @@ mod tests {
         s.sections().map(|e| e.key.0).collect()
     }
 
-    const BARS: Bars = Bars {
-        entry: 800.0,
-        evict: 600.0,
-        evict_steps: 3,
-    };
-
     /// **The opening places the mandatory sections, then the ranked ones that
     /// fit, the first at the top**: m (30), then a (40) and c (20); b (50)
     /// does not fit the 30 left after a and is passed over.
@@ -141,30 +116,6 @@ mod tests {
         );
         assert_eq!(keys(&s), vec![9, 1, 3]);
         assert!(s.entry(SectionKey(9)).unwrap().mandatory);
-    }
-
-    /// **A section leaves only after staying under the eviction bar for its
-    /// steps, and a step at or over it resets the count**; a mandatory one
-    /// never counts.
-    #[test]
-    fn a_section_leaves_after_its_steps_under_the_bar() {
-        let mut s = RangeScope::new(100);
-        s.open(&[c(9, 10)], &[c(1, 20), c(2, 20)]);
-        let rates = |low: u64| move |k: SectionKey| if k.0 == low { 100.0 } else { 700.0 };
-        assert!(s.step(rates(1), &[], &BARS).is_empty());
-        assert!(s.step(rates(1), &[], &BARS).is_empty());
-        // A step at the bar resets 1's count.
-        assert!(s.step(rates(0), &[], &BARS).is_empty());
-        assert!(s.step(rates(1), &[], &BARS).is_empty());
-        assert!(s.step(rates(1), &[], &BARS).is_empty());
-        let change = s.step(rates(1), &[], &BARS);
-        assert_eq!(change.left, vec![SectionKey(1)]);
-        assert_eq!(keys(&s), vec![9, 2]);
-        // 9 is mandatory: under the bar for ever, it stays.
-        for _ in 0..10 {
-            s.step(rates(9), &[], &BARS);
-        }
-        assert_eq!(keys(&s), vec![9, 2]);
     }
 
     /// **Candidates at or over the entry bar enter in front, strongest
@@ -181,7 +132,7 @@ mod tests {
             5 => 799.0,
             _ => 700.0,
         };
-        let change = s.step(rate, &[c(3, 10), c(4, 25), c(5, 5)], &BARS);
+        let change = s.admit(rate, &[c(3, 10), c(4, 25), c(5, 5)], &Bars::DEFAULT);
         assert_eq!(change.entered, vec![SectionKey(3), SectionKey(4)]);
         assert_eq!(change.slid, vec![SectionKey(1)]);
         assert_eq!(keys(&s), vec![2, 3, 4]);

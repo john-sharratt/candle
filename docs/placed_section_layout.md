@@ -206,7 +206,23 @@ pool's momentum, not provenance strength.
   a section near the line does not flap. They are declared per section in `projection.yaml`
   beside its budgets, as the tools declare `min_score` / `evict_score`
   (800 / 600), and measured on the needle and multi-file cases before they
-  are fixed.
+  are fixed. Until then the knowledge base runs on `Bars::KNOWLEDGE_BASE`
+  (`files/scope/bars.rs`): entry 800, and an eviction bar of 1 — a section
+  leaves only once the selection has not read it at all for 64 steps. The
+  rate is out of every block of the section by every query, and the
+  selection keeps a few blocks of the whole prompt a query, so a section that
+  is being read sits far under 600; the tools' 600 would empty the range one
+  cadence into every request.
+- **The step's counts stay beside the slot.** Which steps a placed section
+  has spent under the bar is the scheduler's (`files/scope/watch.rs`, held
+  on the slot's projection state): a step that changes no layout publishes
+  no substrate version. A section that leaves is evicted on the files set
+  (`FilesSet::evict`), stays out until the next question even where its
+  momentum would choose it, and the view is reprojected at the next wave
+  (`scheduler/section_step.rs`). Placed sections are declared to the model
+  as hit rounds of their own (`RoundKey::of_section`), so a step's read
+  rates them; every step's read is summed into the slot's unread hits, so
+  the boundary still folds them into its momentum.
 - **Entering never moves anything.** A step's entries take positions below the
   lowest placed section; every section already placed keeps its positions,
   so every relative position a decoded token was formed against holds. The

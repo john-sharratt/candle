@@ -84,6 +84,54 @@ pub(in super::super) struct SlotState {
     /// Pieces that left the pool, keeping their pages for a few refreshes
     /// (`super::pool_linger`).
     pub(in super::super) pool_linger: PoolLinger,
+    /// The knowledge-base sections the last assembly declared as rounds, by
+    /// their round's timeline ([`RoundKey::of_section`]): what a step's hits
+    /// rate (`docs/placed_section_layout.md` §3.4).
+    pub(in super::super) kb_rounds: HashMap<TimelineId, SectionKey>,
+    /// The steps each placed section has stayed under the eviction bar.
+    pub(in super::super) evict_watch: EvictWatch,
+}
+
+/// `hits` — one read of a declaration whose rounds are `keys` — folded into
+/// `parts`: summed into the last part when it read the same declaration, so a
+/// read every step keeps one part a declaration; otherwise appended, the
+/// oldest going past [`UNREAD_HIT_PARTS`].
+pub(in super::super) fn fold_part(parts: &mut Vec<HitPart>, keys: &[RoundKey], hits: PieceHits) {
+    if let Some((last_keys, last)) = parts.last_mut() {
+        if last_keys.as_slice() == keys && last.hits.len() == hits.hits.len() {
+            for (a, b) in last.hits.iter_mut().zip(&hits.hits) {
+                *a += b;
+            }
+            last.queries += hits.queries;
+            last.shadow_queries += hits.shadow_queries;
+            return;
+        }
+    }
+    parts.push((keys.to_vec(), hits));
+    if parts.len() > UNREAD_HIT_PARTS {
+        parts.remove(0);
+    }
+}
+
+/// Each declared section round's rate in `hits`, a read of the declaration
+/// whose rounds are `keys`, on the 0–1000 band (`files::scope::band`).
+pub(in super::super) fn section_rates(
+    keys: &[RoundKey],
+    hits: &PieceHits,
+    sections: &HashMap<TimelineId, SectionKey>,
+) -> HashMap<SectionKey, f32> {
+    keys.iter()
+        .enumerate()
+        .filter_map(|(i, k)| {
+            let section = sections.get(&k.timeline)?;
+            let rate = band(
+                u64::from(*hits.hits.get(i)?),
+                u64::from(*hits.blocks.get(i)?),
+                hits.queries_of(i),
+            );
+            Some((*section, rate))
+        })
+        .collect()
 }
 
 /// The most read-back parts a slot keeps between reprojections; past it the
@@ -93,16 +141,27 @@ pub(super) const UNREAD_HIT_PARTS: usize = 8;
 /// Every placed round as a hit piece (`docs/hit_driven_projection.md` §6.4,
 /// §8.1): its key and the positions it took, in slot order. A round is one
 /// whole turn, so each placed turn is grouped into the round of the exchange it
-/// belongs to. `placed[j]` records `pieces[j]`; pieces that are not turns and
-/// turns with no conversation to name them by are not declared.
+/// belongs to; a placed section of the knowledge base `sections` names is one
+/// round of its own ([`RoundKey::of_section`]). `placed[j]` records
+/// `pieces[j]`; other pieces and turns with no conversation to name them by
+/// are not declared.
 pub(in super::super) fn hit_rounds_of(
     pieces: &[AssembledPiece],
     placed: &[PlacedPiece],
     conv: &Substrate,
+    sections: &HashMap<SectionId, SectionKey>,
 ) -> (Vec<RoundKey>, Vec<Range<usize>>) {
     let mut turns_of: HashMap<TimelineId, Vec<(TurnIndex, Range<usize>)>> = HashMap::new();
+    let mut declared: Vec<(RoundKey, Range<usize>)> = Vec::new();
     for (piece, p) in pieces.iter().zip(placed) {
         if p.tokens == 0 {
+            continue;
+        }
+        if let AssembledPiece::Section(id) = piece {
+            if let Some(&key) = sections.get(id) {
+                let span = (p.at_after - p.tokens) as usize..p.at_after as usize;
+                declared.push((RoundKey::of_section(key), span));
+            }
             continue;
         }
         if let AssembledPiece::Turn {
@@ -115,7 +174,6 @@ pub(in super::super) fn hit_rounds_of(
             turns_of.entry(*timeline).or_default().push((*index, span));
         }
     }
-    let mut declared: Vec<(RoundKey, Range<usize>)> = Vec::new();
     for (timeline, placed) in turns_of {
         for turns in conv.exchanges_of(timeline) {
             let Some(&head) = turns.first() else {
@@ -379,6 +437,9 @@ impl SlotState {
             pool: PoolPages::new(),
             pool_walked: HashMap::new(),
             pool_linger: PoolLinger::default(),
+            // Its rounds are declared afresh, and its steps counted afresh.
+            kb_rounds: HashMap::new(),
+            evict_watch: EvictWatch::default(),
         }
     }
 

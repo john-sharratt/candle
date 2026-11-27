@@ -116,7 +116,6 @@ pub(crate) fn files_splice<R: ContentResolver>(
                     key: c.key,
                     tokens: c.tokens,
                     mandatory: false,
-                    below: 0,
                 })
             })
             .collect(),
@@ -162,8 +161,10 @@ pub(crate) fn files_splice<R: ContentResolver>(
                 }
             }
             picked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            // A section its hit rate evicted this request stays out of it.
             let picked: Vec<Candidate> = picked
                 .into_iter()
+                .filter(|(k, _)| !set.evicted.contains(k))
                 .filter_map(|(k, _)| candidate(k))
                 .collect();
             let positions = files_positions(schema, resolver.trained_window());

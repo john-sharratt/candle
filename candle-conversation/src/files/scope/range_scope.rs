@@ -60,14 +60,6 @@ impl RangeScope {
         self.places.iter().filter_map(Place::section)
     }
 
-    /// Every placed section, mutably, top first.
-    pub fn entries_mut(&mut self) -> impl Iterator<Item = &mut Entry> {
-        self.places.iter_mut().filter_map(|p| match p {
-            Place::Section(e) => Some(e),
-            Place::Hole(_) => None,
-        })
-    }
-
     /// Enter `key`, of `tokens` positions, in front of every placed section,
     /// and return the sections a full range slid out to make room, top first.
     /// `None`, and nothing changed, when it cannot fit even with every place
@@ -109,7 +101,6 @@ impl RangeScope {
             key,
             tokens,
             mandatory,
-            below: 0,
         }));
         Some(out)
     }
@@ -150,9 +141,11 @@ impl RangeScope {
     /// `key` is no longer held, mandatory or not: it leaves as
     /// [`Self::leave`] has a section leave.
     pub fn forget(&mut self, key: SectionKey) -> bool {
-        for e in self.entries_mut() {
-            if e.key == key {
-                e.mandatory = false;
+        for p in &mut self.places {
+            if let Place::Section(e) = p {
+                if e.key == key {
+                    e.mandatory = false;
+                }
             }
         }
         self.leave(key)

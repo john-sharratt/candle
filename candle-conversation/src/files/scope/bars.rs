@@ -16,11 +16,24 @@ pub struct Bars {
 }
 
 impl Bars {
-    /// The bars the tools' belief selection holds (`min_score` 800,
-    /// `evict_score` 600) and one 64-step cadence.
+    /// The tools' belief selection's bars (`min_score` 800, `evict_score`
+    /// 600) and one 64-step cadence.
     pub const DEFAULT: Bars = Bars {
         entry: 800.0,
         evict: 600.0,
+        evict_steps: 64,
+    };
+
+    /// The knowledge base's bars until the needle and multi-file cases
+    /// measure them (`docs/placed_section_layout.md` §3.4): entry at the
+    /// tools' 800, and a section leaves only once the selection has not read
+    /// it at all — under one on the band — for one 64-step cadence. A rate is
+    /// out of every block of the section by every query, and the selection
+    /// keeps a few blocks of the whole prompt a query, so a placed section's
+    /// rate sits far under 600 while it is read.
+    pub const KNOWLEDGE_BASE: Bars = Bars {
+        entry: 800.0,
+        evict: 1.0,
         evict_steps: 64,
     };
 
@@ -69,6 +82,7 @@ mod tests {
     #[test]
     fn bars_must_be_on_the_band_with_entry_above_eviction() {
         assert_eq!(Bars::DEFAULT.invalid(), None);
+        assert_eq!(Bars::KNOWLEDGE_BASE.invalid(), None);
         let flipped = Bars {
             entry: 500.0,
             evict: 600.0,

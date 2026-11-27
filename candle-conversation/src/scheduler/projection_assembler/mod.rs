@@ -51,7 +51,10 @@ use crate::projection::{
 use crate::scheduler::hit_density::HitPart;
 use crate::scheduler::injected_piece::InjectedPiece;
 use candle_transformers::models::decode_diag::PieceSpan;
+use candle_transformers::models::hit_layers::PieceHits;
 
+use crate::files::scope::{band, EvictWatch};
+use crate::files::SectionKey;
 use crate::scheduler::pending_ranges::PendingRanges;
 use crate::scheduler::piece_identity::{
     alignment_identities, chained_identities, piece_label, PieceReads,
@@ -72,6 +75,7 @@ mod apply_build;
 mod assembly;
 mod gap_fill;
 mod inject;
+mod kb_sections;
 mod prefill;
 mod slot_state;
 #[cfg(test)]
@@ -80,6 +84,8 @@ mod tests_assembly;
 mod tests_fixtures;
 #[cfg(test)]
 mod tests_holes;
+#[cfg(test)]
+mod tests_kb_rounds;
 #[cfg(test)]
 mod tests_reasoning;
 #[cfg(test)]
@@ -91,6 +97,7 @@ pub(super) use apply_build::*;
 pub(crate) use assembly::*;
 pub(super) use gap_fill::*;
 use inject::*;
+use kb_sections::kb_sections;
 pub(super) use prefill::*;
 pub(super) use slot_state::*;
 use walk::*;
