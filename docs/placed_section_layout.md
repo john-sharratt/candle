@@ -154,9 +154,9 @@ That is the price of never moving anything until the range is full.
 **The scope is shared across layers, decided by the sampled layers.** The
 shadow scan holds index rows for unplaced sections only at the sampled layers
 (`hits.layers`, model layers 19, 31 and 43 on Flash-Next;
-`hit_driven_projection.md` §6.1), so those are the only layers with a peak
-for a section not yet placed. A section's peak is the **largest of its peaks
-across the sampled layers**, and one scope holds for every layer. Per-layer
+`hit_driven_projection.md` §6.1), so those are the only layers that count
+hits for a section not yet placed. A section's hit rate (§3.4) is taken
+**over the sampled layers together**, and one scope holds for every layer. Per-layer
 scope, below, is built only if the shared scope's measurements call
 for it, at the cost of index rows and a shadow scan at every full-attention
 layer.
@@ -174,33 +174,36 @@ The query of a given token has one position across layers, above the range in
 every one, so every placed section is visible to it in every layer that holds
 it.
 
-### 3.4 Order: peak index attention, decided per decode step
+### 3.4 Order: the index's hit rate, decided per decode step
 
-The one signal that orders a relevance-ordered range is a section's **peak
-index attention**: at a decode step, in a layer, the highest score the QSA
-indexer gives any block of the section. Without a QSA index it is the
+The one signal that orders a relevance-ordered range is a section's **hit
+rate**: the share of the section's blocks the QSA index selected — or, for a
+section not placed, would have selected above the query's cut (the shadow
+scan) — per query, over the sampled layers. Without a QSA index it is the
 section's provenance score (§3.8). Nothing else orders the range — not the
-pool's momentum, not provenance strength, not a hit count.
+pool's momentum, not provenance strength.
 
-- **Peak, not count.** A count of selected blocks grows with a section's
-  length, so a long section out-votes a short one that answers better. The
-  peak is one number per section whatever its length, so sections of every
-  size compete on what they hold.
-- **Per decode step.** At each step, after the sampled layers' selection, a
-  section that is resident (§3.5) and out of scope **enters** when its peak
-  crosses the entry bar: it is placed in front of the sections already in
-  scope (§3.2). A section in scope **leaves** when its peak has stayed below
-  the eviction bar for **64 consecutive steps** — one reprojection cadence —
-  and leaves a hole.
-- **The bars are on the normalized band.** A peak is normalized per query to
-  the 0–1000 band the tools' belief selection uses: 0 at the query's cut (the
-  lowest score its real selection kept, which the selection kernel already
-  records per row, `hit_driven_projection.md` §6.3), 1000 at the best score
-  it kept, a peak below the cut negative and one above the best clamped to
-  1000. The band is scale-free across layers, depths and queries, and "would
-  have displaced a block the model read" is any peak above 0. The bars are a
-  pair on it, entry above eviction — hysteresis, so a section near
-  the line does not flap. They are declared per section in `projection.yaml`
+- **A rate, not a raw count, and no kernel change.** The device already
+  counts hits per declared round (`qsa_hits.cu`, `qsa_shadow.cu`: one
+  `atomicAdd` per selected block, and a shadow hit only above the query's
+  cut). A section is one round. The host divides its hits by its blocks and
+  the queries counted, so a long section does not out-vote a short one, and
+  sections are bounded at `PAGE_LINES` anyway (§3.5c). A peak score per
+  section would need a running maximum in both kernels; the rate needs
+  none.
+- **Per decode step.** At each step a section that is resident (§3.5) and out
+  of scope **enters** when its rate crosses the entry bar: it is placed in
+  front of the sections already in scope (§3.2). A section in scope
+  **leaves** when its rate has stayed below the eviction bar for **64
+  consecutive steps** — one reprojection cadence — and leaves a hole.
+- **The bars are on the normalized band.** The rate is mapped onto the 0–1000
+  band the tools' belief selection uses: 1000 when every block of the section
+  is selected by every query counted, 0 when none is. Every hit is already
+  above the query's cut — the selection's own kept set, or a shadow block
+  scoring above the lowest score the selection kept — so the band is
+  relative to what the model read, scale-free across layers, depths and
+  queries. The bars are a pair on it, entry above eviction — hysteresis, so
+  a section near the line does not flap. They are declared per section in `projection.yaml`
   beside its budgets, as the tools declare `min_score` / `evict_score`
   (800 / 600), and measured on the needle and multi-file cases before they
   are fixed.
@@ -211,22 +214,21 @@ pool's momentum, not provenance strength, not a hit count.
   attended. That is why the order is append-in-front: per-step decisions with
   no re-layout.
 - **The order is the order of entry.** At the opening, the sections the
-  question's prefill selects enter in descending peak, strongest first, so
+  question's prefill selects enter in descending rate, strongest first, so
   the strongest is at the top, nearest the question. After it, a section's
   position records the step it entered.
-- **A step's decision applies from the next step.** The scores of step *t*
+- **A step's decision applies from the next step.** The hits of step *t*
   decide the layout step *t* + 1 reads, so a step never reads a layout its own
-  scores changed. With speculative decoding the step is the verified step: a
+  hits changed. With speculative decoding the step is the verified step: a
   draft and its verify read the layout fixed when the draft began, and the
-  verify's accepted tokens' scores decide the next one (§4.6).
-- **The peaks of sections not in scope come from the shadow scan**, which
+  verify's accepted tokens' hits decide the next one (§4.6).
+- **The hits of sections not in scope come from the shadow scan**, which
   scores resident, unplaced sections' index rows against the step's queries
   (`hit_driven_projection.md` §6.3), now every step for the resident set
   rather than once per boundary for the pool. The pool beyond residency is
   still scanned at boundaries; a section there enters residency first (§3.5).
 
-Every per-step decision runs on the device (§4.4): the host is not on the
-per-token path.
+The decision is the host's, every step, and waits on nothing (§4.4).
 
 ### 3.5 Three budgets per section
 
@@ -239,8 +241,8 @@ is a position range.
 | Budget | What it bounds | Who reduces into it | Today |
 |---|---|---|---|
 | **Index scan** (`scan`) | The sections whose sampled-layer index rows are on the device and scored by the shadow scan. No K/V moves for them. | Provenance, by section (§3.5c): the gallery scan scores each section of a file as its own case. | The pool: `PoolSize::for_card` (2M / 500K / 256K tokens, 72 / 24 / 16 GB), shared across the pool's kinds, choosing whole files. |
-| **Residency** (`resident`) | The sections whose K/V is hot — on the device, in the KV-regions tenancy — whether placed or not, so one can enter the range at the next step without a PCIe or redo-log wait. | Provenance and the index together: the section's provenance score and its peak index attention from the shadow scan, fused (§3.5c). | Not a budget. A pooled member's K/V stays wherever it is (hot, warm, cold) until the fill places it (§7.2 step 3), and a cold one is placed a boundary late. |
-| **Projection** (`project`) | The tokens placed in the section's range: `R`. The positions the sections take, and the K/V and index rows the selection attends. | The index alone: peak index attention per step (§3.4). | The fill's `readings` cap, a share of the room (22.5%, ≈ 52K at a 233K room), by `base·(1+gain·h)`; tools by count (`budget: {min: 1, max: 5}`). |
+| **Residency** (`resident`) | The sections whose K/V is hot — on the device, in the KV-regions tenancy — whether placed or not, so one can enter the range at the next step without a PCIe or redo-log wait. | Provenance and the index together: the section's provenance score and its hit rate from the shadow scan, fused (§3.5c). | Not a budget. A pooled member's K/V stays wherever it is (hot, warm, cold) until the fill places it (§7.2 step 3), and a cold one is placed a boundary late. |
+| **Projection** (`project`) | The tokens placed in the section's range: `R`. The positions the sections take, and the K/V and index rows the selection attends. | The index alone: its hit rate per step (§3.4). | The fill's `readings` cap, a share of the room (22.5%, ≈ 52K at a 233K room), by `base·(1+gain·h)`; tools by count (`budget: {min: 1, max: 5}`). |
 
 `scan ≥ resident ≥ project`, and each stage reduces into the next:
 provenance proposes the scan set from the unbounded corpus, the index
@@ -268,8 +270,8 @@ The room the dialogue's fill has is the slot less the system prompt **with its
 ranges at full size**, so the dialogue's share never depends on what the
 sections hold.
 
-**No kind caps in the range.** Inside the knowledge base's range, peak index
-attention alone decides what enters (§3.4): readings, folders, guides and
+**No kind caps in the range.** Inside the knowledge base's range, the index's hit
+rate alone decides what enters (§3.4): readings, folders, guides and
 journal notes compete on one band, and the working set's kind shares
 (`working_set.shares`) no longer cap them there. The kinds keep their
 per-kind minimum counts in the scan pool (`PoolSize::per_kind`), so guides
@@ -292,7 +294,7 @@ earlier sections immediately below it.
   the types above it is in its K/V. Losing that is judged worse than what
   the next point costs.
 - **The order of placement can break a file's relative positions.** Sections
-  enter the range by peak index attention (§3.4), not by line order, so two
+  enter the range by hit rate (§3.4), not by line order, so two
   sections of one file can be placed in an order or at a distance other than
   the one they were sealed at. This is accepted and measured: §7's tests
   includes a question that needs two sections of one file placed out of line
@@ -316,7 +318,7 @@ projection, outside the selection's budget):
 - a mandatory section is resident and in scope from the opening, in every
   layer, and never leaves;
 - it holds positions in its range like any other — inside `R`, outside the
-  competition — and enters at the opening in peak order with the rest (§3.4);
+  competition — and enters at the opening in rate order with the rest (§3.4);
 - the seed's files — each repository's root listing, README, ARCHITECTURE,
   AGENTS, CLAUDE (`branch_ingest/prime.rs`) — are the knowledge base's
   mandatory sections, cut into sections as every file is (§3.5c); the seed
@@ -374,9 +376,8 @@ cap (`provenance_system_collection.md` D22). Both now work on sections:
   chunks' votes into one score: each section competes on what it holds, and a
   large file stops swamping the scan;
 - **the scan set and residency are chosen by section**, by provenance score,
-  and residency fuses in the section's peak index attention from the shadow
-  scan (§3.5);
-- **the projection is chosen by section** on peak index attention alone
+  and residency fuses in the section's hit rate from the shadow scan (§3.5);
+- **the projection is chosen by section** on the index's hit rate alone
   (§3.4).
 
 The calibration's votes and the working set's momentum move to the section
@@ -610,14 +611,61 @@ another's simply holds different chunks. The work is in the projection
 assembler, which today injects the same pieces into every layer: it injects a
 layer's own scope into that layer, and records per layer what it placed.
 
-### 4.4 The hits stay on the device
+### 4.4 The per-step decision: the host's, from what the device publishes
 
-The selection tables are on the device. Counting a section's hits, comparing
-them to thresholds and choosing what to place must not read them back
-(`AGENTS.md` hot-path invariants 3 and 4): a device buffer accumulates hits
-per (layer, section) across a boundary's steps, and the boundary's decision
-reads that summary through the mapped ring the MoE dispatch already uses for
-the same purpose — off the critical path, waited on by nothing on the device.
+No kernel is added or changed. Every piece the per-step decision reads and
+writes exists:
+
+- **The hits are published every wave.** `qwen4exp/hits.rs` counts each
+  sampled layer's selected blocks per declared round and, after the wave's
+  last sampled layer, publishes the counters into a mapped block. The host's
+  `SeqHits::take` reads the newest finished publish — no copy, no wait — and
+  takes the difference from its last read. Read every step, it is the step's
+  hits. The host already waits for each wave's token ids before building the
+  next (the sanctioned embedding readback, `AGENTS.md` invariant 3), and the
+  publish precedes sampling, so step *t*'s hits are always there when step
+  *t* + 1 is built: a one-step lag and no added wait.
+- **The shadow scan runs on the step it is asked.** `take` asks the next wave
+  to scan; the scan kernel takes a mask of the kept-query slots written since
+  the last scan, so asking every step scores the newest queries alone. Its
+  rows are the resident set's, declared by `SeqHits::redeclare`.
+- **Changing the layout is host table work.** A chunk's position is written
+  by the host into its descriptor entry (`gpu_chunks/guard.rs`
+  `rebuild_decode` / `extend_decode`); a front insertion re-serialises the
+  layer's table rather than appending to it. A launch still reading the
+  previous table holds its own pinned copy (`ChunkPin`), so a change between
+  waves cannot reach the one in flight. Index pages are placed at their
+  positions through the index cache, holes and all (`skip_to`). The decode
+  path captures no CUDA graph, so nothing is invalidated by a new table.
+- **Placement is in place.** A change is a splice of the slot's tables, as the
+  deferred placement in `scheduler/decode/decode_step.rs` does, not a
+  reprojection's rebuild of the slot. A resident section holds its K/V and
+  every layer's index rows on the device (§3.5), so an entry moves no bytes
+  across PCIe.
+
+The cost is host time on a step whose layout changes: re-serialising the
+chunk tables of each full-attention layer, placing the section's index pages
+and redeclaring the hit map. Hysteresis and the 64-step eviction window keep
+such steps rare; their time is measured against today's per-step wave build
+by §7's throughput test.
+
+### 4.8 What is reused
+
+| Design piece | Existing code it builds on | The change |
+|---|---|---|
+| Explicit key positions, holes, ranges, slides | Per-chunk `rope_base` in the descriptor table (`gpu_chunks/guard.rs`) | A chunk carries its position instead of the running sum of the usage before it |
+| Query positions apart from the token count | Per-row absolute positions passed into the wave (`qwen4exp/wave/layers.rs` `dec_off` / `pre_off`) | Fed from the position frontier; every caller that reads the token count as a position is found and told which it means |
+| Index holes and placement | Recorded page positions, `skip_to`, `push_positional_gap` (`qwen4exp/wave/positional.rs`) | None in the engine; the assembler places at range positions |
+| Sealing at a range's top | `seal_members`, `prepare_section_ingest` | The seal's prefill starts at the frontier `B + R − T` |
+| Sections in `file_read`'s format | `zend-tools/src/tools/file/render.rs` (`windows` and the page body), which the ingest already drives | Replaces `files::cut_lines` and the plain fence of `files/render.rs`; adds the `...` marker |
+| Provenance by section | The gallery's signatures per `ChunkKey` | `cases: section` beside `cases: file` in the belief groups |
+| Calibration by section | `calibrate/count.rs`, profiles, prompts, the seal | Counts from the section's tokens; votes by a section scan id; one frame; the draft sees the section |
+| Mandatory sections | The tools collection's mandatory members (`SectionCollection::mandatory`) as the model | A mandatory set in the files splice; the seed chain removed |
+| Residency | `elevate_to_hot`, the tier migration, the region pool | Promotes ranked sections, every layer's index rows with them, without placing them |
+| Hit rates per step | `qwen4exp/hits.rs`, `qsa_hits.cu`, `qsa_shadow.cu`, the mapped hit summary | A section is a round; `take` every step; the rate computed on the host |
+| Birth-ordered dialogue and journal | The fill, reprojection, `held_turn`; the YaRN rungs chosen by reach | No re-choice or renumbering within a request; whole requests pruned between them |
+
+No kernel source changes.
 
 ### 4.5 Position budget
 
@@ -640,7 +688,7 @@ counts; it no longer decides positions by concatenation.
 
 A speculative draft attends the same layout as the turn it drafts for. The
 layout changes per verified step (§3.4): a draft and its verify read the
-layout fixed when the draft began, and only the accepted tokens' scores
+layout fixed when the draft began, and only the accepted tokens' hits
 decide the next one, so a draft never spans a change and a rejected token
 never changed the layout.
 
@@ -658,8 +706,13 @@ never changed the layout.
 4. **Re-entry moves a section.** A section evicted and brought back is placed
    at new positions — a move, but only of content no decoded token was
    attending when it left.
-5. **The range running out forces a relayout**, which moves everything once.
-   Sized to the budget, it should be rare; it is counted and logged.
+5. **A full range slides** (§3.2), which shortens every placed section's
+   distance to the question at once. Sized to the budget, it should be rare;
+   it is counted and logged.
+6. **The position frontier touches every caller of the token count.** The
+   slot's token count has been its position everywhere — truncation, the
+   prefix kept on a rebuild, reprojection, KV-region planning. Each is found
+   and told which it means; one missed reads a wrong position silently.
 
 ## 6. What this does not fix
 
@@ -679,14 +732,15 @@ projection, or recomputing the few tokens whose state deviates most
 
 ## 7. Build, wipe, test
 
-**One build.** Everything in §3 and §4 lands together, the per-step decision
-on the device included: explicit positions and the position frontier; every
+**One build, no kernel changes.** Everything in §3 and §4 lands together,
+on the reuse of §4.8: explicit positions and the position frontier; every
 range and the gap in the birth prefix; members sealed at the top of their
 range under the new content address; sections in `file_read`'s format with
 the `...` marker, each file's sections a chain; the mandatory set in place of
-the seed chain; provenance, calibration and the projection by section; peak
-index attention per step with append-in-front and the full range as a
-window; the residency budget; the birth-ordered journal and dialogue. Scope
+the seed chain; provenance, calibration and the projection by section; the
+hit rate read and decided on every step by the host, with append-in-front
+and the full range as a window; the residency budget; the birth-ordered
+journal and dialogue. Scope
 is shared across layers (§3.3); per-layer scope is the one part left out, and
 is built only if the tests below call for it.
 
