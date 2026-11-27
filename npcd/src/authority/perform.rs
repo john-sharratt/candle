@@ -588,8 +588,14 @@ impl Runtime {
         // own acts, and the house's device acts on what it is connected to.
         let through_a_terminal =
             terminal::is_mine(act.tool) || (bridge::is_mine(act.tool) && self.is_bodiless(npc));
+        // A conversation's post, its standing checked above, names the party it
+        // was made with, so the report comes back to them.
+        let asked = match source {
+            ActSource::Talk { party } if posts_work(act) => Some(party.as_str()),
+            _ => None,
+        };
         let recorded = if body::is_device(act.tool) {
-            self.enact_device(npc, act, pinned).await
+            self.enact_device(npc, act, pinned, asked).await
         } else if body::composes(act.tool) {
             self.compose(npc, act).await
         } else if through_a_terminal {

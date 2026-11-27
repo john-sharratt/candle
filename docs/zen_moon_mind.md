@@ -224,6 +224,12 @@ name mirrored rooms and their terminals — "go to the Sharratt house and read t
   work. The report itself is read at the table (`order_results`). A posted mission that ends
   unreported — called off, replaced, or set for a Drone that is gone — is filed to Zen the same
   way, as not done and why, so nothing it posted is out for good.
+- **Whoever asked for it is told too.** A mission Zen's conversation posted
+  (`docs/npc_conversations.md` §6.2) names that conversation's party
+  (`Origin::Ordered { asked }`), carried in by the device call as a typed
+  `effector::auth::AskedBy` extension only the in-process path inserts. Its report is handed
+  to Zen's conversation with them as something to tell — what the Drone reported — and Zen's
+  mind is told the report with the line that they are being told it.
 - **When a Drone messages it**, which is how a Drone asks about its mission.
 
 ### 8.3 The Drones wait for work

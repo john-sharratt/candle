@@ -480,7 +480,7 @@ async fn calling_the_lift_from_a_landing_is_accepted() {
     place_where(&rt, 6, landings[top].clone());
 
     let (status, ack) = rt
-        .effector_invoke(6, "/lift/command-shaft/call", json!({}), None)
+        .effector_invoke(6, "/lift/command-shaft/call", json!({}), None, None)
         .await
         .expect("the fast path answers");
     assert_eq!(status, StatusCode::OK, "{ack}");
@@ -516,7 +516,7 @@ async fn a_called_lift_arrives_over_ticks_and_the_status_shows_it_boardable() {
 
     // Call it — acknowledged this turn; the travel is the world's to do.
     let (status, ack) = rt
-        .effector_invoke(7, "/lift/command-shaft/call", json!({}), None)
+        .effector_invoke(7, "/lift/command-shaft/call", json!({}), None, None)
         .await
         .expect("the fast path answers");
     assert_eq!(status, StatusCode::OK, "{ack}");
@@ -560,7 +560,7 @@ async fn calling_the_lift_from_the_wrong_standpoint_is_refused() {
     place(&rt, 8, "band-one");
 
     let (status, refused) = rt
-        .effector_invoke(8, "/lift/command-shaft/call", json!({}), None)
+        .effector_invoke(8, "/lift/command-shaft/call", json!({}), None, None)
         .await
         .expect("the fast path answers");
     assert_eq!(status, StatusCode::CONFLICT, "{refused}");

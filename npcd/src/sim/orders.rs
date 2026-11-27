@@ -35,6 +35,10 @@ pub struct Filed {
     pub outcome: Outcome,
     /// What the carrier reported: what it found, or what stopped it.
     pub notes: String,
+    /// The party whose conversation with the poster posted the mission, when
+    /// one did — a body id or an account handle. The poster tells them.
+    #[serde(default)]
+    pub asked: Option<String>,
 }
 
 impl Filed {
@@ -147,6 +151,7 @@ mod tests {
             brief: brief.to_string(),
             outcome: Outcome::Pass,
             notes: "the blast door stands locked".to_string(),
+            asked: None,
         }
     }
 

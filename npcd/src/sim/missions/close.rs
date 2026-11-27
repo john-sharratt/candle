@@ -135,13 +135,14 @@ impl Missions {
     /// its poster as not done, for `why` — so its poster is told, and it is no
     /// longer counted as out.
     pub(super) fn called_off(&mut self, body: &str, m: &Mission, why: &str) {
-        if let Origin::Ordered { poster, .. } = &m.origin {
+        if let Origin::Ordered { poster, asked, .. } = &m.origin {
             self.orders.filed(Filed {
                 poster: poster.clone(),
                 carrier: body.to_string(),
                 brief: m.prompt.clone(),
                 outcome: Outcome::Fail,
                 notes: why.to_string(),
+                asked: asked.clone(),
             });
         }
     }
@@ -190,12 +191,13 @@ impl Missions {
         // A posted mission's report is its poster's; a standing mission's is
         // filed for whoever gives orders here, and, done, it is done there.
         match &mission.origin {
-            Origin::Ordered { poster, .. } => self.orders.filed(Filed {
+            Origin::Ordered { poster, asked, .. } => self.orders.filed(Filed {
                 poster: poster.clone(),
                 carrier: body.to_string(),
                 brief: mission.prompt.clone(),
                 outcome,
                 notes: notes.to_string(),
+                asked: asked.clone(),
             }),
             Origin::Standing { id, room } => {
                 let key = format!("{id}@{room}");
@@ -214,6 +216,7 @@ impl Missions {
                     brief: mission.prompt.clone(),
                     outcome,
                     notes: notes.to_string(),
+                    asked: None,
                 });
             }
             _ => {}

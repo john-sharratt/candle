@@ -525,6 +525,8 @@ impl Runtime {
     ///   ([`Self::assign_work`]), which is told then, with the mission.
     /// - **A report** tells its poster who reported what, that the report waits
     ///   at the table, and — with nothing left on the table — that it is empty.
+    ///   One a conversation posted is also handed to the poster's conversation
+    ///   with whoever asked for it, to tell them.
     pub(super) fn give_notice(&self, hosted: &Hosted, notice: Notice) {
         let world = hosted.id();
         let tell = |npc_id: u64, text: String| {
@@ -572,13 +574,44 @@ impl Runtime {
                 // order table for it, Zen read "Wick has reported it done:"
                 // with the brief after it, took the brief for the work still
                 // owed, and told the family it was still waiting on Wick.
-                let line = format!(
-                    "{carrier} has {how}: {}. What {carrier} reported: \"{}\"{empty}",
+                let report = format!(
+                    "{carrier} has {how}: {}. What {carrier} reported: \"{}\"",
                     filed.brief.trim_end_matches('.'),
                     filed.notes.trim()
                 );
+                // **Whoever asked for it is told what came back.** Posted from
+                // a conversation, the report reached only the mind, which had
+                // nothing calling it back to the phone: the person who asked
+                // Zen for the research never heard what Wick found. Their
+                // conversation now says it, and the mind is told it is said.
+                let asker = filed.asked.as_ref().map(|party| {
+                    let name = hosted
+                        .sim(|s| s.threads.name_of(party).map(str::to_string))
+                        .unwrap_or_else(|| party.clone());
+                    (party.clone(), name)
+                });
+                let line = match &asker {
+                    Some((_, name)) => format!(
+                        "{report}{empty} {name} asked for it, and you are telling them what came \
+                         back."
+                    ),
+                    None => format!("{report}{empty}"),
+                };
                 for npc_id in posters {
                     tell(npc_id, line.clone());
+                    if let Some((party, _)) = &asker {
+                        self.tell(
+                            npc_id,
+                            self.world_ms(npc_id),
+                            Salience::URGENT,
+                            EventKind::Purpose {
+                                party: party.clone(),
+                                intent: format!(
+                                    "what came back on the work you asked for: {report}"
+                                ),
+                            },
+                        );
+                    }
                 }
             }
         }

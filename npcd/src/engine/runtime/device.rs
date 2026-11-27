@@ -39,6 +39,7 @@ impl Runtime {
         path: &str,
         body: Value,
         pinned: Option<&npc_map::world::Where>,
+        asked: Option<&str>,
     ) -> anyhow::Result<(StatusCode, Value)> {
         let router = self
             .effector
@@ -64,6 +65,11 @@ impl Runtime {
         // forged by — an external caller (see [`PinnedStandpoint`]).
         if let Some(at) = pinned {
             builder = builder.extension(PinnedStandpoint(at.clone()));
+        }
+        // Whose conversation made the call, the same way: a typed extension
+        // no external caller can insert (see [`AskedBy`]).
+        if let Some(party) = asked {
+            builder = builder.extension(AskedBy(party.to_string()));
         }
         let request = builder
             .header(CONTENT_TYPE, "application/json")
@@ -114,6 +120,7 @@ impl Runtime {
         npc_id: u64,
         act: &Act,
         pinned: Option<&npc_map::world::Where>,
+        asked: Option<&str>,
     ) -> Recorded {
         let url = act
             .args
@@ -163,7 +170,10 @@ impl Runtime {
                     // The grammar writes `body` as an object — taken as-is.
                     Some(other) => other.clone(),
                 };
-                match self.effector_invoke(npc_id, &path, body, pinned).await {
+                match self
+                    .effector_invoke(npc_id, &path, body, pinned, asked)
+                    .await
+                {
                     Ok((status, value)) => {
                         let landed = status.is_success();
                         // **The character reads the world's own line, not the HTTP
