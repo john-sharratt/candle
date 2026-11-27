@@ -103,6 +103,10 @@ pub(in super::super) struct SlotState {
     /// range in (`section_relayout`).
     pub(in super::super) applied_segments: Vec<ProjectionSegment>,
     pub(in super::super) applied_composition: Option<ProjectionEvent>,
+    /// A step changed the range and the slot does not hold it yet: owed
+    /// until an assembly lays it out or a rebuild finds the slot already
+    /// holds it, so a re-layout that was declined is asked again.
+    pub(in super::super) layout_owed: bool,
 }
 
 /// `hits` — one read of a declaration whose rounds are `keys` — folded into
@@ -130,13 +134,16 @@ pub(in super::super) fn fold_part(parts: &mut Vec<HitPart>, keys: &[RoundKey], h
 /// rounds are `keys`, on the 0–1000 band (`files::scope::band`): a placed
 /// section out of the selection's queries, a pooled one — declared once per
 /// index page — out of the shadow scan's, its pages' hits and blocks summed.
-/// A section none of whose queries were counted has no rate.
+/// Each kind is rated over its own queries; a section declared as both reads
+/// as placed, the selection's own reading. A section none of whose queries
+/// were counted has no rate.
 pub(in super::super) fn section_rates(
     keys: &[RoundKey],
     hits: &PieceHits,
     sections: &HashMap<TimelineId, SectionKey>,
 ) -> HashMap<SectionKey, f32> {
-    let mut summed: HashMap<SectionKey, (u64, u64, u64)> = HashMap::new();
+    // Hits and blocks per section and kind: loaded first.
+    let mut summed: HashMap<(SectionKey, bool), (u64, u64)> = HashMap::new();
     for (i, k) in keys.iter().enumerate() {
         let (Some(section), Some(&h), Some(&b)) = (
             sections.get(&k.timeline),
@@ -145,16 +152,26 @@ pub(in super::super) fn section_rates(
         ) else {
             continue;
         };
-        let e = summed.entry(*section).or_default();
+        let e = summed.entry((*section, i < hits.loaded)).or_default();
         e.0 += u64::from(h);
         e.1 += u64::from(b);
-        e.2 = hits.queries_of(i);
     }
-    summed
-        .into_iter()
-        .filter(|(_, (_, _, q))| *q > 0)
-        .map(|(s, (h, b, q))| (s, band(h, b, q)))
-        .collect()
+    let mut out: HashMap<SectionKey, f32> = HashMap::new();
+    for loaded in [false, true] {
+        let queries = match loaded {
+            true => hits.queries,
+            false => hits.shadow_queries,
+        };
+        if queries == 0 {
+            continue;
+        }
+        for (&(s, kind), &(h, b)) in &summed {
+            if kind == loaded {
+                out.insert(s, band(h, b, queries));
+            }
+        }
+    }
+    out
 }
 
 /// The most read-back parts a slot keeps between reprojections; past it the
@@ -470,6 +487,7 @@ impl SlotState {
             // again only by a reprojection of its own.
             applied_segments: Vec::new(),
             applied_composition: None,
+            layout_owed: false,
         }
     }
 
@@ -536,11 +554,13 @@ impl SlotState {
         self.pending_user_part = None;
     }
 
-    /// The slot is assembled from `segments`: their composition is not yet
-    /// known, and a reprojection's rebuild records it.
+    /// The slot is assembled from `segments`, which lay out the range as it
+    /// stands: their composition is not yet known, and a reprojection's
+    /// rebuild records it.
     pub(in super::super) fn set_applied(&mut self, segments: &[ProjectionSegment]) {
         self.applied_segments = segments.to_vec();
         self.applied_composition = None;
+        self.layout_owed = false;
     }
 
     /// Install a projection's working set; the one it replaces is held as

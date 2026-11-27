@@ -699,6 +699,10 @@ impl Scheduler {
         self.reproject_census
             .add(ReprojectPart::Identity, identity_us);
         if view_state.applied_identity == Some(identity) {
+            // The slot holds this layout already, the range's included.
+            if let Some(state) = self.slot_projection_state.get_mut(&parent_id) {
+                state.layout_owed = false;
+            }
             self.keep_unchanged_projection(view_id, composition);
             self.end_reprojection(ReprojectOutcome::Kept, t_repro);
             tracing::debug!(

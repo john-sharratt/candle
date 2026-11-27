@@ -134,7 +134,10 @@ impl FilesSet {
     /// A step's entries: every one of `candidates` at or over `bars`' entry
     /// bar by `rate` enters the range in front, strongest first
     /// ([`RangeScope::admit`]); what it changed. One an eviction sent out this
-    /// request stays out.
+    /// request stays out, and so does one of a file withheld since the
+    /// candidates were chosen. One a full range slid out past its top has
+    /// left as an evicted one has, and stays out until the next question too,
+    /// so two sections over the bar never trade places step after step.
     pub fn admit(
         &mut self,
         rate: impl Fn(SectionKey) -> f32,
@@ -147,9 +150,17 @@ impl FilesSet {
         let open: Vec<Candidate> = candidates
             .iter()
             .filter(|c| !self.evicted.contains(&c.key))
+            .filter(|c| {
+                !self
+                    .members
+                    .get(&c.key)
+                    .is_some_and(|s| self.withheld.contains(&s.file))
+            })
             .copied()
             .collect();
-        scope.admit(rate, &open, bars)
+        let change = scope.admit(rate, &open, bars);
+        self.evicted.extend(change.slid.iter().copied());
+        change
     }
 
     /// Whether `section` is placed.
@@ -300,14 +311,16 @@ mod tests {
     }
 
     /// **A step admits the candidates over the entry bar in front, but not one
-    /// an eviction sent out this request.**
+    /// an eviction sent out this request, nor one of a withheld file.**
     #[test]
     fn a_step_admits_over_the_bar_but_not_the_evicted() {
         let mut scope = RangeScope::new(100);
         scope.enter(SectionKey(1), 30, false);
         let mut set = FilesSet::default();
         set.set_scope(scope);
+        set.members.insert(SectionKey(4), standing(500.0, 9));
         set.evicted.insert(SectionKey(3));
+        set.withhold([FileKey(9)]);
         let candidates = [
             Candidate {
                 key: SectionKey(2),
@@ -317,10 +330,35 @@ mod tests {
                 key: SectionKey(3),
                 tokens: 20,
             },
+            Candidate {
+                key: SectionKey(4),
+                tokens: 20,
+            },
         ];
         let change = set.admit(|_| 900.0, &candidates, &Bars::KNOWLEDGE_BASE);
         assert_eq!(change.entered, vec![SectionKey(2)]);
         assert!(set.places(SectionKey(2)) && !set.places(SectionKey(3)));
+        assert!(!set.places(SectionKey(4)));
+    }
+
+    /// **A section a full range slid out stays out until the next question**:
+    /// in a 50-range holding a (30), b (40) enters and slides a out; a, over
+    /// the bar at the next step, does not come back, and a new question lets
+    /// it.
+    #[test]
+    fn a_section_slid_out_stays_out_until_the_next_question() {
+        let (a, b) = (SectionKey(1), SectionKey(2));
+        let mut scope = RangeScope::new(50);
+        scope.enter(a, 30, false);
+        let mut set = FilesSet::default();
+        set.set_scope(scope);
+        let c = |key, tokens| Candidate { key, tokens };
+        let change = set.admit(|_| 900.0, &[c(b, 40)], &Bars::KNOWLEDGE_BASE);
+        assert_eq!(change.slid, vec![a]);
+        let again = set.admit(|_| 900.0, &[c(a, 30)], &Bars::KNOWLEDGE_BASE);
+        assert!(again.entered.is_empty(), "a stays out this request");
+        set.clear_withheld();
+        assert!(!set.evicted.contains(&a));
     }
 
     /// **A pinned set folds no scan.**

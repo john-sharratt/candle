@@ -114,7 +114,8 @@ use journal_core::journal::Holds;
 use journal_core::journal::Journal;
 use journal_core::record::view as journal_view;
 use journal_core::section::{
-    entry_section, JournalPrompt, Kept, Section, CLOSE_SECTION, HISTORY_SECTION, JOURNAL,
+    entry_section, JournalPrompt, Kept, Section, CLOSE_SECTION, CURRENT_SECTION, HISTORY_SECTION,
+    JOURNAL,
 };
 use journal_core::span::Span;
 use journal_core::transcript::{Filed, Hits, Miss, Page};
@@ -511,6 +512,8 @@ mod prompt_text;
 mod status;
 mod submission;
 mod substrate_view_routes;
+#[cfg(test)]
+mod tests_growing_end;
 #[cfg(test)]
 mod tests_projection;
 #[cfg(test)]

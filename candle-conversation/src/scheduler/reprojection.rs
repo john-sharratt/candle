@@ -11,6 +11,7 @@
 //! the next, so its decay and reinforcement accumulate across the whole turn.
 
 use super::*;
+use crate::projection::ProjectionEvent;
 
 /// All the per-conversation context the scheduler needs to do continuous
 /// re-projection on its own thread, without round-tripping back to the
@@ -87,7 +88,7 @@ pub(super) struct Selected {
     pub(super) sections: Vec<SectionId>,
     pub(super) segments: Vec<ProjectionSegment>,
     pub(super) turns: Vec<TurnKey>,
-    pub(super) composition: crate::projection::ProjectionEvent,
+    pub(super) composition: ProjectionEvent,
 }
 
 /// What a reprojection's selection took, reported with its rebuild.
@@ -136,7 +137,7 @@ pub(super) struct ReprojectInFlight {
     /// (buckets + materialized/substrate totals; the decode-span timing is
     /// filled in at `complete` from the per-sequence anchor). Emitted as a
     /// [`TurnEvent::Projection`] so the GUI drops a timeline dot per reproject.
-    pub(super) composition: crate::projection::ProjectionEvent,
+    pub(super) composition: ProjectionEvent,
     pub(super) plan: projection_assembler::GapFillPlan,
     pub(super) build_ms: u64,
     /// Wall-clock start of the whole reproject (set at the top of `prepare`);
@@ -240,7 +241,7 @@ impl Scheduler {
         // reprojections; the event is just a marker.)
         {
             let (start_token, seconds) = turn.projection_point(Instant::now());
-            let event = crate::projection::ProjectionEvent {
+            let event = ProjectionEvent {
                 start_token,
                 seconds,
                 ..composition

@@ -30,8 +30,9 @@
 //! A request's rounds read one layout of the chain
 //! (`docs/placed_section_layout.md` §3.7): what it holds stays where it was
 //! sealed, and only what joins its end is taken ([`Changes::Growing`]). A
-//! change that would take a held section away — a fold, a forgotten entry,
-//! the oldest entry leaving — waits for the next request's first round.
+//! change that would take a held section away, or seal one again ahead of the
+//! chain's growing end — a fold, a forgotten entry, the oldest entry leaving,
+//! an entry edited — waits for the next request's first round.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -74,10 +75,12 @@ pub enum Linking {
 pub enum Changes {
     /// Every change: between requests, or a collection read apart from one.
     Any,
-    /// A request is running: sections join, and none held is taken away. A
-    /// reconcile that would remove a held section makes no change at all and
-    /// answers with what is held, in the order it was sealed.
-    Growing,
+    /// A request is running: sections join, and none held is taken away or
+    /// sealed again ahead of `end` — the index in the wanted list where the
+    /// chain's growing end begins (a journal's steps and close, which change
+    /// as the request goes). A reconcile that would makes no change at all
+    /// and answers with what is held, in the order it was sealed.
+    Growing { end: usize },
 }
 
 /// What a reconcile has to do, decided before any of it is done.
@@ -158,11 +161,15 @@ fn plan(
     plan
 }
 
-/// Whether `plan` waits under `changes`: a request running, and the plan
-/// takes away a section `held` holds. A swept name nothing holds is no held
-/// section.
-fn waits(plan: &Plan, changes: Changes, held: impl Fn(&str) -> bool) -> bool {
-    changes == Changes::Growing && plan.remove.iter().any(|n| held(n))
+/// Whether `plan` over `wanted` waits under `changes`: a request running, and
+/// the plan takes away a section `held` holds, or seals one it holds again
+/// ahead of the growing end. A swept name nothing holds is no held section.
+fn waits(plan: &Plan, wanted: &[Want<'_>], changes: Changes, held: impl Fn(&str) -> bool) -> bool {
+    let Changes::Growing { end } = changes else {
+        return false;
+    };
+    plan.remove.iter().any(|n| held(n))
+        || plan.submit.iter().any(|&i| i < end && held(wanted[i].name))
 }
 
 /// `held`'s names in the order they were sealed: a chain's by how many
@@ -241,7 +248,17 @@ impl Carried {
             .collect();
         let todo = plan(&standing, wanted, kept, sweep, !self.swept);
         drop(standing);
-        if waits(&todo, changes, |n| self.held.contains_key(n)) {
+        // A held section that failed to seal or was removed is read by no
+        // round, so taking it away takes nothing the request reads.
+        let read_by_a_round = |n: &str| {
+            self.held.get(n).is_some_and(|h| {
+                !matches!(
+                    h.section.state(),
+                    SectionState::Failed(_) | SectionState::Removed
+                )
+            })
+        };
+        if waits(&todo, wanted, changes, read_by_a_round) {
             let order = sealed_order(self.held.iter().map(|(n, h)| (n.as_str(), h.after.len())));
             let mut sealed = Vec::new();
             for name in order {
@@ -552,42 +569,56 @@ mod tests {
         assert_eq!(p.remove, vec!["journal/1".to_string()]);
     }
 
-    /// **While a request runs, a plan that takes a held section away waits;
-    /// one that only adds goes ahead**, and a swept name nothing holds is no
+    /// **While a request runs, a plan that takes a held section away, or seals
+    /// one again ahead of the growing end, waits; one that adds an entry and
+    /// seals the end again goes ahead**, and a swept name nothing holds is no
     /// held section.
     #[test]
-    fn a_running_request_waits_on_a_removal_and_takes_a_growth() {
+    fn a_running_request_waits_on_a_removal_or_an_edit_and_takes_a_growth() {
         let one = names(&["journal/1"]);
+        let two = names(&["journal/1", "journal/2"]);
         let held = [
             chained("journal/1", "a", NONE),
             chained("journal/2", "b", &one),
+            chained("journal/close", "x", &two),
         ];
-        let is_held = |n: &str| n == "journal/1" || n == "journal/2";
+        let is_held = |n: &str| ["journal/1", "journal/2", "journal/close"].contains(&n);
         // A fold: entries 1 and 2 become entry 3.
-        let folded = plan(
-            &held,
-            &[want("journal/3", "ab")],
-            Linking::Chain,
-            &[],
-            false,
-        );
-        assert!(waits(&folded, Changes::Growing, is_held));
-        assert!(!waits(&folded, Changes::Any, is_held));
-        // A new entry on the end.
-        let grown = plan(
-            &held,
-            &[
-                want("journal/1", "a"),
-                want("journal/2", "b"),
-                want("journal/3", "c"),
-            ],
-            Linking::Chain,
-            &[],
-            false,
-        );
-        assert!(!waits(&grown, Changes::Growing, is_held));
+        let wanted = [want("journal/3", "ab"), want("journal/close", "x")];
+        let folded = plan(&held, &wanted, Linking::Chain, &[], false);
+        let growing = Changes::Growing { end: 1 };
+        assert!(waits(&folded, &wanted, growing, is_held));
+        assert!(!waits(&folded, &wanted, Changes::Any, is_held));
+        // An edit of entry 1, which seals entry 2 again behind it.
+        let wanted = [
+            want("journal/1", "a, revised"),
+            want("journal/2", "b"),
+            want("journal/close", "x"),
+        ];
+        let edited = plan(&held, &wanted, Linking::Chain, &[], false);
+        assert!(waits(
+            &edited,
+            &wanted,
+            Changes::Growing { end: 2 },
+            is_held
+        ));
+        // A new entry, and the close sealed again after it.
+        let wanted = [
+            want("journal/1", "a"),
+            want("journal/2", "b"),
+            want("journal/3", "c"),
+            want("journal/close", "y"),
+        ];
+        let grown = plan(&held, &wanted, Linking::Chain, &[], false);
+        assert_eq!(grown.submit, vec![2, 3]);
+        assert!(!waits(
+            &grown,
+            &wanted,
+            Changes::Growing { end: 3 },
+            is_held
+        ));
         let swept = plan(&[], &[], Linking::Chain, &["journal/old"], true);
-        assert!(!waits(&swept, Changes::Growing, |_| false));
+        assert!(!waits(&swept, &[], Changes::Growing { end: 0 }, |_| false));
     }
 
     /// **What is held reads in the order it was sealed**: a chain by how many

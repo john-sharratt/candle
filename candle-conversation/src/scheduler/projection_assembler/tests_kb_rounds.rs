@@ -93,6 +93,24 @@ fn a_pooled_sections_rate_sums_its_pages_over_the_shadow_queries() {
     assert_eq!(unscanned[&a], 50.0);
 }
 
+/// **A section declared both placed and pooled is rated as placed, over the
+/// selection's queries alone**: 2 of 10 blocks over 4 queries is 50, whatever
+/// its pooled page counted over the shadow scan's.
+#[test]
+fn a_section_declared_both_ways_is_rated_as_placed() {
+    let a = SectionKey(1);
+    let keys = [RoundKey::of_section(a), RoundKey::of_section(a)];
+    let kb = HashMap::from([(a.scan_id(), a)]);
+    let read = PieceHits {
+        hits: vec![2, 9],
+        blocks: vec![10, 10],
+        loaded: 1,
+        queries: 4,
+        shadow_queries: 1,
+    };
+    assert_eq!(section_rates(&keys, &read, &kb)[&a], 50.0);
+}
+
 /// **A read every step keeps one part a declaration**: a read of the same
 /// rounds is summed into the last part; a read of others is a part of its
 /// own.

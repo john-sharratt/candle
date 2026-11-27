@@ -6,15 +6,18 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::files::names::chunk_name;
-use crate::files::{files_owner, FileRecord, SectionKey, FILES_PREFIX};
+use crate::files::{files_owner, FileKey, FileRecord, LineSpan, SectionKey, FILES_PREFIX};
 use crate::projection::{ProjectionTarget, SectionId};
 use crate::substrate::Substrate;
 
-/// One section as this process holds it: its member and its tokens.
+/// One section as this process holds it: its member, its tokens, and the
+/// file and lines it is of.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in super::super) struct HeldSection {
     pub(in super::super) id: SectionId,
     pub(in super::super) tokens: usize,
+    pub(in super::super) file: FileKey,
+    pub(in super::super) lines: LineSpan,
 }
 
 /// Each of `wanted` this process holds a member for, by its key.
@@ -42,6 +45,8 @@ pub(in super::super) fn held_sections(
                     HeldSection {
                         id,
                         tokens: c.member.tokens as usize,
+                        file: record.key(),
+                        lines: c.lines,
                     },
                 );
             }

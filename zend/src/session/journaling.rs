@@ -28,17 +28,19 @@ pub(super) fn journal_record(state: &InferenceState, timeline: TimelineId) -> Op
 /// Nothing waits for a section to seal: a round reads the journal as it last
 /// sealed, and a new entry joins the prompt the first round after its section
 /// seals (`journal::carry`). Called at each round's head, and by a draft as it
-/// ends, so a new entry is already sealing before the next round begins. A
-/// request's tool rounds carry it [`Changes::Growing`]: entries join the
-/// chain's end, and a fold, a forgotten entry or the oldest leaving waits for
-/// the next request (`docs/placed_section_layout.md` §3.7).
+/// ends, so a new entry is already sealing before the next round begins.
+/// While `in_request` — a request's tool rounds — it is carried
+/// [`Changes::Growing`] from its steps and close ([`growing_end`]): entries
+/// join the chain's end, the steps and the open items change as the request
+/// goes, and a fold, a forgotten or edited entry or the oldest leaving waits
+/// for the next request (`docs/placed_section_layout.md` §3.7).
 pub(super) async fn carry_journal(
     state: &InferenceState,
     conv_id: &str,
     timeline: TimelineId,
     cs: &mut ConvState,
     selection: &mut SelectionState,
-    changes: Changes,
+    in_request: bool,
 ) {
     let t_open = Instant::now();
     state.prewarm.note(conv_id, t_open);
@@ -64,6 +66,12 @@ pub(super) async fn carry_journal(
         .zip(&sharing)
         .map(|(s, &sharing)| section_want(s, sharing))
         .collect();
+    let changes = match in_request {
+        true => Changes::Growing {
+            end: growing_end(&sections),
+        },
+        false => Changes::Any,
+    };
     let lineage_sweep = lineage::sweep_names();
     let memory_sweep = memory_sections::sweep_names();
     let mut sweep = prompt.sweep();
@@ -130,6 +138,17 @@ pub(super) async fn carry_journal(
         sealed = sealed.len(),
         "journal carry"
     );
+}
+
+/// Where the journal's growing end begins in `sections`: its current
+/// request's heading and steps, or its close, whichever comes first — what a
+/// request changes as it goes. Everything ahead of it — the ancestors'
+/// journals, the memory, the entries — holds while a request runs.
+pub(super) fn growing_end(sections: &[Section]) -> usize {
+    sections
+        .iter()
+        .position(|s| s.name == CURRENT_SECTION || s.name == CLOSE_SECTION)
+        .unwrap_or(sections.len())
 }
 
 /// The journal sections the conversation `conv_id` carries, in the order its
@@ -707,7 +726,7 @@ pub(super) async fn reconcile_journal_now(
     if let Some(conversation) = held {
         if let Ok(mut cs) = conversation.try_lock() {
             let mut unused = SelectionState::default();
-            carry_journal(state, conv_id, timeline, &mut cs, &mut unused, Changes::Any).await;
+            carry_journal(state, conv_id, timeline, &mut cs, &mut unused, false).await;
         }
     }
 }

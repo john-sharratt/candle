@@ -10,10 +10,11 @@
 //! without a PCIe or redo-log wait. The lift is priced as a rebuild's is: below
 //! the decode floor the pages are pooled and the K/V stays where it is. The
 //! pages come from the sections' page cache (`section_pages`), never the log:
-//! a section whose page this process does not hold is resident without rows,
+//! on a model the shadow scan rates sections for, a section whose page this
+//! process does not hold could never enter at a step, so it is not resident
 //! and enters only by a boundary's fill.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use candle_transformers::models::piece_key::PieceKey;
@@ -55,10 +56,25 @@ impl Scheduler {
             let ranked = set.may_enter();
             let wanted: HashSet<SectionKey> = ranked.iter().map(|(k, _)| *k).collect();
             let held = held_sections(&read, &wanted);
+            // On a model the shadow scan rates sections for, one with no page
+            // to rate it by could never enter at a step: it is not resident.
+            let rated = self.model.carries_positional_state();
+            let mut pages: HashMap<SectionKey, Arc<StoredPages>> = HashMap::new();
             let candidates: Vec<Candidate> = ranked
                 .iter()
                 .filter_map(|(k, _)| {
-                    held.get(k).map(|h| Candidate {
+                    let h = held.get(k)?;
+                    let page = read
+                        .section_stream(h.id)
+                        .and_then(|s| self.section_positional.get(s).cloned());
+                    match page {
+                        Some(p) => {
+                            pages.insert(*k, p);
+                        }
+                        None if rated => return None,
+                        None => {}
+                    }
+                    Some(Candidate {
                         key: *k,
                         tokens: h.tokens,
                     })
@@ -66,13 +82,7 @@ impl Scheduler {
                 .collect();
             resident(scope, &candidates, |k| read_since.contains(&k))
                 .into_iter()
-                .map(|c| {
-                    let id = held[&c.key].id;
-                    let page = read
-                        .section_stream(id)
-                        .and_then(|s| self.section_positional.get(s).cloned());
-                    (c, id, page)
-                })
+                .map(|c| (c, held[&c.key].id, pages.remove(&c.key)))
                 .collect()
         };
         // Their pages, placed in one call; a page already pooled is kept.

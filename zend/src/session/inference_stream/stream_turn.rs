@@ -636,17 +636,13 @@ pub(in super::super) fn run_inference_stream(
             if state.journaling {
                 // A request's first round takes every change the journal made
                 // since the last; its tool rounds take only what joins the end.
-                let changes = match iteration {
-                    0 => Changes::Any,
-                    _ => Changes::Growing,
-                };
                 carry_journal(
                     &state,
                     &conv_id,
                     timeline,
                     &mut cs,
                     &mut round_selection,
-                    changes,
+                    iteration > 0,
                 )
                 .await;
             }

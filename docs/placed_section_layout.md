@@ -220,8 +220,11 @@ pool's momentum, not provenance strength.
   no substrate version. A section that leaves is evicted on the files set
   (`FilesSet::evict`), stays out until the next question even where its
   momentum would choose it. A resident section (§3.5) out of scope whose
-  shadow rate reaches the entry bar enters in front (`FilesSet::admit`).
-  Either change is laid onto the slot at the next wave (§4.4,
+  shadow rate reaches the entry bar enters in front (`FilesSet::admit`); a
+  section the entry slides out past the range's top has left as an evicted
+  one has, and stays out until the next question too, so two sections over
+  the bar never trade places step after step. Either change is laid onto
+  the slot at the next wave (§4.4,
   `scheduler/section_step.rs`). Placed sections are declared to the model
   as hit rounds of their own (`RoundKey::of_section`), so a step's read
   rates them; every step's read is summed into the slot's unread hits, so
@@ -281,8 +284,9 @@ resident section's index pages are held in the slot's pool and declared as
 pooled rounds under the section's round (one per page), so the shadow scan
 rates it at every step; its K/V is lifted hot when the decode floor holds
 after the lift, and it is protected from relief eviction while it stays
-resident. A section whose page this process does not hold is resident
-without rows and enters only by a boundary's fill.
+resident. On a model the shadow scan rates sections for, a section whose
+page this process does not hold could never enter at a step, so it is not
+resident; it enters only by a boundary's fill.
 
 **Per section.** The tools section and the knowledge base each declare their
 own triple in `projection.yaml`, beside the section:
@@ -546,9 +550,12 @@ the dialogue is stated in requests, not in boundaries:
   nothing (`hit_driven_projection.md` §4). The next request prefills against a
   stable layout, on rung 1 again. The journal's folds and forgotten entries,
   which reseal everything after them, run here too: a request's tool rounds
-  carry the journal `Changes::Growing` (`conversation/carried.rs`), so an
-  entry joins the chain's end mid-request while a reconcile that would take a
-  held section away changes nothing until the next request's first round.
+  carry the journal `Changes::Growing` from its growing end — the current
+  request's steps, or its close (`conversation/carried.rs`,
+  `session/journaling.rs` `growing_end`) — so an entry joins the chain's end
+  and the steps and open items change mid-request, while a reconcile that
+  would take a held section away, or seal one again ahead of that end (an
+  edited entry), changes nothing until the next request's first round.
 - **A turn is read where it was written.** Within a request every turn keeps
   the position it was computed at, so the dialogue's own K/V is read exactly
   as computed. A prune between requests shifts the survivors down together,
@@ -702,8 +709,10 @@ writes exists:
   (`files_relayout`): no probe, no scan, no projection. The rebuild is the
   reprojection's own (`reproject_rebuild`): the turn's tail captured, the
   pieces before the range kept, the range spliced in where it changed, the
-  rest re-walked from the pieces' own K/V. A slot with no assembly on record is
-  reprojected whole. A resident section holds its K/V and its index rows on
+  rest re-walked from the pieces' own K/V; its projection event names the
+  files the range now places. A re-layout declined below the decode floor
+  stays owed and is asked again at the next drain. A slot with no assembly
+  on record is reprojected whole. A resident section holds its K/V and its index rows on
   the device (§3.5), so an entry moves no bytes across PCIe.
 
 The cost is host time on a step whose layout changes: re-serialising the

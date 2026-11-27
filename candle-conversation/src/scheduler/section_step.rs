@@ -96,6 +96,7 @@ pub(super) fn step_sections(
         .substrate
         .update(|s| s.files_step(target, &leaving, rate, &candidates, &bars));
     if changed {
+        state.layout_owed = true;
         tracing::debug!(
             target: "candle_conversation::scheduler::reproject",
             slot = slot.0,
