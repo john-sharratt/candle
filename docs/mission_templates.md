@@ -103,7 +103,13 @@ order_post { job: "play-a-film", title: "Dune", device: "the living room TV", ro
 job's declared parameters as required fields after it (`tools::DECLARED`,
 built from `Within::job_params`), the same way `message`'s `via` brings its
 `to`: the call cannot close until each is written, and a required free string
-cannot close blank (`FreeTextLimits::nonblank`). `post` (`order_table.rs`)
+cannot close blank (`FreeTextLimits::nonblank`). `job` is optional, since a post
+is a job or a brief, and an optional enum brings its value's fields as a
+required one does (`docs/stencil_tree.md`). Reached through the order table's
+device, the post carries those fields beside the act's own
+(`tools::declared_fields`, `effector/station.rs`): the route once kept only
+`order_post`'s params, and a `coding-task` written with its `what` arrived
+without it. `post` (`order_table.rs`)
 fetches the routine by id, reads each parameter from its field, substitutes
 them into its brief and steps, and posts the concrete mission. A missing or
 blank argument is refused there, with the parameter named, the same way a post

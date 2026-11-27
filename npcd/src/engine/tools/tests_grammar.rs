@@ -20,6 +20,49 @@ pub(super) mod tests {
 
     use crate::engine::talk::within::OnThread;
 
+    use serde_json::{json, Value};
+
+    use crate::engine::mission_gen::world::{Draw, Routine};
+    use crate::sim::missions::Missions;
+
+    /// **What the job chosen brings is carried with it**: a post of
+    /// `coding-task` names its `what` and `repository` as fields of the call;
+    /// a job that takes nothing, or none at all, brings nothing; and no other
+    /// act is read for them.
+    #[test]
+    fn a_chosen_job_names_the_fields_it_brings() {
+        let mut missions = Missions::default();
+        missions.set_routines(
+            vec![
+                Routine {
+                    id: "coding-task".into(),
+                    brief: "{what} in {repository}".into(),
+                    steps: vec!["see the task through".into()],
+                    params: vec!["what".into(), "repository".into()],
+                    ..Default::default()
+                },
+                Routine {
+                    id: "ward-shift".into(),
+                    brief: "Take a shift.".into(),
+                    steps: vec!["go".into()],
+                    ..Default::default()
+                },
+            ],
+            Draw::None,
+        );
+        let fields = |v: Value| v.as_object().unwrap().clone();
+        let coding = fields(json!({"job": "coding-task", "what": "w", "repository": "candle"}));
+        assert_eq!(
+            declared_fields("order_post", &coding, &missions),
+            ["what", "repository"]
+        );
+        let shift = fields(json!({"job": "ward-shift"}));
+        assert!(declared_fields("order_post", &shift, &missions).is_empty());
+        let brief = fields(json!({"brief": "b", "steps": "s"}));
+        assert!(declared_fields("order_post", &brief, &missions).is_empty());
+        assert!(declared_fields("report_done", &coding, &missions).is_empty());
+    }
+
     /// **A turn of plain words is offered no act**, whatever its selection
     /// listed before.
     #[test]

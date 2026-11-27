@@ -12,6 +12,10 @@
 
 use super::*;
 
+use serde_json::{Map, Value};
+
+use crate::sim::missions::Missions;
+
 /// What each value of a choosing parameter brings with it, written after that
 /// value and nowhere else. `(tool, param) → [(value, fields)]`.
 ///
@@ -95,6 +99,28 @@ pub(super) fn brought_choice(tool: &str, value: &str, field: &str) -> Option<Cho
 /// brings `what` and `repository`, each required, and the call cannot close
 /// without them.
 pub(super) const DECLARED: &[(&str, &str)] = &[("order_post", "job")];
+
+/// The fields a call of `tool` writing `fields` carries beyond the act's own
+/// params: for each [`DECLARED`] choice it makes, the parameters the world
+/// declares for the value it chose.
+///
+/// **What a value brought is the act's to read.** Reached through the order
+/// table's device, a post kept only `order_post`'s own params, so a
+/// `coding-task` written with its `what` and `repository` arrived without them
+/// and was refused for want of `what`.
+pub fn declared_fields(
+    tool: &str,
+    fields: &Map<String, Value>,
+    missions: &Missions,
+) -> Vec<String> {
+    DECLARED
+        .iter()
+        .filter(|(t, _)| *t == tool)
+        .filter_map(|(_, param)| fields.get(*param)?.as_str())
+        .filter_map(|job| missions.routine(job))
+        .flat_map(|r| r.params.clone())
+        .collect()
+}
 
 /// The fields each value of `t.param` brings, as the grammar's own: those
 /// [`BRINGS`] names, and for a [`DECLARED`] choice the parameters the world

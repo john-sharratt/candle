@@ -209,12 +209,19 @@ async fn invoke(
     };
     // Only the act's declared params are carried through, each as the body gave
     // it — the handler reads strings and booleans off the map exactly as it does
-    // when the act is reached any other way.
+    // when the act is reached any other way — and the fields a value it chose
+    // brings, which the grammar wrote beside it (`tools::declared_fields`).
     let mut args = Map::new();
     if let Some(Json(Value::Object(fields))) = payload {
-        for p in tool.params {
-            if let Some(value) = fields.get(p.name) {
-                args.insert(p.name.to_string(), value.clone());
+        let brought = hosted.sim(|s| tools::declared_fields(tool.name, &fields, &s.missions));
+        let carried = tool
+            .params
+            .iter()
+            .map(|p| p.name)
+            .chain(brought.iter().map(String::as_str));
+        for name in carried {
+            if let Some(value) = fields.get(name) {
+                args.insert(name.to_string(), value.clone());
             }
         }
     }
