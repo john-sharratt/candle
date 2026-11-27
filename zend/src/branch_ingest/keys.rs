@@ -107,10 +107,16 @@ pub const COMMIT_KEY: &str = "commit";
 /// (`docs/provenance_system_collection.md`). A unit read under 6 is a reading
 /// conversation of tool turns, which nothing places any more.
 ///
+/// 8: a file is the knowledge base's sections — each the parts and closing
+/// line a `file_read` of its range returns, under their anchors and relative
+/// line numbers, with the cut marker short of the file's end
+/// (`docs/placed_section_layout.md` §3.5c). A unit read under 7 is the file's
+/// text in a plain fence, with nothing an edit can name.
+///
 /// Every key states its version as a `v<N>:` prefix ([`key_version`]), so a
 /// member can tell a unit read under a NEWER version — a peer's, upgraded before
 /// it — from one it should replace, and leaves it alone.
-pub const KEY_VERSION: u32 = 7;
+pub const KEY_VERSION: u32 = 8;
 
 /// The first key version that writes its `v<N>:` prefix — the oldest a
 /// folder's earlier reading can be recomputed at ([`dir_key_at`]). A key from
@@ -242,11 +248,11 @@ mod tests {
     fn a_file_key_is_its_path_and_blob() {
         assert_eq!(
             file_key("candle/zend/src/main.rs", &oid(A)),
-            "v7:candle/zend/src/main.rs@ce013625030ba8dba906f756967f9e9ca394464a"
+            "v8:candle/zend/src/main.rs@ce013625030ba8dba906f756967f9e9ca394464a"
         );
         assert_eq!(
             file_key("candle/README.md", &oid(A)),
-            "v7:candle/README.md@ce013625030ba8dba906f756967f9e9ca394464a",
+            "v8:candle/README.md@ce013625030ba8dba906f756967f9e9ca394464a",
             "a repository's root anchor is keyed as every file is"
         );
     }

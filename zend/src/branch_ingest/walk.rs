@@ -451,7 +451,7 @@ mod tests {
         );
         assert_eq!(
             corpus.ingest.files[0].key,
-            format!("v7:r/a.rs@{}", a_main.trim())
+            format!("v8:r/a.rs@{}", a_main.trim())
         );
     }
 
