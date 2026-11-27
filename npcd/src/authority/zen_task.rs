@@ -184,7 +184,15 @@ impl Runtime {
                 return recorded(act, false, format!("Zen did not start it: {text}"));
             };
             hosted.with_sim(|s| {
-                s.missions.set_task(&body, Task { handle, heard: 0 });
+                // Started is running: nothing is asked of its carrier yet.
+                s.missions.set_task(
+                    &body,
+                    Task {
+                        handle,
+                        heard: 0,
+                        running: true,
+                    },
+                );
             });
         }
         let line = text.lines().next().unwrap_or_default().to_string();
@@ -312,6 +320,9 @@ fn post_news(s: &mut Sim, body: &str, npc: u64, handle: &str, text: &str) {
     let standing = standing_of(text, handle);
     let said = news_of(text, handle);
     let said_digest = digest(&said);
+    // Every look, news or none: the carrier rests while it runs, and is woken
+    // by the look that finds it asking, stuck, failed or done.
+    s.missions.task_running(body, standing == Standing::Running);
     if standing == Standing::Done && s.missions.task_done(body) {
         s.missions.observe(body, format!("{handle} reported done"));
     }
@@ -460,6 +471,7 @@ mod tests {
                 Task {
                     handle: HANDLE.into(),
                     heard: 0,
+                    running: true,
                 },
             );
         });

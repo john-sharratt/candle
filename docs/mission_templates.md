@@ -274,6 +274,17 @@ act on.
 **A suspended carrier is held still here too**: its task acts are refused, and
 its task is neither asked after nor posted to until it is let go.
 
+**A carrier rests while its task runs.** A task started is running
+(`Task::running`), and every look sets it from the standing, news or none. A
+drone whose mission waits on its task is held at rest as a drone with nothing
+to carry is (`Missions::waits_on_task`, `Runtime::rest_of` → `Rest::OnItsTask`):
+no turn, nothing resident on the card, and no "come to rest" told to anyone.
+The look that finds the task asking, stuck, failed or done clears it, and the
+next moment wakes the drone with the news on its handset. Awake through the
+wait, Wick read every era of the record at a desk, wrote a guide of its own into
+the mind, and nudged the running worker six times with a cause it had made up —
+once to "commit the finding".
+
 ---
 
 ## 8. Build order

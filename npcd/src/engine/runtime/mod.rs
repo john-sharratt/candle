@@ -418,6 +418,8 @@ mod messages;
 mod mind_hold;
 mod missions;
 mod moments;
+#[cfg(test)]
+use moments::Rest;
 mod perceiving;
 mod persona;
 mod records;

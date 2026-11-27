@@ -105,13 +105,18 @@ impl Runtime {
         open && ordered && (!draws || Self::reaches_table(hosted, body))
     }
 
-    /// Whether `body` is a drone at rest in `hosted`
-    /// (`docs/zen_everywhere.md` §3): the table gives it its work, it carries
-    /// nothing, and nothing waits on the table that it may take.
-    pub(super) fn at_rest(&self, hosted: &Hosted, body: &str) -> bool {
+    /// Why `body` is a drone at rest in `hosted`, or `None` when it is not
+    /// (`docs/zen_everywhere.md` §3): the table gives it its work, and it
+    /// carries nothing with nothing on the table that it may take — or its
+    /// mission waits on its task (`Missions::waits_on_task`).
+    pub(super) fn rest_of(&self, hosted: &Hosted, body: &str) -> Option<Rest> {
         // The mission state first: it is a map lookup, and asked of every body
         // every moment.
-        hosted.sim(|s| s.missions.at_rest(body)) && self.table_gives_to(hosted, body)
+        let rest = hosted.sim(|s| match s.missions.at_rest(body) {
+            true => Some(Rest::Unburdened),
+            false => s.missions.waits_on_task(body).then_some(Rest::OnItsTask),
+        })?;
+        self.table_gives_to(hosted, body).then_some(rest)
     }
 
     /// Hold at rest exactly the characters running here whose bodies in
@@ -151,14 +156,18 @@ impl Runtime {
         if !self.standing.runs(npc) {
             return;
         }
-        let rest = self.at_rest(hosted, body);
-        if !self.scheduler.rest(npc, rest) {
+        let rest = self.rest_of(hosted, body);
+        if !self.scheduler.rest(npc, rest.is_some()) {
             return;
         }
+        let Some(rest) = rest else {
+            tracing::info!(npc, "drone woken: it carries a mission");
+            return;
+        };
+        let minds = self.minds.read().unwrap().clone();
+        let freed = minds.as_ref().is_some_and(|m| m.let_go(npc));
         match rest {
-            true => {
-                let minds = self.minds.read().unwrap().clone();
-                let freed = minds.as_ref().is_some_and(|m| m.let_go(npc));
+            Rest::Unburdened => {
                 tracing::info!(
                     npc,
                     freed,
@@ -166,7 +175,14 @@ impl Runtime {
                 );
                 self.tell_whole(hosted, body, "has come to rest, with nothing to carry.");
             }
-            false => tracing::info!(npc, "drone woken: it carries a mission"),
+            // Nothing to tell: the work is still out, and what it brings back
+            // is told when it comes.
+            Rest::OnItsTask => tracing::info!(
+                npc,
+                freed,
+                "drone at rest: its mission's task runs, and it takes no turn until the task has \
+                 news for it"
+            ),
         }
     }
 
@@ -661,4 +677,13 @@ impl Runtime {
             }
         }
     }
+}
+
+/// Why a drone is at rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Rest {
+    /// It carries nothing, and nothing on the table is its to take.
+    Unburdened,
+    /// Its mission's task runs with nothing asked of it.
+    OnItsTask,
 }
