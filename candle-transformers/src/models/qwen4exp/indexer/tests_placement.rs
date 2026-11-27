@@ -237,6 +237,37 @@ pub(super) mod tests {
         Ok(())
     }
 
+    /// **A hole after forwarded tokens closes them into a page and opens the
+    /// tail past it** — a system prompt prefilled live, crossing a reserved
+    /// range (`docs/placed_section_layout.md` §3.1). 40 tokens forwarded, a
+    /// 24-position hole, 16 more: the forwarded 40 are one page of 40 tokens,
+    /// the tail opens at 64, and the index reaches position 80 — the page, the
+    /// hole and the 16. `skip_to` alone refuses the same hole.
+    #[test]
+    fn a_hole_after_forwarded_tokens_closes_them_into_a_page() -> Result<()> {
+        let Some(device) = cuda() else { return Ok(()) };
+        let rig = Rig::new(device.clone(), 256)?;
+        let ratio = rig.ratio;
+
+        let mut refused = IndexCache::new(rig.cfg.head_dim, &device)?;
+        rig.append(&mut refused, 0, 40)?;
+        assert!(
+            refused.skip_to(64).is_err(),
+            "skip_to over live rows is what the hole replaces"
+        );
+
+        let mut c = IndexCache::new(rig.cfg.head_dim, &device)?;
+        rig.append(&mut c, 0, 40)?;
+        c.hole(&rig.w, ratio, rig.eps, 24)?;
+        assert_eq!(c.page_count(), 1);
+        assert_eq!(c.page_at(0).map(|(_, tokens)| tokens), Some(40));
+        assert_eq!(c.live_blocks(), 0);
+        assert_eq!(c.next_base(), 64);
+        rig.append(&mut c, 40, 16)?;
+        assert_eq!(c.indexed_tokens(ratio), 80);
+        Ok(())
+    }
+
     /// **A page's rows are visible to exactly the queries they sit below.**
     ///
     /// The arithmetic that replaces `(pos + 1) / ratio` once a sequence holds a

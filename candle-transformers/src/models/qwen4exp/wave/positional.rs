@@ -706,12 +706,20 @@ impl Qwen4ExpBatched {
     /// contributed none slid every later page's implied start earlier by its
     /// width, and a zero-row page had to stand in to keep the sum honest.
     /// Positions are recorded now, so an unindexed span is simply not indexed.
+    ///
+    /// A hole may follow tokens this sequence forwarded itself — a reserved
+    /// range of the system prompt, which a prompt prefilled live crosses as it
+    /// goes (`docs/placed_section_layout.md` §3.1). Those rows close into a page
+    /// of their own on every selecting layer first ([`IndexCache::hole`]), so
+    /// the tail opens past the hole with nothing live behind it.
     pub fn push_positional_gap(&self, seq: usize, tokens: usize) -> Result<()> {
         if tokens == 0 {
             return Ok(());
         }
         let cfg = &self.model.cfg;
         let want = cfg.kv_layers().total();
+        #[cfg(feature = "cuda")]
+        let (ratios, indexers) = (self.attention_ratios(), self.attention_indexers());
         let mut map = self
             .index
             .write()
@@ -722,6 +730,14 @@ impl Qwen4ExpBatched {
                 caches.push(IndexCache::new(cfg.indexer.head_dim, &self.model.device)?);
             }
         }
+        #[cfg(feature = "cuda")]
+        for ((c, &ratio), w) in caches.iter_mut().zip(ratios.iter()).zip(indexers.iter()) {
+            match ratio {
+                0 => c.skip_to(c.next_base() + tokens)?,
+                _ => c.hole(w, ratio, cfg.rms_norm_eps, tokens)?,
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
         for c in caches.iter_mut() {
             let to = c.next_base() + tokens;
             c.skip_to(to)?;

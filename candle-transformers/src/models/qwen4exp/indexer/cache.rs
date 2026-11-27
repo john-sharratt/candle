@@ -290,6 +290,24 @@ impl IndexCache {
         Ok(tokens)
     }
 
+    /// Leave `tokens` positions empty at the tail: a reserved range's hole
+    /// (`docs/placed_section_layout.md` §3.1). Rows the sequence forwarded
+    /// ahead of it — the system prompt's text up to a range, prefilled live —
+    /// close into a page of their own where they sit ([`Self::close_tail_into_page`]),
+    /// and the tail opens past the hole; a tail already empty only moves.
+    #[cfg(feature = "cuda")]
+    pub fn hole(
+        &mut self,
+        w: &IndexerWeights,
+        ratio: usize,
+        rms_eps: f64,
+        tokens: usize,
+    ) -> Result<()> {
+        self.close_tail_into_page(w, ratio, rms_eps)?;
+        let to = self.next_base() + tokens;
+        self.skip_to(to)
+    }
+
     /// A cache holding `rows` as its live prefix and `open` as its carried,
     /// un-pooled tail — the resume path, and the exact inverse of
     /// [`Self::live_rows_host`] + [`Self::open_rows_host`].
