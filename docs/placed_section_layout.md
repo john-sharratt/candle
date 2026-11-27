@@ -378,19 +378,24 @@ checks it on every cached Qwen vocabulary, sections in and out of line order.
 whole files and the index places a leading run of a file too large for its
 cap (`provenance_system_collection.md` D22). Both now work on sections:
 
-- **provenance scores each section as its own case** (`cases: section` in
-  place of `cases: file`): the gallery already holds a member's signatures
-  under its `ChunkKey` (§4 of that doc), so a section's score is its own
-  signatures' agreement. A large file no longer gathers every one of its
-  chunks' votes into one score: each section competes on what it holds, and a
-  large file stops swamping the scan;
+- **provenance scores each section as its own candidate**
+  (`belief_members.rs`): each section is a candidate named by its
+  `SectionKey` — the digest of its file's content key and its lines — its
+  member stream one window and one case, so the groups' `cases: file` (one
+  case a candidate) now pools a section, not a file. A section's score is its
+  own signatures' agreement and its own calibrations'. A large file no longer
+  gathers every one of its sections' votes into one score: each section
+  competes on what it holds, and a large file stops swamping the scan;
 - **the scan set and residency are chosen by section**, by provenance score,
   and residency fuses in the section's hit rate from the shadow scan (§3.5);
 - **the projection is chosen by section** on the index's hit rate alone
   (§3.4).
 
 The calibration's votes and the working set's momentum move to the section
-key accordingly.
+key accordingly: the files set holds each section's momentum, kind and file
+(`files/set.rs`), the fill places sections strongest first, each that fits
+(`files/fill.rs`), a pin names sections, and a file the turn read withholds
+all its sections.
 
 ### 3.5d Calibration per section
 
@@ -406,7 +411,9 @@ as provenance and the projection do (§3.5c):
   path regex as today (`calibrate/profile.rs`), and each of its prompts keeps
   its own count rule (`per_tokens`, `min`, `max`), applied to the section's
   tokens instead of the file's. The rules are retuned so a profile averages
-  **about 5 questions per section**: half of today's density. Measured on
+  **about 5 questions per section**: half of today's density — each
+  per-section prompt's `per_tokens` doubled and its `min` and `max` halved
+  (rounded up for `min`). Measured on
   candle, battle-cities and yenbot after the ingest's ignores (8,464 files,
   17,024 sections, 2.01 per file), today's rules ask 163,825–194,481
   questions — about 10 per section, for one-section and many-section files
@@ -416,10 +423,17 @@ as provenance and the projection do (§3.5c):
   base's range: its questions are about what the section holds. A draft
   never rereads a large file per section.
 - **File-level prompts are asked once per file.** A profile's prompts about
-  the file as a whole (`purpose`; `architecture` for documents) are asked in
-  one draft per file, from the file's first section, and each such question
-  votes for every section of the file, its weight split evenly across them.
-  The per-section count of §3.5d's retune excludes them.
+  the file as a whole (`purpose`; `architecture` for documents), marked
+  `per: file` in `projection.yaml`, are asked in the file's first section's
+  draft, counted by the file's tokens, and their questions vote for that
+  first section. A vote counts once per token per case and the vote law
+  carries no weights, so a question cannot vote for every section at a split
+  weight without a kernel change; given to every section whole, a file-level
+  question would vote for all of a large file's sections at once — the
+  swamping this design removes. The first section holds the file's opening,
+  where its purpose is stated. A guide's read of a file
+  (`guidance/reads.rs`) votes for the first section the same way. The
+  per-section count of the retune excludes them.
 - **Asked once, behind the empty range.** With the seed chain gone there is
   no seed branch to ask behind, and the questions are no longer split
   between the empty and the target knowledge base: each is asked once,
@@ -667,7 +681,7 @@ by §7's throughput test.
 | Index holes and placement | Recorded page positions, `skip_to`, `push_positional_gap` (`qwen4exp/wave/positional.rs`) | None in the engine; the assembler places at range positions |
 | Sealing at a range's top | `seal_members`, `prepare_section_ingest` | The seal's prefill starts at the frontier `B + R − T` |
 | Sections in `file_read`'s format | `zend-tools/src/tools/file/render.rs` (`windows` and the page body), which the ingest already drives | Replaces `files::cut_lines` and the plain fence of `files/render.rs`; adds the `...` marker |
-| Provenance by section | The gallery's signatures per `ChunkKey` | `cases: section` beside `cases: file` in the belief groups |
+| Provenance by section | The gallery's signatures per member stream, the scan's candidates | Each section a candidate under its `SectionKey`; `cases: file` pools one candidate, now a section |
 | Calibration by section | `calibrate/count.rs`, profiles, prompts, the seal | Counts from the section's tokens; votes by a section scan id; one frame; the draft sees the section |
 | Mandatory sections | The tools collection's mandatory members (`SectionCollection::mandatory`) as the model | A mandatory set in the files splice; the seed chain removed |
 | Residency | `elevate_to_hot`, the tier migration, the region pool | Promotes ranked sections, every layer's index rows with them, without placing them |

@@ -1,4 +1,4 @@
-//! Each dialogue's working set of the knowledge base's files, on the
+//! Each dialogue's working set of the knowledge base's sections, on the
 //! substrate beside its working set (`docs/provenance_system_collection.md`
 //! §4): read by the projection, folded by every scan, its placed order kept
 //! by every fill.
@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use super::Substrate;
-use crate::files::{FileKey, FilesPin, FilesSet};
+use crate::files::{FileKey, FilesPin, FilesSet, FreshSection, SectionKey};
 use crate::projection::{GroupId, TimelineId};
 
 impl Substrate {
@@ -15,11 +15,11 @@ impl Substrate {
         self.files_sets.get(&target).map(|s| &**s)
     }
 
-    /// Fold one scan's fresh file scores into `target`'s files set.
+    /// Fold one scan's fresh section scores into `target`'s files set.
     pub fn files_observe(
         &mut self,
         target: TimelineId,
-        fresh: &[(GroupId, Vec<(FileKey, f32)>)],
+        fresh: &[(GroupId, Vec<FreshSection>)],
         beta: f32,
         min_momentum: f32,
     ) {
@@ -30,9 +30,9 @@ impl Substrate {
         );
     }
 
-    /// Record `order` as where the files a projection of `target` placed sit
-    /// ([`FilesSet::order`] computed it).
-    pub fn files_placed(&mut self, target: TimelineId, order: Vec<FileKey>) {
+    /// Record `order` as where the sections a projection of `target` placed
+    /// sit ([`FilesSet::order`] computed it).
+    pub fn files_placed(&mut self, target: TimelineId, order: Vec<SectionKey>) {
         Arc::make_mut(self.files_sets.entry(target).or_default()).set_placed(order);
     }
 

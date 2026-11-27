@@ -14,12 +14,36 @@ use sha2::{Digest, Sha256};
 
 use super::count::QuestionCount;
 
+/// What a prompt is asked of (`docs/placed_section_layout.md` §3.5d).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskScope {
+    /// Each section of a file, counted by the section's tokens, its questions
+    /// voting for the section.
+    #[default]
+    Section,
+    /// The file as a whole, once, from its first section, counted by the
+    /// file's tokens, its questions voting for that first section.
+    File,
+}
+
+impl AskScope {
+    fn tag(self) -> u8 {
+        match self {
+            AskScope::Section => 0,
+            AskScope::File => 1,
+        }
+    }
+}
+
 /// One prompt as the schema declares it.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RawAsk {
     pub name: String,
     pub questions: QuestionCount,
+    #[serde(default)]
+    pub per: AskScope,
     pub prompt: String,
 }
 
@@ -28,8 +52,10 @@ pub(super) struct RawAsk {
 pub struct Ask {
     /// What kind of question it asks for — `definitions`, `uses`, `purpose`.
     pub name: String,
-    /// How many, by the unit's size.
+    /// How many, by the size of what it is asked of.
     pub questions: QuestionCount,
+    /// What it is asked of: each section, or the file once.
+    pub per: AskScope,
     /// What it asks, with `<<n>>`, `<<subject>>`, and for a file subject
     /// `<<file>>`, `<<repo>>` and `<<path>>` filled in.
     pub prompt: String,
@@ -50,6 +76,7 @@ impl Ask {
         Ok(Self {
             name: raw.name,
             questions: raw.questions,
+            per: raw.per,
             prompt: raw.prompt,
         })
     }
@@ -67,12 +94,14 @@ impl Ask {
             .replace("<<path>>", path)
     }
 
-    /// Feed the ask into a calibration marker's digest: its name, its rule and
-    /// its template, each closed by a zero byte so no two asks run together.
+    /// Feed the ask into a calibration marker's digest: its name, its rule,
+    /// its scope and its template, each closed by a zero byte so no two asks
+    /// run together.
     pub fn digest_into(&self, h: &mut Sha256) {
         h.update(self.name.as_bytes());
         h.update([0u8]);
         self.questions.digest_into(h);
+        h.update([self.per.tag(), 0u8]);
         h.update(self.prompt.as_bytes());
         h.update([0u8]);
     }
@@ -90,6 +119,7 @@ mod tests {
                 min: 4,
                 max: 32,
             },
+            per: AskScope::Section,
             prompt: prompt.into(),
         }
     }
@@ -144,6 +174,24 @@ mod tests {
         let mut reworded = a.clone();
         reworded.prompt.push('!');
         assert_ne!(digest(&reworded), base);
+        let mut whole = a.clone();
+        whole.per = AskScope::File;
+        assert_ne!(digest(&whole), base);
         assert_eq!(digest(&a), base);
+    }
+
+    /// **A prompt is asked of each section unless it says `per: file`.**
+    #[test]
+    fn a_prompt_is_per_section_unless_it_says_per_file() {
+        let section: RawAsk = serde_yaml::from_str(
+            "{name: d, questions: {per_tokens: 300, min: 1, max: 4}, prompt: x}",
+        )
+        .unwrap();
+        assert_eq!(section.per, AskScope::Section);
+        let file: RawAsk = serde_yaml::from_str(
+            "{name: purpose, questions: {per_tokens: 3000, min: 1, max: 4}, per: file, prompt: x}",
+        )
+        .unwrap();
+        assert_eq!(file.per, AskScope::File);
     }
 }

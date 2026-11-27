@@ -125,6 +125,7 @@ impl Profile {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ask::AskScope;
     use super::super::count::QuestionCount;
     use super::*;
 
@@ -139,6 +140,7 @@ mod tests {
                     min: 4,
                     max: 28,
                 },
+                per: AskScope::Section,
                 prompt: "ask <<n>>".into(),
             }],
         }
@@ -184,6 +186,7 @@ mod tests {
                 min: 1,
                 max: 2,
             },
+            per: AskScope::Section,
             prompt: "x".into(),
         });
         assert_eq!(

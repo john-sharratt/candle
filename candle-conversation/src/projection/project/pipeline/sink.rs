@@ -738,6 +738,7 @@ pub fn run_with_sink<R: ContentResolver>(
     // below counts the system prompt without them: the kinds' caps and the
     // dialogue's share are shares of one room.
     let mut files_placed: Vec<PlacedFile> = Vec::new();
+    let mut files_sections: Vec<SectionKey> = Vec::new();
     let mut files_tokens = 0usize;
     let knowledge_base = schema
         .layers
@@ -784,6 +785,7 @@ pub fn run_with_sink<R: ContentResolver>(
             // full size the prompt already counts.
             files_tokens = place_files(&mut system_prompt_segments, at, splice.segments, tokens);
             files_placed = splice.placed;
+            files_sections = splice.sections;
         }
     }
 
@@ -796,6 +798,7 @@ pub fn run_with_sink<R: ContentResolver>(
             fill: Vec::new(),
             unpooled: Vec::new(),
             files_placed,
+            files_sections,
         };
     }
 
@@ -1416,5 +1419,6 @@ pub fn run_with_sink<R: ContentResolver>(
         fill,
         unpooled,
         files_placed,
+        files_sections,
     }
 }

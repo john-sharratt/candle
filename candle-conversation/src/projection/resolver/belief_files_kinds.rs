@@ -1,19 +1,20 @@
-//! Scores the knowledge base's files, kind by kind
-//! (`docs/provenance_system_collection.md` §4).
+//! Scores the knowledge base's sections, kind by kind
+//! (`docs/provenance_system_collection.md` §4,
+//! `docs/placed_section_layout.md` §3.5c).
 //!
-//! Each kind's files are assembled from their members
+//! Each kind's sections are assembled from their members
 //! ([`super::super::belief_members`]) and scored as a turn group's files are:
 //! one batched launch with the pinned question window as a second probe, each
-//! file one case (`cases: file`), read against its kind — `kind_z` over the
-//! files of its own extension — or the kind's learned background, the tail and
-//! the question max-fused after normalization. The result is each file's
-//! fresh score, what the knowledge base's working set builds its momentum
-//! from.
+//! section one case (`cases: section`), read against its kind — `kind_z` over
+//! the sections of files of its own extension — or the kind's learned
+//! background, the tail and the question max-fused after normalization. The
+//! result is each section's fresh score with its file, what the knowledge
+//! base's working set builds its momentum from.
 
-use super::super::belief_members::{assemble_member_scans, file_of};
+use super::super::belief_members::{assemble_member_scans, section_of};
 use super::super::files_kinds::kind_records;
 use super::*;
-use crate::files::{FileKey, FileRecord, FILES_PREFIX};
+use crate::files::{FileKey, FileRecord, FreshSection, SectionKey, FILES_PREFIX};
 use crate::persistence::content_hash::section_stream_id;
 
 impl Conversation {
@@ -27,9 +28,9 @@ impl Conversation {
             .collect()
     }
 
-    /// Score every file of each of `kinds` against `probe` — and `probe_q`,
-    /// the question window, for a kind that pins it — and return each kind's
-    /// files with their fresh scores.
+    /// Score every section of each of `kinds` against `probe` — and
+    /// `probe_q`, the question window, for a kind that pins it — and return
+    /// each kind's sections with their files and fresh scores.
     pub fn score_belief_files(
         &self,
         kinds: &[&GroupSchema],
@@ -37,7 +38,7 @@ impl Conversation {
         probe_q: Option<&[WideQSig]>,
         observe: Observe<'_>,
         arena: Option<&dyn BeliefArena>,
-    ) -> Vec<(GroupId, Vec<(FileKey, f32)>)> {
+    ) -> Vec<(GroupId, Vec<FreshSection>)> {
         let mut out = Vec::new();
         if probe.is_empty() {
             return out;
@@ -48,45 +49,42 @@ impl Conversation {
             if held.is_empty() {
                 continue;
             }
-            let members: Vec<(FileKey, Vec<StreamId>)> = held
-                .iter()
-                .map(|r| {
-                    (
-                        r.key(),
-                        r.chunks
-                            .iter()
-                            .map(|c| section_stream_id(c.member.address))
-                            .collect(),
-                    )
-                })
-                .collect();
-            let paths: HashMap<FileKey, &str> =
-                held.iter().map(|r| (r.key(), r.path.as_str())).collect();
-            let files = {
+            // Every section of the kind's files, each its own case, with its
+            // file and path.
+            let mut members: Vec<(SectionKey, StreamId)> = Vec::new();
+            let mut of: HashMap<SectionKey, (FileKey, &str)> = HashMap::new();
+            for r in &held {
+                for (i, c) in r.chunks.iter().enumerate() {
+                    let key = r.section_key(i);
+                    members.push((key, section_stream_id(c.member.address)));
+                    of.insert(key, (r.key(), r.path.as_str()));
+                }
+            }
+            let sections = {
                 let sub = self.inner.read();
                 assemble_member_scans(&sub, &members)
             };
-            if files.is_empty() {
+            if sections.is_empty() {
                 continue;
             }
-            let scores = self.score_kind(kind, &files, &paths, probe, probe_q, observe, arena);
+            let scores = self.score_kind(kind, &sections, &of, probe, probe_q, observe, arena);
             out.push((kind.id, scores));
         }
         out
     }
 
-    /// One kind's assembled `files` scored and normalized.
+    /// One kind's assembled `sections` scored and normalized.
     #[allow(clippy::too_many_arguments)]
     fn score_kind(
         &self,
         kind: &GroupSchema,
         files: &[FileScan],
-        paths: &HashMap<FileKey, &str>,
+        of: &HashMap<SectionKey, (FileKey, &str)>,
         probe: &[WideQSig],
         probe_q: Option<&[WideQSig]>,
         observe: Observe<'_>,
         arena: Option<&dyn BeliefArena>,
-    ) -> Vec<(FileKey, f32)> {
+    ) -> Vec<FreshSection> {
         let plans = ScanPlans::default();
         let question = match probe_q {
             Some(q) if kind.policy.scan.question_pin && !q.is_empty() => Some(q),
@@ -110,9 +108,8 @@ impl Conversation {
         let extensions: Vec<String> = files
             .iter()
             .map(|f| {
-                paths
-                    .get(&file_of(f.timeline))
-                    .map_or(String::new(), |p| path_kind(p).to_string())
+                of.get(&section_of(f.timeline))
+                    .map_or(String::new(), |(_, p)| path_kind(p).to_string())
             })
             .collect();
         let pool_scope = ScopeKey::pool(kind.id.raw() as u64);
@@ -150,13 +147,15 @@ impl Conversation {
         files
             .iter()
             .enumerate()
-            .map(|(i, f)| {
+            .filter_map(|(i, f)| {
                 let t = tail_normed.get(i).copied().unwrap_or(0.0);
                 let q = question_normed
                     .as_ref()
                     .and_then(|q| q.get(i).copied())
                     .unwrap_or(0.0);
-                (file_of(f.timeline), t.max(q))
+                let section = section_of(f.timeline);
+                let &(file, _) = of.get(&section)?;
+                Some((section, file, t.max(q)))
             })
             .collect()
     }

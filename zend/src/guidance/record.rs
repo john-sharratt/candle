@@ -52,10 +52,10 @@ pub fn record_use(
         .collect();
     let conversation = engine.conversation();
     // A unit stands while a record of its file does: the exemplar names the
-    // file's scan id (`FileKey::scan_id`).
+    // file's first section's scan id (`SectionKey::scan_id`).
     let standing_files: HashSet<TimelineId> = records::all(&conversation)
         .iter()
-        .map(|r| r.key().scan_id())
+        .filter_map(|r| r.section_keys().first().map(|s| s.scan_id()))
         .collect();
     let substrate = conversation.read();
     let standing: Vec<Standing> = exemplars

@@ -138,6 +138,7 @@ pub(super) mod projection_schema_tests {
     /// per-axis split).
     #[test]
     fn embedded_schema_carries_the_working_set_config() {
+        use crate::calibrate::ask::AskScope;
         use crate::calibrate::count::QuestionCount;
         use crate::calibrate::CalibrateSpec;
         use candle_conversation::projection::{ScanCases, ScanNorm, SystemPromptItem};
@@ -239,11 +240,12 @@ pub(super) mod projection_schema_tests {
             layer("repo_map").groups[0].policy.scan.cases,
             ScanCases::Exchange
         );
-        // Each file's reading is calibrated with the questions it answers,
+        // Each section of a file is calibrated with the questions it answers,
         // each opening the thinking it starts, asked by what was read: a
         // manifest what it declares, a test what it proves, a kernel what it
         // computes, code what it defines and who uses it, a document what it
-        // states — each prompt on its own budget.
+        // states — each prompt on its own budget, per section, and the file's
+        // purpose once per file (docs/placed_section_layout.md §3.5d).
         let calibrate = CalibrateSpec::of(layer("code_reading"))
             .unwrap()
             .expect("code_reading declares a calibration");
@@ -258,26 +260,27 @@ pub(super) mod projection_schema_tests {
             let asks = calibrate
                 .asks_for(subject)
                 .iter()
-                .map(|a| (a.name.clone(), a.questions))
+                .map(|a| (a.name.clone(), a.questions, a.per))
                 .collect::<Vec<_>>();
             (profile.name.clone(), asks)
         };
-        let named = |profile: &str, asks: &[(&str, QuestionCount)]| {
+        let named = |profile: &str, asks: &[(&str, QuestionCount, AskScope)]| {
             (
                 profile.to_string(),
                 asks.iter()
-                    .map(|(n, q)| (n.to_string(), *q))
+                    .map(|(n, q, p)| (n.to_string(), *q, *p))
                     .collect::<Vec<_>>(),
             )
         };
+        let (section, file) = (AskScope::Section, AskScope::File);
         assert_eq!(
             asked("candle/zend/Cargo.toml"),
             named(
                 "manifest",
                 &[
-                    ("dependencies", rule(120, 3, 16)),
-                    ("dependents", rule(400, 1, 8)),
-                    ("purpose", rule(4000, 1, 2)),
+                    ("dependencies", rule(240, 2, 8), section),
+                    ("dependents", rule(800, 1, 4), section),
+                    ("purpose", rule(4000, 1, 2), file),
                 ]
             )
         );
@@ -298,10 +301,10 @@ pub(super) mod projection_schema_tests {
             named(
                 "code",
                 &[
-                    ("definitions", rule(300, 4, 28)),
-                    ("uses", rule(400, 2, 20)),
-                    ("messages", rule(1500, 0, 8)),
-                    ("purpose", rule(3000, 2, 6)),
+                    ("definitions", rule(600, 2, 14), section),
+                    ("uses", rule(800, 1, 10), section),
+                    ("messages", rule(3000, 0, 4), section),
+                    ("purpose", rule(3000, 2, 6), file),
                 ]
             )
         );

@@ -3,7 +3,10 @@
 
 use super::*;
 use crate::files::names::chunk_name;
-use crate::files::{ChunkRecord, FileKey, FileUnit, FilesPin, LineSpan, MemberRef, PlacedFile};
+use crate::files::{
+    ChunkRecord, FileKey, FileUnit, FilesPin, LineSpan, MemberRef, PlacedFile, SectionKey,
+    SectionStanding,
+};
 use crate::persistence::content_hash::ContentHash;
 use crate::persistence::streams::ContentAddress;
 use crate::projection::project::{files_splice, ProjectionSegment, SealedKind};
@@ -71,8 +74,19 @@ fn record(path: &str, spans: &[(u32, u32)]) -> FileRecord {
     }
 }
 
+/// Every section of `file`, of `records`, in line order.
+fn sections_of(records: &[FileRecord], file: FileKey) -> Vec<SectionKey> {
+    records
+        .iter()
+        .find(|r| r.key() == file)
+        .map_or(Vec::new(), FileRecord::section_keys)
+}
+
 /// A resolver holding `records`, every member registered, and a files set
-/// of the readings kind with `momentum`, `placed` the order last placed.
+/// of the readings kind in which every section of each file of `momentum`
+/// stands at its file's momentum — less a thousandth per section after the
+/// first, so a file's sections rank in line order — and `placed`'s files'
+/// sections the order last placed.
 fn resolver(
     b: &Builder,
     records: &[FileRecord],
@@ -93,9 +107,21 @@ fn resolver(
     }
     let mut set = FilesSet::default();
     for &(f, m) in momentum {
-        set.members.insert(f, (m, scopes));
+        for (i, s) in sections_of(records, f).into_iter().enumerate() {
+            let standing = SectionStanding {
+                momentum: m - i as f32 / 1_000.0,
+                kind: scopes,
+                file: f,
+            };
+            set.members.insert(s, standing);
+        }
     }
-    set.set_placed(placed);
+    set.set_placed(
+        placed
+            .into_iter()
+            .flat_map(|f| sections_of(records, f))
+            .collect(),
+    );
     let mut mock = MockResolver::new();
     mock.files = Some(set);
     mock.file_records = records.to_vec();
@@ -186,7 +212,7 @@ fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
         &[(fa.key(), 100.0), (fb.key(), 900.0)],
         vec![],
     );
-    mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key()]);
+    mock.files.as_mut().unwrap().pin = FilesPin::Only(fa.section_keys());
     let splice = files_splice(b.schema(), &mock, |_| 0, true);
     assert_eq!(splice.order(), vec![fa.key()]);
     assert_eq!(
@@ -230,7 +256,8 @@ fn pinned_files_sit_in_the_pins_order() {
         &[(fa.key(), 100.0), (fb.key(), 900.0)],
         vec![],
     );
-    mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key(), fb.key()]);
+    mock.files.as_mut().unwrap().pin =
+        FilesPin::Only([fa.section_keys(), fb.section_keys()].concat());
     let splice = files_splice(b.schema(), &mock, |_| 0, true);
     assert_eq!(splice.order(), vec![fa.key(), fb.key()]);
     let chunk = |path: &str| m[&chunk_name(path, "b", LineSpan { first: 1, last: 10 })];
@@ -288,9 +315,9 @@ layers:
         free.files_placed.is_empty(),
         "no working set: provenance places nothing"
     );
-    mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key()]);
+    mock.files.as_mut().unwrap().pin = FilesPin::Only(fa.section_keys());
     let proj = b.project(target, &mock);
-    assert_eq!(proj.files_order(), vec![fa.key()]);
+    assert_eq!(proj.files_order(), fa.section_keys());
     let first = m[&chunk_name("candle/a.rs", "b", LineSpan { first: 1, last: 10 })];
     let sections: Vec<SectionId> = proj
         .segments
@@ -347,7 +374,38 @@ fn the_mandatory_files_open_a_free_knowledge_base() {
     assert_eq!(on.segments.len(), 3);
     let off = files_splice(b.schema(), &mock, |_| 150, false);
     assert_eq!(off.order(), vec![fa.key()]);
-    mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key()]);
+    mock.files.as_mut().unwrap().pin = FilesPin::Only(fa.section_keys());
     let pinned = files_splice(b.schema(), &mock, |_| 150, true);
     assert_eq!(pinned.order(), vec![fa.key()]);
+}
+
+/// **A file's sections compete apart** (`docs/placed_section_layout.md`
+/// §3.5c): a's first section (900) is placed, b (500) next, and a's second
+/// (100) no longer fits the 200-token cap — the placed runs are a, b, and
+/// each names only what it placed.
+#[test]
+fn a_files_sections_compete_apart() {
+    let b = Builder::from_yaml(YAML).unwrap();
+    let fa = record("candle/a.rs", &[(1, 200), (201, 400)]);
+    let fb = record("candle/b.rs", &[(1, 10)]);
+    let records = [fa.clone(), fb.clone()];
+    let (mut mock, _) = resolver(
+        &b,
+        &records,
+        &[(fa.key(), 900.0), (fb.key(), 500.0)],
+        vec![],
+    );
+    let second = fa.section_key(1);
+    let set = mock.files.as_mut().unwrap();
+    set.members.get_mut(&second).unwrap().momentum = 100.0;
+    let splice = files_splice(b.schema(), &mock, |_| 200, true);
+    assert_eq!(splice.order(), vec![fa.key(), fb.key()]);
+    assert_eq!(splice.sections, vec![fa.section_key(0), fb.section_key(0)]);
+    assert_eq!(
+        splice.placed[0].chunks,
+        vec![LineSpan {
+            first: 1,
+            last: 200
+        }]
+    );
 }

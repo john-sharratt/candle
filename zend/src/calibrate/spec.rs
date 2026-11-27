@@ -37,7 +37,7 @@ use candle_conversation::projection::{Draws, LayerSchema};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use super::ask::{Ask, RawAsk};
+use super::ask::{Ask, AskScope, RawAsk};
 use super::count::QuestionCount;
 use super::profile::{Profile, RawProfile};
 
@@ -159,6 +159,7 @@ impl CalibrateSpec {
                 let ask = Ask::of(RawAsk {
                     name: "guidance".into(),
                     questions: g.questions,
+                    per: AskScope::File,
                     prompt: g.prompt,
                 })
                 .map_err(|why| anyhow::anyhow!("layer '{name}': `calibrate.guidance`: {why}"))?;

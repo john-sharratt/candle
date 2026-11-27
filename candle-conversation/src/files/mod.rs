@@ -20,11 +20,11 @@ pub mod set;
 pub mod stream_name;
 
 pub use chunk::Chunk;
-pub use key::{content_key, ChunkKey, FileKey, LineSpan};
+pub use key::{content_key, ChunkKey, FileKey, LineSpan, SectionKey};
 pub use mandatory::{leaves_room, mandatory_records};
 pub use owner::files_owner;
 pub use placed::PlacedFile;
 pub use record::{path_prefix, ChunkRecord, FileRecord, FileUnit, MemberRef, FILES_PREFIX};
 pub use render::{assemble_pieces, knowledge_text, RenderedFile};
-pub use set::{FilesPin, FilesSet};
+pub use set::{FilesPin, FilesSet, FreshSection, SectionStanding};
 pub use stream_name::{is_member_stream_name, member_stream_name};

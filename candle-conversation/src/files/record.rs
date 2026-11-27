@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::key::{FileKey, LineSpan};
+use super::key::{FileKey, LineSpan, SectionKey};
 use crate::persistence::record::CustomObjectPayload;
 use crate::persistence::streams::ContentAddress;
 
@@ -64,6 +64,18 @@ impl FileRecord {
     /// The file's key.
     pub fn key(&self) -> FileKey {
         FileKey::of(&self.content_key)
+    }
+
+    /// The key of section `i` (`docs/placed_section_layout.md` §3.5c).
+    pub fn section_key(&self, i: usize) -> SectionKey {
+        SectionKey::of(&self.content_key, self.chunks[i].lines)
+    }
+
+    /// Every section's key, in line order.
+    pub fn section_keys(&self) -> Vec<SectionKey> {
+        (0..self.chunks.len())
+            .map(|i| self.section_key(i))
+            .collect()
     }
 
     /// The custom-object key the record is stored under.
@@ -171,6 +183,13 @@ mod tests {
         assert_eq!(FileRecord::from_object(&obj), Some(r.clone()));
         assert_eq!(r.tokens(), 2900 + 700);
         assert_eq!(r.key(), FileKey::of("v1:candle/a.rs@ab12"));
+        assert_eq!(
+            r.section_keys(),
+            vec![
+                SectionKey::of("v1:candle/a.rs@ab12", r.chunks[0].lines),
+                SectionKey::of("v1:candle/a.rs@ab12", r.chunks[1].lines),
+            ]
+        );
     }
 
     /// A tombstone, or another prefix's object, is no record.

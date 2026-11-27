@@ -1,52 +1,34 @@
-//! What of a kind's files a projection places
-//! (`docs/provenance_system_collection.md` §4).
+//! What of a kind's sections a projection places
+//! (`docs/provenance_system_collection.md` §4, `docs/placed_section_layout.md`
+//! §3.5c).
 //!
-//! The kind's files go strongest first under the kind's share of the room. A
-//! file that fits is placed whole — every section; one that does not fit is
-//! placed as many of its leading sections as fit, the file's own opening
-//! first, and the next file is tried in what remains. A file none of whose
-//! sections fit is not placed. Each section carries its own heading and
-//! closing line, so a placed file costs its sections' tokens and nothing more.
+//! The kind's sections go strongest first under the kind's share of the room:
+//! each that fits in what is left is placed, and one that does not is passed
+//! over for the next. A section stands alone — it carries its own heading and
+//! closing line — so a large file no longer places as one block: each of its
+//! sections competes on its own score.
 
-use super::key::FileKey;
-use super::record::FileRecord;
+use super::key::SectionKey;
 
-/// One file as a projection places it: its key and the indices of its
-/// sections placed, in line order.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FilePlacement {
-    pub file: FileKey,
-    pub chunks: Vec<usize>,
-}
-
-/// The files of `ranked` — strongest first, each found in `record_of` — placed
-/// under `cap` tokens.
-pub fn choose<'a>(
-    ranked: &[(FileKey, f32)],
-    record_of: impl Fn(FileKey) -> Option<&'a FileRecord>,
+/// The sections of `ranked` — strongest first, each sized by `tokens_of` —
+/// placed under `cap` tokens, in rank order. A section `tokens_of` does not
+/// know is not placed.
+pub fn choose(
+    ranked: &[(SectionKey, f32)],
+    tokens_of: impl Fn(SectionKey) -> Option<usize>,
     cap: usize,
-) -> Vec<FilePlacement> {
+) -> Vec<SectionKey> {
     let mut left = cap;
     let mut out = Vec::new();
-    for &(file, _) in ranked {
-        let Some(record) = record_of(file) else {
+    for &(section, _) in ranked {
+        let Some(t) = tokens_of(section) else {
             continue;
         };
-        let mut room = left;
-        let mut chunks = Vec::new();
-        for (i, c) in record.chunks.iter().enumerate() {
-            let t = c.member.tokens as usize;
-            if t > room {
-                break;
-            }
-            room -= t;
-            chunks.push(i);
-        }
-        if chunks.is_empty() {
+        if t > left {
             continue;
         }
-        left = room;
-        out.push(FilePlacement { file, chunks });
+        left -= t;
+        out.push(section);
     }
     out
 }
@@ -54,69 +36,29 @@ pub fn choose<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::files::{ChunkRecord, FileUnit, LineSpan, MemberRef};
-    use crate::persistence::content_hash::ContentHash;
-    use crate::persistence::streams::ContentAddress;
 
-    fn member(tokens: u32) -> MemberRef {
-        MemberRef {
-            address: ContentAddress {
-                prefix_hash: ContentHash::ZERO,
-                section_hash: ContentHash::ZERO,
-            },
-            tokens,
-        }
-    }
-
-    fn record(path: &str, chunks: &[u32]) -> FileRecord {
-        FileRecord {
-            content_key: format!("v1:{path}@b"),
-            path: path.into(),
-            blob: "b".into(),
-            unit: FileUnit::File,
-            lines: 1,
-            lang: "rs".into(),
-            branches: vec![],
-            chunks: chunks
-                .iter()
-                .enumerate()
-                .map(|(i, &t)| ChunkRecord {
-                    lines: LineSpan {
-                        first: i as u32 * 200 + 1,
-                        last: i as u32 * 200 + 200,
-                    },
-                    member: member(t),
-                })
-                .collect(),
-        }
-    }
-
-    /// **Strongest first, whole when it fits, its leading sections when it
-    /// does not, and the next file tried in what remains**: under 1,000
-    /// tokens, a (300 + 300) whole; b's first section (200) fits the 400 left
-    /// and its second (400) does not; c (500) no longer fits the 200 left.
+    /// **Strongest first, each section that fits in what is left, one that
+    /// does not passed over for the next**: under 1,000 tokens, a (300) and b
+    /// (400) fit; c (500) does not fit the 300 left and is passed over; d
+    /// (250) fits.
     #[test]
-    fn files_are_placed_strongest_first_whole_or_by_their_leading_sections() {
-        let a = record("a.rs", &[300, 300]);
-        let b = record("b.rs", &[200, 400]);
-        let c = record("c.rs", &[500]);
-        let records = [a.clone(), b.clone(), c.clone()];
-        let ranked = [(a.key(), 900.0), (b.key(), 800.0), (c.key(), 700.0)];
-        let placed = choose(&ranked, |k| records.iter().find(|r| r.key() == k), 1_000);
-        assert_eq!(
-            placed,
-            vec![
-                FilePlacement {
-                    file: a.key(),
-                    chunks: vec![0, 1]
-                },
-                FilePlacement {
-                    file: b.key(),
-                    chunks: vec![0]
-                },
-            ]
-        );
-        assert!(choose(&ranked, |_| None, 1_000).is_empty());
-        assert!(choose(&ranked, |k| records.iter().find(|r| r.key() == k), 12).is_empty());
+    fn sections_are_placed_strongest_first_each_that_fits() {
+        let (a, b, c, d) = (SectionKey(1), SectionKey(2), SectionKey(3), SectionKey(4));
+        let tokens = |s: SectionKey| match s.0 {
+            1 => Some(300),
+            2 => Some(400),
+            3 => Some(500),
+            4 => Some(250),
+            _ => None,
+        };
+        let ranked = [
+            (a, 900.0),
+            (b, 800.0),
+            (c, 700.0),
+            (d, 600.0),
+            (SectionKey(9), 500.0),
+        ];
+        assert_eq!(choose(&ranked, tokens, 1_000), vec![a, b, d]);
+        assert!(choose(&ranked, tokens, 200).is_empty());
     }
 }

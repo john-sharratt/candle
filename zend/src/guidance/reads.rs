@@ -1,7 +1,6 @@
 //! Which file a call read, and the unit that read it at the conversation's
 //! base.
 
-use candle_conversation::files::FileKey;
 use candle_conversation::projection::TimelineId;
 use candle_conversation::ConversationEngine;
 use zend_vfs::{RepoFiles, Workspace};
@@ -51,9 +50,10 @@ pub fn read_path(call: &ToolCall, workspace: &Workspace) -> Option<Read> {
 }
 
 /// The knowledge base's file `read` read, at the version the conversation's
-/// base holds, as the id its calibrations name ([`FileKey::scan_id`]), with
-/// its content key — `None` when the conversation changed the file, or no
-/// record holds that version.
+/// base holds, as the id its calibrations name — its first section's
+/// (`SectionKey::scan_id`), as every prompt of a file as a whole votes
+/// (`docs/placed_section_layout.md` §3.5d) — with its content key. `None`
+/// when the conversation changed the file, or no record holds that version.
 pub fn unit_of(
     engine: &ConversationEngine,
     files: &RepoFiles,
@@ -61,10 +61,11 @@ pub fn unit_of(
 ) -> Option<(TimelineId, String)> {
     let (blob, _) = files.repo(&read.repo).ok()?.content_id(&read.rel).ok()??;
     let key = file_key(&read.path(), &blob);
-    records::of_path(&engine.conversation(), &read.path())
+    let record = records::of_path(&engine.conversation(), &read.path())
         .into_iter()
         .find(|r| r.content_key == key)?;
-    Some((FileKey::of(&key).scan_id(), key))
+    let first = record.section_keys().into_iter().next()?;
+    Some((first.scan_id(), key))
 }
 
 #[cfg(test)]

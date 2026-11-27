@@ -1,46 +1,67 @@
-//! The knowledge base's files placed into the system prompt
-//! (`docs/provenance_system_collection.md` §3, §4).
+//! The knowledge base's sections placed into the system prompt
+//! (`docs/provenance_system_collection.md` §3, §4;
+//! `docs/placed_section_layout.md` §3.5c).
 //!
-//! Each kind's files are chosen under the kind's share of the room
-//! ([`choose`]), strongest first. The files of every kind then sit in the
+//! Each kind's sections are chosen under the kind's share of the room
+//! ([`choose`]), strongest first. The sections of every kind then sit in the
 //! order the conversation's files set keeps: at the opening strongest first,
-//! afterwards every kept file where it was and every newcomer after them. Each
-//! file is its placed sections in line order; every section carries its own
-//! heading, closing line and, short of the file's end, the cut marker
-//! (`docs/placed_section_layout.md` §3.5c), so nothing is placed between them.
+//! afterwards every kept section where it was and every newcomer after them.
+//! Every section carries its own heading, closing line and, short of its
+//! file's end, the cut marker, so nothing is placed between them.
 //!
 //! A free knowledge base the seed dial leaves on opens on the mandatory files
-//! (§3.5b), whole and ahead of the chosen ones, outside every kind's cap; a
-//! pinned one holds its pin alone.
+//! (§3.5b), whole and ahead of the chosen sections, outside every kind's cap;
+//! a pinned one holds its pin alone.
 
 use std::collections::HashSet;
 
 use super::*;
-use crate::files::fill::{choose, FilePlacement};
+use crate::files::fill::choose;
 use crate::files::names::chunk_name;
-use crate::files::{mandatory_records, FileKey, FileRecord, FilesPin, LineSpan, PlacedFile};
+use crate::files::{
+    mandatory_records, FileKey, FileRecord, FilesPin, LineSpan, PlacedFile, SectionKey,
+};
 
-/// The files a projection places and the segments they are placed as.
+/// The sections a projection places and the segments they are placed as.
 pub(crate) struct FilesSplice {
-    /// The placed files, in the order they sit, each with its placed chunks'
-    /// lines.
+    /// The placed sections as runs of one file's, in the order they sit,
+    /// each run with its sections' lines.
     pub placed: Vec<PlacedFile>,
+    /// The placed sections, in the order they sit.
+    pub sections: Vec<SectionKey>,
     pub segments: Vec<ProjectionSegment>,
 }
 
 #[cfg(test)]
 impl FilesSplice {
-    /// The placed files' keys, in the order they sit.
+    /// The placed runs' files, in the order they sit.
     pub(crate) fn order(&self) -> Vec<FileKey> {
         self.placed.iter().map(|p| p.file).collect()
     }
 }
 
-/// The files to place under `kind_cap` — each working-set group of `schema`
-/// a kind, its cap the tokens its share allows — and the segments they are
-/// placed as; with `mandatory`, a free knowledge base opens on the mandatory
-/// files whole (`files::mandatory`), outside every cap. Empty when the target
-/// has no files set, or no file's members are held in this process.
+/// `sections`, in the order they sit, as runs of one file's: a file's
+/// sections placed one after another are one run.
+fn runs(sections: &[(FileKey, LineSpan)]) -> Vec<PlacedFile> {
+    let mut out: Vec<PlacedFile> = Vec::new();
+    for &(file, lines) in sections {
+        match out.last_mut() {
+            Some(run) if run.file == file => run.chunks.push(lines),
+            _ => out.push(PlacedFile {
+                file,
+                chunks: vec![lines],
+            }),
+        }
+    }
+    out
+}
+
+/// The sections to place under `kind_cap` — each working-set group of
+/// `schema` a kind, its cap the tokens its share allows — and the segments
+/// they are placed as; with `mandatory`, a free knowledge base opens on the
+/// mandatory files whole (`files::mandatory`), outside every cap. Empty when
+/// the target has no files set; a section whose member this process does not
+/// hold is left out.
 pub(crate) fn files_splice<R: ContentResolver>(
     schema: &Schema,
     resolver: &R,
@@ -50,37 +71,34 @@ pub(crate) fn files_splice<R: ContentResolver>(
     let Some(set) = resolver.files_set() else {
         return FilesSplice {
             placed: Vec::new(),
+            sections: Vec::new(),
             segments: Vec::new(),
         };
     };
     let all = resolver.files_records();
-    let records: HashMap<FileKey, &FileRecord> = all.iter().map(|r| (r.key(), r)).collect();
-    // Each kind's choice, then every chosen file ranked by its momentum — or,
-    // pinned, the pinned files whole, in the pin's order, or nothing.
-    let mut chosen: Vec<(FilePlacement, f32)> = Vec::new();
+    // Every section of every record: its record and its place in it.
+    let index: HashMap<SectionKey, (&FileRecord, usize)> = all
+        .iter()
+        .flat_map(|r| (0..r.chunks.len()).map(move |i| (r.section_key(i), (r, i))))
+        .collect();
+    // The mandatory files' sections, in line order, then each kind's choice
+    // ranked by momentum — or, pinned, the pinned sections in the pin's
+    // order, or nothing.
+    let mut chosen: Vec<SectionKey> = Vec::new();
     match &set.pin {
         FilesPin::Empty => {}
-        FilesPin::Only(files) => {
-            for &file in files {
-                if let Some(record) = records.get(&file) {
-                    let chunks = (0..record.chunks.len()).collect();
-                    chosen.push((FilePlacement { file, chunks }, 0.0));
-                }
-            }
-        }
+        FilesPin::Only(sections) => chosen.extend(sections.iter().copied()),
         FilesPin::Free => {
-            // The mandatory files first, whole, ahead of every chosen one; a
-            // path they hold is no candidate of any kind.
             let paths = match mandatory {
                 true => resolver.files_mandatory(),
                 false => Vec::new(),
             };
             for record in mandatory_records(&all, &paths) {
-                let chunks = (0..record.chunks.len()).collect();
-                let file = record.key();
-                chosen.push((FilePlacement { file, chunks }, f32::INFINITY));
+                chosen.extend(record.section_keys());
             }
+            // A path the mandatory files hold is no candidate of any kind.
             let held: HashSet<&str> = paths.iter().map(String::as_str).collect();
+            let mut picked: Vec<(SectionKey, f32)> = Vec::new();
             for group in schema
                 .layers
                 .iter()
@@ -90,61 +108,50 @@ pub(crate) fn files_splice<R: ContentResolver>(
                 let SelectionRule::WorkingSet { share } = group.selection else {
                     continue;
                 };
-                let ranked: Vec<(FileKey, f32)> = set
+                let ranked: Vec<(SectionKey, f32)> = set
                     .ranked(group.id)
                     .into_iter()
                     .filter(|(k, _)| {
-                        records
+                        index
                             .get(k)
-                            .is_none_or(|r| !held.contains(r.path.as_str()))
+                            .is_some_and(|(r, _)| !held.contains(r.path.as_str()))
                     })
                     .collect();
-                let momentum: HashMap<FileKey, f32> = ranked.iter().copied().collect();
-                for p in choose(&ranked, |k| records.get(&k).copied(), kind_cap(share)) {
-                    let m = momentum.get(&p.file).copied().unwrap_or(0.0);
-                    chosen.push((p, m));
+                let momentum: HashMap<SectionKey, f32> = ranked.iter().copied().collect();
+                let tokens_of = |k: SectionKey| {
+                    index
+                        .get(&k)
+                        .map(|(r, i)| r.chunks[*i].member.tokens as usize)
+                };
+                for s in choose(&ranked, tokens_of, kind_cap(share)) {
+                    picked.push((s, momentum.get(&s).copied().unwrap_or(0.0)));
                 }
             }
-            chosen.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.file.cmp(&b.0.file)));
+            picked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            chosen.extend(picked.into_iter().map(|(s, _)| s));
         }
     }
-    let keys: Vec<FileKey> = chosen.iter().map(|(p, _)| p.file).collect();
-    let order = set.order(&keys);
-    let placement: HashMap<FileKey, &FilePlacement> =
-        chosen.iter().map(|(p, _)| (p.file, p)).collect();
-    // Every file whose members this process holds, its placed sections' lines
-    // and ids resolved; a file with any member missing is not placed.
-    let resolved: Vec<(FileKey, Vec<(LineSpan, SectionId)>)> = order
-        .iter()
-        .filter_map(|file| {
-            let record = records.get(file)?;
-            let p = placement.get(file)?;
-            let chunks = p
-                .chunks
-                .iter()
-                .map(|&c| {
-                    let lines = record.chunks[c].lines;
-                    resolver
-                        .member_section(&chunk_name(&record.path, &record.blob, lines))
-                        .map(|id| (lines, id))
-                })
-                .collect::<Option<Vec<_>>>()?;
-            Some((*file, chunks))
+    // Each section in the order it sits, its member resolved; one this
+    // process does not hold is not placed.
+    let resolved: Vec<(SectionKey, FileKey, LineSpan, SectionId)> = set
+        .order(&chosen)
+        .into_iter()
+        .filter_map(|key| {
+            let &(record, i) = index.get(&key)?;
+            let lines = record.chunks[i].lines;
+            let id = resolver.member_section(&chunk_name(&record.path, &record.blob, lines))?;
+            Some((key, record.key(), lines, id))
         })
         .collect();
-    let segments = resolved
-        .iter()
-        .flat_map(|(_, chunks)| chunks.iter())
-        .map(|&(_, id)| ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(id))))
-        .collect();
+    let spans: Vec<(FileKey, LineSpan)> = resolved.iter().map(|&(_, f, l, _)| (f, l)).collect();
     FilesSplice {
-        placed: resolved
-            .into_iter()
-            .map(|(file, chunks)| PlacedFile {
-                file,
-                chunks: chunks.into_iter().map(|(lines, _)| lines).collect(),
+        placed: runs(&spans),
+        sections: resolved.iter().map(|&(k, ..)| k).collect(),
+        segments: resolved
+            .iter()
+            .map(|&(.., id)| {
+                ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(id)))
             })
             .collect(),
-        segments,
     }
 }

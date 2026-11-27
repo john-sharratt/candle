@@ -90,6 +90,45 @@ pub struct ChunkKey {
     pub lines: LineSpan,
 }
 
+/// A section of a file of the knowledge base — the unit provenance scores, a
+/// calibration votes for and the fill places (`docs/placed_section_layout.md`
+/// §3.5c): the first 8 bytes of [`hash_bytes`] over `{content key}#{first}-
+/// {last}`, read little-endian, as [`FileKey`] is over the content key alone.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SectionKey(pub u64);
+
+impl SectionKey {
+    /// The key of the section holding `lines` of the file whose content key
+    /// is `content_key`.
+    pub fn of(content_key: &str, lines: LineSpan) -> SectionKey {
+        let name = format!("{content_key}#{}-{}", lines.first, lines.last);
+        SectionKey(FileKey::of(&name).0)
+    }
+
+    /// The key as 16 lower-case hex digits, zero-padded.
+    pub fn hex(self) -> String {
+        format!("{:016x}", self.0)
+    }
+
+    /// The section as the id the scan and the calibration index name it by:
+    /// its key as the raw id, never the reserved 0.
+    pub fn scan_id(self) -> TimelineId {
+        TimelineId::from_raw(self.0.max(1)).expect("an id made with max(1) is never the reserved 0")
+    }
+
+    /// The section a [`SectionKey::scan_id`] names.
+    pub fn of_scan_id(id: TimelineId) -> SectionKey {
+        SectionKey(id.raw())
+    }
+}
+
+impl fmt::Display for SectionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.hex())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +166,22 @@ mod tests {
         let k = FileKey(0x473e_088d_5653_2900);
         assert_eq!(k.scan_id().raw(), 0x473e_088d_5653_2900);
         assert_eq!(FileKey::of_scan_id(k.scan_id()), k);
+    }
+
+    /// **A section's key is the digest of its file's content key and its
+    /// lines**, pinned as a number; its scan id names it back.
+    #[test]
+    fn a_section_key_is_the_digest_of_its_file_and_lines() {
+        let key = content_key(1, "candle/zend/src/ingest_lease.rs", "3f2a9c");
+        let lines = LineSpan {
+            first: 201,
+            last: 400,
+        };
+        let s = SectionKey::of(&key, lines);
+        assert_eq!(s.0, FileKey::of(&format!("{key}#201-400")).0);
+        assert_ne!(s.0, FileKey::of(&key).0);
+        assert_eq!(SectionKey::of_scan_id(s.scan_id()), s);
+        assert_eq!(s.hex().len(), 16);
     }
 
     #[test]

@@ -24,23 +24,23 @@ use std::collections::{HashMap, HashSet};
 
 use candle_conversation::projection::TimelineId;
 
-use super::kb_frame::KbFrame;
-
-/// A unit of the layer: one file of the knowledge base asked behind one
-/// frame — the id its calibrations name it by, what it is of, the marker its
-/// calibration carries, and whether it can be calibrated now: recorded, its
-/// members sealed in this process.
+/// A unit of the layer: one section of a file of the knowledge base — the id
+/// its calibrations name it by, what it is of, the marker its calibration
+/// carries, and whether it can be calibrated now: recorded, its members
+/// sealed in this process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unit {
-    /// The file's scan id (`FileKey::scan_id`), which its calibrations name.
+    /// The section's scan id (`SectionKey::scan_id`), which its calibrations
+    /// name.
     pub timeline: TimelineId,
     pub subject: String,
-    /// What the unit is, whatever it is asked: `{frame}:{content key}`, so
-    /// each frame's calibration stands and is replaced on its own.
+    /// What the unit is, whatever it is asked: `{content key}#{first}-{last}`,
+    /// so each section's calibration stands and is replaced on its own.
     pub key: String,
     /// The file's content key.
     pub content_key: String,
-    pub frame: KbFrame,
+    /// Which section of the file, from 0.
+    pub section: usize,
     pub marker: String,
     pub ready: bool,
     /// What its calibration's failures have recorded, if any.
@@ -134,7 +134,7 @@ mod tests {
             subject: format!("s{raw}"),
             key: marker[..1].into(),
             content_key: marker[..1].into(),
-            frame: KbFrame::Empty,
+            section: 0,
             marker: marker.into(),
             ready: true,
             prior_failures: None,
