@@ -37,8 +37,9 @@ use agent::checkouts::Checkouts;
 use agent::config::{AgentConfig, CheckoutConfig, SweepConfig, BUILD_HOLD_MINS};
 use agent::jobs::Jobs;
 use candle::Device;
+use candle_conversation::models::identity::rope_key;
 use candle_conversation::models::Model;
-use candle_conversation::persistence::content_hash::ContentHash;
+use candle_conversation::persistence::content_hash::{hash_bytes, ContentHash};
 use candle_conversation::persistence::log_file::FILE_FORMAT_VERSION;
 use candle_conversation::persistence::record::SnapshotPayload;
 use candle_conversation::persistence::SUBSTRATE_DIR;
@@ -338,8 +339,8 @@ impl Default for Workspace {
 // ── The production-model workspace ───────────────────────────────────────────
 
 /// The workspace every production-model daemon test boots on:
-/// `target/tmp/zend_production_ws_log_v<format>` ([`kept_workspace`]), one
-/// directory shared by every test binary.
+/// `target/tmp/zend_production_ws_log_v<format>_<model>` ([`kept_workspace`]),
+/// one directory shared by every test binary.
 ///
 /// **Never the source tree.** A daemon writes its substrate, logs and uploads
 /// into its workspace. Booting on the repo root writes into the user's live
@@ -352,20 +353,29 @@ impl Default for Workspace {
 /// every later boot resumes it. A workspace admits one daemon at a time, which
 /// these `#[ignore]`d tests honour by being run by name, one at a time.
 pub fn production_workspace() -> PathBuf {
-    kept_workspace("zend_production_ws")
+    kept_workspace("zend_production_ws", zend::model::MODEL)
 }
 
-/// A workspace kept under `target/tmp` between runs, its directory named for
-/// the redo-log format its substrate is written in.
+/// A workspace kept under `target/tmp` between runs for `model`, its
+/// directory named for the redo-log format its substrate is written in and for
+/// the parts of the model's identity the code decides.
 ///
 /// A kept workspace outlives the build that wrote it, and a daemon refuses a
-/// log in any format but its own — there is no migration. Keyed by
-/// [`FILE_FORMAT_VERSION`], a format bump starts a fresh workspace (calibration
-/// paid once more) instead of booting into a substrate the daemon will not
-/// open, which exits the test process before any assertion runs.
-pub fn kept_workspace(name: &str) -> PathBuf {
+/// log in any format but its own, or one bound to another model — there is no
+/// migration, and the refusal exits the test process before any assertion
+/// runs. A checkpoint's weights and vocabulary are its file's, but its
+/// architecture's name and its RoPE schedule's key ([`rope_key`]) are this
+/// build's: the schedule's key dropped its `min=` factor on 2026-11-13, and
+/// every kept substrate then belonged to a model no build ran. So the
+/// directory is keyed by [`FILE_FORMAT_VERSION`] and a digest of those two,
+/// and either changing starts a fresh workspace (calibration paid once more).
+pub fn kept_workspace(name: &str, model: Model) -> PathBuf {
+    let spec = model.spec();
+    let identity = format!("{:?}\n{}", spec.arch, rope_key(&spec.rope));
+    let tag = hash_bytes(identity.as_bytes()).to_bytes();
+    let tag: String = tag[..4].iter().map(|b| format!("{b:02x}")).collect();
     let ws = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("{name}_log_v{FILE_FORMAT_VERSION}"));
+        .join(format!("{name}_log_v{FILE_FORMAT_VERSION}_{tag}"));
     std::fs::create_dir_all(&ws).expect("create the kept workspace");
     ws
 }

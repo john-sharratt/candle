@@ -91,7 +91,7 @@ pub fn run_arm(arm: &Arm) {
 /// The arm's workspace, holding the files the script reads in its one
 /// repository.
 fn workspace(arm: &Arm) -> PathBuf {
-    let ws = kept_workspace(arm.workspace);
+    let ws = kept_workspace(arm.workspace, arm.model.clone());
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("zend sits inside the repo");

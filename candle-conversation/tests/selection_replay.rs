@@ -22,19 +22,21 @@
 //!   doc-comment and README.)
 //! - **Guards**: tool selection already works; it must stay working through
 //!   every scoring change.
-//! - **Design acceptance** (GREEN under the shipped pipeline): the formerly-red
-//!   TDD targets of `docs/provenance_adaptive_projection.md`, asserted through
-//!   the production content-axis chain (content-gated fusion + traffic-peak
-//!   normalization + question/tail max-fusion + ungated mass).
+//! - **Design acceptance**: the formerly-red TDD targets of
+//!   `docs/provenance_adaptive_projection.md`, asserted through the code-reading
+//!   scopes group's scan as the daemon runs it (a file one case, the top-8
+//!   square-rooted vote law, each file read among its own kind, question/tail
+//!   max-fusion), and the attention mass on the ungated additive sum.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use candle_conversation::normalization::{ChildKey, NormConfig, NormalizationCache, ScopeKey};
+use candle_conversation::normalization::{kind_z_band, path_kind};
 use candle_conversation::projection::{attention_mass, decode_events, ProjectionEvent};
 use candle_conversation::provenance::{
-    decode_wide_sigs, score_slots, score_slots_fused, score_slots_grouped, FusionMode, WideQSig,
+    decode_wide_sigs, score_slots, score_slots_grouped, score_slots_law, FusionMode, VoteLaw,
+    WideQSig,
 };
 use serde_json::Value;
 
@@ -367,129 +369,77 @@ fn calculator_probe_ranks_calculator_top1() {
     );
 }
 
-// ── Design acceptance — content_gated on the FIXTURE (NOT the live ship path) ─
+// ── Design acceptance — the production code-reading scan ─────────────────────
 //
-// IMPORTANT (2026-08-03): these assert the content_gated pipeline on the
-// CURATED fixture, where it ranks the right targets #1. LIVE testing showed
-// content_gated ZEROS natural-language→code retrieval (the call↔def domain
-// gap: an NL decode-Q agrees with prose, not source), so the shipped config
-// reverted the content axes to ADDITIVE. These tests therefore verify the
-// content_gated MECHANISM, not what the daemon ships — the fixture's
-// self-matching stored-sig probes are exactly the unrepresentative case that
-// let content_gated pass here while failing live. Kept as mechanism-regression
-// coverage; do not read them as production behaviour.
+// Formerly the RED TDD targets of `docs/provenance_adaptive_projection.md`,
+// asserted through the code-reading scopes group's scan as the daemon runs it
+// (`zend/src/prompts/projection.yaml`, the `scopes` group;
+// `projection/resolver/belief_files_kinds.rs`): each file one case, every
+// window of it in that case (`cases: file`); additive fusion; each probe token
+// voting for its best 8 files with every kept vote square-rooted
+// (`vote_top_k: 8`, `vote_power: 0.5`); each file read as a z-score among the
+// scoring files of its own kind on the probe (`normalize: kind_z`); and the
+// pinned question's scan max-fused with the tail's (`question_pin`; the
+// question window is the head-64 approximation, see F11). Any change to that
+// chain that breaks these breaks the design's headline behavior.
 
-//
-// Formerly the RED TDD targets of `docs/provenance_adaptive_projection.md`;
-// they now run the PRODUCTION content-axis pipeline — `score_slots_fused` with
-// content-gated fusion (Concept G), the production `NormalizationCache` warmed
-// by the captured conversation's own seal-order observes (Concept A), and the
-// pinned-question + tail max-fusion (Concept F; the Q-window is the head-64
-// approximation, see F11) — and assert the design's ideal outcomes from
-// `ideal_projections.json`. Any scoring change that breaks these breaks the
-// design's headline behavior.
+/// The vote law the code-reading scopes group scans with.
+const SCOPES_LAW: VoteLaw = VoteLaw {
+    top_k: 8,
+    power: 0.5,
+};
 
-/// The production content-axis scoring chain over fixture slots, exactly as
-/// the daemon composes it (the R5-measured configuration, results doc §25):
-/// per-window content-gated grouped scan (`score_slots_fused`) → background
-/// normalization learned from the captured dialogue's seal-order observes →
-/// per-slot max of the question and tail windows. Returns
-/// `(normalized_fused, raw_tail)` — mass (Concept B) keys on the raw tail.
-fn production_pipeline_scores(
-    f: &'static Fixture,
-    slots: &[(String, Vec<&[WideQSig]>)],
-    tl: u64,
-    idx: u64,
-) -> (Vec<f32>, Vec<f32>) {
-    let scan = |probe: &[WideQSig]| -> Vec<f32> {
-        let mut windows: Vec<&[WideQSig]> = Vec::new();
-        let mut slot_of: Vec<usize> = Vec::new();
-        for (i, (_, wins)) in slots.iter().enumerate() {
-            for w in wins {
-                windows.push(w);
-                slot_of.push(i);
-            }
-        }
-        score_slots_fused(
-            probe,
-            &windows,
-            &slot_of,
-            slots.len(),
-            &[],
-            FusionMode::ContentGated { gate_group: 0 },
-        )
-    };
-    // Backgrounds: the captured dialogue turns' seal-order observes — gated-
-    // fusion groups skip the self-match warm and learn from traffic alone, a
-    // live turn about no known slot. CAUSAL: the probed turn itself is
-    // excluded — live, a turn's seal observe fires AFTER the selections it is
-    // being scored for.
-    let scope = ScopeKey::turn_group(0, 0);
-    let cache = NormalizationCache::new(NormConfig::default());
-    let mut dialogue: Vec<(u64, u64)> = f.events.keys().copied().collect();
-    dialogue.sort_unstable();
-    for (dtl, didx) in dialogue {
-        if (dtl, didx) == (tl, idx) {
-            continue;
-        }
-        let probe = f.probe(dtl, didx);
-        let raw = scan(&probe);
-        let pairs: Vec<(ChildKey, f32)> = slots
-            .iter()
-            .zip(&raw)
-            .map(|((name, _), &v)| (ChildKey::named(name.clone()), v))
-            .collect();
-        // Each dialogue turn is its own piece of evidence; `observe` folds a
-        // given source once.
-        cache.observe(&scope, (dtl << 32) ^ didx, &pairs, None, probe.len());
-    }
-    // Each scan is normalized on the length of the probe that produced it. A raw
-    // score is a SUM over probe tokens and these two probes differ by ~4x (a
-    // capped tail against the head-64 question window), so without this the
-    // max-fusion below compares window sizes rather than evidence.
-    let normalize = |raw: &[f32], probe_tokens: usize| -> Vec<f32> {
-        let pairs: Vec<(ChildKey, f32)> = slots
-            .iter()
-            .zip(raw)
-            .map(|((name, _), &v)| (ChildKey::named(name.clone()), v))
-            .collect();
-        cache
-            .normalize(&scope, &pairs, probe_tokens)
-            .into_iter()
-            .map(|(_, v)| v)
-            .collect()
-    };
-    let all = f.sig(tl, idx);
-    let q_window = &all[..64.min(all.len())];
-    let tail_probe = f.probe(tl, idx);
-    let raw_tail = scan(&tail_probe);
-    let tail = normalize(&raw_tail, tail_probe.len());
-    let question = normalize(&scan(q_window), q_window.len());
-    let fused = tail.iter().zip(&question).map(|(t, q)| t.max(*q)).collect();
+/// One case of a competition: its name, its kind (the extension `kind_z`
+/// reads it among), and every gallery window it holds.
+type Case = (String, String, Vec<&'static [WideQSig]>);
 
-    // Mass base: the UNGATED additive group sum of the tail scan — the gate
-    // removes the concentrated spike mass must see.
+/// The production code-reading scan of `cases` for dialogue turn `(tl, idx)`:
+/// the tail and the question window each scanned under [`SCOPES_LAW`], each
+/// read as its kind's z-score on the band, and the larger of the two per case.
+fn production_pipeline_scores(f: &'static Fixture, cases: &[Case], tl: u64, idx: u64) -> Vec<f32> {
     let mut windows: Vec<&[WideQSig]> = Vec::new();
-    let mut slot_of: Vec<usize> = Vec::new();
-    for (i, (_, wins)) in slots.iter().enumerate() {
+    let mut case_of: Vec<usize> = Vec::new();
+    for (i, (_, _, wins)) in cases.iter().enumerate() {
         for w in wins {
             windows.push(w);
-            slot_of.push(i);
+            case_of.push(i);
         }
     }
-    let grouped = score_slots_grouped(&f.probe(tl, idx), &windows, &slot_of, slots.len(), &[]);
-    let mass_base = if grouped.is_empty() {
-        vec![0.0; slots.len()]
-    } else {
-        FusionMode::Additive.fuse(&grouped)
+    let kinds: Vec<&str> = cases.iter().map(|(_, k, _)| k.as_str()).collect();
+    let scan = |probe: &[WideQSig]| -> Vec<f32> {
+        let raw = score_slots_law(probe, &windows, &case_of, cases.len(), &[], SCOPES_LAW);
+        kind_z_band(&raw, &kinds)
     };
-    (fused, mass_base)
+    let all = f.sig(tl, idx);
+    let tail = scan(&f.probe(tl, idx));
+    let question = scan(&all[..64.min(all.len())]);
+    tail.iter().zip(&question).map(|(t, q)| t.max(*q)).collect()
 }
 
-fn ranked_by(slots: &[(String, Vec<&[WideQSig]>)], scores: &[f32]) -> Vec<(String, f32)> {
-    let mut out: Vec<(String, f32)> = slots
+/// The code candidates the recorded projections selected, each file one case
+/// holding every exchange of it — `except` a path left out.
+fn file_cases(f: &'static Fixture, except: Option<&str>) -> Vec<Case> {
+    let mut by_path: BTreeMap<String, Vec<&'static [WideQSig]>> = BTreeMap::new();
+    for c in f.code_candidates(except) {
+        let path = c.tags.get(1).cloned().unwrap_or_default();
+        by_path
+            .entry(path)
+            .or_default()
+            .push(f.sig(c.timeline, c.index));
+    }
+    by_path
+        .into_iter()
+        .map(|(path, wins)| {
+            let kind = path_kind(&path).to_string();
+            (path, kind, wins)
+        })
+        .collect()
+}
+
+fn ranked_by(cases: &[Case], scores: &[f32]) -> Vec<(String, f32)> {
+    let mut out: Vec<(String, f32)> = cases
         .iter()
-        .map(|(n, _)| n.clone())
+        .map(|(n, _, _)| n.clone())
         .zip(scores.iter().copied())
         .collect();
     out.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -501,40 +451,24 @@ fn ranked_by(slots: &[(String, Vec<&[WideQSig]>)], scores: &[f32]) -> Vec<(Strin
 #[test]
 fn modelbuilder_probe_ranks_builder_rs_over_observed_junk() {
     let Some(f) = fixture() else { return };
-    let mut slots: Vec<(String, Vec<&[WideQSig]>)> = f.targets["models/builder.rs"]
+    let builder: Vec<&'static [WideQSig]> = f.targets["models/builder.rs"]
         .iter()
-        .map(|t| {
-            (
-                format!("builder.rs#{}", t.index),
-                vec![f.sig(t.timeline, t.index)],
-            )
-        })
+        .map(|t| f.sig(t.timeline, t.index))
         .collect();
-    for c in f.code_candidates(Some("models/builder.rs")) {
-        let path = c.tags.get(1).map(String::as_str).unwrap_or_default();
-        slots.push((
-            format!("{path}#{}", c.index),
-            vec![f.sig(c.timeline, c.index)],
-        ));
-    }
-    let (fused, _) = production_pipeline_scores(f, &slots, TOUR_TL, 5);
-    let ranked = ranked_by(&slots, &fused);
-    let best = ranked
+    let mut cases: Vec<Case> = vec![("models/builder.rs".into(), "rs".into(), builder)];
+    cases.extend(file_cases(f, Some("models/builder.rs")));
+    let ranked = ranked_by(&cases, &production_pipeline_scores(f, &cases, TOUR_TL, 5));
+    let rank = ranked
         .iter()
-        .position(|(l, _)| l.starts_with("builder.rs"))
+        .position(|(l, _)| l == "models/builder.rs")
         .map(|p| p + 1)
         .unwrap_or(usize::MAX);
-    // The selection-level criterion: the scopes group selects `top_k k=4`, and
-    // Concept D anchors the file header alongside any selected exchange — so
-    // builder.rs inside the top 3 means the definition AND its header are
-    // PROJECTED (live today it was absent entirely: "no codebase context").
-    // Strict rank-1 over every observed junk scope is not required for the
-    // model to see the file; the two slots measured above it are same-repo
-    // test fixtures that genuinely share the probe's vocabulary.
+    // The selection-level criterion: the scopes group places what it ranks
+    // highest, so builder.rs inside the top 3 is projected (live on 2026-08-02
+    // it was absent entirely: "no codebase context").
     assert!(
-        best <= 3,
-        "a builder.rs exchange must land inside the production selection budget \
-         (top_k 4 with an anchor slot); got rank {best}: {:?}",
+        rank <= 3,
+        "models/builder.rs must land inside the production selection; got rank {rank}: {:?}",
         &ranked[..5.min(ranked.len())]
     );
 }
@@ -543,7 +477,7 @@ fn modelbuilder_probe_ranks_builder_rs_over_observed_junk() {
 #[test]
 fn tour_probe_ranks_structure_over_scopes() {
     let Some(f) = fixture() else { return };
-    let mut slots: Vec<(String, Vec<&[WideQSig]>)> = f.targets["repo_map"]
+    let mut cases: Vec<Case> = f.targets["repo_map"]
         .iter()
         .map(|t| {
             (
@@ -552,25 +486,43 @@ fn tour_probe_ranks_structure_over_scopes() {
                     t.tags.get(1).map(String::as_str).unwrap_or("?"),
                     t.index
                 ),
+                String::new(),
                 vec![f.sig(t.timeline, t.index)],
             )
         })
         .collect();
-    for c in f.code_candidates(None) {
-        let path = c.tags.get(1).map(String::as_str).unwrap_or_default();
-        slots.push((
-            format!("{path}#{}", c.index),
-            vec![f.sig(c.timeline, c.index)],
-        ));
-    }
-    let (fused, _) = production_pipeline_scores(f, &slots, TOUR_TL, 0);
-    let ranked = ranked_by(&slots, &fused);
+    cases.extend(file_cases(f, None));
+    let ranked = ranked_by(&cases, &production_pipeline_scores(f, &cases, TOUR_TL, 0));
     assert!(
         ranked[0].0.starts_with("cluster:"),
         "a codebase-tour probe must rank repository structure over any single \
          file scope under the production pipeline; got {:?}",
         &ranked[..5.min(ranked.len())]
     );
+}
+
+/// The ungated additive group sum of the tail scan of `(tl, idx)` over
+/// `slots`: what the attention mass (Concept B) keys on.
+fn mass_base(
+    f: &'static Fixture,
+    slots: &[(String, Vec<&[WideQSig]>)],
+    tl: u64,
+    idx: u64,
+) -> Vec<f32> {
+    let mut windows: Vec<&[WideQSig]> = Vec::new();
+    let mut slot_of: Vec<usize> = Vec::new();
+    for (i, (_, wins)) in slots.iter().enumerate() {
+        for w in wins {
+            windows.push(w);
+            slot_of.push(i);
+        }
+    }
+    let grouped = score_slots_grouped(&f.probe(tl, idx), &windows, &slot_of, slots.len(), &[]);
+    if grouped.is_empty() {
+        vec![0.0; slots.len()]
+    } else {
+        FusionMode::Additive.fuse(&grouped)
+    }
 }
 
 /// A pure history question must carry (relatively) no code attention: the same
@@ -592,8 +544,7 @@ fn recall_probe_code_mass_collapses_relative_to_code_probe() {
     // Mass keys on the UNGATED additive tail scan with the shipped constants
     // (k = 1, ρ = 2 — the top-1-share² concentration).
     let mass = |idx: u64| -> f32 {
-        let (_, mass_base) = production_pipeline_scores(f, &slots, TOUR_TL, idx);
-        attention_mass(&mass_base, 0.0, f32::MAX, 1, 2.0)
+        attention_mass(&mass_base(f, &slots, TOUR_TL, idx), 0.0, f32::MAX, 1, 2.0)
     };
     let recall = mass(6);
     let code = mass(5);
