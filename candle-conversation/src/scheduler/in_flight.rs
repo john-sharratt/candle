@@ -147,15 +147,10 @@ pub(crate) enum SealAction {
         debug_name: String,
         /// Propagated from `SchedulerRequest::IngestSection` — `true`
         /// when this section is a schema-Collection member (a tool in
-        /// the tool catalog, an entry in a hits list, etc.), `false`
-        /// for boundary sections (role markers, opening / closing
-        /// tags).  Drives section-quantize policy selection: members
-        /// use the turn-level adaptive policy (much smaller VRAM at a
-        /// small precision cost — top-k projection masks the
-        /// per-member noise anyway); boundary sections use the
-        /// near-lossless C0 / Q8_KS / Q8_0 policy because every
-        /// later token of every later turn attends back over them.
-        in_collection: bool,
+        /// the tool catalog, an entry in a hits list, etc.) at its
+        /// collection's level, or a boundary section (role markers,
+        /// opening / closing tags) near-lossless — see [`SectionSeal`].
+        seal: SectionSeal,
     },
     /// Skip the seal entirely.  Used by raw RULER eval and
     /// summarisation paths that don't write to the substrate.
@@ -211,15 +206,9 @@ pub(super) struct PendingSectionQuantize {
     /// a drain takes only the sealing substrate's entries.
     pub(super) substrate: SubstrateRef,
     pub(super) section_id: SectionId,
-    /// Propagated from `SealAction::Section::in_collection` — drives
-    /// the drain's choice of compression policy.  Collection members
-    /// (tools in a tool catalog, hits in a retrieval list, etc.) take
-    /// the turn-level adaptive policy because the projection's top-k
-    /// already masks their per-member K/V noise; boundary sections
-    /// (role markers, opening/closing tags) take the conservative
-    /// near-lossless policy because every later token attends back
-    /// over them.
-    pub(super) in_collection: bool,
+    /// Propagated from `SealAction::Section::seal` — the policy the drain
+    /// quantizes the section under ([`SectionSeal::policy`]).
+    pub(super) seal: SectionSeal,
 }
 
 /// A unit of prefill work queued for processing.
@@ -405,7 +394,7 @@ pub(in super::super) struct QueuedSection {
     pub(in super::super) tokens: TokenBuffer,
     pub(in super::super) address: ContentAddress,
     pub(in super::super) debug_name: String,
-    pub(in super::super) in_collection: bool,
+    pub(in super::super) seal: SectionSeal,
     /// See [`SchedulerRequest::IngestSection::start`].
     pub(in super::super) start: Option<SharedState>,
     /// See [`SchedulerRequest::IngestSection::band`].
@@ -436,7 +425,7 @@ pub(in super::super) struct ActiveSectionIngest {
     /// Carried from the `IngestSection` request through to
     /// `SealAction::Section` — see that variant's docstring for the
     /// quantize-policy implications.
-    pub(in super::super) in_collection: bool,
+    pub(in super::super) seal: SectionSeal,
     /// Whether the seal hands back the state the prefill ended on — set for a
     /// section that was given the state it starts from.
     pub(in super::super) export_end: bool,

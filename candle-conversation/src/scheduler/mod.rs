@@ -206,6 +206,7 @@ use crate::persistence::cold_load::{
 use crate::persistence::content_hash::{section_stream_id, turn_stream_id, ContentChain};
 use crate::provenance::boundaries::{BoundaryRule, BoundaryState, Step};
 use crate::working_set::PoolSize;
+use crate::SectionSeal;
 // Only the K/V-digest request carries these, and it is a test-helper probe.
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::persistence::content_hash::{ContentHash, ContentHasher};
@@ -256,7 +257,7 @@ use first_sample::PrefillEnd;
 use candle::cuda_backend::graph::CaptureStats;
 use candle::quantized::pinned_staging::PinnedBuf;
 use candle::{Device, Tensor};
-use candle_nn::kv_cache::{quantize_sealed_in_place, QuantFormat, SealedSequence, WarmLiftRing};
+use candle_nn::kv_cache::{quantize_sealed_in_place, SealedSequence, WarmLiftRing};
 use candle_nn::CHUNK_SIZE;
 use candle_transformers::models::batched_inference::{
     BatchedInferenceSession, ManagedBatchedModel, ProvSignPacked, SequenceStats,

@@ -189,7 +189,7 @@ impl Scheduler {
                 Arc::new(s.tokens.to_vec()),
                 s.address,
                 s.debug_name,
-                s.in_collection,
+                s.seal,
                 s.export_end,
             );
             let split = s.timing.split(sealing, Instant::now());

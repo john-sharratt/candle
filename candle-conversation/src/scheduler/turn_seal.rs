@@ -63,6 +63,8 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests {
+    use candle_nn::kv_cache::QuantFormat;
+
     use super::*;
 
     fn cc() -> ConvCompression {

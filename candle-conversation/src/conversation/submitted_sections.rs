@@ -42,6 +42,7 @@ use crate::scheduler::exported_state::SharedState;
 use crate::scheduler::SchedulerRequest;
 use crate::substrate::Substrate;
 use crate::token_buffer::TokenBuffer;
+use crate::SectionSeal;
 
 /// Where a submitted section is in its life.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -310,6 +311,8 @@ struct SealJob {
     band: DecodePriority,
     /// Whose the section is — see [`Sharing`].
     sharing: Sharing,
+    /// Its collection's compression level.
+    level: u8,
     settled: Arc<Settled>,
 }
 
@@ -534,7 +537,7 @@ impl SealJob {
                 } else {
                     Substrate::owned_stream_name(self.owner, &self.name)
                 },
-                in_collection: true,
+                seal: SectionSeal::Member { level: self.level },
                 start,
                 band: self.band,
                 response_tx: tx,
@@ -699,6 +702,7 @@ impl Sequence {
         // sealed at its layer's `High` stood behind every character's turn
         // before the turn a person waits on could start.
         let band = self.band();
+        let level = self.collection_kv_level(collection);
         let settled = Settled::new();
         let job = SealJob {
             scheduler_tx: self.scheduler_tx.clone(),
@@ -713,6 +717,7 @@ impl Sequence {
             after: after.to_vec(),
             band,
             sharing,
+            level,
             settled: Arc::clone(&settled),
         };
         if let Err(e) = std::thread::Builder::new()
@@ -864,7 +869,7 @@ impl Sequence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::projection::SelectionRule;
+    use crate::projection::{SelectionRule, MEMBER_KV_LEVEL};
     use tokenizers::models::wordlevel::WordLevel;
     use tokenizers::Tokenizer;
 
@@ -1030,6 +1035,7 @@ layers:
             after: Vec::new(),
             band: DecodePriority::Low,
             sharing: Sharing::Shared,
+            level: MEMBER_KV_LEVEL,
             settled: Arc::clone(&settled),
         };
         assert!(job.still_wanted().is_ok());

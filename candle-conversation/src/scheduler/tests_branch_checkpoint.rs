@@ -405,7 +405,7 @@ pub(super) mod tests {
             tokens: TokenBuffer::from(vec![1u32; 4]),
             address: ContentAddress::default(),
             debug_name: "s".into(),
-            in_collection: true,
+            seal: SectionSeal::Member { level: 4 },
             start: Some(SharedState::from(&start)),
             band: DecodePriority::Low,
             response_tx,

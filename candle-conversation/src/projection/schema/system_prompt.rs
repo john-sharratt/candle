@@ -503,7 +503,17 @@ pub struct SectionCollection {
     /// them and a hole ahead (`docs/placed_section_layout.md` §3.1). A
     /// collection with none takes exactly what its members do.
     pub range: Option<ReservedRange>,
+    /// The adaptive compression level its members' K/V is sealed at
+    /// ([`MEMBER_KV_LEVEL`] unless the collection declares `kv_level`): the
+    /// knowledge base's sections at C5, a tool's signature at C4.
+    pub kv_level: u8,
 }
+
+/// The level a collection's members are sealed at when it declares none.
+pub const MEMBER_KV_LEVEL: u8 = 4;
+
+/// The highest adaptive compression level (`CompressionPolicy`'s C10).
+pub const MAX_KV_LEVEL: u8 = 10;
 
 impl Default for SectionCollection {
     fn default() -> Self {
@@ -521,6 +531,7 @@ impl Default for SectionCollection {
             budget_adaptive: None,
             mandatory: Vec::new(),
             range: None,
+            kv_level: MEMBER_KV_LEVEL,
         }
     }
 }

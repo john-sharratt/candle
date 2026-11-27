@@ -286,6 +286,9 @@ pub(super) enum YamlSystemPromptItem {
         /// of them, a hole ahead (`docs/placed_section_layout.md` §3.1).
         #[serde(default)]
         range: Option<YamlReservedRange>,
+        /// The compression level its members are sealed at.
+        #[serde(default)]
+        kv_level: Option<u8>,
     },
     /// An ordered, individually-toggleable tree of sealed sections.  Each node
     /// is a `section` (mandatory), an `optional` (binary toggle), or a

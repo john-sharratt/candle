@@ -39,9 +39,9 @@ pub(super) fn select_collection_indices<R: ContentResolver>(
     let score_of = |s: &SectionSchema| resolver.section_score(s.id);
     match &coll.selection {
         // No sensible "recent" semantics for sections → all, declaration order.
-        SelectionRule::AlwaysVisible | SelectionRule::Sequence { .. } => {
-            (0..coll.sections.len()).collect()
-        }
+        SelectionRule::AlwaysVisible
+        | SelectionRule::Sequence { .. }
+        | SelectionRule::Birth { .. } => (0..coll.sections.len()).collect(),
         SelectionRule::TopK { k } => top_scored_indices(coll, resolver, scoring, *k, None),
         SelectionRule::Offered { selector, k } => top_scored_indices(
             coll,
@@ -369,7 +369,7 @@ pub(super) fn select_collection_sections<R: ContentResolver>(
             );
             out
         }
-        SelectionRule::Sequence { .. } => {
+        SelectionRule::Sequence { .. } | SelectionRule::Birth { .. } => {
             let mut out = Vec::with_capacity(coll.sections.len());
             for s in &coll.sections {
                 push_member_glue(&mut out, coll);

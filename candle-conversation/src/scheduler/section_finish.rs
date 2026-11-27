@@ -4,12 +4,15 @@
 //!
 //! Boundary sections, which every later token attends back over, take an 8-bit
 //! policy because any noise in them is amplified through every layer. Collection
-//! members take the adaptive policy, since the projection's top-k already masks
-//! their per-member precision. Pending sections are quantized only at a turn-seal
+//! members take the adaptive policy at their collection's level, since the
+//! projection's selection already masks their per-member precision
+//! ([`SectionSeal`]). Pending sections are quantized only at a turn-seal
 //! boundary, after every reader of their native form has finished, and the pass
 //! is deferred while a hot-to-warm migrate is converting the same residences. A
 //! section whose seal fails on a per-layer window divergence is tombstoned only
 //! when its own persisted data confirms the divergence.
+
+use std::collections::BTreeMap;
 
 use super::*;
 
@@ -24,7 +27,7 @@ impl Scheduler {
         tokens: Arc<Vec<u32>>,
         address: ContentAddress,
         debug_name: String,
-        in_collection: bool,
+        seal: SectionSeal,
         export_end: bool,
     ) -> Result<SealResult, ConversationError> {
         #[cfg(feature = "context-dump")]
@@ -58,7 +61,7 @@ impl Scheduler {
                 tokens,
                 address,
                 debug_name,
-                in_collection,
+                seal,
             },
             None,
         )?;
@@ -135,61 +138,10 @@ impl Scheduler {
         Ok(seal)
     }
 
-    /// Snapshot `seal_slot`, seal the new blocks
-    /// `[seal_block_from, block_count)`, and apply the substrate write
-    /// described by `seal_action`.  Returns the [`SealResult`] payload,
-    /// or `Ok(None)` when there are no new blocks to seal.
-    ///
-    /// Near-lossless compression policy for **boundary** sections —
-    /// role markers, opening/closing tags, anything outside a schema
-    /// `Collection`.
-    ///
-    /// Boundary sections sit at the head of every slot and every
-    /// later token of every later turn attends back over them, so any
-    /// K *or* V noise on them is amplified through 48 layers of
-    /// attention.  At Q4_KS K + level-5 V the model produced raw
-    /// gibberish; at Q8_KS K + level-5 V it stayed coherent but the
-    /// model's tool-detection heads dropped below their decision
-    /// threshold.  So we override both sides — K to Q8_KS, V to
-    /// Q8_0, `compression_level = 0` — every K and V block is 8-bit
-    /// with no adaptive Q2/Q4 selection.  ~2.5× smaller than native,
-    /// effectively lossless for downstream attention.
-    pub(super) fn section_compression_policy_boundary() -> candle_nn::kv_cache::CompressionPolicy {
-        candle_nn::kv_cache::CompressionPolicy::new(0)
-            .with_override_k_quant(Some(QuantFormat::Q8_KS))
-            .with_override_v_quant(Some(QuantFormat::Q8_0))
-    }
-
-    /// Compression policy for **collection-member** sections —
-    /// individual tools in a tool catalog, hits in a retrieval list,
-    /// anything inside a schema `Collection`.
-    ///
-    /// The projection's per-turn top-k selection already masks
-    /// per-member precision: of N tools in the catalog only k make it
-    /// into the slot at any given turn, and the scorer picks them on
-    /// relevance, so per-member K/V noise gets averaged out by the
-    /// selection itself.  Members tolerate aggressive compression
-    /// better than boundary sections, but not *as* aggressive as
-    /// turns — a turn is read by a handful of decode steps right
-    /// after its seal, a collection member is read by every later
-    /// token of every later turn the projection re-selects it into.
-    ///
-    /// So members sit between the boundary near-lossless policy
-    /// (C0 / Q8 / Q8) and the dialogue turn policy: **C4, fully adaptive
-    /// for both K and V** — the uniform-K pin removed to match the
-    /// engine-wide adaptive-K stress config.
-    /// `_turn_policy` is taken to keep the call sites future-proof
-    /// for a per-engine override knob; today it's ignored.
-    pub(super) fn section_compression_policy_member(
-        _turn_policy: &candle_nn::kv_cache::CompressionPolicy,
-    ) -> candle_nn::kv_cache::CompressionPolicy {
-        candle_nn::kv_cache::CompressionPolicy::new(4)
-    }
-
     /// Drain [`Self::pending_section_quantize`]: re-read each section's
     /// current native hot bytes from the substrate, quantize them
-    /// per-layer with the section policy, and atomically replace
-    /// the residence's hot with the quantized form.
+    /// per-layer under each section's own seal ([`SectionSeal::policy`]), and
+    /// atomically replace the residence's hot with the quantized form.
     ///
     /// Called from the `SealAction::Turn` handler, on the main scheduler
     /// thread, *after* the turn record has been committed.  At that
@@ -201,8 +153,6 @@ impl Scheduler {
     pub(super) fn quantize_pending_sections(
         &mut self,
         conversation: &Conversation,
-        boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
-        member_policy: &candle_nn::kv_cache::CompressionPolicy,
     ) -> Result<(), ConversationError> {
         // Defer while a hot→warm migrate is in flight: it is converting the
         // same residences float→quant, so quantizing them here would redo work
@@ -221,7 +171,7 @@ impl Scheduler {
             .into_iter()
             .partition(|p| p.substrate.is(conversation));
         self.pending_section_quantize = keep;
-        self.quantize_section_batch(conversation, drained, boundary_policy, member_policy, false)
+        self.quantize_section_batch(conversation, drained, false)
     }
 
     /// Quantize + offload ONLY the collection-member sections currently
@@ -238,8 +188,6 @@ impl Scheduler {
     pub(super) fn quantize_pending_collection_members(
         &mut self,
         conversation: &Conversation,
-        boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
-        member_policy: &candle_nn::kv_cache::CompressionPolicy,
     ) -> Result<(), ConversationError> {
         // See `quantize_pending_sections` — deferred during a hot→warm migrate
         // so the member quantize doesn't redo the conversion it is performing.
@@ -249,14 +197,14 @@ impl Scheduler {
         let mut members: Vec<PendingSectionQuantize> = Vec::new();
         let mut keep: Vec<PendingSectionQuantize> = Vec::new();
         for p in self.pending_section_quantize.drain(..) {
-            if p.in_collection && p.substrate.is(conversation) {
+            if p.seal.is_member() && p.substrate.is(conversation) {
                 members.push(p);
             } else {
                 keep.push(p);
             }
         }
         self.pending_section_quantize = keep;
-        self.quantize_section_batch(conversation, members, boundary_policy, member_policy, true)
+        self.quantize_section_batch(conversation, members, true)
     }
 
     /// Quantize an already-drained pending list and atomically swap each
@@ -266,25 +214,21 @@ impl Scheduler {
         &mut self,
         conversation: &Conversation,
         pending_list: Vec<PendingSectionQuantize>,
-        boundary_policy: &candle_nn::kv_cache::CompressionPolicy,
-        member_policy: &candle_nn::kv_cache::CompressionPolicy,
         mark_evict: bool,
     ) -> Result<(), ConversationError> {
-        // Snapshot per-section native hot + residence + which policy
-        // applies under a brief read lock; the heavy GPU work runs
-        // unlocked.  Pending list is partitioned into (residence,
-        // sealed, in_collection); the per-layer loop below groups by
-        // in_collection so each policy gets its own batched launch.
-        // Each section's native hot copy as the drain reads it: what it
-        // quantizes, and what its install replaces only while still there.
-        let pending: Vec<(SectionId, ResidenceIndex, Arc<HotKv>, bool)> = {
+        // Snapshot per-section native hot + residence + its seal under a
+        // brief read lock; the heavy GPU work runs unlocked. The per-layer
+        // loop below groups by seal so each policy gets its own batched
+        // launch. Each section's native hot copy as the drain reads it: what
+        // it quantizes, and what its install replaces only while still there.
+        let pending: Vec<(SectionId, ResidenceIndex, Arc<HotKv>, SectionSeal)> = {
             let view = conversation.read();
             pending_list
                 .into_iter()
                 .filter_map(|p| {
                     let residence = view.section_residence(p.section_id)?;
                     let native = view.residence(residence).hot()?;
-                    Some((p.section_id, residence, native, p.in_collection))
+                    Some((p.section_id, residence, native, p.seal))
                 })
                 .collect()
         };
@@ -309,20 +253,14 @@ impl Scheduler {
         // the position of each section in the original `pending` list
         // so we can stitch the per-group results back together in the
         // install loop without losing the original order.
-        let mut indices_boundary: Vec<usize> = Vec::new();
-        let mut indices_member: Vec<usize> = Vec::new();
-        for (i, (_, _, _, in_collection)) in pending.iter().enumerate() {
-            if *in_collection {
-                indices_member.push(i);
-            } else {
-                indices_boundary.push(i);
-            }
+        let mut by_seal: BTreeMap<SectionSeal, Vec<usize>> = BTreeMap::new();
+        for (i, (_, _, _, seal)) in pending.iter().enumerate() {
+            by_seal.entry(*seal).or_default().push(i);
         }
         tracing::debug!(
             target: "candle_conversation::scheduler::section_quantize",
-            boundary = indices_boundary.len(),
-            member = indices_member.len(),
-            "quantize drain: boundary vs collection-member split"
+            groups = ?by_seal.iter().map(|(s, v)| (*s, v.len())).collect::<Vec<_>>(),
+            "quantize drain: sections by seal"
         );
 
         // Batch across sections per layer for each group.
@@ -333,14 +271,8 @@ impl Scheduler {
         let mut quantized_per_section: Vec<Vec<SealedSequence>> = (0..pending.len())
             .map(|_| Vec::with_capacity(n_layers))
             .collect();
-        let groups: [(&[usize], &candle_nn::kv_cache::CompressionPolicy); 2] = [
-            (indices_boundary.as_slice(), boundary_policy),
-            (indices_member.as_slice(), member_policy),
-        ];
-        for (group_indices, group_policy) in groups {
-            if group_indices.is_empty() {
-                continue;
-            }
+        for (seal, group_indices) in &by_seal {
+            let group_policy = &seal.policy();
             for layer in 0..n_layers {
                 let inputs: Vec<&SealedSequence> = group_indices
                     .iter()
@@ -382,7 +314,7 @@ impl Scheduler {
         // return to the pool for reuse by the next prefill.
         {
             let view = conversation.read();
-            for ((_, residence, native, _in_collection), q_per_layer) in
+            for ((_, residence, native, _seal), q_per_layer) in
                 pending.into_iter().zip(quantized_per_section)
             {
                 if q_per_layer.len() != n_layers {

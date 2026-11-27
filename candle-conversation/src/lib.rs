@@ -118,6 +118,8 @@ pub(crate) mod scheduler;
 /// corpses of crashed runs — so a harness never attaches to the live store.
 pub mod scratch_substrate;
 mod sealed_turn;
+mod section_seal;
+pub use section_seal::SectionSeal;
 mod sequence_handle;
 mod stats;
 pub mod stencil;

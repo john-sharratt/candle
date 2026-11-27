@@ -98,6 +98,15 @@ pub enum SelectionRule {
         lineage_base: f32,
     },
 
+    /// A conversation **by birth** (`docs/placed_section_layout.md` §3.7,
+    /// `docs/npc_mind_layout.md` §2): its inherited lineage whole, as the
+    /// window's floor, then its current exchange always and the newest past
+    /// exchanges, whole, while they fit `window` tokens — none chosen by score
+    /// and none shed for the budget. Past exchanges are sealed and the window
+    /// is fixed, so every boundary of a request holds the same ones; between
+    /// requests the oldest drop out of the far end.
+    Birth { window: usize },
+
     /// A turn group of whole ingest conversations sized by the projection
     /// target's working set (`docs/zend_working_set.md` §4.4): the target's
     /// pinned conversations in this group, whole, then its provenance

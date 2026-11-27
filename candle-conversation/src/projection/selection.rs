@@ -111,6 +111,9 @@ pub fn apply_selection(
         // conversations sized by its own budget (`project::working_set_picks`);
         // it never reaches a per-turn rule.
         SelectionRule::WorkingSet { .. } => Vec::new(),
+        SelectionRule::Birth { window } => {
+            select_by_birth(*window, turns, token_counts, own_timeline)
+        }
         SelectionRule::Sequence {
             recent,
             historical_top_k,
@@ -223,6 +226,42 @@ fn select_single(
             vec![*idx]
         }
     }
+}
+
+// ── Birth ─────────────────────────────────────────────────────────────────────
+
+/// [`SelectionRule::Birth`]: the lineage whole, then the conversation's own
+/// exchanges from the newest back — the current one always, each older one
+/// while the window less the lineage still holds it whole — in insertion
+/// order. Neither the score nor the projection's budget enters: what a request
+/// opens with it keeps to its end.
+fn select_by_birth(
+    window: usize,
+    turns: &[(TurnKey, f32)],
+    token_counts: &dyn Fn(TurnKey) -> usize,
+    own_timeline: Option<TimelineId>,
+) -> Vec<TurnKey> {
+    let (lineage, own): (Vec<TurnKey>, Vec<TurnKey>) = match own_timeline {
+        Some(tl) => turns
+            .iter()
+            .map(|(k, _)| *k)
+            .partition(|k| k.timeline != tl),
+        None => (Vec::new(), turns.iter().map(|(k, _)| *k).collect()),
+    };
+    let mut left = window.saturating_sub(lineage.iter().map(|&k| token_counts(k)).sum());
+    let mut from = own.len().saturating_sub(1);
+    for i in (0..from).rev() {
+        let cost = token_counts(own[i]);
+        if cost > left {
+            break;
+        }
+        left -= cost;
+        from = i;
+    }
+    let mut out = lineage;
+    out.extend_from_slice(&own[from.min(own.len())..]);
+    out.sort();
+    out
 }
 
 // ── Sequence ──────────────────────────────────────────────────────────────
@@ -394,6 +433,44 @@ mod tests {
     /// A turn on an ANCESTOR's timeline — inherited through `forked_from`.
     fn anc(tl: u64, n: u32) -> TurnKey {
         TurnKey::new(TimelineId::for_test(tl), TurnIndex(n))
+    }
+
+    /// **By birth: the lineage whole, the current exchange always, then the
+    /// newest past ones while the window less the lineage holds them** — and
+    /// neither score nor budget enters. A 35-token window less a 10-token
+    /// lineage holds two 10-token past exchanges beside the current one; the
+    /// highest-scored, oldest one is out.
+    #[test]
+    fn by_birth_the_newest_exchanges_fill_the_window() {
+        let turns = vec![
+            (anc(9, 0), 0.0),
+            (t(0), 900.0),
+            (t(1), 0.0),
+            (t(2), 0.0),
+            (t(3), 0.0),
+        ];
+        let birth = SelectionRule::Birth { window: 35 };
+        let want = vec![t(1), t(2), t(3), anc(9, 0)];
+        let mut want_sorted = want.clone();
+        want_sorted.sort();
+        assert_eq!(
+            apply_selection(&birth, 0.0, &turns, None, &tc, Some(own())),
+            want_sorted
+        );
+        // A budget of one turn changes nothing: the window is fixed.
+        assert_eq!(
+            apply_selection(&birth, 0.0, &turns, Some(10), &tc, Some(own())),
+            want_sorted
+        );
+        // A window smaller than the lineage still holds the current exchange.
+        let tight = SelectionRule::Birth { window: 5 };
+        let mut only = vec![t(3), anc(9, 0)];
+        only.sort();
+        assert_eq!(
+            apply_selection(&tight, 0.0, &turns, None, &tc, Some(own())),
+            only
+        );
+        assert!(apply_selection(&birth, 0.0, &[], None, &tc, Some(own())).is_empty());
     }
 
     /// An inherited turn survives even with a zero score and no seat in the

@@ -258,7 +258,7 @@ impl Scheduler {
                         tokens: Arc::new(s.tokens.to_vec()),
                         address: s.address,
                         debug_name: s.debug_name.clone(),
-                        in_collection: s.in_collection,
+                        seal: s.seal,
                     },
                     None,
                 )
@@ -278,7 +278,7 @@ impl Scheduler {
             seal_block_from,
             address: s.address,
             debug_name: s.debug_name,
-            in_collection: s.in_collection,
+            seal: s.seal,
             export_end: s.start.is_some(),
             band: s.band,
             response_tx: s.response_tx,

@@ -253,6 +253,9 @@ pub(super) struct YamlSelection {
     pub(super) recent: Option<usize>,
     #[serde(default)]
     pub(super) historical_top_k: Option<usize>,
+    /// `kind: birth` only — the tokens of past exchanges a request opens with.
+    #[serde(default)]
+    pub(super) window: Option<usize>,
     /// `kind: conversation` only — the score an inherited lineage turn is
     /// never ranked below; [`LINEAGE_BASE`] when absent.
     #[serde(default)]

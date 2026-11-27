@@ -161,7 +161,9 @@ impl GroupSchema {
     pub fn is_belief_driven(&self) -> bool {
         !matches!(
             self.selection,
-            SelectionRule::Sequence { .. } | SelectionRule::WorkingSet { .. }
+            SelectionRule::Sequence { .. }
+                | SelectionRule::Birth { .. }
+                | SelectionRule::WorkingSet { .. }
         )
     }
 
@@ -221,11 +223,12 @@ impl GroupSchema {
             SelectionRule::TopK { k } | SelectionRule::Offered { k, .. } => *k,
             SelectionRule::Single => 1,
             SelectionRule::AlwaysVisible => n_candidates.max(1),
-            // Named/Sequence aren't belief-driven, and a working-set group is
-            // sized by its target's budget rather than a member count; fall back
-            // to the policy budget.
+            // Named/Sequence/Birth aren't belief-driven, and a working-set group
+            // is sized by its target's budget rather than a member count; fall
+            // back to the policy budget.
             SelectionRule::Named { .. }
             | SelectionRule::Sequence { .. }
+            | SelectionRule::Birth { .. }
             | SelectionRule::WorkingSet { .. } => self.policy.config.budget_max,
         };
         match (self.score_threshold, self.policy_band_declared) {
