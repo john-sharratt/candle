@@ -120,6 +120,10 @@ pub(super) fn segments_identity(
                     h.write_u32(t);
                 }
             }
+            ProjectionSegment::Hole { positions } => {
+                h.write_u8(6);
+                h.write_usize(*positions);
+            }
         }
     }
     h.finish()

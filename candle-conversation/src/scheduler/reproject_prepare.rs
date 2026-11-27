@@ -555,6 +555,9 @@ impl Scheduler {
                         // reproject's rebuilt prefix diverge from submit's.
                         segments.push(seg.clone());
                     }
+                    // A hole is part of the rebuilt prefix's layout, as in
+                    // the SubmitTurn path: every position after it depends on it.
+                    ProjectionSegment::Hole { .. } => segments.push(seg.clone()),
                     ProjectionSegment::NewUserMessage { .. } => {
                         // The active turn's user message is captured as the
                         // writer tail (snapshot/restore in the swap), so it must

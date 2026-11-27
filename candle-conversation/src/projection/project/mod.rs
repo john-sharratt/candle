@@ -82,6 +82,10 @@ pub enum ProjectionSegment {
     /// committed to the substrate at seal time as one half of the
     /// resulting turn record.
     NewUserMessage { tokens: std::sync::Arc<Vec<u32>> },
+    /// Positions left empty: no token, no K/V, no index row. What follows is
+    /// read `positions` further on — the unfilled part of a section's reserved
+    /// range (`docs/placed_section_layout.md` §3.1).
+    Hole { positions: usize },
 }
 
 /// Discriminator under [`ProjectionSegment::Sealed`] — distinguishes a

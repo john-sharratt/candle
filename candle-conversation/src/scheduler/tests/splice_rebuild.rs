@@ -118,12 +118,31 @@ impl Fixture {
             .collect()
     }
 
+    /// The segments placing `layout`: a turn by its index, or a hole of the
+    /// given positions.
+    fn segments_with(&self, layout: &[Place]) -> Vec<ProjectionSegment> {
+        layout
+            .iter()
+            .flat_map(|p| match *p {
+                Place::Turn(t) => self.segments(&[t]),
+                Place::Hole(positions) => vec![ProjectionSegment::Hole { positions }],
+            })
+            .collect()
+    }
+
     fn slot(&mut self) -> SequenceId {
         create_scratch_slot(&mut self.scheduler, &self.conversation)
     }
 
     fn project(&mut self, slot: SequenceId, which: &[usize]) {
         let segments = self.segments(which);
+        self.scheduler
+            .apply_projection(slot, BlockCount(0), &segments)
+            .expect("projection applies");
+    }
+
+    fn project_layout(&mut self, slot: SequenceId, layout: &[Place]) {
+        let segments = self.segments_with(layout);
         self.scheduler
             .apply_projection(slot, BlockCount(0), &segments)
             .expect("projection applies");
@@ -186,6 +205,13 @@ impl Fixture {
                 p.iter().filter(|x| matches!(x, Pushed::Page(_))).count()
             })
     }
+}
+
+/// One place in a projection's layout.
+#[derive(Debug, Clone, Copy)]
+enum Place {
+    Turn(usize),
+    Hole(usize),
 }
 
 type ChunkView = (u16, u16, Vec<i64>);
@@ -257,6 +283,78 @@ fn inserts_evictions_and_a_new_tail_are_a_build_of_the_result() {
 #[test]
 fn a_reordered_projection_is_a_build_of_the_new_order() {
     spliced_equals_built(&[40, 7, 33, 64, 5], &[0, 1, 2, 3, 4], &[3, 0, 1, 2, 4]);
+}
+
+/// Rebuild a slot holding `from` into `to` and build `to` from nothing on
+/// another, holes included; the two must be the same slot, at the same
+/// position. Returns that position and the offset.
+fn spliced_layout_equals_built(widths: &[usize], from: &[Place], to: &[Place]) -> (usize, usize) {
+    let mut f = fixture(widths);
+    let spliced = f.slot();
+    f.project_layout(spliced, from);
+    f.project_layout(spliced, to);
+    let after_splice = f.built(spliced);
+    let at_splice = f.scheduler.session.sequence_position(spliced.0);
+
+    let fresh = f.slot();
+    f.project_layout(fresh, to);
+    let after_build = f.built(fresh);
+    let at_build = f.scheduler.session.sequence_position(fresh.0);
+    assert_eq!(
+        after_splice, after_build,
+        "rebuilding {from:?} into {to:?} left a different slot from building {to:?}"
+    );
+    assert_eq!(
+        at_splice, at_build,
+        "the two slots stand at different positions"
+    );
+    (
+        at_build.expect("a position"),
+        f.scheduler
+            .session
+            .sequence_offset(fresh.0)
+            .expect("an offset"),
+    )
+}
+
+/// **A hole moves the position and not the offset**, and a slot built across
+/// one holds exactly its turns.
+#[test]
+fn a_hole_moves_the_position_and_not_the_offset() {
+    use Place::{Hole, Turn};
+    let (at, offset) = spliced_layout_equals_built(
+        &[40, 7, 33],
+        &[Turn(0), Hole(100), Turn(1)],
+        &[Turn(0), Hole(100), Turn(1), Turn(2)],
+    );
+    assert_eq!(offset, 40 + 7 + 33);
+    assert_eq!(at, 40 + 100 + 7 + 33);
+}
+
+/// **A hole that changed is where the slot is cut and walked**: the rebuild
+/// is still a build of the result, at the result's position.
+#[test]
+fn a_changed_hole_is_a_build_of_the_result() {
+    use Place::{Hole, Turn};
+    let (at, offset) = spliced_layout_equals_built(
+        &[40, 7, 33],
+        &[Turn(0), Hole(100), Turn(1), Turn(2)],
+        &[Turn(0), Hole(60), Turn(1), Turn(2)],
+    );
+    assert_eq!((at, offset), (40 + 60 + 7 + 33, 40 + 7 + 33));
+}
+
+/// **A change after a kept hole splices past it**: the rebuild is a build of
+/// the result, and the hole stands where it stood.
+#[test]
+fn a_change_after_a_kept_hole_is_a_build_of_the_result() {
+    use Place::{Hole, Turn};
+    let (at, offset) = spliced_layout_equals_built(
+        &[40, 7, 33, 64, 5],
+        &[Turn(0), Hole(100), Turn(1), Turn(2), Turn(3)],
+        &[Turn(0), Hole(100), Turn(1), Turn(4), Turn(3)],
+    );
+    assert_eq!((at, offset), (40 + 100 + 7 + 5 + 64, 40 + 7 + 5 + 64));
 }
 
 /// Nothing in common and everything in common are the two ends: a rebuild

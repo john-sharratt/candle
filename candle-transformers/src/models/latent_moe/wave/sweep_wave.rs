@@ -203,6 +203,21 @@ impl BatchedEngine {
             glue_pos.push(pos);
         }
 
+        // This engine addresses its sliding-window arena as `absolute −
+        // evicted`, which holds only while a sequence's positions are its
+        // tokens. A slot with holes in its position space
+        // (`docs/placed_section_layout.md` §4.1) would be read at the wrong
+        // positions, so it is refused by name.
+        for &s in decode_seqs.iter().chain(prefill_seqs).chain(glue_seqs) {
+            let (offset, position) = (session.sequence_offset(s), session.sequence_position(s));
+            if offset != position {
+                candle::bail!(
+                    "latent_moe wave: sequence {s} has holes in its position space (offset \
+                     {offset:?}, position {position:?}); this engine reads positions as tokens"
+                );
+            }
+        }
+
         // Sequence offsets (position of the first new token per sequence).
         // A sequence may occupy SEVERAL decode rows (a speculative verify
         // block: one row per block position); the k-th occurrence sits at

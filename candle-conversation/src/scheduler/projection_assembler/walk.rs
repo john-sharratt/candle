@@ -46,6 +46,10 @@ pub(super) fn hash_piece_identity(
                 h.write_u32(t);
             }
         }
+        Some(AssembledPiece::Hole(positions)) => {
+            h.write_u8(6);
+            h.write_u64(*positions as u64);
+        }
         None => h.write_u8(0),
     }
 }
@@ -89,10 +93,9 @@ pub(super) fn walk_sealed_piece(
             c.write_u32(index.0);
             c.write_u8(*role as u8);
         }
-        AssembledPiece::Glue(_) | AssembledPiece::DeferredUser(_) => {
+        AssembledPiece::Glue(_) | AssembledPiece::DeferredUser(_) | AssembledPiece::Hole(_) => {
             return Err(ConversationError::Channel(format!(
-                "apply_segments: {} is forwarded, not sealed — only a sealed piece is \
-                 placed this way",
+                "apply_segments: {} is not sealed — only a sealed piece is placed this way",
                 piece_label(piece)
             )));
         }
@@ -148,6 +151,9 @@ pub(super) struct SegmentWalker<'c> {
     /// Equal to `Σ chunk usage` by construction (gaps are reserved in place), so
     /// it cross-checks the slot offset in the convention assert.
     pub(super) logical_pos: u32,
+    /// Positions the walk's holes have left empty so far. The slot's position
+    /// is `logical_pos` plus this.
+    pub(super) holes: u32,
     /// True if the most recent slot mutation was a Sealed inject (Arc-shared,
     /// partial trailing chunk possible) — so the gap-fill pushes a fresh writer
     /// chunk before writing.
@@ -220,6 +226,7 @@ impl<'c> SegmentWalker<'c> {
             glue_write_in_blk: Vec::new(),
             fwd_ahead: Vec::new(),
             logical_pos: 0,
+            holes: 0,
             last_was_sealed: false,
             deferred_user: None,
             n_glue_tokens: 0,

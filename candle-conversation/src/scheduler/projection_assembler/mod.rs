@@ -79,6 +79,8 @@ mod tests_assembly;
 #[cfg(test)]
 mod tests_fixtures;
 #[cfg(test)]
+mod tests_holes;
+#[cfg(test)]
 mod tests_reasoning;
 #[cfg(test)]
 mod tests_slots;

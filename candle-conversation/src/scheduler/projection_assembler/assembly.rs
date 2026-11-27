@@ -132,6 +132,9 @@ pub(crate) enum AssembledPiece {
     },
     /// The in-flight user message, deferred to prefill after the gap-fill.
     DeferredUser(Arc<Vec<u32>>),
+    /// Positions left empty on the K/V and the index alike: what follows is
+    /// read this many positions further on.
+    Hole(usize),
 }
 
 /// Lay out a projection's segments into the ordered [`AssembledPiece`]s the
@@ -249,6 +252,12 @@ pub(super) fn assemble_inner(
                 flush(&mut run, &mut pieces);
                 pieces.push(AssembledPiece::DeferredUser(tokens.clone()));
             }
+            ProjectionSegment::Hole { positions } => {
+                flush(&mut run, &mut pieces);
+                if *positions > 0 {
+                    pieces.push(AssembledPiece::Hole(*positions));
+                }
+            }
             ProjectionSegment::Generated { .. } => unreachable!("handled in the run loop above"),
         }
         i += 1;
@@ -332,8 +341,10 @@ pub(crate) fn materialize_conversation(
             // The live user message is a separate prefill unit (not part of
             // `project()`'s segments), so it never reaches this spine — the panel
             // renders the in-flight turn from `um`/`dm`. A stray section is not
-            // part of the displayed dialogue spine.
-            AssembledPiece::DeferredUser(_) | AssembledPiece::Section(_) => None,
+            // part of the displayed dialogue spine, nor is a hole.
+            AssembledPiece::DeferredUser(_)
+            | AssembledPiece::Section(_)
+            | AssembledPiece::Hole(_) => None,
         })
         .collect()
 }

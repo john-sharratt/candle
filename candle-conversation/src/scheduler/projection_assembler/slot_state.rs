@@ -111,7 +111,7 @@ pub(in super::super) fn hit_rounds_of(
             ..
         } = piece
         {
-            let span = (p.pos_after - p.tokens) as usize..p.pos_after as usize;
+            let span = (p.at_after - p.tokens) as usize..p.at_after as usize;
             turns_of.entry(*timeline).or_default().push((*index, span));
         }
     }
@@ -176,10 +176,11 @@ impl SlotState {
                         format!("turn:{}:{}", timeline.raw(), index.0)
                     }
                     Some(PieceRange::Section(id)) => format!("section:{}", id.raw()),
+                    None if p.holes > 0 => "hole".to_string(),
                     None => "glue".to_string(),
                 },
-                start: (p.pos_after - p.tokens) as usize,
-                end: p.pos_after as usize,
+                start: (p.at_after - p.tokens - p.holes) as usize,
+                end: p.at_after as usize,
             })
             .collect()
     }
@@ -193,13 +194,20 @@ pub(in super::super) struct PlacedPiece {
     /// a sealed piece's own, a forwarded piece's chained.
     pub(super) identity: u64,
     pub(super) kind: PieceKind,
-    /// Blocks and positions the piece occupies.
+    /// Blocks and tokens the piece occupies.
     pub(super) blocks: usize,
     pub(super) tokens: u32,
+    /// Positions the piece leaves empty — a hole's size, `0` for every other
+    /// piece. The positions a piece takes are its tokens and its holes.
+    pub(super) holes: u32,
     /// The slot's block count after the piece — where a cut after it lands.
     pub(super) blocks_after: usize,
-    /// The slot's logical position after the piece.
+    /// The slot's token count after the piece: what the token log is cut at.
     pub(super) pos_after: u32,
+    /// The slot's position after the piece — its tokens and every hole before
+    /// it: what the per-position state is cut at and what a span of the index
+    /// is named by.
+    pub(super) at_after: u32,
     /// The piece's contribution to the glue-island cache's running prefix hash.
     pub(super) contrib: u64,
     /// The running prefix hash after the piece, so a walk resumed here keys
@@ -238,8 +246,10 @@ impl PlacedPiece {
             kind: PieceKind::Sealed,
             blocks: blocks_after,
             tokens: (blocks_after * 32) as u32,
+            holes: 0,
             blocks_after,
             pos_after: (blocks_after * 32) as u32,
+            at_after: (blocks_after * 32) as u32,
             contrib: 0,
             prefix_h: DefaultHasher::new(),
             range: None,
@@ -253,32 +263,39 @@ impl PlacedPiece {
 /// contributions before it. A splice moves every piece after it, and this is
 /// where the records learn where they now stand.
 pub(super) fn restack(records: &mut [PlacedPiece]) {
-    let (mut blocks, mut pos) = (0usize, 0u32);
+    let (mut blocks, mut pos, mut at) = (0usize, 0u32, 0u32);
     let mut prefix_h = DefaultHasher::new();
     for r in records {
         blocks += r.blocks;
         pos += r.tokens;
+        at += r.tokens + r.holes;
         prefix_h.write_u64(r.contrib);
         r.blocks_after = blocks;
         r.pos_after = pos;
+        r.at_after = at;
         r.prefix_h = prefix_h.clone();
     }
 }
 
 /// Where the system prompt ends in a slot `placed` describes: the position
-/// after the leading run of sections and the glue between them, `0` when the
-/// projection opens on anything else.
+/// after the leading run of sections, the glue between them and the holes of
+/// their reserved ranges, `0` when the projection opens on anything else.
 ///
 /// `placed[j]` records `pieces[j]` for every piece before the deferred user
 /// message, which the leading run never reaches.
 pub(super) fn prompt_end_of(pieces: &[AssembledPiece], placed: &[PlacedPiece]) -> u32 {
     let lead = pieces
         .iter()
-        .take_while(|p| matches!(p, AssembledPiece::Section(_) | AssembledPiece::Glue(_)))
+        .take_while(|p| {
+            matches!(
+                p,
+                AssembledPiece::Section(_) | AssembledPiece::Glue(_) | AssembledPiece::Hole(_)
+            )
+        })
         .count();
     match lead {
         0 => 0,
-        n => placed[n - 1].pos_after,
+        n => placed[n - 1].at_after,
     }
 }
 
@@ -326,7 +343,7 @@ pub(super) fn pin_ranges_of(
         if pin == Pin::No || p.tokens == 0 {
             continue;
         }
-        let range = (p.pos_after - p.tokens) as usize..p.pos_after as usize;
+        let range = (p.at_after - p.tokens) as usize..p.at_after as usize;
         match out.last_mut() {
             Some(last) if last.end == range.start => last.end = range.end,
             _ => out.push(range),

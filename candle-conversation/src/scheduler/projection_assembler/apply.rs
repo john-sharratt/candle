@@ -230,8 +230,10 @@ pub(super) fn cut_slot(
             ctx.session
                 .truncate_sequence_to_blocks(parent_id.0, last.blocks_after)
                 .map_err(ConversationError::Model)?;
+            // The per-position state is cut at the position the kept pieces
+            // end at, holes included; the token log at their tokens.
             ctx.model
-                .truncate_positional_state(parent_id.0, last.pos_after as usize)
+                .truncate_positional_state(parent_id.0, last.at_after as usize)
                 .map_err(ConversationError::Model)?;
             if let Some(entry) = ctx.slot_tokens.get_mut(&parent_id) {
                 entry.truncate(last.pos_after as usize);
@@ -241,12 +243,24 @@ pub(super) fn cut_slot(
     Ok(())
 }
 
-/// Where held piece `i` starts: the block and position the piece before it
-/// ends at.
-pub(super) fn held_edge(held: &[PlacedPiece], i: usize) -> (usize, usize) {
-    i.checked_sub(1).map_or((0, 0), |j| {
-        (held[j].blocks_after, held[j].pos_after as usize)
+/// Where held piece `i` starts, as the piece before it ends: its block, its
+/// token count and its position.
+pub(super) fn held_edge(held: &[PlacedPiece], i: usize) -> HeldEdge {
+    i.checked_sub(1).map_or(HeldEdge::default(), |j| HeldEdge {
+        block: held[j].blocks_after,
+        token: held[j].pos_after as usize,
+        at: held[j].at_after as usize,
     })
+}
+
+/// A boundary between two held pieces, in each of the measures a splice cuts
+/// by: the K/V by block, the token log by token, the per-position state by
+/// position.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct HeldEdge {
+    pub(super) block: usize,
+    pub(super) token: usize,
+    pub(super) at: usize,
 }
 
 /// Apply `plan`'s edits and return the records of the pieces before
@@ -270,8 +284,9 @@ pub(super) fn splice_edits(
     let parent_id = ctx.parent_id;
     let mut put_in: HashMap<usize, PlacedPiece> = HashMap::new();
     for edit in plan.edits.iter().rev() {
-        let (from_block, from_pos) = held_edge(held, edit.held.start);
-        let (to_block, to_pos) = held_edge(held, edit.held.end);
+        let from = held_edge(held, edit.held.start);
+        let to = held_edge(held, edit.held.end);
+        let (from_block, to_block) = (from.block, to.block);
         if to_block > from_block {
             ctx.session
                 .splice_sealed(
@@ -299,8 +314,11 @@ pub(super) fn splice_edits(
                     kind: aligned[w].1,
                     blocks,
                     tokens: walker.logical_pos - pos_before,
+                    // An edit never carries a hole (`place_hole`).
+                    holes: 0,
                     blocks_after: 0,
                     pos_after: 0,
+                    at_after: 0,
                     contrib,
                     prefix_h: DefaultHasher::new(),
                     range: placed_range(&pieces[w], blocks),
@@ -312,11 +330,11 @@ pub(super) fn splice_edits(
             ConversationError::Channel("apply_segments: the edit lost its cursor".into())
         })?;
         ctx.model
-            .splice_positional_state(parent_id.0, from_pos, to_pos, &cursor.positional)
+            .splice_positional_state(parent_id.0, from.at, to.at, &cursor.positional)
             .map_err(ConversationError::Model)?;
         if let Some(entry) = ctx.slot_tokens.get_mut(&parent_id) {
-            if to_pos <= entry.len() {
-                entry.splice(from_pos..to_pos, cursor.tokens);
+            if to.token <= entry.len() {
+                entry.splice(from.token..to.token, cursor.tokens);
             }
         }
     }

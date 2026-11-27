@@ -87,8 +87,8 @@ pub fn from_projection_with_origins(
                 label: "current message".to_string(),
                 tokens: tokens.len() as u32,
             }),
-            // Structural framing — not materialized content.
-            ProjectionSegment::Generated { .. } => None,
+            // Structural framing and empty positions — not materialized content.
+            ProjectionSegment::Generated { .. } | ProjectionSegment::Hole { .. } => None,
         })
         .collect();
 
@@ -179,6 +179,8 @@ pub(super) fn build_selection(
             ProjectionSegment::Generated { tokens, identity } => {
                 emitted_glue.insert(identity.name.as_str(), tokens.len() as u32);
             }
+            // Empty positions select nothing.
+            ProjectionSegment::Hole { .. } => {}
         }
     }
 

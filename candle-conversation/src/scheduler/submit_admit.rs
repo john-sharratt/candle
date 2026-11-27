@@ -434,9 +434,10 @@ impl Scheduler {
     }
 }
 
-/// Tokens the slot will hold once `segments` are projected onto it: the depth a
-/// submitted turn's prefill rows attend over, read from the substrate's own
-/// counts for its sealed units.
+/// Positions the slot will reach once `segments` are projected onto it: the
+/// depth a submitted turn's prefill rows attend over, read from the substrate's
+/// own counts for its sealed units, holes counted at the positions they leave
+/// empty.
 pub(super) fn projected_depth(
     conversation: &Conversation,
     segments: &[ProjectionSegment],
@@ -453,6 +454,7 @@ pub(super) fn projected_depth(
                 .map_or(0, |tl| read.turn_token_count_of(tl, rt.index())),
             ProjectionSegment::Generated { tokens, .. }
             | ProjectionSegment::NewUserMessage { tokens } => tokens.len(),
+            ProjectionSegment::Hole { positions } => *positions,
         })
         .sum()
 }

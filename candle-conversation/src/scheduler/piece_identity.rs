@@ -15,7 +15,10 @@
 //!   reasoning windowed out (only the slot's own newest turn keeps it, so the
 //!   same turn changes form when a newer one arrives);
 //! - a glue run's tokens, its forward bridge, and — when it bridges — the piece
-//!   it attends into, since its K/V then depends on that piece too.
+//!   it attends into, since its K/V then depends on that piece too;
+//! - a hole's size. A hole is named as a forwarded piece is: every position
+//!   after it depends on it, so it is kept only while everything before it is,
+//!   and a slot is cut at the first hole that changed and walked from there.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
@@ -74,7 +77,7 @@ pub(super) fn alignment_identities(
         .iter()
         .zip(chained)
         .map(|(piece, &chain)| match piece {
-            AssembledPiece::Glue(_) | AssembledPiece::DeferredUser(_) => {
+            AssembledPiece::Glue(_) | AssembledPiece::DeferredUser(_) | AssembledPiece::Hole(_) => {
                 (chain, PieceKind::Forwarded)
             }
             AssembledPiece::Section(_) | AssembledPiece::Turn { .. } => {
@@ -96,6 +99,7 @@ pub(super) fn piece_label(piece: &AssembledPiece) -> String {
             index, timeline, ..
         } => format!("turn {}:{}", tl(timeline), index.0),
         AssembledPiece::DeferredUser(tokens) => format!("user[{}]", tokens.len()),
+        AssembledPiece::Hole(positions) => format!("hole[{positions}]"),
     }
 }
 
@@ -133,6 +137,10 @@ fn write_piece(h: &mut DefaultHasher, piece: &AssembledPiece, reads: &PieceReads
             for &t in tokens.iter() {
                 h.write_u32(t);
             }
+        }
+        AssembledPiece::Hole(positions) => {
+            h.write_u8(6);
+            h.write_usize(*positions);
         }
     }
 }

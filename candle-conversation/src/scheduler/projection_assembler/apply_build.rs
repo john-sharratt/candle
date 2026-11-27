@@ -130,7 +130,9 @@ pub(in super::super) fn apply_segments_build(
         .map(|r| HeldPiece {
             identity: r.identity,
             kind: r.kind,
-            end_pos: r.pos_after as usize,
+            // Where the model's per-position state can be cut is asked by
+            // position, holes included.
+            end_pos: r.at_after as usize,
         })
         .collect();
     let wanted: Vec<WantedPiece> = aligned
@@ -190,6 +192,7 @@ pub(in super::super) fn apply_segments_build(
     let mut content_before = records.last().map_or(0, |r| r.blocks_after);
     if let Some(last) = records.last() {
         walker.logical_pos = last.pos_after;
+        walker.holes = last.at_after - last.pos_after;
         // Every piece ends on a complete region — a sealed inject or a
         // reserved gap — so the next one starts a fresh writer chunk.
         walker.last_was_sealed = true;
@@ -244,13 +247,16 @@ pub(in super::super) fn apply_segments_build(
     check_drift(ctx, &walker, &|| "kept and spliced pieces".to_string());
     for i in plan.walk_from..pieces.len() {
         let pos_before = walker.logical_pos;
+        let holes_before = walker.holes;
         let t_piece = Instant::now();
         // This piece's contribution to the running prefix hash.
         let mut contrib = 0u64;
         let kind = match &pieces[i] {
             AssembledPiece::Section(_) => 0,
             AssembledPiece::Turn { .. } => 1,
-            AssembledPiece::Glue(_) | AssembledPiece::DeferredUser(_) => 2,
+            AssembledPiece::Glue(_) | AssembledPiece::DeferredUser(_) | AssembledPiece::Hole(_) => {
+                2
+            }
         };
         match &pieces[i] {
             AssembledPiece::Glue(tokens) => {
@@ -392,6 +398,13 @@ pub(in super::super) fn apply_segments_build(
             AssembledPiece::DeferredUser(tokens) => {
                 walker.deferred_user = Some(tokens.clone());
             }
+            AssembledPiece::Hole(positions) => {
+                place_hole(ctx, &mut walker, *positions)?;
+                let mut c = DefaultHasher::new();
+                c.write_u8(6);
+                c.write_u64(*positions as u64);
+                contrib = c.finish();
+            }
         }
         check_drift(ctx, &walker, &|| {
             format!("piece {i} {}", piece_label(&pieces[i]))
@@ -410,8 +423,10 @@ pub(in super::super) fn apply_segments_build(
                 kind: aligned[i].1,
                 blocks,
                 tokens: walker.logical_pos - pos_before,
+                holes: walker.holes - holes_before,
                 blocks_after,
                 pos_after: walker.logical_pos,
+                at_after: walker.logical_pos + walker.holes,
                 contrib,
                 prefix_h: prefix_h.clone(),
                 range: placed_range(&pieces[i], blocks),
@@ -539,7 +554,7 @@ pub(in super::super) fn apply_segments_build(
     let reach = state
         .placed_pieces
         .last()
-        .map_or(0, |p| p.pos_after as usize);
+        .map_or(0, |p| p.at_after as usize);
     let trained = ctx
         .model
         .rope_select()

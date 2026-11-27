@@ -661,6 +661,37 @@ pub(super) fn place_gap(
     }
 }
 
+/// Leave `positions` empty at the slot's tail, on its K/V and its per-position
+/// state alike: what the walk places next is read that many positions further
+/// on (`docs/placed_section_layout.md` §3.1).
+///
+/// Only ever at the tail. A hole is a forwarded piece to the splice plan
+/// (`piece_identity`), so an edit never carries one: a hole that changed is
+/// where the slot is cut and walked.
+pub(super) fn place_hole(
+    ctx: &mut ApplyContext<'_>,
+    walker: &mut SegmentWalker,
+    positions: usize,
+) -> Result<(), ConversationError> {
+    if walker.insert.is_some() {
+        return Err(ConversationError::Channel(format!(
+            "apply_segments: a {positions}-position hole inside an edit — the splice plan \
+             cuts at a hole and walks it at the tail"
+        )));
+    }
+    let seq = ctx.parent_id.0;
+    ctx.session
+        .push_sequence_position_gap(seq, positions)
+        .map_err(ConversationError::Model)?;
+    ctx.model
+        .push_positional_gap(seq, positions)
+        .map_err(ConversationError::Model)?;
+    walker.holes += positions as u32;
+    // What follows starts a chunk of its own, as after a sealed inject.
+    walker.last_was_sealed = true;
+    Ok(())
+}
+
 /// Name a piece the session cut to its layers' common prefix: which piece,
 /// what it stored, what the slot received, and what is being done about it.
 pub(super) fn report_cut(

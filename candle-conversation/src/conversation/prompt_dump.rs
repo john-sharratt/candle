@@ -116,6 +116,13 @@ pub(crate) fn lay_out(
                 tokens.as_ref().clone(),
                 source,
             ),
+            // Positions with no token: named, and nothing in the text.
+            ProjectionSegment::Hole { positions } => piece_of(
+                PieceKind::Glue,
+                format!("hole of {positions} positions"),
+                Vec::new(),
+                source,
+            ),
         };
         pieces.push(piece);
     }

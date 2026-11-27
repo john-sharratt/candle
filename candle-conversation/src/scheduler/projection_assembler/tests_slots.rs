@@ -198,6 +198,7 @@ pub(super) mod tests {
             ends.iter()
                 .map(|&pos_after| PlacedPiece {
                     pos_after,
+                    at_after: pos_after,
                     ..PlacedPiece::ending_at(0)
                 })
                 .collect()
@@ -232,6 +233,7 @@ pub(super) mod tests {
                 .map(|&(tokens, pos_after)| PlacedPiece {
                     tokens,
                     pos_after,
+                    at_after: pos_after,
                     ..PlacedPiece::ending_at(0)
                 })
                 .collect()

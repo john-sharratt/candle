@@ -477,11 +477,13 @@ impl Scheduler {
                                 segments.push(seg.clone());
                             }
                             ProjectionSegment::Generated { .. }
-                            | ProjectionSegment::NewUserMessage { .. } => {
-                                // Live-prefill runs and new-user-message
-                                // captures don't need an elevate side-list
-                                // entry — their K/V is produced on the
-                                // slot, not loaded from the substrate.
+                            | ProjectionSegment::NewUserMessage { .. }
+                            | ProjectionSegment::Hole { .. } => {
+                                // Live-prefill runs, new-user-message captures
+                                // and holes don't need an elevate side-list
+                                // entry — their K/V is produced on the slot,
+                                // or there is none, not loaded from the
+                                // substrate.
                                 segments.push(seg.clone());
                             }
                         }
