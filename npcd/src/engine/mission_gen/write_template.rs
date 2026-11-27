@@ -177,6 +177,7 @@ pub fn write(hosted: &Hosted, _body: &str, args: &Map<String, Value>) -> Outcome
         brief,
         steps,
         params,
+        choices: BTreeMap::new(),
         grants: Vec::new(),
         work: None,
     };

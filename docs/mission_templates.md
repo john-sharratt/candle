@@ -59,6 +59,7 @@ id:       kebab-case, unique within its world's library
 brief:    "Put {title} on {device}."          # {param} substitution
 steps:    [ "go to {room}", "put {title} on {device}" ]
 params:   [ title, device, room ]              # NEW — names that may appear in {…}
+choices:  { room: [ the front room, the den ] } # NEW — the values a param may take
 grants:   [ act, ... ]                         # NEW — lent while carried (Mission.grants)
 work:     { writes, reads, checks } | null     # NEW — for doc/coding/deploy templates
 ```
@@ -68,6 +69,14 @@ work:     { writes, reads, checks } | null     # NEW — for doc/coding/deploy t
   that references a `{name}` it did not declare, or that is issued with a declared
   parameter left unfilled, is refused rather than carried with a hole in it. A
   template with no `params` is exactly a routine as it works today.
+- **`choices`** names, for a parameter the world can list in full, every value
+  it may take: the grammar offers them as the field's enum
+  (`JobParam::choices`), and a post naming another is refused with the list.
+  A parameter not in `choices` takes any words. Each key must be a declared
+  parameter, and its values distinct and non-empty. The moon's `coding-task`
+  names its repositories: free, `repository` came back as `candle_repository`
+  and `candle-repo`, and Zen told the Creator it could find no "candle
+  repository" at all.
 - **`grants` / `work`** are the mission fields of the same name, carried through
   onto the produced `Mission` (`Mission::granting`, `Mission::with_work`), so a
   template can lend world-building acts or name a document to write with its
@@ -98,7 +107,10 @@ cannot close blank (`FreeTextLimits::nonblank`). `post` (`order_table.rs`)
 fetches the routine by id, reads each parameter from its field, substitutes
 them into its brief and steps, and posts the concrete mission. A missing or
 blank argument is refused there, with the parameter named, the same way a post
-with no step is refused today. No new post form and no new concept: a template
+with no step is refused today. A brief posted without steps is refused with the
+world's standing jobs named, since its work may be one of theirs: told only to
+give it steps, Zen posted a repository's research as a brief three times and
+never named `coding-task`. No new post form and no new concept: a template
 *is* a job, and this is the job path taking arguments.
 
 **Not one `args` string.** The arguments were first one free field of

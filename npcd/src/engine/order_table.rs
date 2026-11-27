@@ -47,6 +47,22 @@ fn sentence(mut e: String) -> String {
     e
 }
 
+/// The close of a refusal to a post that gave no work: the world's standing
+/// jobs by name, or nothing when it has none.
+fn or_a_job(hosted: &Hosted) -> String {
+    let jobs: Vec<String> = hosted.sim(|s| {
+        s.missions
+            .routines()
+            .iter()
+            .map(|r| format!("`{}`", r.id))
+            .collect()
+    });
+    match jobs.is_empty() {
+        true => String::new(),
+        false => format!(", or a standing `job` by name: {}", jobs.join(", ")),
+    }
+}
+
 /// Whether `body` is somebody a world gives orders to: a character's body —
 /// not a visitor's — that takes them.
 fn takes_orders(hosted: &Hosted, body: &str) -> bool {
@@ -75,20 +91,10 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
             }
         }
         None => {
+            // What to give, said where it is read: in the refusal, with the
+            // standing jobs by name.
+            let or_job = or_a_job(hosted);
             let Some(brief) = text(args, "brief") else {
-                // What to give, said where it is read: in the refusal, with
-                // the standing jobs by name.
-                let jobs: Vec<String> = hosted.sim(|s| {
-                    s.missions
-                        .routines()
-                        .iter()
-                        .map(|r| format!("`{}`", r.id))
-                        .collect()
-                });
-                let or_job = match jobs.is_empty() {
-                    true => String::new(),
-                    false => format!(", or a standing `job` by name: {}", jobs.join(", ")),
-                };
                 return Outcome::Refused(format!(
                     "You meant to post a mission, but did not say what is to be done. Give a \
                      `brief` and its `steps`{or_job}."
@@ -102,13 +108,16 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
                         .collect()
                 })
                 .unwrap_or_default();
+            // **A brief with no steps may be a standing job's work.** Told
+            // only to give it steps, Zen posted a repository's research as a
+            // brief three times over and never named `coding-task`, the one
+            // job that lends a Drone the acts that reach a repository.
             if steps.is_empty() {
-                return Outcome::Refused(
+                return Outcome::Refused(format!(
                     "Give it at least one step, one to a line, that whoever carries it can be \
                      seen to do — \"go to the ward room\", \"scan the sensor panel and read what \
-                     state it is in\"."
-                        .into(),
-                );
+                     state it is in\"{or_job}."
+                ));
             }
             Filled {
                 brief,
@@ -578,6 +587,19 @@ mod tests {
             Outcome::Refused(
                 "You meant to post a mission, but did not say what is to be done. Give a \
                  `brief` and its `steps`, or a standing `job` by name: `ward-shift`."
+                    .into()
+            )
+        );
+        assert_eq!(
+            post(
+                &h,
+                "zen",
+                &args(json!({"brief": "Research the ward rota."}))
+            ),
+            Outcome::Refused(
+                "Give it at least one step, one to a line, that whoever carries it can be seen \
+                 to do — \"go to the ward room\", \"scan the sensor panel and read what state it \
+                 is in\", or a standing `job` by name: `ward-shift`."
                     .into()
             )
         );

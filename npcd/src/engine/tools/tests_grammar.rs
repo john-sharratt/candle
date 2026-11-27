@@ -848,20 +848,30 @@ pub(super) mod tests {
     }
 
     /// A brought field as a test reads it: its name, whether it is required,
-    /// and its bound.
-    type Field<'a> = (&'a str, bool, Option<u32>);
+    /// its bound, and the values it may take.
+    type Field<'a> = (&'a str, bool, Option<u32>, Option<Vec<String>>);
 
     /// **A standing job brings its own arguments**: chosen as `order_post`'s
-    /// `job`, `coding-task` brings `what` and `repository`, each required and
-    /// bounded as an act's string is; a job that takes none brings nothing;
-    /// and there is no free `args` field to write them into.
+    /// `job`, `coding-task` brings `what`, required and bounded as an act's
+    /// string is, and `repository`, required and one of the repositories the
+    /// world names; a job that takes none brings nothing; and there is no free
+    /// `args` field to write them into.
     #[test]
     fn a_standing_job_brings_its_own_arguments() {
         let mut within = Within::among(&[]);
         within.jobs = vec!["coding-task".into(), "ward-shift".into()];
         within.job_params = vec![(
             "coding-task".into(),
-            vec!["what".into(), "repository".into()],
+            vec![
+                JobParam {
+                    name: "what".into(),
+                    choices: Vec::new(),
+                },
+                JobParam {
+                    name: "repository".into(),
+                    choices: vec!["candle".into(), "battle-mind".into()],
+                },
+            ],
         )];
         let params = stencil_params(by_name("order_post").unwrap(), &within);
         let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
@@ -879,7 +889,14 @@ pub(super) mod tests {
                     v.as_str(),
                     fields
                         .iter()
-                        .map(|f| (f.name.as_str(), f.required, f.max_tokens))
+                        .map(|f| {
+                            (
+                                f.name.as_str(),
+                                f.required,
+                                f.max_tokens,
+                                f.enum_values.clone(),
+                            )
+                        })
                         .collect(),
                 )
             })
@@ -889,8 +906,13 @@ pub(super) mod tests {
             [(
                 "coding-task",
                 vec![
-                    ("what", true, Some(ACT_VALUE_TOKENS)),
-                    ("repository", true, Some(ACT_VALUE_TOKENS))
+                    ("what", true, Some(ACT_VALUE_TOKENS), None),
+                    (
+                        "repository",
+                        true,
+                        None,
+                        Some(vec!["candle".to_string(), "battle-mind".to_string()])
+                    )
                 ]
             )]
         );

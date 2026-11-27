@@ -10,6 +10,15 @@
 
 use super::*;
 
+/// One parameter a standing job declares, as choosing the job brings it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct JobParam {
+    /// Its name: the field it is written into.
+    pub name: String,
+    /// The values the world names for it, or none when it takes any words.
+    pub choices: Vec<String>,
+}
+
 /// What is true where a character stands, in the grammar's own terms.
 ///
 /// Small and copied per turn on purpose: it is the *key* the compiled grammar
@@ -39,7 +48,7 @@ pub struct Within {
     pub jobs: Vec<String>,
     /// The parameters each standing job that takes any declares, by job: what
     /// choosing it as `order_post`'s `job` brings as fields of its own.
-    pub job_params: Vec<(String, Vec<String>)>,
+    pub job_params: Vec<(String, Vec<JobParam>)>,
     /// The house links in this room, by name — [`Choices::Links`]. Empty in a
     /// room with no network to survey.
     pub links: Vec<String>,
@@ -331,7 +340,17 @@ impl Within {
             .routines()
             .iter()
             .filter(|r| !r.params.is_empty())
-            .map(|r| (r.id.clone(), r.params.clone()))
+            .map(|r| {
+                let params = r
+                    .params
+                    .iter()
+                    .map(|p| JobParam {
+                        name: p.clone(),
+                        choices: r.choices.get(p).cloned().unwrap_or_default(),
+                    })
+                    .collect();
+                (r.id.clone(), params)
+            })
             .collect();
         self.years = sim
             .missions

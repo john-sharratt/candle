@@ -110,9 +110,10 @@ pub(super) fn value_shapes(
 }
 
 /// The parameters each standing job declares, as the fields choosing it as
-/// `t.param` brings — required free strings, bounded as an act's are. A
-/// parameter named as one of the act's own fields is that field, already
-/// offered, and is not brought again.
+/// `t.param` brings — required, each one of the values the world names for
+/// it, or else a free string bounded as an act's is. A parameter named as one
+/// of the act's own fields is that field, already offered, and is not brought
+/// again.
 fn declared_shapes(t: &Tool, param: &str, within: &Within) -> Vec<(String, Vec<StencilParam>)> {
     if !DECLARED.contains(&(t.name, param)) {
         return Vec::new();
@@ -123,12 +124,12 @@ fn declared_shapes(t: &Tool, param: &str, within: &Within) -> Vec<(String, Vec<S
         .map(|(job, params)| {
             let fields = params
                 .iter()
-                .filter(|p| !t.params.iter().any(|own| own.name == p.as_str()))
+                .filter(|p| !t.params.iter().any(|own| own.name == p.name))
                 .map(|p| StencilParam {
-                    name: p.clone(),
+                    name: p.name.clone(),
                     ty: ParamType::String,
                     required: true,
-                    enum_values: None,
+                    enum_values: (!p.choices.is_empty()).then(|| p.choices.clone()),
                     items: None,
                     min_items: 0,
                     max_items: None,
@@ -136,7 +137,7 @@ fn declared_shapes(t: &Tool, param: &str, within: &Within) -> Vec<(String, Vec<S
                     nullable: false,
                     minimum: None,
                     maximum: None,
-                    max_tokens: Some(ACT_VALUE_TOKENS),
+                    max_tokens: p.choices.is_empty().then_some(ACT_VALUE_TOKENS),
                     requires: Vec::new(),
                     shapes: Vec::new(),
                     pick: Pick::None,
