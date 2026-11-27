@@ -282,7 +282,7 @@ impl ConversationEngine {
                 prompt.iter().filter(|(t, _)| !t.is_empty()).collect();
             let split = pieces
                 .len()
-                .saturating_sub(transplant.map_or(0, |t| t.live_tail));
+                .saturating_sub(transplant.as_ref().map_or(0, |t| t.live_tail));
             let (head, live) = pieces.split_at(split);
             for (tokens, _) in head {
                 self.raw_turn(sequence_id, tokens, 0)?;
@@ -310,6 +310,7 @@ impl ConversationEngine {
                         prompt_tokens: head.iter().map(|(p, _)| p.len()).sum(),
                         kv: t.kv,
                         index: t.index,
+                        own_chunks: t.own_chunks,
                         response_tx: tx,
                     })
                     .map_err(|_| ConversationError::SchedulerGone)?;

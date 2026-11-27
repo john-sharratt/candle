@@ -46,10 +46,43 @@ pub(super) fn leading_covering(
     )))
 }
 
+/// The first `n` chunks of `captured`, each one `own` names taken from `ours`
+/// instead. `window` is a chunk's `(offset, tokens)`: a chunk kept from `ours`
+/// must lie in the captured one's window, or the slot does not hold the same
+/// prompt in the same chunks and the mix is refused.
+pub(super) fn mixed_chunks<T: Clone>(
+    captured: &[T],
+    ours: &[T],
+    n: usize,
+    own: &[usize],
+    window: impl Fn(&T) -> (u16, u16),
+) -> Result<Vec<T>, ConversationError> {
+    let mut out: Vec<T> = captured[..n].to_vec();
+    for &i in own {
+        let (Some(c), Some(o)) = (captured.get(i).filter(|_| i < n), ours.get(i)) else {
+            return Err(ConversationError::Channel(format!(
+                "transplant: chunk {i} kept as the slot's own is past the prompt's {n} \
+                 chunks or the slot's {} chunks",
+                ours.len()
+            )));
+        };
+        if window(c) != window(o) {
+            return Err(ConversationError::Channel(format!(
+                "transplant: chunk {i} is {:?} on the slot but {:?} in the capture",
+                window(o),
+                window(c)
+            )));
+        }
+        out[i] = o.clone();
+    }
+    Ok(out)
+}
+
 impl Scheduler {
     /// Give `slot`, holding the first `prompt_tokens` of the captured slot's
     /// prompt in the same windows, the capture's K/V for them (`kv`), its
-    /// index pages for them (`index`), or both. The capture is taken either
+    /// index pages for them (`index`), or both. With `kv`, the chunks
+    /// `own_chunks` names keep the slot's own K/V. The capture is taken either
     /// way.
     pub(super) fn transplant(
         &mut self,
@@ -58,6 +91,7 @@ impl Scheduler {
         prompt_tokens: usize,
         kv: bool,
         index: bool,
+        own_chunks: &[usize],
     ) -> Result<(), ConversationError> {
         let cap = self
             .captures
@@ -73,7 +107,19 @@ impl Scheduler {
                     .collect();
                 let n = leading_covering(&widths, prompt_tokens)?;
                 let mut prompt = sealed.clone();
-                prompt.chunks.truncate(n);
+                if own_chunks.is_empty() {
+                    prompt.chunks.truncate(n);
+                } else {
+                    // The slot's own chunks, held before it is cut back: what
+                    // the kept anchors are read from.
+                    let ours = backing
+                        .record_turn(slot.0)
+                        .map_err(ConversationError::Model)?;
+                    prompt.chunks =
+                        mixed_chunks(&sealed.chunks, &ours.chunks, n, own_chunks, |c| {
+                            (c.offset, c.token_count)
+                        })?;
+                }
                 prompt.token_count = prompt_tokens;
                 backing
                     .truncate_sequence_to_blocks(slot.0, 0)
@@ -110,6 +156,32 @@ mod tests {
         assert_eq!(leading_covering(&[32, 8, 0, 5, 20], 40).unwrap(), 2);
         assert_eq!(leading_covering(&[32, 8, 5], 45).unwrap(), 3);
         assert_eq!(leading_covering(&[3, 273], 0).unwrap(), 0);
+    }
+
+    /// **The named chunks are the slot's own, every other the capture's**, cut
+    /// to the prompt.
+    #[test]
+    fn the_named_chunks_are_the_slots_own() {
+        let captured = [("c0", 0, 32), ("c1", 0, 32), ("c2", 0, 5), ("c3", 0, 9)];
+        let ours = [("o0", 0, 32), ("o1", 0, 32), ("o2", 0, 5), ("o3", 0, 9)];
+        let window = |c: &(&str, u16, u16)| (c.1, c.2);
+        let mixed = mixed_chunks(&captured, &ours, 3, &[0, 2], window).unwrap();
+        let names: Vec<&str> = mixed.iter().map(|c| c.0).collect();
+        assert_eq!(names, vec!["o0", "c1", "o2"]);
+        let none = mixed_chunks(&captured, &ours, 3, &[], window).unwrap();
+        let names: Vec<&str> = none.iter().map(|c| c.0).collect();
+        assert_eq!(names, vec!["c0", "c1", "c2"]);
+    }
+
+    /// **A kept chunk past the prompt, or in another window, is refused.**
+    #[test]
+    fn a_kept_chunk_out_of_place_is_refused() {
+        let captured = [("c0", 0, 32), ("c1", 0, 7)];
+        let ours = [("o0", 0, 32), ("o1", 0, 8)];
+        let window = |c: &(&str, u16, u16)| (c.1, c.2);
+        assert!(mixed_chunks(&captured, &ours, 1, &[1], window).is_err());
+        assert!(mixed_chunks(&captured, &ours, 2, &[1], window).is_err());
+        assert!(mixed_chunks(&captured, &ours[..1], 2, &[1], window).is_err());
     }
 
     /// **A prompt that ends inside an item is refused.**

@@ -49,6 +49,7 @@ use candle_conversation::{SamplingConfig, TurnOptions};
 use serde::{Deserialize, Serialize};
 
 use super::builders::turn_projection;
+use super::sealed_fresh_anchors::anchor_chunks;
 use super::sealed_fresh_layout::{compare, piece_chunks, LayoutComparison};
 use super::sealed_fresh_reseal::{prefix_before, reseal_behind, DumpedPiece};
 use super::ZendSession;
@@ -121,6 +122,16 @@ pub struct SealedFreshReq {
     /// before it holds.
     #[serde(default)]
     pub live_tail: usize,
+    /// With the sealed K/V transplanted, each section's first this many
+    /// tokens keep the fresh prefill's K/V — computed in the prompt's context
+    /// — and the rest of it takes the sealed K/V (`sealed_fresh_anchors.rs`).
+    /// Whole chunks: every chunk holding one of them. Needs the fresh side
+    /// laid out in pieces, so its chunks are the sealed side's.
+    #[serde(default)]
+    pub anchor_head: usize,
+    /// As [`Self::anchor_head`], each section's last this many tokens.
+    #[serde(default)]
+    pub anchor_tail: usize,
     /// Other knowledge-base files placed after the file, in path order, until
     /// their tokens reach this — the file no longer the last thing the
     /// question reads.
@@ -384,6 +395,9 @@ pub struct SealedFresh {
     /// Resealed, whether the prompt with the resealed members placed holds
     /// exactly the tokens the stored members' prompt did.
     pub resealed_same_tokens: Option<bool>,
+    /// Chunks the transplant kept from the fresh prefill as the sections'
+    /// anchors ([`SealedFreshReq::anchor_head`]); 0 without anchors.
+    pub anchored_chunks: usize,
     /// The files placed after the file, in order, and their members' tokens.
     pub after_files: Vec<String>,
     pub after_tokens: usize,
@@ -597,12 +611,41 @@ impl ZendSession {
                 Recurrent::Sealed => Some(without_members(&dump, &members)),
                 Recurrent::Replayed => Some(dump.token_ids.clone()),
             };
+            let own_chunks = if req.anchor_head + req.anchor_tail > 0 {
+                anyhow::ensure!(
+                    req.fresh_kv == Source::Sealed && req.fresh_layout != Layout::Contiguous,
+                    "anchors keep fresh chunks over a sealed K/V transplant: they need \
+                     fresh_kv: sealed and the fresh side laid out in pieces"
+                );
+                let pieces: Vec<_> = dump
+                    .pieces
+                    .iter()
+                    .filter(|p| !p.token_ids.is_empty())
+                    .collect();
+                let tokens: Vec<usize> = pieces.iter().map(|p| p.token_ids.len()).collect();
+                let sections: Vec<bool> = pieces
+                    .iter()
+                    .map(|p| matches!(p.kind, PieceKind::Section))
+                    .collect();
+                let cuts = piece_chunks(&sealed_layout.chunks, &tokens)
+                    .map_err(|e| anyhow::anyhow!("the sealed slot's pieces: {e}"))?;
+                let widths: Vec<usize> = sealed_layout
+                    .chunks
+                    .iter()
+                    .map(|c| c.tokens as usize)
+                    .collect();
+                anchor_chunks(&widths, &cuts, &sections, req.anchor_head, req.anchor_tail)
+            } else {
+                Vec::new()
+            };
+            let anchored_chunks = own_chunks.len();
             let transplant = (req.fresh_kv == Source::Sealed || req.fresh_index == Source::Sealed)
                 .then_some(TransplantFrom {
                     capture: sealed_layout.capture,
                     kv: req.fresh_kv == Source::Sealed,
                     index: req.fresh_index == Source::Sealed,
                     live_tail: req.live_tail,
+                    own_chunks,
                 });
             if transplant.is_none() {
                 engine.release_capture(sealed_layout.capture);
@@ -650,6 +693,7 @@ impl ZendSession {
                 fresh_finish,
                 layout,
                 resealed_same_tokens,
+                anchored_chunks,
                 after_files: after.iter().map(|r| r.path.clone()).collect(),
                 after_tokens: after.iter().map(record_tokens).sum(),
                 seed_files: seed_files.iter().map(|r| r.path.clone()).collect(),

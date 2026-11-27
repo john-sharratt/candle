@@ -3,7 +3,7 @@
 
 /// A described slot's capture ([`crate::SlotLayout::capture`]) and what of it
 /// to take.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransplantFrom {
     pub capture: u64,
     /// Take the captured slot's K/V for the prompt in place of the slot's own.
@@ -14,4 +14,9 @@ pub struct TransplantFrom {
     /// it, live over the K/V and index it put in place, as production
     /// prefills what follows the sealed sections it places.
     pub live_tail: usize,
+    /// With `kv`, the prompt's chunks, by index, that keep the slot's own K/V
+    /// instead of taking the capture's: the anchors of a section — its first
+    /// and last tokens — computed in the prompt's context, the rest of it as
+    /// sealed. Empty takes every chunk.
+    pub own_chunks: Vec<usize>,
 }

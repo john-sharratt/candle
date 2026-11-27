@@ -383,13 +383,15 @@ pub(crate) enum SchedulerRequest {
     /// Give `sequence_id` — holding the first `prompt_tokens` of a described
     /// slot's prompt in the same chunk windows — that slot's K/V for them
     /// (`kv`), its index pages for them (`index`), or both, from the capture
-    /// its description named. The capture is taken either way.
+    /// its description named. The capture is taken either way. With `kv`, the
+    /// chunks `own_chunks` names keep the slot's own K/V.
     Transplant {
         sequence_id: SequenceId,
         capture: u64,
         prompt_tokens: usize,
         kv: bool,
         index: bool,
+        own_chunks: Vec<usize>,
         response_tx: Sender<Result<(), ConversationError>>,
     },
 

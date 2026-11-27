@@ -53,6 +53,7 @@ pub mod restore;
 pub mod resume;
 pub mod scan;
 pub mod sealed_fresh;
+pub mod sealed_fresh_sweep;
 pub mod substrate;
 pub mod worker_continue;
 
@@ -295,6 +296,14 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             Role::User,
             Dispatch::Best,
             post(sealed_fresh::run),
+        )
+        // The same, swept over how much of each placed section's ends is
+        // kept fresh over sealed K/V.
+        .route(
+            "/v1/substrate/zend/sealed-fresh/anchors",
+            Role::User,
+            Dispatch::Best,
+            post(sealed_fresh_sweep::run),
         )
         // Every member reaches every agent through its gateway, so any one
         // answers for them.
@@ -564,6 +573,7 @@ mod tests {
                 ("/v1/substrate/zend/project", "admin"),
                 ("/v1/substrate/zend/scan", "admin"),
                 ("/v1/substrate/zend/sealed-fresh", "user"),
+                ("/v1/substrate/zend/sealed-fresh/anchors", "user"),
                 ("/v1/agents", "admin"),
                 ("/v1/agents/:node", "admin"),
                 ("/v1/agents/:node/jobs/:id", "admin"),
@@ -683,6 +693,11 @@ mod tests {
             ("DELETE", "/v1/substrate/zend/timeline/7", Dispatch::Best),
             ("POST", "/v1/substrate/zend/scan", Dispatch::Best),
             ("POST", "/v1/substrate/zend/sealed-fresh", Dispatch::Best),
+            (
+                "POST",
+                "/v1/substrate/zend/sealed-fresh/anchors",
+                Dispatch::Best,
+            ),
             ("GET", "/v1/substrate/zend/system-prompt", Dispatch::Any),
             ("DELETE", "/v1/substrate/zend/system-prompt", Dispatch::Best),
             (

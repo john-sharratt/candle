@@ -241,8 +241,10 @@ use titler::{retire_titler_timelines, Titler};
 pub mod placed_files;
 pub mod restore;
 pub mod sealed_fresh;
+pub mod sealed_fresh_anchors;
 pub mod sealed_fresh_layout;
 pub mod sealed_fresh_reseal;
+pub mod sealed_fresh_sweep;
 mod titles;
 
 pub use replay::{

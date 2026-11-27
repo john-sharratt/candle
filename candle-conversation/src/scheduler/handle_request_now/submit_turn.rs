@@ -1005,6 +1005,7 @@ impl Scheduler {
                 prompt_tokens,
                 kv,
                 index,
+                own_chunks,
                 response_tx,
             } => {
                 let _ = response_tx.send(self.transplant(
@@ -1013,6 +1014,7 @@ impl Scheduler {
                     prompt_tokens,
                     kv,
                     index,
+                    &own_chunks,
                 ));
                 true
             }
