@@ -501,17 +501,17 @@ mod cuda_impl {
         use candle::quantized::pinned_staging::PinnedBuf;
         use std::sync::Arc;
 
+        use crate::card_alone::cuda_alone;
         use crate::persistence::record::ChunkPayload;
 
         const FZ_N_KV_HEAD: usize = 4;
         const FZ_HEAD_DIM: usize = 128;
         const FZ_ARENA_CAPACITY: usize = 256;
 
+        /// The card, to this test alone: skips without one, aborts while a
+        /// live daemon holds it (`card_alone`).
         fn cuda_device_or_skip() -> Option<candle::Device> {
-            match candle::Device::cuda_if_available(0) {
-                Ok(d @ candle::Device::Cuda(_)) => Some(d),
-                _ => None,
-            }
+            cuda_alone(0)
         }
 
         fn cuda_stream(device: &candle::Device) -> candle::cuda_backend::StreamLease {
@@ -1114,9 +1114,8 @@ mod cuda_impl {
         /// lengths and a chunk made of two pieces.
         #[test]
         fn gather_with_goldens_matches_cpu_fletcher() {
-            let device = match candle::Device::cuda_if_available(0) {
-                Ok(d @ candle::Device::Cuda(_)) => d,
-                _ => return, // no GPU — skip
+            let Some(device) = cuda_device_or_skip() else {
+                return;
             };
             let dev = cuda_device(&device).unwrap();
 

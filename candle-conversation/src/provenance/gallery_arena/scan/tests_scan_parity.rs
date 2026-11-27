@@ -16,6 +16,7 @@ pub(super) mod tests {
 
     use super::*;
 
+    use crate::card_alone::cuda_alone;
     use crate::persistence::content_hash::turn_stream_id;
 
     use crate::provenance::gpu::{BatchedGpuGallery, SegmentInput};
@@ -31,9 +32,9 @@ pub(super) mod tests {
     /// move a single bit of either probe's votes.
     #[test]
     fn probes_batched_into_one_launch_vote_as_they_do_alone() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -123,9 +124,9 @@ pub(super) mod tests {
     /// vote must still match an arena that never saw the first probe.
     #[test]
     fn a_rescan_reusing_rows_votes_as_a_fresh_scan() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let a: Vec<WideQSig> = (0..40).map(|t| sig(0x7000 + t)).collect();
         let b: Vec<WideQSig> = (0..12).map(|t| sig(0x8000 + t)).collect();
@@ -217,9 +218,9 @@ pub(super) mod tests {
     /// files, and non-uniform group weights. Skips when no CUDA device is present.
     #[test]
     fn paged_matches_contiguous_bit_identical() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -385,9 +386,9 @@ pub(super) mod tests {
     /// at one vote and at top-8.
     #[test]
     fn a_wide_segment_with_tied_cases_votes_as_the_scalar_pass() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -473,9 +474,9 @@ pub(super) mod tests {
     /// on Ada, INT8 IMMA on Ampere and later — Blackwell has only the latter.
     #[test]
     fn tensor_backends_match_scalar_on_adversarial_corpus() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -623,9 +624,9 @@ pub(super) mod tests {
     /// for the top-k law is not reused for rows of a different width.
     #[test]
     fn every_backend_scores_a_segments_vote_law_as_the_host_does() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -746,9 +747,9 @@ pub(super) mod tests {
     /// reference.
     #[test]
     fn a_wide_gallery_is_scanned_in_probe_chunks_bit_identically() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();

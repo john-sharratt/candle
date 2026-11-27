@@ -19,6 +19,7 @@ pub(super) mod tests {
 
     use super::*;
 
+    use crate::card_alone::cuda_alone;
     use crate::persistence::content_hash::turn_stream_id;
 
     use super::super::tests_support::tests::{rand_sig, sig};
@@ -28,9 +29,9 @@ pub(super) mod tests {
     /// the same sigs and reproduces the result bit-identically. Skips without CUDA.
     #[test]
     fn eviction_then_rebuild_is_stable() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -116,9 +117,9 @@ pub(super) mod tests {
     /// still produces the correct result. Skips without CUDA.
     #[test]
     fn index_cache_keyed_by_fingerprint_no_thrash() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -187,9 +188,9 @@ pub(super) mod tests {
     /// dialogue's whole index every reprojection. Skips without CUDA.
     #[test]
     fn an_unrelated_upload_keeps_the_index_and_a_reseal_drops_it() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -267,9 +268,9 @@ pub(super) mod tests {
     /// narrow reader's unweighed group voting for nothing.
     #[test]
     fn readers_weighing_different_groups_share_one_index() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let mut rng = 0x5AA2_ED1D_u64;
@@ -361,9 +362,9 @@ pub(super) mod tests {
     /// gone, so reuse refuses it as stale rather than handing out freed pages.
     #[test]
     fn an_index_over_an_evicted_turn_is_stale() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -408,9 +409,9 @@ pub(super) mod tests {
     /// quietly wrong retrieval.
     #[test]
     fn a_compaction_leaves_every_score_identical() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -525,9 +526,9 @@ pub(super) mod tests {
     /// segments, once.
     #[test]
     fn a_keyed_scan_builds_its_segments_only_for_an_index() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();

@@ -352,9 +352,9 @@ mod tests {
     use super::super::pages::{page_words, transpose_to_pages};
     use super::super::tests::gallery_pool;
     use super::*;
+    use crate::card_alone::cuda_alone;
     use crate::persistence::content_hash::turn_stream_id;
     use crate::provenance::{encode_wide_sigs, SigWindow, WideQSig};
-    use candle::Device;
 
     fn sig(fill: u64) -> WideQSig {
         WideQSig {
@@ -375,7 +375,7 @@ mod tests {
     /// as raw words equal to the single-turn transpose.
     #[test]
     fn a_batch_admits_hits_and_misses_of_either_form() {
-        let Ok(device) = Device::new_cuda(0) else {
+        let Some(device) = cuda_alone(0) else {
             return;
         };
         let _pool = gallery_pool();

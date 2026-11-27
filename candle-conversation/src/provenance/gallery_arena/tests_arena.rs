@@ -15,9 +15,9 @@ use super::*;
 pub(super) mod tests {
     use super::batch_ensure::Wanted;
     use super::*;
+    use crate::card_alone::cuda_alone;
     use crate::projection::TimelineId;
     use crate::provenance::WideQSig;
-    use candle::Device;
 
     fn sig(fill: u64) -> WideQSig {
         WideQSig {
@@ -74,9 +74,9 @@ pub(super) mod tests {
     /// transpose survived the H2D exactly (raw bytes, not a threshold).
     #[test]
     fn resident_pages_roundtrip_group_major() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return, // no GPU — skip
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return, // no GPU — skip
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -110,9 +110,9 @@ pub(super) mod tests {
     /// a region, and none of them in another tenant's arena.
     #[test]
     fn pages_are_gallery_tenant_slots() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -132,9 +132,9 @@ pub(super) mod tests {
     /// A matching fingerprint is a hit: same addresses, no new pages allocated.
     #[test]
     fn fingerprint_hit_reuses_pages() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -151,9 +151,9 @@ pub(super) mod tests {
     /// A changed fingerprint (a re-seal) frees the old pages and re-uploads.
     #[test]
     fn fingerprint_miss_reuploads_and_recycles() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -175,9 +175,9 @@ pub(super) mod tests {
     /// in place, and only admitting a new one gives the idle turns up.
     #[test]
     fn only_an_upload_runs_the_keep_eviction() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -200,9 +200,9 @@ pub(super) mod tests {
     /// batch's own turns — one re-uploaded, one new — are all resident after.
     #[test]
     fn a_preload_gives_up_idle_turns_once_then_admits_its_own() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -232,9 +232,9 @@ pub(super) mod tests {
     /// that; a shared read of turn 1 after a conversation's makes it shared.
     #[test]
     fn holders_widen_and_drop_turns_skips_pins() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -274,9 +274,9 @@ pub(super) mod tests {
     /// Eviction frees LRU turns and skips the pinned working set.
     #[test]
     fn evict_lru_skips_pins() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -320,9 +320,9 @@ pub(super) mod tests {
     /// a corrupted signature, not an approximation.
     #[test]
     fn compaction_moves_pages_without_changing_them() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -394,9 +394,9 @@ pub(super) mod tests {
     /// generation moves only when something actually did.
     #[test]
     fn compaction_skips_pins_and_bumps_the_generation_only_on_a_move() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -437,9 +437,9 @@ pub(super) mod tests {
     /// trusts it without walking its turns.
     #[test]
     fn compaction_of_a_packed_gallery_is_a_no_op() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();

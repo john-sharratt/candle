@@ -488,6 +488,7 @@ mod tests {
     use candle::cuda_backend::cudarc::driver::CudaStream;
     use candle::quantized::pinned_staging::PinnedBuf;
 
+    use crate::card_alone::cuda_alone;
     use crate::projection::{GroupId, LayerId, TimelineAllocator, TimelineId, TurnIndex};
     use crate::substrate::TurnPartWrite;
     use crate::turn::Role;
@@ -495,12 +496,10 @@ mod tests {
     use candle_nn::kv_cache::{ChunkedKvBacking, SealedSequence};
     use half::bf16;
 
-    /// Skip-on-no-GPU helper. Mirrors the candle-nn batched-async tests.
+    /// The card, to this test alone: skips without one, aborts while a live
+    /// daemon holds it (`card_alone`).
     fn cuda_device_or_skip() -> Option<Device> {
-        match Device::cuda_if_available(0) {
-            Ok(d @ Device::Cuda(_)) => Some(d),
-            _ => None,
-        }
+        cuda_alone(0)
     }
 
     /// Create a deterministic BF16 turn across `n_layers` backings and

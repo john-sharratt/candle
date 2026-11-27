@@ -20,6 +20,7 @@ pub(super) mod tests {
 
     use super::*;
 
+    use crate::card_alone::cuda_alone;
     use crate::persistence::content_hash::turn_stream_id;
 
     use crate::projection::TimelineId;
@@ -43,9 +44,9 @@ pub(super) mod tests {
     /// segments and probes. Skips when no CUDA device is present.
     #[test]
     fn the_raw_votes_tally_to_the_weighted_scan() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -120,9 +121,9 @@ pub(super) mod tests {
     /// token then widens them, and scans as the raw arena does.
     #[test]
     fn a_deduped_scan_is_the_raw_scan_of_its_kept_tokens() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let mut rng = 0xDEDD_0B5E_u64;
@@ -255,9 +256,9 @@ pub(super) mod tests {
     /// the turn to shared.
     #[test]
     fn a_scan_holds_its_turns_for_its_reader() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -304,9 +305,9 @@ pub(super) mod tests {
     /// votes, and the narrow pages are a third and two thirds smaller.
     #[test]
     fn a_scan_of_the_weighed_groups_is_the_full_scan() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let mut rng = 0x6A1E_5EED_u64;
@@ -427,9 +428,9 @@ pub(super) mod tests {
     /// the card has write identical rows.
     #[test]
     fn the_statistics_mode_is_the_host_reference_on_every_backend() {
-        let device = match Device::new_cuda(0) {
-            Ok(d) => d,
-            Err(_) => return,
+        let device = match cuda_alone(0) {
+            Some(d) => d,
+            None => return,
         };
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
@@ -534,7 +535,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "benchmark: needs an idle card"]
     fn bench_wide_turn_group_scan() {
-        let device = Device::new_cuda(0).expect("a CUDA card");
+        let device = cuda_alone(0).expect("a CUDA card");
         let _pool = gallery_pool();
         let arena = GalleryArena::new(&device, 24, 3).unwrap();
         let mut rng = 0xBE_4C11_0017_u64;

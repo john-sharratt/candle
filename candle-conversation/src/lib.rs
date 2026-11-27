@@ -51,6 +51,8 @@
 mod banned_rows;
 mod batched_sampler;
 mod cancel;
+/// A GPU test's card to itself: the check that no live daemon holds it.
+pub mod card_alone;
 /// Whether a turn chain finished what it started — the ingest-recovery signal.
 pub mod chain_health;
 mod config;
