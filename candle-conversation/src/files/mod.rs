@@ -5,6 +5,8 @@
 //!   ([`LineSpan`], [`ChunkKey`]);
 //! - [`chunk`] — a section of a file: the lines it holds and its text;
 //! - [`mandatory`] — the files every free knowledge base places whole;
+//! - [`scope`] — a reserved range's placed sections in the order they
+//!   entered, and the per-step decisions that change them;
 //! - [`render`] — the notation, and the pieces the prompt seals it as.
 
 pub mod chunk;
@@ -16,6 +18,7 @@ pub mod owner;
 pub mod placed;
 pub mod record;
 pub mod render;
+pub mod scope;
 pub mod set;
 pub mod stream_name;
 
