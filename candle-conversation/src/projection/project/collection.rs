@@ -7,6 +7,9 @@
 //! Emission keeps the authored catalog order, and a collection with no provenance
 //! opinion shows everything it was offered.
 
+use std::collections::HashSet;
+
+use super::range_fill::fit_by_tokens;
 use super::*;
 
 /// Apply a collection's selection rule, returning the surviving
@@ -231,6 +234,12 @@ pub(super) fn select_collection_sections<R: ContentResolver>(
                     resolver.collection_attention_mass(coll.id.raw()),
                 );
             }
+            // A ranged collection is filled by tokens, not by a count: the
+            // range is its size, so the selection may choose every member and
+            // the range takes them by score while they fit (`range_fill`).
+            if coll.range.is_some() {
+                cfg.budget_max = cfg.budget_max.max(candidates.len());
+            }
             let beliefs = crate::provenance::belief_step(
                 &fresh,
                 &prior_scores,
@@ -266,6 +275,25 @@ pub(super) fn select_collection_sections<R: ContentResolver>(
             // first `k` by declaration order — the room already narrowed it to
             // acts the body can take.
             let no_opinion = offered.is_some() && fresh.iter().all(|&f| f <= 0.0);
+            // What a ranged collection's range holds of what was selected:
+            // the mandatory members' tokens first, then by score while each
+            // fits (`docs/placed_section_layout.md` §3.5).
+            let fits: Option<HashSet<SectionId>> = coll.range.map(|range| {
+                let room = range.positions(resolver.trained_window());
+                let mandatory: usize = coll
+                    .sections
+                    .iter()
+                    .filter(|s| coll.mandatory.contains(&s.id) && is_offered(s))
+                    .map(|s| resolver.section_token_count(s.id))
+                    .sum();
+                let chosen: Vec<(SectionId, f32, usize)> = candidates
+                    .iter()
+                    .zip(&beliefs)
+                    .filter(|(_, b)| b.selected || no_opinion)
+                    .map(|(s, b)| (s.id, b.score, resolver.section_token_count(s.id)))
+                    .collect();
+                fit_by_tokens(&chosen, room, mandatory)
+            });
             let mut beliefs = beliefs.into_iter();
             let mut out = Vec::new();
             for s in coll.sections.iter().filter(|s| is_offered(s)) {
@@ -278,7 +306,7 @@ pub(super) fn select_collection_sections<R: ContentResolver>(
                         .next()
                         .expect("one belief per non-mandatory member, in catalog order");
                     scores.set_section(s.id, b.score, b.qualified);
-                    b.selected || no_opinion
+                    (b.selected || no_opinion) && fits.as_ref().is_none_or(|f| f.contains(&s.id))
                 };
                 if emit {
                     push_member_glue(&mut out, coll);

@@ -217,6 +217,7 @@ mod emit;
 mod exchange;
 mod mode;
 mod pipeline;
+mod range_fill;
 mod resolved;
 mod section_tree;
 #[cfg(test)]

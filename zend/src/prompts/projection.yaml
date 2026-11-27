@@ -676,19 +676,22 @@ system_prompt:
         early_window_tokens: 64
         early_min_score: 250
         early_evict_score: 187.5
-        # Up to five signatures a turn. Three left a delegated task that names
-        # several tools — "call job_status …, then job_grep …" — showing none of
-        # them: build-flavoured tools matched the prompt's cargo words and took
-        # every slot, and the model guessed the named tools' arguments.
+        # At least one signature a turn. The count's ceiling binds only a
+        # collection with no range: this one's range below is its size, and
+        # the selection fills it by score until the next signature does not
+        # fit (docs/placed_section_layout.md §3.5). A count of three left a
+        # delegated task that names several tools — "call job_status …, then
+        # job_grep …" — showing none of them.
         budget: { min: 1, max: 5 }
       # `selection` mirrors the policy budget (max 5) for the pre-belief
-      # selection path; once the belief loop drives selection the policy's
-      # budget is the single source of truth.
+      # selection path; once the belief loop drives selection the policy and
+      # the range below decide.
       selection: { kind: top_k, k: 5 }
-      # Its reserved range (docs/placed_section_layout.md §3.1, §3.7b): each
-      # signature sealed ending at the range's top, the selected ones placed
-      # there, the rest of the range a hole — so everything after the tools
-      # stands where it stands whichever are selected.
+      # Its reserved range (docs/placed_section_layout.md §3.1, §3.5, §3.7b):
+      # each signature sealed ending at the range's top, the selected ones
+      # placed there by score while they fit, the rest of the range a hole —
+      # so everything after the tools stands where it stands whichever are
+      # selected.
       range: { tokens: 8192 }
       sections: []
 

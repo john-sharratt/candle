@@ -77,7 +77,8 @@ fn project(b: &Builder, resolver: &MockResolver) -> Vec<ProjectionSegment> {
 }
 
 /// **A range filled from the top holds its members at the top**: a hole of
-/// what the two selected members leave, then the members.
+/// what the members that fit leave, then the members — c (50) does not fit
+/// the 45 a and b leave.
 #[test]
 fn a_range_filled_from_the_top_holds_its_members_at_the_top() {
     let b = Builder::from_yaml(&yaml("top")).unwrap();
@@ -89,6 +90,7 @@ fn a_range_filled_from_the_top_holds_its_members_at_the_top() {
         .with_section_tokens(id("framing"), 5)
         .with_section_tokens(id("tool_a"), 30)
         .with_section_tokens(id("tool_b"), 25)
+        .with_section_tokens(id("tool_c"), 50)
         .with_section_tokens(id("outro"), 4);
     assert_eq!(
         places(&project(&b, &resolver)),
@@ -100,6 +102,35 @@ fn a_range_filled_from_the_top_holds_its_members_at_the_top() {
             (Some(id("outro")), None),
         ]
     );
+}
+
+/// **A ranged collection is filled by tokens, not by its count**
+/// (`docs/placed_section_layout.md` §3.5): `top_k` 2 notwithstanding, the
+/// 60-position range takes a (30) and b (25) by score and would take a third
+/// that fit; c (20) does not fit the 5 left. The hole is what they leave.
+#[test]
+fn a_ranged_collection_is_filled_by_tokens() {
+    let yaml = yaml("top").replace(
+        "range: { tokens: 100, small_context: 40, fill: top }",
+        "range: { tokens: 60 }",
+    );
+    let b = Builder::from_yaml(&yaml).unwrap();
+    let id = |n: &str| b.id_for_system_section(n).unwrap();
+    let resolver = MockResolver::new()
+        .with_section_score(id("tool_a"), 950.0)
+        .with_section_score(id("tool_b"), 900.0)
+        .with_section_score(id("tool_c"), 850.0)
+        .with_section_tokens(id("tool_a"), 30)
+        .with_section_tokens(id("tool_b"), 25)
+        .with_section_tokens(id("tool_c"), 20);
+    let got = places(&project(&b, &resolver));
+    assert!(
+        got.contains(&(None, Some(5))),
+        "the range's hole is what a and b leave: {got:?}"
+    );
+    assert!(got.contains(&(Some(id("tool_a")), None)));
+    assert!(got.contains(&(Some(id("tool_b")), None)));
+    assert!(!got.contains(&(Some(id("tool_c")), None)), "{got:?}");
 }
 
 /// **A range filled from the bottom holds its members at the bottom**, the

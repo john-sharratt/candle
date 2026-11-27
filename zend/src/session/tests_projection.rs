@@ -368,8 +368,10 @@ pub(super) mod projection_schema_tests {
         );
         // Strict normalized-band gate (reverted from the too-permissive min 112).
         assert_eq!(tools.policy.config.min_score, 800.0);
-        // Five signatures a turn: a delegated task names several tools.
+        // The count's ceiling, binding only without a range; the tools' range
+        // is their size (docs/placed_section_layout.md §3.5).
         assert_eq!(tools.policy.config.budget_max, 5);
+        assert!(tools.range.is_some());
 
         // Dialogue stays recency-driven — no scan concepts apply.
         let dialogue = layer("dialogue");
