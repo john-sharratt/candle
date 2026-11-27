@@ -108,7 +108,7 @@ pub fn select_layer_bytes(
         let cand = cache.candidates_at(last.saturating_sub(1), ratio);
         span_cand.push(cand);
         bytes += cache.score_bound(s.len, cand, appended, h, d, CARVE_ALIGN)?;
-        needs_pages |= cache.has_pages();
+        needs_pages |= cache.needs_page_table();
         prefixes += cache.page_prefixes().len();
     }
     for run in score_runs(spans) {

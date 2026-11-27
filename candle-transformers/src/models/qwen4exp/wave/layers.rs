@@ -58,6 +58,7 @@ impl Qwen4ExpBatched {
         h: &Tensor,
         spans: &[SeqSpan],
         offsets: &[usize],
+        token_runs: &[Option<Vec<[u32; 2]>>],
         idx_map: &mut HashMap<usize, Vec<IndexCache>>,
         capture: Option<&mut SpecCapture>,
         total_rows: usize,
@@ -71,6 +72,7 @@ impl Qwen4ExpBatched {
             h,
             spans,
             offsets,
+            token_runs,
             idx_map,
             capture,
             total_rows,
@@ -340,6 +342,18 @@ impl Qwen4ExpBatched {
         let mut offsets_all: Vec<usize> = Vec::with_capacity(total_rows);
         offsets_all.extend_from_slice(dec_at);
         offsets_all.extend_from_slice(pre_at);
+        // Each prefill span's slot, its positions against its tokens: the
+        // prefill kernel walks tokens, so its page table names pages by token
+        // (`indexer::token_pages`). Every layer carries the same holes, so the
+        // first KV layer's answer is the slot's. A decode span keeps positions.
+        let token_runs: Vec<Option<Vec<[u32; 2]>>> = contexts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| match c.kv_caches.caches.first() {
+                Some(cache) if i >= n_decode => cache.k_cache().chunked_position_runs().map(Some),
+                _ => Ok(None),
+            })
+            .collect::<Result<_>>()?;
         let mut idx_map = self
             .index
             .write()
@@ -686,6 +700,7 @@ impl Qwen4ExpBatched {
                         &h,
                         &spans,
                         &offsets_all,
+                        &token_runs,
                         &mut idx_map,
                         cap_map.as_mut(),
                         total_rows,
@@ -1013,6 +1028,7 @@ impl Qwen4ExpBatched {
                     pre_params: &pre_params,
                     spans: &spans,
                     offsets_all: &offsets_all,
+                    token_runs: &token_runs,
                     index_rope: &index_rope,
                     kv_layer: cfg
                         .mtp_kv_layer()

@@ -21,7 +21,10 @@
 // (`i8_pal_rank_load4`): the block header once, one format dispatch per
 // window pair. Otherwise each column is decoded on its own.
 //
-// K is rotated by the sequence's RoPE rung at its own position and quantised
+// K is rotated by the sequence's RoPE rung at its own position — a sealed
+// key at its slice's RoPE base plus its cell (`token_rope_pos`), a fresh one
+// at its offset from the first fresh token's (`fresh_rope_base`), so a key past
+// a hole in the slot is rotated where the slot reads it — and quantised
 // per (column, 32-dim window) against the window's absmax over the warp; V is
 // handed over as FP32 for the caller to store as FP16.
 // ============================================================================
@@ -160,12 +163,16 @@ __device__ __forceinline__ float i8_arena_elem_of(
 ///
 /// A dead warp (no block in the tile) passes `pos0 = kv_len`: every column
 /// is past the sequence and stages as zeros.
+///
+/// `fresh_pos` is the position the first fresh token (`prefix_len`) is read
+/// at (`fresh_rope_base`); a fresh column is rotated at its offset from it, a
+/// sealed one at its slice's (`token_rope_pos`).
 template <typename QT, int HEAD_DIM, typename KSink, typename VSink>
 __device__ __forceinline__ void i8_stage_quad(
     WarpPalette<HEAD_DIM>& wp, int& bound_slice, const SlotHeader& slot_hdr,
     int n_kv_head, int kv_head_idx,
     const QT* __restrict__ k_packed, const QT* __restrict__ v_packed, int q_start,
-    int prefix_len, int kv_len, int pos0, int lane,
+    int prefix_len, int fresh_pos, int kv_len, int pos0, int lane,
     int rope_interleaved, const RopeView& rope,
     KSink&& k_sink, VSink&& v_sink)
 {
@@ -220,6 +227,9 @@ __device__ __forceinline__ void i8_stage_quad(
                 uniform = uniform && wp.fmt[0][p] == fk && wp.fmt[1][p] == fv;
             if (uniform) {
                 quad = true;
+                // The four are consecutive cells of one slice, so they sit at
+                // consecutive positions from the first one's.
+                const int kpos0 = token_rope_pos<HEAD_DIM>(slot_hdr, pos0, n_kv_head);
                 // Windows wa and wb's four tokens of rank table `side` at quad
                 // `ib0` — `i8_pal_rank_load4` for each, with the one branch
                 // it takes (a quant block's aligned quad or unaligned run)
@@ -263,7 +273,7 @@ __device__ __forceinline__ void i8_stage_quad(
                     I8RopePair rp[4];
                     #pragma unroll
                     for (int tt = 0; tt < 4; ++tt)
-                        rp[tt] = i8_rope_pair_cs<N_WIN>(rope, pos0 + tt, w, lane, rope_interleaved);
+                        rp[tt] = i8_rope_pair_cs<N_WIN>(rope, kpos0 + tt, w, lane, rope_interleaved);
                     float lo[4], hi[4];
                     i8_with_format(fk, [&](auto tag) {
                         load_pair(tag, KSide{}, w, w + N_WIN / 2, lo, hi);
@@ -383,8 +393,12 @@ __device__ __forceinline__ void i8_stage_quad(
                 }
             }
         }
-        if (pos < kv_len)
-            i8_rope_row<N_WIN>(x, pos, lane, rope_interleaved, rope);
+        if (pos < kv_len) {
+            const int at = (pos >= prefix_len)
+                ? fresh_pos + (pos - prefix_len)
+                : token_rope_pos<HEAD_DIM>(slot_hdr, pos, n_kv_head);
+            i8_rope_row<N_WIN>(x, at, lane, rope_interleaved, rope);
+        }
         #pragma unroll
         for (int w = 0; w < N_WIN; ++w) stage_k_window(tt, w, x[w]);
     }

@@ -658,8 +658,10 @@ impl Scheduler {
         // until a selection past the identity threshold refuses — so the
         // mismatch is named here, where the parent that caused it is still in
         // hand.
+        // In positions, as the index places its pages: past the parent's holes
+        // (`docs/placed_section_layout.md` §4.1).
         if let Some(cov) = self.model.positional_coverage(view_id.0) {
-            let parent_tokens = self.session.sequence_offset(parent_id.0).unwrap_or(0);
+            let parent_tokens = self.session.sequence_position(parent_id.0).unwrap_or(0);
             if cov < parent_tokens {
                 // **The PARENT's coverage too, because it decides where to look.**
                 // A child short of a parent that is itself complete is a fork
@@ -674,7 +676,7 @@ impl Scheduler {
                     parent_tokens,
                     parent_coverage = ?parent_cov,
                     view_coverage = cov,
-                    "fork_view_state: forked a view over {} token(s) its index does not cover",
+                    "fork_view_state: forked a view over {} position(s) its index does not cover",
                     parent_tokens - cov
                 );
             }

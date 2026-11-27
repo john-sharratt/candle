@@ -659,6 +659,18 @@ assigns it.
 - `sequence_offset` (tokens held) and the frontier (next position) are two
   numbers. Every caller that today reads one as the other is found and told
   which it means; a query's position is the frontier, never the token count.
+- **Every kernel rotates by the slices' positions.** Decode rotates its query
+  at the write slice's `rope + len`; prefill rotates each query and each key it
+  reads at its slice's `rope_base − offset + cell` (`token_rope_pos`), so a
+  token prefilled past a hole and the same token decoded see the context at
+  the same distances. The float fallback rotates at the positions the slot's
+  runs give (`ChunkedKvBacking::position_runs`, `token_position`).
+- **Prefill addresses by token, decode by position.** The prefill kernel's
+  causal bound, key count and position map are in tokens, so the QSA page
+  table a prefill row reads names each page by its first token
+  (`qwen4exp/indexer/token_pages.rs`); a decode row's table keeps positions,
+  which its kernel resolves through the slices' RoPE bases. The index's
+  coverage is checked against the frontier, never the token count.
 
 ### 4.2 The index window
 

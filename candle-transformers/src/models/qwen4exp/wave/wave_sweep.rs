@@ -254,8 +254,10 @@ impl WaveSweep for Qwen4ExpBatched {
         // invariant 7).
         let t_pre = profile_now();
         if !in_step {
-            for ((&seq, &off), &q) in seq_ids.iter().zip(&offsets).zip(&q_lens) {
-                self.ensure_seq_state(seq, off, off + q, layer_start)?;
+            for (((&seq, &off), &at), &q) in
+                seq_ids.iter().zip(&offsets).zip(&positions).zip(&q_lens)
+            {
+                self.ensure_seq_state(seq, off, at, off + q, layer_start)?;
             }
         }
         pipeline_record("q4e:pre:ensure_state", t_pre);

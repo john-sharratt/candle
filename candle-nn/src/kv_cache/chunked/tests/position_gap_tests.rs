@@ -116,6 +116,47 @@ fn trimming_an_empty_tail_keeps_its_holes() {
     assert_eq!(rope_bases(&b, 0), vec![0, 28, 32]);
 }
 
+/// **The position runs turn a position past a hole into its token.** Two
+/// holes — 100 after the first seven tokens, 20 after the next two — and one
+/// pending at the tail: each opens a run at the first position past it, and the
+/// tokens at 107 and 129 are the 7th and 9th.
+#[test]
+fn position_runs_open_past_each_hole() {
+    let b = backing();
+    b.alloc_sequence().unwrap();
+    assert_eq!(b.position_runs(0).unwrap(), vec![[0, 0]]);
+    b.reserve_glue_gap_chunk(0, 3).unwrap();
+    b.reserve_glue_gap_chunk(0, 4).unwrap(); // [0, 7)
+    b.push_position_gap(0, 100).unwrap();
+    b.reserve_glue_gap_chunk(0, 2).unwrap(); // [107, 109)
+    b.push_position_gap(0, 20).unwrap();
+    b.reserve_glue_gap_chunk(0, 1).unwrap(); // [129, 130)
+    assert_eq!(
+        b.position_runs(0).unwrap(),
+        vec![[0, 0], [107, 100], [129, 120]]
+    );
+    // A hole left at the tail opens its run at the frontier.
+    {
+        let mut state = b.state.write().expect("lock");
+        state.sequences[0].as_mut().expect("slot").push_lead(6);
+    }
+    assert_eq!(b.position_frontier(0).unwrap(), 136);
+    assert_eq!(
+        b.position_runs(0).unwrap(),
+        vec![[0, 0], [107, 100], [129, 120], [136, 126]]
+    );
+    // An unallocated slot is one run with nothing skipped.
+    assert_eq!(b.position_runs(5).unwrap(), vec![[0, 0]]);
+
+    // And back: each token at its position, the next one past the tail's hole.
+    let runs = b.position_runs(0).unwrap();
+    let at: Vec<usize> = [0, 6, 7, 8, 9, 10]
+        .iter()
+        .map(|&t| ChunkedKvBacking::token_position(t, &runs))
+        .collect();
+    assert_eq!(at, vec![0, 6, 107, 108, 129, 136]);
+}
+
 /// **No hole, no change: positions are the running token count.**
 #[test]
 fn without_a_hole_positions_are_the_token_count() {

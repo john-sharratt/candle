@@ -305,6 +305,16 @@ impl Cache {
         }
     }
 
+    /// The chunked slot's positions against its tokens, as runs `[position,
+    /// skipped]` (`ChunkedKvBacking::position_runs`). Contiguous storage has
+    /// no holes: one run with nothing skipped.
+    pub fn chunked_position_runs(&self) -> Result<Vec<[u32; 2]>> {
+        match &self.storage {
+            CacheStorage::Chunked(c) => c.backing.position_runs(c.batch_idx),
+            CacheStorage::Contiguous { .. } => Ok(vec![[0, 0]]),
+        }
+    }
+
     /// Device address of a resident KV-head record (for a slice's `kvheads_ptr`).
     /// `0` if there is no chunked backing or no device residence (CPU pool).
     pub fn chunked_meta_device_addr(&self, meta: &super::MetaGid) -> u64 {

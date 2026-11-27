@@ -218,4 +218,105 @@ pub(super) mod tests {
         );
         Ok(())
     }
+
+    /// **The fallback reads keys where the slot places them** — past a hole
+    /// (`docs/placed_section_layout.md` §4.1): 20 tokens, a 500-position hole,
+    /// then 10 more, whose rows must match attention rotated at positions
+    /// `0..20` for the keys before the hole and `520..530` for the rest.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn float_fallback_prefill_reads_across_a_hole() -> Result<()> {
+        use crate::models::rope_schedule::RopeSchedule;
+        use candle::DType;
+        use candle_nn::kv_cache::ChunkedKvBacking;
+
+        let device = Device::new_cuda(0)?;
+        let (n_head, n_kv_head, head_dim) = (16usize, 2usize, 256usize);
+        let n_rep = n_head / n_kv_head;
+        let (before, hole, after) = (20usize, 500usize, 10usize);
+
+        let backing = ChunkedKvBacking::new(1, n_kv_head, head_dim, DType::BF16, &device, 64)?;
+        let mut cache = KvCache::new(2, 64);
+        cache.force_dtype(DType::BF16);
+        cache.set_chunked_backing(&backing, 0, None)?;
+
+        let total = before + after;
+        let q =
+            Tensor::randn(0f32, 1f32, (total, n_head, head_dim), &device)?.to_dtype(DType::BF16)?;
+        let k = Tensor::randn(0f32, 1f32, (total, n_kv_head, head_dim), &device)?
+            .to_dtype(DType::BF16)?;
+        let v = Tensor::randn(0f32, 1f32, (total, n_kv_head, head_dim), &device)?
+            .to_dtype(DType::BF16)?;
+        let inv_freq: Vec<f32> = (0..head_dim / 2)
+            .map(|i| 1f32 / 1e6f32.powf(2.0 * i as f32 / head_dim as f32))
+            .collect();
+        let rope = RopeRungs::new(&RopeSchedule::stated(inv_freq.clone(), 1 << 20)?, &device)?;
+
+        let mut prefill = |offset: usize, len: usize| -> Result<Tensor> {
+            let rows = |x: &Tensor| x.narrow(0, offset, len);
+            let mut refs: [&mut KvCache; 1] = [&mut cache];
+            paged_prefill_float_fallback(
+                &mut refs,
+                &[offset],
+                &rows(&q)?,
+                &rows(&k)?,
+                &rows(&v)?,
+                &[len],
+                n_head,
+                n_kv_head,
+                head_dim,
+                &rope,
+                false,
+            )
+        };
+        prefill(0, before)?;
+        backing.push_position_gap(0, hole)?;
+        let out = prefill(before, after)?;
+
+        // Reference from f64 angles at the positions the slot holds.
+        let half = head_dim / 2;
+        let rot_at = |x: &Tensor, at: &[usize]| -> Result<Tensor> {
+            let mut cos = Vec::with_capacity(at.len() * half);
+            let mut sin = Vec::with_capacity(at.len() * half);
+            for &pos in at {
+                for w in &inv_freq {
+                    let a = pos as f64 * *w as f64;
+                    cos.push(a.cos() as f32);
+                    sin.push(a.sin() as f32);
+                }
+            }
+            let cos = Tensor::from_vec(cos, (at.len(), half), &device)?.to_dtype(DType::BF16)?;
+            let sin = Tensor::from_vec(sin, (at.len(), half), &device)?.to_dtype(DType::BF16)?;
+            candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
+        };
+        let heads = |x: &Tensor, from: usize, len: usize| -> Result<Tensor> {
+            x.narrow(0, from, len)?
+                .transpose(0, 1)?
+                .unsqueeze(0)?
+                .contiguous()
+        };
+        let key_at: Vec<usize> = (0..before).chain(before + hole..total + hole).collect();
+        let q_r = rot_at(&heads(&q, before, after)?, &key_at[before..])?.to_dtype(DType::F32)?;
+        let k_r = rot_at(&heads(&k, 0, total)?, &key_at)?.to_dtype(DType::F32)?;
+        let v_s = heads(&v, 0, total)?.to_dtype(DType::F32)?;
+        let expect = standard_attention_prefill(
+            &q_r,
+            &repeat_kv(k_r, n_rep)?,
+            &repeat_kv(v_s, n_rep)?,
+            head_dim,
+        )?;
+        let got = out.transpose(0, 1)?.unsqueeze(0)?.to_dtype(DType::F32)?;
+        let diff = got
+            .sub(&expect)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_vec0::<f32>()?;
+        assert!(
+            diff < 5e-2,
+            "the rows past a {hole}-position hole diverged from attention at the slot's \
+             positions (max abs {diff})"
+        );
+        Ok(())
+    }
 }

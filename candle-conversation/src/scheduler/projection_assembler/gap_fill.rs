@@ -372,14 +372,17 @@ pub(in super::super) fn apply_segments_finish(
     // system does not satisfy it yet on that path, so the check reports until it
     // does. Promote it when a run is silent here — that run is the evidence, and
     // this comment is the record that it has not happened.
+    // Both sides in positions: the index places pages past the slot's holes as
+    // the K/V does (`docs/placed_section_layout.md` §4.1), so its coverage is
+    // the slot's position frontier, not its token count.
     if let Some(cov) = ctx.model.positional_coverage(parent_id.0) {
-        let held = ctx.session.sequence_offset(parent_id.0).unwrap_or(0);
+        let held = ctx.session.sequence_position(parent_id.0).unwrap_or(0);
         if cov != held {
             tracing::warn!(
                 slot = parent_id.0,
                 held,
                 coverage = cov,
-                "apply_segments_finish: the assembled slot's index is {} token(s) {} its K/V — {}",
+                "apply_segments_finish: the assembled slot's index is {} position(s) {} its K/V — {}",
                 cov.abs_diff(held),
                 if cov < held { "short of" } else { "past" },
                 if cov < held {

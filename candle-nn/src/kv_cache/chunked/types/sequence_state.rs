@@ -106,6 +106,30 @@ impl SequenceState {
             + self.pending_lead as usize
     }
 
+    /// The slot's positions against its tokens, as runs `[position, skipped]`
+    /// ascending by position: from `position` on, until the next run, the
+    /// token a position holds is `position − skipped` — `skipped` being the
+    /// evicted front and every hole before it. The first run opens at 0; each
+    /// chunk with a lead opens one at its first token, and a lead pending at
+    /// the tail one at the frontier. A slot without holes is one run.
+    pub(in super::super) fn position_runs(&self) -> Vec<[u32; 2]> {
+        let mut skipped = self.base_pos;
+        let mut at = self.base_pos;
+        let mut runs = vec![[0, skipped]];
+        for c in &self.chunks {
+            if c.lead > 0 {
+                skipped += c.lead;
+                runs.push([at + c.lead, skipped]);
+            }
+            at += c.span();
+        }
+        if self.pending_lead > 0 {
+            skipped += self.pending_lead;
+            runs.push([at + self.pending_lead, skipped]);
+        }
+        runs
+    }
+
     /// Leave `n` positions empty at the tail: the next chunk the tail gains
     /// takes them as its lead. A tail that is an empty writer chunk takes them
     /// at once; one holding tokens is closed by the caller first, so no token

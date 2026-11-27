@@ -51,24 +51,17 @@ pub(super) fn paged_prefill_float_fallback(
     let n_rep = n_head / n_kv_head;
     let half = head_dim / 2;
 
-    // The cos/sin planes for the longest prefix any sequence here reaches,
-    // built once per rung present and per scale (K at 1, Q at the rung's
-    // `m²`) — not per sequence. Full width on purpose: a pass-through
+    // The cos/sin planes at `at`, one row per position, by `rung` and `scale`
+    // (K at 1, Q at the rung's `m²`). Full width on purpose: a pass-through
     // frequency is exactly `(cos 1, sin 0)`, unscaled, so rotating all
     // `head_dim/2` pairs is the identity on the non-rotary dims, as the kernels
     // leave them.
-    let max_total = q_lens
-        .iter()
-        .zip(offsets.iter())
-        .map(|(&l, &o)| o + l)
-        .max()
-        .unwrap_or(0);
     let dtype = q.dtype();
     let device = q.device().clone();
-    let planes = |rung: u32, scale: f32| -> Result<(Tensor, Tensor)> {
-        let mut cos = Vec::with_capacity(max_total * half);
-        let mut sin = Vec::with_capacity(max_total * half);
-        for pos in 0..max_total {
+    let planes = |rung: u32, scale: f32, at: &[usize]| -> Result<(Tensor, Tensor)> {
+        let mut cos = Vec::with_capacity(at.len() * half);
+        let mut sin = Vec::with_capacity(at.len() * half);
+        for &pos in at {
             for f in 0..half {
                 let (c, s) = rope.cos_sin(rung, pos, f);
                 let k = if f < rope.pairs() { scale } else { 1.0 };
@@ -77,22 +70,17 @@ pub(super) fn paged_prefill_float_fallback(
             }
         }
         Ok((
-            Tensor::from_vec(cos, (max_total, half), &device)?.to_dtype(dtype)?,
-            Tensor::from_vec(sin, (max_total, half), &device)?.to_dtype(dtype)?,
+            Tensor::from_vec(cos, (at.len(), half), &device)?.to_dtype(dtype)?,
+            Tensor::from_vec(sin, (at.len(), half), &device)?.to_dtype(dtype)?,
         ))
     };
-    // (rung, K planes, Q planes), one entry per rung this call needs.
-    type CosSin = (Tensor, Tensor);
-    let mut by_rung: Vec<(u32, CosSin, CosSin)> = Vec::new();
 
-    // Rotate `x [1, h, len, d]` at absolute positions `start..start + len`.
-    let rot = |x: &Tensor, (cos_full, sin_full): &(Tensor, Tensor), start: usize, len: usize| {
-        let cos = cos_full.narrow(0, start, len)?;
-        let sin = sin_full.narrow(0, start, len)?;
+    // Rotate `x [1, h, len, d]` by `(cos, sin)`, one row per position.
+    let rot = |x: &Tensor, (cos, sin): &(Tensor, Tensor)| {
         if rope_interleaved {
-            candle_nn::rotary_emb::rope_i(&x.contiguous()?, &cos, &sin)
+            candle_nn::rotary_emb::rope_i(&x.contiguous()?, cos, sin)
         } else {
-            candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
+            candle_nn::rotary_emb::rope(&x.contiguous()?, cos, sin)
         }
     };
 
@@ -162,17 +150,16 @@ pub(super) fn paged_prefill_float_fallback(
         let t_rope = profile_now();
         expect_dtype(&k_all, qs.dtype(), "prefill fallback: K vs Q")?;
         expect_dtype(&v_all, qs.dtype(), "prefill fallback: V vs Q")?;
-        let rung = rope.rung_for(total)?;
-        let at = match by_rung.iter().position(|(r, _, _)| *r == rung) {
-            Some(i) => i,
-            None => {
-                by_rung.push((rung, planes(rung, 1.0)?, planes(rung, rope.q_scale(rung))?));
-                by_rung.len() - 1
-            }
-        };
-        let (_, k_planes, q_planes) = &by_rung[at];
-        let k_rot = rot(&k_all, k_planes, 0, total)?;
-        let q_rot = rot(&qs, q_planes, offset, len)?;
+        // Every key at the position the slot places it — past the slot's holes
+        // (`docs/placed_section_layout.md` §4.1) — and each query at its own
+        // key's, as the kernels read them; the rung by the deepest of them.
+        let runs = cache.k_cache().chunked_position_runs()?;
+        let key_at: Vec<usize> = (0..total)
+            .map(|t| ChunkedKvBacking::token_position(t, &runs))
+            .collect();
+        let rung = rope.rung_for(key_at.last().map_or(0, |p| p + 1))?;
+        let k_rot = rot(&k_all, &planes(rung, 1.0, &key_at)?)?;
+        let q_rot = rot(&qs, &planes(rung, rope.q_scale(rung), &key_at[offset..])?)?;
         let k_rep = repeat_kv(k_rot, n_rep)?;
         let v_rep = repeat_kv(v_all, n_rep)?;
         pipeline_record("prefill_fb:rope_repeat", t_rope);

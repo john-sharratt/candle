@@ -183,6 +183,7 @@ mod tests_record;
 mod tests_rewind;
 #[cfg(test)]
 mod tests_support;
+mod token_pages;
 
 pub use append::*;
 pub use bound::*;
@@ -191,3 +192,4 @@ pub use pages::*;
 pub use project::*;
 pub use rotate::*;
 pub use select::*;
+pub use token_pages::*;

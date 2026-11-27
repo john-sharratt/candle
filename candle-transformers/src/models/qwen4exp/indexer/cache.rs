@@ -169,6 +169,14 @@ impl IndexCache {
         !self.pages.is_empty()
     }
 
+    /// Whether the attention kernels need this cache's page table: it holds
+    /// pages, or its live tail opens past position 0 — a span placed with no
+    /// rows, or a hole, before it — so block `b` no longer starts at
+    /// `b · ratio`.
+    pub fn needs_page_table(&self) -> bool {
+        self.has_pages() || self.tail_base > 0
+    }
+
     /// Blocks the live tail has completed.
     pub fn live_blocks(&self) -> usize {
         self.n_blocks

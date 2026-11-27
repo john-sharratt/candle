@@ -23,9 +23,9 @@ use candle::quantized::Int8Mode;
 #[cfg(feature = "cuda")]
 use candle::quantized::SumScale;
 use candle::{DType, Device, Result, Tensor};
-use candle_nn::kv_cache::KvCache;
 #[cfg(feature = "cuda")]
 use candle_nn::kv_cache::{begin_wave, LayerPhase};
+use candle_nn::kv_cache::{ChunkedKvBacking, KvCache};
 
 use crate::models::lazy_rope::LazyRope;
 use crate::models::operand_guard::{expect_dense_view, expect_dtype};

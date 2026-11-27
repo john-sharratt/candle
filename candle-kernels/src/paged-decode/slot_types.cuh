@@ -156,6 +156,36 @@ __device__ __forceinline__ TokenSliceHdr load_token_slice(uint64_t slices_ptr, i
     return h;
 }
 
+// The position the token at cum-token index `t` is read at: its slice's RoPE
+// base, less the slice's skip, plus its cell — the position a key stored there
+// rotates by in every kernel, so a key rotated by it agrees with the decode's
+// across the slot's holes (`docs/placed_section_layout.md` §4.1). Needs the
+// prefill header's position_map (`resolve_pos`).
+//
+// Exact for a token the slot already held when the header was serialised, and
+// for the launch's first fresh token, whose slice's base follows only committed
+// chunks. A later writer chunk's base was taken before this launch filled the
+// ones ahead of it, so a fresh token is placed from the first fresh one
+// (`fresh_rope_base`), the run being contiguous: a hole is only ever left
+// between launches.
+template <int HD>
+__device__ __forceinline__ int token_rope_pos(const SlotHeader& slot_hdr, int t, int n_kv_head) {
+    int slice_idx, in_blk;
+    resolve_pos(slot_hdr, t, slice_idx, in_blk);
+    const TokenSliceHdr s = load_token_slice<HD>(slot_hdr.slices_ptr, slice_idx, n_kv_head);
+    return s.rope_base() - s.offset() + in_blk;
+}
+
+// The position of the launch's first fresh token, `prefix_len` — past every
+// hole before it. `prefix_len` itself when the launch brings no token.
+template <int HD>
+__device__ __forceinline__ int fresh_rope_base(
+    const SlotHeader& slot_hdr, int prefix_len, int kv_len, int n_kv_head)
+{
+    return (prefix_len < kv_len) ? token_rope_pos<HD>(slot_hdr, prefix_len, n_kv_head)
+                                 : prefix_len;
+}
+
 __device__ __forceinline__ uint16_t slice_offset(const uint8_t* slice) {
     return *reinterpret_cast<const uint16_t*>(slice + 0);
 }

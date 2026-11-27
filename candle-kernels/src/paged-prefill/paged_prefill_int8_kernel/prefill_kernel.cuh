@@ -85,6 +85,9 @@ paged_prefill_int8_kernel(
     const int kv_len = (int)kv_lens[batch_idx];
     int prefix_len = kv_len - q_len;
     if (prefix_len < 0) prefix_len = 0;
+    // Where the first fresh token is read: the slot's token count plus the
+    // holes before it. The fresh tokens follow it contiguously.
+    const int fresh_pos = fresh_rope_base<HEAD_DIM>(slot_hdr, prefix_len, kv_len, n_kv_head);
 
     int hpg = n_head / n_kv_head;
     if (hpg <= 0) hpg = 1;
@@ -256,7 +259,9 @@ paged_prefill_int8_kernel(
             const float v = qt_to_f32<QT>(qrow[lane + 32 * w]);
             x[w] = live ? v : 0.f;
         }
-        i8_rope_row<N_WIN>(x, prefix_len + tok, lane, rope_interleaved, rope.for_q());
+        // At the position its own key is written at — past every hole the
+        // slot leaves, as each key it reads is rotated at its own.
+        i8_rope_row<N_WIN>(x, fresh_pos + tok, lane, rope_interleaved, rope.for_q());
         #pragma unroll
         for (int w = 0; w < N_WIN; ++w) {
             float a = fabsf(x[w]);
@@ -550,7 +555,7 @@ paged_prefill_int8_kernel(
         } else {
             i8_stage_quad<QT, HEAD_DIM>(
                 s_wpal[warp], bound_slice, slot_hdr, n_kv_head, kv_head_idx,
-                k_packed, v_packed, q_start, prefix_len, kv_len, pos0, lane,
+                k_packed, v_packed, q_start, prefix_len, fresh_pos, kv_len, pos0, lane,
                 rope_interleaved, rope,
                 [&](int tt, int w, int8_t code, float scale) {
                     s_k8[j0 + tt][lane + 32 * w] = code;

@@ -79,10 +79,13 @@ paged_prefill_kv_prestage_kernel(
     __half* const ks = kv_stage_k_scale<HEAD_DIM>(stage, n_kv_head) + row0 * N_WIN;
     __half* const vv = kv_stage_v<HEAD_DIM>(stage, n_kv_head) + row0 * HEAD_DIM;
 
+    // Where the first fresh token is read, as the attention kernel places it.
+    const int fresh_pos = fresh_rope_base<HEAD_DIM>(slot_hdr, prefix_len, kv_len, n_kv_head);
+
     int bound_slice = -1;
     i8_stage_quad<QT, HEAD_DIM>(
         s_wpal[warp], bound_slice, slot_hdr, n_kv_head, kv_head_idx,
-        k_packed, v_packed, q_start, prefix_len, kv_len, pos0, lane,
+        k_packed, v_packed, q_start, prefix_len, fresh_pos, kv_len, pos0, lane,
         rope_interleaved, rope,
         [&](int tt, int w, int8_t code, float scale) {
             if (pos0 + tt >= kv_len) return;

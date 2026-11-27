@@ -76,6 +76,35 @@ impl ChunkedKvBacking {
             .map_or(0, |s| s.lead_total()))
     }
 
+    /// `batch_idx`'s positions against its tokens, as runs `[position,
+    /// skipped]` (`SequenceState::position_runs`): what turns a position the
+    /// index places a page at into the token a kernel walking the slot's
+    /// tokens reads it at. `Ok([[0, 0]])` for an unallocated slot.
+    pub fn position_runs(&self, batch_idx: usize) -> Result<Vec<[u32; 2]>> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        Ok(state
+            .sequences
+            .get(batch_idx)
+            .and_then(|s| s.as_ref())
+            .map_or_else(|| vec![[0, 0]], |s| s.position_runs()))
+    }
+
+    /// The position the slot's `token`th token is read at, under its
+    /// [`Self::position_runs`]: the token plus what the last run opening at or
+    /// below it skips — a run `[position, skipped]` opens at token
+    /// `position − skipped`.
+    pub fn token_position(token: usize, runs: &[[u32; 2]]) -> usize {
+        let skipped = runs
+            .iter()
+            .take_while(|r| (r[0] - r[1]) as usize <= token)
+            .last()
+            .map_or(0, |r| r[1] as usize);
+        token + skipped
+    }
+
     /// The position `batch_idx`'s next token is read at: its evicted front,
     /// every chunk's lead and tokens, and the hole pending at its tail. `Ok(0)`
     /// for an unallocated slot.

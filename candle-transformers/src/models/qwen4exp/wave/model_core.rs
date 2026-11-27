@@ -137,10 +137,15 @@ impl Qwen4ExpBatched {
     /// last window's layers would then hold real state, the earlier ones
     /// standing at sequence-start as though the prompt had never run — with
     /// every shape still matching and nothing raised.
+    ///
+    /// `position` is where the sequence's next token is read — `offset` plus
+    /// the holes its slot leaves (`docs/placed_section_layout.md` §4.1) — and is
+    /// what the index's coverage is checked against, as its pages are placed.
     pub(super) fn ensure_seq_state(
         &self,
         seq: usize,
         offset: usize,
+        position: usize,
         tokens: usize,
         layer_start: usize,
     ) -> Result<()> {
@@ -247,11 +252,12 @@ impl Qwen4ExpBatched {
             let off: Vec<(usize, usize)> = if layer_start != 0 {
                 Vec::new()
             } else {
-                // **Exact, to the token.** `indexed_tokens` counts the open
+                // **Exact, to the position.** `indexed_tokens` counts the open
                 // block's carried rows as well as the completed blocks and the
-                // injected pages, so an index that is where its K/V is agrees
-                // with `offset` exactly — and one that is off by less than a
-                // block is misplaced just the same (see `coverage`).
+                // injected pages, placed past the slot's holes as its K/V is, so
+                // an index that is where its K/V is agrees with `position`
+                // exactly — and one that is off by less than a block is
+                // misplaced just the same (see `coverage`).
                 coverage_disagreements(
                     caches
                         .iter()
@@ -259,20 +265,21 @@ impl Qwen4ExpBatched {
                         .enumerate()
                         .filter(|(_, (_, ratio))| *ratio > 0)
                         .map(|(layer, (c, ratio))| (layer, c.indexed_tokens(ratio))),
-                    offset,
+                    position,
                 )
             };
             if !off.is_empty() {
                 tracing::warn!(
                     seq,
                     offset,
+                    position,
                     tokens,
                     starting_over,
                     layers = ?off,
                     "qwen4exp index disagrees with this sequence's K/V at wave entry — \
-                     (kv layer, tokens indexed) against {offset} held: short refuses the \
-                     select past the identity threshold, long selects over positions the \
-                     slot does not hold"
+                     (kv layer, positions indexed) against {position} held: short refuses \
+                     the select past the identity threshold, long selects over positions \
+                     the slot does not hold"
                 );
             }
         }

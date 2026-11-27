@@ -386,7 +386,9 @@ impl Scheduler {
             // is the last point at which that is attributable to this rebuild —
             // downstream it surfaces only as a refused select on some later turn.
             if let Some(cov) = self.model.positional_coverage(parent_id.0) {
-                let held = self.session.sequence_offset(parent_id.0).unwrap_or(0);
+                // In positions, as the index places its pages: past the slot's
+                // holes (`docs/placed_section_layout.md` §4.1).
+                let held = self.session.sequence_position(parent_id.0).unwrap_or(0);
                 // Both directions. Short drops rows the turn needs; long means
                 // a piece was restored twice — the rebuild re-supplies the
                 // turn's user half from cache and the span seal carries it too
@@ -404,7 +406,7 @@ impl Scheduler {
                         coverage = cov,
                         tail_token_count,
                         pages_pushed = tail_index_page.len(),
-                        "reproject: the rebuilt slot's index is {} token(s) {} its K/V",
+                        "reproject: the rebuilt slot's index is {} position(s) {} its K/V",
                         cov.abs_diff(held),
                         if cov < held { "short of" } else { "past" }
                     );

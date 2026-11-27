@@ -195,6 +195,22 @@ fn build_history_slot(
     stager: &PinnedStager,
     device: &Device,
 ) -> Result<(ChunkedKvBacking, KvCache)> {
+    build_history_slot_after(g, history, seed, alt, rope, stager, device, 0)
+}
+
+/// [`build_history_slot`] behind a hole of `front` positions: the history is
+/// read from `front` on.
+#[allow(clippy::too_many_arguments)]
+fn build_history_slot_after(
+    g: Geom,
+    history: usize,
+    seed: u64,
+    alt: &[bool],
+    rope: &RopeRungs,
+    stager: &PinnedStager,
+    device: &Device,
+    front: usize,
+) -> Result<(ChunkedKvBacking, KvCache)> {
     // Capacity from the history, not a fixed constant: [`MAX_BLOCKS`] is sized
     // for the 100-token cases and holds 2,048 tokens, so a depth case sized by
     // it would run off the end of the backing — reading garbage at 8K and
@@ -204,6 +220,9 @@ fn build_history_slot(
     let mut cache = KvCache::new(2, 64);
     cache.force_dtype(DType::BF16);
     cache.set_chunked_backing(&backing, 0, None)?;
+    // Pending on the bound slot before it holds a chunk, so the history's first
+    // chunk takes it as its lead.
+    backing.push_position_gap(0, front)?;
 
     backing.ensure_for_batch_entries(&[(0, 0)], history)?;
 
@@ -1429,6 +1448,120 @@ fn prefill_honours_a_page_layout_at_hd128() -> Result<()> {
             head_dim: 128,
         },
         0xF2,
+    )
+}
+
+/// **A prefill reads its keys where the slot places them, holes and all**
+/// (`docs/placed_section_layout.md` §4.1).
+///
+/// A hole between the history and the queries puts every history key that
+/// many positions further from every query, so it must move the answer — a
+/// kernel that rotates by token count reads straight across it and answers as
+/// though it were not there, which is what this prefill did: past a reserved
+/// range a question read neither the knowledge base nor itself. A hole in
+/// front of everything moves every key and query alike and changes no distance,
+/// so it may move the answer only by the rounding of rotations at other angles
+/// — far less than the real hole does. A kernel rotating a query and its keys by
+/// different positions fails that second half.
+fn prefill_hole_case(g: Geom, seed: u64) -> Result<()> {
+    let _guard = gpu_serial();
+    let device = match Device::cuda_if_available(0) {
+        Ok(d) if d.is_cuda() => d,
+        _ => {
+            eprintln!("skipping: CUDA device required");
+            return Ok(());
+        }
+    };
+    let (history, q_len, hole) = (100usize, 24usize, 1000usize);
+    let stager = PinnedStager::new_from_device(&device);
+    let rope = rope_of(g, &device)?;
+    let (q, k, v) = make_qkv(g, q_len, seed ^ 0x77, &[], &device)?;
+
+    // `front` positions before the history, `between` between it and the
+    // queries.
+    let run = |front: usize, between: usize| -> Result<Vec<f32>> {
+        let (backing, mut cache) = build_history_slot_after(
+            g,
+            history,
+            seed,
+            &none_alt(history),
+            &rope,
+            &stager,
+            &device,
+            front,
+        )?;
+        backing.push_position_gap(0, between)?;
+        assert_eq!(
+            backing.position_frontier(0)?,
+            front + history + between,
+            "the queries are read past both holes"
+        );
+        backing.ensure_for_batch_entries(&[(0, history)], q_len)?;
+        let generation = stager.begin_generation();
+        let out = {
+            let mut caches_arr: [&mut KvCache; 1] = [&mut cache];
+            paged_prefill_batched(
+                None,
+                &mut caches_arr[..],
+                &[history],
+                &q,
+                &k,
+                &v,
+                1,
+                &[q_len],
+                g.n_head,
+                g.n_kv_head,
+                g.head_dim,
+                None,
+                &rope,
+                false,
+                &generation,
+                &std::cell::RefCell::new(None),
+                None,
+            )?
+        };
+        bits(&out.to_owned_tensor()?)
+    };
+    let worst = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
+    };
+
+    let flat = run(0, 0)?;
+    let between = run(0, hole)?;
+    let front = run(hole, 0)?;
+    let moved = worst(&flat, &between);
+    let shifted = worst(&flat, &front);
+    eprintln!("a hole between moved the prefill by {moved:.3e}; one in front by {shifted:.3e}");
+    assert!(
+        moved > 0.0,
+        "a {hole}-position hole between the history and the queries left the prefill answer \
+         exactly where it was — the kernel reads keys by token count, not position"
+    );
+    assert!(
+        shifted * 10.0 < moved,
+        "a hole in front of everything moved the prefill by {shifted:.3e}, against {moved:.3e} \
+         for one between — the queries and their keys are rotated at different positions"
+    );
+    Ok(())
+}
+
+#[test]
+fn prefill_reads_across_a_hole_at_hd256() -> Result<()> {
+    prefill_hole_case(FLASH_NEXT, 0xF5)
+}
+
+#[test]
+fn prefill_reads_across_a_hole_at_hd128() -> Result<()> {
+    prefill_hole_case(
+        Geom {
+            n_head: 4,
+            n_kv_head: 2,
+            head_dim: 128,
+        },
+        0xF6,
     )
 }
 

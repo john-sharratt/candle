@@ -111,6 +111,9 @@ pub struct HeadWave<'a> {
     pub spans: &'a [SeqSpan],
     /// Every row's sequence position, decode rows then prefill rows.
     pub offsets_all: &'a [usize],
+    /// Each span's slot position runs, for a prefill span; `None` for a decode
+    /// span (`indexer::select_layer`).
+    pub token_runs: &'a [Option<Vec<[u32; 2]>>],
     /// The indexer's factored RoPE table.
     pub index_rope: &'a FactoredRope,
     /// The head's KV layer, which is also its index into a sequence's index
@@ -233,6 +236,7 @@ impl Qwen4ExpBatched {
             &h,
             w.spans,
             w.offsets_all,
+            w.token_runs,
             idx_map,
             // The head's cache advances over a verify block exactly as the
             // trunk's do — it runs the same rows in the same wave — so it has
@@ -461,6 +465,8 @@ impl Qwen4ExpBatched {
             })
             .collect();
         let g_sel = gpu_span("q4e:draft:select", dev);
+        // Decode rows only: every span's pages stay at their positions.
+        let token_runs: Vec<Option<Vec<[u32; 2]>>> = vec![None; spans.len()];
         let sel = self.layer_selection(
             kv_layer,
             *compress_ratio,
@@ -469,6 +475,7 @@ impl Qwen4ExpBatched {
             &h,
             &spans,
             at,
+            &token_runs,
             idx_map,
             // A draft walk is rolled back whole, so it has nothing to rewind
             // partially and nothing to capture.

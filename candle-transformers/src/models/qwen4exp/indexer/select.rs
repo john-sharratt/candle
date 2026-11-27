@@ -452,6 +452,11 @@ pub struct SelectedRows {
 /// A free function rather than a method on the wave engine so the selection
 /// path can be driven — and benchmarked — without a loaded model: everything it
 /// needs is the indexer's own weights, the caches, and two config values.
+///
+/// `offsets` are the spans' first POSITIONS. `token_runs` has one entry per
+/// span: a prefill span's slot position runs, which name its pages by token
+/// for the prefill kernel (`token_pages`), and `None` for a decode span, whose
+/// pages stay at their positions.
 #[allow(clippy::too_many_arguments)]
 pub fn select_layer(
     kv: usize,
@@ -461,6 +466,7 @@ pub fn select_layer(
     h: &Tensor,
     spans: &[SeqSpan],
     offsets: &[usize],
+    token_runs: &[Option<Vec<[u32; 2]>>],
     idx_map: &mut HashMap<usize, Vec<IndexCache>>,
     capture: Option<&mut SpecCapture>,
     total_rows: usize,
@@ -478,6 +484,13 @@ pub fn select_layer(
 ) -> Result<Option<(QsaSelection, SelectedRows)>> {
     if compress_ratio == 0 {
         return Ok(None);
+    }
+    if token_runs.len() != spans.len() {
+        candle::bail!(
+            "qsa select: {} spans against {} position-run entries",
+            spans.len(),
+            token_runs.len()
+        );
     }
 
     // Row `spans[i]` covers positions `offsets[i] ..< offsets[i] + len`.
@@ -715,7 +728,7 @@ pub fn select_layer(
         idx_map
             .get(&s.seq)
             .and_then(|c| c.get(kv))
-            .is_some_and(|c| c.has_pages())
+            .is_some_and(|c| c.needs_page_table())
     });
     if !needs_pages {
         log_bulk_selection(total_rows, widest, 0);
@@ -723,14 +736,20 @@ pub fn select_layer(
     }
     let mut pages: Vec<u32> = Vec::new();
     let mut win: Vec<u32> = vec![0; total_rows * 2];
-    for span in spans {
+    for (span, runs) in spans.iter().zip(token_runs) {
         let off = pages.len() / 2;
-        let prefixes = match idx_map.get(&span.seq).and_then(|c| c.get(kv)) {
+        let mut prefixes = match idx_map.get(&span.seq).and_then(|c| c.get(kv)) {
             Some(cache) => cache.page_prefixes(),
             // A sequence with no cache contributes the degenerate layout, which
             // is the uniform arithmetic.
             None => vec![0, 0],
         };
+        // A prefill span's rows are read by a kernel that walks tokens, so its
+        // pages are named by token; a decode span's stay at their positions,
+        // which its kernel resolves through the slices' RoPE bases.
+        if let Some(runs) = runs {
+            pages_to_tokens(&mut prefixes, runs);
+        }
         let count = prefixes.len() / 2;
         pages.extend(prefixes);
         for r in span.start..span.start + span.len {
