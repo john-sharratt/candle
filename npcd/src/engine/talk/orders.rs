@@ -27,6 +27,7 @@ use crate::engine::mission::{Mission, Origin, Todo};
 use crate::engine::runtime::Runtime;
 use crate::engine::talk::authority::{self, Standing};
 use crate::engine::talk::key::Party;
+use crate::engine::talk::within::POSTING;
 use crate::engine::work;
 use crate::world::Hosted;
 
@@ -34,9 +35,27 @@ use crate::world::Hosted;
 pub const NO_STANDING: &str =
     "Only whoever owns you, or an authorizer of this world, can change your mission.";
 
+/// Why a party with no standing over the character is refused an order posted
+/// for it.
+pub const NO_POSTING: &str =
+    "Only whoever owns you, or an authorizer of this world, can have you post work from a \
+     conversation.";
+
 /// Why a change inside the thrash cooldown is refused.
 pub const COOLING: &str =
     "Your mission was changed through a conversation a moment ago; it stays as it is for now.";
+
+/// Whether `act` posts work on the order table: an `invoke` of a table's
+/// `order_post` address.
+pub fn posts_work(act: &Act) -> bool {
+    body::is_device(act.tool)
+        && act
+            .args
+            .get("url")
+            .and_then(Value::as_str)
+            .and_then(|url| url.trim().rsplit('/').next())
+            == Some(POSTING)
+}
 
 impl Runtime {
     /// Apply mission act `act` from `npc_id`'s conversation with `member`,
@@ -79,6 +98,29 @@ impl Runtime {
             self.talk_changes.mark(npc_id, world_ms);
         }
         done
+    }
+
+    /// Why `npc_id`'s conversation with `member` may not post the work it
+    /// decided on, where the world is written — `None` when the party is the
+    /// character's owner or an authorizer.
+    ///
+    /// **The conversation that decides to give a Drone the work posts it.**
+    /// Told on the phone to have a Drone research the code, Zen's conversation
+    /// answered "I have instructed the Drones" and could only talk; the mind
+    /// that could post then took the work for its own and ran it on the
+    /// cluster's terminal, turn after turn, while no order was ever on the
+    /// table.
+    pub(crate) fn talk_post_refused(&self, npc_id: u64, member: &str) -> Option<String> {
+        let (hosted, _) = self.body_of(npc_id)?;
+        let party = Party::of_member(member, |b| self.bodies.mind_of(hosted.id(), b));
+        let owner = self
+            .npcs()
+            .and_then(|n| n.view().payload(npc_id).map(|p| p.owner_id.clone()));
+        let authorizers = hosted.sim(|s| s.missions.authorizers().to_vec());
+        match authority::standing(&party, owner.as_deref(), &authorizers) {
+            Standing::Nobody => Some(NO_POSTING.into()),
+            _ => None,
+        }
     }
 
     /// An ordered body's mission changed by `account`, whom it calls `name`.
@@ -170,5 +212,38 @@ impl Runtime {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn invoke(url: &str) -> Act {
+        Act {
+            tool: "invoke",
+            args: json!({"url": url, "body": {"job": "coding-task"}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        }
+    }
+
+    /// **A post is an `invoke` of a table's `order_post`**, and only that:
+    /// reading what came back, or a compiled act, posts nothing.
+    #[test]
+    fn a_post_is_an_invoke_of_the_tables_order_post() {
+        assert!(posts_work(&invoke(
+            "http://local/command/order-table~0/order_post"
+        )));
+        assert!(!posts_work(&invoke(
+            "http://local/command/order-table~0/order_results"
+        )));
+        let compiled = Act {
+            tool: "reply",
+            args: json!({"url": "x/order_post"}).as_object().unwrap().clone(),
+        };
+        assert!(!posts_work(&compiled));
     }
 }

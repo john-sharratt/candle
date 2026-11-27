@@ -682,6 +682,7 @@ pub(super) mod tests {
             name: "friend-0",
             owed: vec!["the garden report".into(), "the key".into()],
             may_change_mission: true,
+            may_post: false,
             carried: None,
             capped: false,
             cooling: Vec::new(),

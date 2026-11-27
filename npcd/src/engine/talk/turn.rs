@@ -28,7 +28,7 @@ use crate::engine::experience::line;
 use crate::engine::mind::{Minds, Talk, TalkTurn};
 use crate::engine::runtime::Runtime;
 use crate::engine::talk::asked::held_request;
-use crate::engine::talk::authority;
+use crate::engine::talk::authority::{self, Standing};
 use crate::engine::talk::catchup::{self, CatchUp};
 use crate::engine::talk::clock::{self, Ended, Input};
 use crate::engine::talk::critical;
@@ -36,6 +36,7 @@ use crate::engine::talk::guard::{self, Words};
 use crate::engine::talk::hand_off;
 use crate::engine::talk::journal::{self, TalkJournal, TALK};
 use crate::engine::talk::key::Party;
+use crate::engine::talk::orders::posts_work;
 use crate::engine::talk::runner::{Inputs, Key};
 use crate::engine::talk::state::TalkState;
 use crate::engine::talk::templates::Destination;
@@ -281,6 +282,7 @@ impl Runtime {
                 self.talk_changes.last(npc),
                 world_ms,
             ),
+            may_post: standing != Standing::Nobody,
             carried,
             capped: guard::capped(&party, state.activation),
             cooling: guard::cooling(&party, seen.last_said_ms, now_ms()),
@@ -428,6 +430,12 @@ impl Runtime {
                 // and this one offers the next turn's acts.
                 t if t.starts_with("mission_") => {
                     self.talk_changes.mark(npc, world_ms);
+                    elsewhere.push(done.answer.clone());
+                    settled = true;
+                }
+                // What the conversation posted is the mind's to oversee: it
+                // is told the post as the table answered it.
+                _ if posts_work(act) => {
                     elsewhere.push(done.answer.clone());
                     settled = true;
                 }
