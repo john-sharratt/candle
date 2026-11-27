@@ -595,13 +595,13 @@ The first build's budgets, on Flash-Next's trained window (`L0` =
 |---|---|---:|---:|---|
 | Journal | Birth | 8K (8,192) on a model whose native context is 128K or more — Flash-Next, Qwen3.6-35B; 2K (2,048) on a smaller one | — (the conversation's own sections, always hot) | — |
 | Tools | Relevance | 8K (8,192) | the catalog | the catalog |
-| Knowledge base | Relevance | 96K (98,304), the mandatory sections inside it | 2× the range: 192K, on every card | the pool, `PoolSize::for_card` |
+| Knowledge base | Relevance | 112K (114,688), the mandatory sections inside it | 2× the range: 224K, on every card | the pool, `PoolSize::for_card` |
 | Dialogue window | Birth | 96K (98,304) of past turns at a request's start | — | — |
-| Request reserve | Birth | the rest: `L0` less the ranges, the window and the fixed prompt — ≈ 43K on Flash-Next with a ~6K fixed prompt | — | — |
+| Request reserve | Birth | the rest: `L0` less the ranges, the window and the fixed prompt — ≈ 27K on Flash-Next with a ~6K fixed prompt | — | — |
 
 - **The reserve is the request's.** There is no separate `reserve_tokens`
   margin: what the ranges, the window and the fixed prompt leave is the room a
-  request grows into on rung 1 (§3.7), about seven 200-line reads. Past it a
+  request grows into on rung 1 (§3.7), about four 200-line reads. Past it a
   request runs on the next rung.
 - **The journal's range follows the native context.** 8K holds a long
   conversation's folded history and a request's notes on a model that reads
@@ -617,10 +617,13 @@ The first build's budgets, on Flash-Next's trained window (`L0` =
   range outside the competition, as the knowledge base's mandatory sections
   do; the belief selection fills the rest by score until the next signature
   does not fit. Its `min: 1` stays; its `max` is the range.
-- **The mandatory set must fit.** The seed's files were about 37K tokens; as
-  mandatory sections they take that much of the knowledge base's 96K, and
-  the load check (§3.5b) refuses a mandatory set that leaves less than half
-  the range to the competition.
+- **The mandatory set must fit.** The seed's files were about 37K tokens as
+  plain text; in `file_read`'s format (§3.5c) — every part fenced with its
+  anchor, every line behind its relative number — they measured 51,691 on
+  2026-11-28, past half of the 96K the range was first given, and the load
+  check (§3.5b), which refuses a mandatory set that leaves less than half the
+  range to the competition, refused to start. The range is 112K so the seed
+  fits with room to grow; the reserve gave up the 16K.
 
 ### 3.8 Models without a QSA index
 

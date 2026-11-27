@@ -720,7 +720,9 @@ system_prompt:
     - kind: collection
       name: files
       selection: { kind: always_visible }
-      range: { tokens: 98304 }
+      # 112K: the seed's files in `file_read`'s format (~52K, part anchors and
+      # line numbers included) must take at most half of it (§3.5b).
+      range: { tokens: 114688 }
       # Sealed at C5, as the knowledge base is everywhere
       # (docs/npc_mind_layout.md §3): a collection that declares none is C4.
       kv_level: 5

@@ -122,8 +122,8 @@ pub(super) mod projection_schema_tests {
         assert_eq!(
             range("files"),
             Some(ReservedRange {
-                tokens: 98_304,
-                small_context: 98_304,
+                tokens: 114_688,
+                small_context: 114_688,
                 fill: RangeFill::Top,
             })
         );
