@@ -74,8 +74,8 @@ use candle_conversation::persistence::{
     content_hash, OpenProgressHook, OpenStage, SharedSubstrate, SUBSTRATE_DIR,
 };
 use candle_conversation::projection::{
-    self, prefix_before_collection, Builder, Conversation, DecodePriority, ExclusionLearner,
-    GroupId, LayerId, PrefixItem, Reserved, SectionId, SectionLoads, SelectionRule, SystemItem,
+    self, prefix_before_summary, Builder, Conversation, DecodePriority, ExclusionLearner, GroupId,
+    LayerId, PrefixItem, Reserved, SectionId, SectionLoads, SelectionRule, SystemItem,
     SystemPromptItem, TimelineId, TurnIndex,
 };
 use candle_conversation::provenance::gallery_arena::GroupSet;

@@ -7,8 +7,15 @@
 //! it is emitted even when nothing was selected, because it is then the only
 //! thing that names the members. Sections gated on a collection emit only when
 //! that collection materialised.
+//!
+//! Every item takes the same positions on every projection
+//! (`docs/placed_section_layout.md` §3.1c): a section is padded to its slot and
+//! a gated one that does not emit is a hole of it, each tree node is padded to
+//! its slot, a ranged collection fills its range and a summary with a range
+//! fills that.
 
 use super::*;
+use crate::projection::{collection_of, node_slot, section_slot, summary_points};
 
 /// Walk the shared system prompt's `items` in declaration order, emitting each
 /// plain section verbatim or each collection's surviving subset (after applying
@@ -141,8 +148,22 @@ pub(super) fn emit_system_prompt_items<R: ContentResolver>(
         .collect();
     // Second pass: walk items in declaration order, applying the
     // `depends_on` predicate to Sections and using the cached
-    // collection results for Collections.
-    for item in &sp.items {
+    // collection results for Collections. Every item takes its slot
+    // (`docs/placed_section_layout.md` §3.1c): a section is padded to its slot
+    // and a gated one that does not emit is a hole of it, each tree node is
+    // padded to its slot, and a catalog summary with a range stands in it.
+    let summary_slots = summary_points(&sp.items);
+    for (at, item) in sp.items.iter().enumerate() {
+        for &cid in summary_slots.get(&at).into_iter().flatten() {
+            emit_summary_slot(
+                &mut out,
+                &sp.items,
+                cid,
+                pending_summaries.remove(&cid),
+                resolver,
+                selection_state,
+            );
+        }
         match item {
             SystemPromptItem::Section(s) => {
                 let should_emit = match (
@@ -179,6 +200,14 @@ pub(super) fn emit_system_prompt_items<R: ContentResolver>(
                     }
                     push_section_segment(&mut out, s);
                 }
+                // The section's slot: what it emitted and a hole of the rest,
+                // or all of it a hole when it did not emit.
+                let tokens = resolver.section_token_count(s.id);
+                let slot = section_slot(s, tokens);
+                let positions = if should_emit { slot - tokens } else { slot };
+                if positions > 0 {
+                    out.push(ProjectionSegment::Hole { positions });
+                }
             }
             SystemPromptItem::Collection(coll) => {
                 if let Some(selected) = collection_results.remove(&coll.id) {
@@ -205,74 +234,124 @@ pub(super) fn emit_system_prompt_items<R: ContentResolver>(
                 // fired, addressed by id.
                 let selection = tree.selection(|id| selection_state.get(id));
                 for node in &tree.nodes {
-                    // A live-prefilled structural marker (`<tools>` etc.): emit a
-                    // Generated run when the active branch is one it lives in (e.g.
-                    // tools on).  Prefix-transparent — never a Sealed segment.
-                    if let Some(g) = &node.glue {
-                        let key = tree.pack(&selection, node.ancestor_dims);
-                        if g.active_keys.contains(&key) {
-                            if let Some(tokens) = &g.tokens {
-                                out.push(ProjectionSegment::Generated {
-                                    tokens: tokens.clone(),
-                                    identity: GeneratedIdentity {
-                                        name: node.name.clone(),
-                                        position: out.len(),
-                                    },
-                                });
+                    let node_start = out.len();
+                    'node: {
+                        // A live-prefilled structural marker (`<tools>` etc.): emit a
+                        // Generated run when the active branch is one it lives in (e.g.
+                        // tools on).  Prefix-transparent — never a Sealed segment.
+                        if let Some(g) = &node.glue {
+                            let key = tree.pack(&selection, node.ancestor_dims);
+                            if g.active_keys.contains(&key) {
+                                if let Some(tokens) = &g.tokens {
+                                    out.push(ProjectionSegment::Generated {
+                                        tokens: tokens.clone(),
+                                        identity: GeneratedIdentity {
+                                            name: node.name.clone(),
+                                            position: out.len(),
+                                        },
+                                    });
+                                }
                             }
+                            break 'node;
                         }
-                        continue;
-                    }
-                    // A prefix-transparent embedded collection emits its cached
-                    // active-branch selection — the same drain path as a
-                    // top-level collection (summary outside its markers).  When
-                    // `deferred_projection` is set its selection is emitted by a
-                    // placeholder node below (`inject_collection`), so it skips
-                    // its own emission and leaves the cached results in place.
-                    if let Some(tc) = &node.collection {
-                        if tc.deferred_projection {
-                            continue;
-                        }
-                        if let Some(selected) = collection_results.remove(&tc.collection.id) {
-                            if let Some(sum_id) = pending_summaries.remove(&tc.collection.id) {
-                                emit_summary(&mut out, sum_id, resolver, selection_state);
+                        // A prefix-transparent embedded collection emits its cached
+                        // active-branch selection — the same drain path as a
+                        // top-level collection (summary outside its markers).  When
+                        // `deferred_projection` is set its selection is emitted by a
+                        // placeholder node below (`inject_collection`), so it skips
+                        // its own emission and leaves the cached results in place.
+                        if let Some(tc) = &node.collection {
+                            if tc.deferred_projection {
+                                break 'node;
                             }
-                            out.extend(selected);
+                            if let Some(selected) = collection_results.remove(&tc.collection.id) {
+                                if let Some(sum_id) = pending_summaries.remove(&tc.collection.id) {
+                                    emit_summary(&mut out, sum_id, resolver, selection_state);
+                                }
+                                out.extend(selected);
+                            }
+                            break 'node;
                         }
-                        continue;
-                    }
-                    // A placeholder node: it sealed its own anchor content (so the
-                    // nodes below attend to a stable prefix), but at projection its
-                    // content is REPLACED by the injected collection's top-k — the
-                    // provenance-selected real members, glued by their own trailing
-                    // newlines.  The anchor's K/V is intentionally not emitted here.
-                    // (The catalog summary is its own sealed tree section above the
-                    // tool block, not drained here.)
-                    if let Some(cid) = node.inject_collection {
-                        if let Some(selected) = collection_results.remove(&cid) {
-                            out.extend(selected);
+                        // A placeholder node: it sealed its own anchor content (so the
+                        // nodes below attend to a stable prefix), but at projection its
+                        // content is REPLACED by the injected collection's top-k — the
+                        // provenance-selected real members, glued by their own trailing
+                        // newlines.  The anchor's K/V is intentionally not emitted here.
+                        // (The catalog summary is its own sealed tree section above the
+                        // tool block, not drained here.)
+                        if let Some(cid) = node.inject_collection {
+                            if let Some(selected) = collection_results.remove(&cid) {
+                                out.extend(selected);
+                            }
+                            break 'node;
                         }
-                        continue;
+                        let opt_idx = node.chosen(&selection);
+                        let option = &node.options[opt_idx];
+                        if let Some(sel_id) = node.selector_id() {
+                            resolved_selections.push(ResolvedSelection {
+                                selector: sel_id.to_string(),
+                                option: option.id.clone(),
+                            });
+                        }
+                        // Empty options (e.g. a binary node's `absent`) emit nothing.
+                        if let Some(v) =
+                            option.variant_for(tree.pack(&selection, node.ancestor_dims))
+                        {
+                            out.push(ProjectionSegment::Sealed(SealedKind::Section(
+                                ResolvedSection::new(v.id),
+                            )));
+                        }
                     }
-                    let opt_idx = node.chosen(&selection);
-                    let option = &node.options[opt_idx];
-                    if let Some(sel_id) = node.selector_id() {
-                        resolved_selections.push(ResolvedSelection {
-                            selector: sel_id.to_string(),
-                            option: option.id.clone(),
+                    // The node's slot: what it emitted and a hole of the rest.
+                    let used = segment_tokens(&out[node_start..], resolver);
+                    let slot = node_slot(node, |id| resolver.section_token_count(id));
+                    if slot > used {
+                        out.push(ProjectionSegment::Hole {
+                            positions: slot - used,
                         });
-                    }
-                    // Empty options (e.g. a binary node's `absent`) emit nothing.
-                    if let Some(v) = option.variant_for(tree.pack(&selection, node.ancestor_dims)) {
-                        out.push(ProjectionSegment::Sealed(SealedKind::Section(
-                            ResolvedSection::new(v.id),
-                        )));
                     }
                 }
             }
         }
     }
     out
+}
+
+/// Emit collection `cid`'s catalog summary slot: its `summary` and the notes
+/// the turn set on it, when it emits this projection, and a hole of the rest
+/// of the collection's `summary_range` (`docs/placed_section_layout.md`
+/// §3.1c). A summary past its range is emitted whole and warned of: everything
+/// after it moves.
+fn emit_summary_slot<R: ContentResolver>(
+    out: &mut Vec<ProjectionSegment>,
+    items: &[SystemPromptItem],
+    cid: CollectionId,
+    summary: Option<SectionId>,
+    resolver: &R,
+    selection_state: &SelectionState,
+) {
+    let Some(range) = collection_of(items, cid).and_then(|c| c.summary_range) else {
+        return;
+    };
+    let mut slot = Vec::new();
+    if let Some(summary) = summary {
+        emit_summary(&mut slot, summary, resolver, selection_state);
+    }
+    let used = segment_tokens(&slot, resolver);
+    let reserved = range.positions(resolver.trained_window());
+    if used > reserved {
+        tracing::warn!(
+            collection = ?cid,
+            used,
+            reserved,
+            "a catalog summary takes more than its range: everything after it moves"
+        );
+    }
+    out.extend(slot);
+    let hole = range.hole(resolver.trained_window(), used);
+    if hole > 0 {
+        out.push(ProjectionSegment::Hole { positions: hole });
+    }
 }
 
 /// Emit a collection's `selected` members in its reserved range: what they do

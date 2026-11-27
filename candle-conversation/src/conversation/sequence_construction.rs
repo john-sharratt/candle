@@ -10,6 +10,25 @@
 //! recurrent layers silently at zero.
 
 use super::*;
+use crate::projection::{
+    collection_of, node_options_tokens, section_slot, summary_points, tree_prefix, unpack_selection,
+};
+
+/// Warn of a dynamic section, or a tree node, whose content outgrew the
+/// `min_tokens` it declares (`docs/placed_section_layout.md` §3.1c): its slot
+/// grew, everything after it moved, and what was sealed behind the old slot is
+/// stale.
+fn warn_outgrown(name: &str, tokens: usize, min_tokens: usize) {
+    if min_tokens > 0 && tokens > min_tokens {
+        tracing::warn!(
+            section = name,
+            tokens,
+            min_tokens,
+            "a section outgrows its min_tokens: everything after it moved, and the \
+             substrate sealed behind its old slot is stale"
+        );
+    }
+}
 
 /// Whether a dialed first turn has to swap the prompt checkpoint: only when the
 /// branch its selection names is not the one already installed.
@@ -439,20 +458,46 @@ impl Sequence {
         // each other). Sections declared after a Collection attend to
         // the full set of members during ingest — the maximal-context
         // approximation for runtime selection.
-        for item in &layer_items {
+        // Every item takes its slot in both prefixes, as every projection lays
+        // it down (`docs/placed_section_layout.md` §3.1c): a catalog summary's
+        // range is a hole here, nothing being summarised yet; a section is
+        // padded to its slot, and one the birth prefix leaves out is a hole of
+        // it; each tree node is padded to its slot, inside the tree as after it.
+        let summary_slots = summary_points(&layer_items);
+        let substrate = conv.substrate.clone();
+        let tokens_of = |id: SectionId| substrate.read().section_tokens_of(id).len();
+        for (at, item) in layer_items.iter().enumerate() {
+            for &cid in summary_slots.get(&at).into_iter().flatten() {
+                if let Some(range) = collection_of(&layer_items, cid).and_then(|c| c.summary_range)
+                {
+                    let positions = range.positions(native);
+                    linear_prefix.push(PrefixItem::Hole(positions));
+                    fixed_prefix.push(PrefixItem::Hole(positions));
+                }
+            }
             match item {
                 SystemPromptItem::Section(s) => {
                     conv.insert_section_with_prefix(s.id, s.content.as_str(), &linear_prefix)?;
+                    let tokens = tokens_of(s.id);
+                    let slot = section_slot(s, tokens);
+                    warn_outgrown(&s.name, tokens, s.min_tokens);
                     linear_prefix.push(PrefixItem::Section(s.id));
+                    if slot > tokens {
+                        linear_prefix.push(PrefixItem::Hole(slot - tokens));
+                    }
                     // Sections with `depends_on` are conditional — they
                     // only emit when the named collection materialises —
-                    // so they must NOT contribute to the birth prefix
-                    // `fixed_prefix`. Nor does a section with no content:
-                    // ingest seals nothing for it and the projection emits
-                    // nothing for it, so the frame must not name it either,
-                    // or the two lists disagree about what the slot holds.
+                    // so they do not enter the birth prefix `fixed_prefix`:
+                    // their slot does, as a hole, so what follows stands
+                    // where it does whether they emit or not. A section with
+                    // no content is named by neither.
                     if s.depends_on.is_none() && !s.content.is_empty() {
                         fixed_prefix.push(PrefixItem::Section(s.id));
+                        if slot > tokens {
+                            fixed_prefix.push(PrefixItem::Hole(slot - tokens));
+                        }
+                    } else if slot > 0 {
+                        fixed_prefix.push(PrefixItem::Hole(slot));
                     }
                     done_bytes += s.content.len() as u64;
                     report(done_bytes);
@@ -538,11 +583,19 @@ impl Sequence {
                     // Seal EVERY option's branch variants up front — the full
                     // cross-product prefill that makes selector switching free.
                     // Each variant is sealed against `[outer content prefix |
-                    // that branch's in-tree ancestor variants]`.  Sealing in
-                    // (node order, option order, variant order) is
-                    // dependency-safe: a variant's in-tree prefix references only
-                    // earlier nodes' variants, which are already sealed.
-                    for node in &tree.nodes {
+                    // that branch's in-tree ancestor variants]`, every earlier
+                    // node in its slot (`tree_prefix`).  Sealing in (node order,
+                    // option order, variant order) is dependency-safe: a
+                    // variant's in-tree prefix references only earlier nodes'
+                    // variants, which are already sealed, so their slots are
+                    // known.
+                    for (ni, node) in tree.nodes.iter().enumerate() {
+                        // The slotted in-tree prefix a variant of this node
+                        // keyed `ancestors` seals behind.
+                        let in_tree = |ancestors: u32| {
+                            let selection = unpack_selection(tree, ancestors, node.ancestor_dims);
+                            tree_prefix(tree, ni, &selection, tokens_of)
+                        };
                         // A prefix-transparent embedded collection: seal each
                         // member ONCE PER ancestor branch (the ×outer-selector
                         // fan-out), batching all members of a branch under that
@@ -556,7 +609,7 @@ impl Sequence {
                             if let Some(branch_list) = tc.variants.first() {
                                 for (bi, bvar) in branch_list.iter().enumerate() {
                                     let mut prefix = linear_prefix.clone();
-                                    prefix.extend(sections_prefix(&bvar.in_tree_prefix));
+                                    prefix.extend(in_tree(bvar.ancestors));
                                     let batch: Vec<(SectionId, &str)> = members
                                         .iter()
                                         .enumerate()
@@ -604,7 +657,7 @@ impl Sequence {
                         for option in &node.options {
                             for v in &option.variants {
                                 let mut prefix = linear_prefix.clone();
-                                prefix.extend(sections_prefix(&v.in_tree_prefix));
+                                prefix.extend(in_tree(v.ancestors));
                                 conv.insert_section_with_prefix(
                                     v.id,
                                     option.content.as_str(),
@@ -614,21 +667,28 @@ impl Sequence {
                                 report(done_bytes);
                             }
                         }
+                        warn_outgrown(
+                            &node.name,
+                            node_options_tokens(node, tokens_of),
+                            node.min_tokens,
+                        );
                     }
                     // Sections declared after the tree (and the birth
                     // prefix) attend to the default branch — the fan-out is
                     // bounded to the tree itself.
                     //
-                    // Remember where this tree's branch ids sit in
+                    // Remember where this tree's branch ids and its pad sit in
                     // `fixed_prefix`, so the checkpoint pass below can swap the
-                    // default branch for any other leaf without re-walking the
-                    // schema. Pushed rather than assigned: a schema may declare
-                    // several trees, and each owns its own window.
-                    branch_spans.push((fixed_prefix.len(), tree.default_present_ids.len()));
-                    for id in &tree.default_present_ids {
-                        linear_prefix.push(PrefixItem::Section(*id));
-                        fixed_prefix.push(PrefixItem::Section(*id));
-                    }
+                    // default branch for any other leaf, padded to the same
+                    // slot, without re-walking the schema. Pushed rather than
+                    // assigned: a schema may declare several trees, and each
+                    // owns its own window.
+                    let start = fixed_prefix.len();
+                    let branch =
+                        tree_prefix(tree, tree.nodes.len(), &tree.default_selection, tokens_of);
+                    linear_prefix.extend(branch.iter().cloned());
+                    fixed_prefix.extend(branch);
+                    branch_spans.push((start, fixed_prefix.len() - start));
                 }
             }
         }
@@ -712,7 +772,8 @@ impl Sequence {
     ///
     /// `birth` is the birth-time projection — the collections-as-empty section
     /// list — and `branch_spans` are the windows inside it that the section
-    /// trees filled, one per tree in item order. Each window is
+    /// trees filled, one per tree in item order, each a branch's sections and
+    /// the hole padding them to the tree's slot. Each window is
     /// **re-derived** from its tree and this conversation's own selection
     /// rather than taken as-is, because the walk that built `birth`
     /// had only the authored defaults to go on: `SectionTree::branch_prefix_ids`
@@ -754,11 +815,10 @@ impl Sequence {
                 }
                 ids.extend_from_slice(&birth[cursor..start]);
                 let selection = tree.selection(|id| self.selection.get(id));
-                ids.extend(
-                    tree.branch_prefix_ids(&selection)
-                        .into_iter()
-                        .map(PrefixItem::Section),
-                );
+                // The branch, every node in its slot as the default's were
+                // (`docs/placed_section_layout.md` §3.1c).
+                let tokens_of = |id: SectionId| self.substrate.read().section_tokens_of(id).len();
+                ids.extend(tree_prefix(tree, tree.nodes.len(), &selection, tokens_of));
                 cursor = start + len;
             }
         }

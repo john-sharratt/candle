@@ -286,7 +286,7 @@ pub use ids::{
     process_timeline_allocator, CollectionId, GroupId, LayerId, Reserved, SectionId,
     TimelineAllocator, TimelineId, TurnId, TurnIndex, TurnKey,
 };
-pub use owned_prefix::prefix_before_collection;
+pub use owned_prefix::{prefix_before_collection, prefix_before_summary};
 pub use owned_sections::{OwnedSection, OwnedSections};
 pub use pins::{within_budget, Pin, PinSet};
 pub use plain_prompt::PlainPromptFrames;
@@ -307,11 +307,13 @@ pub use resolver::{
     TargetedRead, WarmProbe,
 };
 pub use schema::{
-    Budget, CompressionPrompt, Content, CorruptTurnPolicy, DecodePriority, Draws, GatherScope,
-    GroupSchema, LayerDials, LayerSchema, LayerSummary, RangeFill, Recency, ReservedRange, Schema,
-    ScoreFormula, SectionCollection, SectionSchema, SectionTree, SelectionRule, SystemPromptItem,
-    SystemPromptSchema, TreeDim, TreeNode, TreeOption, TreeVariant, TurnSummary, WorkingSetShare,
-    LINEAGE_BASE, MAX_KV_LEVEL, MEMBER_KV_LEVEL,
+    collection_of, node_options_tokens, node_slot, section_slot, summary_points, tree_prefix,
+    tree_slot, unpack_selection, Budget, CompressionPrompt, Content, CorruptTurnPolicy,
+    DecodePriority, Draws, GatherScope, GroupSchema, LayerDials, LayerSchema, LayerSummary,
+    RangeFill, Recency, ReservedRange, Schema, ScoreFormula, SectionCollection, SectionSchema,
+    SectionTree, SelectionRule, SystemPromptItem, SystemPromptSchema, TreeDim, TreeNode,
+    TreeOption, TreeVariant, TurnSummary, WorkingSetShare, LINEAGE_BASE, MAX_KV_LEVEL,
+    MEMBER_KV_LEVEL,
 };
 pub use script::{recorded_dials, ProjectionScript};
 pub use working_set_pick::{SlotBoundary, WorkingSetMembers};

@@ -687,7 +687,10 @@ impl InferenceState {
         // the text is rebuilt and its section prefilled on every startup, exactly
         // like the tool sections themselves.
         {
-            let prelude = pre_tools_prefix(&proj_builder_refresh, base_conv.native_context());
+            let prelude =
+                pre_tools_prefix(&proj_builder_refresh, base_conv.native_context(), |s| {
+                    base_conv.section_tokens(s)
+                });
             let summary_for = |mode: ToolMode| {
                 let offered = crate::tools::offered_tool_names(mode);
                 let sections: Vec<crate::tool_summary::InstalledTool> = tool_sections
@@ -710,14 +713,20 @@ impl InferenceState {
             // the same pre-tools prefix so its KV is position-correct for "just
             // before the tools". Each mode's projection points the tools collection
             // at its own summary ([`tool_summary_section`]); None emits none.
+            let mut longest_summary = 0usize;
             for (text, reserved, label) in summaries {
                 let sid = SectionId::reserved(reserved);
                 match base_conv.insert_section_with_prefix(sid, &text, &prelude) {
-                    Ok(()) => tracing::info!(
-                        section = sid.raw(),
-                        label,
-                        "tool summary section sealed (prefilled before tools)",
-                    ),
+                    Ok(()) => {
+                        let tokens = base_conv.section_tokens(sid);
+                        longest_summary = longest_summary.max(tokens);
+                        tracing::info!(
+                            section = sid.raw(),
+                            label,
+                            tokens,
+                            "tool summary section sealed (prefilled before tools)",
+                        )
+                    }
                     Err(e) => tracing::warn!(label, "tool summary section seal failed: {e}"),
                 }
             }
@@ -729,11 +738,42 @@ impl InferenceState {
                 tool_summary_section(ToolMode::Comprehensive)
                     .map(|r| PrefixItem::Section(SectionId::reserved(r))),
             );
+            let mut all_lines = 0usize;
             for (sid, line) in crate::tool_availability::line_sections() {
                 let text = format!("\n{line}");
                 if let Err(e) = base_conv.insert_section_with_prefix(sid, &text, &after_summary) {
                     tracing::warn!(line, "tool availability line seal failed: {e}");
                 }
+                all_lines += base_conv.section_tokens(sid);
+            }
+
+            // The summary's slot (`docs/placed_section_layout.md` §3.1c) must
+            // hold the longest summary with every line a turn can add after it:
+            // past it, a projection moves everything after the summary.
+            let reserved = proj_builder_refresh
+                .schema()
+                .system_prompt
+                .collection_named("tools")
+                .and_then(|c| c.summary_range)
+                .map(|r| r.positions(base_conv.native_context()));
+            let needed = longest_summary + all_lines;
+            match reserved {
+                Some(reserved) if needed <= reserved => tracing::info!(
+                    needed,
+                    reserved,
+                    "the tool summary's range holds the longest summary and every line"
+                ),
+                Some(reserved) => tracing::error!(
+                    needed,
+                    reserved,
+                    "the tool summary's range is smaller than the longest summary and every \
+                     line: a turn that projects them moves everything after the summary"
+                ),
+                None => tracing::error!(
+                    needed,
+                    "the tools collection declares no summary_range: the summary moves \
+                     everything after it"
+                ),
             }
         }
 

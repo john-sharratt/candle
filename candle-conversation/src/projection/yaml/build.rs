@@ -241,6 +241,7 @@ pub(super) fn build_system_prompt(
             depends_on_configured: None,
             depends_on_unconfigured: None,
             is_template: false,
+            min_tokens: 0,
             template_tokens: None,
         }));
     }
@@ -289,6 +290,7 @@ pub(super) fn build_system_prompt(
                 depends_on_absent,
                 depends_on_configured,
                 depends_on_unconfigured,
+                min_tokens,
             } => {
                 if !section_names.insert(id.clone()) {
                     return Err(ConstructionError::DuplicateSectionName(id.clone()));
@@ -322,6 +324,7 @@ pub(super) fn build_system_prompt(
                     depends_on_configured: depends_on_configured_cid,
                     depends_on_unconfigured: depends_on_unconfigured_cid,
                     is_template: false,
+                    min_tokens: *min_tokens,
                     template_tokens: None,
                 }));
             }
@@ -329,6 +332,7 @@ pub(super) fn build_system_prompt(
                 id,
                 dialect: dialect_name,
                 depends_on,
+                min_tokens,
             } => {
                 let dlct = dialect.ok_or_else(|| ConstructionError::DialectRequired {
                     item: format!("{}/{}", owner, id),
@@ -369,6 +373,7 @@ pub(super) fn build_system_prompt(
                     depends_on_configured: None,
                     depends_on_unconfigured: None,
                     is_template: true,
+                    min_tokens: *min_tokens,
                     template_tokens: None,
                 }));
             }
@@ -383,6 +388,7 @@ pub(super) fn build_system_prompt(
                 default: coll_default,
                 budget_adaptive: coll_budget_adaptive,
                 range: coll_range,
+                summary_range: coll_summary_range,
                 kv_level,
             } => {
                 let cid = *collections
@@ -390,6 +396,13 @@ pub(super) fn build_system_prompt(
                     .expect("first-pass pre-allocated every collection id");
                 let label = format!("{}/{}", owner, name);
                 let range = parse_reserved_range(&label, coll_range.as_ref())?;
+                // The summary stands at its range's front, whatever `fill` says.
+                let summary_range =
+                    parse_reserved_range(&format!("{label}/summary"), coll_summary_range.as_ref())?
+                        .map(|r| ReservedRange {
+                            fill: RangeFill::Bottom,
+                            ..r
+                        });
                 let kv_level = kv_level.unwrap_or(MEMBER_KV_LEVEL);
                 if kv_level > MAX_KV_LEVEL {
                     return Err(ConstructionError::InvalidPolicy {
@@ -426,6 +439,7 @@ pub(super) fn build_system_prompt(
                         depends_on_configured: None,
                         depends_on_unconfigured: None,
                         is_template: false,
+                        min_tokens: 0,
                         template_tokens: None,
                     });
                 }
@@ -469,6 +483,7 @@ pub(super) fn build_system_prompt(
                     )?,
                     mandatory: Vec::new(),
                     range,
+                    summary_range,
                     kv_level,
                 }));
             }
@@ -526,6 +541,7 @@ pub(super) fn build_compression_prompt(
             depends_on_configured: None,
             depends_on_unconfigured: None,
             is_template: false,
+            min_tokens: 0,
             template_tokens: None,
         },
         user_prompt: yc.user_prompt.clone(),

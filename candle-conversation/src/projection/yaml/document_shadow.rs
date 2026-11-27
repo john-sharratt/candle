@@ -238,6 +238,11 @@ pub(super) enum YamlSystemPromptItem {
         /// Collection has no members at all, i.e. the facility is switched off.
         #[serde(default)]
         depends_on_unconfigured: Option<String>,
+        /// The least the section's slot takes (`docs/placed_section_layout.md`
+        /// §3.1c): room for its text to change, or for a gated section to emit
+        /// or not, without moving anything after it.
+        #[serde(default)]
+        min_tokens: usize,
     },
     /// References a [`DialectTemplate`] catalog entry by snake-case
     /// name.  Resolves to the dialect's string at build time and lands
@@ -253,6 +258,9 @@ pub(super) enum YamlSystemPromptItem {
         /// [`Self::Section::depends_on`].
         #[serde(default)]
         depends_on: Option<String>,
+        /// As [`Self::Section::min_tokens`].
+        #[serde(default)]
+        min_tokens: usize,
     },
     Collection {
         name: String,
@@ -286,6 +294,11 @@ pub(super) enum YamlSystemPromptItem {
         /// of them, a hole ahead (`docs/placed_section_layout.md` §3.1).
         #[serde(default)]
         range: Option<YamlReservedRange>,
+        /// The positions its catalog summary and the turn's notes on it always
+        /// take, the summary at their front and a hole after it
+        /// (`docs/placed_section_layout.md` §3.1c). `fill` does not apply.
+        #[serde(default)]
+        summary_range: Option<YamlReservedRange>,
         /// The compression level its members are sealed at.
         #[serde(default)]
         kv_level: Option<u8>,
@@ -337,6 +350,11 @@ pub(super) enum YamlTreeNode {
         /// `TreeCollection::deferred_projection`).
         #[serde(default)]
         inject_collection: Option<String>,
+        /// The least the node's slot takes (`docs/placed_section_layout.md`
+        /// §3.1c): room for its content to change without moving anything
+        /// after it.
+        #[serde(default)]
+        min_tokens: usize,
     },
     /// Binary toggle — `present` (the content) vs `absent` (empty).  Its `id`
     /// is the selector id the runtime flips.
@@ -352,6 +370,9 @@ pub(super) enum YamlTreeNode {
         /// Authored default presence: `present` (default) or `absent`.
         #[serde(default)]
         default: Option<String>,
+        /// As [`Self::Section::min_tokens`].
+        #[serde(default)]
+        min_tokens: usize,
     },
     /// N-way selector — emits the one option whose id the runtime selects (by
     /// the node `id`).  Exactly one option emits.
@@ -363,6 +384,9 @@ pub(super) enum YamlTreeNode {
         /// The option id used when the runtime supplies no selection.
         default: String,
         options: Vec<YamlTreeOption>,
+        /// As [`Self::Section::min_tokens`].
+        #[serde(default)]
+        min_tokens: usize,
     },
     /// A nested `section_tree` — its nodes expand inline into the enclosing
     /// tree, so its selectors become dims declared **after** every node above

@@ -675,14 +675,18 @@ impl Sequence {
             ConversationError::Other(format!("the schema has no collection {collection:?}"))
         })?;
         let native = self.substrate.read().trained_window();
-        let prefix =
-            prefix_before_collection(&base.schema().system_prompt.items, collection_id, native)
-                .ok_or_else(|| {
-                    ConversationError::Other(format!(
-                        "collection {collection:?} is inside a section tree, which seals each \
+        let prefix = prefix_before_collection(
+            &base.schema().system_prompt.items,
+            collection_id,
+            native,
+            |s| self.section_tokens(s),
+        )
+        .ok_or_else(|| {
+            ConversationError::Other(format!(
+                "collection {collection:?} is inside a section tree, which seals each \
                      member once per branch; submit to a top-level collection"
-                    ))
-                })?;
+            ))
+        })?;
 
         if let Some(at) = self.submitted.position_of_name(name) {
             let earlier = self.submitted.entries.remove(at);

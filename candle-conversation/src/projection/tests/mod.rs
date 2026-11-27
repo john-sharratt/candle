@@ -476,6 +476,7 @@ mod tests_section_tree_basics;
 #[cfg(test)]
 mod tests_section_tree_nesting;
 mod tests_selection;
+mod tests_slots;
 mod tests_substitution_and_zend;
 mod tests_turn_groups;
 mod tests_visibility;

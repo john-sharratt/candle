@@ -151,6 +151,10 @@ system_prompt:
     #   thinking_effort  ← composer "effort"   dial (off/quick/balanced/deep/exhaustive = 0..4)
     #   response_length  ← composer "verbosity" dial (terse/concise/standard/detailed/comprehensive = 0..4)
     #   no_think         ← thinking on/off (present/absent)
+    #
+    # Each node's `min_tokens` is its slot (docs/placed_section_layout.md
+    # §3.1c): about twice what its longest option takes today, so its text can
+    # change without moving anything after it.
     - kind: section_tree
       nodes:
         # `no_think` — the USER-TURN half of `Dialect::thinking_suppression`.
@@ -177,6 +181,8 @@ system_prompt:
           id: persona
           pin: true
           default: assistant
+          # The assistant frame takes 273.
+          min_tokens: 576
           options:
             # Written from the one baseline this daemon has — Cline's system prompt,
             # which the same checkpoint follows cleanly on the passthrough: a plain
@@ -210,6 +216,8 @@ system_prompt:
         - kind: optional
           id: reasoning_stance
           default: present
+          # 61 today.
+          min_tokens: 128
           content: |+
             Use your <think> block to plan: work out what the user needs and which files or
             tools will answer it. Reason from the actual files, code, and decisions in this
@@ -259,6 +267,8 @@ system_prompt:
         - kind: selector
           id: thinking_effort
           default: balanced
+          # `exhaustive`, the longest, takes ~75.
+          min_tokens: 160
           options:
             - id: off
               content: |+
@@ -279,6 +289,8 @@ system_prompt:
         - kind: selector
           id: response_length
           default: standard
+          # `comprehensive`, the longest, takes ~35.
+          min_tokens: 96
           options:
             - id: terse
               content: |+
@@ -309,6 +321,9 @@ system_prompt:
         - kind: selector
           id: role
           default: generic
+          # The node's slot (docs/placed_section_layout.md §3.1c): the coder's
+          # rules, the longest option, take ~2400.
+          min_tokens: 4096
           options:
             - id: generic
             - id: coder
@@ -418,6 +433,8 @@ system_prompt:
         - kind: selector
           id: driven
           default: attended
+          # The node's slot: `alone` takes ~150.
+          min_tokens: 384
           options:
             - id: attended
             - id: alone
@@ -461,6 +478,8 @@ system_prompt:
     - kind: section
       id: grounding
       depends_on_configured: tools
+      # Its slot (docs/placed_section_layout.md §3.1c): 426 today.
+      min_tokens: 768
       content: |+
         Answer from what is actually in this conversation and the files in the knowledge
         base. Your tools run for real in the
@@ -490,6 +509,8 @@ system_prompt:
     - kind: section
       id: grounding_no_tools
       depends_on_unconfigured: tools
+      # ~40 today.
+      min_tokens: 96
       content: |+
         Answer from what is actually in this conversation and the files in the knowledge
         base. If you need something that has not appeared yet, say so.
@@ -515,6 +536,8 @@ system_prompt:
       id: journal_intro
       pin: true
       depends_on: journal
+      # Its slot: ~300 today.
+      min_tokens: 576
       content: |+
         # Your journal
 
@@ -563,6 +586,8 @@ system_prompt:
       # emit bare JSON — then emitted it untagged. Plain `|`, so the last line sits
       # against the `<tools>` block it introduces.
       depends_on_configured: tools
+      # Its slot: 444 today.
+      min_tokens: 768
       content: |
         # Tools
 
@@ -693,6 +718,12 @@ system_prompt:
       # so everything after the tools stands where it stands whichever are
       # selected.
       range: { tokens: 8192 }
+      # The catalog summary's slot (docs/placed_section_layout.md §3.1c), just
+      # before `<tools>`: the summary the tools mode lists and every
+      # availability line a turn can add after it, the rest a hole, so
+      # everything after the summary stands where it stands whichever mode,
+      # selection and lines a turn has. Startup logs what it needs of this.
+      summary_range: { tokens: 4096 }
       sections: []
 
     - kind: template

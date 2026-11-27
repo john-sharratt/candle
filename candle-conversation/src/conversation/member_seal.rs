@@ -116,6 +116,12 @@ impl Sequence {
         self.substrate.read().trained_window()
     }
 
+    /// The tokens a sealed section takes, as the prompt walks size its slot
+    /// (`docs/placed_section_layout.md` §3.1c); 0 for one not sealed.
+    pub fn section_tokens(&self, section: SectionId) -> usize {
+        self.substrate.read().section_tokens_of(section).len()
+    }
+
     /// The token ids `text` encodes to, as a member's seal encodes it.
     pub fn member_token_ids(&self, text: &str) -> crate::Result<Vec<u32>> {
         Ok(self
@@ -143,7 +149,10 @@ impl Sequence {
             });
         }
         let native = self.substrate.read().trained_window();
-        let before = prefix_before_collection(&base.schema().system_prompt.items, id, native)
+        let before =
+            prefix_before_collection(&base.schema().system_prompt.items, id, native, |s| {
+                self.section_tokens(s)
+            })
             .ok_or_else(|| {
                 ConversationError::Other(format!(
                     "collection {collection:?} is inside a section tree; its members are \

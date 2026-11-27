@@ -113,6 +113,7 @@ impl Schema {
 }
 
 mod group;
+mod item_slot;
 mod layer;
 mod reserved_range;
 mod selection;
@@ -122,6 +123,7 @@ mod system_prompt;
 mod tests_group;
 
 pub use group::*;
+pub use item_slot::*;
 pub use layer::*;
 pub use reserved_range::*;
 pub use selection::*;

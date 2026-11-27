@@ -331,6 +331,10 @@ pub struct TreeNode {
     /// How many selector dims are declared **before** this node — the width of
     /// its ancestor assignment (the `dim_count` for [`SectionTree::pack`]).
     pub ancestor_dims: usize,
+    /// The least the node's slot takes (`docs/placed_section_layout.md` §3.1c,
+    /// [`super::node_slot`]): room for its options to change without moving
+    /// anything after it. 0 when the schema declares none.
+    pub min_tokens: usize,
 }
 
 /// A live-prefilled structural marker in a [`SectionTree`] ([`TreeNode::glue`]).
@@ -503,6 +507,11 @@ pub struct SectionCollection {
     /// them and a hole ahead (`docs/placed_section_layout.md` §3.1). A
     /// collection with none takes exactly what its members do.
     pub range: Option<ReservedRange>,
+    /// The positions its catalog summary and the turn's notes on it always
+    /// take, the summary at the front and a hole after
+    /// (`docs/placed_section_layout.md` §3.1c). A collection with none emits its
+    /// summary in what it takes.
+    pub summary_range: Option<ReservedRange>,
     /// The adaptive compression level its members' K/V is sealed at
     /// ([`MEMBER_KV_LEVEL`] unless the collection declares `kv_level`): the
     /// knowledge base's sections at C5, a tool's signature at C4.
@@ -531,6 +540,7 @@ impl Default for SectionCollection {
             budget_adaptive: None,
             mandatory: Vec::new(),
             range: None,
+            summary_range: None,
             kv_level: MEMBER_KV_LEVEL,
         }
     }
@@ -595,6 +605,11 @@ pub struct SectionSchema {
     /// stays attention-correct under whatever prefix the projection
     /// selected this turn.
     pub is_template: bool,
+    /// The least the section's slot takes (`docs/placed_section_layout.md`
+    /// §3.1c, [`super::section_slot`]): room for its text to change, or for it
+    /// to emit or not, without moving anything after it. 0 when the schema
+    /// declares none.
+    pub min_tokens: usize,
     /// Pre-tokenised template content, populated by
     /// [`super::Builder::tokenize_templates`] before the first
     /// projection.  `Some` only when `is_template == true`; the

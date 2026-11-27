@@ -43,6 +43,7 @@ impl CompressionPrompt {
                 depends_on_configured: None,
                 depends_on_unconfigured: None,
                 is_template: false,
+                min_tokens: 0,
                 template_tokens: None,
             },
             user_prompt: String::new(),

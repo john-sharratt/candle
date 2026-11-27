@@ -121,6 +121,61 @@ the positions straight after `files_open` (the range of size 0); the first
 ingest after this lands seals at the top of the range and, keyed by the new
 address, replaces those members rather than mixing with them.
 
+### 3.1c Every item of the system prompt takes a fixed slot
+
+A range fixes what follows it only if everything before it is fixed too, and
+most of the system prompt is not: a dial picks one of a tree node's options, a
+gated section emits or does not (`depends_on`, `depends_on_absent`,
+`depends_on_configured`, `depends_on_unconfigured`), and the catalog summary
+emits with the notes the turn adds only when the selection is partial. Each of
+those moved `B` for every range after it, by up to a thousand positions
+between the tools dial's settings alone — and the ingest sealed members
+against yet another prefix, every bare section and each tree's default branch,
+which no projection ever produces.
+
+So **every item takes the positions of its largest form, always**: what it
+emits and a hole of the rest. The slots are
+
+| Item | Slot |
+|---|---|
+| a section, gated or not | its tokens, or its `min_tokens` when that is more — a gated one that does not emit is a hole of it |
+| a section-tree node | its longest option, glue included, or its `min_tokens` when that is more |
+| a section tree | the sum of its nodes' slots |
+| a collection with a range | the range (§3.1) |
+| a collection's catalog summary | its declared `summary_range`, the summary and its notes at the front |
+
+Every dynamic section with text that can change declares a `min_tokens`, its
+margin: room to edit its text without moving anything after it. A dialect
+marker (`<tools>`, `</tools>`, `no_think`) is fixed text and needs none: its
+slot is its own tokens, a hole of them when it does not emit,
+so a prompt change inside the margin leaves every sealed section and member
+where it was. Each tree node is padded to its own slot, inside the tree as
+after it: a variant seals behind the earlier nodes each in its slot
+(`tree_prefix`), so changing one option moves neither the nodes below it nor
+anything after the tree. zend sizes each at about twice its longest form today
+— persona 576 (273), reasoning stance 128 (61), effort 160 (~75), length 96
+(~35), role 4096 (the coder's ~2400), `driven` 384 (~150), grounding 768
+(426), the no-tools grounding 96 (~40), the journal intro 576 (~300), the tool
+overview 768 (444). A section whose text
+outgrows its minimum is warned of at a conversation's creation: everything
+after it has moved, and what was sealed behind its old slot is stale.
+
+The summary's slot stands where the summary is read: just before the first
+template gated on its collection (`<tools>`), or before the collection when
+none is. A collection with no range — none in zend's schema; npcd's
+identity, response and mood collections — takes what its members take, and
+moves what follows it.
+
+Every walk of the system prompt lays the slots down the same way: the
+projection (`project/emit.rs`), the creation walk that seals the system
+sections and builds the birth prefix and its branch checkpoints
+(`conversation/sequence_construction.rs`), and the prefix a collection's
+members are sealed behind (`projection/owned_prefix.rs`). Each puts the
+content it has always used — the projection what it selected, the creation
+walk and the ingest every section and each tree's default branch — and a hole
+for what that content leaves of its slot, so a range starts at the same `B`
+in all of them, whatever the dials, the tools mode or the journal hold.
+
 ### 3.2 Order, growth and removal
 
 - **The opening** places its sections in relevance order with the strongest

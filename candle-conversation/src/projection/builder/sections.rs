@@ -63,6 +63,7 @@ impl Builder {
                 depends_on_configured: None,
                 depends_on_unconfigured: None,
                 is_template: false,
+                min_tokens: 0,
                 template_tokens: None,
             }));
         self.name_maps
@@ -137,6 +138,7 @@ impl Builder {
                 budget_adaptive: None,
                 mandatory: Vec::new(),
                 range: None,
+                summary_range: None,
                 kv_level: MEMBER_KV_LEVEL,
             }));
         self.name_maps
@@ -195,6 +197,7 @@ impl Builder {
                     depends_on_configured: None,
                     depends_on_unconfigured: None,
                     is_template: false,
+                    min_tokens: 0,
                     template_tokens: None,
                 });
                 id
@@ -235,6 +238,7 @@ impl Builder {
                     depends_on_configured: None,
                     depends_on_unconfigured: None,
                     is_template: false,
+                    min_tokens: 0,
                     template_tokens: None,
                 });
                 tc.variants.push(variants);
@@ -291,6 +295,7 @@ impl Builder {
             depends_on_configured: None,
             depends_on_unconfigured: None,
             is_template: false,
+            min_tokens: 0,
             template_tokens: None,
         });
         self.name_maps

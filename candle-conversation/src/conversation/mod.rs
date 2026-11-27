@@ -41,8 +41,8 @@ use crate::persistence::content_hash::{
 use crate::persistence::record::BranchCheckpointPayload;
 use crate::persistence::streams::ContentAddress;
 use crate::projection::{
-    decode_events, decode_points, from_projection_with_origins, runs_are_empty, sections_prefix,
-    Builder, Conversation, DecodePriority, Observe, PrefixItem, ProjectionEvent, ProjectionMode,
+    decode_events, decode_points, from_projection_with_origins, runs_are_empty, Builder,
+    Conversation, DecodePriority, Observe, PrefixItem, ProjectionEvent, ProjectionMode,
     ProjectionPoint, ProjectionTarget, RangeFill, SectionId, SectionTree, SelectionState,
     SystemPromptItem, TimelineId, TokenRun, TurnIndex, TurnKey,
 };

@@ -47,18 +47,24 @@ pub(super) fn turn_projection(
     proj
 }
 
-/// What the `tools` collection is sealed behind: the prompt the creation walk
-/// lays down before it (`prefix_before_collection`) — bare sections, the
-/// default branch of each section tree, and each earlier reserved range as a
-/// hole of its size on an engine trained to `native` positions. Sealing the
-/// tool-summary section behind the *same* prefix puts its KV exactly where
-/// "just before the tools" is. Empty when the schema declares no `tools`
-/// collection.
-pub(super) fn pre_tools_prefix(builder: &Builder, native: Option<usize>) -> Vec<PrefixItem> {
+/// What the `tools` collection's catalog summary is sealed behind: the prompt
+/// the creation walk lays down before the summary's slot
+/// (`prefix_before_summary`, `docs/placed_section_layout.md` §3.1c) — bare
+/// sections, the default branch of each section tree padded to its slot, and
+/// each earlier reserved range as a hole of its size on an engine trained to
+/// `native` positions. Sealed behind the *same* prefix, the summary's K/V
+/// stands exactly where every projection reads it. `tokens` is a sealed
+/// section's length. Empty when the schema declares no `tools` collection or
+/// no summary range on it.
+pub(super) fn pre_tools_prefix(
+    builder: &Builder,
+    native: Option<usize>,
+    tokens: impl Fn(SectionId) -> usize,
+) -> Vec<PrefixItem> {
     builder
         .id_for_system_collection("tools")
         .and_then(|tools| {
-            prefix_before_collection(&builder.schema().system_prompt.items, tools, native)
+            prefix_before_summary(&builder.schema().system_prompt.items, tools, native, tokens)
         })
         .unwrap_or_default()
 }

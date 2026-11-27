@@ -52,6 +52,8 @@ pub(super) enum TreeSpec<'a> {
         /// `<tools>`): it becomes live-prefilled glue — no sealed variants,
         /// prefix-transparent, emitted as `Generated` (see [`TreeNode::glue`]).
         is_glue: bool,
+        /// The least the node's slot takes ([`TreeNode::min_tokens`]).
+        min_tokens: usize,
     },
     /// A prefix-transparent embedded collection.
     Collection {
@@ -123,6 +125,7 @@ pub(super) fn flatten_tree_specs<'a>(
                 content,
                 dialect: d,
                 inject_collection: _,
+                min_tokens: _,
             } => {
                 let item = format!("{layer_name}/{id}");
                 (
@@ -140,6 +143,7 @@ pub(super) fn flatten_tree_specs<'a>(
                 content,
                 dialect: d,
                 default,
+                min_tokens: _,
             } => {
                 let item = format!("{layer_name}/{id}");
                 // `present` is option 0, `absent` option 1 — an unspecified
@@ -174,6 +178,7 @@ pub(super) fn flatten_tree_specs<'a>(
                 pin: _,
                 default,
                 options,
+                min_tokens: _,
             } => {
                 let item = format!("{layer_name}/{id}");
                 let mut opts = Vec::with_capacity(options.len());
@@ -264,6 +269,12 @@ pub(super) fn flatten_tree_specs<'a>(
             } => inject_collection.as_deref(),
             _ => None,
         };
+        let min_tokens = match n {
+            YamlTreeNode::Section { min_tokens, .. }
+            | YamlTreeNode::Optional { min_tokens, .. }
+            | YamlTreeNode::Selector { min_tokens, .. } => *min_tokens,
+            _ => 0,
+        };
         // A `dialect:` mandatory section is a structural marker → live glue.
         // (An `optional`/`selector` with a dialect is a real dimension, not glue.)
         let is_glue = matches!(
@@ -279,6 +290,7 @@ pub(super) fn flatten_tree_specs<'a>(
             default_option,
             inject_collection,
             is_glue,
+            min_tokens,
         });
     }
     Ok(())
@@ -335,7 +347,9 @@ pub(super) fn build_section_tree<'a>(
                 default_option,
                 inject_collection,
                 is_glue,
+                min_tokens,
             } => {
+                let min_tokens = *min_tokens;
                 // A live-prefilled structural marker (`<tools>` etc.): allocate NO
                 // sealed variant, do NOT extend the prefix (nodes below seal as if
                 // it weren't here), and record the branches it lives in so it emits
@@ -361,6 +375,7 @@ pub(super) fn build_section_tree<'a>(
                         }),
                         dim: None,
                         ancestor_dims,
+                        min_tokens,
                     });
                     continue;
                 }
@@ -443,6 +458,7 @@ pub(super) fn build_section_tree<'a>(
                         glue: None,
                         dim: Some(dim_index),
                         ancestor_dims,
+                        min_tokens,
                     });
                 } else {
                     // Mandatory: append its single option's variant to every branch.
@@ -460,6 +476,7 @@ pub(super) fn build_section_tree<'a>(
                         glue: None,
                         dim: None,
                         ancestor_dims,
+                        min_tokens,
                     });
                 }
             }
@@ -524,6 +541,7 @@ pub(super) fn build_section_tree<'a>(
                         depends_on_configured: None,
                         depends_on_unconfigured: None,
                         is_template: false,
+                        min_tokens: 0,
                         template_tokens: None,
                     });
                     member_variants.push(variants);
@@ -547,6 +565,7 @@ pub(super) fn build_section_tree<'a>(
                     // A prefix-transparent tree collection takes no positions
                     // of its own in the prompt below it.
                     range: None,
+                    summary_range: None,
                     kv_level: MEMBER_KV_LEVEL,
                 };
                 // Capture the branch templates so runtime member additions
@@ -570,6 +589,7 @@ pub(super) fn build_section_tree<'a>(
                     glue: None,
                     dim: None,
                     ancestor_dims,
+                    min_tokens: 0,
                 });
             }
             TreeSpec::GroupStart {
@@ -610,6 +630,7 @@ pub(super) fn build_section_tree<'a>(
                     glue: None,
                     dim: Some(dim_index),
                     ancestor_dims,
+                    min_tokens: 0,
                 });
                 let mut present = Vec::with_capacity(branches.len());
                 let mut absent = Vec::with_capacity(branches.len());
