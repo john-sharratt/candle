@@ -140,7 +140,8 @@ mod tests {
 
     use super::*;
     use crate::engine::tools::{
-        estimated_paths, specs_within, Mode, ACTS_PER_TURN, CATALOG, MAX_TURN_PATHS,
+        estimated_paths, specs_within, Mode, ACTS_PER_TURN, CATALOG, LINE, LINE_TOKENS, LIST_MOST,
+        MAX_TURN_PATHS,
     };
 
     const TOWER: &str = "http://local/tower/bridge-console~0/command_tower";
@@ -233,23 +234,31 @@ mod tests {
         assert!(body.required);
     }
 
-    /// **A post must name a standing job or a brief**: the two make the choice
-    /// the body cannot close without, so `{}` is no post.
+    /// **A post must name a standing job or its steps**: the two make the
+    /// choice the body cannot close without, so neither `{}` nor a brief alone
+    /// is a post — and the steps are a list of at least one line.
     #[test]
-    fn a_post_must_name_a_job_or_a_brief() {
+    fn a_post_must_name_a_job_or_its_steps() {
         const POST: &str = "http://local/command/order-table~0/order_post";
         // A world with a standing job: in one with none, `job` is taken out
-        // and `brief` alone makes the choice.
+        // and `steps` alone makes the choice.
         let within = Within {
             invokable: vec![Invokable::new(POST, "order_post")],
             jobs: vec!["ward-shift".into()],
             ..Within::among(&[])
         };
         let body = body_of_url(&within, POST);
-        for member in ["job", "brief"] {
+        for member in ["job", "steps"] {
             assert_eq!(field(&body, member).pick, Pick::AtLeastOne, "{member}");
         }
-        assert_eq!(field(&body, "steps").pick, Pick::None);
+        assert_eq!(field(&body, "brief").pick, Pick::None);
+        let steps = field(&body, "steps");
+        assert_eq!(steps.ty, ParamType::Array);
+        assert_eq!((steps.min_items, steps.max_items), (1, Some(LIST_MOST)));
+        let line = steps.items.as_deref().expect("each step is a line");
+        assert_eq!(line.ty, ParamType::String);
+        assert_eq!(line.pattern.as_deref(), Some(LINE));
+        assert_eq!(line.max_tokens, Some(LINE_TOKENS));
     }
 
     #[test]

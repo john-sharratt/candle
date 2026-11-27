@@ -104,7 +104,7 @@ JSON schema.
     it brings and the fields it requires, then the gates over the optionals
     after it, from the standing the object had reached (`builder::value_tails`
     with an `Owed`); left out, the object goes on as if it had no shapes. Only a
-    required enum once decided: npcd's `order_post` takes `job` or a `brief`,
+    required enum once decided: npcd's `order_post` takes `job` or its `steps`,
     so `job` is optional, and choosing `coding-task` brought nothing — Zen
     wrote a `brief` beside it and the post was refused for want of `what`.
   - **Equal shapes share one tail.** The spec is a DAG and the compile memoises on

@@ -39,7 +39,7 @@ fn add(h: &Hosted, title: &str, priority: &str) -> Outcome {
         h,
         "zen",
         "mission_add",
-        json!({"title": title, "brief": format!("Do {title}."), "steps": "go to the watch room\npost work on the order table", "priority": priority}),
+        json!({"title": title, "brief": format!("Do {title}."), "steps": ["go to the watch room", "post work on the order table"], "priority": priority}),
     )
 }
 
@@ -127,7 +127,7 @@ fn an_agenda_item_with_a_step_unseen_is_not_closed_by_saying_so() {
         &h,
         "zen",
         "mission_add",
-        json!({"title": "the sensor panel", "brief": "A Drone is to read the sensor panel.", "steps": "go to the watch room", "priority": "now"}),
+        json!({"title": "the sensor panel", "brief": "A Drone is to read the sensor panel.", "steps": ["go to the watch room"], "priority": "now"}),
     );
     let Outcome::Refused(why) = act(
         &h,
@@ -161,7 +161,7 @@ fn an_edit_keeps_what_was_done_and_a_raised_priority_goes_first() {
             &h,
             "zen",
             "mission_edit",
-            json!({"mission": "watch earth", "steps": "post work on the order table\n- scan the sensor panel and read what state it is in"})
+            json!({"mission": "watch earth", "steps": ["post work on the order table", "scan the sensor panel and read what state it is in"]})
         ),
         Outcome::Did("On your agenda, and worked now: watch earth.".into())
     );
@@ -211,7 +211,7 @@ fn the_agenda_is_bounded_and_kept_only_by_one_who_takes_no_orders() {
             &h,
             "wick",
             "mission_add",
-            json!({"title": "x", "brief": "x", "steps": "go to the watch room", "priority": "now"})
+            json!({"title": "x", "brief": "x", "steps": ["go to the watch room"], "priority": "now"})
         ),
         Outcome::Refused(
             "You keep no agenda of your own: your work is what the table gives you.".into()
@@ -234,7 +234,7 @@ fn the_agenda_is_bounded_and_kept_only_by_one_who_takes_no_orders() {
         &h,
         "zen",
         "mission_add",
-        json!({"title": "x", "brief": "x", "steps": "\n - \n", "priority": "now"})
+        json!({"title": "x", "brief": "x", "steps": [" ", ""], "priority": "now"})
     )
     .happened());
     assert!(!add(&h, "x", "urgent").happened());

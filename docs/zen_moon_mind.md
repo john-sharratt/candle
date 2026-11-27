@@ -212,8 +212,10 @@ ending "post work on the order table" is not held on that step for its hour and 
 An order is a **mission**, not a line on the orders board: it has steps the engine signs off as
 they happen, a compass that tells the Drone what comes next, and a report. Its origin names its
 poster (`Origin::Ordered { by, poster }` — its name and its body), so its report is the poster's
-to read (`sim::orders`, the newest 50 kept). Steps are given one to a line; the engine adds the
-report back to the table it was posted at. A mission's steps may
+to read (`sim::orders`, the newest 50 kept). Steps are given as a list — at least one, at most
+twelve, each a single line opening on something written, held so by the grammar
+(`tools::lists`), so a post can be a standing job or its steps but never a brief alone or an
+empty `steps`; the engine adds the report back to the table it was posted at. A mission's steps may
 name mirrored rooms and their terminals — "go to the Sharratt house and read the hallway camera"
 — and are signed off as any journey and reading is.
 
@@ -488,7 +490,7 @@ doing), and only to a character that takes no orders:
 
 | Act | Does |
 |---|---|
-| `mission_add` | `{title, brief, steps, priority}` — a new mission on the agenda, steps one to a line as `order_post` takes them. |
+| `mission_add` | `{title, brief, steps, priority}` — a new mission on the agenda, steps a list of lines as `order_post` takes them. |
 | `mission_edit` | `{mission, brief?, steps?, priority?}` — changes one; steps already signed off stay signed off. |
 | `mission_cancel` | `{mission, why}` — drops one; what it was and why goes on its record. |
 | `mission_done` | `{mission, found}` — closes one as done that no step shows done: a step that is Zen's to judge. |

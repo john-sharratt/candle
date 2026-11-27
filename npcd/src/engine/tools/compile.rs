@@ -253,11 +253,12 @@ pub(super) fn stencil_param(t: &Tool, p: &Param, within: &Within) -> StencilPara
                 fixed_values(t.name, p.name).map(|v| v.iter().map(|s| (*s).to_string()).collect())
             }
         },
-        // An act's arguments are scalars; none is a container, and none may
-        // be null.
-        items: None,
-        min_items: 0,
-        max_items: None,
+        // An act's arguments are scalars, or a list of lines ([`LIST`]) —
+        // at least one, at most [`LIST_MOST`], each a line opening on
+        // something written. None may be null.
+        items: (p.ty == LIST).then(|| Box::new(line_item())),
+        min_items: usize::from(p.ty == LIST),
+        max_items: (p.ty == LIST).then_some(LIST_MOST),
         properties: None,
         nullable: false,
         minimum: minimum_of(t.name, p.name),
@@ -286,7 +287,13 @@ pub(super) fn stencil_param(t: &Tool, p: &Param, within: &Within) -> StencilPara
 /// optional because the other may stand in its place, and with nothing
 /// requiring either, the empty post would be the cheapest path through the
 /// grammar.
-pub(super) const PICKS: &[(&str, &[&str])] = &[("order_post", &["job", "brief"])];
+///
+/// **The choice is the work, not its description.** Chosen between `job` and
+/// `brief`, a brief alone closed the call — a post with no step, which the
+/// table refuses. Between `job` and `steps`, a post is either a standing job or
+/// a list of at least one step ([`LIST`]); a brief written without its steps
+/// cannot close.
+pub(super) const PICKS: &[(&str, &[&str])] = &[("order_post", &["job", "steps"])];
 
 /// What `param` of `tool` owes a choice among the act's fields.
 pub(super) fn pick_of(tool: &str, param: &str) -> Pick {

@@ -45,7 +45,7 @@ use crate::effector::router::Local;
 use crate::effector::station::body_schema;
 use crate::engine::act::Act;
 use crate::engine::body;
-use crate::engine::tools::{self, Tool};
+use crate::engine::tools::{self, wire_type, Tool};
 use crate::sim::phone::{Kind, Thread};
 
 /// The phone verbs addressed at the phone itself — `POST /phone/<verb>`.
@@ -170,7 +170,7 @@ fn body_schema_excluding(tool: &Tool, skip: &str) -> Value {
         if p.name == skip {
             continue;
         }
-        properties.insert(p.name.to_string(), json!({ "type": p.ty }));
+        properties.insert(p.name.to_string(), wire_type(p.ty));
         if p.required {
             required.push(Value::String(p.name.to_string()));
         }

@@ -18,7 +18,7 @@
 //! life. The handlers are in [`crate::engine::work`], beside the other acts that
 //! run on `Sim` state.
 
-use super::tools::{Availability, Example, Param, Plane, Tool};
+use super::tools::{Availability, Example, Param, Plane, Tool, LIST};
 use crate::engine::mission::Origin;
 use crate::sim::Sim;
 
@@ -148,11 +148,11 @@ pub const ORDER_POST: Tool = Tool {
         },
         Param {
             name: "steps",
-            ty: "string",
+            ty: LIST,
             required: false,
-            description: "The steps, one to a line, each something they can be seen to do: \
-                          \"go to the ward room\", \"scan the sensor panel and read what state \
-                          it is in\". Needed unless you post a standing job.",
+            description: "The steps, in order, each something they can be seen to do: \"go to \
+                          the ward room\", \"scan the sensor panel and read what state it is \
+                          in\". Needed unless you post a standing job.",
         },
         Param {
             name: "for",
@@ -166,7 +166,7 @@ pub const ORDER_POST: Tool = Tool {
         Example {
             situation: "The sensor panel showed a fault on the Sharratts' level, and nobody has \
                         looked at it.",
-            call: r#"{"brief":"Find out what the fault on the groups level is and whether the Sharratts are affected.","steps":"go to the ward room\nscan the sensor panel and read what state it is in\nscan the status board and read what state it is in"}"#,
+            call: r#"{"brief":"Find out what the fault on the groups level is and whether the Sharratts are affected.","steps":["go to the ward room","scan the sensor panel and read what state it is in","scan the status board and read what state it is in"]}"#,
             because: "Something seen and set as work is something that gets done; something seen \
                       and only thought about is not.",
         },

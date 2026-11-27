@@ -58,7 +58,7 @@ pub(super) mod tests {
         );
         let shift = fields(json!({"job": "ward-shift"}));
         assert!(declared_fields("order_post", &shift, &missions).is_empty());
-        let brief = fields(json!({"brief": "b", "steps": "s"}));
+        let brief = fields(json!({"brief": "b", "steps": ["s"]}));
         assert!(declared_fields("order_post", &brief, &missions).is_empty());
         assert!(declared_fields("report_done", &coding, &missions).is_empty());
     }
@@ -639,12 +639,16 @@ pub(super) mod tests {
     /// down whatever else is running with it. It cost two crashed editors
     /// before it was understood. The path budget below is what keeps the
     /// integers honest.
+    ///
+    /// A list ([`LIST`]) is the one container, and only because the act's
+    /// spec bounds it whole: at most [`LIST_MOST`] entries, each a string held
+    /// to [`LINE`] and [`LINE_TOKENS`] — never "any JSON value".
     #[test]
     fn every_parameter_is_a_type_the_grammar_can_bound() {
         for tool in CATALOG.iter() {
             for p in tool.params {
                 assert!(
-                    matches!(p.ty, "string" | "boolean" | "integer"),
+                    matches!(p.ty, "string" | "boolean" | "integer" | LIST),
                     "`{}` declares `{}` as `{}` — the grammar cannot bound that type, and \
                      compiling it does not terminate. Carry it as a string and parse it in the \
                      act.",

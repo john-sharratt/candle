@@ -5,6 +5,7 @@ use serde_json::{Map, Value};
 use crate::engine::act::Act;
 use crate::engine::body::Outcome;
 use crate::engine::mission::{Mission, Origin, Todo};
+use crate::engine::tools::list_arg;
 use crate::sim::agenda::Priority;
 use crate::sim::Sim;
 use crate::world::Hosted;
@@ -12,17 +13,6 @@ use crate::world::Hosted;
 fn text(args: &Map<String, Value>, key: &str) -> Option<String> {
     let s = args.get(key)?.as_str()?.trim();
     (!s.is_empty()).then(|| s.to_string())
-}
-
-/// Steps given one to a line, a leading bullet dropped and blank lines left
-/// out — as `order_post` takes them.
-fn steps(args: &Map<String, Value>) -> Option<Vec<String>> {
-    let lines: Vec<String> = text(args, "steps")?
-        .lines()
-        .map(|l| l.trim().trim_start_matches(['-', '*']).trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    (!lines.is_empty()).then_some(lines)
 }
 
 /// Perform agenda act `act` for `body`.
@@ -45,10 +35,10 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                         .into(),
                 );
             };
-            let Some(steps) = steps(a) else {
+            let Some(steps) = list_arg(a, "steps") else {
                 return Outcome::Refused(
-                    "Give it at least one step, one to a line, that you can be seen to do — \
-                     \"go to the watch room\", \"post work on the order table\"."
+                    "Give it at least one step, each something you can be seen to do — \"go to \
+                     the watch room\", \"post work on the order table\"."
                         .into(),
                 );
             };
@@ -79,7 +69,7 @@ pub fn perform(hosted: &Hosted, body: &str, act: &Act) -> Outcome {
                     }
                 },
             };
-            let (brief, steps) = (text(a, "brief"), steps(a));
+            let (brief, steps) = (text(a, "brief"), list_arg(a, "steps"));
             if brief.is_none() && steps.is_none() && priority.is_none() {
                 return Outcome::Refused(
                     "You meant to change it, but said nothing to change: a brief, its steps, or \

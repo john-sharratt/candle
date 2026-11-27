@@ -838,7 +838,7 @@ pub(super) mod tests {
             &hosted,
             &poster,
             &args(
-                serde_json::json!({"brief": "Read the board.", "steps": "go to the dispatch room"})
+                serde_json::json!({"brief": "Read the board.", "steps": ["go to the dispatch room"]})
             )
         )
         .happened());
@@ -856,7 +856,7 @@ pub(super) mod tests {
             &poster,
             &args(serde_json::json!({
                 "brief": "Watch Earth.",
-                "steps": "go to the observatory",
+                "steps": ["go to the observatory"],
                 "for": "Maker-02"
             })),
         )

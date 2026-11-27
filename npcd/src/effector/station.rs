@@ -58,7 +58,7 @@ use crate::engine::act::Act;
 use crate::engine::body;
 use crate::engine::mission_acts::{self, COMMAND_DESK};
 use crate::engine::order_table;
-use crate::engine::tools::{self, Tool};
+use crate::engine::tools::{self, wire_type, Tool};
 use crate::world::Hosted;
 
 /// The sub-router for one station namespace: read, schema, act.
@@ -353,8 +353,9 @@ fn short_verb<'a>(name: &'a str, ns: &str) -> &'a str {
     name.strip_prefix(&format!("{ns}_")).unwrap_or(name)
 }
 
-/// The JSON schema of an act's body: each param a property typed by its `ty`,
-/// the required ones listed. Types are passed through, never invented (§11).
+/// The JSON schema of an act's body: each param a property typed by its `ty`
+/// (a list with its entries and bounds, [`wire_type`]), the required ones
+/// listed. Types are passed through, never invented (§11).
 ///
 /// `pub(crate)` so the personal `/phone` routes build their verb schemas the one
 /// way the station routes do — the same raw shape, from each act's own `params`.
@@ -362,7 +363,7 @@ pub(crate) fn body_schema(tool: &Tool) -> Value {
     let mut properties = Map::new();
     let mut required = Vec::new();
     for p in tool.params {
-        properties.insert(p.name.to_string(), json!({ "type": p.ty }));
+        properties.insert(p.name.to_string(), wire_type(p.ty));
         if p.required {
             required.push(Value::String(p.name.to_string()));
         }
@@ -574,7 +575,7 @@ mod tests {
             .expect("the command room holds the order table")
             .id();
         let (rt, tokens) = daemon(53);
-        let post = json!({"brief": "Read the board.", "steps": "go to the dispatch room"});
+        let post = json!({"brief": "Read the board.", "steps": ["go to the dispatch room"]});
         let path = format!("/command/{table}/order_post");
 
         let (status, body) = send(&rt, &tokens, 53, "POST", &path, Some(post.clone())).await;
