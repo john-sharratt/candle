@@ -4,7 +4,7 @@
 //! as its calibrations.
 //!
 //! A file is asked in a **draft** — a fork of the dialogue's base, projected
-//! as a dialogue's first turn is, the seed absent and the knowledge base
+//! as a dialogue's first turn is, the seed dial off and the knowledge base
 //! pinned to the file alone, whole
 //! ([`FilesPin::Only`]) — so the model writes its questions with the file in
 //! front of it, in the notation a dialogue reads files in. The draft is
@@ -14,7 +14,7 @@
 //! bases** in draft order ([`KbFrame`]): the first, third, fifth… behind the
 //! empty one (`files_open` with nothing under it), the second, fourth… behind
 //! the target (the file alone). Each is a fork of the same base, the seed
-//! absent, thinking on; what the model reasons, up to the layer's `think`
+//! dial off, thinking on; what the model reasons, up to the layer's `think`
 //! budget, is kept ([`super::thinking`]). A file's questions are asked at
 //! once, so they decode in one wave.
 //!
@@ -491,7 +491,7 @@ pub(crate) fn calibration_meta(unit: TimelineId, subject: &str) -> BTreeMap<Stri
 }
 
 /// The selection a draft is asked under: no reasoning, no tool block, and
-/// the seed's absent branch (§12 D11).
+/// the seed dial off, so no mandatory file joins the pinned one (§12 D11).
 pub(super) fn draft_selection() -> SelectionState {
     let mut selection = SelectionState::new();
     selection.select("thinking_effort", "off");
@@ -502,8 +502,8 @@ pub(super) fn draft_selection() -> SelectionState {
 }
 
 /// The selection a question's thinking, and its calibration's prefill, run
-/// under: a live dialogue turn's, every dial at its default, on the seed's
-/// absent branch.
+/// under: a live dialogue turn's, every dial at its default but the seed's,
+/// which is off.
 pub(super) fn frame_selection() -> SelectionState {
     let mut selection = SelectionState::new();
     selection.set_seeds(false);
@@ -1093,7 +1093,7 @@ mod tests {
 
     /// A question's thinking is decoded as a live dialogue turn is — no dial
     /// but the seed set, so thinking stays on at the dialogue's default effort
-    /// — and on the seed's absent branch.
+    /// — with the seed dial off.
     #[test]
     fn a_question_is_thought_about_as_a_live_turn_is_without_the_seed() {
         let s = frame_selection();

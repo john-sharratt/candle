@@ -320,11 +320,16 @@ projection, outside the selection's budget):
 - it holds positions in its range like any other — inside `R`, outside the
   competition — and enters at the opening in rate order with the rest (§3.4);
 - the seed's files — each repository's root listing, README, ARCHITECTURE,
-  AGENTS, CLAUDE (`branch_ingest/prime.rs`) — are the knowledge base's
-  mandatory sections, cut into sections as every file is (§3.5c); the seed
-  dial includes or omits the mandatory set;
-- the range's budget is checked at load to hold the mandatory sections with
-  room for the rest, and refuses to build otherwise.
+  AGENTS, CLAUDE (`zend/src/files/seed.rs`) — are the knowledge base's
+  mandatory files, ingested and cut into sections as every file is (§3.5c),
+  and named at startup by workspace path (`files/mandatory.rs`, the
+  substrate's `mandatory_files`); a path the branches hold in several
+  versions places the version most branches hold. Every free knowledge base
+  the seed dial leaves on places them whole, outside every kind's cap; a
+  pinned one (a calibration's frames) holds its pin alone. The `seed` section
+  tree and its branch checkpoints go;
+- the range's budget is checked at load to hold the mandatory files with
+  room for the rest — at most half of it — and refuses to start otherwise.
 
 A section's address is the prompt's hash with the range (§3.1b), the hash of
 its file's earlier sections, and its own text. A change to a file re-seals

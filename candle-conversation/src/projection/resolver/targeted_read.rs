@@ -321,6 +321,10 @@ impl<'a> ContentResolver for TargetedRead<'a> {
             .collect()
     }
 
+    fn files_mandatory(&self) -> Vec<String> {
+        self.read.mandatory_files().to_vec()
+    }
+
     fn member_section(&self, name: &str) -> Option<SectionId> {
         self.read.owned_section_named(files_owner(), name)
     }

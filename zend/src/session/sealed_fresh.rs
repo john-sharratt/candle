@@ -1,13 +1,13 @@
 //! Sealed against fresh: one question decoded twice over exactly the same
 //! tokens — once on the production path, where the knowledge base's files are
-//! sealed members spliced into the prompt and the seed a sealed section, and
-//! once with every one of those tokens prefilled afresh on a bare slot — and
+//! sealed members spliced into the prompt, the seed's mandatory files first,
+//! and once with every one of those tokens prefilled afresh on a bare slot — and
 //! the first decoded token where the two part
 //! (`docs/provenance_system_collection.md` §8, `docs/results/
 //! files_collection_rollout_2026-11-26.md`).
 //!
 //! The sealed side is a fork of the dialogue's base, its knowledge base pinned
-//! (one file, or none — the seed alone), reprojection held to the opening and
+//! (the seed's files, then one file or none), reprojection held to the opening and
 //! its tools the request's mode, so the prompt it decodes over is fixed and is
 //! the one
 //! [`Sequence::prompt_dump_with`] lays out before the turn. The fresh side is
@@ -39,7 +39,7 @@ use candle_conversation::files::names::chunk_name;
 use candle_conversation::files::{files_owner, FileKey, FileRecord, FilesPin};
 use candle_conversation::projection::Conversation;
 use candle_conversation::projection::{
-    DecodePriority, OptionalState, ReprojectionMode, SelectionState, TurnIndex, SEED_SELECTOR,
+    DecodePriority, ReprojectionMode, SelectionState, TurnIndex,
 };
 use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{
@@ -69,7 +69,7 @@ pub struct SealedFreshReq {
     /// The question, as the user's message.
     pub question: String,
     /// The knowledge base's one file, by its workspace path; absent places
-    /// none, the seed alone.
+    /// the seed's files alone.
     #[serde(default)]
     pub file: Option<String>,
     /// Tokens to decode on each side, at most [`MAX_TOKENS`].
@@ -99,7 +99,7 @@ pub struct SealedFreshReq {
     #[serde(default)]
     pub reseal: bool,
     /// Resealed, seal the file's members under a boundary section's policy —
-    /// Q8 K and V, the seed's — instead of a member's.
+    /// Q8 K and V — instead of a member's.
     #[serde(default)]
     pub reseal_boundary: bool,
     /// Where the fresh side's prompt K/V comes from: its own prefill, or the
@@ -126,12 +126,6 @@ pub struct SealedFreshReq {
     /// question reads.
     #[serde(default)]
     pub after_tokens: usize,
-    /// The seed as files: the seed section left out (its dial absent) and
-    /// each of its files placed instead as a member of the knowledge base,
-    /// in the seed's order, ahead of the file — each sealed alone behind the
-    /// prompt up to `files_open`, as the file is, none behind another.
-    #[serde(default)]
-    pub seed_as_files: bool,
     /// Place the file after the other files (`after_tokens`), nearest the
     /// question, rather than before them (`docs/placed_section_layout.md` §7
     /// stage 0: whether position alone moves the answer).
@@ -393,8 +387,8 @@ pub struct SealedFresh {
     /// The files placed after the file, in order, and their members' tokens.
     pub after_files: Vec<String>,
     pub after_tokens: usize,
-    /// With the seed as files, the seed's files placed as members, in order,
-    /// and the seed's files this process holds no record of.
+    /// The seed's files placed as members, in order, and the seed's files
+    /// this process holds no record of.
     pub seed_files: Vec<String>,
     pub seed_missing: Vec<String>,
 }
@@ -429,12 +423,9 @@ fn without_members(dump: &PromptDump, members: &HashSet<u32>) -> Vec<u32> {
 /// The selection the sealed side runs under: the opening its only projection,
 /// every other dial the dialogue's default. Which tools it places is its
 /// projection's ([`SealedFreshReq::tools`]).
-fn selection(seed_as_files: bool) -> SelectionState {
+fn selection() -> SelectionState {
     let mut s = SelectionState::new();
     s.set_reprojection_mode(ReprojectionMode::Opening);
-    if seed_as_files {
-        s.set_optional(SEED_SELECTOR, OptionalState::Absent);
-    }
     s
 }
 
@@ -459,15 +450,11 @@ impl ZendSession {
                     .with_context(|| format!("no record of {path}"))?,
             ),
         };
-        // The files placed after the needle, to `after_tokens`.
-        // The seed's files, placed as members ahead of the file when the seed
-        // is asked for as files.
+        // The seed's files, placed as members ahead of the file as every
+        // knowledge base places its mandatory files; then the files placed
+        // after the needle, to `after_tokens`.
         let seed_paths = seed_paths(&state.branch_ingest.seed_read());
-        let seed_files = if req.seed_as_files {
-            placeable_records(&engine.conversation(), &seed_paths)
-        } else {
-            Vec::new()
-        };
+        let seed_files = placeable_records(&engine.conversation(), &seed_paths);
         let after = match &record {
             Some(r) => files_after(&engine.conversation(), r, &seed_paths, req.after_tokens),
             None => Vec::new(),
@@ -482,13 +469,21 @@ impl ZendSession {
                 req.needle_last,
             ))
         };
-        let pin = record.as_ref().map_or(FilesPin::Empty, pin_of);
-        // The placed file's member sections in this process: what the prompt
-        // holds that production's recurrence never ran over.
+        let pin = record
+            .as_ref()
+            .map_or(FilesPin::Only(seed_keys.clone()), pin_of);
+        // The placed files' member sections in this process — the seed's and
+        // the needle's: what the prompt holds that production's recurrence
+        // never ran over.
+        let seed_members: HashSet<u32> = seed_files
+            .iter()
+            .flat_map(|r| member_ids(&engine.conversation(), r))
+            .collect();
         let mut members: HashSet<u32> = record
             .as_ref()
             .map(|r| member_ids(&engine.conversation(), r))
             .unwrap_or_default();
+        members.extend(&seed_members);
         let mut probe: Option<FileRecord> = None;
         let mut conv = state
             .base_conv
@@ -502,7 +497,7 @@ impl ZendSession {
             conv.set_projection(turn_projection(&state, "sealed-fresh", None, mode));
         }
         let out = (|| {
-            let selection = selection(req.seed_as_files);
+            let selection = selection();
             let mut dump = conv
                 .prompt_dump_with(&selection)
                 .context("the sealed side's prompt")?;
@@ -553,6 +548,7 @@ impl ZendSession {
                 )?;
                 engine.files_pin(timeline, pin_of(&p));
                 members = member_ids(&conversation, &p);
+                members.extend(&seed_members);
                 probe = Some(p);
                 let again = conv
                     .prompt_dump_with(&selection)
@@ -659,7 +655,7 @@ impl ZendSession {
                 seed_files: seed_files.iter().map(|r| r.path.clone()).collect(),
                 seed_missing: seed_paths
                     .iter()
-                    .filter(|p| req.seed_as_files && !seed_files.iter().any(|r| &r.path == *p))
+                    .filter(|p| !seed_files.iter().any(|r| &r.path == *p))
                     .cloned()
                     .collect(),
             })
@@ -851,13 +847,8 @@ mod tests {
     #[test]
     fn the_sealed_side_holds_its_prompt_to_the_opening() {
         assert_eq!(
-            selection(false).reprojection_mode(),
+            selection().reprojection_mode(),
             Some(ReprojectionMode::Opening)
-        );
-        assert_eq!(selection(false).optional(SEED_SELECTOR), None);
-        assert_eq!(
-            selection(true).optional(SEED_SELECTOR),
-            Some(OptionalState::Absent)
         );
     }
 

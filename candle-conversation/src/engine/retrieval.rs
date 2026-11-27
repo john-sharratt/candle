@@ -57,6 +57,13 @@ impl ConversationEngine {
             .update(|s| s.files_withhold(target, files));
     }
 
+    /// Name the knowledge base's mandatory files by workspace path
+    /// (`files::mandatory`), placed whole in every free knowledge base.
+    pub fn set_mandatory_files(&self, paths: Vec<String>) {
+        self.conversation
+            .update(|s| s.set_mandatory_files(paths.clone()));
+    }
+
     /// Pin what `target`'s knowledge base holds: nothing, or one file whole
     /// (`docs/provenance_system_collection.md` §12 D11). Set before the
     /// conversation's first turn, which places it.

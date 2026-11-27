@@ -8,11 +8,17 @@
 //! file is its placed sections in line order; every section carries its own
 //! heading, closing line and, short of the file's end, the cut marker
 //! (`docs/placed_section_layout.md` §3.5c), so nothing is placed between them.
+//!
+//! A free knowledge base the seed dial leaves on opens on the mandatory files
+//! (§3.5b), whole and ahead of the chosen ones, outside every kind's cap; a
+//! pinned one holds its pin alone.
+
+use std::collections::HashSet;
 
 use super::*;
 use crate::files::fill::{choose, FilePlacement};
 use crate::files::names::chunk_name;
-use crate::files::{FileKey, FileRecord, FilesPin, LineSpan, PlacedFile};
+use crate::files::{mandatory_records, FileKey, FileRecord, FilesPin, LineSpan, PlacedFile};
 
 /// The files a projection places and the segments they are placed as.
 pub(crate) struct FilesSplice {
@@ -32,12 +38,14 @@ impl FilesSplice {
 
 /// The files to place under `kind_cap` — each working-set group of `schema`
 /// a kind, its cap the tokens its share allows — and the segments they are
-/// placed as. Empty when the target has no files set, or no file's members
-/// are held in this process.
+/// placed as; with `mandatory`, a free knowledge base opens on the mandatory
+/// files whole (`files::mandatory`), outside every cap. Empty when the target
+/// has no files set, or no file's members are held in this process.
 pub(crate) fn files_splice<R: ContentResolver>(
     schema: &Schema,
     resolver: &R,
     kind_cap: impl Fn(WorkingSetShare) -> usize,
+    mandatory: bool,
 ) -> FilesSplice {
     let Some(set) = resolver.files_set() else {
         return FilesSplice {
@@ -45,11 +53,8 @@ pub(crate) fn files_splice<R: ContentResolver>(
             segments: Vec::new(),
         };
     };
-    let records: HashMap<FileKey, FileRecord> = resolver
-        .files_records()
-        .into_iter()
-        .map(|r| (r.key(), r))
-        .collect();
+    let all = resolver.files_records();
+    let records: HashMap<FileKey, &FileRecord> = all.iter().map(|r| (r.key(), r)).collect();
     // Each kind's choice, then every chosen file ranked by its momentum — or,
     // pinned, the pinned files whole, in the pin's order, or nothing.
     let mut chosen: Vec<(FilePlacement, f32)> = Vec::new();
@@ -64,6 +69,18 @@ pub(crate) fn files_splice<R: ContentResolver>(
             }
         }
         FilesPin::Free => {
+            // The mandatory files first, whole, ahead of every chosen one; a
+            // path they hold is no candidate of any kind.
+            let paths = match mandatory {
+                true => resolver.files_mandatory(),
+                false => Vec::new(),
+            };
+            for record in mandatory_records(&all, &paths) {
+                let chunks = (0..record.chunks.len()).collect();
+                let file = record.key();
+                chosen.push((FilePlacement { file, chunks }, f32::INFINITY));
+            }
+            let held: HashSet<&str> = paths.iter().map(String::as_str).collect();
             for group in schema
                 .layers
                 .iter()
@@ -73,9 +90,17 @@ pub(crate) fn files_splice<R: ContentResolver>(
                 let SelectionRule::WorkingSet { share } = group.selection else {
                     continue;
                 };
-                let ranked = set.ranked(group.id);
+                let ranked: Vec<(FileKey, f32)> = set
+                    .ranked(group.id)
+                    .into_iter()
+                    .filter(|(k, _)| {
+                        records
+                            .get(k)
+                            .is_none_or(|r| !held.contains(r.path.as_str()))
+                    })
+                    .collect();
                 let momentum: HashMap<FileKey, f32> = ranked.iter().copied().collect();
-                for p in choose(&ranked, |k| records.get(&k), kind_cap(share)) {
+                for p in choose(&ranked, |k| records.get(&k).copied(), kind_cap(share)) {
                     let m = momentum.get(&p.file).copied().unwrap_or(0.0);
                     chosen.push((p, m));
                 }

@@ -697,33 +697,18 @@ system_prompt:
       dialect: tool_block_close
       depends_on: tools
 
-    # ── The knowledge base (docs/provenance_system_collection.md §3, §6.2b) ──
-    # The end of the system prompt, in Qwen-Agent's notation: the heading,
-    # then the seed — the repositories' root listings and documents, rendered
-    # at startup (`zend::files::seed`) into the `seed` optional's present side
-    # and read by the branch checkpoint's recurrence — then the files
-    # provenance places for the turn (the `files` collection: its members are
-    # the corpus's sealed chunks, placed by the fill and attended only), then
-    # the close. The seed dial picks the branch, so a seed-off turn opens on the
-    # absent branch's checkpoint.
-    #
-    # The seed stands BEFORE the files. It is sealed once, with no file ahead
-    # of it; placed after the files, its 37K tokens were the last thing the
-    # question read, and their K/V — computed without the files — told the
-    # model a placed file's content was not in the prompt: the sealed-fresh
-    # transplant read the file only once the seed was prefilled live after it
-    # (docs/results/files_collection_rollout_2026-11-26.md).
+    # ── The knowledge base (docs/placed_section_layout.md §3.1, §3.5b–§3.5c) ──
+    # The end of the system prompt: the heading, then the files provenance
+    # places for the turn (the `files` collection: its members are the
+    # corpus's sealed sections, each in `file_read`'s format, placed by the
+    # fill and attended only), then the close. The seed — the repositories'
+    # root listings and anchor documents (`zend::files::seed`) — is the
+    # collection's mandatory files, placed whole in every knowledge base the
+    # seed dial leaves on; no knowledge-base content is in the prompt the
+    # recurrence runs over.
     - kind: section
       id: files_open
       content: "\n# Knowledge Base\n\n"
-
-    - kind: section_tree
-      nodes:
-        - kind: optional
-          id: seed
-          # Replaced at startup by the rendered seed (`zend::files::seed`).
-          content: "seed"
-          default: present
 
     # Its reserved range (docs/placed_section_layout.md §3.1, §3.7b): each
     # file's chain sealed ending at the range's top, the placed files there,

@@ -9,8 +9,8 @@
 //!   the journals alone, [`ProjectionLevel::Minimal`] nothing (the tool
 //!   catalog, which the system prompt carries under the tools dial, is all
 //!   that is left; with tools off, nothing is).
-//! - **`seed`** — whether a new conversation opens on its configured seed
-//!   files.
+//! - **`seed`** — whether a free knowledge base places its mandatory files
+//!   (`files::mandatory`).
 //! - **`reprojection`** — whether the decode re-selects inside its think
 //!   block ([`ReprojectionMode::Full`]), holds the block and re-selects only
 //!   at its close and through the answer ([`ReprojectionMode::Held`]), or
@@ -25,7 +25,8 @@ use crate::projection::fill::Kind;
 
 /// Selector for [`ProjectionLevel`].
 pub const PROJECTION_SELECTOR: &str = "projection";
-/// Selector for the seed dial: [`OptionalState::Absent`] opens on no seeds.
+/// Selector for the seed dial: [`OptionalState::Absent`] places no mandatory
+/// file.
 pub const SEED_SELECTOR: &str = "seed";
 /// Selector for [`ReprojectionMode`].
 pub const REPROJECTION_SELECTOR: &str = "reprojection";
@@ -127,8 +128,8 @@ impl SelectionState {
         self.select(PROJECTION_SELECTOR, level.as_id())
     }
 
-    /// Whether the conversation opens on its seed files: yes unless the dial
-    /// is [`OptionalState::Absent`].
+    /// Whether the knowledge base places its mandatory files: yes unless the
+    /// dial is [`OptionalState::Absent`].
     pub fn seeds(&self) -> bool {
         self.optional(SEED_SELECTOR) != Some(OptionalState::Absent)
     }

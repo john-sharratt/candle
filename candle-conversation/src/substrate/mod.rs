@@ -264,6 +264,12 @@ pub struct Substrate {
     /// from the belief scan as the working sets are.
     files_sets: PMap<TimelineId, Arc<FilesSet>>,
 
+    /// The knowledge base's mandatory files by workspace path
+    /// (`docs/placed_section_layout.md` §3.5b): placed whole in every free
+    /// knowledge base the seed dial leaves on, outside the competition.
+    /// Installed by the daemon at startup.
+    mandatory_files: Arc<Vec<String>>,
+
     /// Each calibrated conversation's calibrations, by the timeline each
     /// names under [`Self::CALIBRATES_KEY`] — kept as that metadata is applied,
     /// so a scan reads a unit's calibrations without walking every timeline.

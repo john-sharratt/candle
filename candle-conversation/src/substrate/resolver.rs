@@ -291,6 +291,12 @@ pub trait ContentResolver {
         Vec::new()
     }
 
+    /// The knowledge base's mandatory files by workspace path
+    /// (`files::mandatory`). Default none.
+    fn files_mandatory(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// The section of the knowledge base's member registered as `name`
     /// (`files::names`), when this process holds it. Default `None`.
     fn member_section(&self, _name: &str) -> Option<SectionId> {

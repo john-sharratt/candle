@@ -591,14 +591,12 @@ impl InferenceState {
         if load_stopped(&engine, "loading repositories") {
             return Ok(None);
         }
-        // The seed, rendered from the repositories' roots into the knowledge
-        // base's `seed` optional before any conversation is built — and only
-        // once the repositories are up to the log, or a fresh substrate's seed
-        // reads no repository at all: sealed behind `files_open`, read by every
-        // branch checkpoint's recurrence (docs/provenance_system_collection.md
-        // §6.2b).
+        // The seed, named from the repositories' roots as the knowledge base's
+        // mandatory files before any conversation is built — and only once the
+        // repositories are up to the log, or a fresh substrate's seed reads no
+        // repository at all (docs/placed_section_layout.md §3.5b).
         let (seed_repos, _) = crate::branch_ingest::record_branches(&workspace);
-        let seed_read = crate::files::seed::install(&mut proj_builder, &seed_repos)?;
+        let seed_read = crate::files::seed::install(&engine, &proj_builder, &seed_repos)?;
 
         let formatted_prompt = builder.format_system_prompt();
         let decoder = engine.token_decoder();

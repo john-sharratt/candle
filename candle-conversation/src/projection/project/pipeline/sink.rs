@@ -776,7 +776,7 @@ pub fn run_with_sink<R: ContentResolver>(
                 WorkingSetShare::Journals => shares.journals,
             }
         };
-        let splice = files_splice(schema, resolver, kind_cap);
+        let splice = files_splice(schema, resolver, kind_cap, effective_selection.seeds());
         let at = files_at.insert_at(&system_prompt_segments);
         if let (Some(at), false) = (at, splice.segments.is_empty()) {
             let tokens = segment_tokens(&splice.segments, resolver);

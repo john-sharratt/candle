@@ -135,7 +135,7 @@ impl RetrievalDials {
                 "seed",
                 serde_json::json!({
                     "type": "boolean",
-                    "description": "Whether a new conversation opens on its configured seed files (default true)."
+                    "description": "Whether the knowledge base holds the repositories' root listings and anchor documents — README, ARCHITECTURE, AGENTS, CLAUDE — on every turn (default true)."
                 }),
             ),
             (

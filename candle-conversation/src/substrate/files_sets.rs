@@ -63,4 +63,14 @@ impl Substrate {
     pub(super) fn forget_files_set(&mut self, target: TimelineId) {
         self.files_sets.remove(&target);
     }
+
+    /// The knowledge base's mandatory files, by workspace path, in order.
+    pub fn mandatory_files(&self) -> &[String] {
+        &self.mandatory_files
+    }
+
+    /// Name the knowledge base's mandatory files (`files::mandatory`).
+    pub fn set_mandatory_files(&mut self, paths: Vec<String>) {
+        self.mandatory_files = Arc::new(paths);
+    }
 }

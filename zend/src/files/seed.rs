@@ -1,37 +1,34 @@
-//! The seed every conversation opens on (`docs/provenance_system_collection.md`
-//! §6.2b): for each repository, in the workspace's order, its root listing
-//! and its anchor documents — README, ARCHITECTURE, AGENTS, CLAUDE — as its
-//! default branch holds them, in the knowledge base's notation.
+//! The seed: the knowledge base's mandatory files
+//! (`docs/placed_section_layout.md` §3.5b) — for each repository, in the
+//! workspace's order, its root listing and its anchor documents (README,
+//! ARCHITECTURE, AGENTS, CLAUDE) as its default branch holds them.
 //!
-//! It is one section of the prompt, the `seed` optional's present side,
-//! rendered here at startup and installed into the schema before any
-//! conversation is built, as the tool catalog is. Sealed behind `files_open`
-//! and read by the branch checkpoint's recurrence, it is the part of the
-//! knowledge base every conversation's recurrent state has read.
+//! They are ingested as every file is, each cut into sections and sealed
+//! alone, and named here at startup as the files every free knowledge base the
+//! seed dial leaves on places whole, inside the `files` range and outside the
+//! competition. The range must hold them with room for the rest; a schema
+//! whose range does not is refused.
 
-use candle_conversation::files::{assemble_pieces, FileUnit, RenderedFile};
-use candle_conversation::projection::Builder;
+use candle_conversation::files::{leaves_room, mandatory_records};
+use candle_conversation::projection::{Builder, SystemPromptItem};
+use candle_conversation::ConversationEngine;
 use zend_vfs::vfs::Tree;
-use zend_vfs::Rev;
+use zend_vfs::{GitError, Rev};
 
-use super::listing::listing_text;
-use super::sections::sections;
+use super::{records, FILES_COLLECTION};
 use crate::branch_ingest::walk::RepoBranches;
 use crate::journal::opening::SeedRead;
-
-/// The tree node whose present side the seed is installed into.
-pub const SEED_NODE: &str = "seed";
 
 /// Anchor documents, in seed order after a repository's root listing.
 /// Matched case-insensitively against the repository's own root files —
 /// never a subfolder's.
 pub const ANCHOR_FILES: [&str; 4] = ["README.md", "ARCHITECTURE.md", "AGENTS.md", "CLAUDE.md"];
 
-/// The seed's files of one repository: its root listing, then each anchor
-/// document its default branch holds at the root, matched case-insensitively,
-/// in [`ANCHOR_FILES`] order, each cut into the knowledge base's sections. A
-/// repository with no branch contributes nothing.
-pub fn repo_seed(repo: &RepoBranches) -> anyhow::Result<Vec<RenderedFile>> {
+/// The workspace paths of one repository's seed: its root listing, then each
+/// anchor document its default branch holds at the root, matched
+/// case-insensitively, in [`ANCHOR_FILES`] order. A repository with no branch
+/// contributes nothing.
+pub fn repo_seed(repo: &RepoBranches) -> Result<Vec<String>, GitError> {
     let Some(tip) = repo.tips.first() else {
         return Ok(Vec::new());
     };
@@ -40,77 +37,84 @@ pub fn repo_seed(repo: &RepoBranches) -> anyhow::Result<Vec<RenderedFile>> {
     };
     let tree = Tree::read(&repo.repo, &tree_id)?;
     let children = tree.children("");
-    let root = format!("{}/", repo.name);
-    let mut out = vec![RenderedFile {
-        chunks: sections(&root, FileUnit::Folder, &listing_text(&children))?,
-        path: root,
-    }];
+    let mut out = vec![format!("{}/", repo.name)];
     for anchor in ANCHOR_FILES {
         let found = children
             .iter()
             .find(|(path, _, is_dir)| !is_dir && path.eq_ignore_ascii_case(anchor));
-        let Some((path, _, _)) = found else {
-            continue;
-        };
-        let Some((blob, _)) = tree.file(path) else {
-            continue;
-        };
-        let Some(bytes) = repo.repo.blobs().read_blob(blob)? else {
-            continue;
-        };
-        let text = String::from_utf8_lossy(&bytes);
-        let path = format!("{}/{path}", repo.name);
-        out.push(RenderedFile {
-            chunks: sections(&path, FileUnit::File, &text)?,
-            path,
-        });
+        if let Some((path, _, _)) = found {
+            out.push(format!("{}/{path}", repo.name));
+        }
     }
     Ok(out)
 }
 
-/// The seed's text: `files`' sections as the knowledge base places them after
-/// `files_open`.
-pub fn seed_text(files: &[RenderedFile]) -> String {
-    assemble_pieces(files).into_iter().skip(1).collect()
-}
-
-/// What `files`, the seed's, read: each root listing by its repository, each
+/// What the seed's `paths` read: each root listing by its repository, each
 /// anchor by its path — what a dialogue's journal opens by saying it read.
-pub fn seed_read(files: &[RenderedFile]) -> SeedRead {
+pub fn seed_read(paths: &[String]) -> SeedRead {
     let mut read = SeedRead::default();
-    for f in files {
-        match f.path.strip_suffix('/') {
+    for path in paths {
+        match path.strip_suffix('/') {
             Some(repo) => read.listings.push(repo.to_string()),
-            None => read.documents.push(f.path.clone()),
+            None => read.documents.push(path.clone()),
         }
     }
     read
 }
 
-/// Render the seed from `repos` and install it into `builder`'s `seed`
-/// optional, returning what it read. A repository whose tree cannot be read
-/// is left out of the seed, and said so.
-pub fn install(builder: &mut Builder, repos: &[RepoBranches]) -> anyhow::Result<SeedRead> {
-    let mut files = Vec::new();
+/// The positions `builder`'s `files` collection reserves on an engine of
+/// `native` context; `None` when it reserves none.
+fn files_range(builder: &Builder, native: Option<usize>) -> Option<usize> {
+    builder
+        .schema()
+        .system_prompt
+        .items
+        .iter()
+        .find_map(|item| match item {
+            SystemPromptItem::Collection(c) if c.name == FILES_COLLECTION => c.range,
+            _ => None,
+        })
+        .map(|range| range.positions(native))
+}
+
+/// Name the seed of `repos` as `engine`'s mandatory files, returning what it
+/// reads. A repository whose tree cannot be read is left out of the seed, and
+/// said so. Refused when the mandatory files the substrate already holds take
+/// more than half of `builder`'s `files` range.
+pub fn install(
+    engine: &ConversationEngine,
+    builder: &Builder,
+    repos: &[RepoBranches],
+) -> anyhow::Result<SeedRead> {
+    let mut paths = Vec::new();
     for repo in repos {
         match repo_seed(repo) {
-            Ok(of_repo) => files.extend(of_repo),
+            Ok(of_repo) => paths.extend(of_repo),
             Err(e) => tracing::warn!(
                 repo = %repo.name,
                 "the seed leaves this repository out: its tree could not be read: {e}"
             ),
         }
     }
-    let text = seed_text(&files);
-    builder
-        .set_tree_option_content(SEED_NODE, "present", text.clone())
-        .map_err(|e| anyhow::anyhow!("installing the seed: {e}"))?;
+    let conversation = engine.conversation();
+    let native = conversation.read().trained_window();
+    if let Some(positions) = files_range(builder, native) {
+        let held = records::all(&conversation);
+        let mandatory = mandatory_records(&held, &paths);
+        anyhow::ensure!(
+            leaves_room(&mandatory, positions),
+            "the seed's {} files take {} tokens, more than half the knowledge base's \
+             {positions}-position range",
+            mandatory.len(),
+            mandatory.iter().map(|r| r.tokens()).sum::<u32>(),
+        );
+    }
+    engine.set_mandatory_files(paths.clone());
     tracing::info!(
-        files = files.len(),
-        bytes = text.len(),
-        "seed installed: the repositories' roots, in the knowledge base",
+        files = paths.len(),
+        "seed installed: the repositories' roots, the knowledge base's mandatory files",
     );
-    Ok(seed_read(&files))
+    Ok(seed_read(&paths))
 }
 
 #[cfg(test)]
@@ -153,30 +157,49 @@ mod tests {
         (tmp, branches)
     }
 
-    /// **The seed renders a repository's root listing and its anchor
-    /// documents, in the knowledge base's notation**: the listing first, then
-    /// README and the lower-case `agents.md` matched as AGENTS, a subfolder's
-    /// README left out; each a section, its text what follows `files_open`.
+    /// **The seed names a repository's root listing and its anchor
+    /// documents**: the listing first, then README and the lower-case
+    /// `agents.md` matched as AGENTS, a subfolder's README left out.
     #[test]
-    fn the_seed_renders_its_files_in_the_knowledge_bases_notation() {
+    fn the_seed_names_the_root_listing_and_its_anchor_documents() {
         let (_tmp, repo) = repo();
-        let files = repo_seed(&repo).unwrap();
-        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        let paths = repo_seed(&repo).unwrap();
         assert_eq!(paths, ["r/", "r/README.md", "r/agents.md"]);
-        let text = seed_text(&files);
-        assert!(
-            text.starts_with(
-                "## The content from r/:\n\n```\nREADME.md 4\nagents.md 5\ndocs/\nsrc/\n```\n\n\
-                 ## The content from r/README.md:\n\n```markdown file=r/README.md part="
-            ),
-            "{text}"
-        );
-        assert!(
-            text.ends_with("end of r/agents.md lines 1 of 1 — the end of the file\n\n"),
-            "{text}"
-        );
-        let read = seed_read(&files);
+        let read = seed_read(&paths);
         assert_eq!(read.listings, ["r"]);
         assert_eq!(read.documents, ["r/README.md", "r/agents.md"]);
+    }
+
+    /// **The files range is read off the schema** for the engine's context.
+    #[test]
+    fn the_files_range_is_read_off_the_schema() {
+        let yaml = r#"
+system_prompt:
+  items:
+    - kind: section
+      id: open
+      content: "open"
+    - kind: collection
+      name: files
+      selection: { kind: always_visible }
+      range: { tokens: 1000, small_context: 100 }
+      sections: []
+layers:
+  - name: dialogue
+    window: 4000
+    score_formula: max
+    budget: { priority: 100 }
+    summary:
+      turns:
+        max_tokens: 256
+        user: { system_prompt: c, user_prompt: c }
+        assistant: { system_prompt: c, user_prompt: c }
+    groups:
+      - id: convo
+        selection: { kind: always_visible }
+"#;
+        let b = Builder::from_yaml(yaml).unwrap();
+        assert_eq!(files_range(&b, Some(262_144)), Some(1_000));
+        assert_eq!(files_range(&b, Some(32_768)), Some(100));
     }
 }

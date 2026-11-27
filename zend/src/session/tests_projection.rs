@@ -426,18 +426,17 @@ pub(super) mod projection_schema_tests {
     }
 
     /// **The system prompt ends on the knowledge base**: `files_open`, the
-    /// `seed` optional present by default, the `files` collection with no
-    /// schema member, then the close — so the birth prefix and every branch
-    /// checkpoint end `files_open, seed, system_close`, the dynamic members
-    /// outside them, and the placed files come after the seed, the last
-    /// knowledge the question reads (docs/provenance_system_collection.md
-    /// §6.2b).
+    /// `files` collection with no schema member, then the close — so the
+    /// birth prefix and every branch checkpoint end `files_open`, the files'
+    /// range, `system_close`, with no knowledge-base content in them: the
+    /// seed is the collection's mandatory files, placed as the others are
+    /// (docs/placed_section_layout.md §3.5b).
     #[test]
     fn the_system_prompt_ends_on_the_knowledge_base() {
         use candle_conversation::projection::SystemPromptItem;
         let builder = build_projection_builder(Path::new("demo-project"));
         let items = &builder.schema().system_prompt.items;
-        let tail: Vec<String> = items[items.len() - 4..]
+        let tail: Vec<String> = items[items.len() - 3..]
             .iter()
             .map(|item| match item {
                 SystemPromptItem::Section(s) => format!("section {}", s.name),
@@ -455,12 +454,11 @@ pub(super) mod projection_schema_tests {
             tail,
             vec![
                 "section files_open",
-                "tree seed [present|absent]",
                 "collection files (0 members)",
                 "section system_close",
             ]
         );
-        let SystemPromptItem::Section(open) = &items[items.len() - 4] else {
+        let SystemPromptItem::Section(open) = &items[items.len() - 3] else {
             unreachable!()
         };
         assert_eq!(open.content, "\n# Knowledge Base\n\n");

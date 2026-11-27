@@ -99,6 +99,8 @@ struct MockResolver {
     files: Option<FilesSet>,
     /// The knowledge base's file records.
     file_records: Vec<FileRecord>,
+    /// The knowledge base's mandatory files by path.
+    mandatory_files: Vec<String>,
     /// Each member's section by the name it is registered under.
     members: HashMap<String, SectionId>,
 }
@@ -245,6 +247,10 @@ impl ContentResolver for MockResolver {
 
     fn files_records(&self) -> Vec<FileRecord> {
         self.file_records.clone()
+    }
+
+    fn files_mandatory(&self) -> Vec<String> {
+        self.mandatory_files.clone()
     }
 
     fn member_section(&self, name: &str) -> Option<SectionId> {

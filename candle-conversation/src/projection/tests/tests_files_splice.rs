@@ -128,7 +128,7 @@ fn files_are_spliced_strongest_first_as_their_sections() {
         &[(fa.key(), 800.0), (fb.key(), 900.0)],
         vec![],
     );
-    let splice = files_splice(b.schema(), &mock, |_| 10_000);
+    let splice = files_splice(b.schema(), &mock, |_| 10_000, true);
     assert_eq!(splice.order(), vec![fb.key(), fa.key()]);
     // Each placement names the lines of the chunks it placed, in order.
     assert_eq!(
@@ -187,7 +187,7 @@ fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
         vec![],
     );
     mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key()]);
-    let splice = files_splice(b.schema(), &mock, |_| 0);
+    let splice = files_splice(b.schema(), &mock, |_| 0, true);
     assert_eq!(splice.order(), vec![fa.key()]);
     assert_eq!(
         ids(&splice.segments),
@@ -211,7 +211,7 @@ fn a_pinned_knowledge_base_holds_its_file_whole_or_nothing() {
         ]
     );
     mock.files.as_mut().unwrap().pin = FilesPin::Empty;
-    let empty = files_splice(b.schema(), &mock, |_| 10_000);
+    let empty = files_splice(b.schema(), &mock, |_| 10_000, true);
     assert!(empty.placed.is_empty());
     assert!(empty.segments.is_empty());
 }
@@ -231,7 +231,7 @@ fn pinned_files_sit_in_the_pins_order() {
         vec![],
     );
     mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key(), fb.key()]);
-    let splice = files_splice(b.schema(), &mock, |_| 0);
+    let splice = files_splice(b.schema(), &mock, |_| 0, true);
     assert_eq!(splice.order(), vec![fa.key(), fb.key()]);
     let chunk = |path: &str| m[&chunk_name(path, "b", LineSpan { first: 1, last: 10 })];
     assert_eq!(
@@ -323,7 +323,31 @@ fn a_kept_file_keeps_its_place_in_the_knowledge_base() {
         vec![fa.key(), fb.key()],
     );
     assert_eq!(
-        files_splice(b.schema(), &mock, |_| 10_000).order(),
+        files_splice(b.schema(), &mock, |_| 10_000, true).order(),
         vec![fa.key(), fb.key()]
     );
+}
+
+/// **The mandatory files open a free knowledge base, whole and outside the
+/// caps, and the seed dial leaves them out**: m, weaker than a and bigger
+/// than the cap, is placed first and whole; under a 150-token cap a's one
+/// section fits beside it; with the dial off, a alone. A pinned knowledge
+/// base holds its pin alone.
+#[test]
+fn the_mandatory_files_open_a_free_knowledge_base() {
+    let b = Builder::from_yaml(YAML).unwrap();
+    let fm = record("candle/README.md", &[(1, 200), (201, 300)]);
+    let fa = record("candle/a.rs", &[(1, 10)]);
+    let records = [fm.clone(), fa.clone()];
+    let (mut mock, _) = resolver(&b, &records, &[(fm.key(), 10.0), (fa.key(), 900.0)], vec![]);
+    mock.mandatory_files = vec!["candle/README.md".into(), "candle/AGENTS.md".into()];
+    let on = files_splice(b.schema(), &mock, |_| 150, true);
+    assert_eq!(on.order(), vec![fm.key(), fa.key()]);
+    assert_eq!(on.placed[0].chunks.len(), 2, "whole, whatever the cap");
+    assert_eq!(on.segments.len(), 3);
+    let off = files_splice(b.schema(), &mock, |_| 150, false);
+    assert_eq!(off.order(), vec![fa.key()]);
+    mock.files.as_mut().unwrap().pin = FilesPin::Only(vec![fa.key()]);
+    let pinned = files_splice(b.schema(), &mock, |_| 150, true);
+    assert_eq!(pinned.order(), vec![fa.key()]);
 }
