@@ -145,6 +145,7 @@ impl ChunkedKvBacking {
             slot.push_chunk(ChunkWindow {
                 gids: chunk_ids[i].clone(),
                 usage: CHUNK_SIZE as u32,
+                lead: 0,
                 offset: 0,
                 k_pal: donors[i].k_pal.clone(),
                 v_pal: donors[i].v_pal.clone(),
@@ -160,6 +161,7 @@ impl ChunkedKvBacking {
             slot.push_chunk(ChunkWindow {
                 gids: chunk_ids[n - 1].clone(),
                 usage: 0,
+                lead: 0,
                 offset: 0,
                 k_pal: donors[n - 1].k_pal.clone(),
                 v_pal: donors[n - 1].v_pal.clone(),
@@ -318,6 +320,7 @@ impl ChunkedKvBacking {
             slot.push_chunk(ChunkWindow {
                 gids: rb.gids.clone(),
                 usage: chunk_size as u32,
+                lead: 0,
                 offset: 0,
                 k_pal: rb.k_pal.clone(),
                 v_pal: rb.v_pal.clone(),
@@ -335,6 +338,7 @@ impl ChunkedKvBacking {
             slot.push_chunk(ChunkWindow {
                 gids: rb.gids.clone(),
                 usage: last_usage as u32,
+                lead: 0,
                 offset: 0,
                 k_pal: rb.k_pal.clone(),
                 v_pal: rb.v_pal.clone(),
@@ -448,6 +452,7 @@ impl ChunkedKvBacking {
                     ChunkWindow {
                         gids: cw.gids.clone(),
                         usage: CHUNK_SIZE as u32,
+                        lead: cw.lead,
                         offset: 0,
                         k_pal: cw.k_pal.clone(),
                         v_pal: cw.v_pal.clone(),

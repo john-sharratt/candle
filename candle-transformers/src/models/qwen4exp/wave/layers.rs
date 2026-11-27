@@ -136,6 +136,10 @@ impl Qwen4ExpBatched {
         inputs: &[Tensor],
         n_decode: usize,
         offs: (&[usize], &[usize], &[usize], &[usize]),
+        // Decode then prefill rows' positions: their offsets plus the holes
+        // before them. Everything that rotates or places by position reads
+        // these; attention reads the offsets.
+        pos: (&[usize], &[usize]),
         rows: (usize, usize),
         range: (usize, usize),
         x_in: Option<ResidualIn<'_>>,
@@ -147,6 +151,7 @@ impl Qwen4ExpBatched {
         fwd_ticket: Option<candle::cuda_backend::wave_provenance::WaveTicket>,
     ) -> Result<(WavePhase, Option<WaveGuard>)> {
         let (dec_off, dec_q, pre_off, pre_q) = offs;
+        let (dec_at, pre_at) = pos;
         let (total_rows, pre_rows) = rows;
         let (layer_start, layer_end) = range;
         let (decode_headers, prefill_headers) = headers;
@@ -272,9 +277,9 @@ impl Qwen4ExpBatched {
         // ── Model-side RoPE for the non-paged paths; the paged kernels rotate
         // from `self.rope`, each sequence at its own rung. ──
         let theta = cfg.rope_theta;
-        let dec_pos: Vec<u32> = dec_off.iter().map(|&o| o as u32).collect();
+        let dec_pos: Vec<u32> = dec_at.iter().map(|&o| o as u32).collect();
         let mut pre_pos: Vec<u32> = Vec::with_capacity(pre_rows);
-        for (&o, &l) in pre_off.iter().zip(pre_q) {
+        for (&o, &l) in pre_at.iter().zip(pre_q) {
             for i in 0..l {
                 pre_pos.push((o + i) as u32);
             }
@@ -333,8 +338,8 @@ impl Qwen4ExpBatched {
         // rows first (one each), then each prefill sequence's span.
         let index_rope = self.index_rope().clone();
         let mut offsets_all: Vec<usize> = Vec::with_capacity(total_rows);
-        offsets_all.extend_from_slice(dec_off);
-        offsets_all.extend_from_slice(pre_off);
+        offsets_all.extend_from_slice(dec_at);
+        offsets_all.extend_from_slice(pre_at);
         let mut idx_map = self
             .index
             .write()
@@ -350,7 +355,7 @@ impl Qwen4ExpBatched {
             .arms
             .write()
             .map_err(|_| candle::Error::Msg("arms lock poisoned".into()))?;
-        let span_at: Vec<usize> = dec_off.iter().chain(pre_off).copied().collect();
+        let span_at: Vec<usize> = dec_at.iter().chain(pre_at).copied().collect();
         let mut ple_map = self
             .ple
             .write()

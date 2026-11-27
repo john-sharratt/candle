@@ -286,6 +286,7 @@ impl ChunkedKvBacking {
         Ok(ChunkWindow {
             gids: HeadGids::from_vec(gids),
             usage,
+            lead: 0,
             offset,
             k_pal: self.inner.identity_pal.clone(),
             v_pal: self.inner.identity_pal.clone(),

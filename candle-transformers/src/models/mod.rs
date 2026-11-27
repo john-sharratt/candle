@@ -155,6 +155,8 @@ pub mod profile;
 // (`qwen4exp::qsa_select`), the tensors the kernels read live here.
 pub mod piece_key;
 pub mod positional_piece;
+#[cfg(all(test, feature = "cuda"))]
+mod positions_tests;
 pub mod qsa_selection;
 /// Choosing an expert weight format from the card the model lands on.
 pub mod quant_ladder;

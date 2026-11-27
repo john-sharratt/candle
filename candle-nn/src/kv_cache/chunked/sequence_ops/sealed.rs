@@ -156,6 +156,7 @@ pub(super) fn sealed_windows(sealed: &SealedSequence) -> Vec<ChunkWindow> {
         .map(|sc| ChunkWindow {
             gids: sc.gids.clone(),
             usage: sc.token_count as u32,
+            lead: 0,
             offset: sc.offset,
             k_pal: Arc::clone(&sc.k_pal),
             v_pal: Arc::clone(&sc.v_pal),

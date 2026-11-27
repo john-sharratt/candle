@@ -17,6 +17,7 @@ pub(super) mod pin_tests {
         ChunkWindow {
             gids,
             usage: 32,
+            lead: 0,
             offset: 0,
             k_pal: Arc::new(Vec::new()),
             v_pal: Arc::new(Vec::new()),

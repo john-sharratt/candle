@@ -123,6 +123,7 @@ impl ChunkedKvBacking {
                     ChunkWindow {
                         gids: cw.gids.clone(),
                         usage: CHUNK_SIZE as u32,
+                        lead: cw.lead,
                         offset: 0,
                         k_pal: cw.k_pal.clone(),
                         v_pal: cw.v_pal.clone(),
@@ -192,6 +193,11 @@ impl ChunkedKvBacking {
                 .as_ref()
                 .and_then(|s| s.chunk_at(last_blk))
                 .and_then(|cw| cw.q_sign.clone());
+            // The copy stands where the source block stood, hole and all.
+            let source_lead = state.sequences[source_batch]
+                .as_ref()
+                .and_then(|s| s.chunk_at(last_blk))
+                .map_or(0, |cw| cw.lead);
 
             // Allocate new chunks using active_k_arena_key (R16 on GPU, Float on CPU)
             // so the active decode kernel can write directly into them.
@@ -345,6 +351,7 @@ impl ChunkedKvBacking {
                 .push_chunk(ChunkWindow {
                     gids,
                     usage: remainder as u32,
+                    lead: source_lead,
                     offset: 0,
                     k_pal: source_k_pal,
                     v_pal: source_v_pal,

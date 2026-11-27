@@ -7,6 +7,7 @@
 //!
 //! - `alloc`: allocating and freeing slots.
 //! - `fork`: forking a sequence into another slot.
+//! - `position_gap`: holes in a slot's position space.
 //! - `queries`: per-block metadata reads.
 //! - `sealed`: injecting and splicing sealed chunks.
 //! - `sharing`: prefix sharing and borrowed chunks.
@@ -34,6 +35,7 @@ use crate::kv_cache::{active_kv_formats, KvFormat};
 
 mod alloc;
 mod fork;
+mod position_gap;
 mod queries;
 mod sealed;
 mod sharing;

@@ -24,6 +24,7 @@ mod tests {
         crate::kv_cache::chunked::ChunkWindow {
             gids: crate::kv_cache::chunked::head_gids::HeadGids::uniform(gid, 1),
             usage,
+            lead: 0,
             offset,
             k_pal: std::sync::Arc::new(Vec::new()),
             v_pal: std::sync::Arc::new(Vec::new()),

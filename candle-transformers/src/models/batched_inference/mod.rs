@@ -24,6 +24,7 @@
 //! - `kv_layers`: division into stream and draft layers.
 //! - `managed_model`: the scheduler-facing model trait.
 //! - `model_core`: static model properties for planning.
+//! - `positions`: the position frontier apart from the token count.
 //! - `prefill_slabs`: slab packing for pure prefills.
 //! - `provenance`: provenance gathering and sign packing.
 //! - `seal_guard`: refusal of sealed per-layer skew.
@@ -171,6 +172,7 @@ mod kv_arenas;
 mod kv_layers;
 mod managed_model;
 mod model_core;
+mod positions;
 mod prefill_slabs;
 mod provenance;
 mod seal_guard;

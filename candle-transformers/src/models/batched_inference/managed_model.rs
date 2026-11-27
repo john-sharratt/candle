@@ -1118,13 +1118,9 @@ pub trait ManagedBatchedModel {
     /// find no candidates, and every piece after it sits exactly where its K/V
     /// does.
     ///
-    /// This used to have to do more. Positions were implied by the widths that
-    /// came before, so a piece injected without its rows slid every later
-    /// piece's start earlier by its own width and queries past it resolved
-    /// through the wrong block — a wrong answer, not a missing one. A zero-row
-    /// page had to stand in to keep the sum honest. Positions are recorded now
-    /// (`IndexPage::roped_base` and the placement it is put at), so there is no
-    /// sum left to keep honest.
+    /// A page is position-free: its position is the placement it is put at,
+    /// read off the window rather than implied by the widths before it, so a
+    /// span with no rows leaves a hole and moves no later page.
     ///
     /// Call it wherever [`Self::push_positional_state`] would have been called
     /// but the piece has nothing to push. A no-op for a model that keeps no

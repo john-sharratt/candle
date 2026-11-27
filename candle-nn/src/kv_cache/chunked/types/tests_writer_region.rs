@@ -30,6 +30,7 @@ pub(super) mod writer_region_tests {
         ChunkWindow {
             gids: HeadGids::uniform(ChunkGid::detached(0), 1),
             usage,
+            lead: 0,
             offset: 0,
             k_pal: Arc::new(Vec::new()),
             v_pal: Arc::new(Vec::new()),

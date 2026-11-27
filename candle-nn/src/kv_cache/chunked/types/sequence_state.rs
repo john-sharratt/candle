@@ -14,7 +14,8 @@ use super::*;
 /// decision behind [`SequenceState::evict_front_window`], factored out so the
 /// off-by-one boundary is unit-testable without arenas.
 ///
-/// `usages[i]` is chunk `i`'s valid-token count; `writer_start` bounds how far
+/// `usages[i]` is the positions chunk `i` takes — its lead and its valid tokens
+/// ([`ChunkWindow::span`]); `writer_start` bounds how far
 /// the sweep may go (never evicts the writer or a shared prefix); `base_pos` is
 /// the absolute position of the first resident token; the window ends at
 /// `abs_pos` and spans `window_size` tokens. A chunk at absolute
@@ -56,6 +57,7 @@ impl SequenceState {
             writer_start_idx: 0,
             gap_cursor: 0,
             base_pos: 0,
+            pending_lead: 0,
             decode_stale_from: None,
             fill_from: None,
         }
@@ -69,6 +71,7 @@ impl SequenceState {
             writer_start_idx: 0,
             gap_cursor: 0,
             base_pos: 0,
+            pending_lead: 0,
             decode_stale_from: None,
             fill_from: None,
         }
@@ -84,6 +87,52 @@ impl SequenceState {
     #[inline]
     pub(in super::super) fn seq_len(&self) -> usize {
         self.chunks.iter().map(|c| c.usage as usize).sum()
+    }
+
+    /// The positions the slot leaves empty: every chunk's lead and the lead
+    /// pending at the tail. The position frontier is the token count plus
+    /// this, since every hole lies before the tail.
+    #[inline]
+    pub(in super::super) fn lead_total(&self) -> usize {
+        self.chunks.iter().map(|c| c.lead as usize).sum::<usize>() + self.pending_lead as usize
+    }
+
+    /// The position the next token the tail gains is read at: the evicted
+    /// front, every chunk's lead and tokens, and the lead pending at the tail.
+    #[inline]
+    pub(in super::super) fn position_frontier(&self) -> usize {
+        self.base_pos as usize
+            + self.chunks.iter().map(|c| c.span() as usize).sum::<usize>()
+            + self.pending_lead as usize
+    }
+
+    /// Leave `n` positions empty at the tail: the next chunk the tail gains
+    /// takes them as its lead. A tail that is an empty writer chunk takes them
+    /// at once; one holding tokens is closed by the caller first, so no token
+    /// is written after the hole into the chunk before it.
+    pub(in super::super) fn push_lead(&mut self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        match self.chunks.last_mut() {
+            Some(tail) if tail.usage == 0 => {
+                tail.lead += n;
+                self.gpu_chunks.as_mut().clear();
+            }
+            _ => self.pending_lead += n,
+        }
+    }
+
+    /// Hand the pending lead to `cw`, the chunk the tail is about to gain.
+    #[inline]
+    pub(in super::super) fn take_pending_lead(&mut self, cw: &mut ChunkWindow) {
+        cw.lead += std::mem::take(&mut self.pending_lead);
+    }
+
+    /// Drop the lead pending at the tail: the tail it was left after is gone.
+    #[inline]
+    pub(in super::super) fn clear_pending_lead(&mut self) {
+        self.pending_lead = 0;
     }
 
     /// The sliding-window ring's evicted-front count — the absolute position of
@@ -158,20 +207,24 @@ impl SequenceState {
     }
 
     /// Compute the ABSOLUTE RoPE base position for block `blk`: the count of
-    /// tokens evicted off the front (`base_pos`) plus the cumulative token
-    /// count of all preceding resident blocks. `base_pos` is zero until the
-    /// sliding-window ring evicts, so a non-windowed slot reads exactly the
-    /// cumulative-usage sum it always did.
+    /// tokens evicted off the front (`base_pos`), the positions all preceding
+    /// resident blocks take (leads and tokens), and the block's own lead.
+    /// `base_pos` is zero until the sliding-window ring evicts. Past the last
+    /// block it is the position frontier.
     #[inline]
     pub(in super::super) fn rope_pos(&self, blk: usize) -> i32 {
         let count = blk.min(self.chunks.len());
-        self.base_pos as i32
-            + self
-                .chunks
-                .iter()
-                .take(count)
-                .map(|c| c.usage as i32)
-                .sum::<i32>()
+        let before: i32 = self
+            .chunks
+            .iter()
+            .take(count)
+            .map(|c| c.span() as i32)
+            .sum();
+        let own = match self.chunks.get(blk) {
+            Some(c) => c.lead,
+            None => self.pending_lead,
+        };
+        self.base_pos as i32 + before + own as i32
     }
 
     /// Slide the sliding-window ring: drop every FRONT chunk that has fully
@@ -193,16 +246,18 @@ impl SequenceState {
     /// intact via [`Self::rope_pos`] / the serialised `rope_base`) and shifts
     /// the writer boundary down by the number dropped.
     pub(crate) fn evict_front_window(&mut self, window_size: usize, abs_pos: usize) -> u32 {
-        let usages: Vec<u32> = self.chunks.iter().map(|c| c.usage).collect();
+        // The positions each chunk takes, its lead included, so a hole in front
+        // of a chunk counts toward how far the window has passed it.
+        let spans: Vec<u32> = self.chunks.iter().map(ChunkWindow::span).collect();
         let drained = front_evict_count(
-            &usages,
+            &spans,
             self.writer_start_idx,
             self.base_pos,
             window_size,
             abs_pos,
         );
         if drained > 0 {
-            let evicted: u32 = usages[..drained].iter().copied().sum();
+            let evicted: u32 = spans[..drained].iter().copied().sum();
             self.drain_front_chunks(drained); // RAII-frees GIDs + clears GPU buffer
             self.base_pos = self.base_pos.wrapping_add(evicted);
             self.writer_start_idx = self.writer_start_idx.saturating_sub(drained);

@@ -295,6 +295,16 @@ impl Cache {
         }
     }
 
+    /// The positions the chunked slot leaves empty — its holes
+    /// (`ChunkedKvBacking::lead_total`). A sequence's position frontier is its
+    /// token count plus this. `0` for contiguous storage, which has none.
+    pub fn chunked_lead_total(&self) -> usize {
+        match &self.storage {
+            CacheStorage::Chunked(c) => c.backing.lead_total(c.batch_idx).unwrap_or(0),
+            CacheStorage::Contiguous { .. } => 0,
+        }
+    }
+
     /// Device address of a resident KV-head record (for a slice's `kvheads_ptr`).
     /// `0` if there is no chunked backing or no device residence (CPU pool).
     pub fn chunked_meta_device_addr(&self, meta: &super::MetaGid) -> u64 {

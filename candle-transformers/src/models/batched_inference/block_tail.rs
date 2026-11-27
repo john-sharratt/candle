@@ -44,8 +44,10 @@ impl BatchedInferenceSession {
     /// move before a write, because the pad then sits between the old content
     /// and the new on exactly the layers that were short. Trimming is lossless
     /// by the same argument that makes padding lossless — an empty chunk holds
-    /// no token, so no position moves — and it leaves every layer's next
-    /// append at the same block index by construction.
+    /// no token — and the holes an empty chunk carries stay pending at the new
+    /// tail (`ChunkedKvBacking::trim_empty_tail`), so no position moves either.
+    /// It leaves every layer's next append at the same block index by
+    /// construction.
     pub fn trim_empty_tail_chunks(&mut self, seq_idx: usize) -> Result<()> {
         for backing in &self.backings {
             // A slot holding more blocks than the backing's `max_blocks` is a
@@ -56,7 +58,7 @@ impl BatchedInferenceSession {
                 continue;
             };
             if keep < blocks {
-                backing.truncate_sequence_to_blocks(seq_idx, keep)?;
+                backing.trim_empty_tail(seq_idx)?;
             }
         }
         Ok(())

@@ -60,8 +60,11 @@ impl SequenceState {
     /// whole list is thousands of chunks, re-serialised and re-uploaded per
     /// layer at every 32-token boundary — the dominant host cost of a deep
     /// decode step.
+    ///
+    /// The chunk takes the lead pending at the tail ([`Self::push_lead`]).
     #[inline]
-    pub(crate) fn push_chunk(&mut self, cw: ChunkWindow) {
+    pub(crate) fn push_chunk(&mut self, mut cw: ChunkWindow) {
+        self.take_pending_lead(&mut cw);
         self.chunks.push(cw);
         self.gpu_chunks.mark_appended();
     }
@@ -70,6 +73,7 @@ impl SequenceState {
     pub(crate) fn clear_chunks(&mut self) {
         self.chunks.clear();
         self.gap_cursor = 0;
+        self.clear_pending_lead();
         self.gpu_chunks.as_mut().clear();
     }
 
@@ -78,6 +82,7 @@ impl SequenceState {
     pub(crate) fn take_chunks(&mut self) -> (Vec<ChunkWindow>, Arc<Vec<ChunkPin>>) {
         let chunks = std::mem::take(&mut self.chunks);
         self.gap_cursor = 0;
+        self.clear_pending_lead();
         let pins = self.gpu_chunks.as_mut().clear_detached();
         (chunks, pins)
     }
@@ -104,6 +109,7 @@ impl SequenceState {
     pub(crate) fn replace_chunks(&mut self, new_chunks: Vec<ChunkWindow>) {
         self.chunks = new_chunks;
         self.gap_cursor = 0;
+        self.clear_pending_lead();
         self.gpu_chunks.as_mut().clear();
     }
 
@@ -143,18 +149,44 @@ impl SequenceState {
     pub(crate) fn split_off_chunks(&mut self, at: usize) -> Vec<ChunkWindow> {
         let tail = self.chunks.split_off(at);
         self.gap_cursor = cursor_after_truncate(self.gap_cursor, self.chunks.len());
+        self.clear_pending_lead();
         self.gpu_chunks.as_mut().clear();
         tail
     }
 
     /// Truncate to `n` chunks.  If the length actually decreases the GPU
-    /// buffer is cleared.
+    /// buffer is cleared, and the lead pending after the old tail goes with it.
     pub(crate) fn truncate_chunks(&mut self, n: usize) {
         if n < self.chunks.len() {
             self.chunks.truncate(n);
             self.gap_cursor = cursor_after_truncate(self.gap_cursor, n);
+            self.clear_pending_lead();
             self.gpu_chunks.as_mut().clear();
         }
+    }
+
+    /// Drop the trailing chunks that hold no token, keeping the holes they
+    /// carried: their leads, with the lead pending after them, become the lead
+    /// pending at the new tail, so nothing the slot gains next moves. Returns
+    /// the chunks dropped.
+    pub(crate) fn trim_empty_tail(&mut self) -> usize {
+        let keep = self
+            .chunks
+            .iter()
+            .rposition(|c| c.usage != 0)
+            .map_or(0, |i| i + 1);
+        let dropped = self.chunks.len() - keep;
+        if dropped == 0 {
+            return 0;
+        }
+        let holes: u32 =
+            self.chunks[keep..].iter().map(|c| c.lead).sum::<u32>() + self.pending_lead;
+        self.truncate_chunks(keep);
+        self.pending_lead = holes;
+        if self.writer_start_idx > keep {
+            self.writer_start_idx = keep;
+        }
+        dropped
     }
 
     /// Extend with additional `ChunkWindow`s and invalidate the cached GPU
@@ -165,8 +197,15 @@ impl SequenceState {
     /// back into its parent — moves the writer boundary past it, so it is
     /// never the chunk a write resolves to. See
     /// [`Self::seal_unwritable_writer_region`].
+    ///
+    /// The first appended chunk takes the lead pending at the tail.
     pub(crate) fn extend_chunks(&mut self, iter: impl IntoIterator<Item = ChunkWindow>) {
-        self.chunks.extend(iter);
+        let mut iter = iter.into_iter();
+        if let Some(mut first) = iter.next() {
+            self.take_pending_lead(&mut first);
+            self.chunks.push(first);
+            self.chunks.extend(iter);
+        }
         self.gpu_chunks.as_mut().clear();
         self.seal_unwritable_writer_region();
     }

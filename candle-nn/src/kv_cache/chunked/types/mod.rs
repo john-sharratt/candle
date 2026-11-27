@@ -85,6 +85,12 @@ pub(crate) struct SequenceState {
     /// every non-windowed slot (dialogue/section KV never evicts its front), so
     /// those paths are byte-identical to a `base_pos == 0` derivation.
     base_pos: u32,
+    /// Positions left empty after the last chunk, taken as the lead of the next
+    /// chunk the tail gains ([`Self::push_chunk`], [`Self::extend_chunks`]): a
+    /// hole pushed at the tail before the content that follows it exists
+    /// (`docs/placed_section_layout.md` §3.1). Part of the position frontier
+    /// ([`Self::position_frontier`]), never of the token count.
+    pending_lead: u32,
     /// Set by a commit made outside the decode kernel: the chunk index from
     /// which the cached decode slot buffer's lengths may be behind the host —
     /// the first chunk the earliest such commit since the buffer was last

@@ -166,8 +166,12 @@ impl SequenceState {
         if self.gpu_chunks.n_chunks() == 0 {
             return Ok(());
         }
-        let rope_base: u32 =
-            self.base_pos + self.chunks[..blk].iter().map(|c| c.usage).sum::<u32>();
+        let rope_base: u32 = self.base_pos
+            + self.chunks[..blk]
+                .iter()
+                .map(ChunkWindow::span)
+                .sum::<u32>()
+            + self.chunks[blk].lead;
         let SequenceState {
             ref chunks,
             ref mut gpu_chunks,
@@ -218,6 +222,7 @@ impl SequenceState {
         let mut rope_bases: Vec<u32> = Vec::with_capacity(last + 1);
         let mut acc: u32 = base_pos;
         for c in chunks.iter().take(last + 1) {
+            acc = acc.wrapping_add(c.lead);
             rope_bases.push(acc);
             acc = acc.wrapping_add(c.usage);
         }

@@ -560,8 +560,10 @@ pub(super) fn build_slot_headers(
             write_slice,
             slices_ptr,
             position_map_ptr: pm_base_ptr + pm_byte_offsets[i] as u64,
-            // The deepest position this launch writes for the slot.
-            rope_rung: rope.rung_for(offsets[i] + q_lens[i])?,
+            // The deepest position this launch writes for the slot: its
+            // tokens, the holes before them, and the new tokens.
+            rope_rung: rope
+                .rung_for(offsets[i] + caches[i].k_cache().chunked_lead_total() + q_lens[i])?,
         }
         .write(&mut header_buf);
     }

@@ -22,6 +22,7 @@ pub(super) mod band_iteration_tests {
         ChunkWindow {
             gids: HeadGids::uniform(ChunkGid::detached(0), 1),
             usage: 32,
+            lead: 0,
             offset: 0,
             k_pal: Arc::new(Vec::new()),
             v_pal: Arc::new(Vec::new()),

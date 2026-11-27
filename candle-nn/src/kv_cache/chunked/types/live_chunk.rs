@@ -3,8 +3,9 @@
 //!
 //! A window pairs the RAII chunk IDs of one block with the valid-token span it
 //! claims inside each physical chunk. RoPE is not stored: a block's position is
-//! the cumulative count of the blocks before it, which is why the same chunk
-//! bytes can be injected at any position. The borrowed view exists because
+//! the positions the blocks before it take — each its lead (positions it leaves
+//! empty in front of itself) and its tokens — plus its own lead, which is why
+//! the same chunk bytes can be injected at any position. The borrowed view exists because
 //! cloning every window on each layer call cost about half a millisecond at deep
 //! prefixes. A window also carries the format tag of each band, and it takes
 //! writes only while every band is in a format the paged stores write.
@@ -83,8 +84,8 @@ pub struct LiveChunkRef<'a> {
 /// When per-head quantization is active, each slot may point to a different
 /// arena / chunk.
 ///
-/// RoPE positions are not stored — they are recomputed as the cumulative token
-/// count of all preceding blocks.
+/// RoPE positions are not stored — a block's first token sits at the positions
+/// all preceding blocks take ([`Self::span`] each) plus its own [`Self::lead`].
 #[derive(Debug, Clone)]
 pub(crate) struct ChunkWindow {
     /// RAII chunk IDs, length `2 * n_kv_head`.
@@ -92,6 +93,10 @@ pub(crate) struct ChunkWindow {
     pub(crate) gids: HeadGids,
     /// Valid token count in this chunk's window.
     pub(in super::super) usage: u32,
+    /// Positions left empty in front of this window: a hole in the slot's
+    /// position space that holds no K/V (`docs/placed_section_layout.md`
+    /// §3.1). Zero for a window that follows the one before it directly.
+    pub(in super::super) lead: u32,
     /// Skip-count from the start of the physical chunk where valid data begins.
     pub(in super::super) offset: u16,
     /// Per-chunk K-side palette map: `n_kv_head * (head_dim/4)` bytes.
@@ -124,6 +129,12 @@ pub(crate) struct ChunkWindow {
 }
 
 impl ChunkWindow {
+    /// The positions this window takes in its slot: its lead, then its tokens.
+    #[inline]
+    pub(in super::super) fn span(&self) -> u32 {
+        self.lead + self.usage
+    }
+
     /// Whether every band is still native — in a format the paged stores
     /// write. A chunk sealed into a quantized format is read-only whatever room
     /// it has left.

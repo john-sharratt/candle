@@ -166,10 +166,20 @@ impl WaveSweep for Qwen4ExpBatched {
         }
 
         // Offsets + query lengths from the session, BEFORE the contexts borrow.
+        // The offset is the tokens a sequence holds — what attention's key
+        // counts and write lengths are measured in; its position is where its
+        // next token is read — what the indexer, the index caches, the hits and
+        // a rung are measured in. They differ by the holes its block table
+        // leaves (`docs/placed_section_layout.md` §4.1).
         let offsets: Vec<usize> = seq_ids
             .iter()
             .map(|&s| session.sequence_offset(s).unwrap_or(0))
             .collect();
+        let positions: Vec<usize> = seq_ids
+            .iter()
+            .map(|&s| session.sequence_position(s).unwrap_or(0))
+            .collect();
+        let (dec_pos, pre_pos) = positions.split_at(n_decode);
         let q_lens: Vec<usize> = inputs
             .iter()
             .map(|t| t.dims().get(1).copied().unwrap_or(1))
@@ -317,7 +327,7 @@ impl WaveSweep for Qwen4ExpBatched {
                     qsa_bytes: self.wave_qsa_bytes(
                         seq_ids,
                         &q_lens,
-                        &offsets,
+                        &positions,
                         layer_start,
                         layer_end,
                     )?,
@@ -468,6 +478,7 @@ impl WaveSweep for Qwen4ExpBatched {
             inputs,
             n_decode,
             (dec_off, dec_q, pre_off, pre_q),
+            (dec_pos, pre_pos),
             (total_rows, pre_rows),
             (layer_start, layer_end),
             x_in,

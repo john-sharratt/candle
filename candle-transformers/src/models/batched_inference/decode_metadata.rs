@@ -131,11 +131,15 @@ impl BatchedInferenceSession {
                 (seq_idx, offset)
             })
             .collect();
-        // Each sequence's rung, from the reach this step writes: its offset
-        // plus the decoded token. Layer-invariant, so taken once.
+        // Each sequence's rung, from the reach this step writes: the position
+        // its offset stands at — the offset plus the holes before it — plus the
+        // decoded token. Layer-invariant, so taken once.
         let rungs: Vec<u32> = seq_offsets
             .iter()
-            .map(|&(_, offset)| self.rope_rung_for(offset + 1))
+            .map(|&(seq_idx, offset)| {
+                let holes = group[0].lead_total(seq_idx)?;
+                self.rope_rung_for(offset + holes + 1)
+            })
             .collect::<Result<_>>()?;
 
         // `(slice count, write slice)` per sequence, read from the group's

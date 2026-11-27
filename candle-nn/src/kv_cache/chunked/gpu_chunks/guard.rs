@@ -161,9 +161,10 @@ impl GpuChunksGuard<'_> {
     }
 
     /// Clear the buffer and re-serialise all `chunks` from scratch, computing
-    /// each chunk's `rope_base` as `base_pos` + the cumulative usage of
-    /// preceding chunks (`base_pos` = tokens evicted off the front by the
-    /// sliding-window ring; zero for non-windowed slots).
+    /// each chunk's `rope_base` as `base_pos` + the positions the preceding
+    /// chunks take (their leads and tokens) + its own lead (`base_pos` = tokens
+    /// evicted off the front by the sliding-window ring; zero for non-windowed
+    /// slots).
     ///
     /// `write_len` overrides the last chunk's serialised `len` field so callers
     /// can supply the true sequence-offset-derived length rather than the
@@ -203,6 +204,7 @@ impl GpuChunksGuard<'_> {
         let mut rope_base = base_pos;
         for (i, chunk) in chunks.iter().enumerate() {
             let len = decode_entry_len(chunk, i, write_idx, write_len);
+            rope_base += chunk.lead;
             self.write_entry(
                 i, chunk, len, rope_base, n_kv_head, head_dim, n_palette, arena_info,
             );
@@ -271,10 +273,11 @@ impl GpuChunksGuard<'_> {
         }
         let mut rope_base = base_pos;
         for c in &chunks[..start] {
-            rope_base += c.usage;
+            rope_base += c.span();
         }
         for (i, chunk) in chunks.iter().enumerate().skip(start) {
             let len = decode_entry_len(chunk, i, write_idx, write_len);
+            rope_base += chunk.lead;
             self.write_entry(
                 i, chunk, len, rope_base, n_kv_head, head_dim, n_palette, arena_info,
             );
