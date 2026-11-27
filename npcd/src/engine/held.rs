@@ -11,9 +11,11 @@
 //! crowd out the one line somebody said to it directly.
 //!
 //! An arrival that only restates a standing fact (a situation, an unread count,
-//! a standing instruction — [`EventKind::replaces`]) is superseded by the next
-//! of its band anyway, so only the newest of each band is kept, and the rest go
-//! without a line: nothing in them is missing from the one kept.
+//! a standing instruction — [`EventKind::replaces`] — or a thread's message
+//! notice, which carries no words) is superseded by the next of its kind
+//! anyway, so only the newest is kept, as urgent as the loudest it stands for,
+//! and the rest go without a line: nothing in them is missing from the one
+//! kept.
 
 use std::collections::{HashMap, HashSet};
 
@@ -48,11 +50,17 @@ fn source(kind: &EventKind) -> Source {
         };
     }
     match kind {
-        EventKind::Message { thread, .. } => named(
-            format!("message:{thread}"),
-            format!("message on {thread}"),
-            format!("messages on {thread}"),
-        ),
+        // **A message notice is a standing fact of its thread.** It carries no
+        // words — who wrote, where, and how many wait there in all — so the
+        // newest says everything every earlier one did. Kept twenty deep,
+        // Jitter woke from its task to twenty lines of "Your phone shows a
+        // message from Zen Code (… unread messages in all)" in one reading.
+        EventKind::Message { thread, .. } => Source {
+            key: format!("message:{thread}"),
+            one: String::new(),
+            many: String::new(),
+            standing: true,
+        },
         // Held for the conversation, never the mind; named should one wait.
         EventKind::Talk { thread, .. } => named(
             format!("talk:{thread}"),
@@ -163,8 +171,15 @@ pub fn bound(queue: Vec<Event>, keep: usize, mut seq: impl FnMut() -> u64) -> Ve
     // One line per source, where the first of those it counts stood.
     let mut told: HashSet<&str> = HashSet::new();
     let mut out = Vec::with_capacity(queue.len());
-    for ((e, src), left) in queue.into_iter().zip(&sources).zip(out_of) {
+    for ((mut e, src), left) in queue.into_iter().zip(&sources).zip(out_of) {
         if !left {
+            // The one kept of a standing source stands for those it replaced,
+            // so it is as urgent as the loudest of them.
+            if src.standing {
+                if let Some(l) = loudest.get(src.key.as_str()) {
+                    e.salience = e.salience.max_of(*l);
+                }
+            }
             out.push(e);
             continue;
         }
@@ -247,11 +262,6 @@ mod tests {
         assert_eq!(
             prose(&out),
             vec![
-                "While you were away, 4 more messages on #general.".to_string(),
-                "Your phone shows a message from Kit on #general (5 unread messages in all). \
-                 `read` #general to see what was said, and answer it there with `reply`, not \
-                 to Kit alone."
-                    .to_string(),
                 "A door slams.".to_string(),
                 "Your phone shows a message from Kit on #general (6 unread messages in all). \
                  `read` #general to see what was said, and answer it there with `reply`, not \
@@ -260,11 +270,43 @@ mod tests {
                 "You are in the yard.".to_string(),
             ]
         );
-        let line = &out[0];
         assert_eq!(
-            (line.seq, line.at_ms, line.salience),
-            (101, 1, Salience::URGENT),
-            "as urgent as the loudest left out, where the first of them stood"
+            (out[1].seq, out[1].salience),
+            (7, Salience::URGENT),
+            "the newest notice of a thread stands for the rest, as urgent as the loudest"
+        );
+    }
+
+    /// **A source that is not standing keeps its newest and counts the rest in
+    /// one line where they began**, as loud as the loudest left out.
+    #[test]
+    fn a_source_past_its_bound_counts_what_it_leaves_out() {
+        let q: Vec<Event> = (1..=5u64)
+            .map(|i| {
+                let s = if i == 2 {
+                    Salience::URGENT
+                } else {
+                    Salience::NORMAL
+                };
+                Event::new(
+                    i,
+                    i,
+                    s,
+                    EventKind::Description {
+                        text: format!("A pipe knocks, {i}."),
+                    },
+                )
+            })
+            .collect();
+        let out = bound(q, 2, || 100);
+        assert_eq!(out.len(), 3, "{:?}", prose(&out));
+        assert_eq!(
+            out[0].prose(),
+            "While you were away, 3 more things that happened around you."
+        );
+        assert_eq!(
+            (out[0].seq, out[0].at_ms, out[0].salience),
+            (100, 1, Salience::URGENT)
         );
     }
 

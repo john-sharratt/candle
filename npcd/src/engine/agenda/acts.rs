@@ -4,13 +4,23 @@
 //! needs no table — and only to a character that keeps an agenda, through the
 //! sets its parameters are bound to (`Choices::Priorities`, `Choices::Agenda`).
 
-use crate::engine::tools::{Availability, Example, Param, Plane, Tool};
+use crate::engine::tools::{Availability, Example, Param, Plane, Tool, LIST};
 
 /// An agenda act's parameter.
 const fn param(name: &'static str, required: bool, description: &'static str) -> Param {
     Param {
         name,
         ty: "string",
+        required,
+        description,
+    }
+}
+
+/// A mission's steps, as a list of lines.
+const fn steps(required: bool, description: &'static str) -> Param {
+    Param {
+        name: "steps",
+        ty: LIST,
         required,
         description,
     }
@@ -37,18 +47,17 @@ pub const MISSION_ADD: Tool = Tool {
             true,
             "What is to be done, and why, in a sentence or two.",
         ),
-        param(
-            "steps",
+        steps(
             true,
-            "The steps, one to a line, each something you can be seen to do: \"go to the \
-             watch room\", \"post work on the order table\".",
+            "The steps, in order, each something you can be seen to do: \"go to the watch \
+             room\", \"post work on the order table\".",
         ),
         param("priority", true, "How soon: `now`, `soon` or `later`."),
     ],
     examples: &[Example {
         situation: "Yen has asked you to make sure John is reminded to collect her parcels \
                     when he is next home.",
-        call: r#"{"title":"Yen's parcels","brief":"See that John is reminded to collect Yen's parcels from downstairs.","steps":"post work on the order table","priority":"soon"}"#,
+        call: r#"{"title":"Yen's parcels","brief":"See that John is reminded to collect Yen's parcels from downstairs.","steps":["post work on the order table"],"priority":"soon"}"#,
         because: "A request that takes doing is a mission; once it is on your agenda it is \
                   worked through, not worried over.",
     }],
@@ -73,7 +82,7 @@ pub const MISSION_EDIT: Tool = Tool {
             false,
             "What is to be done now, and why, when that has changed.",
         ),
-        param("steps", false, "Its steps now, one to a line."),
+        steps(false, "Its steps now, in order."),
         param("priority", false, "How soon now: `now`, `soon` or `later`."),
     ],
     examples: &[Example {

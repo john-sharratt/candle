@@ -194,7 +194,8 @@ pub(super) fn describe_catalog(part_names: &PartNames) -> Value {
                 .params
                 .iter()
                 .map(|p| {
-                    let mut prop = json!({ "type": p.ty, "description": p.description });
+                    let mut prop = tools::wire_type(p.ty);
+                    prop["description"] = json!(p.description);
                     if let Some(vs) = tools::fixed_values(t.name, p.name) {
                         prop["enum"] = json!(vs);
                     } else if let Some(c) = tools::live_choice(t.name, p.name) {

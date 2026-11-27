@@ -12,6 +12,7 @@
 //! - `act_tools`: speech, attention and movement acts, pitched by who hears them.
 //! - `choices`: the closed sets a call's arguments are chosen from.
 //! - `compile`: the grammar a turn is decoded under, and its path budget.
+//! - `lists`: an act's list argument — a mission's steps — held, published and read.
 //! - `offers`: the fields a chosen value brings, and the live sets the world offers.
 //! - `show`: which acts a turn's prompt describes.
 //! - `within_tools`: what is true where a character stands.
@@ -135,6 +136,7 @@ const BODY_ACTS: &[Tool] = &[
 mod act_tools;
 mod choices;
 mod compile;
+mod lists;
 mod offers;
 mod show;
 #[cfg(test)]
@@ -149,6 +151,7 @@ mod within_tools;
 pub use act_tools::*;
 pub use choices::*;
 pub use compile::*;
+pub use lists::*;
 pub use offers::*;
 pub use show::*;
 pub use types::*;

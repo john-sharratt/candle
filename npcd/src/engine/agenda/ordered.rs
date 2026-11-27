@@ -18,7 +18,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::engine::tools::{Availability, Example, Param, Plane, Tool};
+use crate::engine::tools::{list_arg, Availability, Example, Param, Plane, Tool, LIST};
 
 /// The category these are filed under, which is what tells them from the
 /// agenda's acts of the same names.
@@ -28,6 +28,16 @@ const fn param(name: &'static str, required: bool, description: &'static str) ->
     Param {
         name,
         ty: "string",
+        required,
+        description,
+    }
+}
+
+/// A mission's steps, as a list of lines.
+const fn steps(required: bool, description: &'static str) -> Param {
+    Param {
+        name: "steps",
+        ty: LIST,
         required,
         description,
     }
@@ -48,17 +58,16 @@ pub const MISSION_ADD: Tool = Tool {
             true,
             "What is to be done, and why, in a sentence or two, as they asked it.",
         ),
-        param(
-            "steps",
+        steps(
             true,
-            "The steps, one to a line, each something you can be seen to do: \"go to the \
-             watch room\", \"check the lounge doors\".",
+            "The steps, in order, each something you can be seen to do: \"go to the watch \
+             room\", \"check the lounge doors\".",
         ),
     ],
     examples: &[Example {
         situation: "John, who owns you, asks you to stop tidying and check the garden doors \
                     are locked before dark.",
-        call: r#"{"brief":"Check the garden doors are locked before dark, as John asked.","steps":"go to the garden room\ncheck the garden doors"}"#,
+        call: r#"{"brief":"Check the garden doors are locked before dark, as John asked.","steps":["go to the garden room","check the garden doors"]}"#,
         because: "Your owner has changed what you are doing; the old mission is called off.",
     }],
 };
@@ -79,11 +88,11 @@ pub const MISSION_EDIT: Tool = Tool {
             false,
             "What is to be done now, and why, when that has changed.",
         ),
-        param("steps", false, "Its steps now, one to a line."),
+        steps(false, "Its steps now, in order."),
     ],
     examples: &[Example {
         situation: "John says the lounge only needs the windows done today, not the whole room.",
-        call: r#"{"mission":"Keep the lounge tidy.","steps":"clean the lounge windows"}"#,
+        call: r#"{"mission":"Keep the lounge tidy.","steps":["clean the lounge windows"]}"#,
         because: "What changed is the steps, not what the mission is for.",
     }],
 };
@@ -172,17 +181,6 @@ fn text(args: &Map<String, Value>, key: &str) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
-/// Steps given one to a line, a leading bullet dropped and blank lines left
-/// out — as the agenda's acts take them.
-fn steps(args: &Map<String, Value>) -> Option<Vec<String>> {
-    let lines: Vec<String> = text(args, "steps")?
-        .lines()
-        .map(|l| l.trim().trim_start_matches(['-', '*']).trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    (!lines.is_empty()).then_some(lines)
-}
-
 /// The order `tool` with `args` makes, or what the character is told when it
 /// makes none.
 pub fn order(tool: &str, args: &Map<String, Value>) -> Result<Order, String> {
@@ -191,13 +189,13 @@ pub fn order(tool: &str, args: &Map<String, Value>) -> Result<Order, String> {
         "mission_add" => {
             let brief =
                 text(args, "brief").ok_or("A mission needs a brief of what is to be done.")?;
-            let steps = steps(args)
-                .ok_or("Give it at least one step, one to a line, that you can be seen to do.")?;
+            let steps = list_arg(args, "steps")
+                .ok_or("Give it at least one step, each something you can be seen to do.")?;
             Ok(Order::Add { brief, steps })
         }
         "mission_edit" => {
             let mission = mission()?;
-            let (brief, steps) = (text(args, "brief"), steps(args));
+            let (brief, steps) = (text(args, "brief"), list_arg(args, "steps"));
             if brief.is_none() && steps.is_none() {
                 return Err(
                     "You meant to change it, but said nothing to change: a brief, or its steps."
@@ -253,7 +251,7 @@ mod tests {
             order(
                 "mission_add",
                 &args(
-                    r#"{"brief":"Check the doors.","steps":"- go to the garden\n\n* check the doors"}"#
+                    r#"{"brief":"Check the doors.","steps":[" go to the garden","","check the doors "]}"#
                 )
             ),
             Ok(Order::Add {
@@ -264,7 +262,7 @@ mod tests {
         assert_eq!(
             order(
                 "mission_edit",
-                &args(r#"{"mission":"Tidy.","steps":"dust"}"#)
+                &args(r#"{"mission":"Tidy.","steps":["dust"]}"#)
             ),
             Ok(Order::Edit {
                 mission: "Tidy.".into(),
@@ -296,7 +294,8 @@ mod tests {
 
     #[test]
     fn an_order_missing_what_it_needs_is_refused() {
-        assert!(order("mission_add", &args(r#"{"brief":"x","steps":"  \n"}"#)).is_err());
+        assert!(order("mission_add", &args(r#"{"brief":"x","steps":["  "]}"#)).is_err());
+        assert!(order("mission_add", &args(r#"{"brief":"x","steps":"go"}"#)).is_err());
         assert!(order("mission_edit", &args(r#"{"mission":"Tidy."}"#)).is_err());
         assert!(order("mission_cancel", &args(r#"{"mission":"Tidy."}"#)).is_err());
         assert!(order("mission_done", &args(r#"{"found":"x"}"#)).is_err());

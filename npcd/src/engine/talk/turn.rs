@@ -410,6 +410,12 @@ impl Runtime {
                 .await
                 .recorded;
             if !done.landed {
+                // A refused post is the mind's to put right: the conversation
+                // has decided and will not see the table's answer.
+                if posts_work(act) {
+                    elsewhere.push(refused_post(&seen.party_name, &done.answer));
+                    settled = true;
+                }
                 continue;
             }
             let arg = |k: &str| act.args.get(k).and_then(|v| v.as_str()).unwrap_or_default();
@@ -796,6 +802,23 @@ fn said_for_the_mind(words: &str) -> String {
     )
 }
 
+/// What the mind is told of a post its conversation with `party` made and the
+/// table refused, in the table's own words `why`.
+///
+/// **A refused post reached nobody.** A conversation's acts are performed once
+/// it has decided, so it never reads the table's answer: asked to have a Drone
+/// research the code, Zen's conversation posted a brief with no steps, the
+/// table refused it, and John's request was dropped with no word to him or to
+/// the mind.
+fn refused_post(party: &str, why: &str) -> String {
+    format!(
+        "Your conversation with {party} tried to post work on the order table, and the table \
+         refused it: {} Nothing is posted. It is yours to post now, as the table says, and to \
+         tell {party} when it is done.",
+        why.trim()
+    )
+}
+
 /// The band a conversation with `party` decodes at.
 ///
 /// **A person on the other end is waiting on the turn right now** — the
@@ -812,7 +835,23 @@ fn talk_band(party: &Party) -> DecodePriority {
 
 #[cfg(test)]
 mod tests {
-    use super::{said_for_the_mind, talk_band, DecodePriority, Party};
+    use super::{refused_post, said_for_the_mind, talk_band, DecodePriority, Party};
+
+    /// **A refused post is told to the mind in the table's own words**, with
+    /// whose request it was.
+    #[test]
+    fn a_refused_post_is_the_minds_to_put_right() {
+        assert_eq!(
+            refused_post(
+                "John",
+                " Give it at least one step, or a standing `job` by name: `coding-task`. "
+            ),
+            "Your conversation with John tried to post work on the order table, and the table \
+             refused it: Give it at least one step, or a standing `job` by name: `coding-task`. \
+             Nothing is posted. It is yours to post now, as the table says, and to tell John \
+             when it is done."
+        );
+    }
 
     /// The mind is told what was said, and that the doing is still its own.
     #[test]

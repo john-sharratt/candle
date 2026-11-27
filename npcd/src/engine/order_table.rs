@@ -18,6 +18,7 @@ use crate::engine::body::Outcome;
 use crate::engine::mission::{Origin, Outcome as Verdict};
 use crate::engine::mission_gen::standing::table_room;
 use crate::engine::mission_gen::world::{mission_of, Filled, FilledStep};
+use crate::engine::tools::list_arg;
 use crate::world::Hosted;
 
 /// The argument a post carries the party whose conversation posted it under:
@@ -105,25 +106,17 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
                      `brief` and its `steps`{or_job}."
                 ));
             };
-            let steps: Vec<String> = text(args, "steps")
-                .map(|s| {
-                    s.lines()
-                        .map(|l| l.trim().trim_start_matches(['-', '*']).trim().to_string())
-                        .filter(|l| !l.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
             // **A brief with no steps may be a standing job's work.** Told
             // only to give it steps, Zen posted a repository's research as a
             // brief three times over and never named `coding-task`, the one
             // job that lends a Drone the acts that reach a repository.
-            if steps.is_empty() {
+            let Some(steps) = list_arg(args, "steps") else {
                 return Outcome::Refused(format!(
-                    "Give it at least one step, one to a line, that whoever carries it can be \
-                     seen to do — \"go to the ward room\", \"scan the sensor panel and read what \
-                     state it is in\"{or_job}."
+                    "Give it at least one step, each something whoever carries it can be seen to \
+                     do — \"go to the ward room\", \"scan the sensor panel and read what state it \
+                     is in\"{or_job}."
                 ));
-            }
+            };
             Filled {
                 brief,
                 steps: steps
@@ -412,7 +405,7 @@ mod tests {
             "zen",
             &args(json!({
                 "brief": "Read the breaker panel.",
-                "steps": "go to the plant room\n- scan the breaker panel and read what state it is in\n"
+                "steps": ["go to the plant room", " scan the breaker panel and read what state it is in ", ""]
             })),
         );
         assert_eq!(
@@ -456,7 +449,7 @@ mod tests {
             "zen",
             &args(json!({
                 "brief": "Read the breaker panel.",
-                "steps": "scan the breaker panel and read what state it is in",
+                "steps": ["scan the breaker panel and read what state it is in"],
                 "asked": "u_154797f3"
             })),
         );
@@ -499,7 +492,7 @@ mod tests {
     fn a_post_for_one_by_name_is_theirs() {
         let h = vault();
         let watch =
-            json!({"brief": "Watch Earth.", "steps": "go to the observatory", "for": "jitter"});
+            json!({"brief": "Watch Earth.", "steps": ["go to the observatory"], "for": "jitter"});
         let posted = post(&h, "zen", &args(watch));
         assert!(posted.happened(), "{posted:?}");
         assert!(!h.sim(|s| s.missions.has_work_for("wick")));
@@ -508,7 +501,7 @@ mod tests {
             post(
                 &h,
                 "zen",
-                &args(json!({"brief": "x", "steps": "go", "for": "Zen"}))
+                &args(json!({"brief": "x", "steps": ["go"], "for": "Zen"}))
             ),
             Outcome::Refused("Zen takes no orders: there is nobody to set it for there.".into())
         );
@@ -516,7 +509,7 @@ mod tests {
             post(
                 &h,
                 "zen",
-                &args(json!({"brief": "x", "steps": "go", "for": "Umbra"}))
+                &args(json!({"brief": "x", "steps": ["go"], "for": "Umbra"}))
             ),
             Outcome::Refused(
                 "There is nobody called \"Umbra\" to give it to. Those who take your orders: \
@@ -524,9 +517,10 @@ mod tests {
                     .into()
             )
         );
-        assert!(!post(&h, "zen", &args(json!({"steps": "go"}))).happened());
+        assert!(!post(&h, "zen", &args(json!({"steps": ["go"]}))).happened());
         assert!(!post(&h, "zen", &args(json!({"brief": "Watch Earth."}))).happened());
-        assert!(!post(&h, "zen", &args(json!({"brief": "x", "steps": "\n - \n"}))).happened());
+        assert!(!post(&h, "zen", &args(json!({"brief": "x", "steps": ["", " "]}))).happened());
+        assert!(!post(&h, "zen", &args(json!({"brief": "x", "steps": ""}))).happened());
     }
 
     /// **The table is not a queue to fill.** A mission still out is not posted
@@ -537,7 +531,7 @@ mod tests {
     fn the_table_takes_no_more_than_the_hands_to_carry_it() {
         let h = vault();
         let board =
-            || args(json!({"brief": "Read the board.", "steps": "go to the dispatch room"}));
+            || args(json!({"brief": "Read the board.", "steps": ["go to the dispatch room"]}));
         assert!(post(&h, "zen", &board()).happened());
         assert_eq!(
             post(&h, "zen", &board()),
@@ -547,9 +541,9 @@ mod tests {
                     .into()
             )
         );
-        let earth = args(json!({"brief": "Watch Earth.", "steps": "go to the observatory"}));
+        let earth = args(json!({"brief": "Watch Earth.", "steps": ["go to the observatory"]}));
         assert!(post(&h, "zen", &earth).happened());
-        let ward = args(json!({"brief": "Walk the ward.", "steps": "go to the ward room"}));
+        let ward = args(json!({"brief": "Walk the ward.", "steps": ["go to the ward room"]}));
         assert_eq!(
             post(&h, "zen", &ward),
             Outcome::Refused(
@@ -574,9 +568,9 @@ mod tests {
             s.missions
                 .set_suspended(BTreeSet::from(["jitter".to_string()]))
         });
-        let board = args(json!({"brief": "Read the board.", "steps": "go to the dispatch room"}));
+        let board = args(json!({"brief": "Read the board.", "steps": ["go to the dispatch room"]}));
         assert!(post(&h, "zen", &board).happened());
-        let earth = args(json!({"brief": "Watch Earth.", "steps": "go to the observatory"}));
+        let earth = args(json!({"brief": "Watch Earth.", "steps": ["go to the observatory"]}));
         assert_eq!(
             post(&h, "zen", &earth),
             Outcome::Refused(
@@ -597,7 +591,7 @@ mod tests {
         use crate::engine::mission::{Mission, Origin, Todo};
         let h = vault();
         for brief in ["Read the board.", "Watch Earth."] {
-            let a = args(json!({"brief": brief, "steps": "go to the dispatch room"}));
+            let a = args(json!({"brief": brief, "steps": ["go to the dispatch room"]}));
             assert!(post(&h, "zen", &a).happened());
         }
         h.with_sim(|s| {
@@ -610,7 +604,7 @@ mod tests {
                 ),
             )
         });
-        let ward = args(json!({"brief": "Walk the ward.", "steps": "go to the ward room"}));
+        let ward = args(json!({"brief": "Walk the ward.", "steps": ["go to the ward room"]}));
         let Outcome::Refused(why) = post(&h, "zen", &ward) else {
             panic!("the table is full");
         };
@@ -651,9 +645,9 @@ mod tests {
                 &args(json!({"brief": "Research the ward rota."}))
             ),
             Outcome::Refused(
-                "Give it at least one step, one to a line, that whoever carries it can be seen \
-                 to do — \"go to the ward room\", \"scan the sensor panel and read what state it \
-                 is in\", or a standing `job` by name: `ward-shift`."
+                "Give it at least one step, each something whoever carries it can be seen to do \
+                 — \"go to the ward room\", \"scan the sensor panel and read what state it is \
+                 in\", or a standing `job` by name: `ward-shift`."
                     .into()
             )
         );
@@ -748,13 +742,13 @@ mod tests {
         post(
             &h,
             "zen",
-            &args(json!({"brief": "Read the board.", "steps": "go to the dispatch room"})),
+            &args(json!({"brief": "Read the board.", "steps": ["go to the dispatch room"]})),
         );
         post(
             &h,
             "zen",
             &args(
-                json!({"brief": "Watch Earth.", "steps": "go to the observatory", "for": "Jitter"}),
+                json!({"brief": "Watch Earth.", "steps": ["go to the observatory"], "for": "Jitter"}),
             ),
         );
         h.with_sim(|s| {
@@ -788,7 +782,7 @@ mod tests {
     fn a_post_called_off_or_left_by_the_gone_is_told_to_its_poster() {
         let h = vault();
         let go = |brief: &str, to: Option<&str>| {
-            let mut a = json!({"brief": brief, "steps": "go to the dispatch room"});
+            let mut a = json!({"brief": brief, "steps": ["go to the dispatch room"]});
             if let Some(to) = to {
                 a["for"] = json!(to);
             }

@@ -342,7 +342,7 @@ pub(super) mod tests {
             &seat,
             &act(
                 "order_post",
-                serde_json::json!({"brief": "Read the board.", "steps": "go to the dispatch room"}),
+                serde_json::json!({"brief": "Read the board.", "steps": ["go to the dispatch room"]}),
             ),
         );
         assert!(posted.happened(), "{posted:?}");
@@ -405,7 +405,7 @@ pub(super) mod tests {
                 tool: "order_post",
                 args: serde_json::json!({
                     "brief": "Read the board.",
-                    "steps": "go to the dispatch room",
+                    "steps": ["go to the dispatch room"],
                     "asked": "u_154797f3"
                 })
                 .as_object()
