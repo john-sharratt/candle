@@ -30,8 +30,8 @@ use web::cluster::service_key::{subject, SERVICE_PROVIDER};
 use crate::engine::act::Act;
 use crate::engine::runtime::{Recorded, Runtime, LANDED, REFUSED};
 use crate::engine::zen_task::request::{
-    answer_of, digest, handle_in, news, news_of, rpc, standing_of, status_call, thread_for,
-    zend_call, Standing, ZEND_MCP,
+    answer_of, digest, done_seen, handle_in, news, news_of, rpc, standing_of, status_call,
+    task_answer, thread_for, zend_call, Standing, ZEND_MCP,
 };
 use crate::engine::zen_task::{task_grants, Task};
 use crate::sim::phone::{Kind as ThreadKind, Said, Who};
@@ -324,7 +324,10 @@ fn post_news(s: &mut Sim, body: &str, npc: u64, handle: &str, text: &str) {
     // by the look that finds it asking, stuck, failed or done.
     s.missions.task_running(body, standing == Standing::Running);
     if standing == Standing::Done && s.missions.task_done(body) {
-        s.missions.observe(body, format!("{handle} reported done"));
+        s.missions.observe(
+            body,
+            done_seen(handle, task_answer(text, handle).as_deref()),
+        );
     }
     if !s.missions.is_news(body, said_digest) {
         return;

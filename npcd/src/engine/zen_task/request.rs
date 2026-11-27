@@ -228,6 +228,49 @@ pub fn news_of(text: &str, handle: &str) -> String {
         .to_string()
 }
 
+/// What follows a done task's answer in `job_status`'s block, each opening a
+/// paragraph of its own (`zend::mcp::tools::wait`).
+const AFTER_ANSWER: [&str; 3] = [
+    "\n\nCitation audit:",
+    "\n\nIt can be continued with",
+    "\n\nJournal entries:",
+];
+
+/// The answer a done task `handle` gave, as `job_status`'s `text` words it —
+/// empty when it answered nothing — or `None` when the text holds no done
+/// block for it.
+pub fn task_answer(text: &str, handle: &str) -> Option<String> {
+    let opener = format!("{handle} — done");
+    let from = text.find(&opener)?;
+    let rest = &text[from..];
+    let at = rest.find("Its answer:\n")? + "Its answer:\n".len();
+    let answer = &rest[at..];
+    let end = AFTER_ANSWER
+        .iter()
+        .filter_map(|m| answer.find(m))
+        .min()
+        .unwrap_or(answer.len());
+    Some(answer[..end].trim().to_string())
+}
+
+/// What the carrier saw of its task `handle` when it reported done: its answer,
+/// cut as its news is, or that it answered nothing.
+///
+/// **The answer is what the carrier reports.** Seen only as "reported done", a
+/// carrier told to report exactly what it found had nothing it had found, and
+/// Jitter, whose task finished with an empty answer, reported a cause of its
+/// own: that the repository's search tools were not available to it.
+pub fn done_seen(handle: &str, answer: Option<&str>) -> String {
+    match answer.map(str::trim) {
+        Some("") => format!(
+            "{handle} finished and answered nothing: it found nothing it reported, so that is \
+             what there is to report"
+        ),
+        Some(answer) => format!("{handle} reported done. Its answer: {}", news(answer)),
+        None => format!("{handle} reported done"),
+    }
+}
+
 /// A digest of what the task said, so the same news is posted once.
 pub fn digest(text: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -257,6 +300,49 @@ mod tests {
 
     fn args(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
+    }
+
+    /// **A done task's answer is what lies between `Its answer:` and the
+    /// paragraphs zend closes it with**; an empty one is empty, not absent.
+    #[test]
+    fn a_done_tasks_answer_is_read_off_its_block() {
+        let h = "task:mission-7-39/find-default";
+        let full = format!(
+            "{h}: done\n{h} — done. Its answer:\nMEMBER_KV_LEVEL = 4, in \
+             system_prompt.rs\n\nCitation audit: 1 cited.\n\nIt can be continued with \
+             `repo_task_reply`.\n\nJournal entries:\n\nT:x#1\nEntry 1"
+        );
+        assert_eq!(
+            task_answer(&full, h).as_deref(),
+            Some("MEMBER_KV_LEVEL = 4, in system_prompt.rs")
+        );
+        // WhiteWorld 2026-11-28: a task that finished saying nothing.
+        let empty = format!(
+            "{h}: done\n{h} — done. Its answer:\n\n\nIt can be continued with \
+             `repo_task_reply` — to check a claim."
+        );
+        assert_eq!(task_answer(&empty, h).as_deref(), Some(""));
+        let unkept = format!(
+            "{h} — done; no journal entry was kept (no journal draft ran). Its answer:\nVerdict: ok"
+        );
+        assert_eq!(task_answer(&unkept, h).as_deref(), Some("Verdict: ok"));
+        assert_eq!(task_answer(&format!("{h}: running"), h), None);
+    }
+
+    /// **What the carrier saw names the answer, or that there was none.**
+    #[test]
+    fn a_done_task_is_seen_with_its_answer() {
+        let h = "task:t/x";
+        assert_eq!(
+            done_seen(h, Some("MEMBER_KV_LEVEL = 4")),
+            "task:t/x reported done. Its answer: MEMBER_KV_LEVEL = 4"
+        );
+        assert_eq!(
+            done_seen(h, Some("  \n")),
+            "task:t/x finished and answered nothing: it found nothing it reported, so that is \
+             what there is to report"
+        );
+        assert_eq!(done_seen(h, None), "task:t/x reported done");
     }
 
     /// **Each act is one zend tool, on the mission's thread**, with its
