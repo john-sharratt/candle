@@ -180,6 +180,7 @@ pub(super) mod tests {
                     by: "Zen".into(),
                     poster: "zen".into(),
                     job: None,
+                    asked: None,
                 },
             )
         };

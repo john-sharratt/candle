@@ -143,11 +143,15 @@ pub enum Origin {
     /// its name, `poster` its body), whose report goes back to it — see
     /// `sim::orders` and `docs/zen_moon_mind.md` §8. `job` names the standing
     /// job it was posted from, when it was one of the world's routines.
+    /// `asked` is the party whose conversation with the poster posted it, when
+    /// one did: its report is told to them too.
     Ordered {
         by: String,
         poster: String,
         #[serde(default)]
         job: Option<String>,
+        #[serde(default)]
+        asked: Option<String>,
     },
     /// Put up by the table itself, on a schedule: the standing mission `id`,
     /// for the room `room` (`area/node`) — see `engine::mission_gen::standing`

@@ -49,7 +49,7 @@ use serde_json::{json, Map, Value};
 use npc_map::world::Where;
 
 use crate::api::err;
-use crate::effector::auth::{DeviceCaller, PinnedStandpoint};
+use crate::effector::auth::{AskedBy, DeviceCaller, PinnedStandpoint};
 use crate::effector::enact_route::enact_response;
 use crate::effector::namespace::namespace_of;
 use crate::effector::router::Local;
@@ -57,6 +57,7 @@ use crate::effector::token::Scope;
 use crate::engine::act::Act;
 use crate::engine::body;
 use crate::engine::mission_acts::{self, COMMAND_DESK};
+use crate::engine::order_table;
 use crate::engine::tools::{self, Tool};
 use crate::world::Hosted;
 
@@ -180,6 +181,7 @@ async fn invoke(
     Extension(caller): Extension<DeviceCaller>,
     Extension(mount): Extension<StationNamespace>,
     pinned: Option<Extension<PinnedStandpoint>>,
+    asked: Option<Extension<AskedBy>>,
     Path((id, verb)): Path<(String, String)>,
     payload: Option<Json<Value>>,
 ) -> Response {
@@ -224,6 +226,11 @@ async fn invoke(
                 args.insert(name.to_string(), value.clone());
             }
         }
+    }
+    // Whose conversation made the call rides in from the in-process path
+    // alone, under a name no act declares, so no body can supply it.
+    if let Some(Extension(AskedBy(party))) = asked {
+        args.insert(order_table::ASKED.to_string(), Value::String(party));
     }
     let act = Act {
         tool: tool.name,

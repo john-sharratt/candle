@@ -20,6 +20,11 @@ use crate::engine::mission_gen::standing::table_room;
 use crate::engine::mission_gen::world::{mission_of, Filled, FilledStep};
 use crate::world::Hosted;
 
+/// The argument a post carries the party whose conversation posted it under:
+/// put there by the station from its in-process `AskedBy` extension
+/// (`effector::auth`), never by a body — no act declares it.
+pub const ASKED: &str = "asked";
+
 fn text(args: &Map<String, Value>, key: &str) -> Option<String> {
     let s = args.get(key)?.as_str()?.trim();
     (!s.is_empty()).then(|| s.to_string())
@@ -186,6 +191,7 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
             by: me,
             poster: body.to_string(),
             job,
+            asked: text(args, ASKED),
         },
         Some(&room),
     );
@@ -373,6 +379,7 @@ mod tests {
     use super::*;
     use crate::engine::mission::bank::Facts;
     use crate::engine::mission_gen::world::{Draw, Routine};
+    use crate::sim::orders::Notice;
 
     fn vault() -> Hosted {
         let h = Hosted::load(
@@ -434,8 +441,55 @@ mod tests {
                 by: "Zen".into(),
                 poster: "zen".into(),
                 job: None,
+                asked: None,
             }
         );
+    }
+
+    /// **A post a conversation made names who asked for it**, and its report
+    /// is filed with them, so the poster can tell them what came back.
+    #[test]
+    fn a_post_from_a_conversation_names_who_asked() {
+        let h = vault();
+        let posted = post(
+            &h,
+            "zen",
+            &args(json!({
+                "brief": "Read the breaker panel.",
+                "steps": "scan the breaker panel and read what state it is in",
+                "asked": "u_154797f3"
+            })),
+        );
+        assert!(posted.happened(), "{posted:?}");
+        let took = h.with_sim(|s| s.missions.collect("wick", &Facts::default()).cloned());
+        assert_eq!(
+            took.unwrap().origin,
+            Origin::Ordered {
+                by: "Zen".into(),
+                poster: "zen".into(),
+                job: None,
+                asked: Some("u_154797f3".into()),
+            }
+        );
+        h.with_sim(|s| {
+            s.missions.report(
+                "wick",
+                Verdict::Pass,
+                "the panel reads all breakers closed",
+                None,
+            )
+        });
+        let filed: Vec<Option<String>> = h.with_sim(|s| {
+            s.missions
+                .take_notices()
+                .into_iter()
+                .filter_map(|n| match n {
+                    Notice::Reported(f) => Some(f.asked),
+                    Notice::Posted { .. } => None,
+                })
+                .collect()
+        });
+        assert_eq!(filed, [Some("u_154797f3".to_string())]);
     }
 
     /// **A mission posted for one by name is theirs alone**; nobody who takes

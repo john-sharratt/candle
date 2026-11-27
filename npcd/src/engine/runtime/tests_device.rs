@@ -71,6 +71,7 @@ pub(super) mod tests {
                     json!({ "url": "http://local/lift/command-shaft/call" }),
                 ),
                 None,
+                None,
             )
             .await;
         assert!(inv.landed, "the invoke did not land: {inv:?}");
@@ -101,6 +102,7 @@ pub(super) mod tests {
                     json!({ "url": "http://local/lift/command-shaft/call", "body": "{not json" }),
                 ),
                 None,
+                None,
             )
             .await;
         assert!(
@@ -121,6 +123,7 @@ pub(super) mod tests {
                     "invoke",
                     json!({ "url": "http://local/lift/command-shaft/use" }),
                 ),
+                None,
                 None,
             )
             .await;

@@ -65,6 +65,17 @@ pub struct DeviceCaller {
 #[derive(Debug, Clone)]
 pub struct PinnedStandpoint(pub Where);
 
+/// The party whose conversation with the caller made this device call — a body
+/// id or an account handle — so work it posts at the order table is told back
+/// to them when it is reported.
+///
+/// **Trusted for the reason [`PinnedStandpoint`] is**: a typed extension only
+/// the in-process path inserts, for a conversation's act the authority has
+/// already checked (`Runtime::perform_here`). No external caller can name an
+/// asker.
+#[derive(Debug, Clone)]
+pub struct AskedBy(pub String);
+
 /// Resolve the bearer token to a [`DeviceCaller`], or refuse the request.
 ///
 /// On success the caller is inserted into the request extensions and the handler

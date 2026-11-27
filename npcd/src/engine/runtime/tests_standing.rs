@@ -376,6 +376,74 @@ pub(super) mod tests {
         );
     }
 
+    /// **Work a conversation posted is reported to whoever asked for it**: the
+    /// poster's mind is told the report and that it is being told, and its
+    /// conversation with the asker is handed what came back to say.
+    #[tokio::test]
+    async fn a_report_on_work_a_conversation_posted_goes_back_to_who_asked() {
+        use crate::engine::mission_gen::world::Draw;
+        let rt = vaulted();
+        rt.scheduler.wake(1, 0, 0);
+        let zen = Kind {
+            unordered: true,
+            attends: true,
+            ..Kind::default()
+        };
+        rt.embody_in_world(1, WORLD, zen, "Zen", None, 0).unwrap();
+        rt.scheduler.wake(2, 0, 0);
+        rt.embody_in_world(2, WORLD, Kind::default(), "Wick", None, 0)
+            .unwrap();
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        let (_, seat) = rt.body_of(1).unwrap();
+        let (_, wick) = rt.body_of(2).unwrap();
+        hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::None));
+        rt.set_table_open(true);
+        let posted = body::perform(
+            &hosted,
+            &seat,
+            &Act {
+                tool: "order_post",
+                args: serde_json::json!({
+                    "brief": "Read the board.",
+                    "steps": "go to the dispatch room",
+                    "asked": "u_154797f3"
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            },
+        );
+        assert!(posted.happened(), "{posted:?}");
+        rt.moment(&hosted);
+        assert!(hosted.sim(|s| s.missions.is_on_mission(&wick)));
+        waiting(&rt, 1);
+        hosted.with_sim(|s| {
+            s.missions
+                .report(&wick, Verdict::Pass, "two jobs stalled", None)
+        });
+        rt.moment(&hosted);
+        let told = waiting(&rt, 1);
+        let report = "Wick has reported it done: Read the board. What Wick reported: \"two jobs \
+                      stalled\"";
+        assert!(
+            told.iter().any(|l| l
+                == &format!(
+                    "{report} The table is empty: nothing you posted waits to be taken. \
+                     u_154797f3 asked for it, and you are telling them what came back."
+                )),
+            "{told:?}"
+        );
+        // Taken before anything awaits, so the runner's tick has not started
+        // the conversation's turn on it.
+        let to_tell = rt.talks.take(&(1, "u_154797f3".to_string())).purposes;
+        assert_eq!(
+            to_tell,
+            [format!(
+                "what came back on the work you asked for: {report}"
+            )]
+        );
+    }
+
     /// **A mind with no body reaches real things through one terminal at a
     /// time** (`docs/zen_everywhere.md` §5). It lists what there is, connects,
     /// and has that terminal's verbs alone in its grammar; a verb of another

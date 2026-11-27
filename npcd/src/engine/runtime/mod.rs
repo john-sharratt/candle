@@ -74,7 +74,7 @@ use crate::authority::ops::{ActSource, Voiced, WorldOp};
 use crate::authority::told::Told;
 use crate::authority::{Role, Standing};
 use crate::bridge::is_mine as is_of_the_bridge;
-use crate::effector::auth::PinnedStandpoint;
+use crate::effector::auth::{AskedBy, PinnedStandpoint};
 use crate::effector::router::address_of;
 use crate::effector::station;
 use crate::effector::token::Tokens;
