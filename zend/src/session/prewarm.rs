@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use candle_conversation::persistence::streams::StreamId;
 use candle_conversation::projection::{DecodePriority, TimelineId};
-use candle_conversation::{Carried, Linking, Sequence, Sharing, Want};
+use candle_conversation::{Carried, Changes, Linking, Sequence, Sharing, Want};
 use journal_core::journal::Holds;
 use journal_core::section::{Section, JOURNAL};
 
@@ -400,6 +400,7 @@ async fn seal_run(
             JOURNAL,
             &wants,
             Linking::Chain,
+            Changes::Any,
             &[],
             Some(wait),
             tokio::time::sleep,

@@ -207,19 +207,22 @@ pool's momentum, not provenance strength.
   beside its budgets, as the tools declare `min_score` / `evict_score`
   (800 / 600), and measured on the needle and multi-file cases before they
   are fixed. Until then the knowledge base runs on `Bars::KNOWLEDGE_BASE`
-  (`files/scope/bars.rs`): entry 800, and an eviction bar of 1 — a section
-  leaves only once the selection has not read it at all for 64 steps. The
-  rate is out of every block of the section by every query, and the
-  selection keeps a few blocks of the whole prompt a query, so a section that
-  is being read sits far under 600; the tools' 600 would empty the range one
-  cadence into every request.
+  (`files/scope/bars.rs`): an entry bar of 50 — one block in twenty above
+  the query's cut, for every query of the step — and an eviction bar of 1, so
+  a section leaves only once the selection has not read it at all for 64
+  steps. The rate is out of every block of the section by every query, and
+  the selection keeps a few blocks of the whole prompt a query, so a section
+  that is being read sits far under 600: the tools' 600 would empty the range
+  one cadence into every request, and their 800 would admit nothing.
 - **The step's counts stay beside the slot.** Which steps a placed section
   has spent under the bar is the scheduler's (`files/scope/watch.rs`, held
   on the slot's projection state): a step that changes no layout publishes
   no substrate version. A section that leaves is evicted on the files set
   (`FilesSet::evict`), stays out until the next question even where its
-  momentum would choose it, and the view is reprojected at the next wave
-  (`scheduler/section_step.rs`). Placed sections are declared to the model
+  momentum would choose it. A resident section (§3.5) out of scope whose
+  shadow rate reaches the entry bar enters in front (`FilesSet::admit`).
+  Either change is laid onto the slot at the next wave (§4.4,
+  `scheduler/section_step.rs`). Placed sections are declared to the model
   as hit rounds of their own (`RoundKey::of_section`), so a step's read
   rates them; every step's read is summed into the slot's unread hits, so
   the boundary still folds them into its momentum.
@@ -267,6 +270,19 @@ hot set. A member leaving the projection stays resident while it still ranks,
 so it can come back in front (§3.2) at the next step at device speed; one
 leaving the resident set keeps its index rows while it stays scanned, so the
 shadow scan can still raise it.
+
+**The knowledge base's residency as built** (`files/scope/resident.rs`,
+`scheduler/kb_residency.rs`). At each boundary, beside the pool's refresh,
+the slot chooses its resident sections: twice the range's positions, less
+what is placed, from the files set's sections that may enter during the
+request (none an eviction sent out, none of a withheld file), strongest by
+momentum, those the shadow scan read since the last boundary first. Each
+resident section's index pages are held in the slot's pool and declared as
+pooled rounds under the section's round (one per page), so the shadow scan
+rates it at every step; its K/V is lifted hot when the decode floor holds
+after the lift, and it is protected from relief eviction while it stays
+resident. A section whose page this process does not hold is resident
+without rows and enters only by a boundary's fill.
 
 **Per section.** The tools section and the knowledge base each declare their
 own triple in `projection.yaml`, beside the section:
@@ -529,7 +545,10 @@ the dialogue is stated in requests, not in boundaries:
   its range. Keys and index rows are stored un-rotated, so re-seating rewrites
   nothing (`hit_driven_projection.md` §4). The next request prefills against a
   stable layout, on rung 1 again. The journal's folds and forgotten entries,
-  which reseal everything after them, run here too.
+  which reseal everything after them, run here too: a request's tool rounds
+  carry the journal `Changes::Growing` (`conversation/carried.rs`), so an
+  entry joins the chain's end mid-request while a reconcile that would take a
+  held section away changes nothing until the next request's first round.
 - **A turn is read where it was written.** Within a request every turn keeps
   the position it was computed at, so the dialogue's own K/V is read exactly
   as computed. A prune between requests shifts the survivors down together,
@@ -676,11 +695,16 @@ writes exists:
   waves cannot reach the one in flight. Index pages are placed at their
   positions through the index cache, holes and all (`skip_to`). The decode
   path captures no CUDA graph, so nothing is invalidated by a new table.
-- **Placement is in place.** A change is a splice of the slot's tables, as the
-  deferred placement in `scheduler/decode/decode_step.rs` does, not a
-  reprojection's rebuild of the slot. A resident section holds its K/V and
-  every layer's index rows on the device (§3.5), so an entry moves no bytes
-  across PCIe.
+- **Placement is in place.** A change is a splice of the slot's tables, not a
+  reprojection's choice of the slot. As built (`scheduler/section_relayout.rs`)
+  a step's change is laid out at the next wave from the segments the slot was
+  last assembled from, the range rewritten from the files set's scope
+  (`files_relayout`): no probe, no scan, no projection. The rebuild is the
+  reprojection's own (`reproject_rebuild`): the turn's tail captured, the
+  pieces before the range kept, the range spliced in where it changed, the
+  rest re-walked from the pieces' own K/V. A slot with no assembly on record is
+  reprojected whole. A resident section holds its K/V and its index rows on
+  the device (§3.5), so an entry moves no bytes across PCIe.
 
 The cost is host time on a step whose layout changes: re-serialising the
 chunk tables of each full-attention layer, placing the section's index pages

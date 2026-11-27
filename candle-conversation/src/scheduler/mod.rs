@@ -569,6 +569,11 @@ pub(crate) struct Scheduler {
     /// this batch.
     pending_reprojections: Vec<SequenceId>,
 
+    /// Views whose knowledge-base range a step changed, laid out again at the
+    /// same drain without a scan (`section_relayout`); a view also pending a
+    /// reprojection is reprojected instead, which lays the range out too.
+    pending_relayouts: Vec<SequenceId>,
+
     /// A request's first-reading scores, by the parent slot its turn is
     /// submitted again on (`first_reading`): the second reading's opening
     /// projection is scored by them, so the question's files rank beside the
@@ -1136,8 +1141,10 @@ mod transplant;
 pub use slot_layout::{format_name, ChunkLayout, IndexPage, SlotLayout};
 mod prefix_run;
 use prefix_run::PrefixRun;
+mod kb_residency;
 mod seal_turn;
 mod section_finish;
+mod section_relayout;
 mod section_step;
 use section_step::step_sections;
 mod sections;

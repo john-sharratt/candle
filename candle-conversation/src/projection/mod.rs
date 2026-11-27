@@ -292,7 +292,7 @@ pub use pins::{within_budget, Pin, PinSet};
 pub use plain_prompt::PlainPromptFrames;
 pub use policy::{PolicyConfig, PolicyPreset, SelectionPolicy};
 pub use prefix_item::{prefix_sections, runs_are_empty, sections_prefix, PrefixItem, TokenRun};
-pub(crate) use project::turn_belief_key;
+pub(crate) use project::{files_relayout, turn_belief_key};
 pub use project::{
     GeneratedIdentity, GroupKey, OptionalState, PriorBelief, Projection, ProjectionLevel,
     ProjectionMode, ProjectionSegment, ProjectionTarget, ReprojectionMode, ResolvedSection,

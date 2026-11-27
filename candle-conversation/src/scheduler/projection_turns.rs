@@ -120,6 +120,7 @@ impl Scheduler {
         // eviction can protect it (see `evict_cold_tail`); the one it replaces
         // is held for one projection.
         state.set_working_set(projection_assembler::working_set_from_segments(segments));
+        state.set_applied(segments);
 
         projection_assembler::apply_segments(
             state,
@@ -168,6 +169,7 @@ impl Scheduler {
         let pass_budget = self.prefill_pass_budget();
         let state = self.slot_projection_state.entry(parent_id).or_default();
         state.set_working_set(projection_assembler::working_set_from_segments(segments));
+        state.set_applied(segments);
         let mut ctx = projection_assembler::ApplyContext {
             session: &mut self.session,
             model: &mut self.model,

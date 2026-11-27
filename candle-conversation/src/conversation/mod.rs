@@ -76,7 +76,7 @@ use flume::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 mod carried;
-pub use carried::{Carried, Linking, Want};
+pub use carried::{Carried, Changes, Linking, Want};
 mod birth_range;
 mod ephemeral_turn;
 pub(crate) use birth_range::BirthRange;

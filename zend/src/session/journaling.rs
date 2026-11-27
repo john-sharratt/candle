@@ -21,19 +21,24 @@ pub(super) fn journal_record(state: &InferenceState, timeline: TimelineId) -> Op
     )
 }
 
-/// Bring the conversation's journal sections in line with its journal, and pin
-/// the ones that have sealed in `selection`.
+/// Bring the conversation's journal sections in line with its journal, as far
+/// as `changes` lets them change, and pin the ones that have sealed in
+/// `selection`.
 ///
 /// Nothing waits for a section to seal: a round reads the journal as it last
 /// sealed, and a new entry joins the prompt the first round after its section
 /// seals (`journal::carry`). Called at each round's head, and by a draft as it
-/// ends, so a new entry is already sealing before the next round begins.
+/// ends, so a new entry is already sealing before the next round begins. A
+/// request's tool rounds carry it [`Changes::Growing`]: entries join the
+/// chain's end, and a fold, a forgotten entry or the oldest leaving waits for
+/// the next request (`docs/placed_section_layout.md` §3.7).
 pub(super) async fn carry_journal(
     state: &InferenceState,
     conv_id: &str,
     timeline: TimelineId,
     cs: &mut ConvState,
     selection: &mut SelectionState,
+    changes: Changes,
 ) {
     let t_open = Instant::now();
     state.prewarm.note(conv_id, t_open);
@@ -82,6 +87,7 @@ pub(super) async fn carry_journal(
             JOURNAL,
             &wants,
             Linking::Chain,
+            changes,
             &sweep,
             None,
             tokio::time::sleep,
@@ -102,6 +108,7 @@ pub(super) async fn carry_journal(
                 JOURNAL,
                 &wants,
                 Linking::Chain,
+                changes,
                 &sweep,
                 Some(OPENING_SEAL_WAIT),
                 tokio::time::sleep,
@@ -700,7 +707,7 @@ pub(super) async fn reconcile_journal_now(
     if let Some(conversation) = held {
         if let Ok(mut cs) = conversation.try_lock() {
             let mut unused = SelectionState::default();
-            carry_journal(state, conv_id, timeline, &mut cs, &mut unused).await;
+            carry_journal(state, conv_id, timeline, &mut cs, &mut unused, Changes::Any).await;
         }
     }
 }

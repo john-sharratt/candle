@@ -24,6 +24,14 @@
 //! before it leaves, every section after it is resealed with it. And a turn
 //! reads only the chain's sealed beginning — a section never shows without
 //! the ones it was sealed after.
+//!
+//! # While a request runs
+//!
+//! A request's rounds read one layout of the chain
+//! (`docs/placed_section_layout.md` §3.7): what it holds stays where it was
+//! sealed, and only what joins its end is taken ([`Changes::Growing`]). A
+//! change that would take a held section away — a fold, a forgotten entry,
+//! the oldest entry leaving — waits for the next request's first round.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -59,6 +67,17 @@ pub enum Linking {
     Apart,
     /// Each continues the ones before it, in the order they are wanted.
     Chain,
+}
+
+/// Which changes a reconcile may make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Changes {
+    /// Every change: between requests, or a collection read apart from one.
+    Any,
+    /// A request is running: sections join, and none held is taken away. A
+    /// reconcile that would remove a held section makes no change at all and
+    /// answers with what is held, in the order it was sealed.
+    Growing,
 }
 
 /// What a reconcile has to do, decided before any of it is done.
@@ -139,6 +158,21 @@ fn plan(
     plan
 }
 
+/// Whether `plan` waits under `changes`: a request running, and the plan
+/// takes away a section `held` holds. A swept name nothing holds is no held
+/// section.
+fn waits(plan: &Plan, changes: Changes, held: impl Fn(&str) -> bool) -> bool {
+    changes == Changes::Growing && plan.remove.iter().any(|n| held(n))
+}
+
+/// `held`'s names in the order they were sealed: a chain's by how many
+/// sections each continues, sections apart by name.
+fn sealed_order<'a>(held: impl Iterator<Item = (&'a str, usize)>) -> Vec<&'a str> {
+    let mut out: Vec<(&str, usize)> = held.collect();
+    out.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(b.0)));
+    out.into_iter().map(|(n, _)| n).collect()
+}
+
 /// The sections of one collection a conversation holds.
 pub struct Carried {
     held: BTreeMap<String, Held>,
@@ -164,20 +198,25 @@ impl Carried {
     }
 
     /// Bring the conversation's sections in line with `wanted`, related as
-    /// `kept` says, and return the names that are sealed and selectable, in the
-    /// order they were wanted — for a chain, only its sealed beginning.
+    /// `kept` says and as far as `changes` lets them change, and return the
+    /// names that are sealed and selectable, in the order they were wanted —
+    /// for a chain, only its sealed beginning. A reconcile that waits
+    /// ([`Changes::Growing`]) changes nothing and answers with the sealed
+    /// sections it holds, in the order they were sealed.
     ///
     /// With `wait`, a submitted section is given that long to seal, because its
     /// text is meant to be in the prompt of the turn that follows; past it the
     /// section is left out of the answer and the caller's stand-in is read
     /// instead. The crate runs on no async runtime of its own, so the wait
     /// sleeps through the caller's `sleep`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn reconcile<S, F>(
         &mut self,
         sequence: &mut Sequence,
         collection: &str,
         wanted: &[Want<'_>],
         kept: Linking,
+        changes: Changes,
         sweep: &[&str],
         wait: Option<Duration>,
         sleep: S,
@@ -202,6 +241,19 @@ impl Carried {
             .collect();
         let todo = plan(&standing, wanted, kept, sweep, !self.swept);
         drop(standing);
+        if waits(&todo, changes, |n| self.held.contains_key(n)) {
+            let order = sealed_order(self.held.iter().map(|(n, h)| (n.as_str(), h.after.len())));
+            let mut sealed = Vec::new();
+            for name in order {
+                let ready = matches!(self.held[name].section.state(), SectionState::Ready { .. });
+                if ready {
+                    sealed.push(name.to_string());
+                } else if kept == Linking::Chain {
+                    break;
+                }
+            }
+            return sealed;
+        }
         self.swept = true;
 
         for name in &todo.remove {
@@ -498,5 +550,52 @@ mod tests {
         let held = [standing("journal/1", "a", true)];
         let p = plan(&held, &[], Linking::Apart, &["journal/1"], true);
         assert_eq!(p.remove, vec!["journal/1".to_string()]);
+    }
+
+    /// **While a request runs, a plan that takes a held section away waits;
+    /// one that only adds goes ahead**, and a swept name nothing holds is no
+    /// held section.
+    #[test]
+    fn a_running_request_waits_on_a_removal_and_takes_a_growth() {
+        let one = names(&["journal/1"]);
+        let held = [
+            chained("journal/1", "a", NONE),
+            chained("journal/2", "b", &one),
+        ];
+        let is_held = |n: &str| n == "journal/1" || n == "journal/2";
+        // A fold: entries 1 and 2 become entry 3.
+        let folded = plan(
+            &held,
+            &[want("journal/3", "ab")],
+            Linking::Chain,
+            &[],
+            false,
+        );
+        assert!(waits(&folded, Changes::Growing, is_held));
+        assert!(!waits(&folded, Changes::Any, is_held));
+        // A new entry on the end.
+        let grown = plan(
+            &held,
+            &[
+                want("journal/1", "a"),
+                want("journal/2", "b"),
+                want("journal/3", "c"),
+            ],
+            Linking::Chain,
+            &[],
+            false,
+        );
+        assert!(!waits(&grown, Changes::Growing, is_held));
+        let swept = plan(&[], &[], Linking::Chain, &["journal/old"], true);
+        assert!(!waits(&swept, Changes::Growing, |_| false));
+    }
+
+    /// **What is held reads in the order it was sealed**: a chain by how many
+    /// sections each continues.
+    #[test]
+    fn what_is_held_reads_in_the_order_it_was_sealed() {
+        let order =
+            sealed_order([("journal/close", 2), ("journal/7", 0), ("journal/9", 1)].into_iter());
+        assert_eq!(order, vec!["journal/7", "journal/9", "journal/close"]);
     }
 }

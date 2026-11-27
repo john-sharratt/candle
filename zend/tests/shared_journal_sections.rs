@@ -23,7 +23,8 @@ use candle::Device;
 use candle_conversation::models::Model;
 use candle_conversation::projection;
 use candle_conversation::{
-    Carried, ConversationEngine, Linking, SamplingConfig, SectionRef, Sequence, Sharing, Want,
+    Carried, Changes, ConversationEngine, Linking, SamplingConfig, SectionRef, Sequence, Sharing,
+    Want,
 };
 use journal_core::section::JOURNAL;
 
@@ -114,6 +115,7 @@ fn carry(conv: &mut Sequence, carried: &mut Carried, wanted: &[Want<'_>]) -> Vec
         JOURNAL,
         wanted,
         Linking::Chain,
+        Changes::Any,
         &[],
         Some(Duration::from_secs(120)),
         tokio::time::sleep,

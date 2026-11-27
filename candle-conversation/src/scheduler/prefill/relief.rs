@@ -393,6 +393,9 @@ impl Scheduler {
                 continue;
             }
             keep_sections.extend(st.working_set.sections.iter().copied());
+            // The knowledge base's resident sections stand ready to enter the
+            // range at the next step: hot, like what the slot places.
+            keep_sections.extend(st.kb_resident.iter().map(|r| r.id));
             keep_turns.extend(st.working_set.turns.iter().copied());
         }
         (keep_sections, keep_turns)

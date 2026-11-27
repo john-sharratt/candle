@@ -319,6 +319,9 @@ impl Scheduler {
         }
         stats.lingering = linger.len();
         keep.extend(linger.keys());
+        // The knowledge base's resident sections pool beside the
+        // conversations (`docs/placed_section_layout.md` §3.5).
+        keep.extend(self.refresh_kb_residency(slot, conversation, target));
         if let Err(e) = self.model.retain_pooled(slot.0, &keep) {
             tracing::warn!(slot = slot.0, error = %e, "pool: dropped pieces not released");
         }

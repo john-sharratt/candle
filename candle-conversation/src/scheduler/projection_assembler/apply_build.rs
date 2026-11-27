@@ -585,16 +585,27 @@ pub(in super::super) fn apply_segments_build(
         Ok(_) => {}
         Err(e) => tracing::warn!(slot = parent_id.0, error = %e, "hits not read back"),
     }
-    // The placed rounds, then every unplaced round of what the pool holds —
-    // the rounds the shadow scan reads (§6.3).
+    // The placed rounds, then every unplaced round of what the pool holds,
+    // then each resident section out of scope — the rounds the shadow scan
+    // reads (§6.3; `docs/placed_section_layout.md` §3.4).
     let (hit_keys, hit_ranges, pooled) = {
         let conv = ctx.conversation.read();
         let sections = kb_sections(&conv, ctx.slot_target);
-        state.kb_rounds = sections.values().map(|&k| (k.scan_id(), k)).collect();
+        state.kb_rounds = sections
+            .values()
+            .copied()
+            .chain(state.kb_resident.iter().map(|r| r.key))
+            .map(|k| (k.scan_id(), k))
+            .collect();
         let (mut keys, ranges) = hit_rounds_of(&pieces, &state.placed_pieces, &conv, &sections);
         let placed: HashSet<RoundKey> = keys.iter().copied().collect();
-        let (pooled_keys, pooled) = pooled_rounds(&state.pool, &placed, |tl| conv.exchanges_of(tl));
+        let (pooled_keys, mut pooled) =
+            pooled_rounds(&state.pool, &placed, |tl| conv.exchanges_of(tl));
         keys.extend(pooled_keys);
+        let in_scope: HashSet<SectionKey> = sections.values().copied().collect();
+        let (kb_keys, kb_pooled) = kb_pooled_rounds(&state.kb_resident, &in_scope);
+        keys.extend(kb_keys);
+        pooled.extend(kb_pooled);
         (keys, ranges, pooled)
     };
     match ctx.model.set_hit_rounds(parent_id.0, &hit_ranges, &pooled) {

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use candle_conversation::projection::{DecodePriority, SelectionState};
 use candle_conversation::stencil::{StencilTree, TurnGrammar};
 use candle_conversation::{
-    AskScope, Carried, Linking, Sequence, Sharing, TurnOptions, UnsealedAsker, Want,
+    AskScope, Carried, Changes, Linking, Sequence, Sharing, TurnOptions, UnsealedAsker, Want,
 };
 use journal_core::section::JournalPrompt;
 use journal_core::span::Span;
@@ -412,6 +412,7 @@ impl Minds {
                 catchup::COLLECTION,
                 &[],
                 Linking::Apart,
+                Changes::Any,
                 &[catchup::SECTION],
                 None,
                 tokio::time::sleep,
@@ -467,6 +468,7 @@ impl Minds {
                 identity::MISSION,
                 &mission.into_iter().collect::<Vec<_>>(),
                 Linking::Apart,
+                Changes::Any,
                 &[identity::MISSION_SECTION],
                 Some(SEAL_WAIT),
                 tokio::time::sleep,
@@ -479,6 +481,7 @@ impl Minds {
                 identity::JOURNAL,
                 &journal_wants(persona.journal),
                 Linking::Chain,
+                Changes::Any,
                 &journal_sweep(persona.journal),
                 None,
                 tokio::time::sleep,
@@ -499,6 +502,7 @@ impl Minds {
                 catchup::COLLECTION,
                 &wants,
                 Linking::Apart,
+                Changes::Any,
                 &[catchup::SECTION],
                 Some(SEAL_WAIT),
                 tokio::time::sleep,

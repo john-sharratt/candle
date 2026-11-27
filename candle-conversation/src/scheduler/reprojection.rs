@@ -79,6 +79,31 @@ impl ReprojectionPolicy {
 // Internal state
 // ————————————————————————————————————————————————————————————————————————————
 
+/// What a reprojection selected, for its rebuild
+/// ([`Scheduler::reproject_rebuild`]): the sealed sections to lift, the
+/// segments to apply, the turns to lift, and the composition the turn's
+/// belief and the projection event are taken from.
+pub(super) struct Selected {
+    pub(super) sections: Vec<SectionId>,
+    pub(super) segments: Vec<ProjectionSegment>,
+    pub(super) turns: Vec<TurnKey>,
+    pub(super) composition: crate::projection::ProjectionEvent,
+}
+
+/// What a reprojection's selection took, reported with its rebuild.
+pub(super) struct PrepareTimes {
+    /// When the reprojection began.
+    pub(super) t_repro: Instant,
+    pub(super) probe_ms: u64,
+    pub(super) scan_ms: u64,
+    pub(super) project_ms: u64,
+    pub(super) warm_us: u64,
+    pub(super) score_us: u64,
+    pub(super) observe_us: u64,
+    /// Tokens the probe covered.
+    pub(super) probe_tokens: usize,
+}
+
 /// In-flight reprojection state carried from
 /// [`Scheduler::reproject_view_prepare`] to
 /// [`Scheduler::reproject_view_complete`], so the cross-conversation wave can

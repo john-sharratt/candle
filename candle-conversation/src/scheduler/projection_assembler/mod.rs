@@ -14,6 +14,8 @@
 //! - `assembly`: lays the pieces out in logical order.
 //! - `gap_fill`: fires the batched forward that fills glue gaps.
 //! - `inject`: injects sealed sections and turns with their index pages.
+//! - `kb_sections`, `kb_resident`: the knowledge base's placed and resident
+//!   sections, and how the hit declaration names them.
 //! - `prefill`: prefills a slot's own tokens, and re-injects forwarded spans.
 //! - `slot_state`: the state a slot carries between projections.
 //! - `walk`: walks sealed pieces, and reserves glue islands in place.
@@ -45,8 +47,9 @@ use crate::persistence::content_hash::turn_stream_id;
 use crate::projection::event::{group_name_of, layer_name_of_group, role_str};
 use crate::projection::rounds::{self, RoundKey};
 use crate::projection::{
-    ContentResolver, Conversation, GroupId, HitMomentum, MaterializedPiece, Pin, ProjectionSegment,
-    ProjectionTarget, Schema, SealedKind, SectionId, SelectedTurn, TimelineId, TurnIndex, TurnKey,
+    ContentResolver, Conversation, GroupId, HitMomentum, MaterializedPiece, Pin, ProjectionEvent,
+    ProjectionSegment, ProjectionTarget, Schema, SealedKind, SectionId, SelectedTurn, TimelineId,
+    TurnIndex, TurnKey,
 };
 use crate::scheduler::hit_density::HitPart;
 use crate::scheduler::injected_piece::InjectedPiece;
@@ -75,6 +78,7 @@ mod apply_build;
 mod assembly;
 mod gap_fill;
 mod inject;
+mod kb_resident;
 mod kb_sections;
 mod prefill;
 mod slot_state;
@@ -97,7 +101,8 @@ pub(super) use apply_build::*;
 pub(crate) use assembly::*;
 pub(super) use gap_fill::*;
 use inject::*;
-use kb_sections::kb_sections;
+pub(super) use kb_resident::{kb_pooled_rounds, KbResident};
+pub(super) use kb_sections::{held_sections, kb_sections, HeldSection};
 pub(super) use prefill::*;
 pub(super) use slot_state::*;
 use walk::*;

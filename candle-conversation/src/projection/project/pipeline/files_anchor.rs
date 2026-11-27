@@ -8,6 +8,7 @@
 //! file ahead of it, is never what the prompt reads after them.
 
 use std::collections::HashSet;
+use std::ops::Range;
 
 use super::*;
 
@@ -20,6 +21,25 @@ pub(crate) struct FilesPosition {
     /// Every section id declared ahead of the collection: its sections and
     /// every variant of its trees.
     before: HashSet<SectionId>,
+    /// Every section id the system prompt declares, ahead of the collection
+    /// or after it: none of them is a section of the knowledge base.
+    declared: HashSet<SectionId>,
+}
+
+/// Every section id `item` declares: its section, every variant of its tree,
+/// or its collection's sections.
+fn item_sections(item: &SystemPromptItem) -> Vec<SectionId> {
+    match item {
+        SystemPromptItem::Section(s) => vec![s.id],
+        SystemPromptItem::SectionTree(t) => t
+            .nodes
+            .iter()
+            .flat_map(|n| n.options.iter())
+            .flat_map(|o| o.variants.iter())
+            .map(|v| v.id)
+            .collect(),
+        SystemPromptItem::Collection(c) => c.sections.iter().map(|s| s.id).collect(),
+    }
 }
 
 /// The `files` collection's place in `schema`; `None` when it declares none.
@@ -28,23 +48,25 @@ pub(crate) fn files_position(schema: &Schema) -> Option<FilesPosition> {
     let at = items.iter().position(
         |it| matches!(it, SystemPromptItem::Collection(c) if c.name == FILES_COLLECTION),
     )?;
-    let mut before = HashSet::new();
-    for item in &items[..at] {
-        match item {
-            SystemPromptItem::Section(s) => {
-                before.insert(s.id);
-            }
-            SystemPromptItem::SectionTree(t) => before.extend(
-                t.nodes
-                    .iter()
-                    .flat_map(|n| n.options.iter())
-                    .flat_map(|o| o.variants.iter())
-                    .map(|v| v.id),
-            ),
-            SystemPromptItem::Collection(c) => before.extend(c.sections.iter().map(|s| s.id)),
-        }
-    }
-    Some(FilesPosition { before })
+    let before = items[..at].iter().flat_map(item_sections).collect();
+    let declared = items.iter().flat_map(item_sections).collect();
+    Some(FilesPosition { before, declared })
+}
+
+/// `segments` — a projection of `schema` as a slot applied it — with the
+/// knowledge base's range laid out as `layout`, from the range's front to its
+/// top (`docs/placed_section_layout.md` §4.4): every other segment as it was.
+/// `None` when the schema declares no files collection or nothing it declares
+/// ahead of it is placed.
+pub(crate) fn files_relayout(
+    schema: &Schema,
+    segments: &[ProjectionSegment],
+    layout: Vec<ProjectionSegment>,
+) -> Option<Vec<ProjectionSegment>> {
+    let region = files_position(schema)?.region(segments)?;
+    let mut out = segments.to_vec();
+    out.splice(region, layout);
+    Some(out)
 }
 
 impl FilesPosition {
@@ -59,6 +81,23 @@ impl FilesPosition {
                     if self.before.contains(&s.id))
             })
             .map(|p| p + 1)
+    }
+
+    /// The knowledge base's range in `segments`, placed: from
+    /// [`Self::insert_at`] through every hole and every section the schema
+    /// does not declare after it. `None` when nothing declared ahead of the
+    /// collection is placed.
+    pub(crate) fn region(&self, segments: &[ProjectionSegment]) -> Option<Range<usize>> {
+        let at = self.insert_at(segments)?;
+        let len = segments[at..]
+            .iter()
+            .take_while(|seg| match seg {
+                ProjectionSegment::Hole { .. } => true,
+                ProjectionSegment::Sealed(SealedKind::Section(s)) => !self.declared.contains(&s.id),
+                _ => false,
+            })
+            .count();
+        Some(at..at + len)
     }
 }
 
@@ -212,6 +251,50 @@ layers:
             [_, ProjectionSegment::Sealed(SealedKind::Section(f)), _]
                 if f.id == SectionId::new(900)
         ));
+    }
+
+    /// **A relayout replaces the range and nothing else**: the range's front
+    /// hole, its placed sections and the hole between them go; the sections
+    /// the schema declares on either side stay.
+    #[test]
+    fn a_relayout_replaces_the_range_and_nothing_else() {
+        let b = builder(&[OPEN, FILES, CLOSE]);
+        let open = segment(section_id(&b, "files_open"));
+        let close = segment(section_id(&b, "close"));
+        let hole = |positions| ProjectionSegment::Hole { positions };
+        let applied = vec![
+            open.clone(),
+            hole(600),
+            segment(SectionId::new(901)),
+            hole(100),
+            segment(SectionId::new(900)),
+            close.clone(),
+        ];
+        let layout = vec![
+            hole(500),
+            segment(SectionId::new(902)),
+            segment(SectionId::new(901)),
+            hole(100),
+            segment(SectionId::new(900)),
+        ];
+        let got = files_relayout(b.schema(), &applied, layout.clone()).unwrap();
+        let mut want = vec![open];
+        want.extend(layout);
+        want.push(close);
+        assert_eq!(shape(&got), shape(&want));
+        assert_eq!(shape(&got).len(), 7);
+    }
+
+    /// Each segment as a section's id or a hole's positions.
+    fn shape(segments: &[ProjectionSegment]) -> Vec<(char, u64)> {
+        segments
+            .iter()
+            .map(|s| match s {
+                ProjectionSegment::Sealed(SealedKind::Section(r)) => ('s', r.id.raw() as u64),
+                ProjectionSegment::Hole { positions } => ('h', *positions as u64),
+                _ => ('?', 0),
+            })
+            .collect()
     }
 
     /// **A schema without the collection places no files.**

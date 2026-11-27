@@ -25,14 +25,15 @@ impl Bars {
     };
 
     /// The knowledge base's bars until the needle and multi-file cases
-    /// measure them (`docs/placed_section_layout.md` §3.4): entry at the
-    /// tools' 800, and a section leaves only once the selection has not read
-    /// it at all — under one on the band — for one 64-step cadence. A rate is
-    /// out of every block of the section by every query, and the selection
-    /// keeps a few blocks of the whole prompt a query, so a placed section's
-    /// rate sits far under 600 while it is read.
+    /// measure them (`docs/placed_section_layout.md` §3.4). A rate is out of
+    /// every block of the section by every query, and the selection keeps a
+    /// few blocks of the whole prompt a query, so a section the selection
+    /// reads sits far under the tools' bars. A section enters at 50 — one
+    /// block in twenty above the query's cut, for every query of the step —
+    /// and leaves only once the selection has not read it at all, under one,
+    /// for one 64-step cadence.
     pub const KNOWLEDGE_BASE: Bars = Bars {
-        entry: 800.0,
+        entry: 50.0,
         evict: 1.0,
         evict_steps: 64,
     };

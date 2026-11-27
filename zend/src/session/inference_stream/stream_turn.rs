@@ -634,7 +634,21 @@ pub(in super::super) fn run_inference_stream(
                 engine.ending_with_steps(&held, &answer_steps::of(engine, timeline))
             });
             if state.journaling {
-                carry_journal(&state, &conv_id, timeline, &mut cs, &mut round_selection).await;
+                // A request's first round takes every change the journal made
+                // since the last; its tool rounds take only what joins the end.
+                let changes = match iteration {
+                    0 => Changes::Any,
+                    _ => Changes::Growing,
+                };
+                carry_journal(
+                    &state,
+                    &conv_id,
+                    timeline,
+                    &mut cs,
+                    &mut round_selection,
+                    changes,
+                )
+                .await;
             }
             let journal_ms = t_head.elapsed().as_millis() as u64;
             // The prompt shows what the grammar lets the turn call, and no more.

@@ -39,8 +39,8 @@ use candle_conversation::stencil::{
 };
 use candle_conversation::throwaway::Throwaway;
 use candle_conversation::{
-    Carried, ConversationEngine, Linking, PromptDump, SamplingConfig, Sequence, SequenceConfig,
-    Sharing, TurnOptions, UnsealedAsker, Want,
+    Carried, Changes, ConversationEngine, Linking, PromptDump, SamplingConfig, Sequence,
+    SequenceConfig, Sharing, TurnOptions, UnsealedAsker, Want,
 };
 use journal_core::folding::{self, Folded};
 use journal_core::journal::Holds;

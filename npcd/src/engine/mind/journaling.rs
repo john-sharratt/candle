@@ -132,6 +132,7 @@ impl Minds {
                 identity::JOURNAL,
                 &journal_wants(Some(prompt)),
                 Linking::Chain,
+                Changes::Any,
                 &sweep,
                 None,
                 tokio::time::sleep,

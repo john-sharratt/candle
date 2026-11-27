@@ -90,6 +90,19 @@ pub(in super::super) struct SlotState {
     pub(in super::super) kb_rounds: HashMap<TimelineId, SectionKey>,
     /// The steps each placed section has stayed under the eviction bar.
     pub(in super::super) evict_watch: EvictWatch,
+    /// The knowledge-base sections kept resident beside the range, chosen at
+    /// the last boundary (`docs/placed_section_layout.md` §3.5): their K/V
+    /// hot, their index pages pooled for the shadow scan.
+    pub(in super::super) kb_resident: Vec<KbResident>,
+    /// The resident sections the shadow scan has read since the last
+    /// boundary: the next residency keeps them first.
+    pub(in super::super) kb_read: HashSet<SectionKey>,
+    /// The segments the slot was last assembled from, and — once a
+    /// reprojection's rebuild applied them — the composition they were
+    /// chosen as: what a step's re-layout rewrites the knowledge base's
+    /// range in (`section_relayout`).
+    pub(in super::super) applied_segments: Vec<ProjectionSegment>,
+    pub(in super::super) applied_composition: Option<ProjectionEvent>,
 }
 
 /// `hits` — one read of a declaration whose rounds are `keys` — folded into
@@ -113,24 +126,34 @@ pub(in super::super) fn fold_part(parts: &mut Vec<HitPart>, keys: &[RoundKey], h
     }
 }
 
-/// Each declared section round's rate in `hits`, a read of the declaration
-/// whose rounds are `keys`, on the 0–1000 band (`files::scope::band`).
+/// Each declared section's rate in `hits`, a read of the declaration whose
+/// rounds are `keys`, on the 0–1000 band (`files::scope::band`): a placed
+/// section out of the selection's queries, a pooled one — declared once per
+/// index page — out of the shadow scan's, its pages' hits and blocks summed.
+/// A section none of whose queries were counted has no rate.
 pub(in super::super) fn section_rates(
     keys: &[RoundKey],
     hits: &PieceHits,
     sections: &HashMap<TimelineId, SectionKey>,
 ) -> HashMap<SectionKey, f32> {
-    keys.iter()
-        .enumerate()
-        .filter_map(|(i, k)| {
-            let section = sections.get(&k.timeline)?;
-            let rate = band(
-                u64::from(*hits.hits.get(i)?),
-                u64::from(*hits.blocks.get(i)?),
-                hits.queries_of(i),
-            );
-            Some((*section, rate))
-        })
+    let mut summed: HashMap<SectionKey, (u64, u64, u64)> = HashMap::new();
+    for (i, k) in keys.iter().enumerate() {
+        let (Some(section), Some(&h), Some(&b)) = (
+            sections.get(&k.timeline),
+            hits.hits.get(i),
+            hits.blocks.get(i),
+        ) else {
+            continue;
+        };
+        let e = summed.entry(*section).or_default();
+        e.0 += u64::from(h);
+        e.1 += u64::from(b);
+        e.2 = hits.queries_of(i);
+    }
+    summed
+        .into_iter()
+        .filter(|(_, (_, _, q))| *q > 0)
+        .map(|(s, (h, b, q))| (s, band(h, b, q)))
         .collect()
 }
 
@@ -437,9 +460,16 @@ impl SlotState {
             pool: PoolPages::new(),
             pool_walked: HashMap::new(),
             pool_linger: PoolLinger::default(),
-            // Its rounds are declared afresh, and its steps counted afresh.
+            // Its rounds are declared afresh, and its steps counted afresh;
+            // its residency is its own pool's, chosen at its first boundary.
             kb_rounds: HashMap::new(),
             evict_watch: EvictWatch::default(),
+            kb_resident: Vec::new(),
+            kb_read: HashSet::new(),
+            // A fork's slot holds what the parent's held, and is laid out
+            // again only by a reprojection of its own.
+            applied_segments: Vec::new(),
+            applied_composition: None,
         }
     }
 
@@ -504,6 +534,13 @@ impl SlotState {
     /// Drop the in-flight `NewUserMessage` capture after a successful seal.
     pub(in super::super) fn trim_post_turn(&mut self) {
         self.pending_user_part = None;
+    }
+
+    /// The slot is assembled from `segments`: their composition is not yet
+    /// known, and a reprojection's rebuild records it.
+    pub(in super::super) fn set_applied(&mut self, segments: &[ProjectionSegment]) {
+        self.applied_segments = segments.to_vec();
+        self.applied_composition = None;
     }
 
     /// Install a projection's working set; the one it replaces is held as

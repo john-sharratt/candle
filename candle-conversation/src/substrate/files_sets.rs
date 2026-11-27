@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use super::Substrate;
-use crate::files::scope::RangeScope;
+use crate::files::scope::{Bars, Candidate, RangeScope};
 use crate::files::{FileKey, FilesPin, FilesSet, FreshSection, SectionKey};
 use crate::projection::{GroupId, TimelineId};
 
@@ -36,13 +36,25 @@ impl Substrate {
         Arc::make_mut(self.files_sets.entry(target).or_default()).set_scope(scope);
     }
 
-    /// `sections` leave `target`'s range until its next question
-    /// ([`FilesSet::evict`]); whether any left.
-    pub fn files_evict(&mut self, target: TimelineId, sections: &[SectionKey]) -> bool {
-        match self.files_sets.get_mut(&target) {
-            Some(set) => Arc::make_mut(set).evict(sections),
-            None => false,
-        }
+    /// A step of `target`'s range: `leaving` leave it until its next question
+    /// ([`FilesSet::evict`]), then `candidates` over `bars`' entry bar by
+    /// `rate` enter it in front ([`FilesSet::admit`]); whether its layout
+    /// changed.
+    pub fn files_step(
+        &mut self,
+        target: TimelineId,
+        leaving: &[SectionKey],
+        rate: impl Fn(SectionKey) -> f32,
+        candidates: &[Candidate],
+        bars: &Bars,
+    ) -> bool {
+        let Some(set) = self.files_sets.get_mut(&target) else {
+            return false;
+        };
+        let set = Arc::make_mut(set);
+        let left = set.evict(leaving);
+        let entered = set.admit(rate, candidates, bars);
+        left || !entered.is_empty()
     }
 
     /// Keep `files`, read by `target`'s turn, from being placed until its

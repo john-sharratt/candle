@@ -147,9 +147,9 @@ pub use config::{
     REPROJECT_TRIGGER_TEXTS,
 };
 pub use conversation::{
-    is_shared_stream_name, AskScope, Carried, ChainRound, GlueMarkers, Linking, MemberSpec,
-    MembersPrefix, PieceKind, Probed, PromptDump, PromptPiece, SealAs, SealedMember, SectionRef,
-    SectionState, Sequence, Sharing, UnsealedAsker, Want,
+    is_shared_stream_name, AskScope, Carried, ChainRound, Changes, GlueMarkers, Linking,
+    MemberSpec, MembersPrefix, PieceKind, Probed, PromptDump, PromptPiece, SealAs, SealedMember,
+    SectionRef, SectionState, Sequence, Sharing, UnsealedAsker, Want,
 };
 pub use engine::{
     ConversationEngine, EngineAttacher, RawDecode, SubstrateReloadStatus, SubstrateReloader,

@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::key::{FileKey, SectionKey};
-use super::scope::RangeScope;
+use super::scope::{Bars, Candidate, RangeScope, StepChange};
 use crate::projection::GroupId;
 
 /// What a conversation's knowledge base holds, when it is not provenance's
@@ -131,6 +131,27 @@ impl FilesSet {
         any
     }
 
+    /// A step's entries: every one of `candidates` at or over `bars`' entry
+    /// bar by `rate` enters the range in front, strongest first
+    /// ([`RangeScope::admit`]); what it changed. One an eviction sent out this
+    /// request stays out.
+    pub fn admit(
+        &mut self,
+        rate: impl Fn(SectionKey) -> f32,
+        candidates: &[Candidate],
+        bars: &Bars,
+    ) -> StepChange {
+        let Some(scope) = self.scope.as_mut() else {
+            return StepChange::default();
+        };
+        let open: Vec<Candidate> = candidates
+            .iter()
+            .filter(|c| !self.evicted.contains(&c.key))
+            .copied()
+            .collect();
+        scope.admit(rate, &open, bars)
+    }
+
     /// Whether `section` is placed.
     pub fn places(&self, section: SectionKey) -> bool {
         self.scope.as_ref().is_some_and(|s| s.holds(section))
@@ -144,6 +165,24 @@ impl FilesSet {
             .iter()
             .filter(|(_, s)| s.kind == kind)
             .filter(|(&k, s)| !self.withheld.contains(&s.file) || self.places(k))
+            .map(|(&k, s)| (k, s.momentum))
+            .collect();
+        out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        out
+    }
+
+    /// Every section of the set that may enter the range during this request,
+    /// strongest first (ties by key), whatever its kind: none an eviction
+    /// sent out, none of a withheld file. A pinned set's range is its pin's,
+    /// and none may enter it.
+    pub fn may_enter(&self) -> Vec<(SectionKey, f32)> {
+        if self.pin != FilesPin::Free {
+            return Vec::new();
+        }
+        let mut out: Vec<(SectionKey, f32)> = self
+            .members
+            .iter()
+            .filter(|(k, s)| !self.evicted.contains(k) && !self.withheld.contains(&s.file))
             .map(|(&k, s)| (k, s.momentum))
             .collect();
         out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -225,6 +264,63 @@ mod tests {
         set.clear_withheld();
         assert!(set.evicted.is_empty());
         assert_eq!(set.scope.as_ref().unwrap().used(), 20);
+    }
+
+    /// **What may enter during a request is every kind's, strongest first,
+    /// with neither an evicted section nor a withheld file's**; a pinned set
+    /// admits nothing.
+    #[test]
+    fn what_may_enter_is_every_kinds_but_the_evicted_and_withheld() {
+        let (a, b, c, d) = (SectionKey(1), SectionKey(2), SectionKey(3), SectionKey(4));
+        let mut set = FilesSet::default();
+        set.observe(
+            &[
+                (
+                    kind(1),
+                    vec![(a, FileKey(7), 500.0), (b, FileKey(8), 400.0)],
+                ),
+                (
+                    kind(2),
+                    vec![(c, FileKey(9), 450.0), (d, FileKey(9), 300.0)],
+                ),
+            ],
+            0.2,
+            100.0,
+        );
+        set.evicted.insert(b);
+        set.withhold([FileKey(9)]);
+        assert_eq!(set.may_enter(), vec![(a, 500.0)]);
+        set.clear_withheld();
+        assert_eq!(
+            set.may_enter(),
+            vec![(a, 500.0), (c, 450.0), (b, 400.0), (d, 300.0)]
+        );
+        set.pin = FilesPin::Empty;
+        assert!(set.may_enter().is_empty());
+    }
+
+    /// **A step admits the candidates over the entry bar in front, but not one
+    /// an eviction sent out this request.**
+    #[test]
+    fn a_step_admits_over_the_bar_but_not_the_evicted() {
+        let mut scope = RangeScope::new(100);
+        scope.enter(SectionKey(1), 30, false);
+        let mut set = FilesSet::default();
+        set.set_scope(scope);
+        set.evicted.insert(SectionKey(3));
+        let candidates = [
+            Candidate {
+                key: SectionKey(2),
+                tokens: 20,
+            },
+            Candidate {
+                key: SectionKey(3),
+                tokens: 20,
+            },
+        ];
+        let change = set.admit(|_| 900.0, &candidates, &Bars::KNOWLEDGE_BASE);
+        assert_eq!(change.entered, vec![SectionKey(2)]);
+        assert!(set.places(SectionKey(2)) && !set.places(SectionKey(3)));
     }
 
     /// **A pinned set folds no scan.**

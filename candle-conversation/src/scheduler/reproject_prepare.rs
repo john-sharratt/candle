@@ -496,7 +496,6 @@ impl Scheduler {
         //    drive the zero-copy rebuild in step 6.
         let t_project = Instant::now();
         let project_span = profile::span("reproject:project");
-        let parent_id = view_state.parent_id;
         let mut turn_keys_for_elevate: Vec<TurnKey> = Vec::new();
         let (projected_sections, projected_segments, composition) = {
             let view = policy
@@ -618,6 +617,65 @@ impl Scheduler {
             t_project.elapsed().as_micros() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+        self.reproject_rebuild(
+            view_id,
+            Selected {
+                sections: projected_sections,
+                segments: projected_segments,
+                turns: turn_keys_for_elevate,
+                composition,
+            },
+            PrepareTimes {
+                t_repro,
+                probe_ms,
+                scan_ms,
+                project_ms,
+                warm_us,
+                score_us,
+                observe_us,
+                probe_tokens: probe.len(),
+            },
+        )
+    }
+
+    /// The rebuild half of a reprojection of `view_id` onto `selected`: kept
+    /// when the parent already holds it, declined below the decode floor,
+    /// and otherwise the zero-copy rebuild described on
+    /// [`Self::reproject_view_prepare`] — the turn's tail captured, the view
+    /// freed, the parent re-assembled — up to the gap-fill descriptor.
+    /// `times` are what the selection took.
+    pub(super) fn reproject_rebuild(
+        &mut self,
+        view_id: SequenceId,
+        selected: Selected,
+        times: PrepareTimes,
+    ) -> Result<Option<ReprojectInFlight>, ConversationError> {
+        let Selected {
+            sections: projected_sections,
+            segments: projected_segments,
+            turns: turn_keys_for_elevate,
+            composition,
+        } = selected;
+        let PrepareTimes {
+            t_repro,
+            probe_ms,
+            scan_ms,
+            project_ms,
+            warm_us,
+            score_us,
+            observe_us,
+            probe_tokens,
+        } = times;
+        let view_state = self.turn_views.get(&view_id).copied().ok_or_else(|| {
+            ConversationError::Channel(format!("reproject: missing view state {view_id}"))
+        })?;
+        let policy = self
+            .turn_reading(view_id)
+            .ok_or_else(|| {
+                ConversationError::Channel(format!("reproject: view {view_id} has no turn"))
+            })?
+            .policy;
+        let parent_id = view_state.parent_id;
 
         // Count of sealed turns this projection selected — the reproject cost
         // scales linearly with it (each adds one boundary-glue prefill).
@@ -1011,9 +1069,14 @@ impl Scheduler {
                  probe_tokens={}",
                 view_id.0,
                 t_build.elapsed().as_micros(),
-                probe.len(),
+                probe_tokens,
             )
         });
+        // What the slot now holds, for a step's re-layout to start from
+        // (`section_relayout`).
+        if let Some(state) = self.slot_projection_state.get_mut(&parent_id) {
+            state.applied_composition = Some(composition.clone());
+        }
         Ok(Some(ReprojectInFlight {
             view_id,
             parent_id,

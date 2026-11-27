@@ -242,6 +242,7 @@ impl Scheduler {
             carried_beliefs: HashMap::new(),
             guests,
             pending_reprojections: Vec::new(),
+            pending_relayouts: Vec::new(),
             first_readings: HashMap::new(),
             slot_tokens: HashMap::new(),
             slot_projection_state: HashMap::new(),

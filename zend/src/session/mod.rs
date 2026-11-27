@@ -95,9 +95,9 @@ use candle_conversation::Result as EngineResult;
 use candle_conversation::Role as TurnRole;
 use candle_conversation::TurnText;
 use candle_conversation::{
-    CancelToken, Carried, ConversationEngine, ConversationError, EngineSource, GlueMarkers,
-    GroupScanner, Linking, Probed, PromptDump, SamplingConfig, SelectionState, Sequence, Sharing,
-    ThinkSteering, TokenDecoder, TurnEvent, UnsealedAsker, Want,
+    CancelToken, Carried, Changes, ConversationEngine, ConversationError, EngineSource,
+    GlueMarkers, GroupScanner, Linking, Probed, PromptDump, SamplingConfig, SelectionState,
+    Sequence, Sharing, ThinkSteering, TokenDecoder, TurnEvent, UnsealedAsker, Want,
 };
 use host::calibration;
 use host::download::ensure_model_pack;

@@ -65,6 +65,34 @@ fn a_sections_rate_is_its_hits_over_its_blocks_and_queries() {
     assert_eq!(rates[&b], 0.0);
 }
 
+/// **A pooled section's rate sums its pages, out of the shadow scan's
+/// queries**: c, declared as two pages after the one loaded round, has 3 + 1
+/// hits of 10 + 6 blocks over 2 shadow queries — 125 on the band; with no
+/// shadow query counted it has no rate.
+#[test]
+fn a_pooled_sections_rate_sums_its_pages_over_the_shadow_queries() {
+    let (a, c) = (SectionKey(1), SectionKey(3));
+    let keys = [
+        RoundKey::of_section(a),
+        RoundKey::of_section(c),
+        RoundKey::of_section(c),
+    ];
+    let kb = HashMap::from([(a.scan_id(), a), (c.scan_id(), c)]);
+    let read = |shadow_queries| PieceHits {
+        hits: vec![2, 3, 1],
+        blocks: vec![10, 10, 6],
+        loaded: 1,
+        queries: 4,
+        shadow_queries,
+    };
+    let rates = section_rates(&keys, &read(2), &kb);
+    assert_eq!(rates[&a], 50.0);
+    assert_eq!(rates[&c], 125.0);
+    let unscanned = section_rates(&keys, &read(0), &kb);
+    assert_eq!(unscanned.get(&c), None);
+    assert_eq!(unscanned[&a], 50.0);
+}
+
 /// **A read every step keeps one part a declaration**: a read of the same
 /// rounds is summed into the last part; a read of others is a part of its
 /// own.

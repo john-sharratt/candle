@@ -89,18 +89,28 @@ impl Scheduler {
     /// to the scheduler — never visible to the caller).  Failures mark
     /// the view as finished with an error event.
     pub(in super::super) fn drain_pending_reprojections(&mut self) {
-        if self.pending_reprojections.is_empty() {
+        if self.pending_reprojections.is_empty() && self.pending_relayouts.is_empty() {
             return;
         }
         let _t_drain = super::super::PhaseTimer::new("drain_reprojections");
         let _diag = decode_diag::reproject_span();
         let pending = std::mem::take(&mut self.pending_reprojections);
+        // A view reprojected whole has its range laid out by that too.
+        let relayouts: Vec<SequenceId> = std::mem::take(&mut self.pending_relayouts)
+            .into_iter()
+            .filter(|v| !pending.contains(v))
+            .collect();
 
         // Phase 1 — prepare each view: provenance scan + projection + tier elevate +
         // inject the sealed prefix + build the gap-fill descriptor. Removes the
-        // view's `DecodeState` into the in-flight; does NOT fire the forward.
+        // view's `DecodeState` into the in-flight; does NOT fire the forward. A
+        // re-layout prepares the same rebuild over the slot's last segments.
         let mut inflights: Vec<super::super::ReprojectInFlight> = Vec::new();
-        for view_id in pending {
+        let work = pending
+            .into_iter()
+            .map(|v| (v, false))
+            .chain(relayouts.into_iter().map(|v| (v, true)));
+        for (view_id, relayout) in work {
             // The view may have finished (EOS/health) between trigger and
             // drain; an opening stopped at a boundary is reprojected like a
             // decoding view (`held_turn`).
@@ -123,7 +133,11 @@ impl Scheduler {
             if decode_diag::fresh() {
                 self.diag_forget_placement(view_id);
             }
-            match self.reproject_view_prepare(view_id) {
+            let prepared = match relayout {
+                true => self.relayout_view_prepare(view_id),
+                false => self.reproject_view_prepare(view_id),
+            };
+            match prepared {
                 Ok(Some(inflight)) => inflights.push(inflight),
                 // Nothing to swap — a selection the slot already holds, or no
                 // ground for a scan: the turn goes on as it stood.

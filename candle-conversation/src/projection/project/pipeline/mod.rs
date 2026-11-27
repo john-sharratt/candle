@@ -42,6 +42,6 @@ mod files_anchor;
 mod files_splice;
 mod sink;
 
-pub(crate) use files_anchor::{files_position, place_files};
+pub(crate) use files_anchor::{files_position, files_relayout, place_files};
 pub(crate) use files_splice::files_splice;
 pub use sink::*;
