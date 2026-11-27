@@ -71,13 +71,29 @@ pub const YOUR_OWN_TIME: &str = "Nobody gives you orders, and nothing is waiting
 /// `party` made of it on the phone, is still to be done and told — with
 /// `table`, for a character that gives orders, what the order table holds of
 /// its posting ([`orders_line`]).
+///
+/// **One who gives orders is told to post first.** The close once read "do it
+/// yourself" for everyone, beneath a table line saying a Drone's work is
+/// posted. With only the table to answer through, Zen posted every time; with
+/// the cluster's terminals in reach as well, it took "yourself" at its word and
+/// spent thirty turns trying to run the research it had meant to give a Drone,
+/// from acts that could not reach the repository.
 pub fn still_asked(party: &str, request: &str, table: Option<&str>) -> String {
-    let table = table.map(|t| format!("\n{t}")).unwrap_or_default();
+    let (table, act) = match table {
+        Some(t) => (
+            format!("\n{t}"),
+            "Do it now: post it, if it is a Drone's to carry, or else take the act that answers \
+             it yourself. Then tell",
+        ),
+        None => (
+            String::new(),
+            "Do it yourself, now, with the act that answers it, then tell",
+        ),
+    };
     format!(
         "Still yours to do, and nothing comes before it: what {party} asked of you on the \
-         phone.\n{}{table}\nDo it yourself, now, with the act that answers it, then tell \
-         {party} what came of it — what you read, or that you could not. Telling them you are \
-         about to is not an answer.",
+         phone.\n{}{table}\n{act} {party} what came of it — what you read, or that you could \
+         not. Telling them you are about to is not an answer.",
         request.trim()
     )
 }

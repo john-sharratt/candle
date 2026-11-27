@@ -281,13 +281,15 @@ pub async fn world(State(s): State<Arc<Authored>>, headers: HeaderMap) -> Respon
 /// counterpart of the feed: the feed says what happened, this says what is still
 /// being held. Reading them together is how you tell "it forgot" from "it never
 /// perceived it" — the first is a turn that has faded out of here, the second is
-/// a turn that never reached the feed.
+/// a turn that never reached the feed. Owner-scoped, with `?all=true` for an
+/// admin, like `system-prompt`.
 pub async fn window(
     State(s): State<Arc<Authored>>,
     Path(nid): Path<String>,
+    Query(q): Query<AllQuery>,
     headers: HeaderMap,
 ) -> Response {
-    let nid = match owned(&s, &headers, &nid).await {
+    let nid = match readable(&s, &headers, &nid, &q).await {
         Ok(id) => id,
         Err(r) => return *r,
     };
