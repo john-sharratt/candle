@@ -6,13 +6,14 @@
 //! Provenance proposes: every scan's fresh score for a section feeds its
 //! momentum, `m ← (1 − β)·m + fresh`, and a section whose momentum falls below
 //! the floor leaves the set. The fill decides what of the set is placed; the
-//! set remembers where each placed section sits, so a reprojection never moves
-//! a section it keeps — a newcomer follows the kept ones, and a section let go
-//! leaves the others in their order.
+//! set keeps the knowledge base's range as it was placed ([`RangeScope`]), so
+//! a reprojection never moves a section it keeps — a newcomer enters in front
+//! of the placed ones, and a section that leaves leaves a hole.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::key::{FileKey, SectionKey};
+use super::scope::RangeScope;
 use crate::projection::GroupId;
 
 /// What a conversation's knowledge base holds, when it is not provenance's
@@ -47,8 +48,9 @@ pub type FreshSection = (SectionKey, FileKey, f32);
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FilesSet {
     pub members: BTreeMap<SectionKey, SectionStanding>,
-    /// The sections placed by the last projection, in the order they sit.
-    pub placed_order: Vec<SectionKey>,
+    /// The knowledge base's range as the last projection placed it; `None`
+    /// before the opening.
+    pub scope: Option<RangeScope>,
     /// Files the turn's own reads hold verbatim in the dialogue: none of
     /// their sections placed until the next question
     /// ([`Self::clear_withheld`]), unless already placed, which keeps its
@@ -98,9 +100,20 @@ impl FilesSet {
         self.withheld.extend(files);
     }
 
-    /// Let every withheld file be placed again: a new question starts.
+    /// A new question starts: every withheld file may be placed again, and
+    /// the range is compacted — the holes the sections that left behind them
+    /// close, between requests, where no decoded token is attending
+    /// (`docs/placed_section_layout.md` §3.2).
     pub fn clear_withheld(&mut self) {
         self.withheld.clear();
+        if let Some(scope) = self.scope.as_mut() {
+            scope.compact();
+        }
+    }
+
+    /// Whether `section` is placed.
+    pub fn places(&self, section: SectionKey) -> bool {
+        self.scope.as_ref().is_some_and(|s| s.holds(section))
     }
 
     /// The set's sections of `kind` a projection may place, strongest first
@@ -110,35 +123,16 @@ impl FilesSet {
             .members
             .iter()
             .filter(|(_, s)| s.kind == kind)
-            .filter(|(k, s)| !self.withheld.contains(&s.file) || self.placed_order.contains(k))
+            .filter(|(&k, s)| !self.withheld.contains(&s.file) || self.places(k))
             .map(|(&k, s)| (k, s.momentum))
             .collect();
         out.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         out
     }
 
-    /// The order `chosen` — the sections a projection places, strongest
-    /// first — sits in: at the opening (nothing placed before), the order
-    /// given; afterwards the sections already placed keep their order and
-    /// every newcomer follows them, in the order given.
-    pub fn order(&self, chosen: &[SectionKey]) -> Vec<SectionKey> {
-        let mut order: Vec<SectionKey> = self
-            .placed_order
-            .iter()
-            .copied()
-            .filter(|s| chosen.contains(s))
-            .collect();
-        for &s in chosen {
-            if !order.contains(&s) {
-                order.push(s);
-            }
-        }
-        order
-    }
-
-    /// Remember `order` as where the placed sections sit.
-    pub fn set_placed(&mut self, order: Vec<SectionKey>) {
-        self.placed_order = order;
+    /// Remember `scope` as the range a projection placed.
+    pub fn set_scope(&mut self, scope: RangeScope) {
+        self.scope = Some(scope);
     }
 }
 
@@ -178,17 +172,21 @@ mod tests {
         assert!(set.ranked(kind(2)).is_empty());
     }
 
-    /// **The opening orders sections strongest first; a kept section keeps
-    /// its place and a newcomer follows the kept ones.**
+    /// **A new question compacts the range**: the hole a section left
+    /// closes.
     #[test]
-    fn a_kept_section_keeps_its_place_and_a_newcomer_follows_the_kept_ones() {
-        let (a, b, c, d) = (SectionKey(1), SectionKey(2), SectionKey(3), SectionKey(4));
+    fn a_new_question_compacts_the_range() {
+        let mut scope = RangeScope::new(100);
+        for (k, t) in [(1, 30), (2, 20), (3, 10)] {
+            scope.enter(SectionKey(k), t, false);
+        }
+        scope.leave(SectionKey(2));
         let mut set = FilesSet::default();
-        let first = set.order(&[b, a, c]);
-        assert_eq!(first, vec![b, a, c]);
-        set.set_placed(first);
-        // c now ranks first, a is let go, d arrives: b and c keep their order.
-        assert_eq!(set.order(&[c, d, b]), vec![b, c, d]);
+        set.set_scope(scope);
+        assert_eq!(set.scope.as_ref().unwrap().used(), 60);
+        set.clear_withheld();
+        assert_eq!(set.scope.as_ref().unwrap().used(), 40);
+        assert!(set.places(SectionKey(3)) && !set.places(SectionKey(2)));
     }
 
     /// **A pinned set folds no scan.**
@@ -224,7 +222,9 @@ mod tests {
             0.2,
             100.0,
         );
-        set.set_placed(vec![a]);
+        let mut scope = RangeScope::new(1_000);
+        scope.enter(a, 10, false);
+        set.set_scope(scope);
         set.withhold([FileKey(7)]);
         assert_eq!(set.ranked(kind(1)), vec![(a, 500.0), (c, 300.0)]);
         set.clear_withheld();

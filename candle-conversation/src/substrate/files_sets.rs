@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use super::Substrate;
-use crate::files::{FileKey, FilesPin, FilesSet, FreshSection, SectionKey};
+use crate::files::scope::RangeScope;
+use crate::files::{FileKey, FilesPin, FilesSet, FreshSection};
 use crate::projection::{GroupId, TimelineId};
 
 impl Substrate {
@@ -30,10 +31,9 @@ impl Substrate {
         );
     }
 
-    /// Record `order` as where the sections a projection of `target` placed
-    /// sit ([`FilesSet::order`] computed it).
-    pub fn files_placed(&mut self, target: TimelineId, order: Vec<SectionKey>) {
-        Arc::make_mut(self.files_sets.entry(target).or_default()).set_placed(order);
+    /// Record `scope` as the range a projection of `target` placed.
+    pub fn files_scope(&mut self, target: TimelineId, scope: RangeScope) {
+        Arc::make_mut(self.files_sets.entry(target).or_default()).set_scope(scope);
     }
 
     /// Keep `files`, read by `target`'s turn, from being placed until its
@@ -45,12 +45,11 @@ impl Substrate {
         }
     }
 
-    /// A new question on `target`: its withheld files may be placed again.
+    /// A new question on `target`: its withheld files may be placed again,
+    /// and its range is compacted ([`FilesSet::clear_withheld`]).
     pub fn files_clear_withheld(&mut self, target: TimelineId) {
         if let Some(set) = self.files_sets.get_mut(&target) {
-            if !set.withheld.is_empty() {
-                Arc::make_mut(set).clear_withheld();
-            }
+            Arc::make_mut(set).clear_withheld();
         }
     }
 

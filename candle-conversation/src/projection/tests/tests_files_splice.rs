@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::files::names::chunk_name;
+use crate::files::scope::RangeScope;
 use crate::files::{
     ChunkRecord, FileKey, FileUnit, FilesPin, LineSpan, MemberRef, PlacedFile, SectionKey,
     SectionStanding,
@@ -86,7 +87,7 @@ fn sections_of(records: &[FileRecord], file: FileKey) -> Vec<SectionKey> {
 /// of the readings kind in which every section of each file of `momentum`
 /// stands at its file's momentum — less a thousandth per section after the
 /// first, so a file's sections rank in line order — and `placed`'s files'
-/// sections the order last placed.
+/// sections the range as last placed, the first at the top.
 fn resolver(
     b: &Builder,
     records: &[FileRecord],
@@ -116,12 +117,13 @@ fn resolver(
             set.members.insert(s, standing);
         }
     }
-    set.set_placed(
-        placed
-            .into_iter()
-            .flat_map(|f| sections_of(records, f))
-            .collect(),
-    );
+    if !placed.is_empty() {
+        let mut scope = RangeScope::new(usize::MAX / 2);
+        for s in placed.into_iter().flat_map(|f| sections_of(records, f)) {
+            scope.enter(s, 100, false);
+        }
+        set.set_scope(scope);
+    }
     let mut mock = MockResolver::new();
     mock.files = Some(set);
     mock.file_records = records.to_vec();
@@ -139,11 +141,13 @@ fn ids(segments: &[ProjectionSegment]) -> Vec<SectionId> {
         .collect()
 }
 
-/// **The files sit strongest first at the opening, each its placed sections
-/// in line order and nothing between them**: b (900) whole, then a (800),
-/// whose two sections are not contiguous — each says where it sits.
+/// **The opening places the strongest section at the top of the range,
+/// nearest the question, and each after it in front** (`docs/placed_section_
+/// layout.md` §3.4): b (900) at the top, a's first section (800) in front of
+/// it, a's second in front of that — so from the front of the range to its
+/// top the prompt reads a 401-600, a 1-200, b, nothing between them.
 #[test]
-fn files_are_spliced_strongest_first_as_their_sections() {
+fn the_opening_places_the_strongest_at_the_top() {
     let b = Builder::from_yaml(YAML).unwrap();
     let fa = record("candle/a.rs", &[(1, 200), (401, 600)]);
     let fb = record("candle/b.rs", &[(1, 50)]);
@@ -155,20 +159,21 @@ fn files_are_spliced_strongest_first_as_their_sections() {
         vec![],
     );
     let splice = files_splice(b.schema(), &mock, |_| 10_000, true);
-    assert_eq!(splice.order(), vec![fb.key(), fa.key()]);
-    // Each placement names the lines of the chunks it placed, in order.
+    assert_eq!(splice.order(), vec![fa.key(), fb.key()]);
+    // Each run names the lines of the sections it placed, in the order they
+    // sit.
     assert_eq!(
-        splice.placed[1],
+        splice.placed[0],
         PlacedFile {
             file: fa.key(),
             chunks: vec![
                 LineSpan {
-                    first: 1,
-                    last: 200
-                },
-                LineSpan {
                     first: 401,
                     last: 600
+                },
+                LineSpan {
+                    first: 1,
+                    last: 200
                 }
             ],
         }
@@ -176,15 +181,6 @@ fn files_are_spliced_strongest_first_as_their_sections() {
     assert_eq!(
         ids(&splice.segments),
         vec![
-            m[&chunk_name("candle/b.rs", "b", LineSpan { first: 1, last: 50 })],
-            m[&chunk_name(
-                "candle/a.rs",
-                "b",
-                LineSpan {
-                    first: 1,
-                    last: 200
-                }
-            )],
             m[&chunk_name(
                 "candle/a.rs",
                 "b",
@@ -193,7 +189,21 @@ fn files_are_spliced_strongest_first_as_their_sections() {
                     last: 600
                 }
             )],
+            m[&chunk_name(
+                "candle/a.rs",
+                "b",
+                LineSpan {
+                    first: 1,
+                    last: 200
+                }
+            )],
+            m[&chunk_name("candle/b.rs", "b", LineSpan { first: 1, last: 50 })],
         ]
+    );
+    let scope = splice.scope.expect("a free knowledge base keeps its range");
+    assert_eq!(
+        scope.sections().map(|e| e.key).collect::<Vec<_>>(),
+        vec![fb.section_key(0), fa.section_key(0), fa.section_key(1)]
     );
 }
 
@@ -335,31 +345,33 @@ layers:
     assert_eq!(sections[at + 1], first, "the file follows files_open");
 }
 
-/// **A kept file keeps its place**: a placed before b, b now stronger — a
-/// stays first.
+/// **A kept section keeps its place and a newcomer enters in front**: a at
+/// the top and b in front of it, b now stronger — both stay where they are;
+/// c, new, enters in front of b.
 #[test]
-fn a_kept_file_keeps_its_place_in_the_knowledge_base() {
+fn a_kept_section_keeps_its_place_and_a_newcomer_enters_in_front() {
     let b = Builder::from_yaml(YAML).unwrap();
     let fa = record("candle/a.rs", &[(1, 10)]);
     let fb = record("candle/b.rs", &[(1, 10)]);
-    let records = [fa.clone(), fb.clone()];
+    let fc = record("candle/c.rs", &[(1, 10)]);
+    let records = [fa.clone(), fb.clone(), fc.clone()];
     let (mock, _) = resolver(
         &b,
         &records,
-        &[(fa.key(), 100.0), (fb.key(), 900.0)],
+        &[(fa.key(), 100.0), (fb.key(), 900.0), (fc.key(), 950.0)],
         vec![fa.key(), fb.key()],
     );
     assert_eq!(
         files_splice(b.schema(), &mock, |_| 10_000, true).order(),
-        vec![fa.key(), fb.key()]
+        vec![fc.key(), fb.key(), fa.key()]
     );
 }
 
 /// **The mandatory files open a free knowledge base, whole and outside the
 /// caps, and the seed dial leaves them out**: m, weaker than a and bigger
-/// than the cap, is placed first and whole; under a 150-token cap a's one
-/// section fits beside it; with the dial off, a alone. A pinned knowledge
-/// base holds its pin alone.
+/// than the cap, takes the top, whole; under a 150-token cap a's one section
+/// fits, in front of it; with the dial off, a alone. A pinned knowledge base
+/// holds its pin alone.
 #[test]
 fn the_mandatory_files_open_a_free_knowledge_base() {
     let b = Builder::from_yaml(YAML).unwrap();
@@ -369,8 +381,16 @@ fn the_mandatory_files_open_a_free_knowledge_base() {
     let (mut mock, _) = resolver(&b, &records, &[(fm.key(), 10.0), (fa.key(), 900.0)], vec![]);
     mock.mandatory_files = vec!["candle/README.md".into(), "candle/AGENTS.md".into()];
     let on = files_splice(b.schema(), &mock, |_| 150, true);
-    assert_eq!(on.order(), vec![fm.key(), fa.key()]);
-    assert_eq!(on.placed[0].chunks.len(), 2, "whole, whatever the cap");
+    assert_eq!(on.order(), vec![fa.key(), fm.key()]);
+    assert_eq!(on.placed[1].chunks.len(), 2, "whole, whatever the cap");
+    assert!(
+        on.scope
+            .as_ref()
+            .unwrap()
+            .entry(fm.section_key(0))
+            .unwrap()
+            .mandatory
+    );
     assert_eq!(on.segments.len(), 3);
     let off = files_splice(b.schema(), &mock, |_| 150, false);
     assert_eq!(off.order(), vec![fa.key()]);
@@ -380,9 +400,9 @@ fn the_mandatory_files_open_a_free_knowledge_base() {
 }
 
 /// **A file's sections compete apart** (`docs/placed_section_layout.md`
-/// §3.5c): a's first section (900) is placed, b (500) next, and a's second
-/// (100) no longer fits the 200-token cap — the placed runs are a, b, and
-/// each names only what it placed.
+/// §3.5c): a's first section (900) takes the top, b (500) enters in front of
+/// it, and a's second (100) no longer fits the 200-token cap — the placed
+/// runs are b, a, and each names only what it placed.
 #[test]
 fn a_files_sections_compete_apart() {
     let b = Builder::from_yaml(YAML).unwrap();
@@ -399,10 +419,10 @@ fn a_files_sections_compete_apart() {
     let set = mock.files.as_mut().unwrap();
     set.members.get_mut(&second).unwrap().momentum = 100.0;
     let splice = files_splice(b.schema(), &mock, |_| 200, true);
-    assert_eq!(splice.order(), vec![fa.key(), fb.key()]);
-    assert_eq!(splice.sections, vec![fa.section_key(0), fb.section_key(0)]);
+    assert_eq!(splice.order(), vec![fb.key(), fa.key()]);
+    assert_eq!(splice.sections, vec![fb.section_key(0), fa.section_key(0)]);
     assert_eq!(
-        splice.placed[0].chunks,
+        splice.placed[1].chunks,
         vec![LineSpan {
             first: 1,
             last: 200

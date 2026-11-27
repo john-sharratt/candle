@@ -739,6 +739,7 @@ pub fn run_with_sink<R: ContentResolver>(
     // dialogue's share are shares of one room.
     let mut files_placed: Vec<PlacedFile> = Vec::new();
     let mut files_sections: Vec<SectionKey> = Vec::new();
+    let mut files_scope: Option<RangeScope> = None;
     let mut files_tokens = 0usize;
     let knowledge_base = schema
         .layers
@@ -787,6 +788,7 @@ pub fn run_with_sink<R: ContentResolver>(
             files_placed = splice.placed;
             files_sections = splice.sections;
         }
+        files_scope = splice.scope;
     }
 
     if group_states.is_empty() {
@@ -799,6 +801,7 @@ pub fn run_with_sink<R: ContentResolver>(
             unpooled: Vec::new(),
             files_placed,
             files_sections,
+            files_scope,
         };
     }
 
@@ -1420,5 +1423,6 @@ pub fn run_with_sink<R: ContentResolver>(
         unpooled,
         files_placed,
         files_sections,
+        files_scope,
     }
 }

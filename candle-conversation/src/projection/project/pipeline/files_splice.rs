@@ -15,9 +15,11 @@
 
 use std::collections::HashSet;
 
+use super::files_anchor::FILES_COLLECTION;
 use super::*;
 use crate::files::fill::choose;
 use crate::files::names::chunk_name;
+use crate::files::scope::{Candidate, Entry, Place, RangeScope};
 use crate::files::{
     mandatory_records, FileKey, FileRecord, FilesPin, LineSpan, PlacedFile, SectionKey,
 };
@@ -27,9 +29,13 @@ pub(crate) struct FilesSplice {
     /// The placed sections as runs of one file's, in the order they sit,
     /// each run with its sections' lines.
     pub placed: Vec<PlacedFile>,
-    /// The placed sections, in the order they sit.
+    /// The placed sections, in the order they sit, from the front of the
+    /// range to its top.
     pub sections: Vec<SectionKey>,
     pub segments: Vec<ProjectionSegment>,
+    /// The range a free knowledge base now holds, for the files set to keep;
+    /// `None` for a pinned one.
+    pub scope: Option<RangeScope>,
 }
 
 #[cfg(test)]
@@ -73,6 +79,7 @@ pub(crate) fn files_splice<R: ContentResolver>(
             placed: Vec::new(),
             sections: Vec::new(),
             segments: Vec::new(),
+            scope: None,
         };
     };
     let all = resolver.files_records();
@@ -81,21 +88,48 @@ pub(crate) fn files_splice<R: ContentResolver>(
         .iter()
         .flat_map(|r| (0..r.chunks.len()).map(move |i| (r.section_key(i), (r, i))))
         .collect();
-    // The mandatory files' sections, in line order, then each kind's choice
-    // ranked by momentum — or, pinned, the pinned sections in the pin's
-    // order, or nothing.
-    let mut chosen: Vec<SectionKey> = Vec::new();
-    match &set.pin {
-        FilesPin::Empty => {}
-        FilesPin::Only(sections) => chosen.extend(sections.iter().copied()),
+    let member = |key: SectionKey| -> Option<SectionId> {
+        let &(record, i) = index.get(&key)?;
+        resolver.member_section(&chunk_name(
+            &record.path,
+            &record.blob,
+            record.chunks[i].lines,
+        ))
+    };
+    let candidate = |key: SectionKey| -> Option<Candidate> {
+        let &(record, i) = index.get(&key)?;
+        member(key)?;
+        Some(Candidate {
+            key,
+            tokens: record.chunks[i].member.tokens as usize,
+        })
+    };
+    // Pinned, the pinned sections in the pin's order, or nothing; free, the
+    // range as it stood with what enters it now.
+    let places: Vec<Place> = match &set.pin {
+        FilesPin::Empty => Vec::new(),
+        FilesPin::Only(sections) => sections
+            .iter()
+            .filter_map(|&k| candidate(k))
+            .map(|c| {
+                Place::Section(Entry {
+                    key: c.key,
+                    tokens: c.tokens,
+                    mandatory: false,
+                    below: 0,
+                })
+            })
+            .collect(),
         FilesPin::Free => {
             let paths = match mandatory {
                 true => resolver.files_mandatory(),
                 false => Vec::new(),
             };
-            for record in mandatory_records(&all, &paths) {
-                chosen.extend(record.section_keys());
-            }
+            let mandatory_sections: Vec<Candidate> = mandatory_records(&all, &paths)
+                .into_iter()
+                .flat_map(FileRecord::section_keys)
+                .filter_map(candidate)
+                .collect();
             // A path the mandatory files hold is no candidate of any kind.
             let held: HashSet<&str> = paths.iter().map(String::as_str).collect();
             let mut picked: Vec<(SectionKey, f32)> = Vec::new();
@@ -128,30 +162,86 @@ pub(crate) fn files_splice<R: ContentResolver>(
                 }
             }
             picked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-            chosen.extend(picked.into_iter().map(|(s, _)| s));
+            let picked: Vec<Candidate> = picked
+                .into_iter()
+                .filter_map(|(k, _)| candidate(k))
+                .collect();
+            let positions = files_positions(schema, resolver.trained_window());
+            let mut scope = match &set.scope {
+                Some(s) if s.positions == positions => s.clone(),
+                _ => RangeScope::new(positions),
+            };
+            // A placed section this process no longer holds leaves the range.
+            let gone: Vec<SectionKey> = scope
+                .sections()
+                .map(|e| e.key)
+                .filter(|&k| member(k).is_none())
+                .collect();
+            for k in gone {
+                scope.forget(k);
+            }
+            if scope.sections().next().is_none() {
+                scope.open(&mandatory_sections, &picked);
+            } else {
+                for c in &mandatory_sections {
+                    scope.enter(c.key, c.tokens, true);
+                }
+                for c in &picked {
+                    scope.enter(c.key, c.tokens, false);
+                }
+            }
+            let places = scope.places().iter().rev().copied().collect();
+            return emit(places, &index, &member, Some(scope));
+        }
+    };
+    emit(places, &index, &member, None)
+}
+
+/// The positions the knowledge base's range reserves on an engine of
+/// `native` context: the `files` collection's range, or no bound when it
+/// declares none.
+fn files_positions(schema: &Schema, native: Option<usize>) -> usize {
+    schema
+        .system_prompt
+        .items
+        .iter()
+        .find_map(|item| match item {
+            SystemPromptItem::Collection(c) if c.name == FILES_COLLECTION => c.range,
+            _ => None,
+        })
+        .map_or(usize::MAX / 2, |range| range.positions(native))
+}
+
+/// `places`, from the front of the range to its top, as the splice places
+/// them: each section its member, each hole its positions.
+fn emit(
+    places: Vec<Place>,
+    index: &HashMap<SectionKey, (&FileRecord, usize)>,
+    member: &impl Fn(SectionKey) -> Option<SectionId>,
+    scope: Option<RangeScope>,
+) -> FilesSplice {
+    let mut segments = Vec::with_capacity(places.len());
+    let mut spans: Vec<(FileKey, LineSpan)> = Vec::new();
+    let mut sections = Vec::new();
+    for place in places {
+        match place {
+            Place::Hole(positions) => segments.push(ProjectionSegment::Hole { positions }),
+            Place::Section(e) => {
+                let (Some(&(record, i)), Some(id)) = (index.get(&e.key), member(e.key)) else {
+                    continue;
+                };
+                spans.push((record.key(), record.chunks[i].lines));
+                sections.push(e.key);
+                segments.push(ProjectionSegment::Sealed(SealedKind::Section(
+                    ResolvedSection::new(id),
+                )));
+            }
         }
     }
-    // Each section in the order it sits, its member resolved; one this
-    // process does not hold is not placed.
-    let resolved: Vec<(SectionKey, FileKey, LineSpan, SectionId)> = set
-        .order(&chosen)
-        .into_iter()
-        .filter_map(|key| {
-            let &(record, i) = index.get(&key)?;
-            let lines = record.chunks[i].lines;
-            let id = resolver.member_section(&chunk_name(&record.path, &record.blob, lines))?;
-            Some((key, record.key(), lines, id))
-        })
-        .collect();
-    let spans: Vec<(FileKey, LineSpan)> = resolved.iter().map(|&(_, f, l, _)| (f, l)).collect();
     FilesSplice {
         placed: runs(&spans),
-        sections: resolved.iter().map(|&(k, ..)| k).collect(),
-        segments: resolved
-            .iter()
-            .map(|&(.., id)| {
-                ProjectionSegment::Sealed(SealedKind::Section(ResolvedSection::new(id)))
-            })
-            .collect(),
+        sections,
+        segments,
+        scope,
     }
 }

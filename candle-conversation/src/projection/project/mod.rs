@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use candle::engine_events::note;
 
+use crate::files::scope::RangeScope;
 use crate::files::{FilesPin, PlacedFile, SectionKey};
 
 use super::adaptive::AnchorMember;
@@ -157,9 +158,13 @@ pub struct Projection {
     /// file's in the order they sit, each run with its sections' lines
     /// (`docs/provenance_system_collection.md` §3).
     pub files_placed: Vec<PlacedFile>,
-    /// The same sections by key, in the order they sit: what the target's
-    /// files set keeps as its placed order once the projection is applied.
+    /// The same sections by key, in the order they sit, from the front of the
+    /// range to its top.
     pub files_sections: Vec<SectionKey>,
+    /// The range a free knowledge base holds once the projection is applied,
+    /// what the target's files set keeps (`files::scope`); `None` when the
+    /// knowledge base is pinned or not placed.
+    pub files_scope: Option<RangeScope>,
 }
 
 impl Projection {

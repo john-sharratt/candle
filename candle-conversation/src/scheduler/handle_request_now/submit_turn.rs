@@ -408,10 +408,11 @@ impl Scheduler {
                         opening.pieces = projection.fill.clone();
                         opening.unpooled = projection.unpooled.clone();
                         opening.placed = projection.files_placed.clone();
-                        // Where the knowledge base's files sit, for the
+                        // The knowledge base's range as placed, for the
                         // next projection to keep.
-                        conversation
-                            .update(|s| s.files_placed(target.timeline, projection.files_order()));
+                        if let Some(scope) = projection.files_scope.clone() {
+                            conversation.update(|s| s.files_scope(target.timeline, scope.clone()));
+                        }
                         // The turn's decode state seeds its belief from what this
                         // opening projection actually selected (the carried belief
                         // stepped against this turn's selection), so the first

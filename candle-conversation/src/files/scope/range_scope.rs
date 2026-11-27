@@ -147,6 +147,17 @@ impl RangeScope {
         true
     }
 
+    /// `key` is no longer held, mandatory or not: it leaves as
+    /// [`Self::leave`] has a section leave.
+    pub fn forget(&mut self, key: SectionKey) -> bool {
+        for e in self.entries_mut() {
+            if e.key == key {
+                e.mandatory = false;
+            }
+        }
+        self.leave(key)
+    }
+
     /// Close every hole: each section moves up toward the top, in order.
     pub fn compact(&mut self) {
         self.places.retain(|p| matches!(p, Place::Section(_)));
@@ -244,6 +255,8 @@ mod tests {
         assert_eq!(s.enter(SectionKey(6), 71, false), None);
         assert_eq!(keys(&s), vec![0, 4, 5]);
         assert!(!s.leave(SectionKey(0)), "a mandatory section never leaves");
+        assert!(s.forget(SectionKey(0)), "unless it is no longer held");
+        assert_eq!(keys(&s), vec![4, 5]);
     }
 
     /// **Compaction closes every hole**, the sections keeping their order.

@@ -589,11 +589,13 @@ impl Scheduler {
             composition.pieces = projection.fill.clone();
             composition.unpooled = projection.unpooled.clone();
             composition.placed = projection.files_placed.clone();
-            // Where the knowledge base's files sit, for the next projection
+            // The knowledge base's range as placed, for the next projection
             // to keep.
-            policy
-                .substrate
-                .update(|s| s.files_placed(policy.target.timeline, projection.files_order()));
+            if let Some(scope) = projection.files_scope.clone() {
+                policy
+                    .substrate
+                    .update(|s| s.files_scope(policy.target.timeline, scope.clone()));
+            }
             // The dialogue glue, sourced from the SAME `assemble_pieces` decision
             // the engine injects from — so the panel shows the real boundary
             // markers, never a reconstruction. `decode` keeps special tokens (the
