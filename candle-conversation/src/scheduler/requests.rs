@@ -383,8 +383,9 @@ pub(crate) enum SchedulerRequest {
     /// Give `sequence_id` — holding the first `prompt_tokens` of a described
     /// slot's prompt in the same chunk windows — that slot's K/V for them
     /// (`kv`), its index pages for them (`index`), or both, from the capture
-    /// its description named. The capture is taken either way. With `kv`, the
-    /// chunks `own_chunks` names keep the slot's own K/V.
+    /// its description named. With `kv`, the chunks `own_chunks` names keep
+    /// the slot's own K/V. The capture stays for further transplants until it
+    /// is released.
     Transplant {
         sequence_id: SequenceId,
         capture: u64,
@@ -395,7 +396,7 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<(), ConversationError>>,
     },
 
-    /// Drop a capture no transplant took.
+    /// Drop a capture, once every slot it was to be given to has had it.
     ReleaseCapture { capture: u64 },
 
     /// Leave `sequence_id`'s blocks native in the gap from here on, so the only

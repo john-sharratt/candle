@@ -37,7 +37,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use candle_conversation::files::names::chunk_name;
 use candle_conversation::files::{files_owner, FileRecord, FilesPin, SectionKey};
-use candle_conversation::projection::Conversation;
+use candle_conversation::projection::{Conversation, TimelineId};
 use candle_conversation::projection::{
     DecodePriority, ReprojectionMode, SelectionState, TurnIndex,
 };
@@ -45,14 +45,14 @@ use candle_conversation::stencil::TriggerRegistry;
 use candle_conversation::{
     format_name, ChunkLayout, PieceKind, PromptDump, SealAs, SlotLayout, SpanQuant, TransplantFrom,
 };
-use candle_conversation::{SamplingConfig, TurnOptions};
+use candle_conversation::{SamplingConfig, Sequence, TurnOptions};
 use serde::{Deserialize, Serialize};
 
 use super::builders::turn_projection;
 use super::sealed_fresh_anchors::anchor_chunks;
 use super::sealed_fresh_layout::{compare, piece_chunks, LayoutComparison};
 use super::sealed_fresh_reseal::{prefix_before, reseal_behind, DumpedPiece};
-use super::ZendSession;
+use super::{InferenceState, ZendSession};
 use crate::files::records;
 use crate::journal::opening::SeedRead;
 use crate::types::ToolMode;
@@ -443,9 +443,41 @@ fn selection() -> SelectionState {
     s
 }
 
+/// A run's sealed side, decoded once ([`ZendSession::sealed_half`]): the
+/// prompt, the sealed decode and its slot's capture, which every fresh side —
+/// one run's, or each cell of a sweep — compares against and transplants from.
+/// Held until [`SealedHalf::close`] releases the capture and the fork.
+pub struct SealedHalf {
+    state: Arc<InferenceState>,
+    _conv: Sequence,
+    timeline: TimelineId,
+    probe: Option<FileRecord>,
+    dump: PromptDump,
+    members: HashSet<u32>,
+    layout: SlotLayout,
+    user_half: Vec<u32>,
+    sealed: Vec<u32>,
+    sealed_prompt_tokens: usize,
+    sealed_finish: String,
+    resealed_same_tokens: Option<bool>,
+    after_files: Vec<String>,
+    after_tokens: usize,
+    seed_files: Vec<String>,
+    seed_missing: Vec<String>,
+}
+
 impl ZendSession {
     /// Decode `req` sealed and fresh over the same tokens ([`SealedFresh`]).
     pub fn sealed_fresh(&self, req: &SealedFreshReq) -> anyhow::Result<SealedFresh> {
+        let half = self.sealed_half(req)?;
+        let out = half.fresh(req);
+        half.close();
+        out
+    }
+
+    /// Decode `req`'s sealed side once ([`SealedHalf`]); its fresh sides are
+    /// [`SealedHalf::fresh`]'s.
+    pub fn sealed_half(&self, req: &SealedFreshReq) -> anyhow::Result<SealedHalf> {
         anyhow::ensure!(
             (1..=MAX_TOKENS).contains(&req.n),
             "n must be 1..={MAX_TOKENS}"
@@ -601,114 +633,184 @@ impl ZendSession {
                 .read()
                 .token_ids_of(timeline, TurnIndex(0));
             let user_half = resp.stats.turn_prefill_tokens.min(turn.len());
-            let mut prompt = dump.token_ids.clone();
-            prompt.extend_from_slice(&turn[..user_half]);
-            let sealed: Vec<u32> = resp.token_ids.to_vec();
-            // The fresh side in one pass, unless its state is swapped or its
-            // K/V quantized between the prompt and the user half.
-            let recurrent_over = match req.fresh_recurrent {
-                Recurrent::Fresh | Recurrent::Split => None,
-                Recurrent::Sealed => Some(without_members(&dump, &members)),
-                Recurrent::Replayed => Some(dump.token_ids.clone()),
-            };
-            let own_chunks = if req.anchor_head + req.anchor_tail > 0 {
-                anyhow::ensure!(
-                    req.fresh_kv == Source::Sealed && req.fresh_layout != Layout::Contiguous,
-                    "anchors keep fresh chunks over a sealed K/V transplant: they need \
-                     fresh_kv: sealed and the fresh side laid out in pieces"
-                );
-                let pieces: Vec<_> = dump
-                    .pieces
-                    .iter()
-                    .filter(|p| !p.token_ids.is_empty())
-                    .collect();
-                let tokens: Vec<usize> = pieces.iter().map(|p| p.token_ids.len()).collect();
-                let sections: Vec<bool> = pieces
-                    .iter()
-                    .map(|p| matches!(p.kind, PieceKind::Section))
-                    .collect();
-                let cuts = piece_chunks(&sealed_layout.chunks, &tokens)
-                    .map_err(|e| anyhow::anyhow!("the sealed slot's pieces: {e}"))?;
-                let widths: Vec<usize> = sealed_layout
-                    .chunks
-                    .iter()
-                    .map(|c| c.tokens as usize)
-                    .collect();
-                anchor_chunks(&widths, &cuts, &sections, req.anchor_head, req.anchor_tail)
-            } else {
-                Vec::new()
-            };
-            let anchored_chunks = own_chunks.len();
-            let transplant = (req.fresh_kv == Source::Sealed || req.fresh_index == Source::Sealed)
-                .then_some(TransplantFrom {
-                    capture: sealed_layout.capture,
-                    kv: req.fresh_kv == Source::Sealed,
-                    index: req.fresh_index == Source::Sealed,
-                    live_tail: req.live_tail,
-                    own_chunks,
-                });
-            if transplant.is_none() {
-                engine.release_capture(sealed_layout.capture);
-            }
-            let one_pass = req.fresh_recurrent == Recurrent::Fresh
-                && req.fresh_quantize.is_none()
-                && req.fresh_layout == Layout::Contiguous
-                && transplant.is_none();
-            let fresh = if one_pass {
-                engine.infer_raw_token_ids(&prompt, req.n)
-            } else {
-                engine.infer_raw_token_ids_swapped(
-                    &fresh_pieces(&dump, req.fresh_layout, req.fresh_quantize, &sealed_layout),
-                    recurrent_over,
-                    transplant,
-                    &turn[..user_half],
-                    req.n,
-                )
-            }
-            .map_err(|e| anyhow::anyhow!("the fresh decode: {e}"))?;
-            let fresh_finish = fresh.finish.map_or("none".into(), |f| format!("{f:?}"));
-            let layout = fresh
-                .layout
-                .as_ref()
-                .map(|f| compare(&dump, &sealed_layout, f));
-            let fresh = fresh.tokens;
-            let decode = |ids: &[u32]| engine.tokenizer().decode(ids, false).unwrap_or_default();
-            let at = first_divergence(&sealed, &fresh);
-            let agreed = &sealed[..at.unwrap_or(sealed.len().min(fresh.len()))];
-            Ok(SealedFresh {
-                recurrent: req.recurrent,
-                fresh_recurrent: req.fresh_recurrent,
-                prompt_tokens: prompt.len(),
-                sealed_prompt_tokens: resp.stats.prefill_token_count,
-                same_prompt: prompt.len() == resp.stats.prefill_token_count,
-                first_divergence: at,
-                sealed_token: at.map(|i| decode(&sealed[i..=i])),
-                fresh_token: at.map(|i| decode(&fresh[i..=i])),
-                agreed: decode(agreed),
-                sealed_text: decode(&sealed),
-                fresh_text: decode(&fresh),
-                sealed_decoded: sealed.len(),
-                fresh_decoded: fresh.len(),
-                sealed_finish: format!("{:?}", resp.stats.finish),
-                fresh_finish,
-                layout,
+            Ok((
+                dump,
+                sealed_layout,
+                turn[..user_half].to_vec(),
+                resp.token_ids.to_vec(),
+                resp.stats.prefill_token_count,
+                format!("{:?}", resp.stats.finish),
                 resealed_same_tokens,
-                anchored_chunks,
-                after_files: after.iter().map(|r| r.path.clone()).collect(),
-                after_tokens: after.iter().map(record_tokens).sum(),
-                seed_files: seed_files.iter().map(|r| r.path.clone()).collect(),
-                seed_missing: seed_paths
-                    .iter()
-                    .filter(|p| !seed_files.iter().any(|r| &r.path == *p))
-                    .cloned()
-                    .collect(),
-            })
+            ))
         })();
-        let _ = engine.tombstone_timeline(timeline);
-        if let Some(p) = &probe {
+        let (dump, layout, user_half, sealed, sealed_prompt_tokens, sealed_finish, resealed) =
+            match out {
+                Ok(o) => o,
+                Err(e) => {
+                    let _ = engine.tombstone_timeline(timeline);
+                    if let Some(p) = &probe {
+                        let _ = records::retire(&engine.conversation(), p);
+                    }
+                    return Err(e);
+                }
+            };
+        Ok(SealedHalf {
+            after_files: after.iter().map(|r| r.path.clone()).collect(),
+            after_tokens: after.iter().map(record_tokens).sum(),
+            seed_missing: seed_paths
+                .iter()
+                .filter(|p| !seed_files.iter().any(|r| &r.path == *p))
+                .cloned()
+                .collect(),
+            seed_files: seed_files.iter().map(|r| r.path.clone()).collect(),
+            state: state.clone(),
+            _conv: conv,
+            timeline,
+            probe,
+            dump,
+            members,
+            layout,
+            user_half,
+            sealed,
+            sealed_prompt_tokens,
+            sealed_finish,
+            resealed_same_tokens: resealed,
+        })
+    }
+}
+
+impl SealedHalf {
+    /// The sealed side's decode, as text.
+    pub fn sealed_text(&self) -> String {
+        self.decode(&self.sealed)
+    }
+
+    /// The prompt's files placed after the needle, in tokens.
+    pub fn after_tokens(&self) -> usize {
+        self.after_tokens
+    }
+
+    fn decode(&self, ids: &[u32]) -> String {
+        self.state
+            .engine
+            .tokenizer()
+            .decode(ids, false)
+            .unwrap_or_default()
+    }
+
+    /// One fresh side under `req`'s fresh dials, over the prompt this sealed
+    /// side decoded: prefilled on a slot of its own, given what `req` takes
+    /// from the sealed slot's capture, and decoded — the capture left for the
+    /// next.
+    pub fn fresh(&self, req: &SealedFreshReq) -> anyhow::Result<SealedFresh> {
+        let engine = &self.state.engine;
+        let dump = &self.dump;
+        let sealed_layout = &self.layout;
+        let sealed = &self.sealed;
+        let mut prompt = dump.token_ids.clone();
+        prompt.extend_from_slice(&self.user_half);
+        // The fresh side in one pass, unless its state is swapped or its
+        // K/V quantized between the prompt and the user half.
+        let recurrent_over = match req.fresh_recurrent {
+            Recurrent::Fresh | Recurrent::Split => None,
+            Recurrent::Sealed => Some(without_members(dump, &self.members)),
+            Recurrent::Replayed => Some(dump.token_ids.clone()),
+        };
+        let own_chunks = if req.anchor_head + req.anchor_tail > 0 {
+            anyhow::ensure!(
+                req.fresh_kv == Source::Sealed && req.fresh_layout != Layout::Contiguous,
+                "anchors keep fresh chunks over a sealed K/V transplant: they need \
+                 fresh_kv: sealed and the fresh side laid out in pieces"
+            );
+            let pieces: Vec<_> = dump
+                .pieces
+                .iter()
+                .filter(|p| !p.token_ids.is_empty())
+                .collect();
+            let tokens: Vec<usize> = pieces.iter().map(|p| p.token_ids.len()).collect();
+            let sections: Vec<bool> = pieces
+                .iter()
+                .map(|p| matches!(p.kind, PieceKind::Section))
+                .collect();
+            let cuts = piece_chunks(&sealed_layout.chunks, &tokens)
+                .map_err(|e| anyhow::anyhow!("the sealed slot's pieces: {e}"))?;
+            let widths: Vec<usize> = sealed_layout
+                .chunks
+                .iter()
+                .map(|c| c.tokens as usize)
+                .collect();
+            anchor_chunks(&widths, &cuts, &sections, req.anchor_head, req.anchor_tail)
+        } else {
+            Vec::new()
+        };
+        let anchored_chunks = own_chunks.len();
+        let transplant = (req.fresh_kv == Source::Sealed || req.fresh_index == Source::Sealed)
+            .then_some(TransplantFrom {
+                capture: sealed_layout.capture,
+                kv: req.fresh_kv == Source::Sealed,
+                index: req.fresh_index == Source::Sealed,
+                live_tail: req.live_tail,
+                own_chunks,
+            });
+        let one_pass = req.fresh_recurrent == Recurrent::Fresh
+            && req.fresh_quantize.is_none()
+            && req.fresh_layout == Layout::Contiguous
+            && transplant.is_none();
+        let fresh = if one_pass {
+            engine.infer_raw_token_ids(&prompt, req.n)
+        } else {
+            engine.infer_raw_token_ids_swapped(
+                &fresh_pieces(dump, req.fresh_layout, req.fresh_quantize, sealed_layout),
+                recurrent_over,
+                transplant,
+                &self.user_half,
+                req.n,
+            )
+        }
+        .map_err(|e| anyhow::anyhow!("the fresh decode: {e}"))?;
+        let fresh_finish = fresh.finish.map_or("none".into(), |f| format!("{f:?}"));
+        let layout = fresh
+            .layout
+            .as_ref()
+            .map(|f| compare(dump, sealed_layout, f));
+        let fresh = fresh.tokens;
+        let at = first_divergence(sealed, &fresh);
+        let agreed = &sealed[..at.unwrap_or(sealed.len().min(fresh.len()))];
+        Ok(SealedFresh {
+            recurrent: req.recurrent,
+            fresh_recurrent: req.fresh_recurrent,
+            prompt_tokens: prompt.len(),
+            sealed_prompt_tokens: self.sealed_prompt_tokens,
+            same_prompt: prompt.len() == self.sealed_prompt_tokens,
+            first_divergence: at,
+            sealed_token: at.map(|i| self.decode(&sealed[i..=i])),
+            fresh_token: at.map(|i| self.decode(&fresh[i..=i])),
+            agreed: self.decode(agreed),
+            sealed_text: self.decode(sealed),
+            fresh_text: self.decode(&fresh),
+            sealed_decoded: sealed.len(),
+            fresh_decoded: fresh.len(),
+            sealed_finish: self.sealed_finish.clone(),
+            fresh_finish,
+            layout,
+            resealed_same_tokens: self.resealed_same_tokens,
+            anchored_chunks,
+            after_files: self.after_files.clone(),
+            after_tokens: self.after_tokens,
+            seed_files: self.seed_files.clone(),
+            seed_missing: self.seed_missing.clone(),
+        })
+    }
+
+    /// Release the capture, end the fork's timeline and retire a resealed
+    /// probe's record.
+    pub fn close(self) {
+        let engine = &self.state.engine;
+        engine.release_capture(self.layout.capture);
+        let _ = engine.tombstone_timeline(self.timeline);
+        if let Some(p) = &self.probe {
             let _ = records::retire(&engine.conversation(), p);
         }
-        out
     }
 }
 

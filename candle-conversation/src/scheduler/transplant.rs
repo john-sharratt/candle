@@ -82,8 +82,9 @@ impl Scheduler {
     /// Give `slot`, holding the first `prompt_tokens` of the captured slot's
     /// prompt in the same windows, the capture's K/V for them (`kv`), its
     /// index pages for them (`index`), or both. With `kv`, the chunks
-    /// `own_chunks` names keep the slot's own K/V. The capture is taken either
-    /// way.
+    /// `own_chunks` names keep the slot's own K/V. The capture stays until it is
+    /// released ([`SchedulerRequest::ReleaseCapture`]), so one described slot
+    /// can be given to as many slots as ask for it.
     pub(super) fn transplant(
         &mut self,
         slot: SequenceId,
@@ -95,7 +96,7 @@ impl Scheduler {
     ) -> Result<(), ConversationError> {
         let cap = self
             .captures
-            .remove(&capture)
+            .get(&capture)
             .ok_or_else(|| ConversationError::Channel(format!("no capture {capture}")))?;
         if kv {
             let backings = self.session.backings();

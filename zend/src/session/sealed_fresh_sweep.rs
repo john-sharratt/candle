@@ -1,7 +1,7 @@
-//! The anchor sweep: one [`SealedFreshReq`] run once with the fresh side's own
-//! K/V throughout — the reference — and then once per `(head, tail)` of a
-//! grid, each section's first `head` and last `tail` tokens kept from the
-//! fresh prefill over a sealed K/V transplant
+//! The anchor sweep: one [`SealedFreshReq`]'s sealed side decoded once, then
+//! its fresh side run with its own K/V throughout — the reference — and once
+//! per `(head, tail)` of a grid, each section's first `head` and last `tail`
+//! tokens kept from the fresh prefill over a sealed K/V transplant
 //! ([`SealedFreshReq::anchor_head`]). Whether sealed sections read as fresh
 //! ones do with their context restored at their ends, and how much of each
 //! end it takes, apart or together.
@@ -65,43 +65,50 @@ pub fn common_prefix_chars(a: &str, b: &str) -> usize {
 }
 
 impl ZendSession {
-    /// Run [`AnchorSweepReq`]: the reference, then every cell of its grid.
+    /// Run [`AnchorSweepReq`]: the sealed side once, then the reference and
+    /// every cell of the grid as fresh sides over it, each transplanting from
+    /// the one capture.
     pub fn sealed_fresh_anchor_sweep(&self, req: &AnchorSweepReq) -> anyhow::Result<AnchorSweep> {
         anyhow::ensure!(
             !req.heads.is_empty() && !req.tails.is_empty(),
             "a sweep needs at least one head and one tail"
         );
-        let reference = self.sealed_fresh(&SealedFreshReq {
-            fresh_kv: Source::Fresh,
-            anchor_head: 0,
-            anchor_tail: 0,
-            ..req.base.clone()
-        })?;
-        let mut cells = Vec::new();
-        for (head, tail) in grid(&req.heads, &req.tails) {
-            let run = self.sealed_fresh(&SealedFreshReq {
-                fresh_kv: Source::Sealed,
-                anchor_head: head,
-                anchor_tail: tail,
+        let half = self.sealed_half(&req.base)?;
+        let out = (|| {
+            let reference = half.fresh(&SealedFreshReq {
+                fresh_kv: Source::Fresh,
+                anchor_head: 0,
+                anchor_tail: 0,
                 ..req.base.clone()
             })?;
-            let agrees_for = common_prefix_chars(&run.fresh_text, &reference.fresh_text);
-            cells.push(AnchorCell {
-                head,
-                tail,
-                anchored_chunks: run.anchored_chunks,
-                same_as_reference: run.fresh_text == reference.fresh_text,
-                agrees_for,
-                text: run.fresh_text,
-            });
-        }
-        Ok(AnchorSweep {
-            sealed_text: reference.sealed_text,
-            reference_text: reference.fresh_text,
-            prompt_tokens: reference.prompt_tokens,
-            after_tokens: reference.after_tokens,
-            cells,
-        })
+            let mut cells = Vec::new();
+            for (head, tail) in grid(&req.heads, &req.tails) {
+                let run = half.fresh(&SealedFreshReq {
+                    fresh_kv: Source::Sealed,
+                    anchor_head: head,
+                    anchor_tail: tail,
+                    ..req.base.clone()
+                })?;
+                let agrees_for = common_prefix_chars(&run.fresh_text, &reference.fresh_text);
+                cells.push(AnchorCell {
+                    head,
+                    tail,
+                    anchored_chunks: run.anchored_chunks,
+                    same_as_reference: run.fresh_text == reference.fresh_text,
+                    agrees_for,
+                    text: run.fresh_text,
+                });
+            }
+            Ok(AnchorSweep {
+                sealed_text: half.sealed_text(),
+                reference_text: reference.fresh_text,
+                prompt_tokens: reference.prompt_tokens,
+                after_tokens: half.after_tokens(),
+                cells,
+            })
+        })();
+        half.close();
+        out
     }
 }
 

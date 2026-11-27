@@ -629,8 +629,8 @@ pub(crate) struct Scheduler {
     describe_at_seal: HashMap<SequenceId, Sender<Result<SlotLayout, ConversationError>>>,
 
     /// Described slots' chunks and index pages, held under the id their
-    /// description names for a [`SchedulerRequest::Transplant`] until it is
-    /// taken or released; the last id handed out.
+    /// description names for any number of [`SchedulerRequest::Transplant`]s
+    /// until it is released; the last id handed out.
     captures: HashMap<u64, transplant::SlotCapture>,
     last_capture: u64,
 

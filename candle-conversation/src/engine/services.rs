@@ -396,7 +396,9 @@ impl ConversationEngine {
         Ok(rx)
     }
 
-    /// Drop a described slot's capture that no transplant took.
+    /// Drop a described slot's capture: a transplant leaves it in place, so
+    /// whoever asked for the description releases it once every slot it was
+    /// to be given to has had it.
     pub fn release_capture(&self, capture: u64) {
         let _ = self
             .core

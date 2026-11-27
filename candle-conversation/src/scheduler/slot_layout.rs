@@ -51,7 +51,7 @@ pub struct SlotLayout {
     pub index_pages: Vec<IndexPage>,
     pub chunks: Vec<ChunkLayout>,
     /// The id the slot's chunks and pages are held under for a transplant
-    /// ([`SchedulerRequest::Transplant`]) until it is taken or released.
+    /// ([`SchedulerRequest::Transplant`]) until it is released.
     pub capture: u64,
 }
 
