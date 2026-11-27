@@ -555,15 +555,18 @@ pub(super) fn build_slot_headers(
     let mut header_buf: Vec<u8> = Vec::with_capacity(caches.len() * SLOT_HEADER_BYTES);
     for (i, &write_slice) in write_slices.iter().enumerate() {
         let (slices_ptr, n_slices, _) = slot_states[i];
+        // Where the launch's first fresh token is read: the slot's tokens and
+        // the holes before them.
+        let fresh_pos = offsets[i] + caches[i].k_cache().chunked_lead_total();
         SlotHeaderHost {
             n_slices,
             write_slice,
             slices_ptr,
             position_map_ptr: pm_base_ptr + pm_byte_offsets[i] as u64,
-            // The deepest position this launch writes for the slot: its
-            // tokens, the holes before them, and the new tokens.
-            rope_rung: rope
-                .rung_for(offsets[i] + caches[i].k_cache().chunked_lead_total() + q_lens[i])?,
+            // The deepest position this launch writes for the slot: the first
+            // fresh one and the new tokens after it.
+            rope_rung: rope.rung_for(fresh_pos + q_lens[i])?,
+            fresh_pos: fresh_pos as u32,
         }
         .write(&mut header_buf);
     }

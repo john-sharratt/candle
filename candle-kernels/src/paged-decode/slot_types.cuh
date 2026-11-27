@@ -25,7 +25,13 @@
 //   [24..28) uint32_t rope_rung        (the sequence's RoPE rung: which of
 //                                        the launch's `RopeRungs` tables this
 //                                        slot rotates by; see rope_table.cuh)
-//   [28..32) uint32_t _pad
+//   [28..32) uint32_t fresh_pos        (the position the launch's first fresh
+//                                        token is read at: the slot's tokens
+//                                        plus every hole before them. Written
+//                                        by the prefill upload, which already
+//                                        knows it; the int8 prefill kernel
+//                                        rotates its queries and fresh keys
+//                                        from it. Decode headers carry 0.)
 //
 // TokenSlice (16 bytes, fixed stride):
 //   [0..2)   uint16_t offset
@@ -66,12 +72,13 @@ struct SlotHeader {
                                 // position_map: u32[total_tokens],
                                 // entry = (slice_idx << 16) | in_blk.
     uint32_t rope_rung;         // index into the launch's RopeRungs
-    uint32_t _pad;
+    uint32_t fresh_pos;         // position of the launch's first fresh token
 };
 static_assert(sizeof(SlotHeader) == 32, "SlotHeader must be 32 bytes");
 static_assert(offsetof(SlotHeader, slices_ptr) == 8, "SlotHeader.slices_ptr at 8");
 static_assert(offsetof(SlotHeader, position_map_ptr) == 16, "SlotHeader.position_map_ptr at 16");
 static_assert(offsetof(SlotHeader, rope_rung) == 24, "SlotHeader.rope_rung at 24");
+static_assert(offsetof(SlotHeader, fresh_pos) == 28, "SlotHeader.fresh_pos at 28");
 
 // Read the SlotHeader for a given slot index from the headers tensor.
 __device__ __forceinline__ const SlotHeader& get_slot_header(const uint8_t* headers, int slot_idx) {
@@ -154,36 +161,6 @@ __device__ __forceinline__ TokenSliceHdr load_token_slice(uint64_t slices_ptr, i
     h.meta = w.x;
     h.kvheads = w.y;
     return h;
-}
-
-// The position the token at cum-token index `t` is read at: its slice's RoPE
-// base, less the slice's skip, plus its cell — the position a key stored there
-// rotates by in every kernel, so a key rotated by it agrees with the decode's
-// across the slot's holes (`docs/placed_section_layout.md` §4.1). Needs the
-// prefill header's position_map (`resolve_pos`).
-//
-// Exact for a token the slot already held when the header was serialised, and
-// for the launch's first fresh token, whose slice's base follows only committed
-// chunks. A later writer chunk's base was taken before this launch filled the
-// ones ahead of it, so a fresh token is placed from the first fresh one
-// (`fresh_rope_base`), the run being contiguous: a hole is only ever left
-// between launches.
-template <int HD>
-__device__ __forceinline__ int token_rope_pos(const SlotHeader& slot_hdr, int t, int n_kv_head) {
-    int slice_idx, in_blk;
-    resolve_pos(slot_hdr, t, slice_idx, in_blk);
-    const TokenSliceHdr s = load_token_slice<HD>(slot_hdr.slices_ptr, slice_idx, n_kv_head);
-    return s.rope_base() - s.offset() + in_blk;
-}
-
-// The position of the launch's first fresh token, `prefix_len` — past every
-// hole before it. `prefix_len` itself when the launch brings no token.
-template <int HD>
-__device__ __forceinline__ int fresh_rope_base(
-    const SlotHeader& slot_hdr, int prefix_len, int kv_len, int n_kv_head)
-{
-    return (prefix_len < kv_len) ? token_rope_pos<HD>(slot_hdr, prefix_len, n_kv_head)
-                                 : prefix_len;
 }
 
 __device__ __forceinline__ uint16_t slice_offset(const uint8_t* slice) {

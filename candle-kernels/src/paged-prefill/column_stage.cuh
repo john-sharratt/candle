@@ -22,9 +22,12 @@
 // window pair. Otherwise each column is decoded on its own.
 //
 // K is rotated by the sequence's RoPE rung at its own position — a sealed
-// key at its slice's RoPE base plus its cell (`token_rope_pos`), a fresh one
-// at its offset from the first fresh token's (`fresh_rope_base`), so a key past
-// a hole in the slot is rotated where the slot reads it — and quantised
+// key at its bound slice's RoPE base, less the slice's skip, plus its cell
+// (`WarpPalette::pos_base`), a fresh one at its offset from the header's
+// `fresh_pos`, so a key past a hole in the slot is rotated where the slot
+// reads it. Neither costs a load: the slice's header is read by the bind
+// that the column's decode needs anyway, and `fresh_pos` comes from the
+// host. The key is then quantised
 // per (column, 32-dim window) against the window's absmax over the warp; V is
 // handed over as FP32 for the caller to store as FP16.
 // ============================================================================
@@ -54,6 +57,10 @@ namespace prefill_int8 {
 /// The reciprocal is `__frcp_rn(scl)`, taken once at the bind: the quad
 /// decode scales by it, and taken per window it was a slow-path branch
 /// between every window's reads — a block boundary no read is hoisted across.
+///
+/// `pos_base` is the slice's RoPE base less its skip (`rope − offset`): the
+/// position of a token at cell `in_blk` is `pos_base + in_blk`, holes and all
+/// (`docs/placed_section_layout.md` §4.1).
 template <int HEAD_DIM>
 struct WarpPalette {
     static constexpr int MAP_WORDS = HEAD_DIM / 16;
@@ -62,6 +69,7 @@ struct WarpPalette {
     float rscl[2][N_PALETTE];
     int fmt[2][N_PALETTE];
     int bb[2][N_PALETTE];
+    int pos_base;
     uint8_t rank[2][HEAD_DIM];
     uint32_t map[2][MAP_WORDS];
 };
@@ -76,8 +84,11 @@ __device__ __forceinline__ void i8_bind_slice(
     constexpr int N_WIN = HEAD_DIM / 32;
     constexpr int MAP_WORDS = WarpPalette<HEAD_DIM>::MAP_WORDS;
     static_assert(MAP_WORDS <= 32, "a palette map must fit one word per lane");
-    const uint8_t* sl = get_slice<HEAD_DIM>(slot_hdr.slices_ptr, sl_idx, n_kv_head);
-    const uint8_t* head = get_head<HEAD_DIM>(sl, kv_head_idx);
+    // The slice's whole 16 bytes in one load: the record pointer the decode
+    // needs and the RoPE base and skip its keys' positions follow from.
+    const TokenSliceHdr s = load_token_slice<HEAD_DIM>(slot_hdr.slices_ptr, sl_idx, n_kv_head);
+    const uint8_t* head = get_head_at<HEAD_DIM>(s.kvheads_ptr(), kv_head_idx);
+    if (lane == 0) wp.pos_base = s.rope_base() - s.offset();
     if (lane < 2 * N_PALETTE) {
         const int side = lane / N_PALETTE;
         const int p = lane - side * N_PALETTE;
@@ -165,8 +176,8 @@ __device__ __forceinline__ float i8_arena_elem_of(
 /// is past the sequence and stages as zeros.
 ///
 /// `fresh_pos` is the position the first fresh token (`prefix_len`) is read
-/// at (`fresh_rope_base`); a fresh column is rotated at its offset from it, a
-/// sealed one at its slice's (`token_rope_pos`).
+/// at (`SlotHeader::fresh_pos`); a fresh column is rotated at its offset from
+/// it, a sealed one at its bound slice's `pos_base` plus its cell.
 template <typename QT, int HEAD_DIM, typename KSink, typename VSink>
 __device__ __forceinline__ void i8_stage_quad(
     WarpPalette<HEAD_DIM>& wp, int& bound_slice, const SlotHeader& slot_hdr,
@@ -229,7 +240,7 @@ __device__ __forceinline__ void i8_stage_quad(
                 quad = true;
                 // The four are consecutive cells of one slice, so they sit at
                 // consecutive positions from the first one's.
-                const int kpos0 = token_rope_pos<HEAD_DIM>(slot_hdr, pos0, n_kv_head);
+                const int kpos0 = wp.pos_base + ib0;
                 // Windows wa and wb's four tokens of rank table `side` at quad
                 // `ib0` — `i8_pal_rank_load4` for each, with the one branch
                 // it takes (a quant block's aligned quad or unaligned run)
@@ -310,6 +321,8 @@ __device__ __forceinline__ void i8_stage_quad(
         // K stays in registers for RoPE (pairs (w, w + N_WIN/2) are
         // in-thread); V goes straight to its sink, one dim at a time.
         float x[N_WIN];
+        // The position the column's key is rotated at (unused past kv_len).
+        int at = 0;
         if (pos >= kv_len) {
             #pragma unroll
             for (int w = 0; w < N_WIN; ++w) {
@@ -318,6 +331,7 @@ __device__ __forceinline__ void i8_stage_quad(
             }
         } else if (pos >= prefix_len) {
             const int tok = pos - prefix_len; // fresh token index
+            at = fresh_pos + tok;
             const QT* kr = k_packed + ((int64_t)(q_start + tok) * n_kv_head + kv_head_idx) * HEAD_DIM;
             const QT* vr = v_packed + ((int64_t)(q_start + tok) * n_kv_head + kv_head_idx) * HEAD_DIM;
             #pragma unroll
@@ -330,6 +344,7 @@ __device__ __forceinline__ void i8_stage_quad(
             resolve_pos(slot_hdr, pos, sl_idx, in_blk);
             if (sl_idx != bound_slice)
                 i8_bind_slice<HEAD_DIM>(wp, bound_slice, slot_hdr, sl_idx, n_kv_head, kv_head_idx, lane);
+            at = wp.pos_base + in_blk;
             const int fk = wp.fmt[0][0];
             const int fv = wp.fmt[1][0];
             bool uniform = true;
@@ -393,12 +408,8 @@ __device__ __forceinline__ void i8_stage_quad(
                 }
             }
         }
-        if (pos < kv_len) {
-            const int at = (pos >= prefix_len)
-                ? fresh_pos + (pos - prefix_len)
-                : token_rope_pos<HEAD_DIM>(slot_hdr, pos, n_kv_head);
+        if (pos < kv_len)
             i8_rope_row<N_WIN>(x, at, lane, rope_interleaved, rope);
-        }
         #pragma unroll
         for (int w = 0; w < N_WIN; ++w) stage_k_window(tt, w, x[w]);
     }

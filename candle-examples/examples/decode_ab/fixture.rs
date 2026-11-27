@@ -413,6 +413,7 @@ impl Fixture {
                 slices_ptr,
                 position_map_ptr: 0,
                 rope_rung: self.rope_rungs.rung_for(len + 1)?,
+                fresh_pos: 0,
             }
             .write(&mut hdr_all);
         }

@@ -9,8 +9,15 @@
 //! [8..16)  u64 slices_ptr        device address of the slice table
 //! [16..24) u64 position_map_ptr  prefill and glue only; 0 in decode
 //! [24..28) u32 rope_rung         the sequence's RoPE rung
-//! [28..32) u32 pad
+//! [28..32) u32 fresh_pos         prefill only: the launch's first fresh
+//!                                token's position; 0 in decode and glue
 //! ```
+//!
+//! **`fresh_pos` is the host's, so the kernel looks nothing up.** The int8
+//! prefill kernel rotates its queries and fresh keys from it, and the
+//! position — the slot's tokens plus every hole before them
+//! (`docs/placed_section_layout.md` §4.1) — is what the upload already has in
+//! hand to pick the rung.
 //!
 //! **The rung is the sequence's own.** Every attention kernel maps a CTA to one
 //! sequence and reads its rotation from that sequence's header, so a launch
@@ -31,6 +38,7 @@ pub struct SlotHeaderHost {
     pub slices_ptr: u64,
     pub position_map_ptr: u64,
     pub rope_rung: u32,
+    pub fresh_pos: u32,
 }
 
 impl SlotHeaderHost {
@@ -41,7 +49,7 @@ impl SlotHeaderHost {
         buf.extend_from_slice(&self.slices_ptr.to_le_bytes());
         buf.extend_from_slice(&self.position_map_ptr.to_le_bytes());
         buf.extend_from_slice(&self.rope_rung.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&self.fresh_pos.to_le_bytes());
     }
 }
 
@@ -59,11 +67,12 @@ mod tests {
             slices_ptr: 0x100f_0e0d_0c0b_0a09,
             position_map_ptr: 0x1817_1615_1413_1211,
             rope_rung: 0x1c1b_1a19,
+            fresh_pos: 0x201f_1e1d,
         };
         let mut buf = Vec::new();
         h.write(&mut buf);
         assert_eq!(buf.len(), SLOT_HEADER_BYTES);
-        let want: Vec<u8> = (1u8..=28).chain([0, 0, 0, 0]).collect();
+        let want: Vec<u8> = (1u8..=32).collect();
         assert_eq!(buf, want);
     }
 }

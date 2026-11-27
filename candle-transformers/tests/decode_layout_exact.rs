@@ -669,6 +669,7 @@ fn decode_one(
         slices_ptr,
         position_map_ptr: pm_ptr,
         rope_rung: 0,
+        fresh_pos: 0,
     }
     .write(&mut hdr);
     let generation = stager.begin_generation();
@@ -992,6 +993,7 @@ fn decode_live(
         slices_ptr: ptr,
         position_map_ptr: 0,
         rope_rung: 0,
+        fresh_pos: 0,
     }
     .write(&mut hdr);
     let mut pinned = generation.alloc(hdr.len())?;
@@ -1090,6 +1092,7 @@ fn decode_one_production(
         slices_ptr: ptr,
         position_map_ptr: 0,
         rope_rung: 0,
+        fresh_pos: 0,
     }
     .write(&mut hdr);
     let mut pinned = generation.alloc(hdr.len())?;

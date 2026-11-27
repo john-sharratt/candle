@@ -663,11 +663,16 @@ assigns it.
   numbers. Every caller that today reads one as the other is found and told
   which it means; a query's position is the frontier, never the token count.
 - **Every kernel rotates by the slices' positions.** Decode rotates its query
-  at the write slice's `rope + len`; prefill rotates each query and each key it
-  reads at its slice's `rope_base − offset + cell` (`token_rope_pos`), so a
-  token prefilled past a hole and the same token decoded see the context at
-  the same distances. The float fallback rotates at the positions the slot's
-  runs give (`ChunkedKvBacking::position_runs`, `token_position`).
+  at the write slice's `rope + len`; prefill rotates each sealed key it reads
+  at its slice's `rope_base − offset + cell`, and each query and fresh key at
+  its offset from the header's `fresh_pos` — the slot's tokens plus its holes,
+  written by the host
+  (`SlotHeaderHost::fresh_pos`) — so a token prefilled past a hole and the
+  same token decoded see the context at the same distances. Neither costs
+  the kernel a lookup: the slice's base is read by the bind its decode
+  already does (`WarpPalette::pos_base`). Holes have no cells, so no kernel's
+  softmax ever sees one. The float fallback rotates at the positions the
+  slot's runs give (`ChunkedKvBacking::position_runs`, `token_position`).
 - **Prefill addresses by token, decode by position.** The prefill kernel's
   causal bound, key count and position map are in tokens, so the QSA page
   table a prefill row reads names each page by its first token

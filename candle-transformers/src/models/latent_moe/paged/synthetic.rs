@@ -266,6 +266,7 @@ impl SyntheticSlots {
                 // layer's frequencies are chosen by its kind, per launch.
                 position_map_ptr: 0,
                 rope_rung: 0,
+                fresh_pos: 0,
             }
             .write(&mut header_bytes);
         }

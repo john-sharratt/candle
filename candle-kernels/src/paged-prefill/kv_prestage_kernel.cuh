@@ -80,7 +80,7 @@ paged_prefill_kv_prestage_kernel(
     __half* const vv = kv_stage_v<HEAD_DIM>(stage, n_kv_head) + row0 * HEAD_DIM;
 
     // Where the first fresh token is read, as the attention kernel places it.
-    const int fresh_pos = fresh_rope_base<HEAD_DIM>(slot_hdr, prefix_len, kv_len, n_kv_head);
+    const int fresh_pos = (int)slot_hdr.fresh_pos;
 
     int bound_slice = -1;
     i8_stage_quad<QT, HEAD_DIM>(

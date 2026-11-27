@@ -260,6 +260,7 @@ fn decode_one_slot(
         slices_ptr: slices_base_ptr,
         position_map_ptr: pm_base_ptr,
         rope_rung: 0,
+        fresh_pos: 0,
     }
     .write(&mut hdr);
 

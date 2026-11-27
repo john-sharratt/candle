@@ -425,6 +425,7 @@ fn decode_launch(
             slices_ptr: s.slices_ptr,
             position_map_ptr: s.pm_ptr,
             rope_rung: *rung,
+            fresh_pos: 0,
         }
         .write(&mut hdr);
     }
@@ -1077,6 +1078,7 @@ fn glue_launch(
             slices_ptr: s.slices_ptr,
             position_map_ptr: s.pm_ptr,
             rope_rung: *rung,
+            fresh_pos: 0,
         }
         .write(&mut hdr);
         cu.push(((i + 1) * GLUE_TOKENS) as u32);

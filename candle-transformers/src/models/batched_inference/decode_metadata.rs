@@ -272,6 +272,7 @@ impl BatchedInferenceSession {
                     slices_ptr: ptr,
                     position_map_ptr: 0,
                     rope_rung: rungs[i],
+                    fresh_pos: 0,
                 }
                 .write(&mut all_headers);
             }

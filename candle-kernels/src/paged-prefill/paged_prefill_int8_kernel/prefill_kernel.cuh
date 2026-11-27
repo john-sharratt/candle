@@ -86,8 +86,9 @@ paged_prefill_int8_kernel(
     int prefix_len = kv_len - q_len;
     if (prefix_len < 0) prefix_len = 0;
     // Where the first fresh token is read: the slot's token count plus the
-    // holes before it. The fresh tokens follow it contiguously.
-    const int fresh_pos = fresh_rope_base<HEAD_DIM>(slot_hdr, prefix_len, kv_len, n_kv_head);
+    // holes before it, as the host wrote it. The fresh tokens follow it
+    // contiguously.
+    const int fresh_pos = (int)slot_hdr.fresh_pos;
 
     int hpg = n_head / n_kv_head;
     if (hpg <= 0) hpg = 1;

@@ -422,6 +422,7 @@ fn run_glue(
         slices_ptr,
         position_map_ptr: pm_ptr,
         rope_rung: 0,
+        fresh_pos: 0,
     }
     .write(&mut hdr);
     let generation = stager.begin_generation();
@@ -977,6 +978,7 @@ fn run_glue_batched(
             slices_ptr: sb.slices_ptr,
             position_map_ptr: sb.pm_ptr,
             rope_rung: 0,
+            fresh_pos: 0,
         }
         .write(&mut hdr);
         acc += sb.glue as u32;

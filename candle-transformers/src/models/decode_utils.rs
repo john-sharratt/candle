@@ -324,6 +324,7 @@ mod cuda_tests {
             slices_ptr: ptr,
             position_map_ptr: 0,
             rope_rung: 0,
+            fresh_pos: 0,
         }
         .write(&mut hdr);
         let mut pinned = gen.alloc(SLOT_HEADER_BYTES)?;
@@ -432,6 +433,7 @@ mod cuda_tests {
             slices_ptr: ptr,
             position_map_ptr: 0,
             rope_rung: 0,
+            fresh_pos: 0,
         }
         .write(&mut hdr);
         let mut pinned = gen.alloc(SLOT_HEADER_BYTES)?;
