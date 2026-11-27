@@ -67,22 +67,29 @@ pub struct FilesSet {
 impl FilesSet {
     /// Fold one scan's fresh scores into the momentum: every member decays by
     /// `beta`, a scored section gains its fresh score, and a section left
-    /// under `min_momentum` leaves the set. A pinned set's knowledge base is
-    /// not provenance's, and folds nothing.
+    /// under `min_momentum` leaves the set. A pinned set folds the scores of
+    /// its pinned sections alone: the pin says what is placed, and the scan
+    /// still ranks it, so the range opens in relevance order
+    /// (`docs/placed_section_layout.md` §3.2). An empty pin folds nothing.
     pub fn observe(
         &mut self,
         fresh: &[(GroupId, Vec<FreshSection>)],
         beta: f32,
         min_momentum: f32,
     ) {
-        if self.pin != FilesPin::Free {
-            return;
-        }
+        let pinned: Option<BTreeSet<SectionKey>> = match &self.pin {
+            FilesPin::Free => None,
+            FilesPin::Empty => return,
+            FilesPin::Only(sections) => Some(sections.iter().copied().collect()),
+        };
         for s in self.members.values_mut() {
             s.momentum *= 1.0 - beta;
         }
         for (kind, scores) in fresh {
             for &(section, file, score) in scores {
+                if pinned.as_ref().is_some_and(|p| !p.contains(&section)) {
+                    continue;
+                }
                 let entry = self.members.entry(section).or_insert(SectionStanding {
                     momentum: 0.0,
                     kind: *kind,
@@ -377,19 +384,31 @@ mod tests {
         assert!(!set.evicted.contains(&a));
     }
 
-    /// **A pinned set folds no scan.**
+    /// **A pinned set folds the scan for its pinned sections alone, and an
+    /// empty pin folds nothing**: pinned to 9, the scan's 9 (500) is ranked and
+    /// its 1 (500) is not.
     #[test]
-    fn a_pinned_set_folds_no_scan() {
+    fn a_pinned_set_folds_the_scan_for_its_own_sections() {
+        let scan = [(
+            kind(1),
+            vec![
+                (SectionKey(1), FileKey(1), 500.0),
+                (SectionKey(9), FileKey(2), 500.0),
+            ],
+        )];
         let mut set = FilesSet {
             pin: FilesPin::Only(vec![SectionKey(9)]),
             ..FilesSet::default()
         };
-        set.observe(
-            &[(kind(1), vec![(SectionKey(1), FileKey(1), 500.0)])],
-            0.2,
-            100.0,
-        );
-        assert!(set.members.is_empty());
+        set.observe(&scan, 0.2, 100.0);
+        assert_eq!(set.momentum_of(SectionKey(9)), Some(500.0));
+        assert_eq!(set.momentum_of(SectionKey(1)), None);
+        let mut empty = FilesSet {
+            pin: FilesPin::Empty,
+            ..FilesSet::default()
+        };
+        empty.observe(&scan, 0.2, 100.0);
+        assert!(empty.members.is_empty());
     }
 
     /// **A file the turn read waits until the next question — every section

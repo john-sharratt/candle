@@ -186,7 +186,11 @@ every other section, and sink back from the question as they stop being read.
 
 - **The first token reads the best order there is.** At a request's start the
   range is ordered by the files set's momentum (§3.4's boundary fold), the
-  mandatory files among the rest (`files_splice`, `RangeScope::reorder`).
+  mandatory files among the rest (`files_splice`, `RangeScope::reorder`). A
+  pinned knowledge base — a test's, a calibration's frame — is ordered the
+  same way: the pin says what is placed, its sections never leave, and the
+  scan still folds their scores (`FilesSet::observe`), so it too opens with
+  the question's strongest beside it.
 - **The decode reorders it every step.** Each section's **momentum** is an
   exponential average of its per-step hit rate on the 0–1000 band
   (`files/scope/momentum.rs`): taken whole the first step that rates it, so
