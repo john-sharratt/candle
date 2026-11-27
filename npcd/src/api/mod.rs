@@ -44,8 +44,8 @@ use tokio::sync::RwLock;
 use tokio::task::spawn_blocking;
 use web::auth::session::Identity;
 
+use candle_conversation::persistence::cast;
 use candle_conversation::persistence::kept_objects::IMPORT_BODY_LIMIT;
-use candle_conversation::persistence::record::NpcPayload;
 use web::auth::{Role, Roles};
 
 use crate::accounts::{self, account_of, Accounts, NameError, PatchError};
@@ -410,6 +410,7 @@ mod record_routes;
 mod route_table;
 #[cfg(test)]
 mod tests_accounts;
+mod tests_cast_backup;
 #[cfg(test)]
 mod tests_characters;
 #[cfg(test)]

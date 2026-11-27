@@ -11,40 +11,72 @@
 
 use super::*;
 
-/// The caller's characters. No total is returned — see §8.3.
-/// `GET /v1/npcs/export` — the whole cast as records, for a backup.
+/// `GET /v1/npcs/export` — the whole cast, for a backup: every character's
+/// record and the portraits they name, as the cast export
+/// (`candle_conversation::persistence::cast`, JSON Lines).
 ///
 /// Every character, live and tombstoned, so a restore into a fresh substrate
 /// brings the cast back with its ids intact. Admin-only and owner-blind: this
 /// is an operator backup of the entire deployment, not a per-account listing.
+///
+/// **The portraits come with it.** A portrait is a blob only a character's
+/// record names, so the kept objects' export never carries one; answered with
+/// the records alone, a backup taken here and restored lost every portrait.
+/// Read off the async runtime: it reads every portrait.
 pub(super) async fn export_npcs(State(s): State<Arc<Authored>>) -> Response {
     let npcs = s.npcs.view().export_all();
-    Json(json!({ "count": npcs.len(), "npcs": npcs })).into_response()
+    let shared = s.npcs.substrate();
+    match spawn_blocking(move || cast::export(npcs, |name| Ok(shared.blob(name)?), now_ms())).await
+    {
+        Ok(Ok(text)) => ([(header::CONTENT_TYPE, "application/x-ndjson")], text).into_response(),
+        Ok(Err(e)) => {
+            tracing::error!(error = ?e, "cast export failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("export failed: {e}"),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("export failed: {e}"),
+        )
+            .into_response(),
+    }
 }
 
-/// `POST /v1/npcs/import` — restore backed-up character records.
-///
-/// Body is `{"npcs": [<record>, …]}` from [`export_npcs`]. Each record is
-/// written verbatim (id, owner, revision, last place preserved). The characters
-/// come back on the next daemon start, which loads them from the log and spawns
-/// their loops — the ordinary boot path, so nothing here needs to embody them.
-pub(super) async fn import_npcs(
-    State(s): State<Arc<Authored>>,
-    Json(body): Json<Value>,
-) -> Response {
-    let payloads: Vec<NpcPayload> =
-        match serde_json::from_value(body.get("npcs").cloned().unwrap_or(Value::Null)) {
-            Ok(v) => v,
-            Err(e) => {
-                return (StatusCode::BAD_REQUEST, format!("bad npcs payload: {e}")).into_response()
-            }
-        };
-    match s.npcs.import(payloads) {
-        Ok(n) => {
+/// `POST /v1/npcs/import` — restore a cast export ([`export_npcs`]): its
+/// portraits, then each character's record verbatim (id, owner, revision, last
+/// place preserved). The characters come back on the next daemon start, which
+/// loads them from the log and spawns their loops — the ordinary boot path, so
+/// nothing here needs to embody them.
+pub(super) async fn import_npcs(State(s): State<Arc<Authored>>, body: String) -> Response {
+    let shared = s.npcs.substrate();
+    let npcs = Arc::clone(&s);
+    let done = spawn_blocking(move || {
+        cast::import(
+            &body,
+            |bytes| Ok(shared.put_blob(bytes)?),
+            |records| {
+                npcs.npcs
+                    .import(records)
+                    .map_err(|e| anyhow::anyhow!("writing the characters: {e:?}"))?;
+                Ok(())
+            },
+        )
+    })
+    .await;
+    match done {
+        Ok(Ok(report)) => {
             // A restored record may be suspended.
             suspend::follow(&s);
-            Json(json!({ "imported": n })).into_response()
+            Json(json!({
+                "imported": report.npcs_written,
+                "portraits": report.blobs_written,
+            }))
+            .into_response()
         }
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, format!("import refused: {e}")).into_response(),
         Err(e) => {
             tracing::error!(error = ?e, "npc import failed");
             (StatusCode::INTERNAL_SERVER_ERROR, "import failed").into_response()
