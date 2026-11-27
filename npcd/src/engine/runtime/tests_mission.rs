@@ -36,7 +36,11 @@ pub(super) mod tests {
             !hosted.sim(|s| s.missions.is_on_mission("m1")),
             "a routine was drawn"
         );
-        assert!(rt.at_rest(&hosted, "m1"), "free, with nothing asked of it");
+        assert_eq!(
+            rt.rest_of(&hosted, "m1"),
+            Some(Rest::Unburdened),
+            "free, with nothing asked of it"
+        );
         hosted.with_sim(|s| {
             s.missions.post(
                 Mission::new(
@@ -665,6 +669,65 @@ pub(super) mod tests {
             rt.scheduler.begin_tick(1).is_none(),
             "a drone at rest thought"
         );
+    }
+
+    /// **A drone waits on its task at rest**: carrying a mission whose task
+    /// runs, it is held and takes no turn, tells nobody it has come to rest,
+    /// and is woken the moment the task asks it something.
+    #[tokio::test]
+    async fn a_drone_waits_on_its_running_task_at_rest() {
+        use crate::engine::event::{EventKind, Salience};
+        use crate::engine::mission::{Mission, Origin, Todo};
+        use crate::engine::mission_gen::world::Draw;
+        use crate::engine::zen_task::{Task, TASK_STEP};
+        let rt = vaulted();
+        let hosted = rt.hosted.get(WORLD).unwrap();
+        hosted.with_sim(|s| s.missions.set_routines(Vec::new(), Draw::None));
+        embody(&rt, 1, "m1", "green-room");
+        waiting(&rt, 1);
+        hosted.with_sim(|s| {
+            s.missions.post(
+                Mission::new(
+                    "Find why recall picks the wrong guides — in `candle`.",
+                    vec![Todo::new(TASK_STEP)],
+                    Origin::Lodged { by: "op".into() },
+                ),
+                Some("m1"),
+            )
+        });
+        rt.assign_work(&hosted);
+        rt.spawn_character(1);
+        assert!(!rt.scheduler.is_resting(1), "its task is not started yet");
+
+        hosted.with_sim(|s| {
+            s.missions.set_task(
+                "m1",
+                Task {
+                    handle: "task:mission-1-0/find-why".into(),
+                    heard: 0,
+                    running: true,
+                },
+            )
+        });
+        rt.settle_rest(1);
+        assert!(rt.scheduler.is_resting(1), "its task runs");
+        assert_eq!(rt.rest_of(&hosted, "m1"), Some(Rest::OnItsTask));
+        rt.scheduler.deliver(
+            1,
+            0,
+            Salience::URGENT,
+            EventKind::Description {
+                text: "Something in the warren moved.".into(),
+            },
+        );
+        assert!(
+            rt.scheduler.begin_tick(1).is_none(),
+            "a drone waiting on its task thought"
+        );
+
+        hosted.with_sim(|s| s.missions.task_running("m1", false));
+        rt.settle_rest(1);
+        assert!(!rt.scheduler.is_resting(1), "the task asks it something");
     }
 
     /// **Work for a suspended drone waits for it.** It is no hand: a mission

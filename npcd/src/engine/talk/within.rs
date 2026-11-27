@@ -9,8 +9,12 @@
 //! cooling is its own — a person is never made to wait on the character's
 //! cooldowns, and the character's are never stamped by a conversation (§8).
 
+use crate::engine::invoke_body::Invokable;
 use crate::engine::talk::key::Party;
 use crate::engine::tools::Within;
+
+/// The device verb a conversation's post is made with.
+const INVOKE: &str = "invoke";
 
 /// Every act a conversation may take, in the order the decision reads them.
 pub const ACTS: &[&str] = &[
@@ -41,6 +45,11 @@ pub const MISSION_ACTS: &[&str] = &[
 /// goodbye.
 pub const TALKING_ACTS: &[&str] = &["reply", "message_someone_else"];
 
+/// The act a character that gives orders posts work with, offered on a thread
+/// to a party with standing over it: what the conversation decides is a
+/// Drone's, it posts there.
+pub const POSTING: &str = "order_post";
+
 /// The conversation a turn belongs to, as the turn's catalog needs it.
 #[derive(Clone, Debug)]
 pub struct OnThread<'a> {
@@ -53,6 +62,10 @@ pub struct OnThread<'a> {
     /// Whether the party may change the character's mission: its owner or an
     /// authorizer, outside the thrash cooldown (§7.2).
     pub may_change_mission: bool,
+    /// Whether the party may have the character post work on the order table:
+    /// its owner or an authorizer. Offered only where the character posts
+    /// there at all.
+    pub may_post: bool,
     /// The brief of the mission a character that takes orders carries — what
     /// its ordered mission acts name (`engine::agenda::ordered`). `None` for
     /// one carrying nothing, or keeping an agenda.
@@ -71,13 +84,32 @@ impl Within {
         let others = |names: &[String]| -> Vec<String> {
             names.iter().filter(|n| **n != party).cloned().collect()
         };
-        let allow: Vec<String> = ACTS
+        let mut allow: Vec<String> = ACTS
             .iter()
             .filter(|act| **act != "remind" || !thread.party.is_person())
             .filter(|act| thread.may_change_mission || !MISSION_ACTS.contains(act))
             .filter(|act| !thread.capped || !TALKING_ACTS.contains(act))
             .map(|act| act.to_string())
             .collect();
+        // Work is posted by `invoke`-ing the order table's `order_post`, so it
+        // is offered where the character can reach one and the party may have
+        // it post — that address alone.
+        let posting: Vec<Invokable> = match thread.may_post {
+            true => self
+                .invokable
+                .iter()
+                .filter(|i| i.act == POSTING)
+                .cloned()
+                .collect(),
+            false => Vec::new(),
+        };
+        // Both names: an address is offered only where its own act would be
+        // (`tools::performable`), and the act, being routed, is never a
+        // compiled call of its own.
+        let posts = !posting.is_empty();
+        if posts {
+            allow.extend([INVOKE.to_string(), POSTING.to_string()]);
+        }
         // A character keeping an agenda is offered priorities; one without
         // them takes orders, and its mission acts are the ordered ones, over
         // the one mission it carries.
@@ -105,6 +137,19 @@ impl Within {
             agenda,
             priorities,
             orders,
+            invokable: posting,
+            jobs: match posts {
+                true => self.jobs.clone(),
+                false => Vec::new(),
+            },
+            takers: match posts {
+                true => self.takers.clone(),
+                false => Vec::new(),
+            },
+            job_params: match posts {
+                true => self.job_params.clone(),
+                false => Vec::new(),
+            },
             cooling: thread.cooling.clone(),
             allow: Some(allow),
             ..Within::default()
@@ -115,7 +160,7 @@ impl Within {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::tools::{specs_within, Catalog};
+    use crate::engine::tools::{specs_within, Catalog, JobParam};
     use crate::sim::agenda::Priority;
 
     /// Zen, standing in a room with somebody in it, on the phone to Mira and
@@ -158,10 +203,63 @@ mod tests {
             name,
             owed: Vec::new(),
             may_change_mission: false,
+            may_post: false,
             carried: None,
             capped: false,
             cooling: Vec::new(),
         }
+    }
+
+    /// **A conversation that gives orders posts them**: the owner on the phone
+    /// to a character that can reach the order table is offered `invoke` at
+    /// the table's `order_post` and no other address, with the world's
+    /// standing jobs and the arguments each brings; a stranger is not, and
+    /// nor is anyone where the character posts nothing.
+    #[test]
+    fn its_owner_has_a_character_that_gives_orders_post_from_the_phone() {
+        let post = "http://local/command/order-table~0/order_post";
+        let party = mira();
+        let mut zen = zen();
+        zen.invokable = vec![
+            Invokable::new(
+                "http://local/command/order-table~0/order_results",
+                "order_results",
+            ),
+            Invokable::new(post, POSTING),
+        ];
+        zen.jobs = vec!["coding-task".into()];
+        zen.takers = vec!["Wick".into(), "Umbra".into()];
+        zen.job_params = vec![(
+            "coding-task".into(),
+            vec![JobParam {
+                name: "what".into(),
+                choices: Vec::new(),
+            }],
+        )];
+        let owner = OnThread {
+            may_post: true,
+            ..thread(&party, "Mira")
+        };
+        let within = zen.on_thread(&owner);
+        assert_eq!(within.invokable, [Invokable::new(post, POSTING)]);
+        assert_eq!(within.jobs, ["coding-task"]);
+        assert_eq!(within.takers, ["Wick", "Umbra"]);
+        assert_eq!(within.job_params, zen.job_params);
+        let specs = specs_within(Catalog::THREAD.mode, &within);
+        let invoke = specs.iter().find(|s| s.name == INVOKE).expect("offered");
+        assert_eq!(invoke.params[0].enum_values, Some(vec![post.to_string()]));
+
+        let offers_invoke = |w: &Within| {
+            specs_within(Catalog::THREAD.mode, w)
+                .iter()
+                .any(|s| s.name == INVOKE)
+        };
+        let stranger = zen.on_thread(&thread(&party, "Mira"));
+        assert!(!offers_invoke(&stranger));
+        assert!(stranger.jobs.is_empty() && stranger.invokable.is_empty());
+        let mut nowhere = zen.clone();
+        nowhere.invokable.clear();
+        assert!(!offers_invoke(&nowhere.on_thread(&owner)));
     }
 
     #[test]

@@ -7,7 +7,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::terminator::Terminator;
+use super::blank::BlankBans;
+use super::terminator::{Blank, Terminator};
 use super::trie::TokenTrie;
 use super::value_rule::ValueRule;
 use super::vocab::TokenId;
@@ -81,6 +82,17 @@ pub struct FreeTextLimits {
     pub boost: f32,
     /// Force-close unconditionally at this count. Always set (runaway guard).
     pub forced_after: u32,
+    /// A string value that may not close blank: a required field's. While
+    /// nothing but whitespace is written inside it, the tokens that would close
+    /// it are not offered ([`super::blank`]).
+    ///
+    /// **A required value written empty is no value.** A table that had
+    /// planned its faults in its reasoning wrote `"faults": ""`; Zen, asked to
+    /// post a job with its arguments, wrote `"args": ""` on nine trials of
+    /// twelve, three of them straight after spelling out what the arguments
+    /// were. Lifting the presence penalty at the value's first token made the
+    /// empty value less likely and no less possible.
+    pub nonblank: bool,
 }
 
 /// The most tokens one JSON string value in a tool call may run to before the
@@ -105,6 +117,7 @@ impl FreeTextLimits {
             ramp_len: 0,
             boost: 0.0,
             forced_after: MAX_STRING_VALUE_TOKENS,
+            nonblank: false,
         }
     }
 
@@ -116,6 +129,7 @@ impl FreeTextLimits {
             ramp_len: 0,
             boost: 0.0,
             forced_after: 1024,
+            nonblank: false,
         }
     }
 
@@ -128,6 +142,7 @@ impl FreeTextLimits {
             ramp_len: forced_after,
             boost: 4.0,
             forced_after,
+            nonblank: false,
         }
     }
 
@@ -139,6 +154,7 @@ impl FreeTextLimits {
             ramp_len: 0,
             boost: 0.0,
             forced_after,
+            nonblank: false,
         }
     }
 
@@ -170,6 +186,9 @@ pub struct StencilTree {
     /// What the tree knows of a call: which spans write which field, and which
     /// branches choose its tool.
     marks: TreeMarks,
+    /// The tokens of this tree's vocabulary that would close a required
+    /// string value blank ([`BlankBans`]).
+    blank: Arc<BlankBans>,
 }
 
 /// Which spans write which argument field, which branches choose a call's
@@ -202,6 +221,7 @@ impl StencilTree {
         label: String,
         bail: Vec<TokenId>,
         marks: TreeMarks,
+        blank: Arc<BlankBans>,
     ) -> Self {
         StencilTree {
             nodes,
@@ -211,7 +231,14 @@ impl StencilTree {
             label,
             bail,
             marks,
+            blank,
         }
+    }
+
+    /// The tokens that would close a required string value standing at
+    /// `blank` — left out of that step's draw.
+    pub fn blank_bans(&self, blank: Blank) -> &Arc<[TokenId]> {
+        self.blank.at(blank)
     }
 
     /// The field the span at `node` writes, when it is an argument's value.
@@ -326,6 +353,7 @@ mod tests {
             ramp_len: 20,
             boost: 8.0,
             forced_after: 30,
+            nonblank: false,
         };
         assert_eq!(l.boost_at(5), 0.0); // before ramp
         assert_eq!(l.boost_at(10), 0.0); // at start

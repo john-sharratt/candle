@@ -40,6 +40,17 @@ pub(super) struct FieldMemo {
     pub(super) values: HashMap<(usize, Owed), (String, SpecId)>,
 }
 
+/// The values of `p` when they decide the rest of its object — an enum that
+/// requires or brings fields per value ([`Param::requires`], [`Param::shapes`])
+/// and cannot be `null`.
+fn decider(p: &Param) -> Option<&[String]> {
+    let decides = !p.requires.is_empty() || !p.shapes.is_empty();
+    match (decides, &p.enum_values, p.nullable) {
+        (true, Some(values), false) => Some(values),
+        _ => None,
+    }
+}
+
 /// Whether the grammar can begin a value of this schema — offer every way it
 /// can start as an arm. Only such elements can be guided inside an array: the
 /// arms carry the separator and the opening together (`, {`, `, true`), and an
@@ -121,30 +132,30 @@ impl<'a> ToolTreeBuilder<'a> {
     ) -> Result<SpecId, BuildError> {
         let required: Vec<&Param> = params.iter().filter(|p| p.required).collect();
         let optional: Vec<&Param> = params.iter().filter(|p| !p.required).collect();
-        self.build_sequence(&required, &optional, true, close, end)
+        let owed = Owed::initial(&optional);
+        self.build_sequence(&required, &optional, true, owed, close, end)
     }
 
-    /// `required` in order, then the gates over `optional`, through `close` to
-    /// `end`. `first` says no field precedes them.
+    /// `required` in order, then the gates over `optional` from standing
+    /// `owed`, through `close` to `end`. `first` says no field precedes them.
     pub(super) fn build_sequence(
         &mut self,
         required: &[&Param],
         optional: &[&Param],
         first: bool,
+        owed: Owed,
         close: &str,
         end: SpecId,
     ) -> Result<SpecId, BuildError> {
         let Some((&p, rest)) = required.split_first() else {
             // Optional gates start with emitted_any = (a required field precedes them).
             let mut memo = FieldMemo::default();
-            let owed = Owed::initial(optional);
             return self.opt_gates(optional, 0, !first, owed, close, end, &mut memo);
         };
-        let decides = !p.requires.is_empty() || !p.shapes.is_empty();
-        if let (true, Some(values), false) = (decides, &p.enum_values, p.nullable) {
+        if let Some(values) = decider(p) {
             return self.build_discriminated(p, values, rest, optional, first, close, end);
         }
-        let tail = self.build_sequence(rest, optional, false, close, end)?;
+        let tail = self.build_sequence(rest, optional, false, owed, close, end)?;
         let (leadin, value) = self.build_value(p, tail)?;
         Ok(self.spec.push(NodeSpec::Static {
             text: self.key(p, first, &leadin),
@@ -172,6 +183,30 @@ impl<'a> ToolTreeBuilder<'a> {
         close: &str,
         end: SpecId,
     ) -> Result<SpecId, BuildError> {
+        let arms = self.value_tails(p, values, rest, optional, None, close, end)?;
+        let branch = self.decided_branch(p, arms);
+        Ok(self.spec.push(NodeSpec::Static {
+            text: self.key(p, first, ""),
+            next: branch,
+        }))
+    }
+
+    /// Each of `values` with the tail it goes on to: `rest`, then the fields
+    /// the value requires moved from `optional` to required and the fields it
+    /// brings, then the gates over what is left of `optional` — from `owed`
+    /// when the field is itself one of the optionals already standing, or
+    /// afresh over what is left.
+    #[allow(clippy::too_many_arguments)]
+    fn value_tails(
+        &mut self,
+        p: &Param,
+        values: &[String],
+        rest: &[&Param],
+        optional: &[&Param],
+        owed: Option<Owed>,
+        close: &str,
+        end: SpecId,
+    ) -> Result<Vec<(String, SpecId)>, BuildError> {
         let mut tails: HashMap<String, SpecId> = HashMap::new();
         let mut arms: Vec<(String, SpecId)> = Vec::with_capacity(values.len());
         for value in values {
@@ -216,14 +251,27 @@ impl<'a> ToolTreeBuilder<'a> {
                         .copied()
                         .filter(|o| !wanted(o) && !brings(o))
                         .collect();
-                    let tail =
-                        self.build_sequence(&now_required, &still_optional, false, close, end)?;
+                    let standing = owed.unwrap_or_else(|| Owed::initial(&still_optional));
+                    let tail = self.build_sequence(
+                        &now_required,
+                        &still_optional,
+                        false,
+                        standing,
+                        close,
+                        end,
+                    )?;
                     tails.insert(key, tail);
                     tail
                 }
             };
             arms.push((value.clone(), tail));
         }
+        Ok(arms)
+    }
+
+    /// The branch over a deciding field's values, each arm going on to its own
+    /// tail ([`Self::value_tails`]), recorded as `p`'s choice.
+    fn decided_branch(&mut self, p: &Param, arms: Vec<(String, SpecId)>) -> SpecId {
         let (branch, values) = match self.env.style {
             // The end marker rides on each arm, as in [`Self::build_value`].
             CallStyle::FunctionBlock => {
@@ -258,10 +306,7 @@ impl<'a> ToolTreeBuilder<'a> {
             }
         };
         self.chosen(branch, p, values);
-        Ok(self.spec.push(NodeSpec::Static {
-            text: self.key(p, first, ""),
-            next: branch,
-        }))
+        branch
     }
 
     /// What opens one argument, up to the point its value begins.
@@ -326,8 +371,31 @@ impl<'a> ToolTreeBuilder<'a> {
                     // Include optional j: a field is emitted, so everything
                     // after has emitted_any = true.
                     let settled = owed.after(p.pick);
-                    let after = self.opt_gates(opts, j + 1, true, settled, close, end, memo)?;
-                    let built = self.build_value(p, after)?;
+                    let built = match decider(p) {
+                        // **An optional field whose values decide the rest
+                        // brings their fields too.** Only a required one did,
+                        // so `order_post`'s optional `job` brought nothing:
+                        // Zen chose `coding-task` and wrote a `brief`, never
+                        // `what` or `repository`, and the post was refused.
+                        Some(values) => {
+                            let later: Vec<&Param> = opts[j + 1..].to_vec();
+                            let arms = self.value_tails(
+                                p,
+                                values,
+                                &[],
+                                &later,
+                                Some(settled),
+                                close,
+                                end,
+                            )?;
+                            (String::new(), self.decided_branch(p, arms))
+                        }
+                        None => {
+                            let after =
+                                self.opt_gates(opts, j + 1, true, settled, close, end, memo)?;
+                            self.build_value(p, after)?
+                        }
+                    };
                     memo.values.insert((j, owed), built.clone());
                     built
                 }

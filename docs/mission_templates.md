@@ -59,6 +59,7 @@ id:       kebab-case, unique within its world's library
 brief:    "Put {title} on {device}."          # {param} substitution
 steps:    [ "go to {room}", "put {title} on {device}" ]
 params:   [ title, device, room ]              # NEW — names that may appear in {…}
+choices:  { room: [ the front room, the den ] } # NEW — the values a param may take
 grants:   [ act, ... ]                         # NEW — lent while carried (Mission.grants)
 work:     { writes, reads, checks } | null     # NEW — for doc/coding/deploy templates
 ```
@@ -68,6 +69,14 @@ work:     { writes, reads, checks } | null     # NEW — for doc/coding/deploy t
   that references a `{name}` it did not declare, or that is issued with a declared
   parameter left unfilled, is refused rather than carried with a hole in it. A
   template with no `params` is exactly a routine as it works today.
+- **`choices`** names, for a parameter the world can list in full, every value
+  it may take: the grammar offers them as the field's enum
+  (`JobParam::choices`), and a post naming another is refused with the list.
+  A parameter not in `choices` takes any words. Each key must be a declared
+  parameter, and its values distinct and non-empty. The moon's `coding-task`
+  names its repositories: free, `repository` came back as `candle_repository`
+  and `candle-repo`, and Zen told the Creator it could find no "candle
+  repository" at all.
 - **`grants` / `work`** are the mission fields of the same name, carried through
   onto the produced `Mission` (`Mission::granting`, `Mission::with_work`), so a
   template can lend world-building acts or name a document to write with its
@@ -84,17 +93,37 @@ gate.
 ## 3. Issuing a template
 
 `order_post` already posts a standing job whole by name (`{job}`); it gains one
-thing — arguments:
+thing — arguments, **each its own field of the call**:
 
 ```
-order_post { job: "play-a-film", args: { title: "Dune", device: "the living room TV", room: "the front room" } }
+order_post { job: "play-a-film", title: "Dune", device: "the living room TV", room: "the front room" }
 ```
 
-`post` (`order_table.rs`) fetches the routine by id as it does now, substitutes
-`args` into its brief and steps, and posts the concrete mission. A missing or
-undeclared argument is refused there, with the parameter named, the same way a
-post with no step is refused today. No new post form and no new concept: a
-template *is* a job, and this is the job path taking arguments.
+`job` is a choice among the world's standing jobs, and choosing one brings that
+job's declared parameters as required fields after it (`tools::DECLARED`,
+built from `Within::job_params`), the same way `message`'s `via` brings its
+`to`: the call cannot close until each is written, and a required free string
+cannot close blank (`FreeTextLimits::nonblank`). `job` is optional, since a post
+is a job or a brief, and an optional enum brings its value's fields as a
+required one does (`docs/stencil_tree.md`). Reached through the order table's
+device, the post carries those fields beside the act's own
+(`tools::declared_fields`, `effector/station.rs`): the route once kept only
+`order_post`'s params, and a `coding-task` written with its `what` arrived
+without it. `post` (`order_table.rs`)
+fetches the routine by id, reads each parameter from its field, substitutes
+them into its brief and steps, and posts the concrete mission. A missing or
+blank argument is refused there, with the parameter named, the same way a post
+with no step is refused today. A brief posted without steps is refused with the
+world's standing jobs named, since its work may be one of theirs: told only to
+give it steps, Zen posted a repository's research as a brief three times and
+never named `coding-task`. No new post form and no new concept: a template
+*is* a job, and this is the job path taking arguments.
+
+**Not one `args` string.** The arguments were first one free field of
+`name: value` lines. The grammar could not hold it to its format — a value rule
+admits no escape, so the newline between two arguments could not be written
+under one — and nothing told the model the parameter names: asked to post
+`coding-task`, Zen wrote `args: ""` on nine trials of twelve.
 
 ---
 
@@ -245,6 +274,17 @@ act on.
 **A suspended carrier is held still here too**: its task acts are refused, and
 its task is neither asked after nor posted to until it is let go.
 
+**A carrier rests while its task runs.** A task started is running
+(`Task::running`), and every look sets it from the standing, news or none. A
+drone whose mission waits on its task is held at rest as a drone with nothing
+to carry is (`Missions::waits_on_task`, `Runtime::rest_of` → `Rest::OnItsTask`):
+no turn, nothing resident on the card, and no "come to rest" told to anyone.
+The look that finds the task asking, stuck, failed or done clears it, and the
+next moment wakes the drone with the news on its handset. Awake through the
+wait, Wick read every era of the record at a desk, wrote a guide of its own into
+the mind, and nudged the running worker six times with a cause it had made up —
+once to "commit the finding".
+
 ---
 
 ## 8. Build order
@@ -256,7 +296,7 @@ with no GPU and no live devices, fully unit-testable.
    substitution, and the foldered loader (walk `missions/`). Tests assert raw
    produced briefs and step lists, refusal of an undeclared or unfilled
    parameter, and refusal of a malformed file.
-2. **Issue.** `order_post { job, args }` — substitute and post; refuse a bad
+2. **Issue.** `order_post { job, <its parameters> }` — substitute and post; refuse a bad
    argument at the table.
 3. **Authoring.** The built-in `write-template` workflow + a `routine-parses`
    check, and the `mission_write` act that renders the template and opens an

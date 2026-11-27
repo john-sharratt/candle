@@ -219,6 +219,23 @@ impl Missions {
         }
     }
 
+    /// Note whether the body's mission's task was found running, asking
+    /// nothing — [`Task::running`].
+    pub fn task_running(&mut self, body: &str, running: bool) {
+        if let Some(t) = self.active.get_mut(body).and_then(|m| m.task.as_mut()) {
+            t.running = running;
+        }
+    }
+
+    /// Whether the body's mission waits on its task: started, and running
+    /// with nothing asked of the body — so the body rests until it changes.
+    pub fn waits_on_task(&self, body: &str) -> bool {
+        self.active
+            .get(body)
+            .and_then(|m| m.task.as_ref())
+            .is_some_and(|t| t.running)
+    }
+
     /// Whether what `digest` names is news from the body's mission's task:
     /// `false` when the news last passed on said it too, or there is no task.
     /// Nothing is noted — [`Self::heard`] notes it once it is passed on.

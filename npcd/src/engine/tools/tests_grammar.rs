@@ -20,6 +20,49 @@ pub(super) mod tests {
 
     use crate::engine::talk::within::OnThread;
 
+    use serde_json::{json, Value};
+
+    use crate::engine::mission_gen::world::{Draw, Routine};
+    use crate::sim::missions::Missions;
+
+    /// **What the job chosen brings is carried with it**: a post of
+    /// `coding-task` names its `what` and `repository` as fields of the call;
+    /// a job that takes nothing, or none at all, brings nothing; and no other
+    /// act is read for them.
+    #[test]
+    fn a_chosen_job_names_the_fields_it_brings() {
+        let mut missions = Missions::default();
+        missions.set_routines(
+            vec![
+                Routine {
+                    id: "coding-task".into(),
+                    brief: "{what} in {repository}".into(),
+                    steps: vec!["see the task through".into()],
+                    params: vec!["what".into(), "repository".into()],
+                    ..Default::default()
+                },
+                Routine {
+                    id: "ward-shift".into(),
+                    brief: "Take a shift.".into(),
+                    steps: vec!["go".into()],
+                    ..Default::default()
+                },
+            ],
+            Draw::None,
+        );
+        let fields = |v: Value| v.as_object().unwrap().clone();
+        let coding = fields(json!({"job": "coding-task", "what": "w", "repository": "candle"}));
+        assert_eq!(
+            declared_fields("order_post", &coding, &missions),
+            ["what", "repository"]
+        );
+        let shift = fields(json!({"job": "ward-shift"}));
+        assert!(declared_fields("order_post", &shift, &missions).is_empty());
+        let brief = fields(json!({"brief": "b", "steps": "s"}));
+        assert!(declared_fields("order_post", &brief, &missions).is_empty());
+        assert!(declared_fields("report_done", &coding, &missions).is_empty());
+    }
+
     /// **A turn of plain words is offered no act**, whatever its selection
     /// listed before.
     #[test]
@@ -682,6 +725,7 @@ pub(super) mod tests {
             name: "friend-0",
             owed: vec!["the garden report".into(), "the key".into()],
             may_change_mission: true,
+            may_post: false,
             carried: None,
             capped: false,
             cooling: Vec::new(),
@@ -845,6 +889,90 @@ pub(super) mod tests {
         assert!(!specs_within(Mode::Physical, &within)
             .iter()
             .any(|s| s.name == "message"));
+    }
+
+    /// A brought field as a test reads it: its name, whether it is required,
+    /// its bound, and the values it may take.
+    type Field<'a> = (&'a str, bool, Option<u32>, Option<Vec<String>>);
+
+    /// **A standing job brings its own arguments**: chosen as `order_post`'s
+    /// `job`, `coding-task` brings `what`, required and bounded as an act's
+    /// string is, and `repository`, required and one of the repositories the
+    /// world names; a job that takes none brings nothing; and there is no free
+    /// `args` field to write them into.
+    #[test]
+    fn a_standing_job_brings_its_own_arguments() {
+        let mut within = Within::among(&[]);
+        within.jobs = vec!["coding-task".into(), "ward-shift".into()];
+        within.takers = vec!["Wick".into(), "Umbra".into()];
+        within.job_params = vec![(
+            "coding-task".into(),
+            vec![
+                JobParam {
+                    name: "what".into(),
+                    choices: Vec::new(),
+                },
+                JobParam {
+                    name: "repository".into(),
+                    choices: vec!["candle".into(), "battle-mind".into()],
+                },
+            ],
+        )];
+        let params = stencil_params(by_name("order_post").unwrap(), &within);
+        let names: Vec<&str> = params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["job", "brief", "steps", "for"]);
+        assert_eq!(
+            params[3].enum_values,
+            Some(vec!["Wick".to_string(), "Umbra".to_string()]),
+            "`for` is one of those who take the orders"
+        );
+        let mut alone = within.clone();
+        alone.takers.clear();
+        let names: Vec<String> = stencil_params(by_name("order_post").unwrap(), &alone)
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["job", "brief", "steps"], "nobody to name, no `for`");
+        let job = &params[0];
+        assert_eq!(
+            job.enum_values.as_deref().unwrap(),
+            ["coding-task".to_string(), "ward-shift".to_string()]
+        );
+        let brought: Vec<(&str, Vec<Field>)> = job
+            .shapes
+            .iter()
+            .map(|(v, fields)| {
+                (
+                    v.as_str(),
+                    fields
+                        .iter()
+                        .map(|f| {
+                            (
+                                f.name.as_str(),
+                                f.required,
+                                f.max_tokens,
+                                f.enum_values.clone(),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            brought,
+            [(
+                "coding-task",
+                vec![
+                    ("what", true, Some(ACT_VALUE_TOKENS), None),
+                    (
+                        "repository",
+                        true,
+                        None,
+                        Some(vec!["candle".to_string(), "battle-mind".to_string()])
+                    )
+                ]
+            )]
+        );
     }
 
     /// **A fold cannot be sent without somewhere to fold to.** The refusal

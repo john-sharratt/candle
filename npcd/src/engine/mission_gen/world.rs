@@ -59,6 +59,15 @@ pub struct Routine {
     /// which is issued and drawn exactly as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub params: Vec<String>,
+    /// The values a parameter may take, by its name, for one the world can
+    /// name in full. A parameter not here takes any words.
+    ///
+    /// **The world names what exists.** `coding-task`'s `repository` was free,
+    /// and Zen, told nowhere which repositories there are, posted
+    /// `candle_repository` and `candle-repo` — and on the phone told the
+    /// Creator it could find no "candle repository" at all.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub choices: BTreeMap<String, Vec<String>>,
     /// The world-building acts the carrier is lent while it carries this — a
     /// standing mission's own ([`Mission::grants`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -283,6 +292,17 @@ impl Routine {
                     value.trim()
                 ));
             }
+            if let Some(may) = self.choices.get(p) {
+                if !may.iter().any(|c| c == value.trim()) {
+                    let named: Vec<String> = may.iter().map(|c| format!("`{c}`")).collect();
+                    return Err(format!(
+                        "the mission `{}` takes `{p}` as one of {}, and \"{}\" is none of them",
+                        self.id,
+                        named.join(", "),
+                        value.trim()
+                    ));
+                }
+            }
         }
         Ok(Filled {
             brief: substitute(&self.brief, args)?,
@@ -411,6 +431,21 @@ fn check_routine(file: &str, r: &Routine) -> Result<(), String> {
         }
     }
     let declared: BTreeSet<&str> = r.params.iter().map(String::as_str).collect();
+    for (p, may) in &r.choices {
+        if !declared.contains(p.as_str()) {
+            return Err(format!(
+                "{file}: routine `{}` gives choices for `{p}`, which is not one of its params",
+                r.id
+            ));
+        }
+        let distinct: BTreeSet<&str> = may.iter().map(|c| c.trim()).collect();
+        if may.is_empty() || distinct.contains("") || distinct.len() != may.len() {
+            return Err(format!(
+                "{file}: routine `{}` needs its choices for `{p}` to be distinct and none empty",
+                r.id
+            ));
+        }
+    }
     let mut used = placeholders(&r.brief);
     for s in &r.steps {
         used.extend(placeholders(s.text()));
@@ -659,6 +694,56 @@ routines:
             ["go to the front room", "put Dune on the living room TV"]
         );
         assert!(filled.steps.iter().all(|s| !s.critical));
+    }
+
+    /// **A parameter the world names in full takes one of its names**: any
+    /// other is refused, naming them; choices for something that is no
+    /// parameter, or with an empty or repeated one, refuse the file.
+    #[test]
+    fn a_parameter_with_choices_takes_one_of_them() {
+        let r = Routine::parse(
+            "coding-task.yaml",
+            "id: coding-task\nbrief: '{what} in `{repository}`.'\nsteps: [see the task through]\nparams: [what, repository]\nchoices:\n  repository: [candle, battle-mind]\n",
+        )
+        .unwrap();
+        let filled = r
+            .fill(&args(&[("what", "Find why"), ("repository", "candle")]))
+            .unwrap();
+        assert_eq!(filled.brief, "Find why in `candle`.");
+        assert_eq!(
+            r.fill(&args(&[
+                ("what", "Find why"),
+                ("repository", "candle-repo")
+            ]))
+            .unwrap_err(),
+            "the mission `coding-task` takes `repository` as one of `candle`, `battle-mind`, and \
+             \"candle-repo\" is none of them"
+        );
+        for (choices, why) in [
+            (
+                "  room: [a]\n",
+                "missions/w.yaml: routine `a` gives choices for `room`, which is not one of its \
+                 params",
+            ),
+            (
+                "  x: []\n",
+                "missions/w.yaml: routine `a` needs its choices for `x` to be distinct and none \
+                 empty",
+            ),
+            (
+                "  x: [p, p]\n",
+                "missions/w.yaml: routine `a` needs its choices for `x` to be distinct and none \
+                 empty",
+            ),
+        ] {
+            let yaml = format!(
+                "routines:\n  - id: a\n    brief: '{{x}}'\n    steps: [s]\n    params: [x]\n    choices:\n    {choices}"
+            );
+            assert_eq!(
+                WorldMissions::parse("missions/w.yaml", &yaml).unwrap_err(),
+                why
+            );
+        }
     }
 
     /// **A step flagged `critical` carries that flag through fill and onto the

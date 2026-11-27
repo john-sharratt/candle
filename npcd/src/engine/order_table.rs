@@ -25,19 +25,13 @@ fn text(args: &Map<String, Value>, key: &str) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
-/// The arguments of a template post — the `args` string, one `name: value` to a
-/// line — as a map. A line with no `:` is skipped, and the fill then names the
-/// argument it did not get.
-fn parse_args(args: &Map<String, Value>) -> BTreeMap<String, String> {
-    let Some(s) = text(args, "args") else {
-        return BTreeMap::new();
-    };
-    s.lines()
-        .filter_map(|line| {
-            let (k, v) = line.split_once(':')?;
-            let (k, v) = (k.trim(), v.trim());
-            (!k.is_empty()).then(|| (k.to_string(), v.to_string()))
-        })
+/// The arguments of a post of a standing job taking `params`: each its own
+/// field of the call, by its name, as choosing the job brought it
+/// (`tools::DECLARED`). One not given is left out, and the fill names it.
+fn job_args(params: &[String], args: &Map<String, Value>) -> BTreeMap<String, String> {
+    params
+        .iter()
+        .filter_map(|p| Some((p.clone(), text(args, p)?)))
         .collect()
 }
 
@@ -51,6 +45,22 @@ fn sentence(mut e: String) -> String {
         e.push('.');
     }
     e
+}
+
+/// The close of a refusal to a post that gave no work: the world's standing
+/// jobs by name, or nothing when it has none.
+fn or_a_job(hosted: &Hosted) -> String {
+    let jobs: Vec<String> = hosted.sim(|s| {
+        s.missions
+            .routines()
+            .iter()
+            .map(|r| format!("`{}`", r.id))
+            .collect()
+    });
+    match jobs.is_empty() {
+        true => String::new(),
+        false => format!(", or a standing `job` by name: {}", jobs.join(", ")),
+    }
 }
 
 /// Whether `body` is somebody a world gives orders to: a character's body —
@@ -75,26 +85,16 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
                     "There is no standing job called \"{id}\" to post."
                 ));
             };
-            match routine.fill(&parse_args(args)) {
+            match routine.fill(&job_args(&routine.params, args)) {
                 Ok(filled) => filled,
                 Err(e) => return Outcome::Refused(sentence(e)),
             }
         }
         None => {
+            // What to give, said where it is read: in the refusal, with the
+            // standing jobs by name.
+            let or_job = or_a_job(hosted);
             let Some(brief) = text(args, "brief") else {
-                // What to give, said where it is read: in the refusal, with
-                // the standing jobs by name.
-                let jobs: Vec<String> = hosted.sim(|s| {
-                    s.missions
-                        .routines()
-                        .iter()
-                        .map(|r| format!("`{}`", r.id))
-                        .collect()
-                });
-                let or_job = match jobs.is_empty() {
-                    true => String::new(),
-                    false => format!(", or a standing `job` by name: {}", jobs.join(", ")),
-                };
                 return Outcome::Refused(format!(
                     "You meant to post a mission, but did not say what is to be done. Give a \
                      `brief` and its `steps`{or_job}."
@@ -108,13 +108,16 @@ pub fn post(hosted: &Hosted, body: &str, args: &Map<String, Value>) -> Outcome {
                         .collect()
                 })
                 .unwrap_or_default();
+            // **A brief with no steps may be a standing job's work.** Told
+            // only to give it steps, Zen posted a repository's research as a
+            // brief three times over and never named `coding-task`, the one
+            // job that lends a Drone the acts that reach a repository.
             if steps.is_empty() {
-                return Outcome::Refused(
+                return Outcome::Refused(format!(
                     "Give it at least one step, one to a line, that whoever carries it can be \
                      seen to do — \"go to the ward room\", \"scan the sensor panel and read what \
-                     state it is in\"."
-                        .into(),
-                );
+                     state it is in\"{or_job}."
+                ));
             }
             Filled {
                 brief,
@@ -247,7 +250,7 @@ fn hands(hosted: &Hosted) -> usize {
 }
 
 /// The names of the characters who take orders here.
-fn order_takers(hosted: &Hosted) -> Vec<String> {
+pub(crate) fn order_takers(hosted: &Hosted) -> Vec<String> {
     hosted
         .read(|w| {
             w.actors()
@@ -587,6 +590,19 @@ mod tests {
                     .into()
             )
         );
+        assert_eq!(
+            post(
+                &h,
+                "zen",
+                &args(json!({"brief": "Research the ward rota."}))
+            ),
+            Outcome::Refused(
+                "Give it at least one step, one to a line, that whoever carries it can be seen \
+                 to do — \"go to the ward room\", \"scan the sensor panel and read what state it \
+                 is in\", or a standing `job` by name: `ward-shift`."
+                    .into()
+            )
+        );
         assert!(post(&h, "zen", &args(json!({"job": "ward-shift"}))).happened());
         let m = h
             .with_sim(|s| s.missions.collect("wick", &Facts::default()).cloned())
@@ -611,9 +627,9 @@ mod tests {
         );
     }
 
-    /// **A standing job that takes arguments is filled when it is posted** — its
-    /// `{name}`s replaced in the brief and steps — and a missing argument is
-    /// refused by name.
+    /// **A standing job that takes arguments is filled when it is posted** —
+    /// each argument its own field of the call, its `{name}`s replaced in the
+    /// brief and steps — and a missing or blank argument is refused by name.
     #[test]
     fn a_job_is_posted_with_its_arguments() {
         let h = vault();
@@ -630,7 +646,8 @@ mod tests {
             "zen",
             &args(json!({
                 "job": "play-a-film",
-                "args": "title: Dune\ndevice: the living room TV"
+                "title": "Dune",
+                "device": "the living room TV"
             })),
         )
         .happened());
@@ -646,14 +663,17 @@ mod tests {
                 "go back to the table in the command room and report it"
             ]
         );
-        assert_eq!(
-            post(
-                &h,
-                "zen",
-                &args(json!({"job": "play-a-film", "args": "title: Dune"})),
-            ),
-            Outcome::Refused("The mission `play-a-film` needs an argument for `device`.".into())
-        );
+        for missing in [
+            json!({"job": "play-a-film", "title": "Dune"}),
+            json!({"job": "play-a-film", "title": "Dune", "device": "  "}),
+        ] {
+            assert_eq!(
+                post(&h, "zen", &args(missing)),
+                Outcome::Refused(
+                    "The mission `play-a-film` needs an argument for `device`.".into()
+                )
+            );
+        }
     }
 
     /// **What came back is read at the table, once**: the reports since the

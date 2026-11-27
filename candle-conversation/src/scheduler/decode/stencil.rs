@@ -318,7 +318,11 @@ impl Scheduler {
                 }
                 match state.pending_mask.take() {
                     Some(StepMask::Branch(set)) => configs[i].constrain_to(&set),
-                    Some(StepMask::Free { opens_value, .. }) => {
+                    Some(StepMask::Free {
+                        opens_value,
+                        barred,
+                        ..
+                    }) => {
                         // A free-text span decodes normally.  A think-steer span's
                         // `</think>` and EOS are both intercepted by the session's
                         // `observe` (the suppressed close drops the token and
@@ -337,6 +341,13 @@ impl Scheduler {
                                 .banned_tokens
                                 .extend(self.eos_tokens.iter().map(|&t| t as i32));
                             configs[i].unpenalized_step = true;
+                        }
+                        // A required value still blank may not draw the tokens
+                        // that would close it so (`stencil::blank`).
+                        if let Some(barred) = barred {
+                            configs[i]
+                                .banned_tokens
+                                .extend(barred.iter().map(|&t| t as i32));
                         }
                     }
                     Some(StepMask::Done) => {

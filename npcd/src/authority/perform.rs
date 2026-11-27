@@ -34,6 +34,7 @@ use crate::engine::experience::line::first_sentence;
 use crate::engine::loopguard::NUDGE;
 use crate::engine::mission::{Mission, StepOutcome};
 use crate::engine::runtime::{Recorded, Runtime, REFUSED};
+use crate::engine::talk::orders::posts_work;
 use crate::engine::{body, build, terminal, tools, zen_task};
 use crate::house;
 
@@ -557,6 +558,24 @@ impl Runtime {
         said: Option<&Voiced>,
         source: &ActSource,
     ) -> Performed {
+        // A conversation's post is checked again where it lands, as its
+        // mission acts are (`engine::talk::orders`).
+        if let ActSource::Talk { party } = source {
+            if let Some(why) = posts_work(act)
+                .then(|| self.talk_post_refused(npc, party))
+                .flatten()
+            {
+                return Performed {
+                    recorded: Recorded {
+                        feed: format!("{} {REFUSED} {why}", act.summary()),
+                        answer: why,
+                        landed: false,
+                        departing: false,
+                    },
+                    moved: false,
+                };
+            }
+        }
         let before = self.mission_mark(npc);
         let bodily = !(body::is_device(act.tool)
             || body::composes(act.tool)

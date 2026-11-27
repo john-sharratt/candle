@@ -30,6 +30,7 @@
 //! [`observe`]: StencilSession::observe
 
 mod answer_steps;
+mod blank;
 mod builder;
 mod call_so_far;
 mod compile;
@@ -93,7 +94,7 @@ pub use opening_call::OpeningCall;
 pub use session::{Observe, StencilAction, StencilSession};
 pub use sim::{lowest_arm_policy, simulate, Oracle, SimError, SimRun};
 pub use spec::{LabeledNode, LabeledTree, NodeSpec, SpecId, TreeSpec};
-pub use terminator::{Feed, Terminator, TerminatorState};
+pub use terminator::{Blank, Feed, Terminator, TerminatorState};
 pub use think::{compile_think_tree, ThinkMode, ThinkSteerEnvelope};
 pub use tool_call::{
     compile_action_loop, compile_action_loop_with_body, compile_invoke_body_tree,

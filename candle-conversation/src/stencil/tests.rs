@@ -730,6 +730,7 @@ fn forced_close_on_runaway_string() {
         ramp_len: 0,
         boost: 0.0,
         forced_after: 3,
+        nonblank: false,
     };
     let spec = StencilTreeBuilder::new("t")
         .root("v")
@@ -765,6 +766,7 @@ fn a_forced_close_writes_the_marker_its_terminator_would_have_consumed() {
         ramp_len: 0,
         boost: 0.0,
         forced_after: 3,
+        nonblank: false,
     };
     let spec = StencilTreeBuilder::new("t")
         .root("v")

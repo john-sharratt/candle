@@ -146,14 +146,15 @@ mod tests {
         assert_eq!(role(&h, &roles()), Role::User);
     }
 
-    /// **Zen, as npcd's drones call zend, is a user**: it starts tasks and
-    /// grants nothing.
+    /// **Zen, as npcd calls zend for it, is an admin**: its cluster terminal
+    /// reads the audit and what each machine runs and starts build and test
+    /// jobs, each of which is an admin's.
     #[test]
-    fn zens_service_identity_is_a_user() {
+    fn zens_service_identity_is_an_admin() {
         let mut h = HeaderMap::new();
         h.insert(USER, "service:zen".parse().unwrap());
         h.insert(PROVIDER, "service-key".parse().unwrap());
-        assert_eq!(role(&h, &roles()), Role::User);
+        assert_eq!(role(&h, &roles()), Role::Admin);
     }
 
     /// The role comes from the gateway's headers; a request without them is

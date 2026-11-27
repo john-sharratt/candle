@@ -137,8 +137,13 @@ other never end.
 whether its order-giver may author templates (`authoring`, off unless said);
 the moon's does not, and its one job is `coding-task`.
 
-**Drones get the long work**: a large coding task, anything that needs long
-reasoning or many turns overseen. Those missions grant the task acts.
+**Drones get the long work**: a large coding task, a question about the code
+to be researched in the repository and answered, anything that needs long
+reasoning or many turns overseen. Those missions grant the task acts. Zen's
+anchor once kept a Drone to code "written or mended" and forbade sending one
+"to look at something"; asked for read-only research on why recall chose the
+wrong guides, Zen took that as its own work and spent thirty turns on cluster
+acts that cannot reach a repository.
 
 ## 5. Terminals
 

@@ -112,12 +112,17 @@ impl ToolCallEnvelope {
     /// four-character `at` came out `8Qy` for `8QyN` on every call and was
     /// refused each time for its length. The field's bound is lifted by
     /// [`VALUE_DELIMITER_TOKENS`], still never above the envelope's.
+    ///
+    /// **A required field may not be written blank**
+    /// ([`FreeTextLimits::nonblank`]); an optional one may, since leaving it
+    /// out is how it is absent and an empty value is the model's to choose.
     pub(super) fn string_limits(&self, p: &Param) -> FreeTextLimits {
         FreeTextLimits {
             forced_after: p.max_tokens.map_or(self.max_string_tokens, |m| {
                 m.saturating_add(VALUE_DELIMITER_TOKENS)
                     .min(self.max_string_tokens)
             }),
+            nonblank: p.required,
             ..FreeTextLimits::json_string()
         }
     }

@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::blank::BlankBans;
 use super::encode_cache::EncodeCache;
 use super::error::BuildError;
 use super::spec::{NodeSpec, SpecId, TreeSpec};
@@ -47,6 +48,7 @@ pub fn compile(spec: &TreeSpec, vocab: &dyn Vocab) -> Result<StencilTree, BuildE
         spec.label.clone(),
         bail,
         marks,
+        BlankBans::of(vocab),
     ))
 }
 

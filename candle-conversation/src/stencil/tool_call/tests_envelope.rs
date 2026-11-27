@@ -441,6 +441,34 @@ pub(super) mod tests {
         }
     }
 
+    /// **A required string value may not be written blank; an optional one
+    /// may** — the JSON value's span carries it, in the order the builder
+    /// pushes a call's fields (back to front).
+    #[test]
+    fn a_required_string_is_held_nonblank() {
+        let tools = parse_tools(
+            r#"[{"name":"post","params":[
+                  {"name":"args","type":"string","required":true},
+                  {"name":"note","type":"string","required":false}
+            ]}]"#,
+        )
+        .unwrap();
+        let nonblank: Vec<bool> = compile_tool_call_tree(&tools, &ToolCallEnvelope::qwen3())
+            .unwrap()
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                NodeSpec::FreeText {
+                    term: Terminator::JsonStringValue,
+                    limits,
+                    ..
+                } => Some(limits.nonblank),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nonblank, [false, true]);
+    }
+
     /// The envelope the action loop uses: `close` carries no turn terminator,
     /// because the finishing arm does.
     pub(in super::super) fn loop_env() -> ToolCallEnvelope {

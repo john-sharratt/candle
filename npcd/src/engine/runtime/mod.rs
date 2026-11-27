@@ -116,6 +116,7 @@ use crate::engine::mission_gen;
 use crate::engine::mission_gen::config::Config;
 use crate::engine::mission_gen::gates::{life_voice, Form};
 use crate::engine::mission_gen::material::strip_calls;
+use crate::engine::order_table::order_takers;
 use crate::engine::people;
 use crate::engine::prompt::{self, Persona};
 use crate::engine::prose::{decode_call, CallAsk, WORK_BAND};
@@ -417,6 +418,8 @@ mod messages;
 mod mind_hold;
 mod missions;
 mod moments;
+#[cfg(test)]
+use moments::Rest;
 mod perceiving;
 mod persona;
 mod records;

@@ -370,8 +370,8 @@ pub(super) mod tests {
         rt.moment(&hosted);
         let told = waiting(&rt, 1);
         assert!(
-            told.iter()
-                .any(|l| l.starts_with("Wick has reported it done: Read the board")),
+            told.iter().any(|l| l
+                .starts_with("Wick has reported it done: Read the board. What Wick reported: \"two jobs stalled\"")),
             "{told:?}"
         );
     }
@@ -666,7 +666,22 @@ pub(super) mod tests {
             told.contains("Have a Drone read the panel.\nNothing you have posted"),
             "{told}"
         );
-        assert!(!still_asked("John", "x", None).contains("order table"));
+        assert!(
+            told.ends_with(
+                "until it is posted, nobody is doing it.\nDo it now: post it, if it is a Drone's \
+                 to carry, or else take the act that answers it yourself. Then tell John what \
+                 came of it — what you read, or that you could not. Telling them you are about \
+                 to is not an answer."
+            ),
+            "{told}"
+        );
+        assert_eq!(
+            still_asked("John", "Read the panel.", None),
+            "Still yours to do, and nothing comes before it: what John asked of you on the \
+             phone.\nRead the panel.\nDo it yourself, now, with the act that answers it, then \
+             tell John what came of it — what you read, or that you could not. Telling them you \
+             are about to is not an answer."
+        );
     }
 
     /// **The standing task is for the quiet turns, and the situation is not

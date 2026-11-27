@@ -30,7 +30,7 @@ JSON schema.
   &ToolCallEnvelope)` returns a `TreeSpec` (the dialect is the envelope);
   `TreeSpec::from_yaml(yaml)` is the YAML front-end; the builder's `build()`
   returns a `TreeSpec`; the simulator is `simulate` with `Oracle` and `SimRun`
-  (`sim.rs`); and `StencilAction::FreeDecode` carries `{ close_boost, opens_value }`.
+  (`sim.rs`); and `StencilAction::FreeDecode` carries `{ close_boost, opens_value, barred }`.
   `Terminator` also has `JsonStringValue`, `JsonValue`, `Never` and `Until`.
 - **Value sub-trees as shipped** (§8.3). Scalars (`integer`/`number`) and any
   container the grammar does not guide are one `FreeText{JsonValue}` span —
@@ -100,6 +100,13 @@ JSON schema.
   makes required). The effector's `invoke` uses it: `url` brings the `body` its
   address takes (`the_effector.md` §11), which is what lets one tree type every
   address a character can reach without a second compile per address.
+  - **An optional enum decides too.** Written, its value goes on to the fields
+    it brings and the fields it requires, then the gates over the optionals
+    after it, from the standing the object had reached (`builder::value_tails`
+    with an `Owed`); left out, the object goes on as if it had no shapes. Only a
+    required enum once decided: npcd's `order_post` takes `job` or a `brief`,
+    so `job` is optional, and choosing `coding-task` brought nothing — Zen
+    wrote a `brief` beside it and the post was refused for want of `what`.
   - **Equal shapes share one tail.** The spec is a DAG and the compile memoises on
     `(spec node, left context)`, so values whose field lists are equal point at
     one tail `SpecId` and lower it once. The tree grows with the number of
@@ -1127,6 +1134,7 @@ tested where it lives.
 | **A gate with no way on** | Every `Branch` has at least two ways on, or one and a spill (`compile.rs`). A choice among optionals ([`Pick`]) offers nothing past its last member while one is owed, so `opt_gates` can always pay; a gate left with one way on becomes a `Static`. |
 | **A value that cannot finish** | A `ValueRule` needs a finishable fixpoint: every state of the walk reaches a close through the vocabulary, or the rule is refused at compile time, not during a call. End tokens spell no value. |
 | **A value that never ends** | Every free span has `forced_after > 0`, refused at compile otherwise. A string's limit is `maxLength` in tokens plus its delimiters, and `MAX_STRING_VALUE_TOKENS` above that. |
+| **A required value written blank** | A required free string's span is `nonblank` (`FreeTextLimits`). While nothing but whitespace is written in it, the step leaves out of its draw the tokens that would close it there (`blank.rs`, one scan per vocabulary): before its opening quote the tokens that open and close at once (` ""`, `"",`), after it the tokens that close (`"`, `",`). The session reads where the value stands from its terminator (`TerminatorState::blank`) and hands them on as `StepMask::Free`'s `barred`. An optional string, a value under a rule, and every other terminator are untouched. Lifting the presence penalty at a value's first step made the empty value less likely and left it possible: a model that had planned a field wrote `""` for it anyway. |
 | **An array that runs on** | Arrays unroll to `maxItems`, at most `MAX_ARRAY_ELEMENTS`, and the last level writes only the close. `run_command`'s `args` stops at 24. |
 | **A turn that loops on calls** | `MAX_TOOL_CALLS_PER_TURN` bounds a turn. Across turns the repeat guard answers the same failing call with a warning, and an argument repeated past `FLAG_REPEATS` is refused before anything runs. |
 | **A heal that changes the decision** | A token that closes a value and carries more (`",`, `"]`) commits only its close, because the next node writes the rest. What it carried is kept (`carried`) and narrows the next branch to the arms that continue it, so the model is not asked again from a bare quote. A rest that leads no arm narrows nothing, so this can never empty a mask. |

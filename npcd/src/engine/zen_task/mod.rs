@@ -27,13 +27,22 @@ use crate::world::Hosted;
 pub use acts::{is_mine, TASK_ACTS};
 pub use step::{is_task_step, TASK_STEP};
 
-/// The task a carried mission drives, once started: its handle, and a digest
-/// of the news last posted to its carrier.
+/// The task a carried mission drives, once started: its handle, a digest of
+/// the news last posted to its carrier, and whether it was last seen running.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub handle: String,
     #[serde(default)]
     pub heard: u64,
+    /// Whether the task was running, asking nothing, when last asked after:
+    /// its carrier has nothing to do for it until that changes, and rests.
+    ///
+    /// **A carrier waiting on its task does not fill the wait.** Wick, its
+    /// research task started, read every era of the record at a desk, wrote a
+    /// guide of its own into the mind, and nudged the running worker six
+    /// times with a cause it had made up — once to "commit the finding".
+    #[serde(default)]
+    pub running: bool,
 }
 
 impl Within {
@@ -127,7 +136,8 @@ mod tests {
                 "drone",
                 Task {
                     handle: "task:mission-1-0/fix-door".into(),
-                    heard: 0
+                    heard: 0,
+                    running: true,
                 }
             ));
             assert!(s.missions.heard("drone", 42), "first news");
