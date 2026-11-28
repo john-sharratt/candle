@@ -400,10 +400,7 @@ pub(in super::super) fn apply_segments_build(
             }
             AssembledPiece::Hole(positions) => {
                 place_hole(ctx, &mut walker, *positions)?;
-                let mut c = DefaultHasher::new();
-                c.write_u8(6);
-                c.write_u64(*positions as u64);
-                contrib = c.finish();
+                contrib = hole_contrib(*positions);
             }
         }
         check_drift(ctx, &walker, &|| {

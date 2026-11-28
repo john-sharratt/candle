@@ -16,9 +16,12 @@
 //!   same turn changes form when a newer one arrives);
 //! - a glue run's tokens, its forward bridge, and — when it bridges — the piece
 //!   it attends into, since its K/V then depends on that piece too;
-//! - a hole's size. A hole is named as a forwarded piece is: every position
-//!   after it depends on it, so it is kept only while everything before it is,
-//!   and a slot is cut at the first hole that changed and walked from there.
+//! - a hole's size. A hole holds no K/V and is computed against nothing, so it
+//!   is named by its size alone and moves as a sealed piece does: a rebuild
+//!   keeps, puts in or takes out a hole where it stands, and the slot's leads
+//!   are laid from where the holes then are (`projection_assembler::apply`).
+//!   What follows a hole still reads it: a forwarded piece's chain includes
+//!   every hole before it.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
@@ -65,9 +68,11 @@ pub(super) fn chained_identities(pieces: &[AssembledPiece], reads: &PieceReads<'
 ///
 /// A sealed piece — section, turn, turn half — is borrowed K/V that may sit
 /// anywhere, so it is named by what it is alone: the same piece wherever the
-/// projection puts it. A forwarded piece — glue, the live user message — is
-/// K/V the slot computed against everything before it, so it keeps its
-/// `chained` identity and matches only where all that is unchanged.
+/// projection puts it. A hole is named by its size alone the same way: it
+/// holds nothing that depends on where it stands. A forwarded piece — glue,
+/// the live user message — is K/V the slot computed against everything before
+/// it, so it keeps its `chained` identity and matches only where all that is
+/// unchanged.
 pub(super) fn alignment_identities(
     pieces: &[AssembledPiece],
     chained: &[u64],
@@ -77,10 +82,10 @@ pub(super) fn alignment_identities(
         .iter()
         .zip(chained)
         .map(|(piece, &chain)| match piece {
-            AssembledPiece::Glue(_) | AssembledPiece::DeferredUser(_) | AssembledPiece::Hole(_) => {
+            AssembledPiece::Glue(_) | AssembledPiece::DeferredUser(_) => {
                 (chain, PieceKind::Forwarded)
             }
-            AssembledPiece::Section(_) | AssembledPiece::Turn { .. } => {
+            AssembledPiece::Section(_) | AssembledPiece::Turn { .. } | AssembledPiece::Hole(_) => {
                 let mut own = DefaultHasher::new();
                 write_piece(&mut own, piece, reads);
                 (own.finish(), PieceKind::Sealed)
@@ -257,6 +262,27 @@ mod tests {
             assert_eq!(before[i].1, PieceKind::Forwarded);
         }
         assert_ne!(before[0], after[0]);
+    }
+
+    /// **A hole is named by its size alone and moves as a sealed piece does**:
+    /// a change in front of it leaves it the same piece, a hole of another
+    /// size is another piece, and glue after it still reads it.
+    #[test]
+    fn a_hole_aligns_by_its_size_and_glue_after_it_reads_it() {
+        let hole = |n: usize| AssembledPiece::Hole(n);
+        let base = [section(1), hole(50), turn(3, 0), glue(&[1, 2])];
+        let before = aligned(&base);
+        let mut moved_front = base.clone();
+        moved_front[0] = section(2);
+        let after = aligned(&moved_front);
+        assert_eq!(before[1], after[1], "the hole kept its identity");
+        assert_eq!(before[1].1, PieceKind::Sealed);
+        let mut resized = base.clone();
+        resized[1] = hole(60);
+        let resized = aligned(&resized);
+        assert_ne!(before[1].0, resized[1].0, "another size is another hole");
+        assert_eq!(before[2], resized[2], "the turn after it is the same turn");
+        assert_ne!(before[3].0, resized[3].0, "the glue after it read the hole");
     }
 
     /// A glue run that bridges into a turn attends that turn, so replacing the

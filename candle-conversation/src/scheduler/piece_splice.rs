@@ -121,19 +121,6 @@ pub(super) fn plan_splice<E>(
         .find(|j| !pairs.iter().any(|&(_, w)| w == *j))
         .unwrap_or(wanted.len());
     pairs.retain(|&(_, w)| w < first_new_forwarded);
-    // A held forwarded piece the projection no longer keeps is cut at too. A
-    // hole holds no chunk of its own — it is the lead of the chunk after it —
-    // so an edit taking one out would splice an empty range in front of that
-    // chunk and leave the hole standing: every later position past the
-    // index by its width.
-    let first_gone_forwarded = held
-        .iter()
-        .enumerate()
-        .filter(|(_, h)| h.kind == PieceKind::Forwarded)
-        .map(|(i, _)| i)
-        .find(|i| !pairs.iter().any(|&(h, _)| h == *i))
-        .unwrap_or(held.len());
-    pairs.retain(|&(h, _)| h < first_gone_forwarded);
     if pairs.is_empty() {
         return Ok(SplicePlan::walk_all());
     }
@@ -332,24 +319,6 @@ mod tests {
         assert_eq!(p.cut_after, 1);
         assert!(p.edits.is_empty());
         assert_eq!(p.walk_from, 1, "the glue at 1 and all after it are walked");
-    }
-
-    /// **A held forwarded piece the projection drops is where the slot is
-    /// cut**: a hole holds no chunk of its own — it is the lead of the chunk
-    /// after it — so an edit taking it out would splice an empty range and
-    /// leave the hole standing. The gap a locked section left, filled by 60,
-    /// is cut at and walked; what came before it is kept.
-    #[test]
-    fn a_held_forwarded_piece_the_projection_drops_is_where_the_slot_is_cut() {
-        let p = plan(
-            &held(&[1, 2, 50, 3], 10, &[50]),
-            &wanted(&[1, 2, 60, 3], &[]),
-        );
-        assert_eq!((p.cut_after, p.walk_from), (2, 2));
-        assert!(p.edits.is_empty());
-        // Dropped with nothing in its place: the same cut.
-        let p = plan(&held(&[1, 2, 50, 3], 10, &[50]), &wanted(&[1, 2, 3], &[]));
-        assert_eq!((p.cut_after, p.walk_from), (2, 2));
     }
 
     /// A forwarded piece the slot already holds is kept: its chained identity

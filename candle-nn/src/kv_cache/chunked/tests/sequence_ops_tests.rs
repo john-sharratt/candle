@@ -2390,6 +2390,37 @@ mod tests {
             assert_eq!(backing.position_frontier(dst).unwrap(), 5 + 100 + 4 + 9 + 3);
         }
 
+        /// **A layout sets the slot's holes where it says they stand**: the
+        /// 100-position hole moves from before `b` to before `c` and a 7 is
+        /// left after the last block; `a` keeps the lead it had. A slot of
+        /// another length, or a block past it, is refused and nothing moves.
+        #[test]
+        fn a_layout_sets_the_holes_where_it_says() {
+            let backing = create_test_backing();
+            let a = piece(&backing, &[5]);
+            let b = piece(&backing, &[7]);
+            let c = piece(&backing, &[3]);
+            let dst = backing.alloc_sequence().expect("alloc dst");
+            backing.inject_sealed_at_tail(dst, &a).expect("inject a");
+            backing.push_position_gap(dst, 100).expect("hole");
+            backing.trim_empty_tail(dst).expect("trim");
+            backing.inject_sealed_at_tail(dst, &b).expect("inject b");
+            backing.inject_sealed_at_tail(dst, &c).expect("inject c");
+            assert_eq!(leads_of(&backing, dst), [0, 100, 0]);
+
+            backing
+                .set_position_leads(dst, 3, &[(1, 0), (2, 100)], 7)
+                .expect("set leads");
+            assert_eq!(leads_of(&backing, dst), [0, 0, 100]);
+            assert_eq!(backing.lead_total(dst).unwrap(), 107);
+            assert_eq!(backing.position_frontier(dst).unwrap(), 5 + 7 + 100 + 3 + 7);
+
+            assert!(backing.set_position_leads(dst, 4, &[], 0).is_err());
+            assert!(backing.set_position_leads(dst, 3, &[(3, 1)], 0).is_err());
+            assert_eq!(leads_of(&backing, dst), [0, 0, 100], "nothing moved");
+            assert_eq!(backing.lead_total(dst).unwrap(), 107);
+        }
+
         /// The writer's chunks are not sealed history, and a splice refuses
         /// them rather than moving chunks a kernel writes into.
         #[test]

@@ -14,6 +14,7 @@ pub(super) mod tests {
 
     use crate::projection::{ResolvedSection, TimelineId};
 
+    use super::super::apply::leads_of;
     use super::super::tests_fixtures::tests::{generated_seg, section_seg, turn_seg};
 
     /// The island cache's retention contract: an entry survives exactly
@@ -187,6 +188,36 @@ pub(super) mod tests {
             walked.write_u64(c);
             assert_eq!(r.prefix_h.finish(), walked.finish());
         }
+    }
+
+    /// **Each hole is the lead of the first block after it**: holes that stand
+    /// together lead the same block, a piece's later blocks lead nothing from
+    /// here, the holes after the last block are pending, and a piece that holds
+    /// blocks and leaves positions is refused — no record says where its hole
+    /// falls.
+    #[test]
+    fn each_hole_leads_the_first_block_after_it() {
+        let piece = |blocks: usize, holes: u32| {
+            let mut p = PlacedPiece::ending_at(99);
+            p.blocks = blocks;
+            p.holes = holes;
+            p
+        };
+        let records = [
+            piece(2, 0),
+            piece(0, 100),
+            piece(0, 50),
+            piece(3, 0),
+            piece(1, 0),
+            piece(0, 7),
+        ];
+        let (leads, pending, blocks) = leads_of(&records).unwrap();
+        assert_eq!(leads, [(0, 0), (2, 150), (5, 0)]);
+        assert_eq!((pending, blocks), (7, 6));
+        assert!(leads_of(&[piece(2, 3)]).is_err());
+        let (leads, pending, blocks) = leads_of(&[]).unwrap();
+        assert!(leads.is_empty());
+        assert_eq!((pending, blocks), (0, 0));
     }
 
     /// The system prompt is the leading run of sections and the glue between

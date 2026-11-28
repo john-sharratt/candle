@@ -47,6 +47,36 @@ impl ChunkedKvBacking {
         Ok(())
     }
 
+    /// Set the holes of `batch_idx`, which holds exactly `blocks` chunks, from
+    /// its layout: each `(block, lead)` is the hole before that block, and
+    /// `pending` the hole after the last. Every block not named keeps its lead.
+    /// A rebuild that moved, put in or took out holes says where they now
+    /// stand; a slot of any other length, or a block past it, is refused.
+    pub fn set_position_leads(
+        &self,
+        batch_idx: usize,
+        blocks: usize,
+        leads: &[(usize, u32)],
+        pending: u32,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| candle::Error::Msg("chunked state lock poisoned".into()))?;
+        let Some(slot) = state.sequences.get_mut(batch_idx).and_then(|s| s.as_mut()) else {
+            candle::bail!("set_position_leads: slot {batch_idx} not allocated");
+        };
+        let held = slot.block_count();
+        if !slot.set_leads(blocks, leads, pending) {
+            candle::bail!(
+                "set_position_leads: slot {batch_idx} holds {held} chunks, the layout {blocks} \
+                 (leads at {:?})",
+                leads.iter().map(|&(b, _)| b).collect::<Vec<_>>()
+            );
+        }
+        Ok(())
+    }
+
     /// Drop `batch_idx`'s trailing chunks that hold no token, keeping every
     /// hole they carried pending at the new tail. Returns the chunks dropped;
     /// `Ok(0)` for an unallocated slot.

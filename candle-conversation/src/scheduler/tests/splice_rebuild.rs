@@ -419,6 +419,26 @@ fn a_gap_that_opens_between_kept_pieces_is_held() {
     assert_eq!((at, offset), (40 + 100 + 7 + 5 + 33, 40 + 7 + 33));
 }
 
+/// **A hole moves, and is resized, where it stands**: the gap between two
+/// locked sections moves down a place, and then grows; every rebuild is a
+/// build of its result.
+#[test]
+fn a_hole_moves_and_is_resized_where_it_stands() {
+    use Place::{Hole, Turn};
+    let (at, offset) = spliced_layout_equals_built(
+        &[40, 7, 33, 5],
+        &[Turn(0), Hole(100), Turn(1), Hole(20), Turn(3), Turn(2)],
+        &[Turn(0), Hole(100), Turn(1), Turn(3), Hole(20), Turn(2)],
+    );
+    assert_eq!((at, offset), (40 + 100 + 7 + 5 + 20 + 33, 40 + 7 + 5 + 33));
+    let (at, offset) = spliced_layout_equals_built(
+        &[40, 7, 33, 5],
+        &[Turn(0), Hole(100), Turn(1), Hole(20), Turn(3), Turn(2)],
+        &[Turn(0), Hole(100), Turn(1), Hole(64), Turn(3), Turn(2)],
+    );
+    assert_eq!((at, offset), (40 + 100 + 7 + 64 + 5 + 33, 40 + 7 + 5 + 33));
+}
+
 /// Nothing in common and everything in common are the two ends: a rebuild
 /// from nothing, and a rebuild that changes nothing.
 #[test]

@@ -661,23 +661,23 @@ pub(super) fn place_gap(
     }
 }
 
-/// Leave `positions` empty at the slot's tail, on its K/V and its per-position
-/// state alike: what the walk places next is read that many positions further
-/// on (`docs/placed_section_layout.md` §3.1).
+/// Leave `positions` empty where the walk is placing, on its K/V and its
+/// per-position state alike: what the walk places next is read that many
+/// positions further on (`docs/placed_section_layout.md` §3.1).
 ///
-/// Only ever at the tail. A hole is a forwarded piece to the splice plan
-/// (`piece_identity`), so an edit never carries one: a hole that changed is
-/// where the slot is cut and walked.
+/// At the tail the K/V takes the hole as the lead of the chunk it gains next.
+/// Inside an edit the per-position state takes it with the edit's one splice,
+/// and the K/V's leads are laid from the records once every edit stands
+/// ([`super::apply::lay_leads`]): a hole holds no chunk of its own to splice.
 pub(super) fn place_hole(
     ctx: &mut ApplyContext<'_>,
     walker: &mut SegmentWalker,
     positions: usize,
 ) -> Result<(), ConversationError> {
     if walker.insert.is_some() {
-        return Err(ConversationError::Channel(format!(
-            "apply_segments: a {positions}-position hole inside an edit — the splice plan \
-             cuts at a hole and walks it at the tail"
-        )));
+        place_gap(ctx, walker, positions).map_err(ConversationError::Model)?;
+        walker.holes += positions as u32;
+        return Ok(());
     }
     let seq = ctx.parent_id.0;
     ctx.session
@@ -690,6 +690,15 @@ pub(super) fn place_hole(
     // What follows starts a chunk of its own, as after a sealed inject.
     walker.last_was_sealed = true;
     Ok(())
+}
+
+/// A hole's contribution to the running prefix hash: its size, wherever the
+/// walk or an edit placed it.
+pub(super) fn hole_contrib(positions: usize) -> u64 {
+    let mut c = DefaultHasher::new();
+    c.write_u8(6);
+    c.write_u64(positions as u64);
+    c.finish()
 }
 
 /// Name a piece the session cut to its layers' common prefix: which piece,

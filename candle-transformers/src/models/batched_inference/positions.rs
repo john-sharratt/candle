@@ -36,4 +36,24 @@ impl BatchedInferenceSession {
         }
         Ok(())
     }
+
+    /// Set `idx`'s holes on every layer from its layout, the sequence holding
+    /// exactly `blocks` blocks: each `(block, lead)` is the hole before that
+    /// block, `pending` the hole after the last
+    /// (the backing's `set_position_leads`). Its offset does not move.
+    pub fn set_sequence_position_leads(
+        &self,
+        idx: usize,
+        blocks: usize,
+        leads: &[(usize, u32)],
+        pending: u32,
+    ) -> Result<()> {
+        if self.sequence_offset(idx).is_none() {
+            candle::bail!("set_sequence_position_leads: sequence {idx} not allocated");
+        }
+        for backing in &self.backings {
+            backing.set_position_leads(idx, blocks, leads, pending)?;
+        }
+        Ok(())
+    }
 }

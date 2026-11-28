@@ -928,7 +928,14 @@ writes exists:
   reprojection's own (`reproject_rebuild`): the turn's tail captured, the
   pieces before the range kept, the range spliced in where it changed, the
   rest re-walked from the pieces' own K/V; its projection event names the
-  files the range now places. A re-layout declined below the decode floor
+  files the range now places. A hole is a piece of the layout as a section
+  is — named by its size, kept, put in, taken out or moved where it stands
+  (`piece_identity`) — so the gap a locked section leaves, and the section
+  that later fills it, are edits like any other. A hole holds no chunk of
+  its own: it is the lead of the first chunk after it, so once the edits
+  stand the slot's leads are laid from the placed pieces
+  (`projection_assembler::apply::lay_leads`), never carried through a
+  splice. A re-layout declined below the decode floor
   stays owed and is asked again at the next drain. A slot with no assembly
   on record is reprojected whole. A resident section holds its K/V and its index rows on
   the device (§3.5), so an entry moves no bytes across PCIe.

@@ -305,7 +305,14 @@ pub(super) fn splice_edits(
         for w in edit.wanted.clone() {
             let block_before = walker.insert.as_ref().map_or(from_block, |c| c.block);
             let pos_before = walker.logical_pos;
-            let contrib = walk_sealed_piece(ctx, walker, &pieces[w])?;
+            let holes_before = walker.holes;
+            let contrib = match &pieces[w] {
+                AssembledPiece::Hole(positions) => {
+                    place_hole(ctx, walker, *positions)?;
+                    hole_contrib(*positions)
+                }
+                piece => walk_sealed_piece(ctx, walker, piece)?,
+            };
             let blocks = walker.insert.as_ref().map_or(block_before, |c| c.block) - block_before;
             put_in.insert(
                 w,
@@ -314,8 +321,7 @@ pub(super) fn splice_edits(
                     kind: aligned[w].1,
                     blocks,
                     tokens: walker.logical_pos - pos_before,
-                    // An edit never carries a hole (`place_hole`).
-                    holes: 0,
+                    holes: walker.holes - holes_before,
                     blocks_after: 0,
                     pos_after: 0,
                     at_after: 0,
@@ -352,12 +358,59 @@ pub(super) fn splice_edits(
         })
         .collect::<Result<Vec<PlacedPiece>, ConversationError>>()?;
     restack(&mut records);
+    lay_leads(ctx, &records)?;
     if let Some(first) = plan.edits.first() {
         for r in &records[first.wanted.start..] {
             record_range(walker, r);
         }
     }
     Ok(records)
+}
+
+/// Lay the slot's holes on its K/V where `records` — the pieces it holds, end
+/// to end — put them ([`leads_of`]).
+///
+/// A hole is the lead of the first block after it. The cut and the splices
+/// move blocks, and a hole holds no block of its own to move with them, so
+/// the leads are laid once the pieces stand rather than carried through each
+/// edit: a hole an edit took out is gone, one it put in stands, and one it kept
+/// stands before whatever block now follows it.
+pub(super) fn lay_leads(
+    ctx: &mut ApplyContext<'_>,
+    records: &[PlacedPiece],
+) -> Result<(), ConversationError> {
+    let (leads, pending, blocks) = leads_of(records)?;
+    ctx.session
+        .set_sequence_position_leads(ctx.parent_id.0, blocks, &leads, pending)
+        .map_err(ConversationError::Model)
+}
+
+/// The leads `records` put on the slot: for each piece holding blocks, its
+/// first block and the holes since the block before it; then the holes after
+/// the last block, pending at the tail; then the blocks they hold. A piece's
+/// later blocks keep their own leads. Refused for a piece both holding blocks
+/// and leaving positions, whose hole no record places.
+pub(super) fn leads_of(
+    records: &[PlacedPiece],
+) -> Result<(Vec<(usize, u32)>, u32, usize), ConversationError> {
+    let mut leads = Vec::new();
+    let (mut holes, mut block) = (0u32, 0usize);
+    for (i, r) in records.iter().enumerate() {
+        match (r.blocks, r.holes) {
+            (0, h) => holes += h,
+            (b, 0) => {
+                leads.push((block, std::mem::take(&mut holes)));
+                block += b;
+            }
+            (b, h) => {
+                return Err(ConversationError::Channel(format!(
+                    "apply_segments: piece {i} holds {b} block(s) and leaves {h} position(s); \
+                     no record says where its hole falls"
+                )))
+            }
+        }
+    }
+    Ok((leads, holes, block))
 }
 
 /// An empty piece on each of `layers` layers — what a splice that only evicts

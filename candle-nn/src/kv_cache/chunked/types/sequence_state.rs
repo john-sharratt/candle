@@ -147,6 +147,27 @@ impl SequenceState {
         }
     }
 
+    /// Set the holes the slot leaves from its layout: each `(block, lead)` in
+    /// `leads` is the hole before that block, and `pending` the hole after the
+    /// last. Every other block keeps its lead. `false`, changing nothing, when
+    /// the slot does not hold exactly `blocks` chunks or a block is past them.
+    pub(in super::super) fn set_leads(
+        &mut self,
+        blocks: usize,
+        leads: &[(usize, u32)],
+        pending: u32,
+    ) -> bool {
+        if self.chunks.len() != blocks || leads.iter().any(|&(b, _)| b >= blocks) {
+            return false;
+        }
+        for &(b, lead) in leads {
+            self.chunks[b].lead = lead;
+        }
+        self.pending_lead = pending;
+        self.gpu_chunks.as_mut().clear();
+        true
+    }
+
     /// Hand the pending lead to `cw`, the chunk the tail is about to gain.
     #[inline]
     pub(in super::super) fn take_pending_lead(&mut self, cw: &mut ChunkWindow) {

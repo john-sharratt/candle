@@ -52,9 +52,11 @@ fn a_hole_is_its_own_piece() {
     );
 }
 
-/// **A hole aligns as a forwarded piece: its size and everything before it.**
+/// **A hole aligns by its size alone, as a sealed piece by itself**: the piece
+/// before it does not change it, another size does — so a rebuild keeps,
+/// moves and resizes holes where they stand.
 #[test]
-fn a_hole_is_aligned_by_everything_before_it() {
+fn a_hole_is_aligned_by_its_size_alone() {
     let reads = PieceReads {
         whole: &|_, _| false,
         section_stamp: &|id| (id.raw() as u64, 1),
@@ -76,8 +78,8 @@ fn a_hole_is_aligned_by_everything_before_it() {
         AssembledPiece::Section(SectionId::new(7)),
         AssembledPiece::Hole(99),
     ]);
-    assert_eq!(a[1].1, PieceKind::Forwarded);
-    assert_ne!(a[1].0, b[1].0, "a different piece before it");
+    assert_eq!(a[1].1, PieceKind::Sealed);
+    assert_eq!(a[1], b[1], "a different piece before it is the same hole");
     assert_ne!(a[1].0, c[1].0, "a different size");
     assert_eq!(
         a[1],
