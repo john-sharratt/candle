@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::Substrate;
-use crate::files::scope::{Bars, Candidate, RangeScope, REORDER_MARGIN};
+use crate::files::scope::{Candidate, RangeScope};
 use crate::files::{FileKey, FilesPin, FilesSet, FreshSection, SectionKey};
 use crate::projection::{GroupId, TimelineId};
 
@@ -47,21 +47,26 @@ impl Substrate {
         }
     }
 
-    /// A step of `target`'s range: its hit `rates` fold into the hit momentum
-    /// when `placed_read` — the step counted the selection's queries, so it
-    /// says how the placed sections were read — `leaving` leave the range
-    /// until the next question ([`FilesSet::evict`]), `candidates` over
-    /// `bars`' entry bar enter it at their rank ([`FilesSet::admit`]), and the
-    /// range is ordered by the momentum, strongest beside the question
-    /// ([`FilesSet::reorder`]); whether its layout changed.
+    /// A step of `target`'s range. When `placed_read` — the step counted the
+    /// selection's queries, so it says how the placed sections were read — its
+    /// hit `rates` fold into the hit momentum. `leaving` leave the range until
+    /// the next question ([`FilesSet::evict`]), `candidates` whose rate would
+    /// hold the lock's edge enter it at their rank ([`FilesSet::admit`],
+    /// [`FilesSet::step_bars`]), and the range is ordered by the momentum
+    /// around the sections locked so far, strongest beside the question
+    /// ([`FilesSet::reorder`]). Only then are the locks taken again from the
+    /// range's shares of attention, none while it is not `engaged`
+    /// ([`FilesSet::relock`]): a section the decode has just begun to read
+    /// hard climbs first and locks where it arrives. Whether its layout
+    /// changed.
     pub fn files_step(
         &mut self,
         target: TimelineId,
         rates: &HashMap<SectionKey, f32>,
         placed_read: bool,
+        engaged: bool,
         leaving: &[SectionKey],
         candidates: &[Candidate],
-        bars: &Bars,
     ) -> bool {
         let Some(set) = self.files_sets.get_mut(&target) else {
             return false;
@@ -71,11 +76,15 @@ impl Substrate {
             set.observe_hits(rates);
         }
         let left = set.evict(leaving);
+        let bars = set.step_bars(rates);
         let rate = |k: SectionKey| rates.get(&k).copied().unwrap_or(0.0);
-        let entered = set.admit(rate, candidates, bars);
+        let entered = set.admit(rate, candidates, &bars);
         // The range in relevance order by the index's momentum, strongest
         // beside the question (`docs/placed_section_layout.md` §3.2).
-        let moved = set.reorder(REORDER_MARGIN);
+        let moved = set.reorder();
+        if placed_read {
+            set.relock(engaged);
+        }
         left || !entered.is_empty() || moved
     }
 

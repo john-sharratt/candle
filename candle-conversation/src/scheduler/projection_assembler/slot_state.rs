@@ -133,33 +133,16 @@ pub(in super::super) fn fold_part(parts: &mut Vec<HitPart>, keys: &[RoundKey], h
 }
 
 /// Each declared section's rate in `hits`, a read of the declaration whose
-/// rounds are `keys`, as a lift over the read's own selection
-/// ([`selection_rate`]): the share of its blocks the queries selected — a
-/// placed section's out of the selection's queries, a pooled one's (declared
-/// once per index page, its pages summed) out of the shadow scan's — over the
-/// share of every placed block they selected. 1 is a section read as any
-/// block of the slot is, 10 one read ten times as often: a measure that does
-/// not move with the prompt's length, the selection's budget or the model, so
-/// the bars set on it hold on every one (`docs/placed_section_layout.md`
-/// §3.4). A section declared as both reads as placed, the selection's own
-/// reading. A section none of whose queries were counted has no rate; with no
-/// placed block selected at all, every rated section's lift is 0.
+/// rounds are `keys`, on the 0–1000 band (`files::scope::band`): the share of
+/// its blocks the queries selected — a placed section's out of the
+/// selection's queries, a pooled one's (declared once per index page, its
+/// pages summed) out of the shadow scan's. Its blocks divide it out, so a long
+/// section does not out-vote a short one; the decisions take the rates as
+/// shares of the range's (`files::scope::nucleus`), which divides out the
+/// prompt's length, the selection's budget and the model. A section declared
+/// as both reads as placed, the selection's own reading. A section none of
+/// whose queries were counted has no rate.
 pub(in super::super) fn section_rates(
-    keys: &[RoundKey],
-    hits: &PieceHits,
-    sections: &HashMap<TimelineId, SectionKey>,
-) -> HashMap<SectionKey, f32> {
-    let chance = selection_rate(hits).unwrap_or(0.0);
-    section_bands(keys, hits, sections)
-        .into_iter()
-        .map(|(k, r)| (k, if chance > 0.0 { r / chance } else { 0.0 }))
-        .collect()
-}
-
-/// Each declared section's share of its blocks selected in `hits`, on the
-/// 0–1000 band (`files::scope::band`), before [`section_rates`] takes it over
-/// the selection's.
-fn section_bands(
     keys: &[RoundKey],
     hits: &PieceHits,
     sections: &HashMap<TimelineId, SectionKey>,

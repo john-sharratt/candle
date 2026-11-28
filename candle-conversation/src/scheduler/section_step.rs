@@ -25,7 +25,7 @@ use candle_transformers::models::batched_inference::ManagedBatchedModel;
 use super::projection_assembler::{fold_part, section_rates, selection_rate, SlotState};
 use super::reprojection::ReprojectionPolicy;
 use super::SequenceId;
-use crate::files::scope::{Bars, Candidate, LOCK_BAR};
+use crate::files::scope::{shares, Candidate};
 use crate::files::{FilesSet, SectionKey};
 
 /// One step of `slot`, whose projection state is `state`, under `policy`:
@@ -59,13 +59,25 @@ pub(super) fn step_sections(
     let chance = selection_rate(&hits);
     let placed_read = hits.queries > 0;
     fold_part(&mut state.unread_hits, &keys, hits);
-    let bars = Bars::KNOWLEDGE_BASE;
     let target = policy.target.timeline;
-    let (leaving, candidates) = {
+    let (leaving, candidates, bars, engaged) = {
         let read = policy.substrate.read();
-        let Some(scope) = read.files_set_of(target).and_then(|s| s.scope.as_ref()) else {
+        let Some(set) = read.files_set_of(target) else {
             return false;
         };
+        let Some(scope) = set.scope.as_ref() else {
+            return false;
+        };
+        let bars = set.step_bars(&rates);
+        // The range is engaged while its sections are read, on the mean, at
+        // least as the selection reads the whole slot: below it a share of
+        // almost nothing would lock the largest of it.
+        let placed: Vec<f32> = scope
+            .sections()
+            .filter_map(|e| rates.get(&e.key).copied())
+            .collect();
+        let engaged = !placed.is_empty()
+            && chance.is_some_and(|c| placed.iter().sum::<f32>() / placed.len() as f32 >= c);
         // Only a read that counted the selection's queries says how the
         // placed sections were read.
         let leaving = match placed_read {
@@ -85,7 +97,7 @@ pub(super) fn step_sections(
                 tokens: r.tokens,
             })
             .collect();
-        (leaving, candidates)
+        (leaving, candidates, bars, engaged)
     };
     let read: HashSet<SectionKey> = candidates
         .iter()
@@ -96,7 +108,7 @@ pub(super) fn step_sections(
     // Every rated section's momentum takes this step, what orders the range.
     let changed = policy
         .substrate
-        .update(|s| s.files_step(target, &rates, placed_read, &leaving, &candidates, &bars));
+        .update(|s| s.files_step(target, &rates, placed_read, engaged, &leaving, &candidates));
     state.kb_steps += 1;
     if changed {
         state.layout_owed = true;
@@ -119,8 +131,10 @@ pub(super) fn step_sections(
                 step = state.kb_steps,
                 changed,
                 selection_rate = chance.unwrap_or(0.0),
+                engaged,
+                locked = set.locked.len(),
                 momenta = %range_momenta(set, &rates),
-                "the knowledge base's range momenta, top first (momentum/rate, * locked)",
+                "the knowledge base's range, top first (share % of its attention/rate, * locked)",
             );
         }
     }
@@ -130,25 +144,22 @@ pub(super) fn step_sections(
 /// Steps between two momenta lines of a range that did not change.
 const MOMENTA_EVERY: u64 = 32;
 
-/// `set`'s placed sections top first, each `momentum/rate` this step, a
-/// locked one marked `*`: one token per section, rounded.
+/// `set`'s placed sections top first, each its share of the range's attention
+/// in percent and its rate this step on the band, a locked one marked `*`:
+/// one token per section, rounded.
 fn range_momenta(set: &FilesSet, rates: &HashMap<SectionKey, f32>) -> String {
     let Some(scope) = set.scope.as_ref() else {
         return String::new();
     };
+    let share = shares(&set.placed_momenta());
     scope
         .sections()
         .map(|e| {
-            let m = set.hits.score(e.key);
             let r = rates.get(&e.key).copied().unwrap_or(0.0);
-            let lock = if m.is_some_and(|m| m >= LOCK_BAR) {
-                "*"
-            } else {
-                ""
-            };
-            match m {
-                Some(m) => format!("{m:.1}/{r:.1}{lock}"),
-                None => format!("-/{r:.1}"),
+            let lock = if set.locked.contains(&e.key) { "*" } else { "" };
+            match share.get(&e.key) {
+                Some(s) => format!("{:.1}/{r:.0}{lock}", 100.0 * s),
+                None => format!("-/{r:.0}"),
             }
         })
         .collect::<Vec<_>>()

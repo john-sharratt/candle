@@ -201,16 +201,14 @@ every other section, and sink back from the question as they stop being read.
   give, with the section the question read most beside it, and the first
   steps move only what the decode reads differently. A section the index has
   not read this question is ordered by its scan momentum (the provenance
-  scan's fold, §3.4), taken off its 0–1000 band into 0–1 — under chance, so
-  every section the index reads at chance or better ranks above it. A pinned
-  knowledge base,
+  scan's fold, §3.4), taken off its 0–1000 band into 0–1, so nearly every
+  section the index reads ranks above it. A pinned knowledge base,
   such as a test's or a calibration's frame, is ordered the same way. The pin
   says what is placed and its sections never leave, but the index rates them
   and the scan still folds their scores (`FilesSet::observe`), so it too
   opens with the question's strongest beside it.
 - **The decode reorders it every step.** Each section's **hit momentum** is
-  an exponential average of its hit rate — a lift over chance (§3.4) — held
-  on the
+  an exponential average of its hit rate (§3.4), held on the
   files set beside the range (`FilesSet::hits`, `files/scope/momentum.rs`). A
   section's first rate this question is taken whole, from the first reading
   or else from the first step that rates it, so the order locks on at once.
@@ -221,16 +219,28 @@ every other section, and sink back from the question as they stop being read.
   (`files_step`), so a section the decode locks onto is drawn to the top
   within a few steps and stays there while it is read, and one it stops
   reading sinks back over several. A section passes the one above it only
-  when its momentum beats that one's by more than `REORDER_MARGIN` (2.5, the
-  top of chance's noise), so neighbours a hair apart do not trade places step
-  after step. Any
+  when its momentum beats that one's by more than `REORDER_SHARE` (2%) of the
+  range's attention — the placed sections' momenta summed — so neighbours a
+  hair apart do not trade places step after step. Any
   change is laid onto the slot at the next wave (§4.4); positions are applied
   at read time, so moving a sealed section costs no prefill.
-- **A section the index reads strongly is locked to its positions.** At a
-  step, a section whose hit momentum is at or over `LOCK_BAR` (7.5 times
-  chance) keeps the positions it stands at, so its K/V — and the relative
-  distances the decode is reading it across — do not move under the reading
-  (`RangeScope::reorder_locked`). Everything else moves around it: the
+- **The nucleus of the range's attention is locked to its positions.** The
+  placed sections' momenta are taken as shares of their sum — the range's
+  attention, normalized to 1 (`files/scope/nucleus.rs`). The nucleus at `p`
+  is the fewest strongest sections that together hold `p` of it: one section
+  when the decode reads one hard, several when it reads several. A section
+  locks when it enters the nucleus at `P_LOCK` (0.5) and stays locked while
+  within the one at `P_UNLOCK` (0.7), so one on the edge does not flip in and
+  out. While the range is read, on the mean, no more than the selection reads
+  the whole slot, nothing is locked: a share of almost nothing would lock the
+  largest of it. A share is a proportion of what the range is read with,
+  whatever the prompt's length, the selection's budget or the model, so the
+  two proportions hold on every one. A locked section keeps the positions it
+  stands at, so its K/V — and the relative distances the decode is reading
+  it across — do not move under the reading (`RangeScope::reorder_locked`).
+  A step reorders around the locks it starts with and only then locks again,
+  so a section the decode has just begun to read hard climbs first and locks
+  where it arrives. Everything else moves around it: the
   unlocked sections, in relevance order, fill the gaps between the locked
   ones from the top down, the strongest that fit into each and a section too
   big for one going on to the next, and the rest lie packed below the last
@@ -242,13 +252,13 @@ every other section, and sink back from the question as they stop being read.
   reorder closes the range up around what is still locked. Without the lock,
   per-step rates swing widely and a step moves a section a quarter of the way
   to its rate, so the margin rarely held: the range was reordered, and the
-  slot rebuilt, on nearly every step (BlackWorld, 2026-11-28). The bar is
-  measured: with the selection reading 16–25 on the band, a range holds one
-  to five sections the decode reads at 8–30 times chance, a band of five to
-  ten read mildly at 2.5–8, and a tail under 2.5. Set inside the mild band,
-  the band hovered on the bar and flipped in and out of the lock; at 7.5 the
-  strong hold their positions and the mild drift. The opening is not locked:
-  it is ordered whole by the first reading.
+  slot rebuilt, on nearly every step (BlackWorld, 2026-11-28). The
+  proportions are measured: a range there held one to five sections read
+  hard, together a third to three fifths of its attention, a band of five to
+  ten read mildly, and a long tail; a bar on the band itself hovered in the
+  mild band and flipped it in and out of the lock, and the band's scale moved
+  with the selection's (16–25) within one run. The opening is not locked: it
+  is ordered whole by the first reading.
 - **A section that comes into scope** enters at its rank by its momentum, or
   its step rate when it has none yet.
 - **A section that falls out of scope** is removed; the next reorder closes
@@ -317,21 +327,20 @@ files set's scan momentum.
   (§3.2), and the range is ordered by momentum. A section in scope
   **leaves** when its rate has stayed below the eviction bar for **64
   consecutive steps** — one reprojection cadence — and leaves a hole.
-- **The rate is a lift over chance, so the bars hold everywhere.** A
-  section's share of its blocks the queries selected is divided by the share
-  of every placed block they selected — the step's own selection rate
-  (`section_rates`, `selection_rate`). 1 is a section read as any block of
-  the slot is; 10 one read ten times as often. A share alone moves with the
-  prompt's length, the selection's budget and the model — on BlackWorld the
-  selection itself read 16–25 on the 0–1000 band within one run — so a bar on
-  it would hold for one setting only; the lift does not move with any of
-  them. A pooled section's shadow share is divided by the same selection
-  rate, so the entry bar asks how strongly it would be read if placed. The
-  bars are a pair on the lift, entry above eviction — hysteresis, so a
-  section near the line does not flap. The knowledge base runs on
-  `Bars::KNOWLEDGE_BASE` (`files/scope/bars.rs`): an entry bar of 2.5, the
-  top of chance's noise, and an eviction bar of 0.05, so a section leaves
-  only once the selection has all but stopped reading it for 64 steps.
+- **The bars are shares of the range's attention, so they hold
+  everywhere.** A section's rate is the share of its blocks the queries
+  selected, on the 0–1000 band (`section_rates`); its blocks divide out its
+  length. That band moves with the prompt's length, the selection's budget
+  and the model — on BlackWorld the selection itself read 16–25 on it within
+  one run — so no bar is set on it. Every decision is taken on shares of the
+  range's: what locks (above), the reorder margin, and the step's bars
+  (`Bars::knowledge_base`, `FilesSet::step_bars`). A resident section enters
+  at a rate that would hold the share of the weakest locked section — it
+  would be among what the range is read by — or an even share when none is
+  locked; its shadow rate is out of the shadow scan's queries, so it says how
+  strongly it would be read if placed. A placed section counts a step toward
+  leaving under a quarter of an even share, `EVICT_OF_EVEN`, and leaves after
+  64 such steps.
 - **The step's counts stay beside the slot.** Which steps a placed section
   has spent under the bar is the scheduler's (`files/scope/watch.rs`, held
   on the slot's projection state): a step that changes no layout publishes

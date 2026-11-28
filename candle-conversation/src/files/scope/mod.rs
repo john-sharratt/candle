@@ -14,6 +14,7 @@
 
 pub mod bars;
 pub mod momentum;
+pub mod nucleus;
 pub mod place;
 pub mod range_scope;
 pub mod resident;
@@ -21,7 +22,8 @@ pub mod step;
 pub mod watch;
 
 pub use bars::{band, Bars};
-pub use momentum::{Momentum, LOCK_BAR, MOMENTUM_KEEP, REORDER_MARGIN};
+pub use momentum::{Momentum, MOMENTUM_KEEP};
+pub use nucleus::{nucleus, relock, shares, EVICT_OF_EVEN, P_LOCK, P_UNLOCK, REORDER_SHARE};
 pub use place::{Entry, Place};
 pub use range_scope::RangeScope;
 pub use resident::{resident, RESIDENT_RANGES};

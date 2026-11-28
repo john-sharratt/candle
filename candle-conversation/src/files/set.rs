@@ -14,12 +14,18 @@
 //! ([`Momentum`]) — first folded from the question's first reading, then from
 //! every decode step — sets the range's order, strongest beside the question;
 //! a section the index has not read is ordered by its scan momentum
-//! ([`FilesSet::order_score`], `docs/placed_section_layout.md` §3.2).
+//! ([`FilesSet::order_score`], `docs/placed_section_layout.md` §3.2). Every
+//! decision of a step is taken on the placed sections' momenta as shares of
+//! the range's attention (`super::scope::nucleus`): which sections are locked
+//! to their positions, how far a section must pass another, what enters and
+//! what leaves.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::key::{FileKey, SectionKey};
-use super::scope::{Bars, Candidate, Momentum, RangeScope, StepChange, LOCK_BAR};
+use super::scope::{
+    relock, shares, Bars, Candidate, Momentum, RangeScope, StepChange, REORDER_SHARE,
+};
 use crate::projection::GroupId;
 
 /// What a conversation's knowledge base holds, when it is not provenance's
@@ -72,19 +78,16 @@ pub struct FilesSet {
     /// reading's rates taken whole, then every decode step's folded in. Emptied
     /// by a new question ([`Self::clear_withheld`]).
     pub hits: Momentum,
+    /// The placed sections locked to their positions at the last step: the
+    /// nucleus of the range's attention ([`Self::relock`]). Emptied by a new
+    /// question.
+    pub locked: BTreeSet<SectionKey>,
 }
 
-/// Whether `section` is locked at a step: the index reads it strongly, its hit
-/// momentum at or over [`LOCK_BAR`], so it keeps its positions.
-fn locks(hits: &Momentum, section: SectionKey) -> bool {
-    hits.score(section).is_some_and(|m| m >= LOCK_BAR)
-}
-
-/// `section`'s place in the order: its hit momentum, a lift over chance, or —
+/// `section`'s place in the order: its hit momentum on the 0–1000 band, or —
 /// not yet read by the index this question — its scan momentum taken off the
-/// 0–1000 band into 0–1, under chance, so among the unread the scan orders
-/// and every section the index reads at chance or better ranks above them;
-/// `None` for one neither ranks.
+/// band into 0–1, so among the unread the scan orders and nearly every section
+/// the index reads ranks above them; `None` for one neither ranks.
 fn order_score(
     hits: &Momentum,
     members: &BTreeMap<SectionKey, SectionStanding>,
@@ -148,6 +151,7 @@ impl FilesSet {
         self.withheld.clear();
         self.evicted.clear();
         self.hits = Momentum::default();
+        self.locked.clear();
         if let Some(scope) = self.scope.as_mut() {
             scope.compact();
         }
@@ -183,6 +187,51 @@ impl FilesSet {
         order_score(&self.hits, &self.members, section)
     }
 
+    /// Every placed section with a hit momentum this question, top first.
+    pub fn placed_momenta(&self) -> Vec<(SectionKey, f32)> {
+        self.scope.as_ref().map_or_else(Vec::new, |scope| {
+            scope
+                .sections()
+                .filter_map(|e| self.hits.score(e.key).map(|m| (e.key, m)))
+                .collect()
+        })
+    }
+
+    /// Lock this step's sections ([`relock`]): the nucleus of the placed
+    /// sections' momenta, those locked before kept while within the wider one,
+    /// none while the range is not `engaged`.
+    pub fn relock(&mut self, engaged: bool) {
+        self.locked = relock(&self.locked, &self.placed_momenta(), engaged);
+    }
+
+    /// The share of the range's attention the weakest locked section holds —
+    /// what a section entering must hold to be among what the range is read
+    /// by — or an even share when none is locked; 0 for a range nothing in
+    /// which has a momentum.
+    pub fn edge_share(&self) -> f32 {
+        let momenta = self.placed_momenta();
+        let share = shares(&momenta);
+        self.locked
+            .iter()
+            .filter_map(|k| share.get(k).copied())
+            .min_by(f32::total_cmp)
+            .unwrap_or(match share.len() {
+                0 => 0.0,
+                n => 1.0 / n as f32,
+            })
+    }
+
+    /// This step's bars (`Bars::knowledge_base`): from the placed sections'
+    /// `rates` this step and the share at the lock's edge.
+    pub fn step_bars(&self, rates: &HashMap<SectionKey, f32>) -> Bars {
+        let placed: Vec<f32> = self.scope.as_ref().map_or_else(Vec::new, |s| {
+            s.sections()
+                .map(|e| rates.get(&e.key).copied().unwrap_or(0.0))
+                .collect()
+        });
+        Bars::knowledge_base(placed.iter().sum(), placed.len(), self.edge_share())
+    }
+
     /// A step's entries: every one of `candidates` at or over `bars`' entry
     /// bar by `rate` enters the range at its rank by [`Self::order_score`],
     /// strongest first ([`RangeScope::admit`]); what it changed. One an
@@ -211,11 +260,11 @@ impl FilesSet {
             })
             .copied()
             .collect();
-        let (hits, members) = (&self.hits, &self.members);
+        let (hits, members, locked) = (&self.hits, &self.members, &self.locked);
         let change = scope.admit(
             rate,
             |k| order_score(hits, members, k),
-            |k| locks(hits, k),
+            |k| locked.contains(&k),
             &open,
             bars,
         );
@@ -225,16 +274,18 @@ impl FilesSet {
 
     /// A step's reorder: the range by [`Self::order_score`], strongest at the
     /// top beside the question, a section passing the one above it only by
-    /// more than `margin`, around the sections the index reads strongly —
-    /// hit momentum at or over [`LOCK_BAR`] — which keep their positions
+    /// more than [`REORDER_SHARE`] of the range's attention, around the
+    /// [`Self::locked`] sections, which keep their positions
     /// ([`RangeScope::reorder_locked`]); whether anything moved.
-    pub fn reorder(&mut self, margin: f32) -> bool {
-        let (hits, members) = (&self.hits, &self.members);
+    pub fn reorder(&mut self) -> bool {
+        let total: f32 = self.placed_momenta().iter().map(|&(_, m)| m).sum();
+        let margin = REORDER_SHARE * total;
+        let (hits, members, locked) = (&self.hits, &self.members, &self.locked);
         self.scope.as_mut().is_some_and(|scope| {
             scope.reorder_locked(
                 |k| order_score(hits, members, k),
                 margin,
-                |k| locks(hits, k),
+                |k| locked.contains(&k),
             )
         })
     }
@@ -291,6 +342,13 @@ impl FilesSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bars every candidate a test admits at 900 is over.
+    const BARS: Bars = Bars {
+        entry: 50.0,
+        evict: 1.0,
+        evict_steps: 64,
+    };
 
     fn kind(raw: u32) -> GroupId {
         GroupId::from_raw(raw).unwrap()
@@ -417,7 +475,7 @@ mod tests {
                 tokens: 20,
             },
         ];
-        let change = set.admit(|_| 900.0, &candidates, &Bars::KNOWLEDGE_BASE);
+        let change = set.admit(|_| 900.0, &candidates, &BARS);
         assert_eq!(change.entered, vec![SectionKey(2)]);
         assert!(set.places(SectionKey(2)) && !set.places(SectionKey(3)));
         assert!(!set.places(SectionKey(4)));
@@ -435,9 +493,9 @@ mod tests {
         let mut set = FilesSet::default();
         set.set_scope(scope);
         let c = |key, tokens| Candidate { key, tokens };
-        let change = set.admit(|_| 900.0, &[c(b, 40)], &Bars::KNOWLEDGE_BASE);
+        let change = set.admit(|_| 900.0, &[c(b, 40)], &BARS);
         assert_eq!(change.slid, vec![a]);
-        let again = set.admit(|_| 900.0, &[c(a, 30)], &Bars::KNOWLEDGE_BASE);
+        let again = set.admit(|_| 900.0, &[c(a, 30)], &BARS);
         assert!(again.entered.is_empty(), "a stays out this request");
         set.clear_withheld();
         assert!(!set.evicted.contains(&a));
@@ -471,14 +529,15 @@ mod tests {
     }
 
     /// **The index orders the range, the scan only what the index has not
-    /// read, a section the index reads strongly keeps its positions, and a
-    /// new question starts the index afresh**: a scanned 900 over b's 300,
-    /// the first reading lifts a 0.4 and b 20 — taken whole — and c, unread,
-    /// ranks by its scan 500 as 0.5, under chance. Top first a, b, c, ten
-    /// positions each: b, locked, stays at 10; c, the stronger of the free,
-    /// fills the ten above it and a goes below. A step's 30 for a moves it a
-    /// quarter of the way (7.8): locked too now, nothing moves. A new question
-    /// forgets every rate.
+    /// read, the nucleus of its attention locks where it stands, and a new
+    /// question starts the index afresh**: a scanned 900 over b's 300, c
+    /// unread at its scan 500, ranked as 0.5. Top first a, b, c, ten
+    /// positions each. A step reads a at 30 and b at 600: unlocked, b climbs
+    /// to the top, and then — 95% of the range's attention — locks there.
+    /// The next reads c at 900 and a at 0: c (59%) climbs to just under b,
+    /// which keeps the top though weaker, and locks; b, within the wider
+    /// nucleus, stays locked. Not engaged, nothing is. A new question forgets
+    /// every rate and every lock.
     #[test]
     fn the_index_orders_the_range_and_the_scan_what_it_has_not_read() {
         let (a, b, c) = (SectionKey(1), SectionKey(2), SectionKey(3));
@@ -500,14 +559,6 @@ mod tests {
             scope.enter(k, 10, false);
         }
         set.set_scope(scope);
-        set.observe_hits(&HashMap::from([(a, 0.4), (b, 20.0)]));
-        assert_eq!(set.order_score(a), Some(0.4));
-        assert_eq!(set.order_score(b), Some(20.0));
-        assert_eq!(
-            set.order_score(c),
-            Some(0.5),
-            "unread: its scan, under chance"
-        );
         let top_first = |set: &FilesSet| -> Vec<SectionKey> {
             set.scope
                 .as_ref()
@@ -516,15 +567,27 @@ mod tests {
                 .map(|e| e.key)
                 .collect()
         };
-        assert!(set.reorder(0.0));
-        assert_eq!(top_first(&set), vec![c, b, a], "b where it was read");
-        set.observe_hits(&HashMap::from([(a, 30.0)]));
-        assert_eq!(set.order_score(a), Some(0.75 * 0.4 + 0.25 * 30.0));
-        assert!(!set.reorder(0.0), "b and a locked, c in the only gap");
-        assert_eq!(top_first(&set), vec![c, b, a]);
+        // A step as `files_step` takes it: fold, reorder, then relock.
+        let step = |set: &mut FilesSet, rates: &[(SectionKey, f32)], engaged: bool| {
+            set.observe_hits(&rates.iter().copied().collect::<HashMap<_, _>>());
+            let moved = set.reorder();
+            set.relock(engaged);
+            moved
+        };
+        assert_eq!(set.order_score(c), Some(0.5), "unread: its scan, scaled");
+        assert!(step(&mut set, &[(a, 30.0), (b, 600.0)], true));
+        assert_eq!(top_first(&set), vec![b, a, c]);
+        assert_eq!(set.locked, BTreeSet::from([b]));
+        assert_eq!(set.edge_share(), 600.0 / 630.0);
+        assert!(step(&mut set, &[(c, 900.0), (a, 0.0)], true));
+        assert_eq!(top_first(&set), vec![b, c, a], "b keeps the top");
+        assert_eq!(set.locked, BTreeSet::from([b, c]));
+        step(&mut set, &[], false);
+        assert!(set.locked.is_empty(), "not engaged, nothing locks");
         set.clear_withheld();
         assert_eq!(set.order_score(a), Some(0.9), "a new question: the scan's");
         assert_eq!(set.hits, Momentum::default());
+        assert!(set.locked.is_empty());
     }
 
     /// **A file the turn read waits until the next question — every section

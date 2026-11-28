@@ -3,6 +3,8 @@
 //! hysteresis, so a section near the line does not flap — and the steps a
 //! section must stay under the eviction bar before it leaves.
 
+use super::nucleus::EVICT_OF_EVEN;
+
 /// One range's bars.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Bars {
@@ -24,17 +26,25 @@ impl Bars {
         evict_steps: 64,
     };
 
-    /// The knowledge base's bars, on its sections' rate — a lift over the
-    /// step's own selection, 1 for a section read as any block of the slot
-    /// (`docs/placed_section_layout.md` §3.4). A section enters at 2.5, the
-    /// top of the noise a section read by chance shows (BlackWorld,
-    /// 2026-11-28), and leaves only once the selection has all but stopped
-    /// reading it, under a twentieth of chance, for one 64-step cadence.
-    pub const KNOWLEDGE_BASE: Bars = Bars {
-        entry: 2.5,
-        evict: 0.05,
-        evict_steps: 64,
-    };
+    /// The knowledge base's bars for one step, taken from the range's shares
+    /// of attention (`docs/placed_section_layout.md` §3.4,
+    /// `super::nucleus`): its `placed` sections rated `total` together on the
+    /// band this step, and `edge` the share of the weakest one locked. A
+    /// section out of scope enters at a rate that would hold `edge` — it would
+    /// be among what the range is read by — and a placed one counts a step
+    /// toward leaving under [`EVICT_OF_EVEN`] of an even share, for one
+    /// 64-step cadence.
+    pub fn knowledge_base(total: f32, placed: usize, edge: f32) -> Bars {
+        let even = match placed {
+            0 => 0.0,
+            n => total / n as f32,
+        };
+        Bars {
+            entry: (edge * total).min(1000.0),
+            evict: (EVICT_OF_EVEN * even).min(1000.0),
+            evict_steps: 64,
+        }
+    }
 
     /// Why these bars cannot be used, if they cannot.
     pub fn invalid(&self) -> Option<String> {
@@ -81,7 +91,9 @@ mod tests {
     #[test]
     fn bars_must_be_on_the_band_with_entry_above_eviction() {
         assert_eq!(Bars::DEFAULT.invalid(), None);
-        assert_eq!(Bars::KNOWLEDGE_BASE.invalid(), None);
+        let kb = Bars::knowledge_base(400.0, 4, 0.375);
+        assert_eq!((kb.entry, kb.evict, kb.evict_steps), (150.0, 25.0, 64));
+        assert_eq!(kb.invalid(), None);
         let flipped = Bars {
             entry: 500.0,
             evict: 600.0,
