@@ -36,8 +36,8 @@ use crate::persistence::content_hash::{
 };
 use crate::persistence::streams::{ContentAddress, StreamId};
 use crate::projection::{
-    prefix_before_collection, sections_prefix, DecodePriority, PrefixItem, SectionId,
-    SystemPromptItem, MEMBER_KV_LEVEL,
+    prefix_before_collection, DecodePriority, PrefixItem, SectionId, SystemPromptItem,
+    MEMBER_KV_LEVEL,
 };
 use crate::scheduler::exported_state::SharedState;
 use crate::scheduler::SchedulerRequest;
@@ -143,6 +143,16 @@ impl MembersPrefix {
         out.extend(self.lead.iter().copied().map(PrefixItem::Section));
         out.extend(earlier.iter().copied().map(PrefixItem::Section));
         out
+    }
+
+    /// What a member is read behind past the prompt: the hole, the lead and the
+    /// earlier members — [`Self::behind`] less the prompt. A member's recurrent
+    /// state is the prompt's, kept once for every member of the collection, run
+    /// on over these: keyed with the hole, whose size is each member's own, the
+    /// prompt's state was computed afresh for every file and stored as a
+    /// checkpoint of its own.
+    pub(super) fn past_prompt(&self, through: usize, earlier: &[SectionId]) -> Vec<PrefixItem> {
+        self.behind(through, earlier).split_off(self.prefix.len())
     }
 
     /// What a member's address is computed from: [`Self::behind`] with the
@@ -376,18 +386,14 @@ impl Sequence {
         let start = match handed {
             Some(state) => Some(state),
             None => {
-                // The state behind the prompt and the empty part of the range,
-                // then run on over the earlier members.
-                let at_collection = state_after(
-                    &self.scheduler_tx,
-                    &self.substrate,
-                    &prefix.behind(through, &[]),
-                )?;
+                // The prompt's state, kept once for the collection, run on over
+                // the hole, the lead and the earlier members.
+                let at_prompt = state_after(&self.scheduler_tx, &self.substrate, &prefix.prefix)?;
                 continue_state(
                     &self.scheduler_tx,
                     &self.substrate,
-                    at_collection,
-                    &sections_prefix(&earlier),
+                    at_prompt,
+                    &prefix.past_prompt(through, &earlier),
                 )?
             }
         };
@@ -426,6 +432,7 @@ impl Sequence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::projection::sections_prefix;
 
     fn ids(raw: &[u32]) -> Vec<SectionId> {
         raw.iter().map(|&r| SectionId::new(r)).collect()
@@ -528,6 +535,11 @@ mod tests {
         want.push(PrefixItem::Hole(525));
         want.extend(sections_prefix(&ids(&[30, 20, 10])));
         assert_eq!(both.behind(400, &ids(&[10])), want);
+        // Past the prompt: the hole, both leads and the earlier member — what
+        // its state is run on over from the prompt's.
+        let mut past = vec![PrefixItem::Hole(525)];
+        past.extend(sections_prefix(&ids(&[30, 20, 10])));
+        assert_eq!(both.past_prompt(400, &ids(&[10])), past);
         // Its address leaves both leads out, their positions in the hole: the
         // same as a chain sealed behind no lead at all.
         let mut addressed = prompt;
