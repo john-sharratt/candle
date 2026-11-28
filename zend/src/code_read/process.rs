@@ -7,7 +7,10 @@
 //! A file the card had no room for goes back through admission whole.
 
 use super::*;
+use candle_conversation::projection::PrefixItem;
+
 use crate::files::lead::lead_of;
+use crate::files::FILES_COLLECTION;
 use crate::ingest_holdoff;
 
 /// Ingest one file: skip it when its key is already recorded with its members
@@ -134,6 +137,49 @@ pub(super) fn process_one_file(
             return Ok(());
         }
     };
+    // The same version sealed again belongs at the addresses its record names,
+    // where a restart restores it: one sealed elsewhere was prefilled afresh.
+    if let Some(prior) = records::of_path(&conversation, &file.path)
+        .into_iter()
+        .find(|r| r.content_key == job.key)
+    {
+        let was: Vec<_> = prior.chunks.iter().map(|c| c.member.address).collect();
+        let now: Vec<_> = record.chunks.iter().map(|c| c.member.address).collect();
+        if was != now {
+            // What the collection's members are sealed behind: its items, the
+            // tokens of its sections, its holes, and the collection's lead.
+            let behind = base.members_prefix(FILES_COLLECTION).ok().map(|m| {
+                let sections: usize = m
+                    .prefix
+                    .iter()
+                    .filter_map(|i| i.section())
+                    .map(|s| base.section_tokens(s))
+                    .sum();
+                let holes: usize = m
+                    .prefix
+                    .iter()
+                    .filter_map(|i| match i {
+                        PrefixItem::Hole(n) => Some(*n),
+                        PrefixItem::Section(_) => None,
+                    })
+                    .sum();
+                (m.prefix.len(), sections, holes, m.range, m.lead_tokens)
+            });
+            tracing::warn!(
+                target: "zend::code_read::ingest",
+                file = %file.path,
+                was = ?was.first(),
+                now = ?now.first(),
+                behind = ?behind,
+                lead = ?lead
+                    .iter()
+                    .map(|&s| (s.raw(), base.section_tokens(s)))
+                    .collect::<Vec<_>>(),
+                "a recorded file sealed at other addresses than its record names — prefilled \
+                 afresh instead of restored",
+            );
+        }
+    }
     if let Err(err) = records::put(&conversation, &record) {
         // Not recorded: no pass or projection finds it, and the earlier
         // version stays placeable, exactly as on the failure path.
