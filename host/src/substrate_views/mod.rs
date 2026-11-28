@@ -5,7 +5,8 @@
 //! `GET /v1/substrate` — storage, counts and layer metadata, cheap however large
 //! the corpus — and each level below it is a view the page fetches only when
 //! that node expands: [`system_prompt`], one layer's [`layer_conversations`],
-//! one conversation's [`timeline`]. The tenant serves them under
+//! one conversation's [`timeline`] — or, for a layer whose units are paths,
+//! one folder's [`path_level`]. The tenant serves them under
 //! `/v1/substrate/<tenant>/`, which its line names as `views`.
 //!
 //! All read the live `Substrate` through a `Conversation` handle — one version
@@ -17,11 +18,13 @@
 //! | [`segments`] | the redo log's files on disk |
 //! | [`selection`] | a group's selection rule, named |
 //! | [`layer`] | one layer's conversations |
+//! | [`path_tree`] | one folder of a layer's knowledge-base units |
 //! | [`system_prompt`] | the shared system prompt's framing |
 //! | [`timeline`] | one conversation's forest |
 
 mod layer;
 mod overview;
+mod path_tree;
 mod segments;
 mod selection;
 mod system_prompt;
@@ -29,6 +32,7 @@ mod timeline;
 
 pub use layer::{layer_conversations, title, ConvView, LayerConversations, Unit};
 pub use overview::{overview, Counts, GroupView, LayerView, Storage, SubstrateOverview};
+pub use path_tree::{path_level, PathLevel, PathNode, PathUnit, PathUnitView};
 pub use segments::{segment_files, SegmentView};
 pub use selection::fmt_selection;
 pub use system_prompt::{system_prompt, system_prompt_labels, SectionView, SystemPromptView};

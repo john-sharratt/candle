@@ -203,6 +203,14 @@ impl SharedSubstrate {
         self.substrate.read().custom_objects_count_under(prefix)
     }
 
+    /// How many live custom objects under `prefix` have a key `keep` accepts,
+    /// read from the keys alone.
+    pub fn custom_objects_count_where(&self, prefix: &str, keep: impl Fn(&str) -> bool) -> usize {
+        self.substrate
+            .read()
+            .custom_objects_count_where(prefix, keep)
+    }
+
     /// The live custom object under `prefix` whose key sorts last.
     pub fn custom_object_last_under(&self, prefix: &str) -> Option<CustomObjectPayload> {
         self.substrate.read().custom_object_last_under(prefix)

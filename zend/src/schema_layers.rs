@@ -32,7 +32,7 @@ fn parse_layers(text: &str) -> anyhow::Result<Vec<Map<String, Value>>> {
 }
 
 /// Each raw entry with the live fields of its layer: `conversation_count`,
-/// `tokens`, `disabled` — or the entry alone for a layer the live view does
+/// `unit_count`, `tokens`, `disabled` — or the entry alone for a layer the live view does
 /// not list (none loaded yet).
 pub fn with_live_fields(raw: Vec<Map<String, Value>>, live: &[LayerView]) -> Vec<Value> {
     raw.into_iter()
@@ -40,6 +40,7 @@ pub fn with_live_fields(raw: Vec<Map<String, Value>>, live: &[LayerView]) -> Vec
             let name = entry.get("name").and_then(Value::as_str).unwrap_or("");
             if let Some(l) = live.iter().find(|l| l.name == name) {
                 entry.insert("conversation_count".into(), json!(l.conversation_count));
+                entry.insert("unit_count".into(), json!(l.unit_count));
                 entry.insert("tokens".into(), json!(l.tokens));
                 entry.insert("disabled".into(), json!(l.disabled));
             }
@@ -81,14 +82,15 @@ mod tests {
             groups: Vec::new(),
             dials: Vec::new(),
             conversation_count: 3,
+            unit_count: 7,
             tokens: 900,
             disabled: false,
         }];
         assert_eq!(
             with_live_fields(raw, &live),
             vec![
-                json!({"name": "a", "window": 10, "conversation_count": 3, "tokens": 900,
-                       "disabled": false}),
+                json!({"name": "a", "window": 10, "conversation_count": 3, "unit_count": 7,
+                       "tokens": 900, "disabled": false}),
                 json!({"name": "b"}),
             ]
         );

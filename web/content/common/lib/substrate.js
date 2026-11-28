@@ -105,7 +105,7 @@ export function mountSubstrate({ tenant, prefix, mock, hosts, live }) {
   function stillOpen(node){ const c = node.closest && node.closest('.'+P+'grp'); return !!c && c.classList.contains(P+'open'); }
 
   // ── state ─────────────────────────────────────────────────────────────────
-  const S = { data:null, lastCounts:null, sp:null, toolsData:null, layerCache:{}, tlCache:{} };
+  const S = { data:null, lastCounts:null, sp:null, toolsData:null, layerCache:{}, pathCache:{}, tlCache:{} };
 
   // ── lazy loaders (fetch-on-expand, cached) ────────────────────────────────
   // The tenant's own views live under `/v1/substrate/<tenant>/`; the overview
@@ -114,6 +114,11 @@ export function mountSubstrate({ tenant, prefix, mock, hosts, live }) {
   async function loadSystemPrompt(){ if(!S.sp) S.sp = mock?mockSystemPrompt():await getJSON(VIEWS+'/system-prompt'); return S.sp; }
   async function loadTools(){ if(!S.toolsData) S.toolsData = mock?mockTools():await getJSON('/v1/tools').then((b)=>({ tools:(b.tools||[]).filter((t)=>t.tenant===tenant) })); return S.toolsData; }
   async function loadLayer(name){ if(!S.layerCache[name]) S.layerCache[name] = mock?mockLayer(name):await getJSON(VIEWS+'/layer/'+encodeURIComponent(name)); return S.layerCache[name]; }
+  async function loadPath(name, at){
+    const k = name+'\u0000'+at;
+    if(!S.pathCache[k]) S.pathCache[k] = mock?mockPath(name, at):await getJSON(VIEWS+'/layer/'+encodeURIComponent(name)+'/path?at='+encodeURIComponent(at));
+    return S.pathCache[k];
+  }
   async function loadTimeline(tl){ if(!S.tlCache[tl]) S.tlCache[tl] = mock?mockTimeline(tl):await getJSON(VIEWS+'/timeline/'+encodeURIComponent(tl)); return S.tlCache[tl]; }
 
   // ── rendering: KPIs ───────────────────────────────────────────────────────
@@ -265,7 +270,9 @@ export function mountSubstrate({ tenant, prefix, mock, hosts, live }) {
     const head=[
       h('span',{class:'title mono'},[document.createTextNode(l.name)]),
       h('div',{class:'meta'},[
-        l.conversation_count?badge('on', l.conversation_count+' conv'):badge('off','empty'),
+        l.conversation_count?badge('on', l.conversation_count+' conv'):null,
+        l.unit_count?badge('on', fmtN(l.unit_count)+' units'):null,
+        (!l.conversation_count && !l.unit_count)?badge('off','empty'):null,
         l.tokens?badge('', fmtTok(l.tokens)+' tok'):null,
         isTarget?badge('peak','target'):null,
         badge('', 'win '+fmtTok(l.window)),
@@ -283,19 +290,73 @@ export function mountSubstrate({ tenant, prefix, mock, hosts, live }) {
         body.appendChild(h('div',{class:'chips'}, l.groups.map(g=>
           h('span',{class:'chip',html:'<b>'+escapeHtml(g.name)+'</b> · '+escapeHtml(g.selection)}))));
       }
-      if(!l.conversation_count){ body.appendChild(h('div',{class:'empty',text:'No conversations target this layer yet.'})); return; }
-      const listHost=h('div'); body.appendChild(listHost);
-      listHost.appendChild(spinner('loading conversations…'));
-      let ld; try{ ld = await loadLayer(l.name); }
-      catch(e){ if(stillOpen(listHost)) listHost.replaceChildren(h('div',{class:'empty',text:'Failed to load: '+e})); return; }
-      if(!stillOpen(listHost)) return;
-      listHost.replaceChildren();
-      if(!ld.conversations.length){ listHost.appendChild(h('div',{class:'empty',text:'No conversations.'})); return; }
-      ld.conversations.forEach(c=> listHost.appendChild(convCard(c)));
+      if(!l.conversation_count && !l.unit_count){ body.appendChild(h('div',{class:'empty',text:'No conversations target this layer yet.'})); return; }
+      if(l.conversation_count){
+        const listHost=h('div'); body.appendChild(listHost);
+        listHost.appendChild(spinner('loading conversations…'));
+        let ld; try{ ld = await loadLayer(l.name); }
+        catch(e){ if(stillOpen(listHost)) listHost.replaceChildren(h('div',{class:'empty',text:'Failed to load: '+e})); return; }
+        if(!stillOpen(listHost)) return;
+        listHost.replaceChildren();
+        if(!ld.conversations.length) listHost.appendChild(h('div',{class:'empty',text:'No conversations.'}));
+        ld.conversations.forEach(c=> listHost.appendChild(convCard(c)));
+      }
+      if(l.unit_count){
+        // Knowledge-base members by path, one folder fetched per open.
+        body.appendChild(h('div',{class:'desc',text:'Knowledge-base members, by path — each folder counts the units below it, and loads as it opens:'}));
+        const treeHost=h('div'); body.appendChild(treeHost);
+        await fillLevel(treeHost, l.name, '');
+      }
     });
     if(isTarget) card.style.borderLeftColor='var(--accent)';
     if(l.disabled) card.style.opacity='0.45';
     return card;
+  }
+
+  // A layer's knowledge-base members, one folder at a time: `fillLevel` fetches
+  // the folder `at` — its own listing, its child folders with their counts, its
+  // files with their versions — and a child folder fetches its own level only
+  // when it opens. A closed folder holds no DOM and fetches nothing, so a tree
+  // of thousands costs what is open.
+  async function fillLevel(host, layer, at){
+    host.replaceChildren(spinner());
+    let lv; try{ lv = await loadPath(layer, at); }
+    catch(e){ if(stillOpen(host)) host.replaceChildren(h('div',{class:'empty',text:'Failed to load: '+e})); return; }
+    if(!stillOpen(host)) return;
+    host.replaceChildren();
+    lv.units.forEach(u=> host.appendChild(unitRow('listing', u)));
+    lv.children.forEach(n=> host.appendChild(pathNode(layer, n)));
+    if(!lv.units.length && !lv.children.length) host.appendChild(h('div',{class:'empty',text:'Nothing here.'}));
+  }
+  function pathNode(layer, n){
+    if(!n.folder){
+      return h('div',{}, n.units.map(u=>unitRow(n.name, u)));
+    }
+    const head=[
+      h('span',{class:'title mono',text:n.name}),
+      h('div',{class:'meta'},[
+        badge('', fmtN(n.unit_count)+' units'),
+        badge('', fmtTok(n.tokens)+' tok'),
+      ]),
+    ];
+    return group(head, (body)=>{ fillLevel(body, layer, n.path); }, {accentColor:'var(--line2)'});
+  }
+  function unitRow(name, u){
+    const shown = u.branches.slice(0, BRANCHES_SHOWN).join(', ');
+    const more = u.branches.length > BRANCHES_SHOWN ? ' +'+(u.branches.length-BRANCHES_SHOWN)+' more' : '';
+    return h('div',{class:'row'},[
+      h('span',{class:'dot'}),
+      h('div',{style:'min-width:0;flex:1'},[
+        h('span',{class:'nm mono',text:name}),
+        h('span',{class:'branches',title:u.blob+(u.branches.length?' · '+u.branches.join(', '):''),
+          text:' @ '+u.blob.slice(0, COMMIT_SHOWN)+(shown?' · '+shown+more:'')}),
+      ]),
+      h('div',{class:'rmeta'},[
+        u.placed?null:badge('off','not here'),
+        badge('', u.sections+' sec'),
+        badge('', fmtTok(u.tokens)+' tok'),
+      ].filter(Boolean)),
+    ]);
   }
 
   // What tells an ingested unit's row from its namesakes. A file reading names
@@ -467,7 +528,7 @@ export function mountSubstrate({ tenant, prefix, mock, hosts, live }) {
       if(JSON.stringify(d.counts)!==S.lastCounts){
         live.set('changed','new data · tap to reload');
         live.onClick(()=>{
-          S.sp=null; S.toolsData=null; S.layerCache={}; S.tlCache={};
+          S.sp=null; S.toolsData=null; S.layerCache={}; S.pathCache={}; S.tlCache={};
           renderAll(d); live.set('live','live'); live.onClick(null);
         });
       } else {
@@ -492,10 +553,10 @@ function mockOverview(){
     counts:{ timeline_count:9, conversation_count:5, section_count:142, token_count:137250 },
     target_layer:'dialogue',
     layers:[
-      {name:'repo_map',description:'Structural shape of the repository: directory tree, file types, line counts.',
-        window:6000,priority:5,groups:[{name:'structure',selection:'top 3'}],dials:['thinking_effort = off','response_length = terse','tools = none'],conversation_count:1,tokens:14880},
-      {name:'code_reading',description:'Raw scope-aware code chunks. One turn per (file × scope) chunk.',
-        window:6000,priority:25,groups:[{name:'scopes',selection:'top 4'}],dials:['thinking_effort = off','response_length = terse','tools = none'],conversation_count:2,tokens:10430},
+      {name:'repo_map',description:'The folders of the knowledge base: each folder\'s listing, a member of the system prompt\'s files collection.',
+        window:6000,priority:5,groups:[{name:'structure',selection:'working set'}],dials:['thinking_effort = off','response_length = terse','tools = none'],conversation_count:0,unit_count:2,tokens:420},
+      {name:'code_reading',description:'The files of the knowledge base, each cut into sections and prefilled as members of the files collection.',
+        window:6000,priority:25,groups:[{name:'scopes',selection:'working set'}],dials:['thinking_effort = off','response_length = terse','tools = none'],conversation_count:0,unit_count:2,tokens:10430},
       {name:'dialogue',description:'The active developer conversation served to the VS Code extension or web chat.',
         window:16000,priority:100,groups:[{name:'primary_conversation',selection:'recent 16 + top 8'}],
         dials:[],conversation_count:3,tokens:35630},
@@ -528,14 +589,6 @@ function mockTools(){
 }
 function mockLayer(name){
   const m={
-    repo_map:[
-      {timeline:'3300220011009988776',conv_id:'',repo:'candle',label:'/',archived:false,group:'structure',turn_count:2,tokens:14880,summary_nodes:0,branches:['main']},
-      {timeline:'3300220011009988777',conv_id:'',repo:'candle',label:'/',archived:false,group:'structure',turn_count:2,tokens:14880,summary_nodes:0,branches:['cline-passthrough','hunt-snapshot','npc-engine','qwen38-moe','stencil-json-repair']},
-    ],
-    code_reading:[
-      {timeline:'2200110099887766554',conv_id:'',repo:'candle',label:'candle-conversation/src/substrate.rs',archived:false,group:'scopes',turn_count:9,tokens:6120,summary_nodes:0,branches:['main','qwen38-moe'],commit:'2122c95d9b8e4f1a3c5d7e9f0a1b2c3d4e5f6a7b'},
-      {timeline:'2200110099887766555',conv_id:'',repo:'candle',label:'zend/src/session.rs',archived:false,group:'scopes',turn_count:6,tokens:4310,summary_nodes:0,branches:['main'],commit:'1dda19ce4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c'},
-    ],
     dialogue:[
       {timeline:'8421990033112233445',conv_id:'a1b2c3d4e5f6',label:'Trace the substrate redo log replay',archived:false,group:'primary_conversation',turn_count:18,tokens:24310,summary_nodes:3},
       {timeline:'7311882299441100223',conv_id:'99aa88bb77cc',label:'Segmented log compaction design',archived:false,group:'primary_conversation',turn_count:7,tokens:9120,summary_nodes:0},
@@ -543,6 +596,30 @@ function mockLayer(name){
     ],
   };
   return { conversations: m[name] || [] };
+}
+// A level of a layer's knowledge-base members, built from a flat list the way
+// the tenant's `path_level` builds it.
+function mockPath(name, at){
+  const unit=(path, blob, tokens, sections)=>({path, u:{blob, branches:['main'], lines:120, sections, tokens, placed:true}});
+  const units={
+    repo_map:[ unit('candle/','9f5fb014a933',300,1), unit('candle/zend/','d7faf1101438',120,1) ],
+    code_reading:[
+      unit('candle/candle-conversation/src/substrate.rs','2122c95d9b8e',6120,3),
+      unit('candle/zend/src/session.rs','1dda19ce4f3a',4310,2),
+      unit('candle/AGENTS.md','77aa01b2c3d4',9800,4),
+    ],
+  }[name] || [];
+  const own=[], kids={};
+  for(const {path, u} of units){
+    if(!path.startsWith(at)) continue;
+    const rest=path.slice(at.length);
+    if(!rest){ own.push(u); continue; }
+    const cut=rest.indexOf('/'), folder=cut>=0, nm=folder?rest.slice(0,cut+1):rest;
+    const k=kids[nm] || (kids[nm]={name:nm, path:at+nm, folder, unit_count:0, tokens:0, units:[]});
+    k.unit_count++; k.tokens+=u.tokens; if(!folder) k.units.push(u);
+  }
+  const children=Object.values(kids).sort((a,b)=>(a.folder===b.folder?a.name.localeCompare(b.name):(a.folder?-1:1)));
+  return { path:at, units:own, children };
 }
 function mockTimeline(tl){
   return {

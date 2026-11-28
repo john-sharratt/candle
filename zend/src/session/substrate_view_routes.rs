@@ -10,6 +10,8 @@
 //! order of the leaders arbitrary.
 
 use super::*;
+use crate::files::layer_tree;
+use host::substrate_views::PathLevel;
 
 impl ZendSession {
     /// What the substrate views read: the substrate and the target layer — the
@@ -30,16 +32,25 @@ impl ZendSession {
     /// `Conversation` handle (one version of it, held for the walk), never a
     /// rebuild from the log.
     /// Answers while zend is still loading, once its substrate has replayed.
+    /// `repo_map` and `code_reading` count the knowledge base's records of their
+    /// kind, which are collection members, not conversations — from the keys
+    /// alone, since the page polls this.
     pub fn substrate_overview(&self) -> Option<SubstrateOverview> {
         let (conv, target_layer) = self.substrate_for_views()?;
         // The builder parsed once at session construction: no lock held, and no
         // per-request re-parse.
-        Some(overview(
+        let mut o = overview(
             &conv,
             self.projection_builder.schema(),
             target_layer,
             &self.config.workspace.root().join(SUBSTRATE_DIR),
-        ))
+        );
+        for layer in &mut o.layers {
+            if let Some(unit) = layer_tree::unit_of_layer(&layer.name) {
+                layer.unit_count = layer_tree::count(&conv, unit);
+            }
+        }
+        Some(o)
     }
 
     /// Flip a projection layer's runtime kill switch (in-memory, non-persistent).
@@ -76,6 +87,17 @@ impl ZendSession {
         let (conv, _) = self.substrate_for_views()?;
         let read = conv.read();
         Some(layer_conversations(&read, &groups, unit_of))
+    }
+
+    /// `GET /v1/substrate/zend/layer/{name}/path?at=` — one folder of
+    /// `repo_map`'s or `code_reading`'s knowledge-base records, `at` `""` for the
+    /// repositories. Fetched when a folder opens: only the records under `at`
+    /// are read. `None` before the substrate has replayed, or for a layer that
+    /// holds no records.
+    pub fn substrate_layer_path(&self, name: &str, at: &str) -> Option<PathLevel> {
+        let unit = layer_tree::unit_of_layer(name)?;
+        let (conv, _) = self.substrate_for_views()?;
+        Some(layer_tree::level(&conv, unit, at))
     }
 
     /// `GET /v1/substrate/zend/system-prompt` — the target (dialogue) layer's framing:

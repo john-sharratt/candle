@@ -8,6 +8,8 @@
 //!
 //! - `GET /v1/substrate/zend/system-prompt`       — the target layer's framing.
 //! - `GET /v1/substrate/zend/layer/{name}`        — the conversations in one layer.
+//! - `GET /v1/substrate/zend/layer/{name}/path?at=` — one folder of a layer's
+//!   knowledge-base records (`repo_map`, `code_reading`), as the page opens it.
 //! - `GET /v1/substrate/zend/timeline/{tl}`       — one conversation's summary forest.
 //! - `GET /v1/substrate/zend/timeline/{tl}/selection` — its most recent
 //!   score-density selection: which nodes made the slot, why, and the
@@ -23,7 +25,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     Json,
 };
@@ -31,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use candle_conversation::summary_tree::SelectionOrigin;
-use host::substrate_views::{LayerConversations, SystemPromptView, TimelineDetail};
+use host::substrate_views::{LayerConversations, PathLevel, SystemPromptView, TimelineDetail};
 
 use crate::session::ZendSession;
 
@@ -64,6 +66,27 @@ pub async fn layer(
     Path(name): Path<String>,
 ) -> Result<Json<LayerConversations>, StatusCode> {
     off_runtime(move || session.substrate_layer(&name))
+        .await?
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Which folder of a layer's records to read.
+#[derive(Deserialize)]
+pub struct PathQuery {
+    /// The folder, `/`-ended; absent or empty for the repositories.
+    #[serde(default)]
+    pub at: String,
+}
+
+/// `GET /v1/substrate/zend/layer/:name/path?at=` — one folder of a layer's
+/// knowledge-base records, fetched as the page opens it.
+pub async fn layer_path(
+    State(session): State<Arc<ZendSession>>,
+    Path(name): Path<String>,
+    Query(q): Query<PathQuery>,
+) -> Result<Json<PathLevel>, StatusCode> {
+    off_runtime(move || session.substrate_layer_path(&name, &q.at))
         .await?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)

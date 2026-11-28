@@ -53,6 +53,15 @@ fn a_prefix_reads_its_own_live_keys_in_order() {
     assert!(keys(&s, "npc/").is_empty());
     assert_eq!(s.custom_objects_count_under("mcp/t/"), 2);
     assert_eq!(s.custom_objects_count_under("npc/"), 0);
+    // By key alone: the ceased mcp/t/c is not counted, whatever it is named.
+    assert_eq!(
+        s.custom_objects_count_where("mcp/", |k| k.ends_with('a')),
+        2
+    );
+    assert_eq!(
+        s.custom_objects_count_where("mcp/t/", |k| !k.ends_with('a')),
+        1
+    );
     assert_eq!(
         s.custom_object_last_under("mcp/t/").map(|o| o.key),
         Some("mcp/t/b".to_string()),

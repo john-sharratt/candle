@@ -95,6 +95,22 @@ impl Substrate {
         self.live_under(prefix).count()
     }
 
+    /// How many live custom objects under `prefix` have a key `keep` accepts:
+    /// keys alone, nothing copied or decoded.
+    pub fn custom_objects_count_where(&self, prefix: &str, keep: impl Fn(&str) -> bool) -> usize {
+        self.custom_object_keys
+            .range(prefix.to_string()..)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .filter(|(k, hash)| {
+                keep(k)
+                    && self
+                        .custom_objects
+                        .get(*hash)
+                        .is_some_and(|obj| !obj.ceased)
+            })
+            .count()
+    }
+
     /// The live custom object under `prefix` whose key sorts last: only it is
     /// copied.
     pub fn custom_object_last_under(&self, prefix: &str) -> Option<CustomObjectPayload> {

@@ -2,6 +2,8 @@
 //! what the daemon renders into it from the workspace.
 //!
 //! - [`ingest`] — a file cut, sealed as members and recorded;
+//! - [`layer_tree`] — `repo_map`'s and `code_reading`'s records by path, for
+//!   the substrate inspector;
 //! - [`lead`] — what a file is sealed behind: its repository's listing;
 //! - [`listing`] — a folder as the knowledge base shows it;
 //! - [`records`] — the file records in the substrate;
@@ -11,6 +13,7 @@
 //!   repositories' roots and installed into the schema at startup.
 
 pub mod ingest;
+pub mod layer_tree;
 pub mod lead;
 pub mod listing;
 pub mod records;

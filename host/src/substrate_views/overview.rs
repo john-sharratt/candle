@@ -71,7 +71,12 @@ pub struct LayerView {
     pub dials: Vec<String>,
     /// Number of conversations targeting this layer.
     pub conversation_count: usize,
-    /// Total sealed tokens across every conversation in this layer.
+    /// Knowledge-base units the layer holds — files or folders, members of the
+    /// system prompt's collection rather than conversations. The tenant counts
+    /// them; zero for a layer of conversations.
+    pub unit_count: usize,
+    /// Total sealed tokens across every conversation in this layer, or across
+    /// its units.
     pub tokens: usize,
     /// Runtime projection kill switch: `true` while this layer is toggled OFF
     /// (excluded from projection assembly). In-memory only — clears on restart.
@@ -134,6 +139,7 @@ pub fn overview(
                     .map(|(sel, opt)| format!("{sel} = {opt}"))
                     .collect(),
                 conversation_count,
+                unit_count: 0,
                 tokens,
                 disabled: s.is_layer_disabled(&l.name),
             }
@@ -250,6 +256,7 @@ layers:
                         }],
                         "dials": [],
                         "conversation_count": 0,
+                        "unit_count": 0,
                         "tokens": 0,
                         "disabled": false,
                     },
@@ -261,6 +268,7 @@ layers:
                         "groups": [{"name": "dreamt", "selection": "top 3"}],
                         "dials": [],
                         "conversation_count": 0,
+                        "unit_count": 0,
                         "tokens": 0,
                         "disabled": false,
                     },

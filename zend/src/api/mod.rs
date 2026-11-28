@@ -251,6 +251,12 @@ fn table(roles: Roles) -> Api<Arc<ZendSession>> {
             get(substrate::layer),
         )
         .route(
+            "/v1/substrate/zend/layer/:name/path",
+            Role::Admin,
+            Dispatch::Any,
+            get(substrate::layer_path),
+        )
+        .route(
             "/v1/substrate/zend/layer/:name/toggle",
             Role::Admin,
             each(),
@@ -566,6 +572,7 @@ mod tests {
                 ("/v1/substrate/zend/system-prompt", "admin"),
                 ("/v1/substrate/zend/system-prompt", "admin"),
                 ("/v1/substrate/zend/layer/:name", "admin"),
+                ("/v1/substrate/zend/layer/:name/path", "admin"),
                 ("/v1/substrate/zend/layer/:name/toggle", "admin"),
                 ("/v1/substrate/zend/timeline/:tl", "admin"),
                 ("/v1/substrate/zend/timeline/:tl", "admin"),

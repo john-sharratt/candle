@@ -19,6 +19,24 @@ pub fn all(conversation: &Conversation) -> Vec<FileRecord> {
     under(conversation, FILES_PREFIX)
 }
 
+/// Every live record at the folder `folder` and below it — `""` for every
+/// record: a range of the key index.
+pub fn below(conversation: &Conversation, folder: &str) -> Vec<FileRecord> {
+    under(conversation, &format!("{FILES_PREFIX}{folder}"))
+}
+
+/// How many live records are folders' listings (`folders`) or files' texts,
+/// read from their keys alone: a folder's path, and so its key before the
+/// blob, ends with `/`.
+pub fn count(conversation: &Conversation, folders: bool) -> usize {
+    conversation
+        .shared()
+        .custom_objects_count_where(FILES_PREFIX, |key| {
+            key.rsplit_once('@')
+                .is_some_and(|(path, _)| path.ends_with('/') == folders)
+        })
+}
+
 /// Every live record of `path`, whatever its blob.
 pub fn of_path(conversation: &Conversation, path: &str) -> Vec<FileRecord> {
     under(conversation, &path_prefix(path))
@@ -112,6 +130,36 @@ mod tests {
         retire(&conversation, &old).unwrap();
         assert_eq!(of_path(&conversation, "candle/a.rs"), vec![new.clone()]);
         assert_eq!(all(&conversation).len(), 2);
+    }
+
+    /// **A folder's records are its own and its descendants'**, never a
+    /// sibling's that only starts with its name; and the files and the folders
+    /// count apart, by their keys.
+    #[test]
+    fn a_folder_reads_below_itself_and_kinds_count_apart() {
+        let conversation = Conversation::new();
+        for r in [
+            record("candle/src/a.rs", "aa"),
+            record("candle/src/", "bb"),
+            record("candle-extra/b.rs", "cc"),
+            record("candle/", "dd"),
+        ] {
+            put(&conversation, &r).unwrap();
+        }
+        let paths = |folder: &str| -> Vec<String> {
+            below(&conversation, folder)
+                .into_iter()
+                .map(|r| r.path)
+                .collect()
+        };
+        assert_eq!(paths("candle/src/"), ["candle/src/", "candle/src/a.rs"]);
+        assert_eq!(
+            paths("candle/"),
+            ["candle/", "candle/src/", "candle/src/a.rs"]
+        );
+        assert_eq!(paths("").len(), 4);
+        assert_eq!(count(&conversation, true), 2);
+        assert_eq!(count(&conversation, false), 2);
     }
 
     /// **A record is placeable only once this process has named its last
