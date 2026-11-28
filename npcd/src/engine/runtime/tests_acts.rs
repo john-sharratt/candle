@@ -16,6 +16,25 @@ pub(super) mod tests {
 
     use super::super::tests_support::tests::{act, at, embody, rt, run, vaulted, window, WORLD};
 
+    /// **What a character reached beyond the world brings it straight back**:
+    /// the forecast is in the act's answer alone, and whoever asked is waiting
+    /// to be told it. Left unwoken, Zen fetched the weather John asked for and
+    /// never took the turn that would have told him.
+    #[tokio::test]
+    async fn an_act_beyond_the_world_brings_the_mind_straight_back() {
+        let rt = vaulted();
+        embody(&rt, 1, "m1", "green-room");
+        rt.scheduler.tick(1, 0, 0, |_, _| Vec::new());
+        assert!(!rt.scheduler.due_now(1_000).contains(&1), "already due");
+
+        let fetched = act("web_fetch", json!({"url": "https://wttr.in/?format=4"}));
+        rt.arm_followup(1, &fetched, true, false);
+        assert!(
+            rt.scheduler.due_now(1_000).contains(&1),
+            "the answer waits for something else to wake it"
+        );
+    }
+
     /// **A message sent to a character has to reach its conversation.**
     ///
     /// The whole path, end to end, because every piece of it was individually

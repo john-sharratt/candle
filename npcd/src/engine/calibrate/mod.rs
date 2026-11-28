@@ -19,6 +19,7 @@ pub mod trajectory;
 use candle_conversation::models::Dialect;
 use host::calibration::{Calibrated, Frame};
 
+use crate::engine::beyond;
 use crate::engine::tools::{self, Tool};
 
 /// One act, as the calibration phase reads it.
@@ -69,8 +70,14 @@ pub fn defs(acts: &[&Tool], dialect: &Dialect) -> Vec<ActDef> {
                 .collect(),
             questions: questions::of(t.name)
                 .iter()
-                .chain(t.examples.iter().map(|e| &e.situation))
-                .map(|q| q.to_string())
+                .copied()
+                .chain(
+                    beyond::acts::of(t.name)
+                        .into_iter()
+                        .flat_map(|r| r.definition.questions.iter().map(String::as_str)),
+                )
+                .chain(t.examples.iter().map(|e| e.situation))
+                .map(str::to_string)
                 .collect(),
         })
         .collect()
@@ -101,6 +108,7 @@ mod tests {
     use host::calibration::Calibrated;
 
     use super::{defs, frame};
+    use crate::engine::beyond::acts;
     use crate::engine::terminal::acts::{CLUSTER_STATUS, TERMINAL_CONNECT};
     use crate::engine::tools::{self, CATALOG};
 
@@ -128,6 +136,24 @@ mod tests {
             assert!(d.questions().iter().any(|q| q == e.situation));
         }
         assert!(d.questions().len() > CLUSTER_STATUS.examples.len());
+    }
+
+    /// **An act reached beyond the world is asked for as its tool is**: every
+    /// question its definition carries is one it is ranked by, beside its
+    /// examples' situations — calibrated on two situations alone, `weather`
+    /// lost a forecast question to `web_fetch`.
+    #[test]
+    fn a_reached_act_is_asked_for_by_its_definitions_questions() {
+        let dialect = Dialect::chat_ml();
+        let weather = acts::of("weather").unwrap();
+        let d = &defs(&[&weather.tool], &dialect)[0];
+        for q in &weather.definition.questions {
+            assert!(d.questions().contains(q), "{q}");
+        }
+        assert_eq!(
+            d.questions().len(),
+            weather.definition.questions.len() + weather.tool.examples.len()
+        );
     }
 
     #[test]

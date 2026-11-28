@@ -376,7 +376,7 @@ impl Minds {
             let Some(spent) = handed else {
                 break;
             };
-            left = hand_off::struck(&left, &spent);
+            left = hand_off::struck(&left, &hand_off::spent_with(&spent));
             asked = format!("{user}\n\n{}", decide::after_hand_off(turn.party, &acts));
         }
         let to = decide::destination(&acts);

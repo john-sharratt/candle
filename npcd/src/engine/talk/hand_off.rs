@@ -24,7 +24,10 @@ pub const MESSAGE_SOMEONE_ELSE: Tool = Tool {
                   person on your phone, or one of your channels. Say first how it goes — \
                   `private`, to one person alone, or `channel`, to one of your channels or \
                   groups — and then which one. This is NOT your answer to the one you are \
-                  talking with: once it is sent you still decide what to say to them.",
+                  talking with: once it is sent you still decide what to say to them. It is \
+                  for what somebody else must hear or do — never for what you will do \
+                  yourself: what you can look up, check, work or make you do once the call \
+                  is over, so you `reply` saying you will.",
     params: MESSAGE.params,
     examples: &[
         Example {
@@ -43,6 +46,17 @@ pub const MESSAGE_SOMEONE_ELSE: Tool = Tool {
         },
     ],
 };
+
+/// What the decision may no longer take once it has handed something off: the
+/// hand-offs it spent, and `reflect`.
+///
+/// **The party is waiting, so the next round answers them.** Asked again after
+/// handing off with `reflect` still offered, Zen — asked about the weather —
+/// posted "I need to check the weather" to the channel and then reflected,
+/// so its words went to its journal and the person who asked heard nothing.
+pub fn spent_with(handed: &[&'static str]) -> Vec<&'static str> {
+    handed.iter().copied().chain(["reflect"]).collect()
+}
 
 /// The conversation's hand-offs: acts that go to somebody else and leave the
 /// decision of what to say to the party still to make.
@@ -142,6 +156,30 @@ mod tests {
         assert_eq!(
             described(&acts),
             ["message_someone_else private → Jitter: check the heat"]
+        );
+    }
+
+    /// **Once something is handed off the party is answered**: the spent
+    /// hand-off and `reflect` are struck, so a reply or a goodbye is left.
+    #[test]
+    fn after_a_hand_off_the_party_is_answered() {
+        let within = Within {
+            allow: Some(
+                [
+                    "reply",
+                    "sign_off",
+                    "reflect",
+                    "promise",
+                    "message_someone_else",
+                ]
+                .map(String::from)
+                .to_vec(),
+            ),
+            ..Within::default()
+        };
+        assert_eq!(
+            struck(&within, &spent_with(&["message_someone_else"])).allow,
+            Some(["reply", "sign_off", "promise"].map(String::from).to_vec())
         );
     }
 

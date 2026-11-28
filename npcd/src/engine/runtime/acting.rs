@@ -107,15 +107,21 @@ impl Runtime {
     /// is waiting to be told. Left to the next thing that happened to wake
     /// it, Zen read the cluster and told John what it said minutes later,
     /// when a Drone posted on the channel.
+    ///
+    /// **And so does what it reached beyond the world** (`docs/zen_moon_mind.md`
+    /// §16): a forecast, a page, a sum, a note is in the act's answer alone.
+    /// Left unwoken, Zen fetched the weather John asked for and never took
+    /// the turn that would have told him.
     pub(super) fn arm_followup(&self, npc_id: u64, act: &Act, landed: bool, moved: bool) {
         let bridged = is_of_the_bridge(act.tool) && self.is_bodiless(npc_id);
+        let reached = beyond::is_mine(act.tool);
         let through_a_terminal = answers_through_a_terminal(act.tool) || bridged;
         // A reading taken is what makes telling whoever asked an answer — not
         // the connect that opened the way to it ([`terminal_reads`]).
-        if (terminal_reads(act.tool) || bridged) && landed {
+        if (terminal_reads(act.tool) || bridged || reached) && landed {
             self.scheduler.worked(npc_id);
         }
-        if moved || through_a_terminal || body::continues(act, landed) {
+        if moved || through_a_terminal || reached || body::continues(act, landed) {
             self.scheduler.think_again(npc_id);
         }
     }

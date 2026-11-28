@@ -687,9 +687,15 @@ The decision is the mind's act turn, run on an ephemeral fork with
   hand-off and none of `reply`, `sign_off` or `reflect` is asked again on a
   fresh fork, with what it handed off struck from the offered acts and told
   what it sent and that the party still waits (`decide::handed_off_only`,
-  `decide::after_hand_off`). Each round strikes at least one hand-off, so the
-  rounds end once they are spent. The acts of every round are performed, so
-  the character messages somebody else and then answers the party.
+  `decide::after_hand_off`). `reflect` is struck with it
+  (`hand_off::spent_with`): the party is waiting, so the round answers them —
+  left offered, Zen asked about the weather posted "I need to check the
+  weather" to the channel, reflected, and the person who asked heard nothing.
+  Each round strikes at least one hand-off, so the rounds end once they are
+  spent. The acts of every round are performed, so the character messages
+  somebody else and then answers the party. A hand-off is for what somebody
+  else must hear or do; what the character can do itself it says it will do,
+  and does once the call is over (§6.3).
 - **The destination.** The loop cannot make one call terminal
   (`compile_action_loop`), so the destination is read after parsing
   (`decide::destination`): the **last** of `reply`, `sign_off` or `reflect` in

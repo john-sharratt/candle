@@ -85,7 +85,7 @@ use crate::engine::agenda::{self, ordered::ORDERED_ACTS};
 use crate::engine::authoring;
 use crate::engine::authorize::{self, critical_compass};
 use crate::engine::bearings;
-use crate::engine::beyond::Group;
+use crate::engine::beyond::{self, Group};
 use crate::engine::body::{self, Outcome};
 use crate::engine::calibrate;
 use crate::engine::channels::{self, ChannelSection};
