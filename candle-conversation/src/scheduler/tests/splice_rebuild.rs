@@ -357,6 +357,29 @@ fn a_change_after_a_kept_hole_is_a_build_of_the_result() {
     assert_eq!((at, offset), (40 + 100 + 7 + 5 + 64, 40 + 7 + 5 + 64));
 }
 
+/// **A reorder right behind a kept hole keeps the hole**: the knowledge
+/// base's range — its front a hole, its sections reordered at a step — cut at
+/// the hole and walked is a build of the result, at the result's position. The
+/// K/V holds a hole as the lead of the chunk after it, so a cut that drops
+/// that chunk must leave the hole pending, or every position after it reads
+/// 100 short of the index.
+#[test]
+fn a_reorder_right_behind_a_kept_hole_keeps_the_hole() {
+    use Place::{Hole, Turn};
+    let (at, offset) = spliced_layout_equals_built(
+        &[40, 7, 33],
+        &[Turn(0), Hole(100), Turn(1), Turn(2)],
+        &[Turn(0), Hole(100), Turn(2), Turn(1)],
+    );
+    assert_eq!((at, offset), (40 + 100 + 33 + 7, 40 + 33 + 7));
+    let (at, offset) = spliced_layout_equals_built(
+        &[40, 7, 33],
+        &[Hole(100), Turn(1), Turn(2)],
+        &[Hole(100), Turn(2), Turn(1)],
+    );
+    assert_eq!((at, offset), (100 + 33 + 7, 33 + 7));
+}
+
 /// Nothing in common and everything in common are the two ends: a rebuild
 /// from nothing, and a rebuild that changes nothing.
 #[test]

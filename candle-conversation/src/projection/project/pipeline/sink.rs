@@ -782,9 +782,23 @@ pub fn run_with_sink<R: ContentResolver>(
         let at = files_at.insert_at(&system_prompt_segments);
         if let (Some(at), false) = (at, splice.segments.is_empty()) {
             let tokens = segment_tokens(&splice.segments, resolver);
+            let hole_before = match system_prompt_segments.get(at) {
+                Some(ProjectionSegment::Hole { positions }) => Some(*positions),
+                _ => None,
+            };
+            let before_total = segment_tokens(&system_prompt_segments, resolver);
             // What the files add to the prompt: none in their range, whose
             // full size the prompt already counts.
             files_tokens = place_files(&mut system_prompt_segments, at, splice.segments, tokens);
+            tracing::debug!(
+                at,
+                hole_before = ?hole_before,
+                tokens,
+                files_tokens,
+                before_total,
+                after_total = segment_tokens(&system_prompt_segments, resolver),
+                "the knowledge base's files placed in its range"
+            );
             files_placed = splice.placed;
             files_sections = splice.sections;
         }

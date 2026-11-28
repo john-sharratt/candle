@@ -2339,6 +2339,57 @@ mod tests {
             assert_eq!(writer_start_of(&backing, dst), 3);
         }
 
+        fn leads_of(backing: &ChunkedKvBacking, seq: usize) -> Vec<u32> {
+            let state = backing.state.read().expect("lock");
+            let s = state.sequences[seq].as_ref().expect("seq");
+            s.chunks_slice().iter().map(|c| c.lead).collect()
+        }
+
+        /// **A hole before the splice point stays there**: `[a | 100 | b | c]`
+        /// with `b` replaced by `c'`, then `d` inserted at the same block —
+        /// the hole is a lead on the chunk at the splice point, so it stays
+        /// on whatever chunk stands there, and the frontier stays 100 past the
+        /// tokens. A splice that took the lead with the chunk it replaced read
+        /// every later position 100 short.
+        #[test]
+        fn a_hole_before_the_splice_point_stays_there() {
+            let backing = create_test_backing();
+            let a = piece(&backing, &[5]);
+            let b = piece(&backing, &[7]);
+            let c = piece(&backing, &[3]);
+            let c2 = piece(&backing, &[9]);
+            let d = piece(&backing, &[4]);
+            let dst = backing.alloc_sequence().expect("alloc dst");
+            backing.inject_sealed_at_tail(dst, &a).expect("inject a");
+            backing.push_position_gap(dst, 100).expect("hole");
+            // The empty writer chunk the hole opened goes, its lead pending,
+            // as a sealed inject behind a hole leaves it.
+            backing.trim_empty_tail(dst).expect("trim");
+            backing.inject_sealed_at_tail(dst, &b).expect("inject b");
+            backing.inject_sealed_at_tail(dst, &c).expect("inject c");
+            assert_eq!(usages_of(&backing, dst), [5, 7, 3]);
+            assert_eq!(leads_of(&backing, dst), [0, 100, 0]);
+            assert_eq!(backing.position_frontier(dst).unwrap(), 5 + 100 + 7 + 3);
+
+            assert_eq!(backing.splice_sequence_blocks(dst, 1, 2, &c2).unwrap(), 2);
+            assert_eq!(usages_of(&backing, dst), [5, 9, 3]);
+            assert_eq!(
+                leads_of(&backing, dst),
+                [0, 100, 0],
+                "c' took b's place, hole and all"
+            );
+            assert_eq!(backing.position_frontier(dst).unwrap(), 5 + 100 + 9 + 3);
+
+            assert_eq!(backing.splice_sequence_blocks(dst, 1, 1, &d).unwrap(), 2);
+            assert_eq!(usages_of(&backing, dst), [5, 4, 9, 3]);
+            assert_eq!(
+                leads_of(&backing, dst),
+                [0, 100, 0, 0],
+                "d sits behind the hole"
+            );
+            assert_eq!(backing.position_frontier(dst).unwrap(), 5 + 100 + 4 + 9 + 3);
+        }
+
         /// The writer's chunks are not sealed history, and a splice refuses
         /// them rather than moving chunks a kernel writes into.
         #[test]

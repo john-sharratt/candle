@@ -137,7 +137,22 @@ impl SequenceState {
             );
         }
         let inserted = windows.len();
+        // A hole is the lead of the chunk after it, and an edit never carries
+        // one (holes are pieces of their own, where a rebuild cuts): a lead at
+        // the splice point is a hole the kept prefix ends in, and stays on
+        // whatever chunk stands at `start` afterwards — or pending at the tail
+        // when nothing does — so every position after it reads where it did.
+        let lead = match self.chunks.get_mut(start) {
+            Some(c) => std::mem::take(&mut c.lead),
+            None => std::mem::take(&mut self.pending_lead),
+        } + self.chunks[start..end].iter().map(|c| c.lead).sum::<u32>();
         self.chunks.splice(start..end, windows);
+        if lead > 0 {
+            match self.chunks.get_mut(start) {
+                Some(c) => c.lead += lead,
+                None => self.pending_lead += lead,
+            }
+        }
         self.writer_start_idx = self.writer_start_idx - (end - start) + inserted;
         self.gap_cursor = cursor_after_splice(self.gap_cursor, start, end, inserted);
         self.gpu_chunks.as_mut().clear();
