@@ -3,10 +3,12 @@
 //! (`docs/provenance_system_collection.md` §7). Nothing is decoded.
 //!
 //! A file is keyed by its path and blob id, and sealed only when no record
-//! carries that key, or the one that does names members this process has not
-//! sealed. Its bytes are read at the commit it was found on.
+//! carries that key, or the one that does names members that do not restore
+//! from the record alone. Its bytes are read at the commit it was found on.
 //!
 //! - `binary_mark`: the record of keys sniffed as binary.
+//! - `boot_restore`: the recorded files restored from their records before
+//!   the pass.
 //! - `chains`: the records the pass plans against.
 //! - `config`: the pool width and the limits.
 //! - `ingest`: the worker pool and the upload path.
@@ -46,6 +48,7 @@ use crate::repo_path::split;
 use crate::repo_scan::{is_binary_sample, Language};
 use crate::workspace::UPLOADS_REPO;
 
+mod boot_restore;
 mod chains;
 mod config;
 mod ingest;

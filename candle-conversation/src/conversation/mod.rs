@@ -82,6 +82,7 @@ mod birth_range;
 mod ephemeral_turn;
 pub(crate) use birth_range::BirthRange;
 mod frame;
+mod member_restore;
 mod member_seal;
 pub use ephemeral_turn::{AskScope, UnsealedAsker};
 pub(crate) use frame::Frame;
@@ -92,6 +93,7 @@ mod sharing;
 mod submitted_sections;
 mod turn_bans;
 
+pub use member_restore::{RecordedChain, RecordedMember};
 pub use member_seal::{MemberSpec, MembersPrefix, SealAs, SealedMember};
 pub(crate) use prefix_state::run_state;
 use prefix_state::{chain_of, checkpoint, shared_held, state_after};

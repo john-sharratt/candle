@@ -133,6 +133,7 @@ impl SchedulerRequest {
             | Self::ArenaGroups { .. }
             | Self::BranchCheckpointPass { .. }
             | Self::RestoreSection { .. }
+            | Self::RestoreSections { .. }
             | Self::RetireSections { .. }
             | Self::OffloadCollectionMembers { .. }
             | Self::SubmitSummaryProbe { .. }
@@ -163,6 +164,7 @@ impl SchedulerRequest {
             | Self::NewEphemeralSequence { conversation, .. }
             | Self::ResumeSequence { conversation, .. }
             | Self::RestoreSection { conversation, .. }
+            | Self::RestoreSections { conversation, .. }
             | Self::RetireSections { conversation, .. }
             | Self::OffloadCollectionMembers { conversation, .. }
             | Self::ReconstructSubstrate { conversation, .. }

@@ -129,6 +129,11 @@ pub fn ingest_jobs(
     let n_workers = parallelism();
     let total = jobs.len();
     let keys: Vec<String> = jobs.iter().map(FileJob::key).collect();
+    // The recorded files restored from their records first, together: each
+    // one restored whole is sealed here, and the snapshot below skips it.
+    if boot_restore::restore_recorded(ctx.engine, base, &keys) > 0 {
+        ctx.retrieval.mark_stale();
+    }
     // One snapshot of the keys sealed here: a file sealed since the caller
     // planned is not sealed twice.
     let present_keys = sealed_keys(ctx.engine);

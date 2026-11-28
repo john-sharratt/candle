@@ -16,6 +16,14 @@ use super::*;
 // Scheduler request types (sent from caller threads)
 // ————————————————————————————————————————————————————————————————————————————
 
+/// One section of a [`SchedulerRequest::RestoreSections`]: what a
+/// [`SchedulerRequest::RestoreSection`] carries for it.
+pub(crate) struct RestoreItem {
+    pub section_id: SectionId,
+    pub stream_id: StreamId,
+    pub tokens: TokenBuffer,
+}
+
 /// Requests sent from caller threads to the scheduler.
 pub(crate) enum SchedulerRequest {
     /// Allocate a fresh empty GPU slot bound to a conversation
@@ -509,6 +517,17 @@ pub(crate) enum SchedulerRequest {
         response_tx: Sender<Result<usize, ConversationError>>,
     },
 
+    /// [`Self::RestoreSection`] for many sections in one request: each
+    /// restored as that request restores one, the answers in the same order.
+    /// A boot's restore of the knowledge base sends its members this way, a
+    /// batch to a request, so it costs a request per batch rather than a
+    /// round trip per member.
+    RestoreSections {
+        conversation: Conversation,
+        items: Vec<RestoreItem>,
+        response_tx: Sender<Vec<Result<usize, ConversationError>>>,
+    },
+
     /// Remove transient sections — a throwaway conversation's frame — once
     /// their last user has finished with them.
     ///
@@ -816,6 +835,7 @@ impl SchedulerRequest {
             Self::MemoryCatchUp { .. } => "req:memory_catch_up",
             Self::BranchCheckpointPass { .. } => "req:branch_checkpoint_pass",
             Self::RestoreSection { .. } => "req:restore_section",
+            Self::RestoreSections { .. } => "req:restore_sections",
             Self::RetireSections { .. } => "req:retire_sections",
             Self::SetBand { .. } => "req:set_band",
             Self::OffloadCollectionMembers { .. } => "req:offload_collection_members",

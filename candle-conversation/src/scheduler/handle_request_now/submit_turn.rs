@@ -831,6 +831,26 @@ impl Scheduler {
                 true
             }
 
+            SchedulerRequest::RestoreSections {
+                conversation,
+                items,
+                response_tx,
+            } => {
+                let results = items
+                    .into_iter()
+                    .map(|item| {
+                        self.restore_section_from_persistence(
+                            &conversation,
+                            item.section_id,
+                            item.stream_id,
+                            item.tokens,
+                        )
+                    })
+                    .collect();
+                let _ = response_tx.send(results);
+                true
+            }
+
             SchedulerRequest::SetBand { sequence_id, band } => {
                 let recorded = || {
                     let conversation = self.slot_conversations.get(&sequence_id)?;
