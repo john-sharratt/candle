@@ -387,10 +387,20 @@ impl Runtime {
                  answer: you are the one speaking now, to tell them one thing.",
                 seen.party_name
             ),
-            None => match away_from_the_phone(&self.reaches_of(npc)) {
-                Some(away) => format!("{head} {ANSWERING} {away}"),
-                None => format!("{head} {ANSWERING}"),
-            },
+            None => {
+                let away = away_from_the_phone(&self.reaches_of(npc));
+                let terminals = self.is_bodiless(npc).then_some(THROUGH_YOUR_TERMINALS);
+                [
+                    Some(head.as_str()),
+                    Some(ANSWERING),
+                    terminals,
+                    away.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" ")
+            }
         };
         let spoken = minds
             .talk_turn(
@@ -824,6 +834,18 @@ const ANSWERING: &str = "On the phone you only talk. Whatever they ask you to do
                          way to: say what you will do, and it becomes yours to do. Never say it \
                          is done, posted or sent: nothing is, until you have done it away from \
                          the phone.";
+
+/// What a turn answering somebody is told of a mind with no body: the house
+/// and the machines are its own to read and work, through its terminals.
+///
+/// **Nobody else can reach them.** Asked which lights were on, Zen's
+/// conversation posted the question to a Drone, which walked the moon looking
+/// for "the lights", found a fault in a light ring there, and searched the web
+/// for "home automation system status"; the mind waited on it, and the house's
+/// own lights terminal was never connected to.
+const THROUGH_YOUR_TERMINALS: &str = "The house — its lights, its devices, its network — the \
+     machines and the cluster are yours alone to read and work, through your terminals: nobody \
+     else can reach them, so never put them to anyone else.";
 
 /// What the mind reads when what it wanted to tell `party` is held: they have
 /// answered none of its last `unanswered` lines.

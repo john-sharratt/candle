@@ -10,6 +10,7 @@
 //! cooldowns, and the character's are never stamped by a conversation (§8).
 
 use crate::engine::invoke_body::Invokable;
+use crate::engine::talk::hand_off::HAND_OFFS;
 use crate::engine::talk::key::Party;
 use crate::engine::tools::Within;
 
@@ -84,11 +85,20 @@ impl Within {
         let others = |names: &[String]| -> Vec<String> {
             names.iter().filter(|n| **n != party).cloned().collect()
         };
+        // **A mind that keeps its own agenda does the passing-on itself.**
+        // Zen's conversation with a person handed each request to "the
+        // channel" — "I need to calculate…, check the time…, get the
+        // weather" — which reached the Drones as noise, while its mind, once
+        // the call was over, did all three. A person talking to a character
+        // that takes no orders is answered; whoever else must hear of it is
+        // told by its mind.
+        let passes_on = !(thread.party.is_person() && !self.priorities.is_empty());
         let mut allow: Vec<String> = ACTS
             .iter()
             .filter(|act| **act != "remind" || !thread.party.is_person())
             .filter(|act| thread.may_change_mission || !MISSION_ACTS.contains(act))
             .filter(|act| !thread.capped || !TALKING_ACTS.contains(act))
+            .filter(|act| passes_on || !HAND_OFFS.contains(act))
             .map(|act| act.to_string())
             .collect();
         // Work is posted by `invoke`-ing the order table's `order_post`, so it
@@ -263,31 +273,43 @@ mod tests {
     }
 
     #[test]
-    fn a_stranger_is_offered_talk_and_hand_offs_and_nothing_of_the_room() {
+    fn a_stranger_is_offered_talk_and_nothing_of_the_room() {
         let party = mira();
         let within = zen().on_thread(&thread(&party, "Mira"));
         assert_eq!(
             offered(&within),
-            [
-                "reply",
-                "sign_off",
-                "reflect",
-                "promise",
-                "message_someone_else",
-                "reach_out"
-            ]
-            .map(String::from)
+            ["reply", "sign_off", "reflect", "promise"].map(String::from)
         );
+    }
+
+    /// **A person talking to a character that keeps its own agenda is
+    /// answered, and nothing is passed on from the phone**: its mind tells
+    /// whoever else must hear. A character talking with it, and a person
+    /// talking with one that takes orders, can still hand off.
+    #[test]
+    fn a_mind_that_keeps_its_own_agenda_passes_on_what_a_person_asks_itself() {
+        let hands_off = |w: &Within| {
+            let o = offered(w);
+            o.contains(&"message_someone_else".to_string()) && o.contains(&"reach_out".to_string())
+        };
+        let person = mira();
+        assert!(!hands_off(&zen().on_thread(&thread(&person, "Mira"))));
+        let jitter = Party::Npc(3);
+        assert!(hands_off(&zen().on_thread(&thread(&jitter, "Jitter"))));
+        let mut wick = zen();
+        wick.agenda.clear();
+        wick.priorities.clear();
+        assert!(hands_off(&wick.on_thread(&thread(&person, "Mira"))));
     }
 
     /// **The conversation's message is for somebody else, and only the
     /// conversation is offered it**: the main loop keeps `message`.
     #[test]
     fn only_a_conversation_is_offered_a_message_to_someone_else() {
-        let party = mira();
+        let party = Party::Npc(3);
         let thread_specs = specs_within(
             Catalog::THREAD.mode,
-            &zen().on_thread(&thread(&party, "Mira")),
+            &zen().on_thread(&thread(&party, "Jitter")),
         );
         assert!(thread_specs
             .iter()
@@ -326,8 +348,6 @@ mod tests {
                 "sign_off",
                 "reflect",
                 "promise",
-                "message_someone_else",
-                "reach_out",
                 "mission_add",
                 "mission_edit",
                 "mission_cancel",

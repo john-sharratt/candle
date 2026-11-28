@@ -695,7 +695,12 @@ The decision is the mind's act turn, run on an ephemeral fork with
   spent. The acts of every round are performed, so the character messages
   somebody else and then answers the party. A hand-off is for what somebody
   else must hear or do; what the character can do itself it says it will do,
-  and does once the call is over (§6.3).
+  and does once the call is over (§6.3). A character that keeps its own
+  agenda — one that takes no orders, as Zen — is offered no hand-off at all
+  on a person's thread (`talk::within`, `passes_on`): its mind tells whoever
+  else must hear once the call is over. From the phone Zen handed every
+  request to "the channel" ("I need to calculate…, check the time…, get the
+  weather"), where it reached the Drones as noise.
 - **The destination.** The loop cannot make one call terminal
   (`compile_action_loop`), so the destination is read after parsing
   (`decide::destination`): the **last** of `reply`, `sign_off` or `reflect` in

@@ -26,7 +26,7 @@ impl ToolHost {
     /// Build a host whose file tools overlay `workspace`'s repositories, which
     /// reads fall through to when the session layer has no entry, whose every
     /// context carries `secrets` — read once by the daemon at launch
-    /// ([`crate::secrets::load`]) — and whose commands run in a sandbox per git
+    /// (`zend_tools::state::launch::load`) — and whose commands run in a sandbox per git
     /// repository, starting the programs [`programs`] lists. Fails when the
     /// workspace's jobs folder cannot be made, or a repository opened.
     pub fn new(workspace: &Workspace, secrets: Arc<Secrets>) -> io::Result<Self> {

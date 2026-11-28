@@ -26,7 +26,8 @@ pub struct DaemonConfig {
     pub workspace: Workspace,
     /// The API keys and tokens the tools and the git layer present, read once
     /// at launch from `~/.zend/secrets.yaml` or the file `--secrets` names
-    /// ([`crate::secrets::load`]). Every context the daemon builds shares it.
+    /// (`zend_tools::state::launch::load`). Every context the daemon builds
+    /// shares it.
     pub secrets: Arc<Secrets>,
     /// Projection layers taken OUT OF SERVICE (`--disable-layer <name>`,
     /// repeatable). A disabled layer still exists in the schema, but it is

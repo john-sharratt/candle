@@ -79,7 +79,6 @@ pub mod retrieval_dials;
 pub mod retrieval_scope;
 pub mod round_timing;
 pub mod schema_layers;
-pub mod secrets;
 pub mod self_check;
 pub mod session;
 pub mod settled;

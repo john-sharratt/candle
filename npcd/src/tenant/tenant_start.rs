@@ -13,6 +13,8 @@
 //! the loading screen stays reachable during that wait. Reloads follow the mind
 //! folder whenever it moves to a newer record.
 
+use zend_tools::state::launch as secrets;
+
 use super::*;
 
 pub(super) async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<Running> {
@@ -253,6 +255,11 @@ pub(super) async fn start(t: NpcdTenant, ctx: TenantContext) -> anyhow::Result<R
     // `substrate/` takes one writable handle. See `Npcs::substrate`.
     runtime.set_substrate(authored.npcs.substrate());
     runtime.set_npcs(authored.npcs.clone());
+    // What the characters' acts beyond the world present — the search key
+    // among them — from the same file zend reads (`docs/zen_moon_mind.md`
+    // §16). Never handed over, every `web_search` answered "no
+    // tavily_api_key configured".
+    runtime.set_tool_secrets(secrets::load(None)?);
     let authored = authored.with_runtime(runtime.clone());
 
     // The effector device: one durable token per character, and the `local`

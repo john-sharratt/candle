@@ -19,13 +19,13 @@ use candle_conversation::persistence::SUBSTRATE_DIR;
 use clap::{ArgAction, Args};
 use host::OneShot;
 use serde::{Deserialize, Deserializer};
+use zend_tools::state::launch as secrets;
 
 use crate::branch_ingest::ignore::Ignore;
 use crate::config::{DaemonConfig, SelfCheck};
 use crate::engine_asks;
 use crate::model::MODEL;
 use crate::reprojection_settings::{ReprojectionSettings, REPROJECT_PROBE_TOKENS};
-use crate::secrets;
 use crate::session::try_projection_builder;
 use crate::substrate_git::open_workspace;
 use crate::tenant::ZendTenant;

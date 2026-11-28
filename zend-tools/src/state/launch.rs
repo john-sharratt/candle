@@ -1,10 +1,11 @@
-//! Which secrets file the daemon reads, and reading it once at launch.
+//! Which secrets file a daemon reads, and reading it once at launch — zend's
+//! and npcd's alike, so both reach the same keys (`docs/web_search_design.md`).
 //!
 //! The file is `~/.zend/secrets.yaml` for the user running the daemon
 //! ([`Secrets::default_path`]), or the one `--secrets <path>` names for an
 //! operator who keeps it elsewhere. What the document holds and how it is
-//! protected is [`zend_tools::state::secrets`]'s concern; this module decides
-//! which file, and how a problem with it affects the launch.
+//! protected is [`super::secrets`]'s concern; this module decides which file,
+//! and how a problem with it affects the launch.
 //!
 //! - **A named file that does not exist fails the launch.** The operator asked
 //!   for that file, so its absence is a typo in the command, and running on with
@@ -22,7 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::bail;
-use zend_tools::state::Secrets;
+
+use super::secrets::Secrets;
 
 /// Read the daemon's secrets: from `explicit` when `--secrets` named a file,
 /// otherwise from the default under the home folder.

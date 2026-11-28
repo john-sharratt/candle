@@ -12,6 +12,7 @@
 //! | [`sessions`] | [`SessionRegistry`] | All session tool groups |
 //! | [`hash_state`] | [`HashStateStore`] | `hash_state_*` streaming hash tools |
 //! | [`secrets`] | [`Secrets`] | `web_search`, git — the daemon's API keys and tokens |
+//! | [`launch`] | — | which secrets file a daemon reads at launch, zend's and npcd's |
 //!
 //! The workspace's repositories and the per-conversation file overlays the
 //! `file_*` tools work through live in `zend_vfs`.
@@ -22,6 +23,7 @@
 
 pub mod credentials;
 pub mod hash_state;
+pub mod launch;
 pub mod notes;
 pub mod secrets;
 mod secrets_exposure;
