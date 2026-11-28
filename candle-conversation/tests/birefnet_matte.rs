@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use candle::{DType, Device, Tensor};
+use candle_kernels::simple::launch_error::take_pending_launch_error;
 use candle_onnx::onnx::{tensor_shape_proto::dimension::Value as Dim, type_proto};
 
 fn home() -> PathBuf {
@@ -189,6 +190,11 @@ fn measure_in(path: PathBuf, heap: Option<usize>) -> usize {
     let before = cuda.pool_used_bytes().unwrap();
 
     cuda.reset_pool_used_peak().unwrap();
+    let before_forward = unsafe { take_pending_launch_error() };
+    assert_eq!(
+        before_forward, 0,
+        "the setup left CUDA error {before_forward} behind"
+    );
     let t = Instant::now();
     let seed =
         candle::cuda_backend::wave_provenance::WaveTicket::guest(stream.context().ordinal() as u32);
@@ -200,6 +206,16 @@ fn measure_in(path: PathBuf, heap: Option<usize>) -> usize {
         None => candle_onnx::simple_eval_on(&model, values, &device).unwrap(),
     };
     device.synchronize().unwrap();
+    // **The forward leaves no launch error behind.** A launch that fails waits
+    // on the thread for whoever next asks — on the card's one inference
+    // thread, the next layer's `moe_bucketize`, which refuses to run and
+    // stops the expert pipeline (WhiteWorld, 2026-11-28: "invalid
+    // configuration argument" after every cutout).
+    let pending = unsafe { take_pending_launch_error() };
+    assert_eq!(
+        pending, 0,
+        "a launch in the forward failed and nothing read it: CUDA error {pending}"
+    );
     let secs = t.elapsed().as_secs_f64();
     let peak = cuda.pool_used_peak_bytes().unwrap();
     let escaped = peak.saturating_sub(before);

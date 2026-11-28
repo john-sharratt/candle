@@ -212,6 +212,7 @@ void run_fast_exp_batch(
     size_t numel,
     void* stream
 ) {
+    if (numel == 0) return;
     int grid = grid_size(numel);
 
     if (dtype == 0) { // f32
@@ -255,6 +256,7 @@ void run_fast_activation_batch(
     size_t numel,
     void* stream
 ) {
+    if (numel == 0) return;
     int grid = grid_size(numel);
     
     if (dtype == 0) { // f32
@@ -283,6 +285,7 @@ void run_reference_exp_batch(
     size_t numel,
     void* stream
 ) {
+    if (numel == 0) return;
     int grid = grid_size(numel);
     reference_exp_batch_f32<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>(inp, out, numel);
 }

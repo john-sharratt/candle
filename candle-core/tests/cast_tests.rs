@@ -32,7 +32,7 @@ fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
 #[cfg(feature = "cuda")]
 #[test]
 fn an_empty_cast_leaves_no_launch_error_pending() -> Result<()> {
-    use candle_kernels::provenance::bdp_take_pending_error;
+    use candle_kernels::simple::launch_error::take_pending_launch_error;
 
     let device = match Device::new_cuda(0) {
         Ok(d) => d,
@@ -42,7 +42,7 @@ fn an_empty_cast_leaves_no_launch_error_pending() -> Result<()> {
         }
     };
     // Whatever an earlier test on this thread left behind is not this test's.
-    let _ = unsafe { bdp_take_pending_error() };
+    let _ = unsafe { take_pending_launch_error() };
 
     let empty = Tensor::from_vec(Vec::<f32>::new(), (0, 128), &device)?;
     for dtype in [DType::BF16, DType::F16] {
@@ -55,7 +55,7 @@ fn an_empty_cast_leaves_no_launch_error_pending() -> Result<()> {
     }
     device.synchronize()?;
     assert_eq!(
-        unsafe { bdp_take_pending_error() },
+        unsafe { take_pending_launch_error() },
         0,
         "an empty cast left a CUDA launch error pending on the thread"
     );

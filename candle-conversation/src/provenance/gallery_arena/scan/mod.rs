@@ -29,9 +29,10 @@ use candle::cuda_backend::staged::segment;
 use candle::cuda_backend::Held;
 use candle::{CudaDevice, Device, Result};
 use candle_kernels::provenance::{
-    bdp_bmma_supported, bdp_imma_supported, bdp_take_pending_error, run_batched_bdp_scan,
-    run_bmma_bdp_scan, run_imma_bdp_scan, BdpStats,
+    bdp_bmma_supported, bdp_imma_supported, run_batched_bdp_scan, run_bmma_bdp_scan,
+    run_imma_bdp_scan, BdpStats,
 };
+use candle_kernels::simple::launch_error::take_pending_launch_error;
 use core::ffi::c_void;
 
 use crate::persistence::streams::StreamId;

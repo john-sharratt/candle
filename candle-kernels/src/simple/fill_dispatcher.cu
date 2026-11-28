@@ -100,6 +100,7 @@ extern "C" void run_fill_op(
     size_t numel,
     void* stream
 ) {
+    if (numel == 0) return;
     unsigned int grid = grid_size(numel);
     
     switch (dtype) {
@@ -204,6 +205,7 @@ extern "C" void run_copy2d_op(
     void* stream
 ) {
     size_t numel = (size_t)d1 * (size_t)d2;
+    if (numel == 0) return;
     unsigned int grid = grid_size(numel);
     
     switch (dtype) {
@@ -274,6 +276,7 @@ extern "C" void run_const_set_op(
     void* out,
     void* stream
 ) {
+    if (numel == 0) return;
     unsigned int grid = grid_size(numel);
     
     switch (dtype) {

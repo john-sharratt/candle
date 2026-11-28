@@ -344,7 +344,7 @@ impl GalleryArena {
         // launcher reads `cudaGetLastError` after its own work, so left pending
         // it is reported as that backend failing, and the fall to the next rung
         // buries the launch that actually failed.
-        let pending = unsafe { bdp_take_pending_error() };
+        let pending = unsafe { take_pending_launch_error() };
         if pending != 0 {
             tracing::warn!(
                 target: "candle_conversation::provenance",

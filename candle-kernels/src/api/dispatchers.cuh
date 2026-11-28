@@ -15,6 +15,7 @@
 // op: 0=add, 1=div, 2=mul, 3=sub, 4=minimum, 5=maximum
 // dtype: 0=f32, 1=f64, 2=u8, 3=u32, 4=i64, 5=f16, 6=bf16, 7=f8_e4m3
 extern "C" void run_binary_arith_op(int32_t op, int32_t dtype, size_t numel, size_t num_dims, const size_t* dims_and_strides, const void* lhs, const void* rhs, void* out, void* stream) {
+    if (numel == 0) return;
     int grid = grid_size(numel);
     
     #define DISPATCH_ARITH(DTYPE, CTYPE) \
@@ -44,6 +45,7 @@ extern "C" void run_binary_arith_op(int32_t op, int32_t dtype, size_t numel, siz
 // op: 0=eq, 1=ne, 2=lt, 3=le, 4=gt, 5=ge
 // dtype: 0=f32, 1=f64, 2=u8, 3=u32, 4=i64, 5=f16, 6=bf16, 7=f8_e4m3
 extern "C" void run_binary_cmp_op(int32_t op, int32_t dtype, size_t numel, size_t num_dims, const size_t* dims_and_strides, const void* lhs, const void* rhs, uint8_t* out, void* stream) {
+    if (numel == 0) return;
     int grid = grid_size(numel);
     
     #define DISPATCH_CMP(DTYPE, CTYPE) \
@@ -74,6 +76,7 @@ extern "C" void run_binary_cmp_op(int32_t op, int32_t dtype, size_t numel, size_
 // dtype: 0=f32, 1=f64, 2=u8, 3=u32, 4=i64, 5=f16, 6=bf16, 7=f8_e4m3
 // NOTE: lhs must be contiguous (we write back to it)
 extern "C" void run_binary_inplace_op(int32_t op, int32_t dtype, size_t numel, size_t num_dims, const size_t* dims_and_strides, void* lhs, const void* rhs, void* stream) {
+    if (numel == 0) return;
     int grid = grid_size(numel);
     
     // For float types, dispatch min/max separately (different naming)
@@ -114,6 +117,7 @@ extern "C" void run_binary_inplace_op(int32_t op, int32_t dtype, size_t numel, s
 // op: 0=elu, 1=powf
 // dtype: 0=f32, 1=f64, 2=f16, 3=bf16
 void run_unary_param_op(int32_t op, int32_t dtype, float param, size_t numel, size_t num_dims, const size_t* info, const void* inp, void* out, void* stream) {
+    if (numel == 0) return;
     int grid = grid_size(numel);
     
     if (op == 0) { // elu
@@ -137,6 +141,7 @@ void run_unary_param_op(int32_t op, int32_t dtype, float param, size_t numel, si
 // cond_dtype: 0=i64, 1=u32, 2=u8
 // data_dtype: 0=f32, 1=f64, 2=u8, 3=u32, 4=i64, 5=f16, 6=bf16
 void run_where(int32_t cond_dtype, int32_t data_dtype, size_t numel, size_t num_dims, const size_t* dims_and_strides, const void* cond, const void* t, const void* f, void* out, void* stream) {
+    if (numel == 0) return;
     int grid = grid_size(numel);
     
     if (cond_dtype == 0) { // i64
@@ -258,6 +263,7 @@ void run_fast_arg_reduce_op(int32_t op, int32_t dtype, size_t src_numel, size_t 
 // dtype: 0=f32, 1=f64, 2=u8, 3=u32, 4=i64, 5=f16, 6=bf16
 // ids_dtype: 0=i16, 1=i32, 2=i64, 3=u32, 4=u8
 void run_index_select(int32_t ids_dtype, int32_t dtype, size_t numel, size_t num_dims, const size_t* info, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t ids_dim_size, size_t right_size, void* stream) {
+    if (numel == 0) return;
     int grid = grid_size(numel);
     
     if (ids_dtype == 2) { // i64
@@ -297,6 +303,7 @@ void run_index_select(int32_t ids_dtype, int32_t dtype, size_t numel, size_t num
 // dtype: 0=f32, 1=f64, 2=u8, 3=u32, 4=i64, 5=f16, 6=bf16
 // ids_dtype: 0=i16, 1=i32, 2=i64, 3=u32, 4=u8
 void run_gather(int32_t ids_dtype, int32_t dtype, size_t numel, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t ids_dim_size, size_t right_size, void* stream) {
+    if (numel == 0) return;
     int grid = grid_size(numel);
     
     if (ids_dtype == 2) { // i64
@@ -359,6 +366,7 @@ void run_gather(int32_t ids_dtype, int32_t dtype, size_t numel, const void* ids,
 // Index add dispatcher
 int32_t run_index_add(int32_t ids_dtype, int32_t dtype, const void* ids, size_t ids_dim_size, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size, void* stream) {
     size_t numel = left_size * right_size;
+    if (numel == 0) return 0;
     int grid = grid_size(numel);
 #define IA_LAUNCH(FN, I, T) FN<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const I*)ids, ids_dim_size, (const T*)src, (T*)dst, left_size, src_dim_size, dst_dim_size, right_size);
     if (ids_dtype == 2) {
@@ -378,6 +386,7 @@ int32_t run_index_add(int32_t ids_dtype, int32_t dtype, const void* ids, size_t 
 // Scatter dispatcher
 int32_t run_scatter(int32_t ids_dtype, int32_t dtype, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size, void* stream) {
     size_t numel = left_size * right_size;
+    if (numel == 0) return 0;
     int grid = grid_size(numel);
 #define S_LAUNCH(FN, I, T) FN<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const I*)ids, (const T*)src, (T*)dst, left_size, src_dim_size, dst_dim_size, right_size);
     if (ids_dtype == 2) {
@@ -394,6 +403,7 @@ int32_t run_scatter(int32_t ids_dtype, int32_t dtype, const void* ids, const voi
 // Scatter add dispatcher
 int32_t run_scatter_add(int32_t ids_dtype, int32_t dtype, const void* ids, const void* src, void* dst, size_t left_size, size_t src_dim_size, size_t dst_dim_size, size_t right_size, void* stream) {
     size_t numel = left_size * right_size;
+    if (numel == 0) return 0;
     int grid = grid_size(numel);
 #define SA_LAUNCH(FN, I, T) FN<<<grid, BLOCK_SIZE, 0, (cudaStream_t)stream>>>((const I*)ids, (const T*)src, (T*)dst, left_size, src_dim_size, dst_dim_size, right_size);
     if (ids_dtype == 2) {
@@ -421,6 +431,7 @@ int32_t run_scatter_add(int32_t ids_dtype, int32_t dtype, const void* ids, const
 //     11=round, 12=normcdf, 13=abs, 14=sqr, 15=sqrt, 16=gelu, 17=gelu_erf, 18=relu, 19=silu, 20=sign, 21=sigmoid
 // dtype: 0=f32, 1=f64, 2=f16, 3=bf16, 4=f8_e4m3, 5=u8, 6=u32, 7=i64 (only for copy)
 void run_unary_op(int32_t op, int32_t dtype, size_t numel, size_t num_dims, const size_t* info, const void* inp, void* out, void* stream) {
+    if (numel == 0) return;
     int grid = grid_size(numel);
     
     // Handle copy operation separately as it supports more dtypes
@@ -487,6 +498,7 @@ void run_unary_op(int32_t op, int32_t dtype, size_t numel, size_t num_dims, cons
 // dtype: 0=f32, 1=f16, 2=bf16, 3=f8_e4m3
 // Computes: out[i] = silu(gate[i]) * up[i]
 void run_fused_silu_mul(int32_t dtype, size_t numel, size_t num_dims, const size_t* dims_and_strides, const void* gate, const void* up, void* out, void* stream) {
+    if (numel == 0) return;
     int grid = grid_size(numel);
 
     switch (dtype) {

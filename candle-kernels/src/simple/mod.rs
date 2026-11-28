@@ -132,6 +132,10 @@ pub mod comp_idx;
 // session of a wave
 pub mod rows_scatter;
 
+// The launch error pending on the calling thread, taken and cleared: what a
+// step of many launches reads after itself, so its failure is its own.
+pub mod launch_error;
+
 // F32 rows × weightᵀ for a few rows: one block per output column, K cut across
 // its threads — the QSA indexer's projections at decode and verify width
 pub mod f32_rows_matmul;

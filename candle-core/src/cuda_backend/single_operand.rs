@@ -244,8 +244,6 @@ impl Map1Any for FastReduce<'_> {
             dims.push(src_dims[dim_idx]);
             stride.push(src_stride[dim_idx]);
         }
-        let el_to_sum_per_block = src_el / dst_el;
-
         let (check_empty, return_index) = match self.1 {
             ReduceOp::Sum => (false, false),
             ReduceOp::Min => (true, false),
@@ -256,6 +254,20 @@ impl Map1Any for FastReduce<'_> {
         if check_empty && layout.shape().elem_count() == 0 {
             Err(crate::Error::EmptyTensor { op: "reduce" }.bt())?
         }
+        // **An empty sum is settled here, not launched.** Over no output
+        // elements there is nothing to write, and over an empty axis each sum
+        // is zero; either way the kernel's own sizing divides by a count of
+        // none, and a zero-block grid is a launch error left pending on the
+        // thread.
+        if src_el == 0 {
+            // SAFETY: zeroed below before it is read; empty, it is never read.
+            let (mut out, out_backing) = unsafe { alloc_inheriting::<T>(dev, dst_el, origin)? };
+            if dst_el > 0 {
+                dev.cuda_stream().memset_zeros(&mut out).w()?;
+            }
+            return Ok((wrap(out), out_backing));
+        }
+        let el_to_sum_per_block = src_el / dst_el;
 
         // Get dtype for FFI dispatcher
         let dtype = T::DTYPE;

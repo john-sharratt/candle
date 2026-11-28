@@ -1,6 +1,8 @@
 use crate::backend::BackendDevice;
 use crate::cpu_backend::CpuDevice;
 use crate::{CpuStorage, DType, Result, Shape, Storage, WithDType};
+#[cfg(feature = "cuda")]
+use candle_kernels::simple::launch_error::take_pending_launch_error;
 
 /// A `DeviceLocation` represents a physical device whereas multiple `Device`
 /// can live on the same location (typically for cuda devices).
@@ -561,6 +563,28 @@ impl Device {
             Self::Cpu => Ok(()),
             Self::Cuda(d) => d.synchronize(),
             Self::Metal(d) => d.synchronize(),
+        }
+    }
+
+    /// The CUDA launch error pending on the calling thread, taken and cleared;
+    /// `None` when there is none, and on a device that launches nothing.
+    ///
+    /// Most of this crate's kernels launch through FFI launchers that never
+    /// read their launch's result, so a launch that fails — an empty grid, an
+    /// oversized block — is not an error of the op that made it: it waits for
+    /// whoever next reads the thread's error. Work made of many ops takes it
+    /// after each, so a failure is named as its own and never left for the
+    /// next model on the thread to stop on.
+    pub fn take_launch_error(&self) -> Option<i32> {
+        match self {
+            #[cfg(feature = "cuda")]
+            Self::Cuda(_) => {
+                // SAFETY: reads and clears the calling thread's CUDA error; no
+                // argument, no memory.
+                let code = unsafe { take_pending_launch_error() };
+                (code != 0).then_some(code)
+            }
+            _ => None,
         }
     }
 

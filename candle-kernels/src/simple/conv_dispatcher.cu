@@ -197,6 +197,7 @@ extern "C" void run_conv1d(
     void* dst,
     cudaStream_t stream
 ) {
+    if (dst_numel == 0) return;
     int grid = grid_size(dst_numel);
     switch (dtype) {
         case CONV_F32:
@@ -258,6 +259,7 @@ extern "C" void run_conv2d(
     void* dst,
     cudaStream_t stream
 ) {
+    if (dst_numel == 0) return;
     int grid = grid_size(dst_numel);
     switch (dtype) {
         case CONV_F32:
@@ -319,6 +321,7 @@ extern "C" void run_conv_transpose1d(
     void* dst,
     cudaStream_t stream
 ) {
+    if (dst_numel == 0) return;
     int grid = grid_size(dst_numel);
     switch (dtype) {
         case CONV_F32:
@@ -382,6 +385,7 @@ extern "C" void run_conv_transpose2d(
     void* dst,
     cudaStream_t stream
 ) {
+    if (dst_numel == 0) return;
     int grid = grid_size(dst_numel);
     switch (dtype) {
         case CONV_F32:
@@ -443,6 +447,7 @@ extern "C" void run_im2col(
     void* dst,
     cudaStream_t stream
 ) {
+    if (dst_numel == 0) return;
     int grid = grid_size(dst_numel);
     switch (dtype) {
         case CONV_F32:
@@ -504,6 +509,7 @@ extern "C" void run_im2col1d(
     // One thread per destination element. Sized by anything smaller, the
     // elements past it are never written and keep whatever the uninitialised
     // allocation held.
+    if (numel == 0) return;
     int grid = grid_size(numel);
     switch (dtype) {
         case CONV_F32:
@@ -559,6 +565,7 @@ extern "C" void run_col2im1d(
     void* dst,
     cudaStream_t stream
 ) {
+    if (dst_el == 0) return;
     int grid = grid_size(dst_el);
     switch (dtype) {
         case CONV_F32:
@@ -614,6 +621,7 @@ extern "C" void run_avg_pool2d(
     void* dst,
     cudaStream_t stream
 ) {
+    if (src_numel == 0) return;
     int grid = grid_size(src_numel);
     switch (dtype) {
         case CONV_F32:
@@ -669,6 +677,7 @@ extern "C" void run_max_pool2d(
     void* dst,
     cudaStream_t stream
 ) {
+    if (src_numel == 0) return;
     int grid = grid_size(src_numel);
     switch (dtype) {
         case CONV_F32:
@@ -738,6 +747,7 @@ extern "C" void run_upsample_nearest2d(
     // cannot read the dims out of it, which is why the count has to come from
     // the caller that already computed it. Every other dispatcher here takes it
     // the same way; this one was the outlier.
+    if (dst_numel == 0) return;
     int grid = grid_size(dst_numel);
     switch (dtype) {
         case CONV_F32:

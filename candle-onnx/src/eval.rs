@@ -2823,6 +2823,19 @@ fn simple_eval_(
             }
             op_type => bail!("unsupported op_type {op_type} for op {node:?}"),
         }
+        // **A node's launches are its own.** A kernel launched with a shape
+        // the card cannot run fails without a word to the op that made it, and
+        // its error waits on the thread — where the next model's first
+        // launcher to read it refuses to run (WhiteWorld, 2026-11-28: every
+        // cutout stopped the expert pipeline of the inference after it). Taken
+        // here, it fails this node, named.
+        if let Some(code) = device.take_launch_error() {
+            bail!(
+                "op `{}` ({}) launched a kernel that failed with CUDA error {code}",
+                node.name,
+                node.op_type
+            )
+        }
     }
     graph
         .output

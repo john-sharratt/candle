@@ -251,6 +251,9 @@ extern "C" void run_softmax_op(
     int n_cols,
     void* stream
 ) {
+    // An empty tensor has no row to launch a block for: a zero-block grid is a
+    // launch error left pending on the thread.
+    if (n_rows <= 0) return;
     // Launch configuration: one block per row, 32 threads per block
     dim3 grid(n_rows, 1, 1);
     dim3 block(1, 32, 1);
@@ -295,6 +298,7 @@ extern "C" void run_rmsnorm_op(
     // Launch configuration: one block per row
     // Cap block size to 1024 (CUDA max) - kernel handles striding over columns
     // Minimum 32 threads to guarantee a full warp for correct __shfl_xor_sync reductions
+    if (n_rows <= 0) return;
     int block_size = n_cols < 1024 ? n_cols : 1024;
     if (block_size < 32) block_size = 32;
     dim3 grid(n_rows, 1, 1);
@@ -342,6 +346,7 @@ extern "C" void run_rmsnorm_q8a128_op(
     int sum_norm,  // q8a128 Σx convention (`SumScale::as_code()`)
     void* stream
 ) {
+    if (n_rows <= 0) return;
     int cap = n_cols < 1024 ? n_cols : 1024;
     int block_size = 32;
     while (block_size * 2 <= cap) block_size *= 2;
@@ -380,6 +385,7 @@ extern "C" void run_layernorm_op(
     // Launch configuration: one block per row
     // Cap block size to 1024 (CUDA max) - kernel handles striding over columns
     // Minimum 32 threads to guarantee a full warp for correct __shfl_xor_sync reductions
+    if (n_rows <= 0) return;
     int block_size = n_cols < 1024 ? n_cols : 1024;
     if (block_size < 32) block_size = 32;
     dim3 grid(n_rows, 1, 1);
@@ -423,6 +429,7 @@ extern "C" void run_rope_i_op(
     // (the kernel uses blockIdx.x * blockDim.x + threadIdx.x as idx,
     //  and processes 2 elements per thread)
     const uint32_t total_threads = (bh * td) / 2;
+    if (total_threads == 0) return;
     const int block_dim = 256;
     const int grid_dim = (total_threads + block_dim - 1) / block_dim;
     cudaStream_t s = (cudaStream_t)stream;
@@ -465,6 +472,7 @@ extern "C" void run_rope_op(
     // (the kernel uses blockIdx.x * blockDim.x + threadIdx.x as idx,
     //  and processes 2 elements per thread)
     const uint32_t total_threads = (bh * td) / 2;
+    if (total_threads == 0) return;
     const int block_dim = 256;
     const int grid_dim = (total_threads + block_dim - 1) / block_dim;
     cudaStream_t s = (cudaStream_t)stream;
@@ -506,6 +514,7 @@ extern "C" void run_rope_thd_op(
 ) {
     // Compute grid/block dimensions
     const uint32_t el_count = b * t * h * d;
+    if (el_count == 0) return;
     const int block_dim = 256;
     const int grid_dim = (el_count + block_dim - 1) / block_dim;
     cudaStream_t s = (cudaStream_t)stream;
