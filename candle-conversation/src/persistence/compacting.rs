@@ -103,7 +103,9 @@ impl SubstratePersistence {
         progress: Option<&dyn Fn(usize, usize)>,
     ) -> Result<()> {
         let rewritten = self.rewrite(substrate, progress, None)?;
-        rewritten.apply_to(substrate);
+        rewritten.reapply(substrate);
+        self.refuse_untaken(&rewritten, &rewritten.untaken(substrate))?;
+        rewritten.settle(substrate);
         self.unlink_rewritten(&rewritten)
     }
 
@@ -127,8 +129,40 @@ impl SubstratePersistence {
                 }
             });
         }
+        let untaken = rewritten.untaken(&substrate.read());
+        self.refuse_untaken(&rewritten, &untaken)?;
         substrate.update(|s| rewritten.settle(s));
         self.unlink_rewritten(&rewritten)
+    }
+
+    /// `Ok` when the re-apply took back everything `rewritten` carried.
+    /// Otherwise the segments it replaced are kept as sealed segments — the
+    /// untaken records are located there and nowhere else — and the
+    /// compaction ends without settling or unlinking anything, naming what it
+    /// could not take back.
+    pub(super) fn refuse_untaken(
+        &mut self,
+        rewritten: &Rewritten,
+        untaken: &[Untaken],
+    ) -> Result<()> {
+        if untaken.is_empty() {
+            return Ok(());
+        }
+        self.segments.keep_replaced(rewritten.old_segments());
+        let chunks: usize = untaken.iter().map(|u| u.carried - u.taken).sum();
+        tracing::error!(
+            target: "candle_conversation::persistence::census",
+            dir = %self.dir().display(),
+            streams = untaken.len(),
+            chunks,
+            first = ?&untaken[..untaken.len().min(8)],
+            "a compaction's re-apply did not take back every chunk it carried — the replaced \
+             segments are kept, nothing was forgotten, and the store reads as it did before"
+        );
+        Err(PersistenceError::RewriteUntaken {
+            streams: untaken.len(),
+            chunks,
+        })
     }
 
     /// Unlink the segments `rewritten` replaced: the substrate names none of

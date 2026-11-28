@@ -881,6 +881,23 @@ impl SegmentedLog {
         Ok(replaced)
     }
 
+    /// Take the segments a compaction replaced ([`Self::adopt_compacted`])
+    /// back as sealed segments of the log, below the compacted one: the
+    /// rewrite's re-apply did not take back everything it carried, so they
+    /// hold records the substrate locates nowhere else. Maintenance then
+    /// counts and carries those records as it does any other segment's.
+    pub fn keep_replaced(&mut self, replaced: &HashSet<SegmentId>) {
+        let mut sealed: Vec<SegmentId> = replaced
+            .iter()
+            .copied()
+            .filter(|&id| id != self.active_id)
+            .chain(self.sealed.iter().copied())
+            .collect();
+        sealed.sort();
+        sealed.dedup();
+        self.sealed = sealed;
+    }
+
     /// Delete the segment files a compaction replaced
     /// ([`Self::adopt_compacted`]), and any legacy single-file active beside
     /// them. Called once the substrate names none of them. A file that will not

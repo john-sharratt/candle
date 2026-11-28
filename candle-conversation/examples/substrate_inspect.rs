@@ -58,6 +58,8 @@
 
 #[path = "substrate_inspect/cast.rs"]
 mod cast;
+#[path = "substrate_inspect/compact_check.rs"]
+mod compact_check;
 #[path = "substrate_inspect/completeness.rs"]
 mod completeness;
 #[path = "substrate_inspect/faces.rs"]
@@ -684,6 +686,10 @@ enum Cmd {
     /// churn; "counted, not carried" is lost when its segment is dropped.
     /// Directory target only.
     Liveness,
+    /// Compact the store and report every stream the substrate stopped holding
+    /// or locating chunks of, with its identities. **Rewrites the store**: run
+    /// it on a copy. Directory target only.
+    CompactCheck,
     /// Which turns hold every record they declare — tokens and every chunk on
     /// every K/V layer — grouped by the member that wrote them. A writer's own
     /// turns short of chunks were never written to its log, and are a gap no
@@ -1289,6 +1295,9 @@ fn main() -> Result<()> {
         if matches!(cli.cmd, Cmd::Liveness) {
             return liveness::liveness(&target);
         }
+        if matches!(cli.cmd, Cmd::CompactCheck) {
+            return compact_check::compact_check(&target);
+        }
         if let Cmd::Completeness { kv_layers } = &cli.cmd {
             return completeness::completeness(&target, *kv_layers);
         }
@@ -1389,6 +1398,9 @@ fn main() -> Result<()> {
         }
         Cmd::Liveness => {
             anyhow::bail!("liveness requires the segmented `substrate` DIRECTORY target")
+        }
+        Cmd::CompactCheck => {
+            anyhow::bail!("compact-check requires the segmented `substrate` DIRECTORY target")
         }
         Cmd::Completeness { .. } => {
             anyhow::bail!("completeness requires the segmented `substrate` DIRECTORY target")

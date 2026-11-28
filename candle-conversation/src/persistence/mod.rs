@@ -83,6 +83,8 @@ mod rebase_tests;
 pub mod record;
 pub mod record_reader;
 pub mod recovery;
+#[cfg(test)]
+mod regeneration_tests;
 pub mod relocation_watch;
 pub mod remote;
 pub mod replica;
@@ -162,7 +164,7 @@ use record::{
 };
 use relocation_watch::RelocationWatch;
 use replica::{AppliedSet, DeferredRecord, Located, LocationIndex, OriginApplied, ReplicaPayload};
-use rewritten::Rewritten;
+use rewritten::{Rewritten, Untaken};
 use sealed_reader::SealedReader;
 use segment::SegmentId;
 use segmented_log::{store_mib, SegmentedLog};
@@ -196,6 +198,15 @@ pub enum PersistenceError {
 
     #[error("corrupt persistence data: {0}")]
     Corrupt(String),
+
+    /// A compaction's re-apply did not take back every chunk it carried, so
+    /// it settled nothing and kept the segments it replaced
+    /// (`persistence::rewritten`).
+    #[error(
+        "the compaction's re-apply did not take back {chunks} chunk(s) of {streams} stream(s): \
+         the replaced segments are kept and nothing was forgotten"
+    )]
+    RewriteUntaken { streams: usize, chunks: usize },
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
