@@ -133,6 +133,76 @@ fn a_ranged_collection_is_filled_by_tokens() {
     assert!(!got.contains(&(Some(id("tool_c")), None)), "{got:?}");
 }
 
+/// **A range with a member bound holds no more than it**, though there is
+/// room: in 100 positions a (30), b (25) and c (20) would all fit, and `most:
+/// 1` keeps the strongest alone. The hole is what it leaves.
+#[test]
+fn a_bounded_range_holds_no_more_members_than_its_bound() {
+    let yaml = yaml("top").replace(
+        "range: { tokens: 100, small_context: 40, fill: top }",
+        "range: { tokens: 100, most: 1 }",
+    );
+    let b = Builder::from_yaml(&yaml).unwrap();
+    let id = |n: &str| b.id_for_system_section(n).unwrap();
+    let resolver = MockResolver::new()
+        .with_section_score(id("tool_a"), 950.0)
+        .with_section_score(id("tool_b"), 900.0)
+        .with_section_score(id("tool_c"), 850.0)
+        .with_section_tokens(id("tool_a"), 30)
+        .with_section_tokens(id("tool_b"), 25)
+        .with_section_tokens(id("tool_c"), 20);
+    assert_eq!(
+        places(&project(&b, &resolver)),
+        vec![
+            (Some(id("framing")), None),
+            (None, Some(70)),
+            (Some(id("tool_a")), None),
+            (Some(id("outro")), None),
+        ]
+    );
+}
+
+/// **An offered range with no opinion holds no more than its bound either**:
+/// with every offered member unscored the collection shows what was offered,
+/// b (25) and c (20), and `most: 1` keeps the first of them, b, alone.
+#[test]
+fn an_offered_range_with_no_opinion_holds_its_bound() {
+    let yaml = yaml("top")
+        .replace(
+            "selection: { kind: top_k, k: 2 }",
+            "selection: { kind: offered, selector: tools, k: 1 }",
+        )
+        .replace(
+            "range: { tokens: 100, small_context: 40, fill: top }",
+            "range: { tokens: 100, most: 1 }",
+        );
+    let b = Builder::from_yaml(&yaml).unwrap();
+    let id = |n: &str| b.id_for_system_section(n).unwrap();
+    let resolver = MockResolver::new()
+        .with_section_tokens(id("tool_a"), 30)
+        .with_section_tokens(id("tool_b"), 25)
+        .with_section_tokens(id("tool_c"), 20);
+    let target = ProjectionTarget {
+        layer: b.id_for_layer("dialogue").unwrap(),
+        group: b.id_for_group("convo").unwrap(),
+        timeline: TimelineId::for_test(1),
+    };
+    let mut offered = SelectionState::default();
+    offered.select_all("tools", ["tool_b", "tool_c"]);
+    let segments = b
+        .project_with_selection(target, &resolver, ProjectionMode::Decode, &offered)
+        .segments;
+    assert_eq!(
+        places(&segments),
+        vec![
+            (Some(id("framing")), None),
+            (None, Some(75)),
+            (Some(id("tool_b")), None),
+            (Some(id("outro")), None),
+        ]
+    );
+}
+
 /// **A full range filled from the bottom is a window**: the oldest member
 /// goes, the newest stay — in a 40-position range, a (30) is dropped and b
 /// (25) and c (10) are placed, the hole the 5 they leave.

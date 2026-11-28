@@ -103,6 +103,11 @@ pub mod work;
 pub mod workflow;
 pub mod zen_task;
 
+#[cfg(test)]
+mod tests_slot_sizes;
+#[cfg(test)]
+mod tests_slots;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

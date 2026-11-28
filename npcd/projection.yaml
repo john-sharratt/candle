@@ -72,6 +72,12 @@ default_policy:
 # while everything BEFORE it matches too. World-specific material must therefore
 # come after `mood` -- put a world's setting above `identity_anchor` and every
 # world forks its own copy of all 596 response templates' KV, silently.
+#
+# EVERY ITEM TAKES A FIXED SLOT (`docs/placed_section_layout.md` §3.1c): a
+# section its `min_tokens`, a collection its `range`, what it emits and a hole
+# of the rest, so what follows an item stands at one position whoever the
+# character is and whichever template a turn has. `mood` has no range because
+# the daemon fills nothing there.
 system_prompt:
   items:
     - kind: template
@@ -80,6 +86,7 @@ system_prompt:
 
     - kind: section
       id: frame
+      min_tokens: 128
       content: |+
         You are a person in a place, not an assistant. You have your own history,
         your own reasons, and your own stake in what happens next. Speak and act
@@ -98,11 +105,13 @@ system_prompt:
     - kind: collection
       name: identity_anchor
       selection: { kind: always_visible }
+      range: { tokens: 4096, fill: bottom }
       sections: []
 
     - kind: collection
       name: identity
       selection: { kind: always_visible }
+      range: { tokens: 2048, fill: bottom }
       sections: []
 
     # ── Response: the locked structural template ─────────────────────────
@@ -121,6 +130,8 @@ system_prompt:
         min_score: 500
         evict_score: 300
       selection: { kind: top_k, k: 1 }
+      # Exactly one template, whatever room is left.
+      range: { tokens: 256, most: 1 }
       sections: []
 
     # ── Mood: the spiking register ───────────────────────────────────────

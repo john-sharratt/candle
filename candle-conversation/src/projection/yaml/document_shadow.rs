@@ -125,6 +125,7 @@ pub(super) fn pinned_names(items: &[YamlSystemPromptItem]) -> Vec<String> {
 ///
 /// ```yaml
 /// range: { tokens: 8192, small_context: 2048, fill: bottom }
+/// range: { tokens: 1024, most: 1 }
 /// ```
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -138,6 +139,9 @@ pub(super) struct YamlReservedRange {
     /// them. `bottom`: they start at its bottom, the hole after them.
     #[serde(default)]
     pub(super) fill: Option<String>,
+    /// The most members the range holds. As many as fit when not given.
+    #[serde(default)]
+    pub(super) most: Option<usize>,
 }
 
 #[derive(Deserialize)]
