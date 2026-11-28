@@ -119,6 +119,11 @@ export function mountSubstrate({ tenant, prefix, mock, hosts, live }) {
     if(!S.pathCache[k]) S.pathCache[k] = mock?mockPath(name, at):await getJSON(VIEWS+'/layer/'+encodeURIComponent(name)+'/path?at='+encodeURIComponent(at));
     return S.pathCache[k];
   }
+  // A unit's text is large and read once: fetched per open, never cached.
+  async function loadUnit(name, path, blob){
+    if(mock) return [{first:1, last:3, tokens:12, text:'## The content from '+path+':\n\n(mock preview)'}];
+    return getJSON(VIEWS+'/layer/'+encodeURIComponent(name)+'/unit?path='+encodeURIComponent(path)+'&blob='+encodeURIComponent(blob));
+  }
   async function loadTimeline(tl){ if(!S.tlCache[tl]) S.tlCache[tl] = mock?mockTimeline(tl):await getJSON(VIEWS+'/timeline/'+encodeURIComponent(tl)); return S.tlCache[tl]; }
 
   // ── rendering: KPIs ───────────────────────────────────────────────────────
@@ -324,13 +329,13 @@ export function mountSubstrate({ tenant, prefix, mock, hosts, live }) {
     catch(e){ if(stillOpen(host)) host.replaceChildren(h('div',{class:'empty',text:'Failed to load: '+e})); return; }
     if(!stillOpen(host)) return;
     host.replaceChildren();
-    lv.units.forEach(u=> host.appendChild(unitRow('listing', u)));
+    lv.units.forEach(u=> host.appendChild(unitRow(layer, lv.path, 'listing', u)));
     lv.children.forEach(n=> host.appendChild(pathNode(layer, n)));
     if(!lv.units.length && !lv.children.length) host.appendChild(h('div',{class:'empty',text:'Nothing here.'}));
   }
   function pathNode(layer, n){
     if(!n.folder){
-      return h('div',{}, n.units.map(u=>unitRow(n.name, u)));
+      return h('div',{}, n.units.map(u=>unitRow(layer, n.path, n.name, u)));
     }
     const head=[
       h('span',{class:'title mono',text:n.name}),
@@ -341,22 +346,37 @@ export function mountSubstrate({ tenant, prefix, mock, hosts, live }) {
     ];
     return group(head, (body)=>{ fillLevel(body, layer, n.path); }, {accentColor:'var(--line2)'});
   }
-  function unitRow(name, u){
+  // One version of a path. It opens to its sealed sections — line span, tokens
+  // and the text decoded from the tokens the model reads — fetched on open and
+  // dropped on close.
+  function unitRow(layer, path, name, u){
     const shown = u.branches.slice(0, BRANCHES_SHOWN).join(', ');
     const more = u.branches.length > BRANCHES_SHOWN ? ' +'+(u.branches.length-BRANCHES_SHOWN)+' more' : '';
-    return h('div',{class:'row'},[
-      h('span',{class:'dot'}),
-      h('div',{style:'min-width:0;flex:1'},[
-        h('span',{class:'nm mono',text:name}),
+    const head=[
+      h('span',{class:'title'},[
+        h('span',{class:'mono',text:name}),
         h('span',{class:'branches',title:u.blob+(u.branches.length?' · '+u.branches.join(', '):''),
           text:' @ '+u.blob.slice(0, COMMIT_SHOWN)+(shown?' · '+shown+more:'')}),
       ]),
-      h('div',{class:'rmeta'},[
+      h('div',{class:'meta'},[
         u.placed?null:badge('off','not here'),
         badge('', u.sections+' sec'),
         badge('', fmtTok(u.tokens)+' tok'),
       ].filter(Boolean)),
-    ]);
+    ];
+    return group(head, async (body)=>{
+      body.appendChild(spinner('loading sections…'));
+      let secs; try{ secs = await loadUnit(layer, path, u.blob); }
+      catch(e){ if(stillOpen(body)) body.replaceChildren(h('div',{class:'empty',text:'Failed to load: '+e})); return; }
+      if(!stillOpen(body)) return;
+      body.replaceChildren();
+      secs.forEach(s=> body.appendChild(h('div',{class:'seg'},[
+        h('div',{class:'lbl',text:'lines '+s.first+'–'+s.last+' · '+fmtTok(s.tokens)+' tok'}),
+        s.text==null
+          ? h('div',{class:'empty',text:'(not sealed or restored on this member)'})
+          : h('pre',{class:'body',text:s.text}),
+      ])));
+    }, {accentColor:'var(--line2)'});
   }
 
   // What tells an ingested unit's row from its namesakes. A file reading names

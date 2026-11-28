@@ -11,6 +11,7 @@
 
 use super::*;
 use crate::files::layer_tree;
+use crate::files::unit_sections::{self, SectionText};
 use host::substrate_views::PathLevel;
 
 impl ZendSession {
@@ -98,6 +99,23 @@ impl ZendSession {
         let unit = layer_tree::unit_of_layer(name)?;
         let (conv, _) = self.substrate_for_views()?;
         Some(layer_tree::level(&conv, unit, at))
+    }
+
+    /// `GET /v1/substrate/zend/layer/{name}/unit?path=&blob=` — one unit's
+    /// sealed sections, decoded with the engine's tokenizer. Fetched when its row
+    /// opens. `None` before the model is loaded, for a layer that holds no
+    /// records, or for a version no live record holds.
+    pub fn substrate_layer_unit(
+        &self,
+        name: &str,
+        path: &str,
+        blob: &str,
+    ) -> Option<Vec<SectionText>> {
+        layer_tree::unit_of_layer(name)?;
+        let state = self.inference.load_full()?;
+        let tokenizer = state.engine.tokenizer();
+        let decode = |tokens: &[u32]| tokenizer.decode(tokens, false).unwrap_or_default();
+        unit_sections::sections(&state.substrate, path, blob, &decode)
     }
 
     /// `GET /v1/substrate/zend/system-prompt` — the target (dialogue) layer's framing:

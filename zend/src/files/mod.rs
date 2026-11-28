@@ -10,7 +10,9 @@
 //! - [`sections`] — a file cut where `file_read` pages it, each section its
 //!   read;
 //! - [`seed`] — the seed every conversation opens on, rendered from the
-//!   repositories' roots and installed into the schema at startup.
+//!   repositories' roots and installed into the schema at startup;
+//! - [`unit_sections`] — one unit's sealed sections, decoded, for the
+//!   substrate inspector.
 
 pub mod ingest;
 pub mod layer_tree;
@@ -19,6 +21,7 @@ pub mod listing;
 pub mod records;
 pub mod sections;
 pub mod seed;
+pub mod unit_sections;
 
 /// The collection the knowledge base's files are placed through: filled per
 /// projection from the corpus by the fill, never from a content folder.

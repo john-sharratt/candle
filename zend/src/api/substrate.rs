@@ -10,6 +10,8 @@
 //! - `GET /v1/substrate/zend/layer/{name}`        — the conversations in one layer.
 //! - `GET /v1/substrate/zend/layer/{name}/path?at=` — one folder of a layer's
 //!   knowledge-base records (`repo_map`, `code_reading`), as the page opens it.
+//! - `GET /v1/substrate/zend/layer/{name}/unit?path=&blob=` — one of those
+//!   units' sealed sections, decoded, as the page opens its row.
 //! - `GET /v1/substrate/zend/timeline/{tl}`       — one conversation's summary forest.
 //! - `GET /v1/substrate/zend/timeline/{tl}/selection` — its most recent
 //!   score-density selection: which nodes made the slot, why, and the
@@ -32,6 +34,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::files::unit_sections::SectionText;
 use candle_conversation::summary_tree::SelectionOrigin;
 use host::substrate_views::{LayerConversations, PathLevel, SystemPromptView, TimelineDetail};
 
@@ -87,6 +90,26 @@ pub async fn layer_path(
     Query(q): Query<PathQuery>,
 ) -> Result<Json<PathLevel>, StatusCode> {
     off_runtime(move || session.substrate_layer_path(&name, &q.at))
+        .await?
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Which unit of a layer's records to read.
+#[derive(Deserialize)]
+pub struct UnitQuery {
+    pub path: String,
+    pub blob: String,
+}
+
+/// `GET /v1/substrate/zend/layer/:name/unit?path=&blob=` — one unit's sealed
+/// sections, decoded, fetched as the page opens its row.
+pub async fn layer_unit(
+    State(session): State<Arc<ZendSession>>,
+    Path(name): Path<String>,
+    Query(q): Query<UnitQuery>,
+) -> Result<Json<Vec<SectionText>>, StatusCode> {
+    off_runtime(move || session.substrate_layer_unit(&name, &q.path, &q.blob))
         .await?
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
