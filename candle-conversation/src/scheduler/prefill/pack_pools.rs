@@ -577,6 +577,16 @@ impl Scheduler {
         // relocates would leave its slot neither where the pass found it nor
         // where it put it.
         drain_reclaimed();
+        // **The outstanding gap is a holder the sweep does not reach**, so it
+        // is caught up first (`docs/kv_quantize_in_the_gap.md` §3.5). Its
+        // lease owns slots no other holder names, and its jobs name native
+        // bands by gid: a pass that relocated them would leave the lease
+        // holding the old slots and the copies named by nobody — on WhiteWorld
+        // (2026-11-28, tight pools, `retried=120`) 218 of 401 relocated slots
+        // came back unwitnessed. The pass synchronises the device anyway, so
+        // waiting out a gap of a few milliseconds costs it next to nothing,
+        // and the lease is back in the pools before the census counts them.
+        self.catch_up_outstanding_gap();
 
         // **Every registered conversation, not one.** Conversations in a workspace
         // share a substrate, so sweeping one sweeps all its residences — but the

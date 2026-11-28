@@ -133,7 +133,8 @@ A gap does these things, in this order:
 
 **At most one gap is outstanding.** A gap whose predecessor's completion word is
 not yet set quantizes nothing; its blocks wait for the next gap, and the
-outstanding gap's lease stays held, untouched, until its catch-up. The summary
+outstanding gap's lease stays held, untouched, until its catch-up — which a
+compaction pass forces before it relocates anything (§3.2). The summary
 is therefore one buffer, a lease is never held by two gaps, and the host never
 reasons about two unread results.
 
@@ -217,7 +218,13 @@ chooses among them.**
   3 MB for an 8K prompt's prefill gap, a few KB for a decode gap — against the
   hundreds of bytes per band the convert moves. At the next catch-up every slot
   the gap did not install goes back to its pool, so no lease stands between
-  gaps: compaction and the empty sweep see every free slot, the next lease is
+  gaps. A compaction pass catches an outstanding gap up before it starts
+  (`pack_kv_pools`, `catch_up_outstanding_gap`): the lease owns slots no other
+  holder names and the gap's jobs name native bands by gid, so a pass run
+  under it relocated slots no holder it swept could rewrite (WhiteWorld,
+  2026-11-28: 218 of 401 unwitnessed). The pass synchronises the device
+  anyway, so the wait is next to free. Compaction and the empty sweep then
+  see every free slot, the next lease is
   packed into the lowest arenas first, into the holes that truncates, evictions and freed
   natives opened, and the addresses on the device are never older than the gap
   that reads them. The host is the only owner of a leased slot; the device is
