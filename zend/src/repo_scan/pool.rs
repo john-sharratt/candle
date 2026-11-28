@@ -9,6 +9,7 @@
 //! hands claimed units back.
 
 use super::*;
+use crate::ingest_holdoff;
 
 /// Drive a bounded worker pool over `jobs`, each worker pulling the next
 /// folder from a shared cursor and running [`process_one_dir`].
@@ -59,6 +60,12 @@ pub(crate) fn run_dir_pool(
                     let job = &jobs[idx];
                     let mut left = false;
                     let tracked = !present_keys.contains(&job.unit.key);
+                    // A failure's cooldown is waited out, so the folder stays
+                    // owed rather than counted another member's
+                    // (`crate::ingest_holdoff`).
+                    if tracked && !ingest_holdoff::wait_out_cooldown() {
+                        return;
+                    }
                     let result = if !tracked {
                         Ok(())
                     } else {

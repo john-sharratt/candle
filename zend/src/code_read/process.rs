@@ -8,6 +8,7 @@
 
 use super::*;
 use crate::files::lead::lead_of;
+use crate::ingest_holdoff;
 
 /// Ingest one file: skip it when its key is already recorded with its members
 /// sealed here, or it is binary; otherwise cut it, seal its members behind
@@ -33,6 +34,11 @@ pub(super) fn process_one_file(
         return Ok(());
     }
     if job.binary.lock().unwrap().contains(job.key) {
+        return Ok(());
+    }
+    // A failure's cooldown is waited out, so the file stays owed rather than
+    // counted another member's (`crate::ingest_holdoff`).
+    if !ingest_holdoff::wait_out_cooldown() {
         return Ok(());
     }
     // Another member that planned this same unread file holds its lease and is

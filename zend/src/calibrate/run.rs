@@ -34,7 +34,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use candle_conversation::files::names::chunk_name;
 use candle_conversation::files::{files_owner, FileRecord, FileUnit, FilesPin, SectionKey};
@@ -159,10 +159,6 @@ const CALIBRATE_PARALLELISM: usize = 3 * LAYER_PARALLELISM;
 const THINKING_WIDTH: usize = 128;
 const _: () = assert!(THINKING_WIDTH >= MAX_PREFILL_WIDTH + MAX_DECODE_WIDTH);
 static THINKING: Permits = Permits::new(THINKING_WIDTH);
-
-/// How often a calibration worker looks again whether a failure's cooldown
-/// has ended.
-const COOLDOWN_POLL: Duration = Duration::from_secs(5);
 
 /// What one layer's pass did.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -307,11 +303,8 @@ pub fn calibrate_layer(
                 // were counted done and the node settled with none of them
                 // calibrated. Waited out here, each unit stays owed until this
                 // member, or one that took its lease, calibrates it.
-                while ingest_holdoff::holdoff().cooling_down(Instant::now()) {
-                    if crate::ingest_cancel::cancelled() {
-                        return;
-                    }
-                    std::thread::sleep(COOLDOWN_POLL);
+                if !ingest_holdoff::wait_out_cooldown() {
+                    return;
                 }
                 // **One member calibrates a file.** Every member's pass plans
                 // the same files from the same replicated substrate; the one

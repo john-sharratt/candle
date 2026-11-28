@@ -18,6 +18,15 @@
 //!
 //! What is already being read goes on: the hold-off refuses new leases, it
 //! does not end the readings that hold one.
+//!
+//! **A cooldown is waited out, never counted as another member's.** Every
+//! reading path — a file, a folder, a layer's unit, a calibration — waits a
+//! running cooldown out ([`wait_out_cooldown`]) before it asks for its next
+//! unit's lease. While it waits its leases are free, so another member takes
+//! what it can; once it ends, the member leases the rest itself. Leaving the
+//! units instead counted them done: on BlackWorld (2026-11-28), the only zend
+//! member, seven seal failures held 7,775 of 7,908 files off, the pass ended,
+//! and nothing read them again.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -99,6 +108,29 @@ pub fn set_ingest(on: bool) {
     HOLDOFF.set_enabled(on);
 }
 
+/// How often a reading waiting a cooldown out looks again.
+const COOLDOWN_POLL: Duration = Duration::from_secs(5);
+
+/// Wait a running cooldown out ([`Holdoff::cooling_down`]) before the next
+/// unit is leased, so the units it holds off stay owed rather than counted
+/// another member's. `false` when the wait ended on a shutdown cancel, which
+/// ends the reading. Ingest off is not waited on: it never ends by itself.
+pub fn wait_out_cooldown() -> bool {
+    wait_out(&HOLDOFF, COOLDOWN_POLL, crate::ingest_cancel::cancelled)
+}
+
+/// [`wait_out_cooldown`] on `holdoff`, looking again every `poll`, ending
+/// early when `cancelled` says so.
+fn wait_out(holdoff: &Holdoff, poll: Duration, cancelled: impl Fn() -> bool) -> bool {
+    while holdoff.cooling_down(Instant::now()) {
+        if cancelled() {
+            return false;
+        }
+        std::thread::sleep(poll);
+    }
+    !cancelled()
+}
+
 /// The reading of `unit` failed: this member takes no new unit for
 /// [`FAILURE_COOLDOWN`], so another member can.
 pub fn cool_down(unit: &str, why: &str) {
@@ -167,6 +199,30 @@ mod tests {
         h.set_enabled(false);
         assert!(h.leaves(t0));
         assert!(!h.cooling_down(t0));
+    }
+
+    /// **A reading waits a cooldown out and then goes on**; with none running
+    /// it goes on at once, and a cancel ends the wait — and the reading.
+    #[test]
+    fn a_reading_waits_a_cooldown_out() {
+        let h = Holdoff::new();
+        assert!(wait_out(&h, Duration::ZERO, || false));
+        // A cooldown ending in 30 ms is waited through.
+        {
+            let mut until = h.until.lock().unwrap();
+            *until = Some(Instant::now() + Duration::from_millis(30));
+        }
+        let t0 = Instant::now();
+        assert!(wait_out(&h, Duration::from_millis(5), || false));
+        assert!(t0.elapsed() >= Duration::from_millis(25));
+        assert!(!h.cooling_down(Instant::now()));
+        // A cancel during a cooldown ends the reading.
+        h.cool_down(Instant::now());
+        assert!(!wait_out(&h, Duration::ZERO, || true));
+        // Ingest off is never waited on.
+        let off = Holdoff::new();
+        off.set_enabled(false);
+        assert!(wait_out(&off, Duration::ZERO, || false));
     }
 
     #[test]

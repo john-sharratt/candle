@@ -283,6 +283,11 @@ fn read_one(
     base: &Sequence,
     files: Option<&EdgeFiles<'_>>,
 ) -> anyhow::Result<()> {
+    // A failure's cooldown is waited out, so the unit stays owed rather than
+    // counted another member's (`crate::ingest_holdoff`).
+    if !ingest_holdoff::wait_out_cooldown() {
+        return Ok(());
+    }
     let hold = match ingest_lease::share(&job.key) {
         Share::Theirs => return Ok(()),
         Share::Mine(hold) => hold,
