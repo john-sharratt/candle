@@ -16,6 +16,7 @@
 //! | [`runner`] | every conversation held here, and whose turn is due |
 //! | [`state`] | what a conversation keeps between turns |
 //! | [`templates`] | the response templates a turn's words are shaped by |
+//! | [`told_first`] | telling the one who asked before anything was looked at, refused |
 //! | [`turn`] | one turn, end to end |
 //! | [`voice`] | a channel post's words, decoded before the act is sent |
 //! | [`within`] | what a conversation's turn can do |
@@ -34,6 +35,7 @@ pub mod orders;
 pub mod runner;
 pub mod state;
 pub mod templates;
+pub mod told_first;
 pub mod turn;
 pub mod voice;
 pub mod within;

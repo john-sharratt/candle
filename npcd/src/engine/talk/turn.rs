@@ -254,8 +254,19 @@ impl Runtime {
 
         // **Nobody is told a third thing while they have answered none of
         // the last two** (§8, unprompted contact): what it meant to tell them
-        // is written down, and the mind is told it waits for them.
-        if lines.is_empty() && guard::holds_purpose(seen.unanswered, seen.last_said_ms, now_ms()) {
+        // is written down, and the mind is told it waits for them. **Except
+        // what they asked for**: while their request stands, the answer is
+        // owed, not unprompted — held, Zen had its answer about the lights,
+        // the cluster and a race, could neither send it nor rest, and searched
+        // the web for the race again and again.
+        let owed = self
+            .scheduler
+            .asked(npc, self.world_ms(npc))
+            .is_some_and(|(asker, _)| asker == seen.party_name);
+        if lines.is_empty()
+            && !owed
+            && guard::holds_purpose(seen.unanswered, seen.last_said_ms, now_ms())
+        {
             for purpose in &inputs.purposes {
                 self.journals.note(
                     &world,

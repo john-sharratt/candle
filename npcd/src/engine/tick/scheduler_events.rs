@@ -122,6 +122,17 @@ impl Scheduler {
             .and_then(|i| i.asked(world_ms))
     }
 
+    /// Who asked this character something at `world_ms` that it has taken no
+    /// reading toward yet — `None` when nothing is asked, or something it did
+    /// has already come back. See [`Inbox::asked`].
+    pub fn asked_and_unworked(&self, npc_id: u64, world_ms: u64) -> Option<String> {
+        let mut inboxes = self.inboxes.lock().unwrap();
+        let inbox = inboxes.get_mut(&npc_id)?;
+        let (party, _) = inbox.asked(world_ms)?;
+        let worked = inbox.asked.as_ref().is_some_and(|a| a.worked);
+        (!worked).then_some(party)
+    }
+
     /// Note that an act of this character's came back with something: from
     /// here, telling whoever asked is an answer.
     pub fn worked(&self, npc_id: u64) {

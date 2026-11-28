@@ -580,6 +580,19 @@ impl Runtime {
                 };
             }
         }
+        // A mind tells the one who asked only once something it did has come
+        // back toward it (`engine::talk::told_first`).
+        if let Some(why) = self.told_before_looking(npc, act, source) {
+            return Performed {
+                recorded: Recorded {
+                    feed: format!("{} {REFUSED} {why}", act.summary()),
+                    answer: why,
+                    landed: false,
+                    departing: false,
+                },
+                moved: false,
+            };
+        }
         let before = self.mission_mark(npc);
         let bodily = !(body::is_device(act.tool)
             || body::composes(act.tool)
