@@ -711,7 +711,8 @@ impl Qwen4ExpBatched {
         let ratio = ratios.get(kv_layer).copied().unwrap_or(0);
         if ratio > 0 {
             for &s in seqs {
-                let base = session.sequence_offset(s).unwrap_or(0);
+                // A position, holes included: the head's tail opens past them.
+                let base = session.sequence_position(s).unwrap_or(0);
                 let cache = idx_map
                     .get_mut(&s)
                     .and_then(|c| c.get_mut(kv_layer))

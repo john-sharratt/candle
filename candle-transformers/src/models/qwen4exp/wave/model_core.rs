@@ -122,10 +122,12 @@ impl Qwen4ExpBatched {
     /// Fresh-or-reset per-sequence state, keyed exactly as the oracle keys its
     /// sessions: a member arriving at offset 0 starts over.
     ///
-    /// `tokens` is what the sequence will hold once this wave lands, which is
-    /// what the index caches are grown against — growth reallocates, and an
-    /// allocation inside the layer loop would move ground a placed tier is
-    /// standing on (hot-path invariant 7). Admission is the place for it.
+    /// `tokens` is what the sequence will hold once this wave lands; the index
+    /// caches are grown against the position that puts its next token at —
+    /// `position` plus the wave's rows, past the slot's holes as the caches'
+    /// tails are. Growth claims arena slots, and a claim inside the layer loop
+    /// would move ground a placed tier is standing on (hot-path invariant 7).
+    /// Admission is the place for it.
     ///
     /// **The reset needs `layer_start == 0` as well as `offset == 0`.** A sweep
     /// runs once per `forward_wave` layer window, and a creeping prefill does
@@ -198,6 +200,10 @@ impl Qwen4ExpBatched {
                     .iter()
                     .zip(self.attention_ratios())
                     .any(|(c, ratio)| ratio > 0 && c.page_row_span() > 0);
+            // Where the next token is read once this wave lands: the caches'
+            // tails open at a position, past the slot's holes, and are grown
+            // against one.
+            let landed = position + tokens.saturating_sub(offset);
             for (cache, ratio) in caches.iter_mut().zip(self.attention_ratios()) {
                 if starting_over {
                     // The prompt end is a declaration about what this slot is
@@ -208,7 +214,7 @@ impl Qwen4ExpBatched {
                     cache.set_prompt_end(prompt_end);
                 }
                 if ratio > 0 {
-                    cache.ensure_capacity(tokens, ratio)?;
+                    cache.ensure_capacity(landed, ratio)?;
                 }
             }
             if injected_before_reset {

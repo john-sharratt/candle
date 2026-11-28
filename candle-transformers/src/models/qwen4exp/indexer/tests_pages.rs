@@ -18,6 +18,24 @@ pub(super) mod tests {
         assert_same_walk, caged, cuda, lcg, placed_page, width_page, zero_page,
     };
 
+    /// **Admission sizes a live tail by position, past the slot's holes.** A
+    /// tail opening at 120,000 — a section sealed at the top of the knowledge
+    /// base's range — that a wave lands 5,000 positions on needs 1,251 blocks:
+    /// five pages, claimed here, none inside the forward. Sized by the token
+    /// count, it was one page.
+    #[test]
+    fn a_tail_past_a_hole_is_sized_by_its_position() {
+        let ratio = 4;
+        let mut c = caged(&[], ratio);
+        c.skip_to(120_000).unwrap();
+        c.ensure_capacity(120_000 + 5_000, ratio).unwrap();
+        assert_eq!(c.capacity_blocks(), 5 * PAGE_BLOCKS);
+        // A page injected ahead of the tail takes no key pages of its own.
+        let mut paged = caged(&[1_000], ratio);
+        paged.ensure_capacity(1_000 + 40, ratio).unwrap();
+        assert_eq!(paged.capacity_blocks(), PAGE_BLOCKS);
+    }
+
     /// **A compaction pass moves buffers, never their contents.** Three caches
     /// across several key pages, the middle one dropped to leave holes, plus a
     /// cache holding a resident page shared with a fork of it, then a pass: every

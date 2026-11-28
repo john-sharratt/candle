@@ -633,15 +633,21 @@ impl IndexCache {
         Ok(moved)
     }
 
-    /// Room for the blocks a sequence at `tokens` tokens will have completed in
-    /// its live tail.
+    /// Room for the blocks a sequence whose next token will be read at
+    /// `position` — its tokens and every hole before them — will have completed
+    /// in its live tail.
     ///
-    /// Called at wave admission. The tail opens at [`Self::next_base`], so the
-    /// tokens injected pages already cover take no key pages here. Growth is a
-    /// page at a time and moves nothing already written.
-    pub fn ensure_capacity(&mut self, tokens: usize, ratio: usize) -> Result<()> {
+    /// Called at wave admission. The tail opens at [`Self::next_base`], a
+    /// position past every injected page and hole, so only what lies beyond it
+    /// takes key pages here. **A position, never a token count**: a slot with
+    /// holes opens its tail far past its token count, and a count measured
+    /// against it reserved one page whatever the tail grew to — the next page
+    /// was then claimed inside the forward, and refused there (BlackWorld,
+    /// 2026-11-28: sections sealed at the top of the 112K files range). Growth
+    /// is a page at a time and moves nothing already written.
+    pub fn ensure_capacity(&mut self, position: usize, ratio: usize) -> Result<()> {
         self.keys
-            .ensure(tokens.saturating_sub(self.tail_base) / ratio + 1)
+            .ensure(position.saturating_sub(self.tail_base) / ratio + 1)
     }
 
     /// Start the sequence over — including its injected prefix. Returns the
