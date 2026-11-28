@@ -9,8 +9,9 @@
 #                    name where the answer turns on telling them apart
 #   architectural  — the seed's documents, the knowledge base's mandatory files
 #
-# Every expected item was read from the file it names when this was written;
-# the format is `battery.yaml`'s.
+# Every expected item was read from the file it names, as the cluster's
+# checkout holds it — what the knowledge base ingests — not a local working
+# tree, which may be behind it; the format is `battery.yaml`'s.
 
 categories: { direct: 15, transitive: 3, architectural: 6 }
 
@@ -120,11 +121,13 @@ questions:
     files: [CHANGELOG.md]
     names_file: true
 
+  # The cluster's checkout's file (battle-cities `c238683c` pinned the stable
+  # 1.100.0); a local checkout behind it still names nightly.
   - id: k14
     category: direct
     question: >-
       Which Rust toolchain channel does battle-cities' rust-toolchain.toml select?
-    expect: ["nightly"]
+    expect: ["1.100.0"]
     files: [../battle-cities/rust-toolchain.toml]
     names_file: true
 

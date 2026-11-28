@@ -94,11 +94,19 @@ impl IngestScope {
     }
 }
 
-/// The language a path's name says it is in, if it is one read at all.
+/// The language a path's name says it is in, if it is one read at all: its
+/// extension's, or for a file the ecosystem names whole — a `Makefile`, a
+/// `Dockerfile`, a `go.mod` — its name's. Taken from the extension alone, a
+/// `Makefile` was never ingested, and a question about one of its targets
+/// found nothing to place (BlackWorld, 2026-11-28).
 pub fn language_of(path: &str) -> Option<Language> {
     let basename = path.rsplit('/').next().unwrap_or(path);
-    if basename == "go.mod" || basename == "go.sum" {
-        return Some(Language::Go);
+    match basename {
+        "go.mod" | "go.sum" => return Some(Language::Go),
+        "Makefile" | "makefile" | "GNUmakefile" | "Dockerfile" | "Justfile" | "justfile"
+        | "Procfile" => return Some(Language::PlainText),
+        "Rakefile" | "Gemfile" => return Some(Language::Ruby),
+        _ => {}
     }
     let (stem, ext) = basename.rsplit_once('.')?;
     if stem.is_empty() {
@@ -152,6 +160,33 @@ mod tests {
         assert_eq!(s.admits("r", "go.mod", 10), Some(Language::Go));
         assert_eq!(s.admits("r", "k/decode.CU", 10), Some(Language::Cpp));
         assert!(s.reaches("r") && s.reaches("other"));
+    }
+
+    /// **A build file named without an extension is read by its name**: a
+    /// `Makefile` — candle's `clean-ptx` lives in one — a `Dockerfile` or a
+    /// `Justfile` as text, a `Rakefile` or `Gemfile` as Ruby; a name that only
+    /// ends like one is not.
+    #[test]
+    fn a_build_file_named_without_an_extension_is_read() {
+        let s = IngestScope::new("", None);
+        for name in [
+            "Makefile",
+            "makefile",
+            "GNUmakefile",
+            "Dockerfile",
+            "Justfile",
+            "justfile",
+            "Procfile",
+        ] {
+            assert_eq!(s.admits("r", name, 10), Some(Language::PlainText), "{name}");
+        }
+        assert_eq!(
+            s.admits("r", "crates/x/Makefile", 10),
+            Some(Language::PlainText)
+        );
+        assert_eq!(s.admits("r", "Rakefile", 10), Some(Language::Ruby));
+        assert_eq!(s.admits("r", "Gemfile", 10), Some(Language::Ruby));
+        assert_eq!(s.admits("r", "OldMakefile", 10), None);
     }
 
     #[test]

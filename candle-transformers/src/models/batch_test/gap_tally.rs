@@ -124,12 +124,30 @@ impl GapTally {
     pub fn catch_up(&mut self, session: &mut BatchedInferenceSession) -> Result<GapCatchUp> {
         let t = Instant::now();
         let c = session.gap_catch_up()?;
-        let host = t.elapsed();
+        self.charge_catch_up(&c, t.elapsed());
+        Ok(c)
+    }
+
+    /// Wait the outstanding gap out and put its blocks in place, as the
+    /// scheduler does before a compaction pass, which refuses while a gap is
+    /// outstanding. Nothing when none is.
+    pub fn catch_up_outstanding(&mut self, session: &mut BatchedInferenceSession) -> Result<()> {
+        if !session.gap_outstanding() {
+            return Ok(());
+        }
+        let t = Instant::now();
+        session.gap_wait()?;
+        let c = session.gap_catch_up()?;
+        self.charge_catch_up(&c, t.elapsed());
+        Ok(())
+    }
+
+    /// One catch-up's host time, into the current window, and its counts.
+    fn charge_catch_up(&mut self, c: &GapCatchUp, host: Duration) {
         if let Some(cost) = self.cost(self.window) {
             cost.catch_up += host;
         }
-        self.fold_catch_up(&c);
-        Ok(c)
+        self.fold_catch_up(c);
     }
 
     /// One catch-up's counts and phases, into the current window.

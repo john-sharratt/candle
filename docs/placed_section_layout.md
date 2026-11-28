@@ -219,9 +219,11 @@ every other section, and sink back from the question as they stop being read.
   (`files_step`), so a section the decode locks onto is drawn to the top
   within a few steps and stays there while it is read, and one it stops
   reading sinks back over several. A section passes the one above it only
-  when its momentum beats that one's by more than `REORDER_SHARE` (2%) of the
+  when its momentum beats that one's by more than `REORDER_SHARE` (5%) of the
   range's attention — the placed sections' momenta summed — so neighbours a
-  hair apart do not trade places step after step. Any
+  hair apart do not trade places step after step: the mildly read sections'
+  shares, 3–6% each, swing by two hundredths a step, and at a 2% margin the
+  range was laid out again on nearly every step. Any
   change is laid onto the slot at the next wave (§4.4); positions are applied
   at read time, so moving a sealed section costs no prefill.
 - **The nucleus of the range's attention is locked to its positions.** The
@@ -229,9 +231,12 @@ every other section, and sink back from the question as they stop being read.
   attention, normalized to 1 (`files/scope/nucleus.rs`). The nucleus at `p`
   is the fewest strongest sections that together hold `p` of it: one section
   when the decode reads one hard, several when it reads several. A section
-  locks when it enters the nucleus at `P_LOCK` (0.5) and stays locked while
-  within the one at `P_UNLOCK` (0.7), so one on the edge does not flip in and
-  out. While the range is read, on the mean, no more than the selection reads
+  locks when it enters the nucleus at `P_LOCK` (0.5), at the share it holds
+  then, and stays locked while within the one at `P_UNLOCK` (0.7), so one on
+  the edge does not flip in and out, and while it keeps `KEEP_OF_LOCKED`
+  (half) of the share it locked at: with only the wider nucleus to hold it, a
+  section that locked beside the question held that seat at 5% of the
+  range's attention while one at 19% sat below it (BlackWorld, 2026-11-28). While the range is read, on the mean, no more than the selection reads
   the whole slot, nothing is locked: a share of almost nothing would lock the
   largest of it. A share is a proportion of what the range is read with,
   whatever the prompt's length, the selection's budget or the model, so the

@@ -28,8 +28,9 @@ pub struct CompactionTally {
     /// Refused because no pool had an arena a pack could empty — the expected refusal.
     pub already_packed: u64,
     /// Refused because a step of the pass failed: claims, copy, barrier, or either
-    /// side of the rewrite. Any non-zero reading is a defect, and the `tracing`
-    /// error beside it names which.
+    /// side of the rewrite — or because a caller compacted with a gap outstanding.
+    /// Any non-zero reading is a defect, and the `tracing` error beside it names
+    /// which.
     pub step_failed: u64,
     /// Refused for want of a device reservation.
     pub no_device: u64,
@@ -172,4 +173,9 @@ pub enum CompactionRefused {
     /// Carries the message because the caller reports it rather than logging it: a
     /// refusal is a `debug` line, and this must not share that fate.
     Fault(String),
+    /// A gap quantize was outstanding. Its lease and its jobs hold slots no holder
+    /// the sweep reaches, so the pass did not start; the caller catches the gap up
+    /// before it compacts (`docs/kv_quantize_in_the_gap.md` §3.2). Counted with the
+    /// failed steps, because a caller that met it skipped that catch-up.
+    GapOutstanding,
 }

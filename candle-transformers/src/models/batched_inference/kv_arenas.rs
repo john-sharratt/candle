@@ -46,7 +46,8 @@ impl BatchedInferenceSession {
     /// projection cache — applies the same relocation map. A caller whose only block
     /// tables are these backings' passes a closure that does nothing.
     ///
-    /// Only legal between forwards; refuses otherwise.
+    /// Only legal between forwards, and with no gap quantize outstanding
+    /// ([`Self::gap_wait`], then [`Self::gap_catch_up`]); refuses otherwise.
     #[cfg(feature = "cuda")]
     pub fn compact_kv(
         &self,
@@ -56,7 +57,7 @@ impl BatchedInferenceSession {
         candle_nn::kv_cache::CompactionReport,
         candle_nn::kv_cache::CompactionRefused,
     > {
-        candle_nn::kv_cache::compact_backings(&self.backings, budget, sweep)
+        candle_nn::kv_cache::compact_backings(&self.backings, self.gap.as_ref(), budget, sweep)
     }
 
     /// Create the arenas that mid-wave refusals recorded, and answer with how

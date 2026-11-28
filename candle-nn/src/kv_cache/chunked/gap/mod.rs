@@ -19,6 +19,8 @@ mod codes;
 mod cycle;
 #[cfg(all(test, feature = "cuda"))]
 mod cycle_tests;
+#[cfg(feature = "cuda")]
+mod deferred;
 #[cfg(any(feature = "cuda", test))]
 mod demand;
 #[cfg(feature = "cuda")]

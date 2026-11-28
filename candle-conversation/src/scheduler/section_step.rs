@@ -156,7 +156,11 @@ fn range_momenta(set: &FilesSet, rates: &HashMap<SectionKey, f32>) -> String {
         .sections()
         .map(|e| {
             let r = rates.get(&e.key).copied().unwrap_or(0.0);
-            let lock = if set.locked.contains(&e.key) { "*" } else { "" };
+            let lock = if set.locked.contains_key(&e.key) {
+                "*"
+            } else {
+                ""
+            };
             match share.get(&e.key) {
                 Some(s) => format!("{:.1}/{r:.0}{lock}", 100.0 * s),
                 None => format!("-/{r:.0}"),

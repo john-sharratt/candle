@@ -30,8 +30,9 @@ use super::super::head_gids::ChunkBands;
 use super::super::size_class::{class_for_format, SizeClass};
 use super::super::types::{ChunkWindow, SealedSequence};
 use super::codes::CodeTables;
+use super::deferred::Deferred;
 use super::demand::{gap_demand, GapKind, PeakShares, PerClass};
-use super::install::{catch_up, requeue_at, window_of};
+use super::install::{catch_up, window_of};
 use super::install_sealed::catch_up_sealed;
 use super::launch::{GapDevice, GapGroup, GapJob, MAX_GAP_JOBS};
 use super::lease::Lease;
@@ -169,9 +170,13 @@ pub struct GapCycle {
     device: GapDevice,
     codes: CodeTables,
     shares: PeakShares,
+    /// The one gap that holds slots: its lease and its jobs' native bands.
+    /// A compaction pass refuses while it stands (`compact_backings`), since
+    /// its sweep does not reach them.
     outstanding: Option<Outstanding>,
-    /// Deferred blocks still standing, with the policy they are claimed under.
-    retry: Vec<(CompressionPolicy, GapJob)>,
+    /// Deferred blocks still standing, with the policy they are claimed under
+    /// — by where they stand, holding no band.
+    retry: Vec<(CompressionPolicy, Deferred)>,
     /// Their exact demand per class — of all but the last `unsized_retry`,
     /// whose demand no summary has reported: re-queued blocks, and blocks a
     /// refused launch handed back. Those are sized by share like new blocks.
@@ -247,11 +252,13 @@ impl GapCycle {
         let done = catch_up(&finished, jobs, &gap_groups, &refs, &mut lease, &self.codes)?;
         self.shares.record(kind, &done.claims);
         self.unsized_retry = done.requeue.len();
+        // Their jobs drop here, and with them the last hold the cycle had on
+        // their native bands.
         self.retry = done
             .retry
             .into_iter()
             .chain(done.requeue)
-            .map(|(g, job)| (groups[g].0, job))
+            .map(|(g, job)| (groups[g].0, Deferred::of(&job)))
             .collect();
         self.retried_demand = done.retried_demand;
         Ok(GapCatchUp {
@@ -493,18 +500,17 @@ impl GapCycle {
         }))
     }
 
-    /// The deferred blocks standing, each re-read at its index — the
-    /// compaction that ran since the catch-up may have moved its bands, and
-    /// moves no index — with their demand. One no longer a native block of its
-    /// window behind its cursor is dropped.
+    /// The deferred blocks standing, each read at its index with the bands it
+    /// holds now — a compaction that ran since the catch-up may have moved
+    /// them, and moves no index — with their demand. One no longer a native
+    /// block of its window behind its cursor is dropped.
     fn take_retries(&mut self, backings: &[ChunkedKvBacking]) -> Result<Retries> {
         let demand = std::mem::replace(&mut self.retried_demand, [0; SizeClass::COUNT]);
         let unsized_jobs = std::mem::take(&mut self.unsized_retry);
         let refs: Vec<&ChunkedKvBacking> = backings.iter().collect();
         let mut jobs = Vec::with_capacity(self.retry.len());
-        for (p, mut job) in std::mem::take(&mut self.retry) {
-            if let Some(bands) = requeue_at(&refs, &job)? {
-                job.bands = bands;
+        for (p, deferred) in std::mem::take(&mut self.retry) {
+            if let Some(job) = deferred.job(&refs)? {
                 jobs.push((p, job));
             }
         }
@@ -515,11 +521,26 @@ impl GapCycle {
         })
     }
 
-    /// Retries a table was not launched for, kept for the next.
+    /// Retries a table was not launched for, kept for the next — by where
+    /// they stand, their bands let go.
     fn put_back(&mut self, retries: Retries) {
-        self.retry = retries.jobs;
+        self.retry = retries
+            .jobs
+            .iter()
+            .map(|(p, job)| (*p, Deferred::of(job)))
+            .collect();
         self.retried_demand = retries.demand;
         self.unsized_retry = retries.unsized_jobs;
+    }
+
+    /// The deferred blocks standing, by where they stand: layer, sequence,
+    /// index.
+    #[cfg(test)]
+    pub(super) fn deferred_at(&self) -> Vec<(usize, usize, usize)> {
+        self.retry
+            .iter()
+            .map(|(_, d)| (d.layer, d.seq, d.block))
+            .collect()
     }
 
     /// Lay the table out — the retries first, in groups of their own, then
@@ -582,7 +603,7 @@ impl GapCycle {
             // cursor, so all of them wait as retries.
             drop(lease.release());
             let policies = groups.iter().flat_map(|(p, r)| r.clone().map(move |_| *p));
-            self.retry = policies.zip(jobs).collect();
+            self.retry = policies.zip(jobs.iter().map(Deferred::of)).collect();
             // Their demand is not known to the slot: the new blocks among them
             // were never claimed. The next gap sizes them all by share.
             self.retried_demand = [0; SizeClass::COUNT];

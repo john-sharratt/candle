@@ -133,8 +133,9 @@ A gap does these things, in this order:
 
 **At most one gap is outstanding.** A gap whose predecessor's completion word is
 not yet set quantizes nothing; its blocks wait for the next gap, and the
-outstanding gap's lease stays held, untouched, until its catch-up — which a
-compaction pass forces before it relocates anything (§3.2). The summary
+outstanding gap's lease stays held, untouched, until its catch-up — which
+every compaction pass's caller forces before it relocates anything, and
+which the pass itself refuses to run without (§3.2). The summary
 is therefore one buffer, a lease is never held by two gaps, and the host never
 reasons about two unread results.
 
@@ -218,12 +219,22 @@ chooses among them.**
   3 MB for an 8K prompt's prefill gap, a few KB for a decode gap — against the
   hundreds of bytes per band the convert moves. At the next catch-up every slot
   the gap did not install goes back to its pool, so no lease stands between
-  gaps. A compaction pass catches an outstanding gap up before it starts
-  (`pack_kv_pools`, `catch_up_outstanding_gap`): the lease owns slots no other
-  holder names and the gap's jobs name native bands by gid, so a pass run
-  under it relocated slots no holder it swept could rewrite (WhiteWorld,
-  2026-11-28: 218 of 401 unwitnessed). The pass synchronises the device
-  anyway, so the wait is next to free. Compaction and the empty sweep then
+  gaps. **No compaction pass runs while a gap is outstanding**: the lease owns
+  slots no other holder names and the gap's jobs hold the native bands they
+  convert, so a pass run under it relocated slots no holder it swept could
+  rewrite (WhiteWorld, 2026-11-28: 218 of 401 unwitnessed). `compact_backings`
+  takes the backings' `GapCycle` and refuses with `GapOutstanding` while one
+  stands, and every caller waits the gap out and catches it up first — the
+  scheduler in `pack_kv_pools` (`catch_up_outstanding_gap`), which every pass
+  of the wave loop, relief, the settle and `lower_frontier_for` runs through,
+  and the batched gate's `settle_span` (`GapTally::catch_up_outstanding`). The
+  pass synchronises the device anyway, so the wait is next to free. Between
+  gaps the cycle holds no slot at all: a deferred block is kept by where it
+  stands — layer, sequence, index, valid window — and its bands are read again
+  from its block table when it leads the next table (`gap/deferred.rs`), so a
+  pass relocates them through the one holder that names them, and a deferred
+  block whose sequence was freed goes with the sequence and is dropped at the
+  next gap. Compaction and the empty sweep then
   see every free slot, the next lease is
   packed into the lowest arenas first, into the holes that truncates, evictions and freed
   natives opened, and the addresses on the device are never older than the gap
@@ -890,7 +901,14 @@ Paths and line numbers are as of the current tree.
   the table is built after it.
 - `candle-nn/src/kv_cache/chunked/gap/cycle.rs`, `GapCycle`: the gap's state
   from one gap to the next and its two calls, `catch_up` and `quantize`
-  (`gap_take` cuts each sequence's take to the gap's room).
+  (`gap_take` cuts each sequence's take to the gap's room). Its deferred
+  blocks are `gap/deferred.rs`'s `Deferred`, which holds no band (§3.2).
+  `gap/cycle_tests.rs` covers a pass refused while a gap is outstanding and
+  run once it is caught up, a deferred block's bands held by its block table
+  alone, and a deferred block of a freed sequence letting its slots go.
+- `candle-nn/src/kv_cache/chunked/compact/pass.rs`, `compact_backings`: takes
+  the backings' `GapCycle` and refuses with `GapOutstanding` while a gap is
+  outstanding (§3.2).
 - `candle-transformers/src/models/batched_inference/gap.rs`: the session's
   `gap_catch_up` and `gap_quantize` over every live sequence, each layer under
   `layer_seal_policies`, resolved through `seal_policy` — and `gap_settle`, gaps

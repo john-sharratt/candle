@@ -30,6 +30,8 @@ use super::compact_map::{CompactionMap, Sweep};
 use super::compact_plan::{by_source_rank, plan_pool, ArenaSlots, ChunkMove, CompactPlan};
 use super::fresh_arenas::FreshArenas;
 #[cfg(feature = "cuda")]
+use super::gap::GapCycle;
+#[cfg(feature = "cuda")]
 use super::migrate_flight::retain_unheld;
 use super::size_class::SizeClass;
 #[cfg(feature = "cuda")]
