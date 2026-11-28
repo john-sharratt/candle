@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::key::{FileKey, SectionKey};
-use super::scope::{Bars, Candidate, Momentum, RangeScope, StepChange};
+use super::scope::{Bars, Candidate, Momentum, RangeScope, StepChange, LOCK_BAR};
 use crate::projection::GroupId;
 
 /// What a conversation's knowledge base holds, when it is not provenance's
@@ -208,14 +208,20 @@ impl FilesSet {
         change
     }
 
-    /// Order the range by [`Self::order_score`], strongest at the top beside
-    /// the question, a section passing the one above it only by more than
-    /// `margin` ([`RangeScope::reorder`]); whether anything moved.
+    /// A step's reorder: the range by [`Self::order_score`], strongest at the
+    /// top beside the question, a section passing the one above it only by
+    /// more than `margin`, and none passing one the index is reading — hit
+    /// momentum at or over [`LOCK_BAR`] ([`RangeScope::reorder_locked`]);
+    /// whether anything moved.
     pub fn reorder(&mut self, margin: f32) -> bool {
         let (hits, members) = (&self.hits, &self.members);
-        self.scope
-            .as_mut()
-            .is_some_and(|scope| scope.reorder(|k| order_score(hits, members, k), margin))
+        self.scope.as_mut().is_some_and(|scope| {
+            scope.reorder_locked(
+                |k| order_score(hits, members, k),
+                margin,
+                |k| hits.score(k).is_some_and(|m| m >= LOCK_BAR),
+            )
+        })
     }
 
     /// `section`'s scan momentum in the set — what the fill chooses by — or
@@ -450,11 +456,13 @@ mod tests {
     }
 
     /// **The index orders the range, the scan only what the index has not
-    /// read, and a new question starts the index afresh**: a scanned 900
-    /// over b's 300, the first reading rates a at 100 and b at 700 — taken
-    /// whole — so b sits beside the question; c, unread, keeps its scan 500.
-    /// A step's 1000 for a moves it a quarter of the way (325); a new
-    /// question forgets every rate.
+    /// read, nothing passes a section the index is reading, and a new
+    /// question starts the index afresh**: a scanned 900 over b's 300, the
+    /// first reading rates a at 30 and b at 700 — taken whole — and c,
+    /// unread, keeps its scan 500. b (locked) climbs past a (unlocked, under
+    /// the bar) and c past a, so b sits beside the question. A step's 1000
+    /// for a moves it a quarter of the way (272.5), still under c's 500. A
+    /// new question forgets every rate.
     #[test]
     fn the_index_orders_the_range_and_the_scan_what_it_has_not_read() {
         let (a, b, c) = (SectionKey(1), SectionKey(2), SectionKey(3));
@@ -476,21 +484,24 @@ mod tests {
             scope.enter(k, 10, false);
         }
         set.set_scope(scope);
-        set.observe_hits(&HashMap::from([(a, 100.0), (b, 700.0)]));
-        assert_eq!(set.order_score(a), Some(100.0));
+        set.observe_hits(&HashMap::from([(a, 30.0), (b, 700.0)]));
+        assert_eq!(set.order_score(a), Some(30.0));
         assert_eq!(set.order_score(b), Some(700.0));
         assert_eq!(set.order_score(c), Some(500.0), "unread: its scan momentum");
-        set.reorder(0.0);
-        let top_first: Vec<SectionKey> = set
-            .scope
-            .as_ref()
-            .unwrap()
-            .sections()
-            .map(|e| e.key)
-            .collect();
-        assert_eq!(top_first, vec![b, c, a], "b beside the question");
+        let top_first = |set: &FilesSet| -> Vec<SectionKey> {
+            set.scope
+                .as_ref()
+                .unwrap()
+                .sections()
+                .map(|e| e.key)
+                .collect()
+        };
+        assert!(set.reorder(0.0));
+        assert_eq!(top_first(&set), vec![b, c, a], "b beside the question");
         set.observe_hits(&HashMap::from([(a, 1_000.0)]));
-        assert_eq!(set.order_score(a), Some(325.0));
+        assert_eq!(set.order_score(a), Some(272.5));
+        assert!(!set.reorder(0.0), "a's 272.5 does not pass c's 500");
+        assert_eq!(top_first(&set), vec![b, c, a]);
         set.clear_withheld();
         assert_eq!(
             set.order_score(a),

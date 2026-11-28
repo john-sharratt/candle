@@ -208,12 +208,29 @@ impl RangeScope {
     /// their places; a section with no score yet counts as 0. Mandatory
     /// sections are ordered like any other.
     pub fn reorder(&mut self, score: impl Fn(SectionKey) -> Option<f32>, margin: f32) -> bool {
+        self.reorder_locked(score, margin, |_| false)
+    }
+
+    /// [`Self::reorder`] with `locked` sections held: nothing passes a locked
+    /// section, so one holds its place unless it climbs itself, past the
+    /// unlocked ones above it. A section the index is reading stays where it
+    /// is read, and only one it has stopped reading sinks.
+    pub fn reorder_locked(
+        &mut self,
+        score: impl Fn(SectionKey) -> Option<f32>,
+        margin: f32,
+        locked: impl Fn(SectionKey) -> bool,
+    ) -> bool {
         let before = self.places.clone();
         self.compact();
         let s = |p: &Place| p.section().map_or(0.0, |e| score(e.key).unwrap_or(0.0));
+        let held = |p: &Place| p.section().is_some_and(|e| locked(e.key));
         for i in 1..self.places.len() {
             let mut j = i;
-            while j > 0 && s(&self.places[j]) > s(&self.places[j - 1]) + margin {
+            while j > 0
+                && !held(&self.places[j - 1])
+                && s(&self.places[j]) > s(&self.places[j - 1]) + margin
+            {
                 self.places.swap(j, j - 1);
                 j -= 1;
             }
@@ -370,6 +387,36 @@ mod tests {
         };
         assert!(s.reorder(unscored, 50.0));
         assert_eq!(keys(&s), vec![1, 2, 0]);
+    }
+
+    /// **Nothing passes a locked section, and every section climbs only past
+    /// unlocked ones**: top first a (300, locked), b (200), c (500, locked),
+    /// d (900). c climbs past b but not past a; d past b, up to c. Nothing
+    /// moves again while the locks hold. a unlocked, c climbs past it and d
+    /// follows, up to c again.
+    #[test]
+    fn nothing_passes_a_locked_section() {
+        let mut s = RangeScope::new(100);
+        for k in 0..4 {
+            s.enter(SectionKey(k), 10, false);
+        }
+        assert_eq!(keys(&s), vec![0, 1, 2, 3]);
+        let score = |k: SectionKey| match k.0 {
+            0 => Some(300.0),
+            1 => Some(200.0),
+            2 => Some(500.0),
+            _ => Some(900.0),
+        };
+        let lock_ac = |k: SectionKey| k.0 == 0 || k.0 == 2;
+        assert!(s.reorder_locked(score, 50.0, lock_ac));
+        assert_eq!(keys(&s), vec![0, 2, 3, 1]);
+        assert!(
+            !s.reorder_locked(score, 50.0, lock_ac),
+            "nothing moves while the locks hold"
+        );
+        let lock_c = |k: SectionKey| k.0 == 2;
+        assert!(s.reorder_locked(score, 50.0, lock_c));
+        assert_eq!(keys(&s), vec![2, 3, 0, 1]);
     }
 
     /// **Compaction closes every hole**, the sections keeping their order.

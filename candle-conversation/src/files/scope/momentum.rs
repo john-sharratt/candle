@@ -6,6 +6,12 @@
 //! step that reads it; after that each step moves it a quarter of the way to
 //! its rate, so a section the decode keeps reading climbs to the top within a
 //! few steps and one it stops reading sinks back over several.
+//!
+//! At a step a section the index is reading — its momentum at or over
+//! [`LOCK_BAR`] — is locked: it holds its place and nothing passes it, so the
+//! sections being read do not trade places step after step on the noise of
+//! their rates. It unlocks once its momentum falls under the bar, and only
+//! then sinks.
 
 use std::collections::HashMap;
 
@@ -19,6 +25,13 @@ pub const MOMENTUM_KEEP: f32 = 0.75;
 /// its place, on the 0–1000 band: neighbours a hair apart do not trade places
 /// step after step.
 pub const REORDER_MARGIN: f32 = 50.0;
+
+/// The hit momentum at or above which a section is locked at a step's reorder,
+/// on the 0–1000 band: the index is reading it, so it holds its place and no
+/// other section passes it. Under it the section is unlocked, and moves by
+/// momentum like any other. The knowledge base's entry bar: one block in
+/// twenty above the query's cut, for every query.
+pub const LOCK_BAR: f32 = 50.0;
 
 /// Every section's momentum, for the slot's life.
 #[derive(Clone, Debug, Default, PartialEq)]

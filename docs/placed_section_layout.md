@@ -222,6 +222,17 @@ every other section, and sink back from the question as they stop being read.
   band), so neighbours a hair apart do not trade places step after step. Any
   change is laid onto the slot at the next wave (§4.4); positions are applied
   at read time, so moving a sealed section costs no prefill.
+- **A section the index is reading is locked.** At a step, a section whose
+  hit momentum is at or over `LOCK_BAR` (50 on the band, the knowledge base's
+  entry bar) holds its place: nothing passes it
+  (`RangeScope::reorder_locked`). It still climbs itself, past unlocked
+  sections, so a section the decode starts reading rises to the read block
+  beside the question. It unlocks only once its momentum falls under the bar,
+  and only then sinks. Without the lock, per-step rates swing across the band
+  and a step moves a section a quarter of the way to its rate, so the margin
+  rarely held: the range was reordered, and the slot rebuilt, on nearly every
+  step (BlackWorld, 2026-11-28). The opening is not locked: it is ordered
+  whole by the first reading.
 - **A section that comes into scope** enters at its rank by its momentum, or
   its step rate when it has none yet.
 - **A section that falls out of scope** is removed; the next reorder closes

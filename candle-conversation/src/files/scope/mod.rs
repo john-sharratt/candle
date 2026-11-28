@@ -21,7 +21,7 @@ pub mod step;
 pub mod watch;
 
 pub use bars::{band, Bars};
-pub use momentum::{Momentum, MOMENTUM_KEEP, REORDER_MARGIN};
+pub use momentum::{Momentum, LOCK_BAR, MOMENTUM_KEEP, REORDER_MARGIN};
 pub use place::{Entry, Place};
 pub use range_scope::RangeScope;
 pub use resident::{resident, RESIDENT_RANGES};
