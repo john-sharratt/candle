@@ -693,6 +693,7 @@ pub(super) mod tests {
             .chain(HOUSE_ACTS)
             .chain(BUILD_ACTS)
             .chain(TASK_ACTS)
+            .chain(BEYOND_ACTS.iter())
             .chain(HAND_OFF_ACTS)
             .map(|t| t.name)
             .collect();

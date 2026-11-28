@@ -35,7 +35,7 @@ use crate::engine::loopguard::NUDGE;
 use crate::engine::mission::{Mission, StepOutcome};
 use crate::engine::runtime::{Recorded, Runtime, REFUSED};
 use crate::engine::talk::orders::posts_work;
-use crate::engine::{body, build, terminal, tools, zen_task};
+use crate::engine::{beyond, body, build, terminal, tools, zen_task};
 use crate::house;
 
 /// An act made, for the feed and the character, and whether it moved the
@@ -502,9 +502,13 @@ impl Runtime {
             let mode = act.args.get("mode").and_then(|v| v.as_str()).unwrap_or("");
             let line = format!("{name} set the house to {} mode.", mode.trim());
             self.changed(&hosted, Change::World { line });
-        } else if terminal::is_mine(act.tool) || hosted.sim(|s| s.missions.is_unordered(&body)) {
-            // What a mind with no body does through a terminal happened in no
-            // room: nobody standing where its seat is saw it.
+        } else if terminal::is_mine(act.tool)
+            || beyond::is_mine(act.tool)
+            || hosted.sim(|s| s.missions.is_unordered(&body))
+        {
+            // What a mind with no body does through a terminal, and what any
+            // character reaches beyond the world, happened in no room: nobody
+            // standing where it is saw it.
         } else if body::is_device(act.tool) || bridge::is_mine(act.tool) || build::is_mine(act.tool)
         {
             let place = hosted.standpoint_of(&body);
@@ -583,7 +587,8 @@ impl Runtime {
             || terminal::is_mine(act.tool)
             || house::is_mine(act.tool)
             || build::is_mine(act.tool)
-            || zen_task::is_mine(act.tool));
+            || zen_task::is_mine(act.tool)
+            || beyond::is_mine(act.tool));
         // A mind with no body works real things through its terminal: its
         // own acts, and the house's device acts on what it is connected to.
         let through_a_terminal =
@@ -608,6 +613,8 @@ impl Runtime {
             self.build_act(npc, act).await
         } else if zen_task::is_mine(act.tool) {
             self.zen_task_act(npc, act).await
+        } else if beyond::is_mine(act.tool) {
+            self.beyond_act(npc, act).await
         } else {
             self.record_act_said(npc, act, said, source)
         };

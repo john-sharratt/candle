@@ -89,20 +89,44 @@ pub(crate) async fn call_zend(
     args: &Value,
     thread: &str,
 ) -> Result<String, String> {
-    let body = rpc(tool, args, thread).to_string().into_bytes();
     // Towards zend's group, not up this member's own stream: a gateway routes
     // that one on npcd's site, where `/v1/mcp` is nobody's.
-    let reply = send_to_group(
+    call_as_zen(
         member,
         ZEND_APP,
-        Method::POST,
         ZEND_MCP,
-        &zen_headers(),
-        body,
-        Some(ANSWER_WITHIN),
+        ANSWER_WITHIN,
+        tool,
+        args,
+        thread,
     )
     .await
-    .map_err(|e| format!("Zen could not be reached: {e:#}"))?;
+}
+
+/// `tool` with `args` called as Zen on the MCP server at `path` of `app`'s
+/// group, on behalf of `session`, answered within `within`: the answer's
+/// text, or why there is none.
+pub(crate) async fn call_as_zen(
+    member: &AppMember,
+    app: &str,
+    path: &str,
+    within: Duration,
+    tool: &str,
+    args: &Value,
+    session: &str,
+) -> Result<String, String> {
+    let body = rpc(tool, args, session).to_string().into_bytes();
+    let reply = send_to_group(
+        member,
+        app,
+        Method::POST,
+        path,
+        &zen_headers(),
+        body,
+        Some(within),
+    )
+    .await
+    .map_err(|e| format!("{app} could not be reached: {e:#}"))?;
     answered(reply.status, &reply.body)
 }
 

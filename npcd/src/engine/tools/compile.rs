@@ -157,6 +157,7 @@ pub fn specs_within(mode: Mode, within: &Within) -> Vec<ToolSpec> {
             Availability::AtLift => within.at_lift && !within.lift_here,
             Availability::AtLanding => within.at_lift,
             Availability::Granted => within.grants.iter().any(|g| g == t.name),
+            Availability::Reached => within.reaches.iter().any(|r| r == t.name),
             Availability::OnThread => within.allow.is_some(),
         })
         .filter(|t| performable(t, within))

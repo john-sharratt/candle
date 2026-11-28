@@ -67,7 +67,8 @@ enum Dimension {
 }
 
 /// (dimension, factor_to_base, offset_to_base)
-/// base units: meter, kg, liter, kelvin, second, byte
+/// base units: meter, kg, liter, second, byte. A temperature's pair is its own
+/// (see [`convert_temp`]).
 fn lookup_unit(unit: &str) -> Option<(Dimension, f64, f64)> {
     // Normalize the way the model naturally writes multi-word units: lowercase
     // and collapse spaces/hyphens to underscores, so "fluid ounce", "Fluid-Ounce",
@@ -124,12 +125,11 @@ fn lookup_unit(unit: &str) -> Option<(Dimension, f64, f64)> {
         "tbsp" | "tablespoon" | "tablespoons" => (Dimension::Volume, 0.0147868, 0.0),
         "tsp" | "teaspoon" | "teaspoons" => (Dimension::Volume, 0.00492892, 0.0),
 
-        // Temperature — affine: value_in_base = value * factor + offset
-        // base: Kelvin
-        "k" | "kelvin" => (Dimension::Temperature, 1.0, 0.0),
-        "c" | "celsius" | "degc" | "°c" => (Dimension::Temperature, 1.0, 273.15),
-        "f" | "fahrenheit" | "degf" | "°f" => (Dimension::Temperature, 5.0 / 9.0, 255.372222),
-        "r" | "rankine" => (Dimension::Temperature, 5.0 / 9.0, 0.0),
+        // Temperature: (its degrees in five Celsius degrees, its reading at 0 °C)
+        "k" | "kelvin" => (Dimension::Temperature, 5.0, 273.15),
+        "c" | "celsius" | "degc" | "°c" => (Dimension::Temperature, 5.0, 0.0),
+        "f" | "fahrenheit" | "degf" | "°f" => (Dimension::Temperature, 9.0, 32.0),
+        "r" | "rankine" => (Dimension::Temperature, 9.0, 491.67),
 
         // Time (base: second)
         "s" | "sec" | "second" | "seconds" => (Dimension::Time, 1.0, 0.0),
@@ -163,16 +163,19 @@ fn lookup_unit(unit: &str) -> Option<(Dimension, f64, f64)> {
     })
 }
 
+/// `value` on one temperature scale read on another. Each scale is its degrees
+/// in five Celsius degrees (`per_five`: 5 or 9, whole) and its reading at 0 °C
+/// (`at_zero`), so a conversion multiplies by a whole number and divides by
+/// one — exact on whole degrees, where a factor of `5/9` is already rounded
+/// and lands 100 °C at 211.99999999999997 °F.
 fn convert_temp(
     value: f64,
-    from_factor: f64,
-    from_offset: f64,
-    to_factor: f64,
-    to_offset: f64,
+    from_per_five: f64,
+    from_at_zero: f64,
+    to_per_five: f64,
+    to_at_zero: f64,
 ) -> f64 {
-    // from -> kelvin -> to
-    let kelvin = value * from_factor + from_offset;
-    (kelvin - to_offset) / to_factor
+    (value - from_at_zero) * to_per_five / from_per_five + to_at_zero
 }
 
 pub struct UnitConvertTool;

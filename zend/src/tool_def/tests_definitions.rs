@@ -18,42 +18,8 @@ pub(super) mod tests {
 
     use zend_vfs::ALL_REPOS;
 
-    /// The folder-metadata pass leaves a `.substrate.yaml` in the tools folder
-    /// itself, and the compile-time embed carries it along; read as a tool it
-    /// failed to parse on every boot. A definition is a `*.yaml` that is not a
-    /// dot-file.
-    #[test]
-    fn folder_metadata_is_not_a_tool_definition() {
-        assert!(!is_definition_file(Path::new(".substrate.yaml")));
-        assert!(!is_definition_file(Path::new("tools/.substrate.yaml")));
-        assert!(!is_definition_file(Path::new("tools/.hidden.yaml")));
-        assert!(is_definition_file(Path::new("tools/calculator.yaml")));
-        assert!(!is_definition_file(Path::new("tools/calculator.yml")));
-        assert!(!is_definition_file(Path::new("tools/README.md")));
-    }
-
-    /// Nothing the embed carries that is not a definition reaches the parser:
-    /// every bundled file that passes the filter parses, so a boot logs no
-    /// `tool definition parse failed`.
-    #[test]
-    fn every_bundled_definition_file_parses() {
-        let unparsed: Vec<String> = TOOLS_DIR
-            .files()
-            .filter(|f| is_definition_file(f.path()))
-            .filter(|f| {
-                f.contents_utf8()
-                    .is_none_or(|text| serde_yaml::from_str::<ToolDef>(text).is_err())
-            })
-            .map(|f| f.path().display().to_string())
-            .collect();
-        assert!(
-            unparsed.is_empty(),
-            "bundled files that do not parse: {unparsed:?}"
-        );
-    }
-
     pub(in super::super) fn def(description: &str, params: Value) -> ToolDef {
-        ToolDef {
+        ToolDef(Definition {
             name: "file_list".to_string(),
             category: "Files".to_string(),
             description: description.to_string(),
@@ -63,7 +29,7 @@ pub(super) mod tests {
             parameters: params,
             examples: vec!["list the files<|im_end|>".to_string()],
             questions: vec!["what files are here".to_string()],
-        }
+        })
     }
 
     /// **Every `repo` parameter becomes a choice between the workspace's

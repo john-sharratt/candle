@@ -58,6 +58,26 @@ parameters:
   title: ReadRequest
   type: object
 examples:
+- |-
+  what exactly did John ask for back in entry 3<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The entry's one line says only that John asked for something; his words are in the turns behind it, in my own journal.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "journal_read", "arguments": {"journal": "self", "entry": 3}}
+  </tool_call><|projection|>
+- |-
+  what have I written in my journal so far<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  Without an entry, journal_read lists my own journal's entries, one line each.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "journal_read", "arguments": {"journal": "self"}}
+  </tool_call><|projection|>
 - read the turns behind journal entry 3
 - what exactly did the tool return in entry 2 of my journal
 - show the rest of entry 5 from line 201

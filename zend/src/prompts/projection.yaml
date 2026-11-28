@@ -650,7 +650,7 @@ system_prompt:
     - kind: collection
       name: tools
       # Filled at startup from the bundled tool definitions in
-      # `src/prompts/tools/*.yaml` (embedded via `crate::tool_def`) — one section
+      # `zend-tools/definitions/*.yaml` (embedded via `crate::tool_def`) — one section
       # per tool, rendered as its `{name,description,parameters}` line; those
       # `parameters` also build the constrained-decode stencil, and each file's
       # ChatML examples drive tool-selection calibration. Only execution stays

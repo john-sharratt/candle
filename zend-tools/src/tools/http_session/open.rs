@@ -86,6 +86,8 @@ impl Tool for HttpSessionOpen {
 
         let mut credential_name = None;
         if let Some(cred_name) = &req.credential_name {
+            // A stored credential and the daemon's bearer tokens are secrets
+            // alike: neither is read under a context without the grant.
             let saved = ctx.credentials()?.get_by_name(cred_name);
             credential_name = Some(cred_name.clone());
             // A conversation's own credential first; then a bearer token the

@@ -546,7 +546,7 @@ pub(super) fn journal_desk(
         move |prompt: &JournalPrompt, filed: Option<&Filed>, ceased: &[u64]| {
             let conversation = recording.engine.conversation();
             let shared = conversation.shared();
-            let text = JournalText::of(shared, timeline);
+            let text = journal::text(shared, timeline);
             if let Some(filed) = filed {
                 text.file(filed)?;
             }
@@ -590,7 +590,7 @@ pub(super) fn cease_journal_text(
     engine: &ConversationEngine,
     timeline: TimelineId,
 ) -> Result<(), ConversationError> {
-    JournalText::of(engine.conversation().shared(), timeline)
+    journal::text(engine.conversation().shared(), timeline)
         .cease_all()
         .map(|_| ())
         .map_err(|e| ConversationError::Other(e.to_string()))
@@ -599,7 +599,7 @@ pub(super) fn cease_journal_text(
 /// `timeline`'s journal text: the turns behind its entries.
 pub(super) fn journal_text(state: &InferenceState, timeline: TimelineId) -> JournalText {
     let shared = state.engine.conversation().shared();
-    JournalText::of(shared, timeline)
+    journal::text(shared, timeline)
 }
 
 /// The journals `conv_id`'s journal tools read: its own, and every journal
@@ -925,7 +925,7 @@ impl ZendSession {
                 .set_conversation_metadata_many(timeline, &metadata_of(&prompt))
                 .map_err(|e| anyhow::anyhow!("the journal could not be recorded: {e}"))
                 .and_then(|()| {
-                    JournalText::of(engine.conversation().shared(), timeline).forget(entry)
+                    journal::text(engine.conversation().shared(), timeline).forget(entry)
                 })
         };
         Some(recorded.map(|_| {

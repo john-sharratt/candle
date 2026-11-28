@@ -1,136 +1,56 @@
-//! The bundled tool definitions: the declarative YAML source for each tool the model
-//! is shown and the constrained decoder compiles.
+//! The tool catalog a zend conversation is shown: each tool's definition
+//! (`zend_tools::definitions`, the YAML beside the code that runs it), with
+//! what belongs to this deployment written in.
 //!
-//! Every tool YAML file is embedded at compile time and defines one tool's name,
-//! category, description, parameters, calibration examples and question seeds. A
-//! behaviour change reaches the model only through its definition. A mind workspace with
-//! its own projection may override the catalog from its own tools folder, while a coding
-//! workspace always uses the bundled one. Every `repo` parameter is constrained to the
-//! workspace's repositories. Only a YAML file that is not a dot-file is a definition, since
-//! folder metadata sits beside the definitions and would fail to parse as one.
+//! A behaviour change reaches the model only through its definition. A mind
+//! workspace with its own projection may override the catalog from its own
+//! tools folder, while a coding workspace always uses the bundled one. Every
+//! `repo` parameter is constrained to the workspace's repositories.
 //!
 //! - `tests_calibration`: tests of calibration markers and question seeds.
 //! - `tests_definitions`: tests of definition shape, values and repository parameters.
 //! - `tests_modes`: tests of what each tool mode offers.
 
 use std::collections::HashSet;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::OnceLock;
 
 use host::calibration::Calibrated;
-#[cfg(doc)]
-use host::calibration::PROJECTION_MARKER;
-use include_dir::{include_dir, Dir};
-use serde::Deserialize;
 use serde_json::Value;
+use zend_tools::definitions::{self, is_definition_file, Definition};
 use zend_tools::registry;
 use zend_vfs::Workspace;
 
 use crate::access;
 use crate::types::ToolMode;
 
-/// The tool definitions, embedded at compile time. The `tools` collection in
-/// `prompts/projection.yaml` is filled from here.
-static TOOLS_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/src/prompts/tools");
+/// One tool's definition, as this daemon shows and calibrates it.
+///
+/// Its own type around [`Definition`] because the calibration phase is the
+/// host's ([`Calibrated`]), which a definition — zend-tools' — cannot
+/// implement where it is declared; everything else is the definition's.
+#[derive(Debug, Clone)]
+pub struct ToolDef(pub Definition);
 
-/// One tool definition parsed from a `tools/*.yaml` file.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ToolDef {
-    pub name: String,
-    #[serde(default)]
-    pub category: String,
-    pub description: String,
-    #[serde(default)]
-    pub high_risk: bool,
-    /// Projected on every turn, outside the `tools` collection's top-k:
-    /// provenance still selects its usual number of tools, and a mandatory one
-    /// is added on top rather than taking a slot. For the tools a coding turn
-    /// needs whatever the question — finding a file, finding code inside one,
-    /// reading and listing, and creating one.
-    ///
-    /// `write` is in the set because the edit tool cannot create a file: a
-    /// "create scratch/x.py" turn that was projected `file_edit` but not `write`
-    /// spent ten calls patching a file that did not exist, then printed the code
-    /// and gave up.
-    ///
-    /// `web_search` and `web_fetch` are in it because a tool shown only by name
-    /// in the catalog listing is, to the model, not really there: asked to
-    /// "search the web and cite your source", a turn projected without
-    /// `web_search` reasoned that the tool was "only in the descriptions, not my
-    /// actual tool list" and answered that it could not search. Looking something
-    /// up is as ordinary a coding-assistant step as reading a file. A mode that
-    /// does not grant the network drops them with the rest of its exclusions.
-    ///
-    /// `journal_read` and `journal_grep` are in it because the journal shows
-    /// one line per entry and its intro tells the model the turns behind each
-    /// are a call away: a turn asked about earlier work that was not offered
-    /// them would read the line, and answer from it, as if that were all there
-    /// is.
-    ///
-    /// The find tools are there with reading and listing, not left out. A turn
-    /// that can only enumerate and read answers "where is this" by guessing a
-    /// directory at `file_list` and reading whole files to check, which is what
-    /// `file_search` and `file_grep` were added to stop; leaving them to win a
-    /// belief slot meant the turns that most needed them — the ones with no
-    /// path in the question to score against — were exactly the turns that did
-    /// not get them.
-    #[serde(default)]
-    pub mandatory: bool,
-    /// Called at most once a turn: once a call names it, the tool-call grammar
-    /// offers it to no later call of the same turn
-    /// (`candle_conversation::stencil::NeverTwice`). For a tool whose second
-    /// call in a turn is never what the turn needs — `journal_note`, the note a
-    /// round opens with, which a model wrote twice, word for word, in place of
-    /// the call its thinking had planned.
-    #[serde(default)]
-    pub never_twice: bool,
-    /// JSON Schema for the call arguments (the tool's Request type).
-    pub parameters: Value,
-    /// ChatML selection-calibration trajectories (prompt + `<|im_end|>
-    /// <|im_start|>assistant` + think→call with [`PROJECTION_MARKER`]s), or a bare
-    /// prompt for a tool whose trajectories are not recorded yet. A trajectory
-    /// is prefilled on its own ([`Calibrated::trajectories`]); a bare prompt
-    /// has no answer to prefill, so it is calibrated as the question it is
-    /// ([`Calibrated::calibration_questions`]).
-    #[serde(default)]
-    pub examples: Vec<String>,
-    /// Extra ways a user might ASK for this tool — one plain question each, no
-    /// reasoning block and no answer.
-    ///
-    /// Routing happens on the question. An `examples` trajectory is ~95% think
-    /// block and call, so its question — the part a live probe resembles — is a
-    /// few percent of the exemplar; the phase lens
-    /// (`docs/provenance_score_normalization.md` §3.4) reads exactly that
-    /// region, and these are entries that are *only* that region — so a tool can
-    /// carry many more phrasings than it could afford as full examples.
-    ///
-    /// **All of a tool's questions are calibrated in ONE submission**, a turn
-    /// group whose cases prefill together, each masked to itself, and seal one
-    /// turn each (`candle_conversation::turn_group`). They are therefore resumed
-    /// as a unit: the group's marker covers every question, so editing any one
-    /// of them regenerates the whole set.
-    #[serde(default)]
-    pub questions: Vec<String>,
+impl Deref for ToolDef {
+    type Target = Definition;
+
+    fn deref(&self) -> &Definition {
+        &self.0
+    }
 }
 
-impl ToolDef {
-    /// The Hermes `{"name","description","parameters"}` line rendered into the
-    /// `<tools>…</tools>` block. Flat shape (no `{"type":"function",…}` wrapper) —
-    /// see the rationale on the former `tools::render_tool_json_line`.
-    pub fn json_line(&self) -> String {
-        let blob = serde_json::json!({
-            "name": self.name,
-            "description": self.description,
-            "parameters": self.parameters,
-        });
-        serde_json::to_string(&blob).unwrap_or_else(|_| "{}".to_string())
+impl DerefMut for ToolDef {
+    fn deref_mut(&mut self) -> &mut Definition {
+        &mut self.0
     }
 }
 
 /// What the calibration phase reads of a definition: its name, the
-/// [`ToolDef::json_line`] the model reads when choosing it (name, description,
-/// parameters — so rewording any of them regenerates its cases), and the
-/// authored examples and questions.
+/// [`Definition::json_line`] the model reads when choosing it (name,
+/// description, parameters — so rewording any of them regenerates its cases),
+/// and the authored examples and questions.
 impl Calibrated for ToolDef {
     fn name(&self) -> &str {
         &self.name
@@ -240,32 +160,13 @@ fn load_effective(workspace: &Path) -> Vec<ToolDef> {
     }
 }
 
-/// Whether `path` names a tool definition: a `*.yaml` file that is not a
-/// dot-file.
-///
-/// The dot-file exclusion is not cosmetic. The folder-metadata pass writes a
-/// `.substrate.yaml` (a folder summary with its questions grouped by kind)
-/// into every folder it describes — this one included, since it lives in the
-/// source tree — and the compile-time embed picks it up with the definitions.
-/// Parsed as a tool it fails on every boot (`questions` is a map there, a
-/// list here), and no tool definition is ever a dot-file.
-fn is_definition_file(path: &Path) -> bool {
-    let hidden = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with('.'));
-    !hidden && path.extension().and_then(|e| e.to_str()) == Some("yaml")
-}
-
-/// Parse the embedded (compile-time) built-in catalog.
+/// The bundled catalog: every tool's own definition.
 fn load_bundled() -> Vec<ToolDef> {
-    let mut defs: Vec<ToolDef> = TOOLS_DIR
-        .files()
-        .filter(|f| is_definition_file(f.path()))
-        .filter_map(|f| parse_def(&f.path().display().to_string(), f.contents_utf8()?))
-        .collect();
-    defs.sort_by(|a, b| a.name.cmp(&b.name));
-    defs
+    definitions::bundled()
+        .iter()
+        .cloned()
+        .map(ToolDef)
+        .collect()
 }
 
 /// Parse a working-dir `tools/` folder off disk (a host override).
@@ -281,21 +182,13 @@ fn load_disk(dir: &Path) -> Vec<ToolDef> {
     paths.sort();
     let mut defs: Vec<ToolDef> = paths
         .iter()
-        .filter_map(|p| parse_def(&p.display().to_string(), &std::fs::read_to_string(p).ok()?))
+        .filter_map(|p| {
+            definitions::parse(&p.display().to_string(), &std::fs::read_to_string(p).ok()?)
+        })
+        .map(ToolDef)
         .collect();
     defs.sort_by(|a, b| a.name.cmp(&b.name));
     defs
-}
-
-/// Parse one tool definition; a malformed file is logged and skipped.
-fn parse_def(loc: &str, text: &str) -> Option<ToolDef> {
-    match serde_yaml::from_str::<ToolDef>(text) {
-        Ok(def) => Some(def),
-        Err(e) => {
-            tracing::error!(file = %loc, "tool definition parse failed: {e}");
-            None
-        }
-    }
 }
 
 /// Look up a tool definition by name.

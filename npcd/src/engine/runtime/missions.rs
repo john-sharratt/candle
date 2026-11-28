@@ -464,7 +464,7 @@ impl Runtime {
     }
 
     /// Mark every character as its personality now says — `takes_orders`,
-    /// `moves` and `idle:` read afresh — after the personalities are read
+    /// `moves`, `idle:` and `reaches:` read afresh — after the personalities are read
     /// again. A character is marked as it is embodied, and one already standing
     /// in its world is not embodied again, so without this an edited
     /// personality reached its characters only at the next restart. The world's
@@ -495,6 +495,7 @@ impl Runtime {
                 continue;
             };
             self.set_idle(npc_id, p.idle.as_deref());
+            self.set_reaches(npc_id, &p.reaches);
             if !writes {
                 continue;
             }
@@ -517,6 +518,25 @@ impl Runtime {
             Some(text) => idles.insert(npc_id, text.to_string()),
             None => idles.remove(&npc_id),
         };
+    }
+
+    /// Keep what `npc_id` reaches beyond its world; none, forget it.
+    pub(crate) fn set_reaches(&self, npc_id: u64, reaches: &[Group]) {
+        let mut all = self.reaches.write().unwrap();
+        match reaches.is_empty() {
+            true => all.remove(&npc_id),
+            false => all.insert(npc_id, reaches.to_vec()),
+        };
+    }
+
+    /// What `npc_id` reaches beyond its world (`docs/zen_moon_mind.md` §16).
+    pub fn reaches_of(&self, npc_id: u64) -> Vec<Group> {
+        self.reaches
+            .read()
+            .unwrap()
+            .get(&npc_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Whether the world gives this character orders: every character but one

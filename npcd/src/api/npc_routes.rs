@@ -744,6 +744,13 @@ pub(super) async fn delete_npc(
                 let minds = rt.minds.read().unwrap().clone();
                 if let Some(minds) = minds {
                     minds.retire_npc(npc_id).await;
+                    // And the turns behind its journal: nothing reads them
+                    // again. Ceased here, on the member it was deleted on, so
+                    // the tombstones are written once and replicate.
+                    if let Err(e) = journal_text::of(minds.substrate().shared(), npc_id).cease_all()
+                    {
+                        tracing::warn!(npc_id, "a deleted character's journal text stays: {e:#}");
+                    }
                 }
             }
             StatusCode::NO_CONTENT.into_response()

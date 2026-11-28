@@ -174,9 +174,8 @@ use crate::journal::sharing::chain_sharing;
 use crate::journal::shelf::{Above, Drafted, Lazy, Notes, Shelf};
 use crate::journal::state::{Request, SessionJournal, FOLD_SWEEP_EVERY};
 use crate::journal::style::style_for;
-use crate::journal::text::JournalText;
 use crate::journal::world::{Citable, JournalsAbove};
-use crate::journal::{carry, draft, origin, pressure};
+use crate::journal::{self, carry, draft, origin, pressure};
 use crate::layers::expiry::now_ms;
 use crate::layers::keys::SUBJECT_KEY;
 use crate::leaving::{Leaving, Running, LEAVE_TURNS_WAIT};
@@ -229,6 +228,7 @@ use candle_conversation::vision::tenancy::{holds, note_use, release_timeline};
 use candle_conversation::vision::{
     load_original, load_thumb, marker, split_markers, touch, ImageSource,
 };
+use host::journal_text::JournalText;
 
 pub mod diag;
 mod kv_census;

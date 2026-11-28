@@ -136,7 +136,7 @@ impl ZendSession {
 
     /// zend's entries in `GET /v1/tools` — the live tool catalog projected into the
     /// dialogue layer's `tools` collection. Sourced from the bundled tool
-    /// definitions (`src/prompts/tools/`, embedded); the schema YAML declares the
+    /// definitions (zend-tools' `definitions/`, embedded); the schema YAML declares the
     /// collection empty and tools install at daemon start. Fetched when the tools
     /// collection expands. The bundled definitions alone: it answers while zend
     /// is still loading.

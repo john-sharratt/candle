@@ -77,6 +77,9 @@ agent        = { path = "../agent" }
 # survey matches, and the `BridgeCall` an NPC's effector verb submits to an
 # in-network agent to run — the device I/O happens on the agent, not here.
 effector-bridge = { path = "../effector-bridge" }
+# zend's own tools, run here for what a personality's `reaches:` grants — the
+# weather, the web, reckoning and the guides (`docs/zen_moon_mind.md` §16).
+zend-tools   = { path = "../zend-tools" }
 substrate-git = { path = "../substrate-git", features = ["member"] }
 # Hashing a provider's subject id into a file name that is valid whatever shape
 # the provider chose. Not a security boundary — the subject inside the file is

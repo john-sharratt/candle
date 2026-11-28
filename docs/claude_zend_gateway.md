@@ -653,7 +653,7 @@ and worker, and over MCP to Claude with `journal_note` beside them. Each takes
 a **mandatory `journal`**, and `journal_read` lists the journal's entries when
 no `entry` is given: `journal_read {journal, entry?, offset?, limit?}`,
 `journal_grep {journal, pattern, entry?, max_results?}`
-(`zend-tools/src/tools/journal/`, `zend/src/prompts/tools/journal_read.yaml`,
+(`zend-tools/src/tools/journal/`, `zend-tools/definitions/journal_read.yaml`,
 `journal_grep.yaml`; over MCP `zend/src/mcp/tools/`). Inside zend a
 conversation's tools read from its shelf — its own journal and every journal
 above it — built at each round (`zend/src/journal/shelf.rs`). (The note tool

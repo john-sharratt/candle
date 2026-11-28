@@ -26,6 +26,9 @@ pub struct Kind<'a> {
     /// The personality's `idle:` — what its idle wake says (see [`Runtime`]'s
     /// `idles`).
     pub idle: Option<&'a str>,
+    /// What the personality's `reaches:` names beyond the world
+    /// (`docs/zen_moon_mind.md` §16).
+    pub reaches: &'a [Group],
 }
 
 /// Everything the prompt needs about one character, owned.
@@ -57,6 +60,9 @@ pub struct OwnedPersona {
     /// Its idle thought — the personality's `idle:`. Never rendered as part of
     /// the persona; see [`Kind`].
     pub idle: Option<String>,
+    /// What it reaches beyond the world — the personality's `reaches:`. Never
+    /// rendered; see [`Kind`].
+    pub reaches: Vec<Group>,
     pub identity: String,
     /// The personality's anchor — the floor every character of it reads.
     ///
@@ -105,6 +111,7 @@ impl OwnedPersona {
             unordered: self.unordered,
             attends: self.attends,
             idle: self.idle.as_deref(),
+            reaches: &self.reaches,
         }
     }
 

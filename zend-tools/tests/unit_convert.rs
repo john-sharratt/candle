@@ -104,6 +104,28 @@ fn convert_celsius_to_fahrenheit() {
     assert!((result - 212.0).abs() < 0.01, "got {result}");
 }
 
+/// **The water points convert exactly**: the Fahrenheit offset is the exact
+/// `273.15 − 32·5/9`, not a truncation of it, which once put every Fahrenheit
+/// conversion off by 4×10⁻⁷.
+#[test]
+fn the_water_points_convert_exactly() {
+    let convert = |value: f64, from: &str, to: &str| {
+        harness::expect_success(harness::invoke(
+            "unit_convert",
+            json!({"value": value, "from": from, "to": to}),
+        ))["result"]
+            .as_f64()
+            .unwrap()
+    };
+    assert_eq!(convert(100.0, "celsius", "fahrenheit"), 212.0);
+    assert_eq!(convert(32.0, "fahrenheit", "celsius"), 0.0);
+    assert_eq!(convert(212.0, "fahrenheit", "celsius"), 100.0);
+    assert_eq!(convert(0.0, "celsius", "kelvin"), 273.15);
+    assert_eq!(convert(273.15, "kelvin", "celsius"), 0.0);
+    assert_eq!(convert(-40.0, "celsius", "fahrenheit"), -40.0);
+    assert_eq!(convert(491.67, "rankine", "fahrenheit"), 32.0);
+}
+
 #[test]
 fn convert_celsius_to_kelvin() {
     let resp = harness::expect_success(harness::invoke(

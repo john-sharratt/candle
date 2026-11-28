@@ -164,6 +164,11 @@ pub(super) fn install_sinks(
             == Some(false);
         persona.attends = field("moves").as_deref() == Some("attention");
         persona.idle = field("idle");
+        // What it reaches beyond the world; a word naming no group is said
+        // where the personalities are read (`worlds_and_identities`).
+        persona.reaches = personality
+            .map(|r| beyond::declared(&r.body).0)
+            .unwrap_or_default();
         Some(persona)
     }));
 

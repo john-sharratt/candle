@@ -11,10 +11,9 @@
 
 use std::sync::{Arc, OnceLock};
 
+use host::journal_text::JournalText;
 use journal_core::transcript::{Hit, Hits, Miss, Page};
 use zend_tools::tools::journal::{JournalBook, JournalShelf, SELF};
-
-use crate::journal::text::JournalText;
 
 /// What a journal with nothing in it lists.
 const NO_ENTRIES: &str = "No entries yet.";
@@ -184,6 +183,7 @@ mod tests {
     use journal_core::transcript::{Filed, Part};
 
     use super::*;
+    use crate::journal;
 
     fn notes(lines: &[&str]) -> Arc<dyn JournalBook> {
         Arc::new(Notes::new(lines.iter().map(|l| l.to_string()).collect()))
@@ -318,7 +318,7 @@ mod tests {
     fn a_drafted_journal_lists_its_lines_and_reads_its_turns() {
         let dir = tempfile::tempdir().unwrap();
         let shared = SharedSubstrate::open_in(dir.path(), Admit::Unbound).unwrap();
-        let text = JournalText::of(shared, TimelineId::from_raw(7).unwrap());
+        let text = journal::text(shared, TimelineId::from_raw(7).unwrap());
         text.file(&Filed {
             entry: 1,
             parts: vec![Part {

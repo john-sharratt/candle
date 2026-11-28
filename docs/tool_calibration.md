@@ -34,7 +34,7 @@ which is why a tool carries many of them.
 
 | Daemon | Definition | Where |
 |---|---|---|
-| zend | `ToolDef`, one YAML file a tool | `zend/src/prompts/tools/*.yaml`, `zend/src/tool_def/mod.rs` |
+| zend | `ToolDef`, one YAML file a tool | `zend-tools/definitions/*.yaml` (`zend_tools::definitions`), `zend/src/tool_def/mod.rs` |
 | npcd | `ActDef`, built from each `Tool` | `npcd/src/engine/calibrate/` |
 
 An npcd act's `Example { situation, call, because }` is rendered as a

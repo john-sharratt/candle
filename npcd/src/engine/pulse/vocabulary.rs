@@ -174,6 +174,8 @@ pub(super) fn describe_catalog(part_names: &PartNames) -> Value {
                     | Availability::AtLanding
                     // A grant is the carried mission's, not the channel's.
                     | Availability::Granted
+                    // What a personality reaches is the character's.
+                    | Availability::Reached
                     // A conversation's own act is the thread's, whatever its channel.
                     | Availability::OnThread => true,
                     Availability::PhysicalOnly => **m == Mode::Physical,
@@ -250,6 +252,7 @@ pub(super) fn describe_catalog(part_names: &PartNames) -> Value {
                     Availability::Granted => {
                         json!("a mission that grants it, in that mission's room in a mirrored place")
                     }
+                    Availability::Reached => json!("a personality that reaches it"),
                     Availability::OnThread => json!("a conversation's decision"),
                 },
                 // Every station, named, however many there are. The `needs`

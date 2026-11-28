@@ -535,7 +535,7 @@ call turn in its projected prefix), so the parallelism is across files —
 each worker's scope decodes coalesce into the scheduler's shared multi-session
 batching, amortising the MoE expert load exactly as any other wave.
 
-**Tools** (`tools/mod.rs`, `tool_def/mod.rs`, YAML specs under `prompts/tools/`) are
+**Tools** (`tools/mod.rs`, `tool_def/mod.rs`, YAML specs under `zend-tools/definitions/`) are
 declared data — network sessions (SSH/TCP/TLS/HTTP/SQL), crypto primitives,
 file/credential management, code execution — surfaced as the `tools`
 section collection and selected into context by the same
@@ -592,7 +592,7 @@ the persistence thread's drain (§4.3). Startup measurement design:
 |---|---|
 | HTTP API, daemon entry point | `zend/src/api/`, `zend/src/main.rs` |
 | Repo/code ingest | `zend/src/repo_scan/`, `zend/src/code_read/` |
-| Tool catalog | `zend/src/tools/`, `zend/src/prompts/tools/` |
+| Tool catalog | `zend/src/tools/`, `zend-tools/definitions/` |
 | Conversation engine entry point | `candle-conversation/src/engine/mod.rs` |
 | Scheduler / wave loop | `candle-conversation/src/scheduler/run/mod.rs`, `mod.rs` |
 | Projection schema + builder | `candle-conversation/src/projection/` |

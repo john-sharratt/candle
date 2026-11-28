@@ -54,6 +54,26 @@ parameters:
   title: GrepRequest
   type: object
 examples:
+- |-
+  did Wick already tell me the door sensor was fixed<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  If Wick said it, it is in the turns behind my own journal's entries; searching them for the door sensor finds the entry and the line.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "journal_grep", "arguments": {"journal": "self", "pattern": "door sensor"}}
+  </tool_call><|projection|>
+- |-
+  which earlier entry has the timeout error in it<|im_end|>
+  <|im_start|>assistant
+  <|projection|><think>
+  The entries' one-line summaries do not quote errors; the turns behind them do. I search my own journal for the word.<|projection|>
+  </think>
+
+  <tool_call>
+  <|projection|>{"name": "journal_grep", "arguments": {"journal": "self", "pattern": "timeout"}}
+  </tool_call><|projection|>
 - search my journal for the timeout error
 - which earlier entry mentions scan.rs
 - find in the journal where the user named the release branch

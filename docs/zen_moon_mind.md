@@ -149,8 +149,9 @@ or Zen that reads of a place the mirror lacks may say so, and the owner decides.
 > on the house network), the house network (a survey and a wake), the cluster (zend's
 > read-only MCP tools) and each machine (a check sent to that machine's agent) — which covers
 > the "PC / phone scanner" row in another form. The bulletin board has `sim::posting` and the
-> map's `post_notice` act. The web terminal's tools and the memory terminal are not verified
-> here; a terminal refused "when Zen's focus is not in its room" cannot apply to a mind with
+> map's `post_notice` act. The web terminal and the memory terminal are not terminals: what
+> they would read is reached by acts a personality's `reaches:` grants wherever it stands
+> (§16). A terminal refused "when Zen's focus is not in its room" cannot apply to a mind with
 > no focus.
 
 Every sense is a terminal: a part, used through the effector like any other station, refused
@@ -266,8 +267,8 @@ still told who is there.
 
 ## 10. Build order
 
-Built: items 1 (without `focus` for Zen, §3.2) and 2 (the effector's internet is unverified,
-§16). Not built, plan of record: 3 and 4.
+Built: items 1 (without `focus` for Zen, §3.2) and 2 (the internet is reached by `reaches:`'s
+acts, §16). Not built, plan of record: 3 and 4.
 
 1. **The work loop**, all in-world: `focus`; `order_post` and `order_results`;
    `Origin::Ordered` and its notifications; the Drones waiting at the table; `idle:`.
@@ -436,24 +437,73 @@ A profile is code in candle, written against the device's own documented or open
 interface. Building one for a kind of device the house has and the world cannot yet reach is
 work like any other — a profile at a time.
 
-## 16. The effector reaches the internet
+## 16. What Zen and the Drones reach beyond the world
 
-> **Status: not verified.** `web_search`, `web_fetch` and `web_request` are not found in
-> `npcd`, `npcd/src/effector/` or `effector-bridge`; in this tree they are zend's tools
-> (`zend/src/tools/catalog.rs`). The private-address refusal and the record of requests
-> below cannot be confirmed here, so read this section as the intended behaviour.
+A personality names what its characters reach outside the world with `reaches:`, a list of
+groups (`npcd/src/engine/beyond/`). In `moon`, `zen-moon` and `moon-drone` name all four; no
+other personality names any, so nothing else is offered them.
 
-Every body in `moon` reaches the internet through its effector, wherever it stands:
+| Group | Acts |
+|---|---|
+| `outside` | `weather`, `web_search`, `web_fetch`, `http_session_open`, `http_request`, `http_session_list`, `http_session_close`, `datetime`, `dns_lookup` |
+| `reckoning` | `calculator`, `unit_convert`, `random` |
+| `memory` | `journal_read`, `journal_grep`, `notes_list`, `notes_read`, `notes_search`, `notes_write`, `guide_read`, `guide_list` |
+| `making` | `image_generate`, `image_edit` |
 
-- `web_search` — ranked results, through the daemon's search key;
-- `web_fetch` — a page, as text;
-- `web_request` — any method, headers and body, to any public address, answered with its status
-  and reply.
+**Each act is its tool's own definition.** The definitions are zend's
+(`zend-tools/definitions/*.yaml`, read through `zend_tools::definitions`), and npcd builds each act
+from the same file zend calibrates its workers on (`beyond::acts`): its name, category,
+description, parameters, and its examples from the definition's worked trajectories. A tool is
+described in one place. What changes is only how a parameter travels through the grammar, which
+bounds a string, an integer, a boolean and a list of lines (`beyond::carry`):
 
-**What is inside the house is reached through its terminals, never here**: `web_fetch` and
-`web_request` refuse a loopback, private or link-local address, checked after the name is
-resolved — the members' own control ports are on those addresses. Every request is recorded with
-who made it.
+| Schema | Carried as |
+|---|---|
+| `string`, `integer`, `boolean`, an array of strings | itself |
+| `number` | a string, `"72.5"` |
+| an object of strings (headers, a query) | a string, one `name: value` to a line |
+| anything else | a string of JSON |
+
+The parameter's description says how it is written, after the definition's own words. A
+parameter named `tool`, `name` or `arguments` — the words an act's line spends on the act — is
+carried under its tool's first word: `guide_read`'s `name` is its `guide`. A trajectory passing an
+argument the tool does not declare is no example.
+
+**Each act is granted, wherever the character stands and whatever it is connected to**: no
+terminal holds them, and a mind with no body reaches them as a Drone does. They are offered in the
+mind's own turns, never on the phone — a conversation only talks, and what it promises to find
+out is the mind's to do (`talk::within`, `talk::turn::ANSWERING`). Their availability is
+`Reached`: shown on the turns that are offered them, ranked against the turn like every other
+act, and never in another character's prompt. The act is checked again as it is performed: a
+character whose personality has stopped naming the group is refused.
+
+**Each runs where the tool already lives**, with the arguments zend's tool of the same name
+takes (`authority::beyond`):
+
+- `outside`, `reckoning`, the guides and the journal tools are zend's tools, run in npcd by
+  `zend_tools::run` on the blocking pool, under a context that grants `Network` alone and holds
+  the daemon's secrets (`~/.zend/secrets.yaml`, for the search key). `web_fetch` pins the public
+  address its name resolved to and refuses a loopback, private or link-local one
+  (`zend_tools::public_fetch`); `http_request` refuses a private or local URL. What is inside the
+  house is reached through its terminals, never here — the members' own control ports are on
+  those addresses.
+- **A character's HTTP sessions are its own.** Each has its own session registry: what Zen opens,
+  no Drone lists or uses, and a character forgotten has its sessions closed.
+- `journal_read` and `journal_grep` read **the character's own journal**, `"self"` — its entries,
+  and the turns each was written from, kept in the substrate under the owner `npc-<id>`
+  (`engine::journal::text`, over `host::journal_text`, which zend's journals use too). The turns
+  are filed as each entry is kept and ceased as it is forgotten. A character has no journal above
+  its own, so any other name is refused.
+- `notes_*` are **the world's notebook**: one per world, shared by everyone in it who reaches
+  `memory`, kept in the substrate under `notes/<world>/<key>` so it replicates and outlives a
+  restart. Writing empty content removes a note.
+- `image_generate` and `image_edit` are npcd's own MCP tools (`/v1/npc/mcp`), called as
+  `service:zen` through the gateway; the answer carries the picture's link, which `image_edit`
+  and `send_image` take.
+
+Every call is logged as `reached beyond the world` with the character, the act and, for a fetch
+or a request, its address. The answer is the tool's own JSON, cut at 6,000 characters; a tool's
+error is a refusal in its own words.
 
 ## 17. Zen's missions
 

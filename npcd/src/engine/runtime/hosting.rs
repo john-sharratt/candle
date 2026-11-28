@@ -66,6 +66,9 @@ impl Runtime {
             reflect_domain: AtomicUsize::new(0),
             feelings: RwLock::new(Vec::new()),
             idles: RwLock::new(HashMap::new()),
+            reaches: RwLock::new(HashMap::new()),
+            tools: Tools::default(),
+            tool_secrets: RwLock::new(Arc::new(Secrets::empty())),
             cooldowns: crate::engine::cooldown::Cooldowns::new(),
             loop_guards: crate::engine::loopguard::LoopGuards::new(),
             stopping: AtomicBool::new(false),
@@ -246,6 +249,7 @@ impl Runtime {
             unordered,
             attends,
             idle,
+            reaches,
         } = kind;
         let body = Self::body_id(npc_id);
         let placed = hosted.with(|w| {
@@ -296,6 +300,7 @@ impl Runtime {
             });
         }
         self.set_idle(npc_id, idle);
+        self.set_reaches(npc_id, reaches);
         // **A handset on arrival, and a line on the roster.** Two halves of one
         // thing: carrying the phone is what makes the messaging acts reachable,
         // and being on the roster is what makes this character reachable *by*
@@ -341,6 +346,8 @@ impl Runtime {
         }
         self.bodies.unbind(npc_id);
         self.set_idle(npc_id, None);
+        self.set_reaches(npc_id, &[]);
+        self.tools.forget(npc_id);
     }
 
     /// Take a character's body away, and let it settle back to reacting.

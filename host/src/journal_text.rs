@@ -1,47 +1,50 @@
-//! A dialogue's journal text: the turns behind each entry, whole, kept in the
-//! substrate beside the conversation for `journal_read` and `journal_grep`
-//! (through [`crate::journal::shelf`]).
+//! A conversation's journal text: the turns behind each entry, whole, kept in
+//! the substrate beside the conversation for the journal tools
+//! (`journal_read`, `journal_grep`) — a coding session's in zend, a
+//! character's in npcd.
 //!
-//! Each stretch a draft covers is one custom object under the conversation's
-//! timeline ([`journal_core::transcript::key`]), written once and never
+//! Each stretch a draft covers is one custom object under the journal's owner
+//! ([`journal_core::transcript::key`]), written once and never
 //! rewritten but by a refile (below) — so it is replicated and compacted like
 //! the rest of the substrate, and ceased like any keyed object. The objects
 //! live as long as the entries they are filed under: forgetting an entry
-//! ceases its own ([`JournalText::forget`]), and tombstoning or archiving the conversation
-//! ceases every one of them ([`JournalText::cease_all`]) — an archived
-//! conversation keeps its journal's entries, but nothing runs a tool on it
-//! again, so the text behind them goes.
+//! ceases its own ([`JournalText::forget`]), and tombstoning or archiving the
+//! conversation ceases every one of them ([`JournalText::cease_all`]).
 //!
-//! A fold ceases its entries' text, except in a conversation owned through
-//! `/mcp`, whose entries are cited by the conversations below it: there the
-//! fold refiles them under its own entry ([`JournalText::refile`]) and notes
-//! where each went, so a folded entry's address still reads its turns.
+//! A fold ceases its entries' text, unless the conversation's entries are
+//! cited by others: then the fold refiles them under its own entry
+//! ([`JournalText::refile`]) and notes where each went, so a folded entry's
+//! address still reads its turns.
 
 use candle_conversation::persistence::record::CustomObjectPayload;
 use candle_conversation::persistence::SharedSubstrate;
 use candle_conversation::projection::TimelineId;
+use journal_core::style::Style;
 use journal_core::transcript::{
     entry_of, entry_prefix, owner_prefix, Book, Filed, Hits, Miss, Page, Part,
 };
 use serde_json::{json, Value};
 
-use crate::journal::style::CODING;
-
 /// The epoch a stretch is written under: none — the conversation's own writer
 /// is the only one that files it.
 const NO_LEASE: u64 = 0;
 
-/// One conversation's journal text in the substrate.
+/// One journal's text in the substrate, read in its journal's style.
 pub struct JournalText {
     shared: SharedSubstrate,
     owner: String,
+    style: &'static Style,
 }
 
 impl JournalText {
-    pub fn of(shared: SharedSubstrate, timeline: TimelineId) -> Self {
+    /// The text of the journal `owner` keeps — a conversation's, by its
+    /// timeline ([`owner_of`]), or a character's, whose journal outlives each
+    /// conversation it is carried in.
+    pub fn of(shared: SharedSubstrate, owner: &str, style: &'static Style) -> Self {
         Self {
             shared,
-            owner: timeline.raw().to_string(),
+            owner: owner.to_string(),
+            style,
         }
     }
 
@@ -184,6 +187,49 @@ impl JournalText {
             .map_err(|e| anyhow::anyhow!("the journal's turns could not be ceased: {e}"))?;
         Ok(n)
     }
+
+    /// `lines` lines of `entry`'s turns from line `from`, counted from 1.
+    /// Reads the entry's own stretches alone: an entry with none is a miss of
+    /// that entry, whatever the others hold.
+    ///
+    /// An entry a fold took reads from the fold's entry, the page opening with
+    /// where it went, so an address cited before the fold still reads its
+    /// evidence.
+    pub fn read(&self, entry: u64, from: usize, lines: usize) -> Result<Page, Miss> {
+        let at = self.resolved(entry);
+        let stretches = self.stretches(&entry_prefix(&self.owner, at));
+        if stretches.is_empty() {
+            return Err(Miss::Entry(entry));
+        }
+        let mut page = Book::new(stretches, self.style).read(at, from, lines)?;
+        if at != entry {
+            page.text = format!(
+                "Entry {entry} was folded into entry {at}; its turns are filed there.\n{}",
+                page.text
+            );
+        }
+        Ok(page)
+    }
+
+    /// The lines that hold `pattern`, ignoring case, in `entry`'s turns —
+    /// wherever a fold filed them — or in every entry's; the first `max`.
+    pub fn grep(&self, pattern: &str, entry: Option<u64>, max: usize) -> Result<Hits, Miss> {
+        let entry = entry.map(|e| self.resolved(e));
+        let prefix = match entry {
+            Some(e) => entry_prefix(&self.owner, e),
+            None => owner_prefix(&self.owner),
+        };
+        let stretches = self.stretches(&prefix);
+        if let (true, Some(e)) = (stretches.is_empty(), entry) {
+            return Err(Miss::Entry(e));
+        }
+        Book::new(stretches, self.style).grep(pattern, entry, max)
+    }
+}
+
+/// The owner a conversation's own journal text is kept under: its timeline.
+pub fn owner_of(timeline: TimelineId) -> String {
+    timeline.raw().to_string()
 }
 
 /// What every note of a fold — which entry went into which — starts with.
@@ -210,56 +256,72 @@ fn parts_of(blob: &Value) -> Vec<Part> {
         .unwrap_or_default()
 }
 
-impl JournalText {
-    /// `lines` lines of `entry`'s turns from line `from`, counted from 1.
-    /// Reads the entry's own stretches alone: an entry with none is a miss of
-    /// that entry, whatever the others hold.
-    ///
-    /// An entry a fold took reads from the fold's entry, the page opening with
-    /// where it went, so an address cited before the fold still reads its
-    /// evidence.
-    pub fn read(&self, entry: u64, from: usize, lines: usize) -> Result<Page, Miss> {
-        let at = self.resolved(entry);
-        let stretches = self.stretches(&entry_prefix(&self.owner, at));
-        if stretches.is_empty() {
-            return Err(Miss::Entry(entry));
-        }
-        let mut page = Book::new(stretches, &CODING).read(at, from, lines)?;
-        if at != entry {
-            page.text = format!(
-                "Entry {entry} was folded into entry {at}; its turns are filed there.\n{}",
-                page.text
-            );
-        }
-        Ok(page)
-    }
-
-    /// The lines that hold `pattern`, ignoring case, in `entry`'s turns —
-    /// wherever a fold filed them — or in every entry's; the first `max`.
-    pub fn grep(&self, pattern: &str, entry: Option<u64>, max: usize) -> Result<Hits, Miss> {
-        let entry = entry.map(|e| self.resolved(e));
-        let prefix = match entry {
-            Some(e) => entry_prefix(&self.owner, e),
-            None => owner_prefix(&self.owner),
-        };
-        let stretches = self.stretches(&prefix);
-        if let (true, Some(e)) = (stretches.is_empty(), entry) {
-            return Err(Miss::Entry(e));
-        }
-        Book::new(stretches, &CODING).grep(pattern, entry, max)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use candle_conversation::persistence::Admit;
+    use journal_core::period::Period;
 
     use super::*;
+
+    /// A turn's time as its milliseconds; every other part of the style is
+    /// one this module never reads.
+    fn clock(at_ms: u64) -> String {
+        format!("t{at_ms}")
+    }
+
+    fn nothing(_: u64, _: u64) -> String {
+        String::new()
+    }
+
+    fn none(_: u64) -> String {
+        String::new()
+    }
+
+    fn bucket(_: Period, at_ms: u64) -> u64 {
+        at_ms
+    }
+
+    fn period_name(_: Period, _: u64) -> String {
+        String::new()
+    }
+
+    const STYLE: Style = Style {
+        entry: "Entry",
+        latest: "Latest:",
+        span: nothing,
+        day: none,
+        hour: none,
+        saw: "Saw:",
+        heard: "Heard:",
+        did: "Did:",
+        inferred: "Concluded:",
+        meaning_to: "Meaning to:",
+        left_open: "Left open:",
+        settled: "Settled:",
+        corrected: " (reads",
+        recheck: " (re-check)",
+        rests_on: " (per",
+        facts: false,
+        open_heading: "Open:",
+        nothing_open: None,
+        history_heading: None,
+        current_heading: None,
+        step: "Step",
+        end: "End.",
+        clock,
+        stretch: nothing,
+        write_question: "",
+        per_question: "",
+        skip_question: "",
+        bucket,
+        period_name,
+        fold_question: "",
+    };
 
     fn part(id: u64, text: &str) -> Part {
         Part {
             id,
-            at_ms: 1_792_713_600_000 + id * 60_000,
+            at_ms: id * 60_000,
             text: text.into(),
         }
     }
@@ -268,16 +330,16 @@ mod tests {
         SharedSubstrate::open_in(dir.path(), Admit::Unbound).unwrap()
     }
 
-    fn timeline(n: u64) -> TimelineId {
-        TimelineId::from_raw(n).unwrap()
+    fn text_of(shared: SharedSubstrate, n: u64) -> JournalText {
+        JournalText::of(shared, &owner_of(TimelineId::from_raw(n).unwrap()), &STYLE)
     }
 
     #[test]
     fn a_filed_stretch_reads_back_under_its_entry_and_no_one_elses() {
         let dir = tempfile::tempdir().unwrap();
         let shared = opened(&dir);
-        let mine = JournalText::of(shared.clone(), timeline(7));
-        let theirs = JournalText::of(shared, timeline(70));
+        let mine = text_of(shared.clone(), 7);
+        let theirs = text_of(shared, 70);
         mine.file(&Filed {
             entry: 1,
             parts: vec![
@@ -296,8 +358,8 @@ mod tests {
         assert_eq!(page.total, 3, "both stretches, in order: {}", page.text);
         assert_eq!(
             page.text,
-            "#1 00:01 User: fix the scan\n#2 00:02 You: reading scan.rs\n#3 00:03 Tool results: \
-             fn scan() {}"
+            "#1 t60000 User: fix the scan\n#2 t120000 You: reading scan.rs\n#3 t180000 Tool \
+             results: fn scan() {}"
         );
         assert_eq!(mine.grep("SCAN", None, 10).unwrap().total, 3);
         assert_eq!(theirs.read(1, 1, 10), Err(Miss::Entry(1)));
@@ -307,7 +369,7 @@ mod tests {
     #[test]
     fn ceasing_a_conversations_text_leaves_nothing_to_read() {
         let dir = tempfile::tempdir().unwrap();
-        let text = JournalText::of(opened(&dir), timeline(7));
+        let text = text_of(opened(&dir), 7);
         text.file(&Filed {
             entry: 2,
             parts: vec![part(5, "You: done")],
@@ -322,7 +384,7 @@ mod tests {
     #[test]
     fn a_forgotten_entry_takes_only_its_own_text() {
         let dir = tempfile::tempdir().unwrap();
-        let text = JournalText::of(opened(&dir), timeline(7));
+        let text = text_of(opened(&dir), 7);
         for entry in [1, 2] {
             text.file(&Filed {
                 entry,
@@ -335,13 +397,13 @@ mod tests {
         assert_eq!(text.read(2, 1, 10).unwrap().total, 1);
     }
 
-    /// **A fold of an `/mcp` conversation keeps its entries' evidence**: the
+    /// **A fold of a cited conversation keeps its entries' evidence**: the
     /// folded entries' turns read back under the fold's entry, beside its
     /// digest, and nothing is left under the folded ones.
     #[test]
     fn refiled_turns_read_back_under_the_fold_beside_its_digest() {
         let dir = tempfile::tempdir().unwrap();
-        let text = JournalText::of(opened(&dir), timeline(7));
+        let text = text_of(opened(&dir), 7);
         text.file(&Filed {
             entry: 1,
             parts: vec![part(1, "User: fix the scan"), part(2, "You: reading")],
@@ -364,8 +426,8 @@ mod tests {
 
         assert_eq!(
             text.read(3, 1, 400).unwrap().text,
-            "#1 00:01 User: fix the scan\n#2 00:02 You: reading\n#3 00:03 You: fixed it\n\
-             #3 00:03 Read scan.rs, fixed the race."
+            "#1 t60000 User: fix the scan\n#2 t120000 You: reading\n#3 t180000 You: fixed it\n\
+             #3 t180000 Read scan.rs, fixed the race."
         );
         // **A folded entry's address resolves to the fold**, and says so.
         let page = text.read(1, 1, 1).unwrap();
@@ -373,7 +435,7 @@ mod tests {
         assert_eq!(
             page.text,
             "Entry 1 was folded into entry 3; its turns are filed there.\n\
-             #1 00:01 User: fix the scan"
+             #1 t60000 User: fix the scan"
         );
         assert_eq!(text.grep("fixed it", Some(2), 10).unwrap().total, 1);
 
@@ -394,7 +456,7 @@ mod tests {
     #[test]
     fn a_refile_run_again_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let text = JournalText::of(opened(&dir), timeline(7));
+        let text = text_of(opened(&dir), 7);
         text.file(&Filed {
             entry: 1,
             parts: vec![part(3, "You: fixed it")],
@@ -415,7 +477,7 @@ mod tests {
         text.refile(&[1], 2).unwrap();
         assert_eq!(
             text.read(2, 1, 400).unwrap().text,
-            "#3 00:03 You: fixed it\n#3 00:03 digest"
+            "#3 t180000 You: fixed it\n#3 t180000 digest"
         );
     }
 
@@ -424,7 +486,7 @@ mod tests {
     #[test]
     fn forgetting_a_fold_ceases_the_notes_that_lead_to_it() {
         let dir = tempfile::tempdir().unwrap();
-        let text = JournalText::of(opened(&dir), timeline(7));
+        let text = text_of(opened(&dir), 7);
         text.file(&Filed {
             entry: 1,
             parts: vec![part(1, "User: hello")],
@@ -440,7 +502,7 @@ mod tests {
     #[test]
     fn a_stretch_with_no_turns_keeps_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let text = JournalText::of(opened(&dir), timeline(7));
+        let text = text_of(opened(&dir), 7);
         text.file(&Filed {
             entry: 1,
             parts: vec![],

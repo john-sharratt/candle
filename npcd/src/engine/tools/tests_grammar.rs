@@ -14,6 +14,7 @@ use super::*;
 pub(super) mod tests {
     use super::*;
 
+    use crate::engine::beyond::Group;
     use crate::engine::talk;
 
     use crate::engine::talk::key::Party;
@@ -695,6 +696,10 @@ pub(super) mod tests {
         // every one — so this is the arm most likely to be the one that puts a
         // future change over the bound.
         within.feelings = (0..116).map(|i| format!("mood-{i}")).collect();
+        // And everything a personality can reach beyond the world, offered
+        // wherever it stands (`docs/zen_moon_mind.md` §16): Zen and the Drones
+        // reach all four groups.
+        let within = within.reaching(&Group::ALL);
 
         let specs = specs_within(Mode::Physical, &within);
         let paths = estimated_paths(&specs, ACTS_PER_TURN);

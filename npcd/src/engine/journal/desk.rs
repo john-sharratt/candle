@@ -26,6 +26,7 @@ use journal_core::workflow::Desk;
 use serde_json::Value;
 
 use crate::engine::identity::Deliberation;
+use crate::engine::journal::text;
 use crate::engine::mind::{Minds, Put};
 use crate::engine::prompt::Persona;
 use crate::engine::tools::Within;
@@ -96,15 +97,25 @@ impl Desk for EngineDesk<'_> {
             .await
     }
 
-    /// A character keeps no text behind its entries: none of its tools reads
-    /// it back, so the stretch it was written from is not filed.
+    /// Keep the entry, and the stretch it was written from under it, for the
+    /// character's `journal_read` and `journal_grep` ([`text`]). The text of
+    /// the entries a fold took goes once the journal no longer holds them:
+    /// nothing cites a character's entries but the character.
     async fn keep(
         &mut self,
         prompt: &JournalPrompt,
-        _filed: Option<&Filed>,
-        _ceased: &[u64],
+        filed: Option<&Filed>,
+        ceased: &[u64],
     ) -> anyhow::Result<()> {
-        self.minds.keep_journal(self.npc_id, prompt).await
+        let turns = text::of(self.minds.substrate().shared(), self.npc_id);
+        if let Some(filed) = filed {
+            turns.file(filed)?;
+        }
+        self.minds.keep_journal(self.npc_id, prompt).await?;
+        for entry in ceased {
+            turns.cease_entry(*entry)?;
+        }
+        Ok(())
     }
 }
 

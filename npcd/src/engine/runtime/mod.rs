@@ -69,7 +69,9 @@ use doc_units::Doc;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_slice, json, to_string, to_vec, Value};
 use tower::ServiceExt;
+use zend_tools::state::Secrets;
 
+use crate::authority::beyond::Tools;
 use crate::authority::ops::{ActSource, Voiced, WorldOp};
 use crate::authority::told::Told;
 use crate::authority::{Role, Standing};
@@ -83,6 +85,7 @@ use crate::engine::agenda::{self, ordered::ORDERED_ACTS};
 use crate::engine::authoring;
 use crate::engine::authorize::{self, critical_compass};
 use crate::engine::bearings;
+use crate::engine::beyond::Group;
 use crate::engine::body::{self, Outcome};
 use crate::engine::calibrate;
 use crate::engine::channels::{self, ChannelSection};
@@ -374,6 +377,17 @@ pub struct Runtime {
     /// Set as the character is embodied, on every member, since the idle wake
     /// is the running member's to deliver.
     idles: RwLock<HashMap<u64, String>>,
+    /// What each character reaches beyond its world, from its personality's
+    /// `reaches:` (`docs/zen_moon_mind.md` §16). Set as it is embodied and as
+    /// its personality is read again, on every member: the acts are offered
+    /// and performed by the member running it.
+    reaches: RwLock<HashMap<u64, Vec<Group>>>,
+    /// What zend's tools run with here: the network alone, the daemon's
+    /// secrets, and each character's own sessions.
+    pub(crate) tools: Tools,
+    /// The daemon's secrets, for [`Self::tools`]: empty until the tenant reads
+    /// them ([`Runtime::set_tool_secrets`]), which a search then says.
+    pub(crate) tool_secrets: RwLock<Arc<Secrets>>,
     /// How soon each character may take each act again.
     ///
     /// Here rather than on a world, because the limit belongs to the person

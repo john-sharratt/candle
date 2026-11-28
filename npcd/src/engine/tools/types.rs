@@ -143,6 +143,11 @@ pub enum Availability {
     /// the acts by which the world builds itself (`docs/zen_moon_mind.md` §14).
     /// See [`Within::grants`].
     Granted,
+    /// Only for a character whose personality reaches it (`reaches:`,
+    /// `docs/zen_moon_mind.md` §16) — wherever it stands, and ranked by
+    /// provenance like any act, since reaching the weather is not the point of
+    /// standing anywhere. See [`Within::reaches`].
+    Reached,
     /// Only in a conversation's decision (`docs/npc_conversations.md` §6.2) —
     /// a turn whose `Within` carries the thread's allow-list
     /// ([`Within::allow`]) — never in the main loop.

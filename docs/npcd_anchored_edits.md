@@ -393,7 +393,7 @@ to keep the old one alive.
    to `doc-units`; the single `tree-sitter` 0.26 pin `yamlpatch` needs stays
    workspace-wide. `zend-vfs`'s `old_text` replace engine is gone.
 2. **`file_read` and `file_edit` change in place**, in `zend-tools`, zend's tool
-   definitions (`zend/src/prompts/tools/`) and npcd's bench acts. Line numbers
+   definitions (`zend-tools/definitions/`) and npcd's bench acts. Line numbers
    and `old_str`/`old_text` are removed from the reads and the act; every
    caller, prompt and example is moved to anchors in the same change.
 3. **zend's `code_reading` units are re-read.** Their turns were read with line

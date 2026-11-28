@@ -204,6 +204,18 @@ pub async fn journal_forget(
             &e.to_string(),
         );
     }
+    // And the turns it was written from, which `journal_read` would otherwise
+    // still find under it.
+    let turns = journal_text::of(minds.substrate().shared(), nid);
+    for entry in &gone {
+        if let Err(e) = turns.forget(*entry) {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "journal_text_not_forgotten",
+                &e.to_string(),
+            );
+        }
+    }
     match rt.scheduler.journal_of(nid, JournalState::view) {
         Some(view) => Json(view).into_response(),
         None => err(

@@ -352,7 +352,7 @@ quoted in Phase 8's report.
    not listed, the bound). Phase 8's trial checks that claude.ai and Claude
    Code list again on it.
 2. **Tool descriptions**, each changed in both places it lives — the `/mcp`
-   definition and its calibrated YAML in `zend/src/prompts/tools/`
+   definition and its calibrated YAML in `zend-tools/definitions/`
    (`repo_task_start`, `journal_note`, `journal_read`, `journal_grep`,
    `journal_check`, `thread_attach`): nesting stated as the code has it; read
    the guide for the work first; `role` and `driven`; the note terms; paging and

@@ -69,6 +69,9 @@ journal-core = { path = "../journal-core" }
 journals = { path = "../journals" }
 # A sandbox job is async; a tool call drives it on a runtime of its own.
 tokio = { version = "1", features = ["rt"] }
+# Each tool's definition — what a model is shown and calibrated on — embedded
+# from `definitions/`, beside the code that runs it.
+include_dir = { version = "0.7" }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -79,6 +82,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
 ] }
+
+[build-dependencies]
+embed-watch = { path = "../embed-watch" }
 
 [dev-dependencies]
 tokio     = { version = "1", features = ["macros", "rt"] }

@@ -163,7 +163,10 @@ impl Runtime {
         .in_the_house(&hosted, &body)
         // And the acts that drive the mission's task, wherever it stands
         // (`docs/mission_templates.md` §7).
-        .with_task_grants(&hosted, &body);
+        .with_task_grants(&hosted, &body)
+        // And what its personality reaches beyond the world, wherever it
+        // stands and whatever it is connected to (`docs/zen_moon_mind.md` §16).
+        .reaching(&self.reaches_of(npc_id));
         // What the world's own state adds: what this body carries, what stands
         // in the room with it, what is outside. An empty answer to any of them
         // takes the acts that need it out of the grammar, which is how a world

@@ -64,6 +64,9 @@ http-body-util      = "0.1"
 heap-census         = { path = "../heap-census" }
 candle              = { workspace = true, features = ["cuda"] }
 candle-conversation = { path = "../candle-conversation", features = ["hub"] }
+# The turns behind a journal's entries, as each tenant's journal tools read them
+# (`journal_text`).
+journal-core        = { path = "../journal-core" }
 
 [build-dependencies]
 embed-watch = { path = "../embed-watch" }

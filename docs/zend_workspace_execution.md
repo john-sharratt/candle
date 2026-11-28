@@ -127,7 +127,7 @@ Required rather than optional, deliberately. An optional scope is where a model 
 
 ### 4.3 The `repo` enum and the stencil
 
-The tool YAML (`zend/src/prompts/tools/*.yaml`) does not carry repository names — they belong to the deployment. A tool that can cover the whole workspace declares `enum: ["*"]`; the rest declare no enum. `tool_def::init` receives the workspace and puts its names at the head of every `repo` parameter's `enum` (`tool_def::constrain_repos`), so the search tools choose between the repositories and `*`, and every other tool between the repositories alone.
+The tool YAML (`zend-tools/definitions/*.yaml`) does not carry repository names — they belong to the deployment. A tool that can cover the whole workspace declares `enum: ["*"]`; the rest declare no enum. `tool_def::init` receives the workspace and puts its names at the head of every `repo` parameter's `enum` (`tool_def::constrain_repos`), so the search tools choose between the repositories and `*`, and every other tool between the repositories alone.
 
 An enum field's grammar arm carries the first step of what follows it — the next key or the close — so the value's closing quote and the separator after it are one arm's text (`candle_conversation::stencil::tool_call`, `continuations`). A tokenizer writes those together (`",`); a quote committed on its own left a live model unable to write the comma and closing its arguments instead of adding the `path` it meant to. The same schema feeds both readers: it is rendered into the prompt, and `tools::tool_catalog` compiles it into the constrained decoder, where a string `enum` becomes a choice between the listed values. The model is shown the names it may use and cannot decode any other.
 

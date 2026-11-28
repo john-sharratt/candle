@@ -76,6 +76,7 @@
 
 pub mod alias_pins;
 pub mod context;
+pub mod definitions;
 pub mod disk;
 pub mod exec;
 pub mod executor;

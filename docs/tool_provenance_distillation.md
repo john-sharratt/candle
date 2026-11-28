@@ -5,7 +5,7 @@ KV chunks, **and** the per-turn wide-Q signature (`WideQSig`). But only the
 signature is ever read at runtime: tool selection scores the `tools` collection's
 belief gallery (`Resolver::belief_gallery`), which reads each in-scope turn's
 `wide_q_sigs` and never touches its tokens or KV. And the trajectories are
-redundant on disk anyway — the tool definitions (`zend/src/prompts/tools/*.yaml`,
+redundant on disk anyway — the tool definitions (`zend-tools/definitions/*.yaml`,
 npcd's act catalog) are the source of truth the prefill-calibration path reads.
 
 So once a calibration turn's sig is captured, its content is dead weight.

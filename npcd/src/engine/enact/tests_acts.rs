@@ -17,7 +17,7 @@ pub(super) mod tests {
 
     use crate::engine::talk::hand_off::HAND_OFF_ACTS;
 
-    use crate::engine::zen_task;
+    use crate::engine::{beyond, zen_task};
 
     use npc_map::world::Where;
 
@@ -77,6 +77,11 @@ pub(super) mod tests {
             // A mission's task acts call zend, also on the async path
             // (`Runtime::zen_task_act`).
             if zen_task::is_mine(name) {
+                continue;
+            }
+            // What a personality reaches beyond the world runs on the async
+            // path too (`Runtime::beyond_act`).
+            if beyond::is_mine(name) {
                 continue;
             }
             // A conversation's hand-off is performed as the world's `message`

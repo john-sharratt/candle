@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 use zend_tools::state::secrets::Secrets;
+use zend_tools::{Capability, Grants, ToolContext};
 
 #[test]
 fn http_session_list_empty() {
@@ -106,6 +107,34 @@ fn http_session_open_with_a_daemon_bearer_token() {
         &ctx,
     );
     harness::expect_error(&missing, "credential_not_found");
+}
+
+/// **Under the network alone a session opens with no credential, and with
+/// one is refused** — the daemon's bearer tokens included, so a context
+/// granted no secrets never sends one.
+#[test]
+fn http_session_open_under_the_network_alone_takes_no_credential() {
+    let secrets = Secrets::from_yaml("http_bearer:\n  yenbot: tok-123\n", "t.yaml").unwrap();
+    let ctx = ToolContext::new()
+        .with_secrets(Arc::new(secrets))
+        .granting(Grants::NONE.with(Capability::Network));
+    let open = harness::expect_success(harness::invoke_with_ctx(
+        "http_session_open",
+        json!({"base_url": "https://example.com"}),
+        &ctx,
+    ));
+    assert!(open["session_id"].as_str().unwrap().starts_with("sess_"));
+    let refused = harness::invoke_with_ctx(
+        "http_session_open",
+        json!({"base_url": "https://yenbot.com.au", "credential_name": "yenbot"}),
+        &ctx,
+    );
+    harness::expect_error(&refused, "not_permitted");
+    assert_eq!(
+        ctx.sessions.list_http().len(),
+        1,
+        "the refused open made none"
+    );
 }
 
 #[test]

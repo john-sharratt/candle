@@ -13,6 +13,8 @@
 //! | [`section`] | which conversation holds a character's journal |
 //! | [`closing`] | the entry that closes a mission's chapter |
 //! | [`desk`] | the character's live conversation a draft runs against |
+//! | [`text`] | the turns behind each entry, kept for the character's journal tools |
+//! | [`shelf`] | the journal those tools reach: its own, `"self"` |
 //! | [`world`] | the world's facts a claim is checked against |
 //!
 //! Whether a stretch is worth an entry is asked by the guardian's journal module
@@ -22,6 +24,8 @@ pub mod closing;
 pub mod desk;
 pub mod origin;
 pub mod section;
+pub mod shelf;
 pub mod state;
 pub mod style;
+pub mod text;
 pub mod world;

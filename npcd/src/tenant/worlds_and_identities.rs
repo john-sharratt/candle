@@ -86,6 +86,18 @@ pub(super) async fn identities(authored: &Arc<Authored>) -> Identities {
             .unwrap_or_default()
             .to_string()
     };
+    // A word in `reaches:` that names no group grants nothing; said here, once
+    // a reading, rather than at every turn that reads the persona.
+    for p in personalities.iter() {
+        let (_, unknown) = beyond::declared(&p.body);
+        if !unknown.is_empty() {
+            tracing::warn!(
+                personality = %p.id,
+                "`reaches:` names no group as {unknown:?}: the groups are outside, reckoning, \
+                 memory and making"
+            );
+        }
+    }
     Identities {
         anchors: personalities
             .iter()

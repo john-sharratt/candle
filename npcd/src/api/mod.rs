@@ -61,6 +61,7 @@ use crate::discord::seal::Sealer;
 use crate::discord::trace::route as discord_trace;
 use crate::drafts::routes as drafts;
 use crate::drafts::{caller, records, Author};
+use crate::engine::journal::text as journal_text;
 use crate::engine::runtime::{OwnedPersona, Runtime};
 use crate::guest_routes;
 use crate::identity::require;

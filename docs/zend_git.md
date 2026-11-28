@@ -530,7 +530,7 @@ A repository's overlay store (`zend-vfs/src/vfs/store.rs`) holds one conversatio
 
 ## 10. Model-facing tools
 
-Twelve `git_*` tools in `zend-tools/src/tools/git/`, each taking the workspace's `repo` enum (`docs/zend_workspace_execution.md` §4.3). They are request/response shells over this layer: nothing in `zend-tools` spawns or parses git. The catalog entry for each is a bundled definition in `zend/src/prompts/tools/git_*.yaml`; the tool-facing view — modes, paging, and why distinctions live inside tools rather than between them — is documented in `docs/tool-system.md` under "Git".
+Twelve `git_*` tools in `zend-tools/src/tools/git/`, each taking the workspace's `repo` enum (`docs/zend_workspace_execution.md` §4.3). They are request/response shells over this layer: nothing in `zend-tools` spawns or parses git. The catalog entry for each is a bundled definition in `zend-tools/definitions/git_*.yaml`; the tool-facing view — modes, paging, and why distinctions live inside tools rather than between them — is documented in `docs/tool-system.md` under "Git".
 
 **Reads** — no capability, offered wherever tools are:
 

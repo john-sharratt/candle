@@ -10,8 +10,8 @@
 //! [`expect_error`] asserts the response has `"error": "<code>"`.
 //!
 //! Tool *definitions* (name, description, `parameters` schema, examples) live in
-//! the bundled `zend/src/prompts/tools/*.yaml` now; this harness exercises only
-//! execution (dispatch, results, confirmation).
+//! the bundled `definitions/*.yaml` (`zend_tools::definitions`); this harness
+//! exercises only execution (dispatch, results, confirmation).
 
 #![allow(dead_code)] // Helpers are pulled into per-tool test binaries selectively.
 

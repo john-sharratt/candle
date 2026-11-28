@@ -86,6 +86,9 @@ pub struct Within {
     /// what [`Availability::Granted`] reads. Empty unless the body carries a
     /// mission granting them, stands in its room, and the room is a mirror.
     pub grants: Vec<String>,
+    /// The acts the character's personality reaches beyond the world
+    /// (`docs/zen_moon_mind.md` §16): what [`Availability::Reached`] reads.
+    pub reaches: Vec<String>,
     /// The devices the last survey here found that no part stands for yet, by
     /// label — [`Choices::Findings`].
     pub findings: Vec<String>,

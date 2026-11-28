@@ -38,7 +38,7 @@ use crate::tool::{ConfirmationDetails, Replay, Tool, ToolError};
 /// A type-erased **execution** registration for the static tool table. Tool
 /// *definitions* — name (shared here as the execution binding), description, the
 /// `parameters` schema, high-risk flag, and calibration examples — live in the
-/// bundled `src/prompts/tools/*.yaml` (see `zend::tool_def`); this table carries
+/// bundled `definitions/*.yaml` ([`crate::definitions`]); this table carries
 /// only what running a call needs.
 #[derive(Copy, Clone)]
 pub struct RegisteredTool {
@@ -1199,8 +1199,10 @@ fn register_all() -> &'static [RegisteredTool] {
         TELNET_SESSION_SEND.requires(NET),
         TELNET_SESSION_LIST.requires(NET),
         TELNET_SESSION_CLOSE.requires(NET),
-        // HTTP session tools (4) — all high-risk (network)
-        HTTP_SESSION_OPEN.requires(NET_SECRETS),
+        // HTTP session tools (4) — all high-risk (network). Opening one with a
+        // credential needs `Secrets` too, which the open itself checks: a
+        // session with none reads nothing stored.
+        HTTP_SESSION_OPEN.requires(NET),
         HTTP_SESSION_REQUEST.requires(NET),
         HTTP_SESSION_LIST.requires(NET),
         HTTP_SESSION_CLOSE.requires(NET),

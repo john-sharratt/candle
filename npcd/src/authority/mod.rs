@@ -28,8 +28,10 @@
 //! | [`report`] | the worlds in `COORD` |
 //! | [`routes`] | the authority's routes |
 //! | [`zen_task`] | a mission's task of Zen's, driven and tended |
+//! | [`beyond`] | what a personality reaches beyond the world, performed |
 
 pub mod beat;
+pub mod beyond;
 pub mod building;
 pub mod cast;
 pub mod driver;

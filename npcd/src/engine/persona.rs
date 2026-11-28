@@ -130,6 +130,7 @@ pub fn of(n: &NpcPayload, world: &str, anchor: &str) -> OwnedPersona {
         unordered: false,
         attends: false,
         idle: None,
+        reaches: Vec::new(),
         manner: String::new(),
         beliefs: n.beliefs.iter().map(believe).collect(),
         relationships: n.relationships.iter().map(know).collect(),

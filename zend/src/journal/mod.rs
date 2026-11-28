@@ -19,7 +19,7 @@
 //! | [`carry`] | the journal as the system prompt carries it |
 //! | [`opening`] | the two entries a dialogue's journal opens with: what was read before the session began |
 //! | [`record`] | the record a restart rebuilds the journal from |
-//! | [`text`] | the turns behind each entry, whole, for `journal_read` and `journal_grep` |
+//! | [`text`] | the turns behind each entry, whole, for `journal_read` and `journal_grep` (`host::journal_text`, in the coding style) |
 //! | [`shelf`] | the journals a dialogue's journal tools reach by name: its own, and those above it |
 //! | [`registry`] | every dialogue's journal, by conversation |
 //!
@@ -42,5 +42,16 @@ pub mod shelf;
 pub mod state;
 pub mod steps;
 pub mod style;
-pub mod text;
 pub mod world;
+
+use candle_conversation::persistence::SharedSubstrate;
+use candle_conversation::projection::TimelineId;
+use host::journal_text::{owner_of, JournalText};
+
+use self::style::CODING;
+
+/// `timeline`'s journal text: the turns behind its entries, read in the
+/// coding style.
+pub fn text(shared: SharedSubstrate, timeline: TimelineId) -> JournalText {
+    JournalText::of(shared, &owner_of(timeline), &CODING)
+}

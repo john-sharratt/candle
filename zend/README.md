@@ -44,7 +44,7 @@ Every layer the projection schema declares is filled by convention rather than a
 | `src/conv_file_store.rs`, `conv_files.rs` | Per-conversation uploaded-file storage, independent of the inference engine |
 | `web/` | The single-page frontend (chat UI, `substrate.html`, `perf.html`, `project.html`), compiled in (`tenant::WEB`) and served by the host; the gateway serves it from disk |
 | `src/prompts/projection.yaml` | The bundled default projection schema |
-| `src/prompts/tools/*.yaml` | Declarative tool definitions (schema, description, calibration examples) |
+| `../zend-tools/definitions/*.yaml` | Declarative tool definitions (schema, description, calibration examples), shared with npcd through `zend_tools::definitions` |
 
 ## Key types & entry points
 

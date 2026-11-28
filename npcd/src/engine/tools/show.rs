@@ -58,6 +58,8 @@ pub fn for_body(mode: Mode, embodied: bool) -> Vec<&'static Tool> {
             Availability::AtLift | Availability::AtLanding => false,
             // A grant is the carried mission's, in its room — the situation's.
             Availability::Granted => false,
+            // What a personality reaches is the character's, read per turn.
+            Availability::Reached => false,
             // A conversation's own act is never the main loop's.
             Availability::OnThread => false,
         })

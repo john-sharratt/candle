@@ -27,6 +27,7 @@ use serde::Serialize;
 
 use crate::bridge::BRIDGE_ACTS;
 use crate::engine::agenda::{self, ordered, AGENDA_ACTS};
+use crate::engine::beyond::BEYOND_ACTS;
 use crate::engine::build::BUILD_ACTS;
 use crate::engine::invoke_body::{self, Invokable};
 use crate::engine::talk::hand_off::HAND_OFF_ACTS;
@@ -116,6 +117,7 @@ pub static CATALOG: std::sync::LazyLock<Vec<Tool>> = std::sync::LazyLock::new(||
         .chain(HOUSE_ACTS)
         .chain(BUILD_ACTS)
         .chain(TASK_ACTS)
+        .chain(BEYOND_ACTS.iter())
         .chain(HAND_OFF_ACTS)
         .copied()
         .collect()

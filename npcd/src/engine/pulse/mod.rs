@@ -29,6 +29,7 @@ use web::auth::{Identity, Role};
 use crate::api::{err, owner_of, Authored};
 use crate::engine::event::{Addressed, Event, EventKind, Salience};
 use crate::engine::journal::state::JournalState;
+use crate::engine::journal::text as journal_text;
 use crate::engine::runtime::Runtime;
 use crate::engine::slash;
 use crate::engine::survey::Survey;
