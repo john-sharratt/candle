@@ -380,6 +380,45 @@ fn a_reorder_right_behind_a_kept_hole_keeps_the_hole() {
     assert_eq!((at, offset), (100 + 33 + 7, 33 + 7));
 }
 
+/// **A gap between pieces that the next layout fills is gone from the
+/// slot** (`docs/placed_section_layout.md` §3.4): a locked section keeps its
+/// place across the gap a section that left made, and a section that then
+/// fills it is placed where the gap was. The hole was the lead of the chunk
+/// after it; a cut that replaced that chunk and carried the lead onto what
+/// replaced it read every later position the gap's width past the index —
+/// 2,046 positions live on BlackWorld, the QSA select refused and the next
+/// wave faulted.
+#[test]
+fn a_gap_the_next_layout_fills_is_gone() {
+    use Place::{Hole, Turn};
+    let (at, offset) = spliced_layout_equals_built(
+        &[40, 7, 33, 5],
+        &[Turn(0), Hole(100), Turn(1), Hole(50), Turn(2)],
+        &[Turn(0), Hole(100), Turn(1), Turn(3), Turn(2)],
+    );
+    assert_eq!((at, offset), (40 + 100 + 7 + 5 + 33, 40 + 7 + 5 + 33));
+    // The gap filled by the section that sat after it, moved up.
+    let (at, offset) = spliced_layout_equals_built(
+        &[40, 7, 33],
+        &[Turn(0), Hole(100), Turn(1), Hole(50), Turn(2)],
+        &[Turn(0), Hole(100), Turn(1), Turn(2)],
+    );
+    assert_eq!((at, offset), (40 + 100 + 7 + 33, 40 + 7 + 33));
+}
+
+/// **A gap that opens between kept pieces is in the slot**: the section
+/// between two locked ones leaves, and its place stays a hole of its width.
+#[test]
+fn a_gap_that_opens_between_kept_pieces_is_held() {
+    use Place::{Hole, Turn};
+    let (at, offset) = spliced_layout_equals_built(
+        &[40, 7, 33, 5],
+        &[Turn(0), Hole(100), Turn(1), Turn(3), Turn(2)],
+        &[Turn(0), Hole(100), Turn(1), Hole(5), Turn(2)],
+    );
+    assert_eq!((at, offset), (40 + 100 + 7 + 5 + 33, 40 + 7 + 33));
+}
+
 /// Nothing in common and everything in common are the two ends: a rebuild
 /// from nothing, and a rebuild that changes nothing.
 #[test]
