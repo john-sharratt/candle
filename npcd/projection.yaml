@@ -106,12 +106,27 @@ system_prompt:
       name: identity_anchor
       selection: { kind: always_visible }
       range: { tokens: 4096, fill: bottom }
+      # Every collection declares a lead (`docs/placed_section_layout.md`
+      # §3.5f): a record of its own kind every member is sealed behind and that
+      # is never selected or emitted. Here an anchor of nobody in the mind.
+      lead:
+        - id: identity_anchor/lead
+          content: |+
+            You keep the lamp at the end of a long pier. You have done it for years, you like the quiet of it, and you notice when a boat is late.
+
       sections: []
 
     - kind: collection
       name: identity
       selection: { kind: always_visible }
       range: { tokens: 2048, fill: bottom }
+      lead:
+        - id: identity/lead
+          content: |+
+            You are Ada Marlow.
+
+            How others would describe you: a ferry clerk with ink on her cuffs, who knows every regular by name.
+
       sections: []
 
     # ── Response: the locked structural template ─────────────────────────
@@ -132,6 +147,11 @@ system_prompt:
       selection: { kind: top_k, k: 1 }
       # Exactly one template, whatever room is left.
       range: { tokens: 256, most: 1 }
+      lead:
+        - id: response/lead
+          content: |+
+            A note left on a door: one line, what happened and when you will be back.
+
       sections: []
 
     # ── Mood: the spiking register ───────────────────────────────────────

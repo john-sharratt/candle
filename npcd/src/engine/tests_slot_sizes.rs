@@ -3,6 +3,9 @@
 //! collection the daemon fills has a range its members fit, and every section
 //! and tree node whose text can change declares a `min_tokens` its text fits.
 //!
+//! Every collection the daemon fills declares a lead its members are sealed
+//! behind, and the lead is counted against the range it gives positions up in.
+//!
 //! An item past its slot moves everything after it, and the K/V sealed behind
 //! the old positions is stale; nothing at run time fails, so this measures it.
 //! The members are installed as the loader installs them — the identities and
@@ -166,9 +169,17 @@ fn misfit(name: &str, tokens: usize, slot: Option<usize>) -> Option<String> {
     }
 }
 
-/// A collection's tokens at the most it ever places: its mandatory members and
-/// its `most` largest others, or its largest member when it places one.
+/// A collection's tokens at the most its range holds: its lead, which every
+/// member is sealed behind and which the range's hole gives up
+/// (`docs/placed_section_layout.md` §3.5f), its mandatory members and its
+/// `most` largest others, or its largest member when it places one.
 fn collection_tokens(c: &SectionCollection, tokens: &impl Fn(&str) -> usize) -> usize {
+    let lead: usize = c.lead.iter().map(|s| tokens(&s.content)).sum();
+    lead + member_tokens(c, tokens)
+}
+
+/// What `c`'s members take at the most it places them.
+fn member_tokens(c: &SectionCollection, tokens: &impl Fn(&str) -> usize) -> usize {
     let mut sizes: Vec<usize> = c
         .sections
         .iter()
@@ -243,6 +254,12 @@ fn the_live_minds_items_fit_their_slots() {
                 );
             }
             SystemPromptItem::Collection(c) => {
+                if c.lead.is_empty() {
+                    misfits.push(format!(
+                        "{}: no lead, so its members are sealed behind nothing",
+                        c.name
+                    ));
+                }
                 let t = collection_tokens(c, &tokens);
                 let range = c.range.map(|r| r.positions(Some(NATIVE)));
                 println!(
