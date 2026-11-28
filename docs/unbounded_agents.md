@@ -1,6 +1,6 @@
 # One Card, One Stack: Constraint-Driven Architecture for Asymptotically Stable Inference over Unbounded Agent Memory
 
-> **Version 2.** v1 ([10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) and its erratum: Appendix A.
+> **Version 3, draft.** v2 ([10.5281/zenodo.24529143](https://zenodo.org/records/24529143)), v1 ([10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) and v1's erratum: Appendix A.
 
 **Abstract**
 
@@ -8,11 +8,11 @@ Persistent agents need context that grows without bound. Under full attention ev
 
 **Theorem (§11.2).** Under provenance-selected attention over a tiered context, the change stored K/V error makes to each attention head's output is bounded by a constant, and a token the step needs keeps an attention weight bounded below by a constant, both independent of context depth N, so the step's signal-to-perturbation ratio is bounded at any depth. Under full attention the needed token's weight falls as 1/N against the same perturbation, and the summed stored error a step reads grows linearly in N.
 
-The system combines (1) online Markov expert prediction with wave-batched grouped GEMM for MoE inference under partial VRAM residency; (2) per-block adaptive KV quantization across eleven levels (C0–C10) with asymmetric K/V error metrics and a prefill refresh at every turn seal, compressing the KV cache 4.1–7.6× at the top level across the fleet's compressing models; (3) attentional provenance indexing — Q-vector sign signatures scanned on the GPU, re-selecting the working set during decode; and (4) an unbounded three-tier context, VRAM-hot, RAM-warm and disk-cold.
+The system combines (1) online Markov expert prediction with wave-batched grouped GEMM for MoE inference under partial VRAM residency; (2) per-block adaptive KV quantization across eleven levels (C0–C10) with asymmetric K/V error metrics and a prefill refresh at every turn seal, compressing the KV cache 4.1–7.6× at the top level across the fleet's compressing models; (3) attentional provenance indexing — Q-vector sign signatures scanned on the GPU choose what the system prompt's knowledge base places, re-laid out at every decode step; and (4) an unbounded three-tier context, VRAM-hot, RAM-warm and disk-cold.
 
 Implemented in Rust on a Candle fork, the system runs a **180B-parameter MoE model on a 16 GB laptop GPU**, decoding one session at 34.9 t/s — above the 27.5–29 published for an RTX 5080, the same 16 GB class with twice the host RAM — and eight at 108.5 t/s aggregate, above every published llama.cpp run of the model and every published multi-session figure for it. On a 72 GB RTX PRO 5000, from 32K to 128K tokens it keeps **96–99% of its prefill and 93–111% of its decode** across two tasks. One card's aggregate decode is **1.4–37.9×** the best published llama.cpp single-stream rate for the same model and card class, reaching **2,869.9 t/s across 64 sessions**, and a **284B model serves sixteen sessions from one GPU** at 4.1× the best published single-GPU decode.
 
-On the system's own 2.2M-line codebase, retrieval ranks one of a question's answer files first among 7,943 files on 49% of 121 questions and in the top five on 69%, by Q-signature agreement alone. Answering 128 questions from memory with tools forbidden, over seven memory arms and three to seven runs each, the memory is worth **37.0 points of recall**, re-selection during reasoning 5.3, and continuous re-selection 6.9 over a single retrieval, every interval clear of zero (§9.12). Mid-decode reprojection selects every fact planted in a history twelve times the working set, at the top compression level as at near-lossless, where a single projection and a rolling window select none (§9.11.2).
+On the system's own 2.2M-line codebase, retrieval ranks one of a question's answer files first among 7,943 files on 49% of 121 questions and in the top five on 69%, by Q-signature agreement alone. Answering 128 questions from memory with tools forbidden, the memory is worth **[pending §9.12]** points of recall (§9.12). Mid-decode reprojection selects every fact planted in a history twelve times the working set, at the top compression level as at near-lossless, where a single projection and a rolling window select none (§9.11.2).
 
 ---
 
@@ -28,7 +28,7 @@ The system came from two constraints held together: persistent agent conversatio
 - **Throughput flat in depth**: 96–99% of prefill and 93–111% of decode kept from 32K to 128K across two tasks on the RTX PRO 5000 (§9.6.2).
 - **KV compression up to 7.6×**, each 32-token block choosing its format as it is sealed; at 8K the top level costs 2–8% of decode for 4.6–6.3× (§9.6.3).
 - **Concurrency**: aggregate decode 1.4–37.9× the best published llama.cpp rate for the same model and card class, 2,869.9 t/s across 64 sessions on one card; a 284B model at sixteen sessions on one GPU, 4.1× the best published single-GPU decode (§9.6.4, §9.6.6).
-- **Retrieval over its own codebase**: an answer file first of 7,943 on 49% of 121 questions and top-five on 69%; the memory worth 37.0 points of recall with tools forbidden, re-selection during reasoning 5.3 (§9.12).
+- **Retrieval over its own codebase**: an answer file first of 7,943 on 49% of 121 questions and top-five on 69%; the memory worth [pending §9.12] points of recall with tools forbidden (§9.12).
 - **Selection at depth**: every fact planted in a history twelve times the working set is selected, at C10 as at C0 (§9.11.2).
 
 The agent use case is the existence proof that the parts run together; it is not the subject of the paper. To our knowledge no prior serving system states a bound on per-step error exposure at unbounded depth. An 80 GB card holds more tokens at full precision, but once a token is compressed or evicted it is in the same position as on a 16 GB card (§11.2, Corollary 2).
@@ -37,7 +37,7 @@ The agent use case is the existence proof that the parts run together; it is not
 
 1. **Online Markov expert prediction** (§4) — a transition matrix learned from live routing, with no calibration, and a wave-batched grouped GEMM that amortises each expert's transfer across the sessions that route to it.
 2. **Two-phase KV quantization** (§5) — K/V re-prefilled from the finished turn at its seal, removing decode drift, then a per-block format chosen independently for K and V by error metrics matched to K's softmax-amplified and V's linear error paths [AsymKV, COLING 2025].
-3. **Attentional provenance indexing** (§6) — Q-vector sign signatures matched Q→Q by XNOR and popcount, scanned on the GPU over a VRAM-resident gallery by tensor-core kernels (~9.5 ms over a 591K-token gallery on a 16 GB laptop GPU; a median 83 ms over the 36.1M-token production gallery with sixteen sessions in flight) and re-selecting the working set every 64 decoded tokens, off the decode's critical path. The think block is the probe that decodes ahead of the answer.
+3. **Attentional provenance indexing** (§6) — Q-vector sign signatures matched Q→Q by XNOR and popcount, scanned on the GPU over a VRAM-resident gallery by tensor-core kernels (~9.5 ms over a 591K-token gallery on a 16 GB laptop GPU; a median 83 ms over the 36.1M-token production gallery with sixteen sessions in flight). What they select is placed as sealed sections in a reserved range at the end of the system prompt, re-laid out at every decode step by the index's attention, a strongly read section locked where it stands. The think block is the probe that decodes ahead of the answer.
 4. **Unbounded three-tier context** (§7, §11.2) — VRAM-hot, RAM-warm and disk-cold paging, with the proof that the stored error entering a step is bounded independent of depth under provenance-selected attention.
 5. **Native quantized kernels** (§8, supporting) — matmuls that never materialise a full-precision weight copy, greedy batch decomposition, and a fused sampling kernel.
 
@@ -74,7 +74,7 @@ RetrievalAttention [Liu et al., NeurIPS 2025] measured the Q→K gap: Q vectors 
 One requirement organises the system: the tokens attending any step must be bounded independently of context depth, the property §11.2 uses. Figure 3-1 shows one decode step and the two loops that feed it. No component materialises an intermediate the next operation does not consume: there is no dequantised weight copy and no BF16 expansion between the logits and the sampling modifiers.
 
 <figure class="fig">
-<svg viewBox="0 0 640 292" role="img" aria-label="Figure 3-1. One decode step: embedding, attention over a working set, MoE experts streamed from VRAM, RAM and NVMe, a fused sampling kernel, and the next token. Every 64 decoded tokens the last 128 Q signatures are scanned against the VRAM gallery, in about 9.5 ms over 591 thousand tokens and a median 83 ms over the 36.1 million-token production gallery, off the critical path, and the result assembles the next forward's working set. When a turn ends it is re-prefilled and each 32-token block is sealed in its own format, C0 to C10, into three tiers: VRAM hot, RAM warm, disk cold, which also hold the gallery.">
+<svg viewBox="0 0 640 292" role="img" aria-label="Figure 3-1. One decode step: embedding, attention over a working set, MoE experts streamed from VRAM, RAM and NVMe, a fused sampling kernel, and the next token. Every 64 decoded tokens the last 128 Q signatures are scanned against the VRAM gallery, in about 9.5 ms over 591 thousand tokens and a median 83 ms over the 36.1 million-token production gallery, off the critical path, and the result lays out the knowledge base the next forward reads, at the end of the system prompt. When a turn ends it is re-prefilled and each 32-token block is sealed in its own format, C0 to C10, into three tiers: VRAM hot, RAM warm, disk cold, which also hold the gallery.">
   <text class="ttl" x="16" y="20">Figure 3-1 · One decode step, and the loops that feed it</text>
   <text class="ttl-sub" x="16" y="36">each forward attends a working set, never the whole context</text>
   <rect class="box" x="16" y="56" width="96" height="52" rx="6"/>
@@ -103,7 +103,7 @@ One requirement organises the system: the tokens attending any step must be boun
   <path class="ax" d="M112 82 H132 M264 82 H284 M416 82 H436 M532 82 H552 M588 108 V165 H532 M198 140 V108 M480 222 V190 M416 247 H436 M88 247 H132"/>
   <path class="t-dim" d="M132 82 l-6 -3.5 v7 z M284 82 l-6 -3.5 v7 z M436 82 l-6 -3.5 v7 z M552 82 l-6 -3.5 v7 z M532 165 l6 -3.5 v7 z M198 108 l-3.5 6 h7 z M480 190 l-3.5 6 h7 z M436 247 l-6 -3.5 v7 z M132 247 l-6 -3.5 v7 z"/>
   <text class="t-dim" x="542" y="182">Q signatures</text>
-  <text class="t-dim" x="206" y="128">next forward's working set</text>
+  <text class="t-dim" x="206" y="128">knowledge base, re-laid each step</text>
   <text class="t-dim" x="486" y="210">gallery, K/V</text>
   <text class="t-dim" x="16" y="251">turn ends</text>
 </svg>
@@ -308,43 +308,13 @@ normalized(c | x) = 1000 × surprise(c | x) / ln(1 / 0.01)
 
 ### 6.5 Retrieval During Decode: Reprojection, and the Think Block as a Speculative Probe
 
-**Mid-decode reprojection.** Every decoded token's Q signature is captured. Every 64 decoded tokens, or at a line break more than 16 tokens after the last, inside the think block as in the answer, the last 128 decoded tokens' signatures are scanned against the gallery, and the result assembles the next forward's working set, so retrieval follows the reasoning by at most one interval and never blocks a forward (`sequence_config.rs`: `REPROJECT_EVERY_N_TOKENS`, `reproject_max_probe_tokens`, `reproject_in_thinking`).
-
-**The opening.** A question's Q depends on the context it is read in, and every conversation opens on configured background files: one battery question's answer file ranked second of the 6,854 files then ingested alone, and fifth against them. So a request is read twice — first with the background held out, scored and discarded; then again, its opening working set ranked by the first reading beside the background. The first reasoning tokens then reproject at 8, 16 and 32 tokens, because what the model writes early about what it has read stays in its context. The cost is one extra prefill and one scan before the first token.
+**The knowledge base, re-laid every step.** What provenance selects is placed in a reserved range at the end of the system prompt, rendered as the model's own agent framework renders retrieved knowledge (`## The content from <path>:`, then the text), never as turns of a conversation, which the model read as one confused dialogue (§9.12). Every item of the prompt takes a fixed slot, and the part of a range nothing fills is a hole: positions no K/V occupies. Whatever the range places, nothing after it moves. A file is placed as sections, each sealed behind its repository's root listing and its own folder's, so it is computed as the part of the repository it is, not as the first thing read. Every 64 decoded tokens, inside the think block as in the answer, the last 128 tokens' signatures are scanned against the gallery for candidates. At every decode step the placed sections are rated by their share of the QSA index's attention: one the selection stopped reading leaves, a candidate read strongly enters, and the order follows the attention, except that the sections holding half of it lock where they stand, so the relative positions a reading depends on do not move under it. The question is read once before the opening, so the opening already stands in the order the decode will read it (`docs/placed_section_layout.md`).
 
 **The think block is the speculative probe.** A probe that decodes ahead of the answer, never enters memory, and chooses the answer's context is what the reasoning block already is. Each boundary inside it reprojects from what it has just reasoned, the reprojection on `</think>` assembles the answer's working set from the whole thought, and at seal its K/V is dropped and the exchange re-prefilled without it (§5). By the first answer token the context has been steered by everything the model thought. From the projection records of the 128-question battery (§9.12):
 
-<figure class="fig">
-<svg viewBox="0 0 640 200" role="img" aria-label="Figure 6-2. Share of 384 answers per arm with an answer file in the working set at the opening and at the first answer token. C1, reprojecting through its reasoning, 51.6 percent to 57.8 percent, with 17.1 reprojections inside the think block and 25.8 percent of the openings' misses brought in. B1, held, 51.6 to 51.8 percent. D1, retrieved once, 48.7 percent throughout.">
-  <text class="ttl" x="16" y="20">Figure 6-2 · The reasoning brings in the answer's file</text>
-  <text class="ttl-sub" x="16" y="36">answer file in the working set · faint: at the opening · solid: at the first answer token</text>
-  <path class="grid" d="M300 52 V168 M400 52 V168 M500 52 V168 M600 52 V168"/>
-  <path class="grid base" d="M200 52 V168"/>
-  <text class="cat" x="16" y="72">C1, reprojecting</text>
-  <text class="cat-sub" x="16" y="85">17.1 in thinking · 25.8% of misses brought in</text>
-  <path class="line-us" d="M432 74 H556"/>
-  <circle class="us-soft" cx="432" cy="74" r="5.5"/>
-  <circle class="dot-us" cx="556" cy="74" r="6.5"/>
-  <text class="t-dim mid" x="432" y="64">51.6%</text>
-  <text class="v-us mid" x="556" y="63">57.8%</text>
-  <text class="cat" x="16" y="112">B1, held</text>
-  <text class="cat-sub" x="16" y="125">0.6 in thinking · 6.5%</text>
-  <circle class="us-soft" cx="432" cy="114" r="5.5"/>
-  <circle class="dot-us" cx="436" cy="114" r="6.5"/>
-  <text class="t-dim" x="448" y="118">51.6% → 51.8%</text>
-  <text class="cat" x="16" y="152">D1, retrieve once</text>
-  <text class="cat-sub" x="16" y="165">0 in thinking · 0%</text>
-  <circle class="dot-us" cx="374" cy="154" r="6.5"/>
-  <text class="t-dim" x="386" y="158">48.7% → 48.7%</text>
-  <text class="tick mid" x="200" y="186">40%</text>
-  <text class="tick mid" x="300" y="186">45%</text>
-  <text class="tick mid" x="400" y="186">50%</text>
-  <text class="tick mid" x="500" y="186">55%</text>
-  <text class="tick mid" x="600" y="186">60%</text>
-</svg>
-</figure>
+**Figure 6-2 · The reasoning brings in the answer's file** — an answer file in the knowledge base at the opening and at the first answer token, per arm. **[pending §9.12]**
 
-B1's 0.6 is the reprojection on `</think>` itself, stamped on the block's last token. The bound of §11.2 is unchanged by how often the working set is updated: each update selects at most B tokens, so reprojection changes the aim of updates, not the bound. On attention-only models each reprojection re-resolves its structural segments (§5); on the recurrent production model they are sealed and cost nothing. Re-selecting during reasoning lets later reasoning be decoded against what the earlier reasoning reached for; §9.12 measures what that is worth.
+The bound of §11.2 is unchanged by how often the working set is updated: each update selects at most B tokens, so reprojection changes the aim of updates, not the bound. On attention-only models each reprojection re-resolves its structural segments (§5); on the recurrent production model they are sealed and cost nothing. Re-selecting during reasoning lets later reasoning be decoded against what the earlier reasoning reached for; §9.12 measures what that is worth.
 
 ### 6.6 The Production Signature and the Resident Gallery
 
@@ -356,7 +326,7 @@ Re-uploading signatures every scan was the first GPU implementation's bottleneck
 
 ## 7. Unbounded Three-Tier Paged Context
 
-The context is paged in 32-token blocks aligned to turn and system-prompt boundaries, so sinks stay block-local, refresh triggers on clean boundaries and promotion moves whole units, across three tiers (Figure 7-1). Each block's KV heads choose their K and V formats at seal, recorded in the descriptor tables the paged attention kernels read (`ArenaTable` / `PerHeadTable`), one read per tile.
+The context is paged in 32-token blocks aligned to turn and system-prompt boundaries, so sinks stay block-local, refresh triggers on clean boundaries and promotion moves whole units, across three tiers (Figure 7-1). Each block's KV heads choose their K and V formats at seal, recorded in the descriptor tables the paged attention kernels read (`ArenaTable` / `PerHeadTable`), one read per tile. A slot's positions are not its tokens: a reserved range's unused part is a hole, held as the lead of the block after it, and the index places its pages past it as the K/V does, so a rebuild that places, moves or removes sections re-lays the holes from where the pieces stand.
 
 <figure class="fig">
 <svg viewBox="0 0 640 214" role="img" aria-label="Figure 7-1. The three tiers. VRAM hot holds the working set, attended at full speed. RAM warm holds recent history in CPU arenas, promoted to hot on demand. Disk cold is the append-only redo log holding every sealed turn's K/V, tokens and signatures. Selected blocks are promoted to hot; hot blocks migrate to warm on the persistence thread; every sealed turn is written to the log. Under full attention every block is read every step; under provenance selection a step reads at most its budget, from any tier.">
@@ -992,7 +962,7 @@ Is the bounded working set delivered when the history is many times larger than 
 
 ### 9.12 Unbounded Context: Codebase Dependency Analysis
 
-A harder property than recall: multi-hop reasoning over the system's own Candle fork (2.2M lines of Rust and CUDA), each decode step's Q vectors retrieving the next node of a dependency chain. The production code-reading ingest has the daemon's model, Flash-Next, read the repository file by file as turns of its own, sealing their K/V and signatures with calibration questions beside each file; nothing in it was written by an external model. It persists as the substrate does (§7), valid for the model that wrote it.
+A harder property than recall: multi-hop reasoning over the system's own Candle fork (2.2M lines of Rust and CUDA), each decode step's Q vectors retrieving the next node of a dependency chain. The production code-reading ingest has the daemon's model, Flash-Next, prefill the repository file by file as sections of its knowledge base (§6.5), sealing their K/V and signatures with calibration questions beside each section; nothing in it was written by an external model. It persists as the substrate does (§7), valid for the model that wrote it.
 
 **The claim.** *Provenance projection supplies the memory the answers come from, and re-selecting the working set while the model reasons brings in the files a question does not name.* The battery isolates the memory, the seed files a conversation opens on, reprojection during reasoning, and continuous reprojection against a single retrieval, holding all else equal, and measures the memory against retrieval-augmented generation over the same repository.
 
@@ -1013,11 +983,13 @@ A harder property than recall: multi-hop reasoning over the system's own Candle 
 | P1 | off | Minimal | — | the memory's own selection, as text under R1's budget |
 | T1 | off | Minimal | — | reading the repository with tools, for reference |
 
-The two baselines project no memory. **R1** ranks every text file of the repository by BM25 over identifier terms of path and body (`zend/examples/dependency_battery/rag/`), the battery and its results left out of the index, and packs the best-ranked files, whole, into the prompt ahead of the question until 24,000 tokens, cutting the file that reaches the budget; its prompt asks for an answer from those files. **P1** asks C1 the question first, takes the files of the reading turns its governing projection point placed, in that point's own order, and packs them whole under R1's budget and prompt, so it differs from R1 in the selection alone and from C1 in reading text instead of K/V. **T1** may call the workspace's read and search tools and answers once it has read what it needs.
+The two baselines project no memory. **R1** ranks every text file of the repository by BM25 over identifier terms of path and body (`zend/examples/dependency_battery/rag/`), the battery and its results left out of the index, and packs the best-ranked files, whole, into the prompt ahead of the question until 24,000 tokens, cutting the file that reaches the budget; its prompt asks for an answer from those files. **P1** asks C1 the question first, takes the files of the sections its governing projection point placed, in that point's own order, and packs them whole under R1's budget and prompt, so it differs from R1 in the selection alone and from C1 in reading text instead of K/V. **T1** may call the workspace's read and search tools and answers once it has read what it needs.
 
-**Running.** On BlackWorld through the daemon's chat API (`dependency_battery run`), the first 748 answers at build 5470-6eb469ce5 and the rest at 5475-3c73da839, which changes no retrieval dial. One fresh conversation per question, its arm's dials on the request, deleted once its answer and projection points (`GET /v1/conversations/{id}/placements`) are read; every memory arm's question asks for an answer from memory with no tool. The first 142 answers ran sixteen at once and the rest eight, and the order mixes the arms throughout, so drift falls on every arm alike. Each arm answers the 128 questions three times: 2,688 answers. The runs added after — R1 and T1 three times each, B1 runs 4–6, C1 runs 4–7, R1 run 4 — ran sixteen at once, interleaved across the arms still owed, on the builds deployed while they ran; none changed retrieval code (no commit to `candle-conversation/src/projection`, `provenance` or `scheduler/reproject*` in the period). P1 ran once, sixteen at once, at build 5564-10dd9ff2b, which changes no retrieval code either, started only once the member reported its memory settled — every file ingested, calibrated and normalized. 4,608 answers in all.
+**Running.** On BlackWorld through the daemon's chat API (`dependency_battery run`), started only once the member reported its memory settled — every file ingested, calibrated and normalized. One fresh conversation per question, its arm's dials on the request, deleted once its answer and projection points (`GET /v1/conversations/{id}/placements`) are read; every memory arm's question asks for an answer from memory with no tool, and the order mixes the arms throughout, so drift falls on every arm alike. Build, concurrency and answer count: **[pending §9.12]**.
 
-**Scoring.** Recall is the share of a question's expected items the answer names, any spelling, case-insensitive; a question's score in an arm is its mean over the arm's runs. Intervals are 95% bootstrap intervals over questions (10,000 resamples, paired for differences); contrasts are Wilcoxon signed-rank on per-question differences, Holm-corrected across the five pre-registered, and the four against the baselines as a family of their own. Every figure's data and `summary.md` are in `docs/results/battery_128/`.
+**Scoring.** Recall is the share of a question's expected items the answer names, any spelling, case-insensitive; a question's score in an arm is its mean over the arm's runs. Intervals are 95% bootstrap intervals over questions (10,000 resamples, paired for differences); contrasts are Wilcoxon signed-rank on per-question differences, Holm-corrected across the five pre-registered, and the four against the baselines as a family of their own. Every figure's data and `summary.md` will be in `docs/results/` beside v2's (`docs/results/battery_128/`).
+
+> **Draft.** Figures 9.12-1 to 9.12-6 and 9.12-2b below are v2's, kept for their layout until `dependency_battery figures` redraws them from the final run; every number in this section's prose and tables marked **[pending §9.12]** comes from that run.
 
 <figure class="fig">
 <svg viewBox="0 0 640 306" role="img" aria-label="Figure 9.12-1. Mean recall by arm over 128 questions, each with its 95% bootstrap interval: A0 0.4% (0.1% to 0.9%); A1 0.5% (0.1% to 1.0%); D1 30.6% (25.0% to 36.4%); B0 31.9% (26.1% to 37.7%); B1 32.2% (26.8% to 37.6%); C0 36.7% (30.8% to 42.6%); C1 37.5% (31.7% to 43.1%); R1 52.6% (46.1% to 58.9%); P1 44.0% (37.4% to 50.9%); T1 95.3% (93.3% to 97.1%). Of the memory arms, the reprojecting C0 and C1 recall the most; R1 is handed BM25's files as text, P1 the memory's own selection as text, and T1 reads the repository with tools.">
@@ -1135,7 +1107,7 @@ The two baselines project no memory. **R1** ranks every text file of the reposit
 </svg>
 </figure>
 
-Recall climbs the ladder the design predicts. The model alone (A0, 0.4%) says it has no record of what is asked rather than invent it; the seed files alone (A1, 0.5%) add nothing; a single retrieval (D1, 30.6%) adds the memory; re-selection during reasoning (C1, 37.5%) adds the files the question does not name. Full marks in every run: 0, 0, 9, 13, 3, 11 and 6 questions across A0–C1, B1's over six runs and C1's over seven. The direct questions are drawn mechanically, so they include call sites no document describes, which makes the 128 harder than the pilot's 24.
+Recall by arm, and full marks in every run: **[pending §9.12]**. The direct questions are drawn mechanically, so they include call sites no document describes, which makes the 128 harder than the pilot's 24.
 
 <figure class="fig">
 <svg viewBox="0 0 640 294" role="img" aria-label="Figure 9.12-2. The effect of each contrast on mean recall over 128 paired questions, with its 95% bootstrap interval and Holm-corrected Wilcoxon p-value: The memory (C1 − A1 · Holm p = 1.9e-17), +37.0 points (+31.3 to +42.6); Reasoning-time reprojection (C1 − B1 · Holm p = 2.8e-6), +5.3 points (+3.2 to +7.4); Continuous against retrieve-once (C1 − D1 · Holm p = 1.7e-4), +6.9 points (+3.6 to +10.1); Reasoning-time reprojection without the seed (C0 − B0 · Holm p = 0.007), +4.9 points (+1.7 to +8.2); The seed files (C1 − C0 · Holm p = 0.539), +0.7 points (−1.7 to +3.3).">
@@ -1180,13 +1152,13 @@ Recall climbs the ladder the design predicts. The model alone (A0, 0.4%) says it
 
 | Contrast | Arms | Effect | 95% interval | p (Holm) |
 |---|---|---:|---:|---:|
-| The memory | C1 − A1 | 37.0 | 31.3 to 42.6 | 1.9 × 10⁻¹⁷ |
-| Reasoning-time reprojection | C1 − B1 | 5.3 | 3.2 to 7.4 | 2.8 × 10⁻⁶ |
-| Continuous against retrieve-once | C1 − D1 | 6.9 | 3.6 to 10.1 | 1.7 × 10⁻⁴ |
-| Reasoning-time reprojection without the seed | C0 − B0 | 4.9 | 1.7 to 8.2 | 0.0069 |
-| The seed files | C1 − C0 | 0.7 | −1.7 to 3.3 | 0.54 |
+| The memory | C1 − A1 | | | |
+| Reasoning-time reprojection | C1 − B1 | | | |
+| Continuous against retrieve-once | C1 − D1 | | | |
+| Reasoning-time reprojection without the seed | C0 − B0 | | | |
+| The seed files | C1 − C0 | | | |
 
-Every contrast that removes a part of provenance retrieval lowers recall, with an interval clear of zero; the seed files change nothing measurable.
+**[pending §9.12]**
 
 <figure class="fig">
 <svg viewBox="0 0 640 384" role="img" aria-label="Figure 9.12-3. Each of the 128 questions' mean recall under reprojection during the reasoning (C1) against the held projection (B1): 71 questions lie above the diagonal, where C1 recalls more, 29 below it, where B1 does, and 28 on it.">
@@ -1347,7 +1319,7 @@ Every contrast that removes a part of provenance retrieval lowers recall, with a
 </svg>
 </figure>
 
-The gain is broad: 71 of 128 questions sit above the diagonal, 29 below and 28 on it.
+Questions above, below and on the diagonal: **[pending §9.12]**.
 
 <figure class="fig">
 <svg viewBox="0 0 640 174" role="img" aria-label="Figure 9.12-4. The gain in mean recall of reprojecting during the reasoning (C1) over the held projection (B1), split by whether the question names its answer file, with 95% bootstrap intervals: Names its file (n=17), +2.6 points (−2.3 to +7.2); Does not (n=111), +5.7 points (+3.5 to +8.0).">
@@ -1372,7 +1344,7 @@ The gain is broad: 71 of 128 questions sit above the diagonal, 29 below and 28 o
 </svg>
 </figure>
 
-The gain lies on the 111 questions that do not name their answer's file, 5.7 points (3.5 to 8.0); on the 17 that do it is 2.6 (−2.3 to 7.2), indistinguishable from zero — a split fixed before any run. What the question names, the opening finds; what it does not, the reasoning reaches, and only a reprojection inside the reasoning places it while the reasoning can use it.
+The gain on the 111 questions that do not name their answer's file, and on the 17 that do — a split fixed before any run: **[pending §9.12]**.
 
 <figure class="fig">
 <svg viewBox="0 0 640 324" role="img" aria-label="Figure 9.12-5. The share of answers whose projection held an answer file, by decoded token, with 95% bootstrap bands: C1 from 51.5% at the first token to 58.6% at token 4,096; B1 from 51.6% at the first token to 56.2% at token 4,096; D1 from 48.7% at the first token to 54.9% at token 4,096.">
@@ -1407,7 +1379,7 @@ The gain lies on the 111 questions that do not name their answer's file, 5.7 poi
 </svg>
 </figure>
 
-With reprojection the share of answers with an answer file in the working set jumps from 51.5% at the opening to 58.8% by the 128th decoded token, inside the reasoning's first two reprojection intervals, and holds there. Held or retrieved once, it stays at the opening's 51.6% or 48.7% until the reasoning ends, and only then climbs — to 56.2% and 54.9% by token 4,096 — as those arms' answers reproject: the file arrives, but after the thought that needed it.
+The share of answers with an answer file in the knowledge base, by decoded token, per arm: **[pending §9.12]**.
 
 <figure class="fig">
 <svg viewBox="0 0 640 188" role="img" aria-label="Figure 9.12-6. Mean recall of the answers by whether their projection held an answer file for the first answer token, with 95% bootstrap intervals: answer file placed (1,534 answers): 51.4% (49.6% to 53.2%); not placed (1,282 answers): 13.7% (12.1% to 15.3%).">
@@ -1434,7 +1406,7 @@ With reprojection the share of answers with an answer file in the working set ju
 </svg>
 </figure>
 
-Over 2,816 answers in the projecting arms, recall is 51.4% (49.6–53.2%) with the answer file placed for the first answer token and 13.7% (12.1–15.3%) without it: retrieval and the answers are one measurement seen twice.
+Recall with and without the answer file placed for the first answer token: **[pending §9.12]**.
 
 **Against retrieval-augmented generation.** R1 hands the model the files BM25 ranks best for the question, as text, under a 24,000-token budget; P1 hands it the memory's own selection the same way; T1 reads the repository with tools. Their contrasts form a second Holm family, so the five above are corrected without them:
 
@@ -1475,15 +1447,15 @@ Over 2,816 answers in the projecting arms, recall is 51.4% (49.6–53.2%) with t
 </svg>
 </figure>
 
-BM25 retrieval recalls 52.6% (46.1–58.9%) against the memory's 37.5%, 15.1 points (7.1 to 23.0) more. To find where, each expected item of C1's seventh run, R1's fourth and P1's run was looked for in the text the model held as its answer began — for C1, the bodies of the turns the governing projection point injected; for R1 and P1, the files their prompts carried — by the same spellings recall matches (`zend/examples/dependency_battery/view.rs`):
+Recall against each baseline: **[pending §9.12]**. Each expected item is looked for in the text the model held as its answer began — for C1, the sections the governing projection point placed; for R1 and P1, the files their prompts carried — by the same spellings recall matches (`zend/examples/dependency_battery/view.rs`):
 
 | Arm | Items | In an answer file's text | Named, when there | Named, when not | Anywhere in view | Named, when anywhere |
 |---|---:|---:|---:|---:|---:|---:|
-| C1 (the memory) | 445 | **48.5%** | 69.9% | 14.0% | **60.4%** | 66.2% |
-| R1 (BM25 files) | 445 | 38.2% | **97.6%** | 22.5% | 56.0% | **90.0%** |
-| P1 (the memory's selection, as text) | 445 | 39.8% | 96.0% | 15.3% | 50.8% | 92.0% |
+| C1 (the memory) | | | | | | |
+| R1 (BM25 files) | | | | | | |
+| P1 (the memory's selection, as text) | | | | | | |
 
-The memory puts the answer in front of the model more often than BM25 does — 48.5% of expected items were in the text of an answer file it injected, against 38.2% for the files BM25 retrieved, and 60.4% against 56.0% anywhere in view. It placed 48.3% of an answer file's reading turns, and those carried the item more often than BM25's whole files did. The difference is in what the model makes of an item once it holds it: from BM25's plain text it names 97.6%, from the memory's K/V 69.9% (`docs/results/battery_128/summary_run11.md`, `table_9_12_in_view.csv`). Handing the model the memory's own selection as text (P1, under R1's budget and prompt) lifts recall from 37.5% to 44.0%, and the model then names 96.0% of what an answer file carries: 6.5 of the 15.1 points are the model's reading of K/V, not provenance's selection. How well a model reads K/V placed from memory is a capability of the model, and it has grown with every model this system has been upgraded to. Provenance's selection puts an answer file first more often than BM25 does (hit@1 40.6% against 28.9%, `table_9_12_retrieval.csv`); what remains sits with BM25's wider spread of whole files under a fixed text budget. T1, reading the source with 12.3 tool calls an answer, recalls 95.3%, the reference for what the questions allow.
+**Reading what is placed.** v2 placed the memory's files as sealed reading turns. The model named 69.9% of the expected items such a turn carried against 97.6% from BM25's plain text (v2 §9.12), and given the same selection as text (P1) it named 96.0%: the gap was the model's reading of the placement, not provenance's selection. On seven questions whose answer files it held whole and named nothing from, the model read the slot as one confused dialogue, crediting a file's content to its neighbour. Re-prefilling every piece fresh changed nothing, so the presentation, not the K/V, was at fault. The same selection placed at the end of the system prompt, in the model's own knowledge format, named 16 of 16 in-view items where the turns named 0 (`docs/results/placement_probe_2026-11-26/`); v3 places the memory there (§6.5). One failure survives the move: two files of one shape (two repositories' `Cargo.toml`) sealed apart are told apart by nothing but which sits nearer the question, though a fresh prefill of the same prompt tells them apart wherever they sit. Entity bindings ride an ordering — *the first, the second* — that a separately computed section cannot take part in [Feng & Steinhardt, ICLR 2024; Dai et al., EMNLP 2024], so each section is sealed behind its repository's root listing and its folder's, and every collection behind a record of its own kind that is never placed. T1, reading the source with tools, is the reference for what the questions allow: **[pending §9.12]**.
 
 **Ranking, apart from the answers.** A scoring lab (`provenance_gates lab`) probes each question once through the daemon — prefilled and decoded through its thinking — scans its votes against every ingested file on the resident gallery, and re-ranks on the host under formulas read from a file, so every variant scores the same votes. It found the binding limit was votes per token (§6.3); every non-linear alternative tried scored below summed `z × margin` (`docs/results/provenance_scoring_lab_2026-11-16.md`). Over the whole battery, on the gallery of 2026-11-24 — 7,943 files, 36.1M tokens, every probe fresh (`docs/results/battery_128/needle.md`) — 121 questions rank; seven name only files since split away:
 
@@ -1533,7 +1505,7 @@ The memory puts the answer in front of the model more often than BM25 does — 4
 
 An answer file is first of 7,943 on 49% of questions and in the top five on 69%, about 1,500 and 430 times a random ranking — by sign agreement alone, with no text index and no embedding model. By kind it is first on 43% of direct, 52% of transitive and 50% of architectural questions. Most misses lose their top places to the same few files that score on every question (`tests_grid.rs`, `file_grep.yaml`, `tasks.rs`, `AGENTS.md`).
 
-**The pilot.** A 24-question pilot, run on production from 2026-11-10 as retrieval changed (57.6% → 62.2% by 2026-11-20; `docs/results/dependency_battery_2026-11-20_b.md`), first measured reasoning-time reprojection with a daemon-wide switch, `reproject_in_thinking: false`, which passes over every boundary inside the think block and keeps the rest — the opening, the answer's boundaries, and one reprojection on `</think>`. Over three runs per arm at one build (`docs/results/dependency_battery_2026-11-23_l_m.md`), reprojecting averaged **57.3%** and holding **38.8%**; every held run scored below every reprojecting run (p = 0.05, one-sided permutation), and per question reprojection won 14 to 4 (sign test, p = 0.031). Its loss fell where the answer lives in a file the question does not name. The 128-question battery measures the same contrast at 5.3 points: smaller, and with an interval clear of zero.
+**The pilot.** A 24-question pilot, run on production from 2026-11-10 as retrieval changed (57.6% → 62.2% by 2026-11-20; `docs/results/dependency_battery_2026-11-20_b.md`), first measured reasoning-time reprojection with a daemon-wide switch, `reproject_in_thinking: false`, which passes over every boundary inside the think block and keeps the rest — the opening, the answer's boundaries, and one reprojection on `</think>`. Over three runs per arm at one build (`docs/results/dependency_battery_2026-11-23_l_m.md`), reprojecting averaged **57.3%** and holding **38.8%**; every held run scored below every reprojecting run (p = 0.05, one-sided permutation), and per question reprojection won 14 to 4 (sign test, p = 0.031). Its loss fell where the answer lives in a file the question does not name. The 128-question battery measures the same contrast at **[pending §9.12]** points.
 
 **What the answers show.** The memory holds documentation and module structure more than the call graph. Answers cite their sources — a design document's section, a module header — and when the model had not read the source it said so, declining rather than inventing; the errors found on reading are near-misses (a constant placed in the header beside the one that defines it, an out-of-date caller), not invented names.
 
@@ -1702,7 +1674,7 @@ KIVI, KVQuant and TurboQuant optimise the compression *primitive*: given that ev
 
 ### 11.4 Attention Was Always Retrieval
 
-Attention is retrieval: Q queries K, scores select, V is aggregated by relevance. This system runs it at two scales — approximate 1-bit attention over the whole unbounded context to select the working set (§6.6), then exact attention over what it selected — hierarchical retrieval at constant exact-attention cost per step, the scan's linear 1-bit work running every 64 tokens off the decode's critical path, where standard attention is flat retrieval over N at every step.
+Attention is retrieval: Q queries K, scores select, V is aggregated by relevance. This system runs it at two scales — approximate 1-bit attention over the whole unbounded context to select the working set (§6.6), then exact attention over what it selected — hierarchical retrieval at constant exact-attention cost per step, the scan's linear 1-bit work running every 64 tokens off the decode's critical path, where standard attention is flat retrieval over N at every step. What it retrieves is read as retrieved only when it is placed as knowledge and computed with its bearings — behind the listing of the repository and folder it belongs to — not as a turn of the conversation or the only thing of its kind (§9.12).
 
 It is not RAG, and the difference is structural. *The signal*: RAG retrieves from text, so iterative RAG (FLARE, Self-RAG) must wait for the model to write a query; Q vectors carry what the model is reaching for before any text forms. *Causal continuity*: RAG injects text into a fresh context, while this system promotes stored K/V computed in its original causal context, K stored un-rotated and positioned on read. *Leading the answer*: reprojection inside the think block, whose K/V is dropped at seal, steers the answer's context by everything the model thought (§6.5). A RAG system given Q→Q matching, causal K/V continuity and retrieval from Q during generation would no longer be RAG; it would be this architecture. §9.12 shows it working: the answer file found among 7,943 by sign agreement alone, and a single retrieval before reasoning 6.9 points below continuous reprojection.
 
@@ -1722,13 +1694,13 @@ In each case the replacement is more efficient in the dimension the constraint b
 
 ## 12. Conclusion
 
-The four contributions — online Markov expert prediction with wave-batched GEMM, per-block adaptive KV quantization with two-phase refresh, attentional provenance indexing with mid-decode reprojection, and an unbounded three-tier context — have precedents individually and had not been integrated.
+The four contributions — online Markov expert prediction with wave-batched GEMM, per-block adaptive KV quantization with two-phase refresh, attentional provenance indexing over a knowledge base re-laid every decode step, and an unbounded three-tier context — have precedents individually and had not been integrated.
 
 Together they run a 180B MoE model for eight sessions on a 16 GB laptop GPU, above every published llama.cpp run of it, on hosts with two to four times the memory; keep throughput flat from 32K to 128K; compress the KV cache up to 7.6× inline, nearly 4× llama.cpp's q8_0 for less decode at 32K, with every session of every width row reproducing its reference; and serve concurrent sessions at 1.4–37.9× the best published single-stream rate for the same model and card class, up to 2,869.9 t/s across 64 sessions, with a 284B model at sixteen sessions on one GPU at 4.1× the best published single-GPU decode. The memory behind it is a 42M-token substrate held at C5, its code gallery 36.1M tokens; under sixteen concurrent answers the card's resident context peaks at 945 thousand tokens, 21.9 GiB at full precision, while the expert zone streams the rest of the model. The most comparable published study found standard frameworks degrade beyond two concurrent users on an RTX 5090 [Herz et al., arXiv:2512.23029].
 
 The Asymptotic Numerical Stability theorem bounds a step's signal-to-perturbation ratio below, and its lemma the summed stored error entering a step above, independently of depth, where under full attention a needed token's weight falls as 1/N and the exposure grows linearly. What it changes is the question the KV quantization literature asks — not how small each token's error can be made inside the full-attention regime, but whether the regime can be left. Provenance selection leaves it, and §9.11.2 shows the premise holds: every planted turn selected from a history twelve times the working set, at the top compression level as at near-lossless.
 
-On the system's own codebase, retrieval ranks an answer file first among 7,943 on 49% of 121 questions by sign agreement alone, and answering 128 questions from memory with tools forbidden, the memory is worth 37.0 points of recall, re-selection during reasoning 5.3, and continuous re-selection 6.9 over a single retrieval, each clear of zero after Holm correction; the gain falls on the questions that do not name their answer's file, the ones only the reasoning can reach. Attention is retrieval: this system runs it hierarchically, approximate over the unbounded context and exact over what it selects, preserving the mechanism RAG replaces and removing the scaling constraint on exact attention. The deeper lesson is methodological: constraints accepted as design requirements forced decisions more efficient in the dimension they bound, measured here on three cards from 16 GB to 72 GB, with a bound that carries to any card.
+On the system's own codebase, retrieval ranks an answer file first among 7,943 on 49% of 121 questions by sign agreement alone, and answering 128 questions from memory with tools forbidden, the memory is worth **[pending §9.12]** points of recall. Attention is retrieval: this system runs it hierarchically, approximate over the unbounded context and exact over what it selects, preserving the mechanism RAG replaces and removing the scaling constraint on exact attention. The deeper lesson is methodological: constraints accepted as design requirements forced decisions more efficient in the dimension they bound, measured here on three cards from 16 GB to 72 GB, with a bound that carries to any card.
 
 ---
 
@@ -1844,6 +1816,10 @@ On the system's own codebase, retrieval ranks an answer file first among 7,943 o
 
 [53] Yang, X., Chen, T., Chen, B. (2025). **APE: Faster and Longer Context-Augmented Generation via Adaptive Parallel Encoding.** ICLR 2025. https://arxiv.org/abs/2502.05431
 
+[54] Feng, J., Steinhardt, J. (2024). **How do Language Models Bind Entities in Context?** ICLR 2024. https://arxiv.org/abs/2310.17191
+
+[55] Dai, Q., Heinzerling, B., Inui, K. (2024). **Representational Analysis of Binding in Language Models.** EMNLP 2024. https://aclanthology.org/2024.emnlp-main.967/
+
 [17] and [19]–[23] are background reading and are not cited in the text.
 
 ---
@@ -1852,10 +1828,10 @@ On the system's own codebase, retrieval ranks an answer file first among 7,943 o
 
 **Source code:** https://github.com/john-sharratt/candle (public)
 
-**Live system:** https://code.tokera.com — the deployed coding assistant over this repository, on the cluster that produced §9.11.1 and §9.13. It requires sign-in; access is by allowlist, with a queue for guests. The project site, https://www.tokera.com, carries v1 and this version.
+**Live system:** https://code.tokera.com — the deployed coding assistant over this repository, on the cluster that produced §9.11.1 and §9.13. It requires sign-in; access is by allowlist, with a queue for guests. The project site, https://www.tokera.com, carries v1, v2 and this version.
 
 **What is released.** The engine, and the raw measurement rows behind every figure — `docs/performance.md` and `docs/results/`, each naming its build, machine and test — with the tests that produce them; the §9.12 battery's questions, ground truth, harness, analysis and per-answer scores (`zend/examples/dependency_battery/`, `docs/results/battery_128/`, and the pilot's `docs/results/dependency_battery_2026-11-*.md`); and the tests behind §9.6.8 and §9.11.2. Not released: the live substrate, a KV archive valid only for its model and holding conversations that are not this paper's to publish, and a view of which signatures matched at each reprojection. A turn's `projection`, `seed` and reprojection are dials of the request, so every arm of §9.12 is a setting a caller can choose.
 
-**Versions.** v1 (13 May 2026, [10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) is archived with an erratum at `docs/unbounded_agents_v1.md`; its "509 t/s" and "2,446 t/s" headlines were prefill rates and are withdrawn. v2 adds a measured evaluation across three machines and twelve models from 0.5B to 284B parameters (§9.6), every number produced by a test in this repository and recorded in `docs/performance.md`, and runs the retrieval evaluation on the production system (§9.11–§9.12). §4.1–§4.3 describe the v1 design on Qwen3-30B-A3B; provenance as production runs it is §6.
+**Versions.** v1 (13 May 2026, [10.5281/zenodo.20156060](https://zenodo.org/records/20156060)) is archived with an erratum at `docs/unbounded_agents_v1.md`; its "509 t/s" and "2,446 t/s" headlines were prefill rates and are withdrawn. v2 adds a measured evaluation across three machines and twelve models from 0.5B to 284B parameters (§9.6), every number produced by a test in this repository and recorded in `docs/performance.md`, and runs the retrieval evaluation on the production system (§9.11–§9.12). §4.1–§4.3 describe the v1 design on Qwen3-30B-A3B; provenance as production runs it is §6. v2 (25 November 2026, [10.5281/zenodo.24529143](https://zenodo.org/records/24529143)) is archived at `docs/unbounded_agents_v2.md`. v3 places what provenance retrieves as sealed sections of a knowledge base at the end of the system prompt, re-laid every decode step and computed with their bearings, in place of v2's reading turns (§6.5, §9.12), and reruns the battery on it.
 
-**Invitation.** v2 is the final version of this paper, and critical review of it is welcome. The v1 erratum stays part of the record; every figure here names its build, machine and test. Validation, stress tests and optimisations are welcome through the GitHub repository.
+**Invitation.** Critical review of this paper is welcome. The v1 erratum stays part of the record; every figure here names its build, machine and test. Validation, stress tests and optimisations are welcome through the GitHub repository.

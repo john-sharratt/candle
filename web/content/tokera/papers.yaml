@@ -33,7 +33,7 @@ papers:
     zenodo: "https://zenodo.org/records/24529143"
     pdf: "https://zenodo.org/records/24529143/files/one-card-v2.pdf?download=1"
     status: "v2"
-    source: unbounded_agents.md
+    source: unbounded_agents_v2.md
     summary: >-
       v2 of One Card, One Stack, measured on the production system. A 180B
       mixture-of-experts model serves eight concurrent sessions from a 16 GB
