@@ -27,11 +27,14 @@ pub const MOMENTUM_KEEP: f32 = 0.75;
 pub const REORDER_MARGIN: f32 = 50.0;
 
 /// The hit momentum at or above which a section is locked at a step's reorder,
-/// on the 0–1000 band: the index is reading it, so it holds its place and no
-/// other section passes it. Under it the section is unlocked, and moves by
-/// momentum like any other. The knowledge base's entry bar: one block in
-/// twenty above the query's cut, for every query.
-pub const LOCK_BAR: f32 = 50.0;
+/// on the 0–1000 band: the index reads it strongly, so it holds its place and
+/// no other section passes it. Under it the section is unlocked, and drifts by
+/// momentum like any other. Measured on BlackWorld (2026-11-28, the depth-1
+/// battery at 16 slots): a range holds one to five sections the decode reads
+/// at 150–600, a band of five to ten read mildly at 50–150, and a tail under
+/// 50. The bar is where the strong part from the mild; at 50 the mild band
+/// hovered on it and flipped in and out of the lock.
+pub const LOCK_BAR: f32 = 150.0;
 
 /// Every section's momentum, for the slot's life.
 #[derive(Clone, Debug, Default, PartialEq)]
