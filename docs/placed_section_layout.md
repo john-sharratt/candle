@@ -222,13 +222,20 @@ every other section, and sink back from the question as they stop being read.
   band), so neighbours a hair apart do not trade places step after step. Any
   change is laid onto the slot at the next wave (§4.4); positions are applied
   at read time, so moving a sealed section costs no prefill.
-- **A section the index reads strongly is locked.** At a step, a section
-  whose hit momentum is at or over `LOCK_BAR` (150 on the band) holds its
-  place: nothing passes it
-  (`RangeScope::reorder_locked`). It still climbs itself, past unlocked
-  sections, so a section the decode starts reading rises to the read block
-  beside the question. It unlocks only once its momentum falls under the bar,
-  and only then sinks. Without the lock, per-step rates swing across the band
+- **A section the index reads strongly is locked to its positions.** At a
+  step, a section whose hit momentum is at or over `LOCK_BAR` (150 on the
+  band) keeps the positions it stands at, so its K/V — and the relative
+  distances the decode is reading it across — do not move under the reading
+  (`RangeScope::reorder_locked`). Everything else moves around it: the
+  unlocked sections, in relevance order, fill the gaps between the locked
+  ones from the top down, the strongest that fit into each and a section too
+  big for one going on to the next, and the rest lie packed below the last
+  locked one. A section that leaves beside a locked one leaves a hole that
+  nothing slides into, so the range fragments while sections are locked; a
+  strongly read newcomer fills the gap nearest the question it fits and
+  locks there itself. An entry never cuts or moves a locked section. A
+  section unlocks once its momentum falls under the bar, and the next
+  reorder closes the range up around what is still locked. Without the lock, per-step rates swing across the band
   and a step moves a section a quarter of the way to its rate, so the margin
   rarely held: the range was reordered, and the slot rebuilt, on nearly every
   step (BlackWorld, 2026-11-28). The bar is measured: a range holds one to

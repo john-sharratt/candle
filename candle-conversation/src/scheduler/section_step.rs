@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 
 use candle_transformers::models::batched_inference::ManagedBatchedModel;
 
-use super::projection_assembler::{fold_part, section_rates, SlotState};
+use super::projection_assembler::{fold_part, section_rates, selection_rate, SlotState};
 use super::reprojection::ReprojectionPolicy;
 use super::SequenceId;
 use crate::files::scope::{Bars, Candidate, LOCK_BAR};
@@ -56,6 +56,7 @@ pub(super) fn step_sections(
     }
     let keys = state.hit_keys.clone();
     let rates = section_rates(&keys, &hits, &state.kb_rounds);
+    let chance = selection_rate(&hits);
     let placed_read = hits.queries > 0;
     fold_part(&mut state.unread_hits, &keys, hits);
     let bars = Bars::KNOWLEDGE_BASE;
@@ -117,6 +118,7 @@ pub(super) fn step_sections(
                 slot = slot.0,
                 step = state.kb_steps,
                 changed,
+                selection_rate = chance.unwrap_or(0.0),
                 momenta = %range_momenta(set, &rates),
                 "the knowledge base's range momenta, top first (momentum/rate, * locked)",
             );

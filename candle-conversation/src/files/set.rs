@@ -74,6 +74,12 @@ pub struct FilesSet {
     pub hits: Momentum,
 }
 
+/// Whether `section` is locked at a step: the index reads it strongly, its hit
+/// momentum at or over [`LOCK_BAR`], so it keeps its positions.
+fn locks(hits: &Momentum, section: SectionKey) -> bool {
+    hits.score(section).is_some_and(|m| m >= LOCK_BAR)
+}
+
 /// `section`'s place in the order: its hit momentum, or — not yet read by the
 /// index this question — its scan momentum; `None` for one neither ranks.
 fn order_score(
@@ -203,23 +209,29 @@ impl FilesSet {
             .copied()
             .collect();
         let (hits, members) = (&self.hits, &self.members);
-        let change = scope.admit(rate, |k| order_score(hits, members, k), &open, bars);
+        let change = scope.admit(
+            rate,
+            |k| order_score(hits, members, k),
+            |k| locks(hits, k),
+            &open,
+            bars,
+        );
         self.evicted.extend(change.slid.iter().copied());
         change
     }
 
     /// A step's reorder: the range by [`Self::order_score`], strongest at the
     /// top beside the question, a section passing the one above it only by
-    /// more than `margin`, and none passing one the index is reading — hit
-    /// momentum at or over [`LOCK_BAR`] ([`RangeScope::reorder_locked`]);
-    /// whether anything moved.
+    /// more than `margin`, around the sections the index reads strongly —
+    /// hit momentum at or over [`LOCK_BAR`] — which keep their positions
+    /// ([`RangeScope::reorder_locked`]); whether anything moved.
     pub fn reorder(&mut self, margin: f32) -> bool {
         let (hits, members) = (&self.hits, &self.members);
         self.scope.as_mut().is_some_and(|scope| {
             scope.reorder_locked(
                 |k| order_score(hits, members, k),
                 margin,
-                |k| hits.score(k).is_some_and(|m| m >= LOCK_BAR),
+                |k| locks(hits, k),
             )
         })
     }
@@ -456,13 +468,14 @@ mod tests {
     }
 
     /// **The index orders the range, the scan only what the index has not
-    /// read, nothing passes a section the index is reading, and a new
-    /// question starts the index afresh**: a scanned 900 over b's 300, the
-    /// first reading rates a at 30 and b at 700 — taken whole — and c,
-    /// unread, keeps its scan 500. b (locked) climbs past a (unlocked, under
-    /// the bar) and c past a, so b sits beside the question. A step's 1000
-    /// for a moves it a quarter of the way (272.5), still under c's 500. A
-    /// new question forgets every rate.
+    /// read, a section the index reads strongly keeps its positions, and a
+    /// new question starts the index afresh**: a scanned 900 over b's 300,
+    /// the first reading rates a at 30 and b at 700 — taken whole — and c,
+    /// unread, keeps its scan 500. Top first a, b, c, ten positions each: b,
+    /// locked, stays at 10; c, the stronger of the free, fills the ten above
+    /// it and a goes below. A step's 1000 for a moves it a quarter of the way
+    /// (272.5): locked too now, nothing moves. A new question forgets every
+    /// rate.
     #[test]
     fn the_index_orders_the_range_and_the_scan_what_it_has_not_read() {
         let (a, b, c) = (SectionKey(1), SectionKey(2), SectionKey(3));
@@ -497,11 +510,11 @@ mod tests {
                 .collect()
         };
         assert!(set.reorder(0.0));
-        assert_eq!(top_first(&set), vec![b, c, a], "b beside the question");
+        assert_eq!(top_first(&set), vec![c, b, a], "b where it was read");
         set.observe_hits(&HashMap::from([(a, 1_000.0)]));
         assert_eq!(set.order_score(a), Some(272.5));
-        assert!(!set.reorder(0.0), "a's 272.5 does not pass c's 500");
-        assert_eq!(top_first(&set), vec![b, c, a]);
+        assert!(!set.reorder(0.0), "b and a locked, c in the only gap");
+        assert_eq!(top_first(&set), vec![c, b, a]);
         set.clear_withheld();
         assert_eq!(
             set.order_score(a),

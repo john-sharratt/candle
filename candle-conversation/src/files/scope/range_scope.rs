@@ -107,17 +107,20 @@ impl RangeScope {
     }
 
     /// Enter `key`, of `tokens` positions and score `value`, at its rank by
-    /// `score`, and return the sections it pushed out, furthest from the
-    /// question first. A full range makes room from its front, but only past
-    /// what scores under `value`: holes and weaker sections go, a mandatory
-    /// section or one at least as strong stops it. `None`, and nothing
-    /// changed, when it cannot make room so, or it is already placed.
+    /// `score` among the sections `locked` leaves free to move
+    /// ([`Self::reorder_locked`]), and return the sections it pushed out,
+    /// furthest from the question first. A full range makes room from its
+    /// front, but only past what scores under `value`: holes and weaker
+    /// sections go, a mandatory section, a locked one or one at least as
+    /// strong stops it. `None`, and nothing changed, when it cannot make room
+    /// so, or it is already placed.
     pub fn enter_over(
         &mut self,
         key: SectionKey,
         tokens: usize,
         value: f32,
         score: impl Fn(SectionKey) -> Option<f32>,
+        locked: impl Fn(SectionKey) -> bool,
     ) -> Option<Vec<SectionKey>> {
         if self.holds(key) {
             return None;
@@ -128,7 +131,7 @@ impl RangeScope {
             let at = cut.checked_sub(1)?;
             let p = &self.places[at];
             if let Some(e) = p.section() {
-                if e.mandatory || score(e.key).unwrap_or(0.0) >= value {
+                if e.mandatory || locked(e.key) || score(e.key).unwrap_or(0.0) >= value {
                     return None;
                 }
             }
@@ -147,7 +150,7 @@ impl RangeScope {
             mandatory: false,
         }));
         let rank = |k: SectionKey| if k == key { Some(value) } else { score(k) };
-        self.reorder(rank, 0.0);
+        self.reorder_locked(rank, 0.0, &locked);
         Some(out)
     }
 
@@ -211,31 +214,71 @@ impl RangeScope {
         self.reorder_locked(score, margin, |_| false)
     }
 
-    /// [`Self::reorder`] with `locked` sections held: nothing passes a locked
-    /// section, so one holds its place unless it climbs itself, past the
-    /// unlocked ones above it. A section the index is reading stays where it
-    /// is read, and only one it has stopped reading sinks.
+    /// [`Self::reorder`] with `locked` sections pinned: each stays at the
+    /// positions it stands at, so its K/V is read where it was read, and the
+    /// rest move around it. The unlocked sections, in relevance order (passing
+    /// only by more than `margin`), fill the gaps between the pinned ones from
+    /// the top down — into each the strongest that fit, a section too big for
+    /// one going on to the next, what none fills staying a hole — and the
+    /// rest lie packed in order below the last pinned one. The range
+    /// fragments while sections are locked and closes up as they unlock.
+    /// Nothing changes if the rest would not fit below the last pinned one.
     pub fn reorder_locked(
         &mut self,
         score: impl Fn(SectionKey) -> Option<f32>,
         margin: f32,
         locked: impl Fn(SectionKey) -> bool,
     ) -> bool {
-        let before = self.places.clone();
-        self.compact();
-        let s = |p: &Place| p.section().map_or(0.0, |e| score(e.key).unwrap_or(0.0));
-        let held = |p: &Place| p.section().is_some_and(|e| locked(e.key));
-        for i in 1..self.places.len() {
+        // Each locked section by its offset from the top; the rest in order.
+        let mut pinned: Vec<(usize, Entry)> = Vec::new();
+        let mut free: Vec<Entry> = Vec::new();
+        let mut at = 0;
+        for p in &self.places {
+            if let Place::Section(e) = p {
+                match locked(e.key) {
+                    true => pinned.push((at, *e)),
+                    false => free.push(*e),
+                }
+            }
+            at += p.positions();
+        }
+        let s = |e: &Entry| score(e.key).unwrap_or(0.0);
+        for i in 1..free.len() {
             let mut j = i;
-            while j > 0
-                && !held(&self.places[j - 1])
-                && s(&self.places[j]) > s(&self.places[j - 1]) + margin
-            {
-                self.places.swap(j, j - 1);
+            while j > 0 && s(&free[j]) > s(&free[j - 1]) + margin {
+                free.swap(j, j - 1);
                 j -= 1;
             }
         }
-        self.places != before
+        let mut left: Vec<Option<Entry>> = free.into_iter().map(Some).collect();
+        let mut out: Vec<Place> = Vec::with_capacity(self.places.len());
+        let mut cursor = 0;
+        for &(offset, e) in &pinned {
+            let room = offset - cursor;
+            let mut used = 0;
+            for slot in left.iter_mut() {
+                if let Some(f) = *slot {
+                    if f.tokens <= room - used {
+                        out.push(Place::Section(f));
+                        used += f.tokens;
+                        *slot = None;
+                    }
+                }
+            }
+            if room > used {
+                out.push(Place::Hole(room - used));
+            }
+            out.push(Place::Section(e));
+            cursor = offset + e.tokens;
+        }
+        let rest: Vec<Entry> = left.into_iter().flatten().collect();
+        if rest.iter().map(|e| e.tokens).sum::<usize>() > self.positions.saturating_sub(cursor) {
+            return false;
+        }
+        out.extend(rest.into_iter().map(Place::Section));
+        let moved = out != self.places;
+        self.places = out;
+        moved
     }
 
     /// The range from its bottom to its top, as the prompt holds it: the
@@ -389,18 +432,31 @@ mod tests {
         assert_eq!(keys(&s), vec![1, 2, 0]);
     }
 
-    /// **Nothing passes a locked section, and every section climbs only past
-    /// unlocked ones**: top first a (300, locked), b (200), c (500, locked),
-    /// d (900). c climbs past b but not past a; d past b, up to c. Nothing
-    /// moves again while the locks hold. a unlocked, c climbs past it and d
-    /// follows, up to c again.
+    /// The positions each placed section starts at, from the top, by key.
+    fn offsets(s: &RangeScope) -> Vec<(u64, usize)> {
+        let mut at = 0;
+        let mut out = Vec::new();
+        for p in s.places() {
+            if let Place::Section(e) = p {
+                out.push((e.key.0, at));
+            }
+            at += p.positions();
+        }
+        out
+    }
+
+    /// **A locked section keeps its positions and the rest flow around it**:
+    /// top first a (300, locked), b (200), c (500, locked), d (900), ten
+    /// positions each. d, the strongest free one, fills the gap above c; b
+    /// goes below. c never moves. With a unlocked, d and a fill the twenty
+    /// positions above c and c still stands at 20.
     #[test]
-    fn nothing_passes_a_locked_section() {
+    fn a_locked_section_keeps_its_positions() {
         let mut s = RangeScope::new(100);
         for k in 0..4 {
             s.enter(SectionKey(k), 10, false);
         }
-        assert_eq!(keys(&s), vec![0, 1, 2, 3]);
+        assert_eq!(offsets(&s), vec![(0, 0), (1, 10), (2, 20), (3, 30)]);
         let score = |k: SectionKey| match k.0 {
             0 => Some(300.0),
             1 => Some(200.0),
@@ -409,14 +465,50 @@ mod tests {
         };
         let lock_ac = |k: SectionKey| k.0 == 0 || k.0 == 2;
         assert!(s.reorder_locked(score, 50.0, lock_ac));
-        assert_eq!(keys(&s), vec![0, 2, 3, 1]);
+        assert_eq!(offsets(&s), vec![(0, 0), (3, 10), (2, 20), (1, 30)]);
         assert!(
             !s.reorder_locked(score, 50.0, lock_ac),
             "nothing moves while the locks hold"
         );
         let lock_c = |k: SectionKey| k.0 == 2;
         assert!(s.reorder_locked(score, 50.0, lock_c));
-        assert_eq!(keys(&s), vec![2, 3, 0, 1]);
+        assert_eq!(offsets(&s), vec![(3, 0), (0, 10), (2, 20), (1, 30)]);
+    }
+
+    /// **The range fragments while locked and closes up as it unlocks**: top
+    /// first a (10), b (10, locked), c (20), d (10). a leaves, a 10-hole above
+    /// b. c (900) is too big for it and d (100) fills it: b stands at 10.
+    /// Without d's fit — d gone too — the hole stays. Unlocked, the range
+    /// closes up: c at the top, b after it.
+    #[test]
+    fn the_range_fragments_while_locked_and_closes_as_it_unlocks() {
+        let mut s = RangeScope::new(100);
+        for (k, t) in [(0, 10), (1, 10), (2, 20), (3, 10)] {
+            s.enter(SectionKey(k), t, false);
+        }
+        let score = |k: SectionKey| match k.0 {
+            1 => Some(400.0),
+            2 => Some(900.0),
+            3 => Some(100.0),
+            _ => None,
+        };
+        let lock_b = |k: SectionKey| k.0 == 1;
+        assert!(s.leave(SectionKey(0)));
+        assert!(s.reorder_locked(score, 50.0, lock_b));
+        assert_eq!(offsets(&s), vec![(3, 0), (1, 10), (2, 20)]);
+        let mut t = RangeScope::new(100);
+        for (k, n) in [(0, 10), (1, 10), (2, 20)] {
+            t.enter(SectionKey(k), n, false);
+        }
+        assert!(t.leave(SectionKey(0)));
+        assert!(!t.reorder_locked(score, 50.0, lock_b), "the hole stays");
+        assert_eq!(offsets(&t), vec![(1, 10), (2, 20)]);
+        assert!(t.reorder_locked(score, 50.0, |_| false));
+        assert_eq!(
+            offsets(&t),
+            vec![(2, 0), (1, 20)],
+            "closed up, by relevance"
+        );
     }
 
     /// **Compaction closes every hole**, the sections keeping their order.

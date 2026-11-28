@@ -65,6 +65,22 @@ fn a_sections_rate_is_its_hits_over_its_blocks_and_queries() {
     assert_eq!(rates[&b], 0.0);
 }
 
+/// **The selection's rate is every placed round's hits over all their blocks
+/// and the queries**: 4 + 6 + 0 hits of 10 + 10 + 8 blocks over 2 queries is
+/// 10 / 56 of the band, 178.57; a pooled round (9 hits of 8) is not counted,
+/// 10 / 40, 250; no query, no rate.
+#[test]
+fn the_selection_rate_is_every_placed_rounds_hits_over_their_blocks() {
+    assert_eq!(
+        selection_rate(&hits(&[4, 6, 0], &[10, 10, 8], 2)),
+        Some(178.57143)
+    );
+    let mut pooled = hits(&[4, 6, 9], &[10, 10, 8], 2);
+    pooled.loaded = 2;
+    assert_eq!(selection_rate(&pooled), Some(250.0));
+    assert_eq!(selection_rate(&hits(&[4, 6], &[10, 10], 0)), None);
+}
+
 /// **A pooled section's rate sums its pages, out of the shadow scan's
 /// queries**: c, declared as two pages after the one loaded round, has 3 + 1
 /// hits of 10 + 6 blocks over 2 shadow queries — 125 on the band; with no

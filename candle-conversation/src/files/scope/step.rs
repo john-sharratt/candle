@@ -64,13 +64,14 @@ impl RangeScope {
     /// Admit every candidate out of scope at or above the entry bar by its
     /// step `rate`, strongest first, each at its rank by `score` — the placed
     /// sections' momentum, a candidate's own or its rate when it has none — a
-    /// full range making room only past weaker sections
-    /// ([`RangeScope::enter_over`]); a section pushed out this step does not
-    /// come back in it.
+    /// full range making room only past weaker sections, and never moving or
+    /// cutting a `locked` one ([`RangeScope::enter_over`]); a section pushed
+    /// out this step does not come back in it.
     pub fn admit(
         &mut self,
         rate: impl Fn(SectionKey) -> f32,
         score: impl Fn(SectionKey) -> Option<f32>,
+        locked: impl Fn(SectionKey) -> bool,
         candidates: &[Candidate],
         bars: &Bars,
     ) -> StepChange {
@@ -91,7 +92,7 @@ impl RangeScope {
             // A section entered earlier this step ranks by the value it entered
             // at, its momentum not yet holding it.
             let ranked = |k: SectionKey| entered.get(&k).copied().or_else(|| score(k));
-            if let Some(slid) = self.enter_over(c.key, c.tokens, value, ranked) {
+            if let Some(slid) = self.enter_over(c.key, c.tokens, value, ranked, &locked) {
                 entered.insert(c.key, value);
                 change.entered.push(c.key);
                 change.slid.extend(slid);
@@ -154,6 +155,7 @@ mod tests {
         let change = s.admit(
             rate,
             momentum,
+            |_| false,
             &[c(3, 10), c(4, 20), c(5, 5)],
             &Bars::DEFAULT,
         );
@@ -175,8 +177,38 @@ mod tests {
             2 => Some(820.0),
             _ => None,
         };
-        let change = s.admit(|_| 810.0, momentum, &[c(3, 10)], &Bars::DEFAULT);
+        let change = s.admit(|_| 810.0, momentum, |_| false, &[c(3, 10)], &Bars::DEFAULT);
         assert!(change.entered.is_empty());
         assert_eq!(keys(&s), vec![1, 2]);
+    }
+
+    /// **An entry never moves or cuts a locked section**: in a 60-range a
+    /// (20, locked at the top, momentum 100) and b (20, 300) leave a 20-hole
+    /// at the front. c (40, 900) needs b's room: it cuts b, the weaker, from
+    /// the front, and takes its rank — above b's place, but a, locked, keeps
+    /// the top positions. d (45, 950) would need c's room and a's, and does
+    /// not enter.
+    #[test]
+    fn an_entry_never_moves_or_cuts_a_locked_section() {
+        let mut s = RangeScope::new(60);
+        s.open(&[], &[c(1, 20), c(2, 20)]);
+        let momentum = |k: SectionKey| match k.0 {
+            1 => Some(100.0),
+            2 => Some(300.0),
+            _ => None,
+        };
+        let locked = |k: SectionKey| k.0 == 1;
+        let rate = |k: SectionKey| match k.0 {
+            3 => 900.0,
+            4 => 950.0,
+            _ => 0.0,
+        };
+        let change = s.admit(rate, momentum, locked, &[c(3, 40)], &Bars::DEFAULT);
+        assert_eq!(change.entered, vec![SectionKey(3)]);
+        assert_eq!(change.slid, vec![SectionKey(2)]);
+        assert_eq!(keys(&s), vec![1, 3], "a keeps the top; c below it");
+        let held = s.admit(rate, momentum, locked, &[c(4, 45)], &Bars::DEFAULT);
+        assert!(held.entered.is_empty(), "d would need a's room");
+        assert_eq!(keys(&s), vec![1, 3]);
     }
 }

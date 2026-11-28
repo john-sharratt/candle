@@ -176,6 +176,20 @@ pub(in super::super) fn section_rates(
     out
 }
 
+/// The rate the selection read every placed round at in `hits`, on the 0–1000
+/// band: all the placed rounds' hits over all their blocks and the queries —
+/// what a section read no more than any other block of the slot would rate.
+/// `None` when no query was counted.
+pub(in super::super) fn selection_rate(hits: &PieceHits) -> Option<f32> {
+    if hits.queries == 0 {
+        return None;
+    }
+    let n = hits.loaded.min(hits.hits.len()).min(hits.blocks.len());
+    let h: u64 = hits.hits[..n].iter().map(|&x| u64::from(x)).sum();
+    let b: u64 = hits.blocks[..n].iter().map(|&x| u64::from(x)).sum();
+    Some(band(h, b, hits.queries))
+}
+
 /// The most read-back parts a slot keeps between reprojections; past it the
 /// oldest goes.
 pub(super) const UNREAD_HIT_PARTS: usize = 8;
