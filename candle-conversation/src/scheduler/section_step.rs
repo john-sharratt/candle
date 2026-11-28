@@ -147,8 +147,8 @@ fn range_momenta(set: &FilesSet, rates: &HashMap<SectionKey, f32>) -> String {
                 ""
             };
             match m {
-                Some(m) => format!("{m:.0}/{r:.0}{lock}"),
-                None => format!("-/{r:.0}"),
+                Some(m) => format!("{m:.1}/{r:.1}{lock}"),
+                None => format!("-/{r:.1}"),
             }
         })
         .collect::<Vec<_>>()

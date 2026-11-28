@@ -201,13 +201,16 @@ every other section, and sink back from the question as they stop being read.
   give, with the section the question read most beside it, and the first
   steps move only what the decode reads differently. A section the index has
   not read this question is ordered by its scan momentum (the provenance
-  scan's fold, §3.4); both are on the 0–1000 band. A pinned knowledge base,
+  scan's fold, §3.4), taken off its 0–1000 band into 0–1 — under chance, so
+  every section the index reads at chance or better ranks above it. A pinned
+  knowledge base,
   such as a test's or a calibration's frame, is ordered the same way. The pin
   says what is placed and its sections never leave, but the index rates them
   and the scan still folds their scores (`FilesSet::observe`), so it too
   opens with the question's strongest beside it.
 - **The decode reorders it every step.** Each section's **hit momentum** is
-  an exponential average of its hit rate on the 0–1000 band, held on the
+  an exponential average of its hit rate — a lift over chance (§3.4) — held
+  on the
   files set beside the range (`FilesSet::hits`, `files/scope/momentum.rs`). A
   section's first rate this question is taken whole, from the first reading
   or else from the first step that rates it, so the order locks on at once.
@@ -218,13 +221,14 @@ every other section, and sink back from the question as they stop being read.
   (`files_step`), so a section the decode locks onto is drawn to the top
   within a few steps and stays there while it is read, and one it stops
   reading sinks back over several. A section passes the one above it only
-  when its momentum beats that one's by more than `REORDER_MARGIN` (50 on the
-  band), so neighbours a hair apart do not trade places step after step. Any
+  when its momentum beats that one's by more than `REORDER_MARGIN` (2.5, the
+  top of chance's noise), so neighbours a hair apart do not trade places step
+  after step. Any
   change is laid onto the slot at the next wave (§4.4); positions are applied
   at read time, so moving a sealed section costs no prefill.
 - **A section the index reads strongly is locked to its positions.** At a
-  step, a section whose hit momentum is at or over `LOCK_BAR` (150 on the
-  band) keeps the positions it stands at, so its K/V — and the relative
+  step, a section whose hit momentum is at or over `LOCK_BAR` (7.5 times
+  chance) keeps the positions it stands at, so its K/V — and the relative
   distances the decode is reading it across — do not move under the reading
   (`RangeScope::reorder_locked`). Everything else moves around it: the
   unlocked sections, in relevance order, fill the gaps between the locked
@@ -235,15 +239,16 @@ every other section, and sink back from the question as they stop being read.
   strongly read newcomer fills the gap nearest the question it fits and
   locks there itself. An entry never cuts or moves a locked section. A
   section unlocks once its momentum falls under the bar, and the next
-  reorder closes the range up around what is still locked. Without the lock, per-step rates swing across the band
-  and a step moves a section a quarter of the way to its rate, so the margin
-  rarely held: the range was reordered, and the slot rebuilt, on nearly every
-  step (BlackWorld, 2026-11-28). The bar is measured: a range holds one to
-  five sections the decode reads at 150–600, a band of five to ten read
-  mildly at 50–150, and a tail under 50. At 50 the mild band hovered on the
-  bar and flipped in and out of the lock; at 150 the strong hold their places
-  and the mild drift. The opening is not locked: it is ordered whole by the
-  first reading.
+  reorder closes the range up around what is still locked. Without the lock,
+  per-step rates swing widely and a step moves a section a quarter of the way
+  to its rate, so the margin rarely held: the range was reordered, and the
+  slot rebuilt, on nearly every step (BlackWorld, 2026-11-28). The bar is
+  measured: with the selection reading 16–25 on the band, a range holds one
+  to five sections the decode reads at 8–30 times chance, a band of five to
+  ten read mildly at 2.5–8, and a tail under 2.5. Set inside the mild band,
+  the band hovered on the bar and flipped in and out of the lock; at 7.5 the
+  strong hold their positions and the mild drift. The opening is not locked:
+  it is ordered whole by the first reading.
 - **A section that comes into scope** enters at its rank by its momentum, or
   its step rate when it has none yet.
 - **A section that falls out of scope** is removed; the next reorder closes
@@ -312,24 +317,21 @@ files set's scan momentum.
   (§3.2), and the range is ordered by momentum. A section in scope
   **leaves** when its rate has stayed below the eviction bar for **64
   consecutive steps** — one reprojection cadence — and leaves a hole.
-- **The bars are on the normalized band.** The rate is mapped onto the 0–1000
-  band the tools' belief selection uses: 1000 when every block of the section
-  is selected by every query counted, 0 when none is. Every hit is already
-  above the query's cut — the selection's own kept set, or a shadow block
-  scoring above the lowest score the selection kept — so the band is
-  relative to what the model read, scale-free across layers, depths and
-  queries. The bars are a pair on it, entry above eviction — hysteresis, so
-  a section near the line does not flap. They are declared per section in `projection.yaml`
-  beside its budgets, as the tools declare `min_score` / `evict_score`
-  (800 / 600), and measured on the needle and multi-file cases before they
-  are fixed. Until then the knowledge base runs on `Bars::KNOWLEDGE_BASE`
-  (`files/scope/bars.rs`): an entry bar of 50 — one block in twenty above
-  the query's cut, for every query of the step — and an eviction bar of 1, so
-  a section leaves only once the selection has not read it at all for 64
-  steps. The rate is out of every block of the section by every query, and
-  the selection keeps a few blocks of the whole prompt a query, so a section
-  that is being read sits far under 600: the tools' 600 would empty the range
-  one cadence into every request, and their 800 would admit nothing.
+- **The rate is a lift over chance, so the bars hold everywhere.** A
+  section's share of its blocks the queries selected is divided by the share
+  of every placed block they selected — the step's own selection rate
+  (`section_rates`, `selection_rate`). 1 is a section read as any block of
+  the slot is; 10 one read ten times as often. A share alone moves with the
+  prompt's length, the selection's budget and the model — on BlackWorld the
+  selection itself read 16–25 on the 0–1000 band within one run — so a bar on
+  it would hold for one setting only; the lift does not move with any of
+  them. A pooled section's shadow share is divided by the same selection
+  rate, so the entry bar asks how strongly it would be read if placed. The
+  bars are a pair on the lift, entry above eviction — hysteresis, so a
+  section near the line does not flap. The knowledge base runs on
+  `Bars::KNOWLEDGE_BASE` (`files/scope/bars.rs`): an entry bar of 2.5, the
+  top of chance's noise, and an eviction bar of 0.05, so a section leaves
+  only once the selection has all but stopped reading it for 64 steps.
 - **The step's counts stay beside the slot.** Which steps a placed section
   has spent under the bar is the scheduler's (`files/scope/watch.rs`, held
   on the slot's projection state): a step that changes no layout publishes

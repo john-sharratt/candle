@@ -80,15 +80,18 @@ fn locks(hits: &Momentum, section: SectionKey) -> bool {
     hits.score(section).is_some_and(|m| m >= LOCK_BAR)
 }
 
-/// `section`'s place in the order: its hit momentum, or — not yet read by the
-/// index this question — its scan momentum; `None` for one neither ranks.
+/// `section`'s place in the order: its hit momentum, a lift over chance, or —
+/// not yet read by the index this question — its scan momentum taken off the
+/// 0–1000 band into 0–1, under chance, so among the unread the scan orders
+/// and every section the index reads at chance or better ranks above them;
+/// `None` for one neither ranks.
 fn order_score(
     hits: &Momentum,
     members: &BTreeMap<SectionKey, SectionStanding>,
     section: SectionKey,
 ) -> Option<f32> {
     hits.score(section)
-        .or_else(|| members.get(&section).map(|s| s.momentum))
+        .or_else(|| members.get(&section).map(|s| s.momentum / 1000.0))
 }
 
 impl FilesSet {
@@ -470,12 +473,12 @@ mod tests {
     /// **The index orders the range, the scan only what the index has not
     /// read, a section the index reads strongly keeps its positions, and a
     /// new question starts the index afresh**: a scanned 900 over b's 300,
-    /// the first reading rates a at 30 and b at 700 — taken whole — and c,
-    /// unread, keeps its scan 500. Top first a, b, c, ten positions each: b,
-    /// locked, stays at 10; c, the stronger of the free, fills the ten above
-    /// it and a goes below. A step's 1000 for a moves it a quarter of the way
-    /// (272.5): locked too now, nothing moves. A new question forgets every
-    /// rate.
+    /// the first reading lifts a 0.4 and b 20 — taken whole — and c, unread,
+    /// ranks by its scan 500 as 0.5, under chance. Top first a, b, c, ten
+    /// positions each: b, locked, stays at 10; c, the stronger of the free,
+    /// fills the ten above it and a goes below. A step's 30 for a moves it a
+    /// quarter of the way (7.8): locked too now, nothing moves. A new question
+    /// forgets every rate.
     #[test]
     fn the_index_orders_the_range_and_the_scan_what_it_has_not_read() {
         let (a, b, c) = (SectionKey(1), SectionKey(2), SectionKey(3));
@@ -497,10 +500,14 @@ mod tests {
             scope.enter(k, 10, false);
         }
         set.set_scope(scope);
-        set.observe_hits(&HashMap::from([(a, 30.0), (b, 700.0)]));
-        assert_eq!(set.order_score(a), Some(30.0));
-        assert_eq!(set.order_score(b), Some(700.0));
-        assert_eq!(set.order_score(c), Some(500.0), "unread: its scan momentum");
+        set.observe_hits(&HashMap::from([(a, 0.4), (b, 20.0)]));
+        assert_eq!(set.order_score(a), Some(0.4));
+        assert_eq!(set.order_score(b), Some(20.0));
+        assert_eq!(
+            set.order_score(c),
+            Some(0.5),
+            "unread: its scan, under chance"
+        );
         let top_first = |set: &FilesSet| -> Vec<SectionKey> {
             set.scope
                 .as_ref()
@@ -511,16 +518,12 @@ mod tests {
         };
         assert!(set.reorder(0.0));
         assert_eq!(top_first(&set), vec![c, b, a], "b where it was read");
-        set.observe_hits(&HashMap::from([(a, 1_000.0)]));
-        assert_eq!(set.order_score(a), Some(272.5));
+        set.observe_hits(&HashMap::from([(a, 30.0)]));
+        assert_eq!(set.order_score(a), Some(0.75 * 0.4 + 0.25 * 30.0));
         assert!(!set.reorder(0.0), "b and a locked, c in the only gap");
         assert_eq!(top_first(&set), vec![c, b, a]);
         set.clear_withheld();
-        assert_eq!(
-            set.order_score(a),
-            Some(900.0),
-            "a new question: the scan's"
-        );
+        assert_eq!(set.order_score(a), Some(0.9), "a new question: the scan's");
         assert_eq!(set.hits, Momentum::default());
     }
 

@@ -24,17 +24,15 @@ impl Bars {
         evict_steps: 64,
     };
 
-    /// The knowledge base's bars until the needle and multi-file cases
-    /// measure them (`docs/placed_section_layout.md` §3.4). A rate is out of
-    /// every block of the section by every query, and the selection keeps a
-    /// few blocks of the whole prompt a query, so a section the selection
-    /// reads sits far under the tools' bars. A section enters at 50 — one
-    /// block in twenty above the query's cut, for every query of the step —
-    /// and leaves only once the selection has not read it at all, under one,
-    /// for one 64-step cadence.
+    /// The knowledge base's bars, on its sections' rate — a lift over the
+    /// step's own selection, 1 for a section read as any block of the slot
+    /// (`docs/placed_section_layout.md` §3.4). A section enters at 2.5, the
+    /// top of the noise a section read by chance shows (BlackWorld,
+    /// 2026-11-28), and leaves only once the selection has all but stopped
+    /// reading it, under a twentieth of chance, for one 64-step cadence.
     pub const KNOWLEDGE_BASE: Bars = Bars {
-        entry: 50.0,
-        evict: 1.0,
+        entry: 2.5,
+        evict: 0.05,
         evict_steps: 64,
     };
 

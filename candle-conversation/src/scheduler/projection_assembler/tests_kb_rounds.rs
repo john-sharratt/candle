@@ -47,10 +47,13 @@ fn a_placed_section_is_a_round_of_its_own() {
     assert_eq!(ranges, vec![10..16]);
 }
 
-/// **A section's rate is its hits over its blocks and the queries, on the
-/// band; a turn's round is no section's.**
+/// **A section's rate is its share of blocks selected over the selection's
+/// share of every placed block — a lift over chance; a turn's round is no
+/// section's**: 2 of a's 10 blocks against 4 of the slot's 40 is a lift of 2,
+/// b's none is 0; the same reads at ten times the queries lift the same. No
+/// block selected anywhere, every lift is 0.
 #[test]
-fn a_sections_rate_is_its_hits_over_its_blocks_and_queries() {
+fn a_sections_rate_is_its_lift_over_the_selection() {
     let a = SectionKey(1);
     let b = SectionKey(2);
     let keys = [
@@ -59,10 +62,14 @@ fn a_sections_rate_is_its_hits_over_its_blocks_and_queries() {
         RoundKey::of_section(b),
     ];
     let kb = HashMap::from([(a.scan_id(), a), (b.scan_id(), b)]);
-    let rates = section_rates(&keys, &hits(&[4, 50, 0], &[10, 10, 8], 2), &kb);
+    let rates = section_rates(&keys, &hits(&[2, 2, 0], &[10, 10, 20], 1), &kb);
     assert_eq!(rates.len(), 2);
-    assert_eq!(rates[&a], 200.0);
+    assert_eq!(rates[&a], 2.0);
     assert_eq!(rates[&b], 0.0);
+    let more = section_rates(&keys, &hits(&[20, 20, 0], &[10, 10, 20], 10), &kb);
+    assert_eq!(more[&a], 2.0, "the lift does not move with the queries");
+    let none = section_rates(&keys, &hits(&[0, 0, 0], &[10, 10, 20], 1), &kb);
+    assert_eq!((none[&a], none[&b]), (0.0, 0.0));
 }
 
 /// **The selection's rate is every placed round's hits over all their blocks
@@ -82,9 +89,11 @@ fn the_selection_rate_is_every_placed_rounds_hits_over_their_blocks() {
 }
 
 /// **A pooled section's rate sums its pages, out of the shadow scan's
-/// queries**: c, declared as two pages after the one loaded round, has 3 + 1
-/// hits of 10 + 6 blocks over 2 shadow queries — 125 on the band; with no
-/// shadow query counted it has no rate.
+/// queries, over the selection's**: the one loaded round, a, has 2 of 10
+/// blocks over 4 queries — 50 on the band, the selection's own, a lift of 1;
+/// c, declared as two pages after it, has 3 + 1 hits of 10 + 6 blocks over 2
+/// shadow queries — 125, a lift of 2.5. With no shadow query counted c has no
+/// rate.
 #[test]
 fn a_pooled_sections_rate_sums_its_pages_over_the_shadow_queries() {
     let (a, c) = (SectionKey(1), SectionKey(3));
@@ -102,16 +111,17 @@ fn a_pooled_sections_rate_sums_its_pages_over_the_shadow_queries() {
         shadow_queries,
     };
     let rates = section_rates(&keys, &read(2), &kb);
-    assert_eq!(rates[&a], 50.0);
-    assert_eq!(rates[&c], 125.0);
+    assert_eq!(rates[&a], 1.0);
+    assert_eq!(rates[&c], 2.5);
     let unscanned = section_rates(&keys, &read(0), &kb);
     assert_eq!(unscanned.get(&c), None);
-    assert_eq!(unscanned[&a], 50.0);
+    assert_eq!(unscanned[&a], 1.0);
 }
 
 /// **A section declared both placed and pooled is rated as placed, over the
-/// selection's queries alone**: 2 of 10 blocks over 4 queries is 50, whatever
-/// its pooled page counted over the shadow scan's.
+/// selection's queries alone**: 2 of 10 blocks over 4 queries, the slot's only
+/// placed round, is a lift of 1, whatever its pooled page counted over the
+/// shadow scan's.
 #[test]
 fn a_section_declared_both_ways_is_rated_as_placed() {
     let a = SectionKey(1);
@@ -124,7 +134,7 @@ fn a_section_declared_both_ways_is_rated_as_placed() {
         queries: 4,
         shadow_queries: 1,
     };
-    assert_eq!(section_rates(&keys, &read, &kb)[&a], 50.0);
+    assert_eq!(section_rates(&keys, &read, &kb)[&a], 1.0);
 }
 
 /// **A read every step keeps one part a declaration**: a read of the same
