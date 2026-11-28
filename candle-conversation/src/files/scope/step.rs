@@ -1,12 +1,15 @@
 //! A range's entries from its sections' hit rates
 //! (`docs/placed_section_layout.md` §3.4).
 //!
-//! **The opening** places the mandatory sections, then the sections the
-//! question's prefill selects in descending rate, each that fits — the first
-//! at the top, nearest the question. **At a step after it**, a section out of
-//! scope at or above the entry bar enters in front, strongest first, sliding a
-//! full range; which sections leave is the [`super::watch`]'s to say. A step's
+//! **The opening** places the mandatory sections, then the ranked sections,
+//! strongest first, each that fits; the projection then orders the range by
+//! relevance, the mandatory ones among the rest. **At a step after it**, a
+//! section out of scope at or above the entry bar enters at its rank by
+//! momentum, strongest first, a full range making room only past weaker
+//! sections; which sections leave is the [`super::watch`]'s to say. A step's
 //! decision is the layout the next step reads.
+
+use std::collections::HashMap;
 
 use super::bars::Bars;
 use super::range_scope::RangeScope;
@@ -58,12 +61,16 @@ impl RangeScope {
         change
     }
 
-    /// Admit every candidate out of scope at or above the entry bar, strongest
-    /// first, each in front; a section a full range slid out this step does
-    /// not come back in it.
+    /// Admit every candidate out of scope at or above the entry bar by its
+    /// step `rate`, strongest first, each at its rank by `score` — the placed
+    /// sections' momentum, a candidate's own or its rate when it has none — a
+    /// full range making room only past weaker sections
+    /// ([`RangeScope::enter_over`]); a section pushed out this step does not
+    /// come back in it.
     pub fn admit(
         &mut self,
         rate: impl Fn(SectionKey) -> f32,
+        score: impl Fn(SectionKey) -> Option<f32>,
         candidates: &[Candidate],
         bars: &Bars,
     ) -> StepChange {
@@ -75,11 +82,17 @@ impl RangeScope {
             .filter(|&(_, r)| r >= bars.entry)
             .collect();
         entering.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.key.cmp(&b.0.key)));
+        let mut entered: HashMap<SectionKey, f32> = HashMap::new();
         for (c, _) in entering {
             if change.slid.contains(&c.key) {
                 continue;
             }
-            if let Some(slid) = self.enter(c.key, c.tokens, false) {
+            let value = score(c.key).unwrap_or_else(|| rate(c.key));
+            // A section entered earlier this step ranks by the value it entered
+            // at, its momentum not yet holding it.
+            let ranked = |k: SectionKey| entered.get(&k).copied().or_else(|| score(k));
+            if let Some(slid) = self.enter_over(c.key, c.tokens, value, ranked) {
+                entered.insert(c.key, value);
                 change.entered.push(c.key);
                 change.slid.extend(slid);
             }
@@ -118,24 +131,52 @@ mod tests {
         assert!(s.entry(SectionKey(9)).unwrap().mandatory);
     }
 
-    /// **Candidates at or over the entry bar enter in front, strongest
-    /// first; one under it does not; a full range slides**: in a 60-range
-    /// holding a (30) and b (20), c (900) and d (850) enter — c in front of b,
-    /// then d in front of c, sliding a out past the top; e (799) does not.
+    /// **Candidates at or over the entry bar enter at their rank, strongest
+    /// first; one under it does not; a full range makes room past weaker
+    /// sections only**: in a 60-range holding a (30, momentum 700) and b (20,
+    /// momentum 300), c (900) enters above a, then d (850) pushes b out from
+    /// the front and takes its rank between c and a; e (799) is under the bar.
     #[test]
-    fn candidates_over_the_bar_enter_in_front_strongest_first() {
+    fn candidates_over_the_bar_enter_at_their_rank() {
         let mut s = RangeScope::new(60);
         s.open(&[], &[c(1, 30), c(2, 20)]);
         let rate = |k: SectionKey| match k.0 {
             3 => 900.0,
             4 => 850.0,
             5 => 799.0,
-            _ => 700.0,
+            _ => 0.0,
         };
-        let change = s.admit(rate, &[c(3, 10), c(4, 25), c(5, 5)], &Bars::DEFAULT);
+        let momentum = |k: SectionKey| match k.0 {
+            1 => Some(700.0),
+            2 => Some(300.0),
+            _ => None,
+        };
+        let change = s.admit(
+            rate,
+            momentum,
+            &[c(3, 10), c(4, 20), c(5, 5)],
+            &Bars::DEFAULT,
+        );
         assert_eq!(change.entered, vec![SectionKey(3), SectionKey(4)]);
-        assert_eq!(change.slid, vec![SectionKey(1)]);
-        assert_eq!(keys(&s), vec![2, 3, 4]);
+        assert_eq!(change.slid, vec![SectionKey(2)]);
+        assert_eq!(keys(&s), vec![3, 4, 1]);
         assert!(change.left.is_empty());
+    }
+
+    /// **A full range does not give way to a weaker entry**: a (30, 900) and
+    /// b (30, 820) fill a 60-range; c (810, over the bar) would need b's room
+    /// and is weaker, so it does not enter.
+    #[test]
+    fn a_full_range_holds_against_a_weaker_entry() {
+        let mut s = RangeScope::new(60);
+        s.open(&[], &[c(1, 30), c(2, 30)]);
+        let momentum = |k: SectionKey| match k.0 {
+            1 => Some(900.0),
+            2 => Some(820.0),
+            _ => None,
+        };
+        let change = s.admit(|_| 810.0, momentum, &[c(3, 10)], &Bars::DEFAULT);
+        assert!(change.entered.is_empty());
+        assert_eq!(keys(&s), vec![1, 2]);
     }
 }

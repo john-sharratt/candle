@@ -1,4 +1,4 @@
-# Placed-section layout: a reserved position range, append-in-front, per layer
+# Placed-section layout: a reserved position range, ordered by relevance, per layer
 
 **Status:** design, not built. Written 2026-11-27 from the sealed-fresh
 investigation of the files collection (`docs/provenance_system_collection.md`,
@@ -183,31 +183,47 @@ in all of them, whatever the dials, the tools mode or the journal hold.
 
 ### 3.2 Order, growth and removal
 
-- **The opening** places its sections in relevance order with the strongest
-  at the top of the range, nearest the question (*Lost in the Middle*: a long
-  context's start and end are read best; the end is what the question is
-  nearest).
-- **A section that comes into scope later** is placed **in front** of those
-  already in scope — immediately below the lowest placed one — never between
-  them and never above.
-- **Nothing placed moves.** Every relative position among placed sections,
-  the question and the decoded tokens holds for the life of the turn.
-- **A section that falls out of scope** is removed and leaves a hole. Its
-  pages stay in the pool, so the shadow scan
-  (`docs/hit_driven_projection.md` §7.2) can bring it back; brought back, it
-  is placed in front again, at new positions.
-- **A full range is a window.** Once the front reaches `B`, an entering
-  section still enters in front, and the placed run slides up by its length
-  to make room: what passes the range's top — the sections that entered
-  earliest — leaves. The run keeps its order and every placed section keeps
-  its position relative to the others; only their distance to the question
-  shortens by the entry's length. This is the one move a relevance range
-  makes under a reply, and it is the same move a sliding window makes: the
-  newest in front, the oldest out of the far end. Holes inside the run slide
-  with it and are closed between requests, when the range is compacted.
+**The range is held in relevance order, always**: the strongest section at
+the top, beside the question (*Lost in the Middle*: a long context's start and
+end are read best; the end is what the question is nearest), each weaker one
+further from it. Nothing is exempt — the mandatory seed files are ordered like
+every other section, and sink back from the question as they stop being read.
 
-A section's position therefore records when it came into scope, not its rank.
-That is the price of never moving anything until the range is full.
+- **The first token reads the best order there is.** At a request's start the
+  range is ordered by the files set's momentum (§3.4's boundary fold), the
+  mandatory files among the rest (`files_splice`, `RangeScope::reorder`). A
+  pinned knowledge base — a test's, a calibration's frame — is ordered the
+  same way: the pin says what is placed, its sections never leave, and the
+  scan still folds their scores (`FilesSet::observe`), so it too opens with
+  the question's strongest beside it.
+- **The decode reorders it every step.** Each section's **momentum** is an
+  exponential average of its per-step hit rate on the 0–1000 band
+  (`files/scope/momentum.rs`): taken whole the first step that rates it, so
+  the order locks on at once, then a quarter of the way toward each step's
+  rate (`MOMENTUM_KEEP` 0.75). After every step the range is ordered by it
+  (`files_step`), so a section the decode locks onto is drawn to the top
+  within a few steps and stays there while it is read, and one it stops
+  reading sinks back over several. A section passes the one above it only
+  when its momentum beats that one's by more than `REORDER_MARGIN` (50 on the
+  band), so neighbours a hair apart do not trade places step after step. Any
+  change is laid onto the slot at the next wave (§4.4); positions are applied
+  at read time, so moving a sealed section costs no prefill.
+- **A section that comes into scope** enters at its rank by its momentum, or
+  its step rate when it has none yet.
+- **A section that falls out of scope** is removed; the next reorder closes
+  its hole. Its pages stay in the pool, so the shadow scan
+  (`docs/hit_driven_projection.md` §7.2) can bring it back at its rank.
+- **A full range makes room from its front**, the end furthest from the
+  question: an entry pushes out the weakest sections there, and only those
+  weaker than itself — a mandatory section, or one at least as strong, stops
+  it (`RangeScope::enter_over`).
+
+The cost is the one the earlier append-only order avoided: a reorder moves
+placed sections under a reply, so a decoded token's distance to a section can
+change between steps. The margin keeps that to the moves relevance calls for.
+The momentum's rate and margin are the formula's two knobs and are tuned by
+measurement; the behaviour — strongest beside the question, reacting from the
+first step — is the design.
 
 ### 3.3 Per layer
 
@@ -236,12 +252,14 @@ it.
 
 ### 3.4 Order: the index's hit rate, decided per decode step
 
-The one signal that orders a relevance-ordered range is a section's **hit
-rate**: the share of the section's blocks the QSA index selected — or, for a
-section not placed, would have selected above the query's cut (the shadow
-scan) — per query, over the sampled layers. Without a QSA index it is the
-section's provenance score (§3.8). Nothing else orders the range — not the
-pool's momentum, not provenance strength.
+The one signal that orders a relevance-ordered range under a decode is a
+section's **hit rate**: the share of the section's blocks the QSA index
+selected — or, for a section not placed, would have selected above the
+query's cut (the shadow scan) — per query, over the sampled layers, averaged
+step to step into its momentum (§3.2). Without a QSA index it is the section's
+provenance score (§3.8). At a request's start, before any step has read the
+range, the files set's momentum — the boundary fold of those same hits —
+orders it.
 
 - **A rate, not a raw count, and no kernel change.** The device already
   counts hits per declared round (`qsa_hits.cu`, `qsa_shadow.cu`: one
@@ -252,8 +270,8 @@ pool's momentum, not provenance strength.
   section would need a running maximum in both kernels; the rate needs
   none.
 - **Per decode step.** At each step a section that is resident (§3.5) and out
-  of scope **enters** when its rate crosses the entry bar: it is placed in
-  front of the sections already in scope (§3.2). A section in scope
+  of scope **enters** when its rate crosses the entry bar, at its rank
+  (§3.2), and the range is ordered by momentum. A section in scope
   **leaves** when its rate has stayed below the eviction bar for **64
   consecutive steps** — one reprojection cadence — and leaves a hole.
 - **The bars are on the normalized band.** The rate is mapped onto the 0–1000
@@ -280,25 +298,19 @@ pool's momentum, not provenance strength.
   no substrate version. A section that leaves is evicted on the files set
   (`FilesSet::evict`), stays out until the next question even where its
   momentum would choose it. A resident section (§3.5) out of scope whose
-  shadow rate reaches the entry bar enters in front (`FilesSet::admit`); a
-  section the entry slides out past the range's top has left as an evicted
+  shadow rate reaches the entry bar enters at its rank (`FilesSet::admit`); a
+  section an entry pushes out of a full range's front has left as an evicted
   one has, and stays out until the next question too, so two sections over
-  the bar never trade places step after step. Either change is laid onto
+  the bar never trade places step after step. Any change is laid onto
   the slot at the next wave (§4.4,
   `scheduler/section_step.rs`). Placed sections are declared to the model
   as hit rounds of their own (`RoundKey::of_section`), so a step's read
   rates them; every step's read is summed into the slot's unread hits, so
   the boundary still folds them into its momentum.
-- **Entering never moves anything.** A step's entries take positions below the
-  lowest placed section; every section already placed keeps its positions,
-  so every relative position a decoded token was formed against holds. The
-  next token sees one more section in front, at positions no earlier token
-  attended. That is why the order is append-in-front: per-step decisions with
-  no re-layout.
-- **The order is the order of entry.** At the opening, the sections the
-  question's prefill selects enter in descending rate, strongest first, so
-  the strongest is at the top, nearest the question. After it, a section's
-  position records the step it entered.
+- **The order is relevance.** At the opening the strongest by the files set's
+  momentum is at the top, nearest the question; after it, every step orders
+  the range by the decode's momentum (§3.2), so a section's position records
+  its rank, not when it entered.
 - **A step's decision applies from the next step.** The hits of step *t*
   decide the layout step *t* + 1 reads, so a step never reads a layout its own
   hits changed. With speculative decoding the step is the verified step: a
@@ -563,7 +575,7 @@ in how the range fills and when anything leaves.
 
 | Rule | Order | Fills | Changes | Leaves |
 |---|---|---|---|---|
-| **By relevance** (§3.1–§3.5) | When it came into scope | Top down, each new member in front | At any reprojection boundary, mid-request included | At a boundary, leaving a hole |
+| **By relevance** (§3.1–§3.5) | Its rank by momentum, strongest at the top | Strongest at the top, reordered every decode step | At any step, mid-request included | At a step, the next reorder closing its hole |
 | **By birth** (§3.7) | When it was written | Bottom up, each new piece after the newest | Appends only, during a request | Only between requests, the oldest first |
 
 What every piece of provenance is, today and under this design:
@@ -897,8 +909,9 @@ range and the gap in the birth prefix; members sealed at the top of their
 range under the new content address; sections in `file_read`'s format with
 the `...` marker, each file's sections a chain; the mandatory set in place of
 the seed chain; provenance, calibration and the projection by section; the
-hit rate read and decided on every step by the host, with append-in-front
-and the full range as a window; the residency budget; the birth-ordered
+hit rate read and decided on every step by the host, the range ordered by
+momentum and a full range making room from its front; the residency budget;
+the birth-ordered
 journal and dialogue. Scope
 is shared across layers (§3.3); per-layer scope is the one part left out, and
 is built only if the tests below call for it.
@@ -935,9 +948,10 @@ carried:
 - **An edit from a placed section.** An edit made from a placed section by
   its part anchor and relative line numbers lands where it should, checked
   against the file.
-- **Stability and throughput.** The placement record shows nothing placed
-  moves within a request until a range is full, and no dialogue turn or
-  journal entry leaves within one; no readback on the per-token path
+- **Order and throughput.** The placement record shows the range in
+  relevance order at every step — the section a question is about drawn to
+  the top within a few steps, the others sinking back — and no dialogue turn
+  or journal entry leaves within a request; no readback on the per-token path
   (`AGENTS.md` invariants 3–4); decode throughput within noise of today's.
 
 ## 8. Alternatives considered
@@ -949,10 +963,12 @@ carried:
   fine-tuning. QSA selection would keep collisions rare for focused queries
   (as InfLLM's fixed-distance memory does) but not for cross-file ones, and
   the index window refuses overlapping pages today.
-- **Reordering every step by attention.** Attention Sorting does this between
-  passes. Within a decode it moves content under decoded tokens every step;
-  append-in-front keeps its benefit — what is attended stays in scope, what is
-  not leaves — without moving anything placed.
+- **Append-in-front: never moving anything placed.** Each new section entered
+  below the lowest placed one and kept its place, so no decoded token's
+  distance to a section ever changed — but a section's place recorded when it
+  came into scope, not its rank, and the seed held the top whatever was read.
+  The range now reorders every step by momentum, with a margin against
+  flapping (§3.2), as Attention Sorting reorders between passes.
 - **Selective recompute** (CacheBlend). Recomputes the tokens whose sealed K/V
   deviates most from a full prefill. Complementary rather than an
   alternative: it is the most promising lever on §6.

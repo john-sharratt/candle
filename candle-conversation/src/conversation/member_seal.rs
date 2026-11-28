@@ -66,15 +66,27 @@ pub struct SealedMember {
     pub restored: bool,
 }
 
-/// What of `before` — everything the schema declares ahead of a collection —
-/// the birth prefix holds, in `before`'s order: collection members,
-/// `depends_on` sections and empty ones left out, as the birth prefix leaves
-/// them out, and every earlier range's hole kept.
-fn in_birth_prefix(before: Vec<PrefixItem>, birth: &[PrefixItem]) -> Vec<PrefixItem> {
+/// What of `before` — everything the schema declares ahead of a collection,
+/// each item in its slot — the birth prefix holds, in `before`'s order: a
+/// collection member or `depends_on` section the birth prefix leaves out is a
+/// hole of its `tokens`, so every position after it stands where the birth
+/// prefix puts it (`docs/placed_section_layout.md` §3.1c), and every hole is
+/// kept.
+fn in_birth_prefix(
+    before: Vec<PrefixItem>,
+    birth: &[PrefixItem],
+    tokens: impl Fn(SectionId) -> usize,
+) -> Vec<PrefixItem> {
     let birth: HashSet<SectionId> = birth.iter().filter_map(|i| i.section()).collect();
     before
         .into_iter()
-        .filter(|item| item.section().is_none_or(|s| birth.contains(&s)))
+        .filter_map(|item| match item.section() {
+            Some(s) if !birth.contains(&s) => {
+                let positions = tokens(s);
+                (positions > 0).then_some(PrefixItem::Hole(positions))
+            }
+            _ => Some(item),
+        })
         .collect()
 }
 
@@ -160,7 +172,7 @@ impl Sequence {
                 ))
             })?;
         Ok(MembersPrefix {
-            prefix: in_birth_prefix(before, &self.birth_prefix),
+            prefix: in_birth_prefix(before, &self.birth_prefix, |s| self.section_tokens(s)),
             range: None,
             level,
         })
@@ -362,19 +374,27 @@ mod tests {
     }
 
     /// **A member is sealed behind what the birth prefix holds before its
-    /// collection**: a tool member (5) and a `depends_on` section (6) ahead
-    /// of the collection are left out, and the seed and the close the birth
-    /// prefix holds after it (8, 9) are never in `before`.
+    /// collection, at the same positions**: a tool member (5, 12 tokens) and a
+    /// `depends_on` section (6, 30 tokens) ahead of the collection become holes
+    /// of their tokens, and the seed and the close the birth prefix holds after
+    /// it (8, 9) are never in `before`.
     #[test]
     fn a_member_is_sealed_behind_the_birth_prefix_before_its_collection() {
         let mut before = sections_prefix(&ids(&[1, 2, 5]));
         before.push(PrefixItem::Hole(64));
         before.extend(sections_prefix(&ids(&[6, 7])));
         let birth = sections_prefix(&ids(&[1, 2, 7, 8, 9]));
+        let tokens = |s: SectionId| match s.raw() {
+            5 => 12,
+            6 => 30,
+            _ => 4,
+        };
         let mut want = sections_prefix(&ids(&[1, 2]));
+        want.push(PrefixItem::Hole(12));
         want.push(PrefixItem::Hole(64));
+        want.push(PrefixItem::Hole(30));
         want.extend(sections_prefix(&ids(&[7])));
-        assert_eq!(in_birth_prefix(before, &birth), want);
+        assert_eq!(in_birth_prefix(before, &birth, tokens), want);
     }
 
     /// **A chain in a range ends at its top**: each member behind the prompt,

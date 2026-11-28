@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use super::Substrate;
-use crate::files::scope::{Bars, Candidate, RangeScope};
+use crate::files::scope::{Bars, Candidate, RangeScope, REORDER_MARGIN};
 use crate::files::{FileKey, FilesPin, FilesSet, FreshSection, SectionKey};
 use crate::projection::{GroupId, TimelineId};
 
@@ -37,14 +37,16 @@ impl Substrate {
     }
 
     /// A step of `target`'s range: `leaving` leave it until its next question
-    /// ([`FilesSet::evict`]), then `candidates` over `bars`' entry bar by
-    /// `rate` enter it in front ([`FilesSet::admit`]); whether its layout
-    /// changed.
+    /// ([`FilesSet::evict`]), `candidates` over `bars`' entry bar by `rate`
+    /// enter it at their rank ([`FilesSet::admit`]), and the range is ordered
+    /// by `score`, the decode's momentum, strongest beside the question
+    /// ([`FilesSet::reorder`]); whether its layout changed.
     pub fn files_step(
         &mut self,
         target: TimelineId,
         leaving: &[SectionKey],
         rate: impl Fn(SectionKey) -> f32,
+        score: impl Fn(SectionKey) -> Option<f32>,
         candidates: &[Candidate],
         bars: &Bars,
     ) -> bool {
@@ -53,8 +55,11 @@ impl Substrate {
         };
         let set = Arc::make_mut(set);
         let left = set.evict(leaving);
-        let entered = set.admit(rate, candidates, bars);
-        left || !entered.is_empty()
+        let entered = set.admit(rate, &score, candidates, bars);
+        // The range in relevance order by the decode's momentum, strongest
+        // beside the question (`docs/placed_section_layout.md` §3.2).
+        let moved = set.reorder(&score, REORDER_MARGIN);
+        left || !entered.is_empty() || moved
     }
 
     /// Keep `files`, read by `target`'s turn, from being placed until its

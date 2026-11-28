@@ -56,7 +56,7 @@ use crate::scheduler::injected_piece::InjectedPiece;
 use candle_transformers::models::decode_diag::PieceSpan;
 use candle_transformers::models::hit_layers::PieceHits;
 
-use crate::files::scope::{band, EvictWatch};
+use crate::files::scope::{band, EvictWatch, Momentum};
 use crate::files::SectionKey;
 use crate::scheduler::pending_ranges::PendingRanges;
 use crate::scheduler::piece_identity::{

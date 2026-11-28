@@ -67,22 +67,29 @@ pub struct FilesSet {
 impl FilesSet {
     /// Fold one scan's fresh scores into the momentum: every member decays by
     /// `beta`, a scored section gains its fresh score, and a section left
-    /// under `min_momentum` leaves the set. A pinned set's knowledge base is
-    /// not provenance's, and folds nothing.
+    /// under `min_momentum` leaves the set. A pinned set folds the scores of
+    /// its pinned sections alone: the pin says what is placed, and the scan
+    /// still ranks it, so the range opens in relevance order
+    /// (`docs/placed_section_layout.md` §3.2). An empty pin folds nothing.
     pub fn observe(
         &mut self,
         fresh: &[(GroupId, Vec<FreshSection>)],
         beta: f32,
         min_momentum: f32,
     ) {
-        if self.pin != FilesPin::Free {
-            return;
-        }
+        let pinned: Option<BTreeSet<SectionKey>> = match &self.pin {
+            FilesPin::Free => None,
+            FilesPin::Empty => return,
+            FilesPin::Only(sections) => Some(sections.iter().copied().collect()),
+        };
         for s in self.members.values_mut() {
             s.momentum *= 1.0 - beta;
         }
         for (kind, scores) in fresh {
             for &(section, file, score) in scores {
+                if pinned.as_ref().is_some_and(|p| !p.contains(&section)) {
+                    continue;
+                }
                 let entry = self.members.entry(section).or_insert(SectionStanding {
                     momentum: 0.0,
                     kind: *kind,
@@ -132,15 +139,16 @@ impl FilesSet {
     }
 
     /// A step's entries: every one of `candidates` at or over `bars`' entry
-    /// bar by `rate` enters the range in front, strongest first
+    /// bar by `rate` enters the range at its rank by `score`, strongest first
     /// ([`RangeScope::admit`]); what it changed. One an eviction sent out this
     /// request stays out, and so does one of a file withheld since the
-    /// candidates were chosen. One a full range slid out past its top has
+    /// candidates were chosen. One an entry pushed out of a full range has
     /// left as an evicted one has, and stays out until the next question too,
     /// so two sections over the bar never trade places step after step.
     pub fn admit(
         &mut self,
         rate: impl Fn(SectionKey) -> f32,
+        score: impl Fn(SectionKey) -> Option<f32>,
         candidates: &[Candidate],
         bars: &Bars,
     ) -> StepChange {
@@ -158,9 +166,24 @@ impl FilesSet {
             })
             .copied()
             .collect();
-        let change = scope.admit(rate, &open, bars);
+        let change = scope.admit(rate, score, &open, bars);
         self.evicted.extend(change.slid.iter().copied());
         change
+    }
+
+    /// Order the range by `score`, strongest at the top beside the question,
+    /// a section passing the one above it only by more than `margin`
+    /// ([`RangeScope::reorder`]); whether anything moved.
+    pub fn reorder(&mut self, score: impl Fn(SectionKey) -> Option<f32>, margin: f32) -> bool {
+        self.scope
+            .as_mut()
+            .is_some_and(|scope| scope.reorder(score, margin))
+    }
+
+    /// `section`'s momentum in the set — what the opening ranks it by — or
+    /// `None` for a section the set does not hold.
+    pub fn momentum_of(&self, section: SectionKey) -> Option<f32> {
+        self.members.get(&section).map(|s| s.momentum)
     }
 
     /// Whether `section` is placed.
@@ -335,45 +358,57 @@ mod tests {
                 tokens: 20,
             },
         ];
-        let change = set.admit(|_| 900.0, &candidates, &Bars::KNOWLEDGE_BASE);
+        let change = set.admit(|_| 900.0, |_| None, &candidates, &Bars::KNOWLEDGE_BASE);
         assert_eq!(change.entered, vec![SectionKey(2)]);
         assert!(set.places(SectionKey(2)) && !set.places(SectionKey(3)));
         assert!(!set.places(SectionKey(4)));
     }
 
-    /// **A section a full range slid out stays out until the next question**:
-    /// in a 50-range holding a (30), b (40) enters and slides a out; a, over
-    /// the bar at the next step, does not come back, and a new question lets
-    /// it.
+    /// **A section a full range pushed out stays out until the next
+    /// question**: in a 50-range holding a (30, no momentum yet), b (40) enters
+    /// and pushes a out; a, over the bar at the next step, does not come back,
+    /// and a new question lets it.
     #[test]
-    fn a_section_slid_out_stays_out_until_the_next_question() {
+    fn a_section_pushed_out_stays_out_until_the_next_question() {
         let (a, b) = (SectionKey(1), SectionKey(2));
         let mut scope = RangeScope::new(50);
         scope.enter(a, 30, false);
         let mut set = FilesSet::default();
         set.set_scope(scope);
         let c = |key, tokens| Candidate { key, tokens };
-        let change = set.admit(|_| 900.0, &[c(b, 40)], &Bars::KNOWLEDGE_BASE);
+        let change = set.admit(|_| 900.0, |_| None, &[c(b, 40)], &Bars::KNOWLEDGE_BASE);
         assert_eq!(change.slid, vec![a]);
-        let again = set.admit(|_| 900.0, &[c(a, 30)], &Bars::KNOWLEDGE_BASE);
+        let again = set.admit(|_| 900.0, |_| None, &[c(a, 30)], &Bars::KNOWLEDGE_BASE);
         assert!(again.entered.is_empty(), "a stays out this request");
         set.clear_withheld();
         assert!(!set.evicted.contains(&a));
     }
 
-    /// **A pinned set folds no scan.**
+    /// **A pinned set folds the scan for its pinned sections alone, and an
+    /// empty pin folds nothing**: pinned to 9, the scan's 9 (500) is ranked and
+    /// its 1 (500) is not.
     #[test]
-    fn a_pinned_set_folds_no_scan() {
+    fn a_pinned_set_folds_the_scan_for_its_own_sections() {
+        let scan = [(
+            kind(1),
+            vec![
+                (SectionKey(1), FileKey(1), 500.0),
+                (SectionKey(9), FileKey(2), 500.0),
+            ],
+        )];
         let mut set = FilesSet {
             pin: FilesPin::Only(vec![SectionKey(9)]),
             ..FilesSet::default()
         };
-        set.observe(
-            &[(kind(1), vec![(SectionKey(1), FileKey(1), 500.0)])],
-            0.2,
-            100.0,
-        );
-        assert!(set.members.is_empty());
+        set.observe(&scan, 0.2, 100.0);
+        assert_eq!(set.momentum_of(SectionKey(9)), Some(500.0));
+        assert_eq!(set.momentum_of(SectionKey(1)), None);
+        let mut empty = FilesSet {
+            pin: FilesPin::Empty,
+            ..FilesSet::default()
+        };
+        empty.observe(&scan, 0.2, 100.0);
+        assert!(empty.members.is_empty());
     }
 
     /// **A file the turn read waits until the next question — every section
