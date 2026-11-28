@@ -1,5 +1,6 @@
-//! Whether a resident gallery turn's conversation still stands — read off the
-//! substrates, for the memory report's census and the gallery sweep alike.
+//! Whether a resident gallery stream still stands — a turn's conversation, or
+//! a knowledge-base section's declaration — read off the substrates, for the
+//! memory report's census and the gallery sweep alike.
 
 use serde::Serialize;
 
@@ -19,11 +20,21 @@ pub enum TurnStatus {
     Absent,
 }
 
-/// The turn on `sid` as `substrate` holds it: its standing and the group it
-/// was written to. `None` when this substrate does not declare it.
+/// The resident stream `sid` as `substrate` holds it: its standing and, for a
+/// turn, the group it was written to. `None` when this substrate does not
+/// declare it.
+///
+/// **Every declared stream stands, not only a turn.** The gallery also holds
+/// the knowledge base's sections, which are `PromptSection` streams; a stream
+/// that is not a turn stands while its declaration does. A tombstoned section
+/// has none, so it reads `None` here and the sweep gives it up as absent.
+/// Reading only turns judged every section absent, so the sweep gave up the
+/// whole knowledge base each time a tombstone epoch moved and the next scan
+/// uploaded all of it again — 20,547 sections, ~36 s on the wave thread, every
+/// ~40 s of a calibration sweep (2026-11-28).
 pub fn turn_in(substrate: &Substrate, sid: StreamId) -> Option<(TurnStatus, Option<GroupId>)> {
-    let Some(StreamDecl::Turn(t)) = substrate.stream_of(sid).and_then(|s| s.decl.as_ref()) else {
-        return None;
+    let StreamDecl::Turn(t) = substrate.stream_of(sid)?.decl.as_ref()? else {
+        return Some((TurnStatus::Live, None));
     };
     let dead = TimelineId::from_raw(t.timeline_id).is_some_and(|tl| {
         substrate.is_tombstoned(tl) || substrate.is_turn_tombstoned(tl, t.turn_index)
@@ -39,7 +50,8 @@ pub fn turn_in(substrate: &Substrate, sid: StreamId) -> Option<(TurnStatus, Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::content_hash::turn_stream_id;
+    use crate::persistence::content_hash::{hash_bytes, turn_stream_id, ContentHash};
+    use crate::persistence::streams::ContentAddress;
     use crate::projection::{Conversation, LayerId};
     use crate::substrate::TurnPartWrite;
     use crate::turn::Role;
@@ -88,5 +100,23 @@ mod tests {
             None,
             "a substrate that never declared it"
         );
+    }
+
+    /// **A knowledge-base section stands while it is declared**, so the
+    /// gallery sweep keeps it; tombstoned, it is declared no more and reads
+    /// absent.
+    #[test]
+    fn a_declared_section_reads_live_until_tombstoned() {
+        let conv = Conversation::ephemeral();
+        let address = ContentAddress {
+            prefix_hash: ContentHash { lo: 9, hi: 0 },
+            section_hash: hash_bytes(b"a file's section"),
+        };
+        let sid = conv
+            .declare_section_stream(address, "shared/files/candle/a.rs@b#1-10")
+            .expect("declare");
+        assert_eq!(turn_in(&conv.read(), sid), Some((TurnStatus::Live, None)));
+        conv.tombstone_section(sid, None).unwrap();
+        assert_eq!(turn_in(&conv.read(), sid), None, "tombstoned");
     }
 }
