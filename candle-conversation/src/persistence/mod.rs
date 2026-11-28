@@ -103,6 +103,7 @@ pub mod stranded;
 pub mod streams;
 mod stripes;
 pub mod survival;
+pub mod tail_cut;
 pub mod thread;
 pub mod tombstone_expiry;
 pub mod transfer;

@@ -330,7 +330,7 @@ fn scan_segments(dir: &Path) -> Result<Vec<SegmentId>> {
 ///   (a writable open adopts it by renaming; this reads it where it lies);
 /// - a legacy monolithic `substrate.log` in a store with no segment files is
 ///   [`FIRST_SEGMENT`], the id a writable open's migration seals it as.
-fn scan_segment_files(dir: &Path) -> Result<Vec<(SegmentId, PathBuf)>> {
+pub(crate) fn scan_segment_files(dir: &Path) -> Result<Vec<(SegmentId, PathBuf)>> {
     let mut files: BTreeMap<SegmentId, PathBuf> = BTreeMap::new();
     let mut legacy_actives: Vec<(SegmentId, PathBuf)> = Vec::new();
     for entry in fs::read_dir(dir)? {

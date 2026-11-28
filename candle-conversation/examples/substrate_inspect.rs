@@ -62,6 +62,8 @@ mod cast;
 mod compact_check;
 #[path = "substrate_inspect/completeness.rs"]
 mod completeness;
+#[path = "substrate_inspect/cut_after.rs"]
+mod cut_after;
 #[path = "substrate_inspect/faces.rs"]
 mod faces;
 #[path = "substrate_inspect/index_q8.rs"]
@@ -70,6 +72,8 @@ mod index_q8;
 mod kept;
 #[path = "substrate_inspect/liveness.rs"]
 mod liveness;
+#[path = "substrate_inspect/members.rs"]
+mod members;
 
 use std::path::{Path, PathBuf};
 
@@ -699,6 +703,29 @@ enum Cmd {
         #[arg(long)]
         kv_layers: usize,
     },
+    /// Which knowledge-base members a restore would take whole, and which it
+    /// would read again — partial, holding no chunk, or holding no tokens.
+    /// Directory target only.
+    Members {
+        /// K/V layer count of the model the store was written by.
+        #[arg(long)]
+        kv_layers: usize,
+    },
+    /// Cut the log back to before `origin`'s first record at or after
+    /// `from-ms` (wall-clock milliseconds): later segments set aside as
+    /// `<name>.cut`, the one it falls in truncated. Prints the plan; **writes
+    /// only with `--apply`**, the daemon stopped. Directory target only.
+    CutAfter {
+        /// The origin whose run is cut: the store's node, in hex.
+        #[arg(long)]
+        origin: String,
+        /// The first wall-clock millisecond of the run.
+        #[arg(long)]
+        from_ms: u64,
+        /// Apply the cut rather than only printing it.
+        #[arg(long)]
+        apply: bool,
+    },
     /// **Writes.** Tombstone every ingest unit's face, then run maintenance
     /// until it has nothing to do: undoes the face backfill that kept a
     /// recurrent snapshot per face. The daemon must be stopped. Directory
@@ -1301,6 +1328,17 @@ fn main() -> Result<()> {
         if let Cmd::Completeness { kv_layers } = &cli.cmd {
             return completeness::completeness(&target, *kv_layers);
         }
+        if let Cmd::Members { kv_layers } = &cli.cmd {
+            return members::members(&target, *kv_layers);
+        }
+        if let Cmd::CutAfter {
+            origin,
+            from_ms,
+            apply,
+        } = &cli.cmd
+        {
+            return cut_after::cut_after(&target, origin, *from_ms, *apply);
+        }
         if matches!(cli.cmd, Cmd::RetireFaces) {
             let workspace = target
                 .parent()
@@ -1404,6 +1442,12 @@ fn main() -> Result<()> {
         }
         Cmd::Completeness { .. } => {
             anyhow::bail!("completeness requires the segmented `substrate` DIRECTORY target")
+        }
+        Cmd::Members { .. } => {
+            anyhow::bail!("members requires the segmented `substrate` DIRECTORY target")
+        }
+        Cmd::CutAfter { .. } => {
+            anyhow::bail!("cut-after requires the segmented `substrate` DIRECTORY target")
         }
         Cmd::RetireFaces => {
             anyhow::bail!("retire-faces requires the segmented `substrate` DIRECTORY target")

@@ -7,6 +7,7 @@
 //!
 //! - `persist`: writes a turn's chunk, token and commit records.
 //! - `recover`: reads a turn's metadata, grid and cold references back.
+//! - `grid_cover`: whether a section's recovered chunks cover it whole.
 //! - `tests_resume`: tests of persistence, recovery and tombstones across restarts.
 
 use super::identity::Stamped;
@@ -157,10 +158,12 @@ pub fn decode_token_ids(bytes: &[u8]) -> Result<Vec<u32>> {
         .collect())
 }
 
+mod grid_cover;
 mod persist;
 mod recover;
 #[cfg(test)]
 mod tests_resume;
 
+pub use grid_cover::grid_gap;
 pub use persist::*;
 pub use recover::*;

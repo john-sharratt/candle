@@ -11,6 +11,7 @@
 //! still lines up with the slot.
 
 use super::*;
+use crate::persistence::resume::grid_gap;
 
 impl Scheduler {
     /// Install a persisted section as a **cold-marker** — `cold = Some`,
@@ -70,6 +71,13 @@ impl Scheduler {
                      chunks — re-ingest"
                 ))
             })?;
+        // A grid short of the section — chunks whose segment is gone — would
+        // install K/V that stops short of its tokens. It is no restore.
+        if let Some(gap) = grid_gap(&cold_refs, tokens.len()) {
+            return Err(ConversationError::Channel(format!(
+                "section {section_id:?}: stream {stream_id:?} is partial ({gap}) — re-ingest"
+            )));
+        }
 
         // 2. The section's index page, for a model that keeps per-position
         //    state. It is computed from hidden states, so borrowing the K/V
