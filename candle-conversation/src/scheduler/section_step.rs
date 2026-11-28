@@ -18,15 +18,15 @@
 //! unread parts, so the boundary's reprojection still folds every step's
 //! hits into its momentum.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use candle_transformers::models::batched_inference::ManagedBatchedModel;
 
 use super::projection_assembler::{fold_part, section_rates, SlotState};
 use super::reprojection::ReprojectionPolicy;
 use super::SequenceId;
-use crate::files::scope::{Bars, Candidate};
-use crate::files::SectionKey;
+use crate::files::scope::{Bars, Candidate, LOCK_BAR};
+use crate::files::{FilesSet, SectionKey};
 
 /// One step of `slot`, whose projection state is `state`, under `policy`:
 /// whether the range's layout changed, so the view must be laid out again.
@@ -96,6 +96,7 @@ pub(super) fn step_sections(
     let changed = policy
         .substrate
         .update(|s| s.files_step(target, &rates, placed_read, &leaving, &candidates, &bars));
+    state.kb_steps += 1;
     if changed {
         state.layout_owed = true;
         tracing::debug!(
@@ -106,5 +107,48 @@ pub(super) fn step_sections(
             "the knowledge base's range changed on its sections' hit rates",
         );
     }
+    // The range's momenta, top first, on every change and every
+    // `MOMENTA_EVERY`th step: what the lock bar is set from.
+    if changed || state.kb_steps % MOMENTA_EVERY == 0 {
+        let read = policy.substrate.read();
+        if let Some(set) = read.files_set_of(target) {
+            tracing::debug!(
+                target: "candle_conversation::scheduler::reproject",
+                slot = slot.0,
+                step = state.kb_steps,
+                changed,
+                momenta = %range_momenta(set, &rates),
+                "the knowledge base's range momenta, top first (momentum/rate, * locked)",
+            );
+        }
+    }
     changed
+}
+
+/// Steps between two momenta lines of a range that did not change.
+const MOMENTA_EVERY: u64 = 32;
+
+/// `set`'s placed sections top first, each `momentum/rate` this step, a
+/// locked one marked `*`: one token per section, rounded.
+fn range_momenta(set: &FilesSet, rates: &HashMap<SectionKey, f32>) -> String {
+    let Some(scope) = set.scope.as_ref() else {
+        return String::new();
+    };
+    scope
+        .sections()
+        .map(|e| {
+            let m = set.hits.score(e.key);
+            let r = rates.get(&e.key).copied().unwrap_or(0.0);
+            let lock = if m.is_some_and(|m| m >= LOCK_BAR) {
+                "*"
+            } else {
+                ""
+            };
+            match m {
+                Some(m) => format!("{m:.0}/{r:.0}{lock}"),
+                None => format!("-/{r:.0}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }

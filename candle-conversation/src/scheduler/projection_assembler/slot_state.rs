@@ -90,6 +90,8 @@ pub(in super::super) struct SlotState {
     pub(in super::super) kb_rounds: HashMap<TimelineId, SectionKey>,
     /// The steps each placed section has stayed under the eviction bar.
     pub(in super::super) evict_watch: EvictWatch,
+    /// The decode steps that have rated the range, for the slot's life.
+    pub(in super::super) kb_steps: u64,
     /// The knowledge-base sections kept resident beside the range, chosen at
     /// the last boundary (`docs/placed_section_layout.md` §3.5): their K/V
     /// hot, their index pages pooled for the shadow scan.
@@ -481,6 +483,7 @@ impl SlotState {
             // its residency is its own pool's, chosen at its first boundary.
             kb_rounds: HashMap::new(),
             evict_watch: EvictWatch::default(),
+            kb_steps: 0,
             kb_resident: Vec::new(),
             kb_read: HashSet::new(),
             // A fork's slot holds what the parent's held, and is laid out
