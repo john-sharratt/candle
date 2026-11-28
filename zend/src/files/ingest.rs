@@ -8,6 +8,7 @@
 
 use candle_conversation::files::names::chunk_name;
 use candle_conversation::files::{Chunk, ChunkRecord, FileRecord, FileUnit, MemberRef};
+use candle_conversation::projection::SectionId;
 use candle_conversation::{MemberSpec, SealedMember, Sequence};
 
 use super::sections::sections;
@@ -60,17 +61,18 @@ pub fn record_of(source: &FileSource<'_>, chunks: &[Chunk], sealed: &[SealedMemb
     }
 }
 
-/// Cut `text` into its sections, seal them as `source`'s members on `base`,
-/// and return its record.
+/// Cut `text` into its sections, seal them as `source`'s members on `base`
+/// behind `lead` ([`super::lead`]), and return its record.
 pub fn ingest_text(
     base: &Sequence,
     source: &FileSource<'_>,
     text: &str,
+    lead: &[SectionId],
 ) -> anyhow::Result<FileRecord> {
     let chunks = sections(source.path, source.unit, text)?;
     let specs = member_specs(source.path, source.blob, &chunks);
     let sealed = base
-        .seal_members(FILES_COLLECTION, &specs)
+        .seal_members(FILES_COLLECTION, lead, &specs)
         .map_err(|e| anyhow::anyhow!("sealing {}: {e}", source.path))?;
     Ok(record_of(source, &chunks, &sealed))
 }

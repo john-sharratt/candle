@@ -7,6 +7,7 @@
 //! A file the card had no room for goes back through admission whole.
 
 use super::*;
+use crate::files::lead::lead_of;
 
 /// Ingest one file: skip it when its key is already recorded with its members
 /// sealed here, or it is binary; otherwise cut it, seal its members behind
@@ -117,7 +118,10 @@ pub(super) fn process_one_file(
         lang: extension_of(&file.path),
         branches: &file.branches,
     };
-    let record = match ingest_text(base, &source, &text) {
+    // Sealed behind its repository's listing, so each section is computed
+    // as a part of that repository (`files::lead`).
+    let lead = lead_of(&conversation, &file.path, &file.branches);
+    let record = match ingest_text(base, &source, &text, &lead) {
         Ok(record) => record,
         Err(e) => {
             sealing_failed(job, failures, &file.path, superseded.len(), e);

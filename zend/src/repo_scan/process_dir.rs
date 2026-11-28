@@ -48,7 +48,8 @@ pub(super) fn process_one_dir(
         lang: "",
         branches: &job.branches,
     };
-    let record = match ingest_text(base, &source, &text) {
+    // A listing is what a file is led by, and is led by nothing itself.
+    let record = match ingest_text(base, &source, &text, &[]) {
         Ok(record) => record,
         Err(e) => {
             let msg = format!("{e:#}");

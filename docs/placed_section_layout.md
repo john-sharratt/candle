@@ -621,6 +621,45 @@ as provenance and the projection do (§3.5c):
   (`Cargo.lock`) join the `ignore` list of `motherd/motherd.yaml` and the
   machine configs.
 
+### 3.5e A file is sealed behind its repository's listing
+
+**A section sealed with nothing before it reads as the only one of its
+kind.** Each file is sealed once, behind the prompt up to `files_open`, so
+two files of the same shape — two `Cargo.toml`s, two `README.md`s — are each
+computed as if no other existed. Their headings name their files, but the
+lines below carry nothing that tells one file's from the other's: on
+BlackWorld (2026-11-28) a question about candle's `serde` version was answered
+with yenbot's whenever yenbot's `Cargo.toml` sat nearer the question, and with
+candle's when candle's did, while a fresh prefill of the same prompt — the
+same tokens, the same recurrent state, the same C4 quantization — found
+candle's wherever it sat. What a fresh prefill gives the later file is the
+earlier one in its attention; interpretability work on how models bind
+entities finds those bindings carried by an ordering — *the first, the
+second* — that a separately computed section has no way to take
+(Feng & Steinhardt, ICLR 2024; Dai et al., EMNLP 2024).
+
+**So a file's members are sealed behind its repository's root listing**
+(`files/lead.rs`, `MembersPrefix::led_by`): the listing's sections stand just
+ahead of the file's first member, inside the range, the range's hole above
+them short by their positions, and every section of the file is computed as
+a part of the repository the listing names, read after its tree rather than
+as the first thing read. The listing's K/V is the one the knowledge base
+already holds — reused as a seed chain reuses its sections, its recurrent
+state run on from its own — so the lead costs no prefill. It is part of every
+member's address, so a file sealed behind it is another member than one
+sealed behind nothing.
+
+- **The listing first.** The repository layer (`repo_map`) is ingested ahead
+  of the files in every pass, so a file finds its listing sealed. A file whose
+  repository's listing this process holds no version of is sealed behind
+  nothing; a listing is led by nothing itself.
+- **The version on the file's branch.** A repository's listing has a version
+  per branch; a file is led by the first that shares a branch with it, in the
+  file's branch order.
+- **Placed, the lead is not.** The listing stands in the range only when the
+  fill places it, wherever relevance puts it; positions are applied at read
+  time, so a section sealed behind it reads the same wherever it lies.
+
 ### 3.6 Two orders: by relevance and by birth
 
 Every piece of provenance the projection places falls under one of two

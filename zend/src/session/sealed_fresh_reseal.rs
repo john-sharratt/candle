@@ -84,6 +84,8 @@ pub fn reseal_behind(
         prefix: prefix.to_vec(),
         range: None,
         level: base.collection_kv_level(FILES_COLLECTION),
+        lead: Vec::new(),
+        lead_tokens: 0,
     };
     let sealed = base
         .seal_members_behind(&behind, &specs, kind)
