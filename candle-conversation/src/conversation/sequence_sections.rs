@@ -112,7 +112,7 @@ impl Sequence {
         prefix: &[PrefixItem],
         seal: SectionSeal,
     ) -> crate::Result<Vec<(SectionId, usize)>> {
-        self.insert_section_collection_with_progress(sections, prefix, None, seal, |_, _| {})
+        self.insert_section_collection_with_progress(sections, prefix, None, &[], seal, |_, _| {})
     }
 
     /// Same as [`Self::insert_section_collection`] but fires
@@ -136,11 +136,16 @@ impl Sequence {
     /// the part of the range above its own tokens left empty
     /// (`docs/placed_section_layout.md` §3.1b), so its address names that hole
     /// too.
+    ///
+    /// `lead` is the collection's lead (`docs/placed_section_layout.md` §3.5f),
+    /// already sealed: each section is sealed straight behind it, the range's
+    /// hole short by its positions.
     pub fn insert_section_collection_with_progress<F>(
         &mut self,
         sections: &[(SectionId, &str)],
         prefix: &[PrefixItem],
         range: Option<usize>,
+        lead: &[SectionId],
         seal: SectionSeal,
         mut on_section_done: F,
     ) -> crate::Result<Vec<(SectionId, usize)>>
@@ -243,9 +248,10 @@ impl Sequence {
             return Ok(out_skip);
         }
 
-        let base_chain = {
+        let (base_chain, lead_tokens) = {
             let mut chain = ContentChain::new();
             let view = self.substrate.read();
+            let lead_tokens: Vec<_> = lead.iter().map(|&id| view.section_tokens_of(id)).collect();
             let schema = self.projection.schema();
             for &item in prefix {
                 let pid = match item {
@@ -271,23 +277,28 @@ impl Sequence {
                 }
                 chain.push_section(&pre_tokens);
             }
-            chain
+            (chain, lead_tokens)
         };
-        // A member of a range is sealed at its top: behind the prefix and the
-        // part of the range above its own tokens. Without a range, behind the
-        // prefix alone.
-        let member_hole = |tokens: usize| range.map_or(0, |r| r.saturating_sub(tokens));
-        let member_prefix = |tokens: usize| {
-            let mut items = prefix.to_vec();
-            match member_hole(tokens) {
-                0 => {}
-                hole => items.push(PrefixItem::Hole(hole)),
-            }
-            items
+        // A member of a range is sealed at its top: behind the prefix, the
+        // part of the range above the lead and its own tokens, then the lead.
+        // Without a range, behind the prefix and the lead alone.
+        let lead_positions: usize = lead_tokens.iter().map(|t| t.len()).sum();
+        let member_hole =
+            |tokens: usize| range.map_or(0, |r| r.saturating_sub(tokens + lead_positions));
+        let behind = MembersPrefix {
+            prefix: prefix.to_vec(),
+            range,
+            level: seal.policy().compression_level,
+            lead: lead.to_vec(),
+            lead_tokens: lead_positions,
         };
+        let member_prefix = |tokens: usize| behind.behind(tokens, &[]);
         let prefix_hash_of = |tokens: usize| {
             let mut chain = base_chain.clone();
             chain.push_hole(member_hole(tokens));
+            for t in &lead_tokens {
+                chain.push_section(t);
+            }
             chain.prefix()
         };
         // ── Pass 2: triage what's left into two buckets ────────────────

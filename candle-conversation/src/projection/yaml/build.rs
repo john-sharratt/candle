@@ -390,6 +390,7 @@ pub(super) fn build_system_prompt(
                 range: coll_range,
                 summary_range: coll_summary_range,
                 kv_level,
+                lead,
             } => {
                 let cid = *collections
                     .get(name)
@@ -420,8 +421,9 @@ pub(super) fn build_system_prompt(
                     });
                 }
 
-                let mut sec_schemas = Vec::with_capacity(sections.len());
-                for s in sections {
+                // The lead and the members alike: named sections of the layer,
+                // each with an id of its own.
+                let mut declared = |s: &YamlSection| -> Result<SectionSchema, ConstructionError> {
                     if !section_names.insert(s.id.clone()) {
                         return Err(ConstructionError::DuplicateSectionName(s.id.clone()));
                     }
@@ -429,7 +431,7 @@ pub(super) fn build_system_prompt(
                     maps.section_names.insert((lid, s.id.clone()), sid);
                     let pri = s.priority.unwrap_or(50.0);
                     validate_priority(&format!("{}/{}", owner, s.id), pri)?;
-                    sec_schemas.push(SectionSchema {
+                    Ok(SectionSchema {
                         id: sid,
                         name: s.id.clone(),
                         content: s.content.clone(),
@@ -441,8 +443,16 @@ pub(super) fn build_system_prompt(
                         is_template: false,
                         min_tokens: 0,
                         template_tokens: None,
-                    });
-                }
+                    })
+                };
+                let lead_schemas = lead
+                    .iter()
+                    .map(&mut declared)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let sec_schemas = sections
+                    .iter()
+                    .map(&mut declared)
+                    .collect::<Result<Vec<_>, _>>()?;
 
                 // A collection with no explicit `policy:` but a `top_k` selection
                 // derives its belief budget from that rule (k → budget max,
@@ -485,6 +495,7 @@ pub(super) fn build_system_prompt(
                     range,
                     summary_range,
                     kv_level,
+                    lead: lead_schemas,
                 }));
             }
             YamlSystemPromptItem::SectionTree { nodes } => {

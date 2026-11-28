@@ -104,6 +104,47 @@ fn a_range_filled_from_the_top_holds_its_members_at_the_top() {
     );
 }
 
+/// **A collection's lead is a section of the schema but never one of its
+/// members, and never placed** (`docs/placed_section_layout.md` §3.5f): it is
+/// named, counted among the prompt's ids, and sealed by the creation walk, but
+/// the projection lays down the same range as without it, scored or not.
+#[test]
+fn a_collections_lead_is_never_placed() {
+    let yaml = yaml("top").replace(
+        "      sections:\n        - id: tool_a",
+        "      lead:\n        - id: tool_lead\n          content: \"L\"\n      sections:\n        - id: tool_a",
+    );
+    let b = Builder::from_yaml(&yaml).unwrap();
+    let id = |n: &str| b.id_for_system_section(n).unwrap();
+    let system = &b.schema().system_prompt;
+    let tools = system.collection_named("tools").unwrap();
+    assert_eq!(tools.lead_ids(), vec![id("tool_lead")]);
+    assert_eq!(tools.sections.len(), 3);
+    assert!(!system.is_collection_member(id("tool_lead")));
+    assert!(system.all_section_ids().any(|s| s == id("tool_lead")));
+    let resolver = MockResolver::new()
+        .with_section_score(id("tool_lead"), 0.95)
+        .with_section_score(id("tool_a"), 0.9)
+        .with_section_score(id("tool_b"), 0.8)
+        .with_section_score(id("tool_c"), 0.1)
+        .with_section_tokens(id("framing"), 5)
+        .with_section_tokens(id("tool_lead"), 10)
+        .with_section_tokens(id("tool_a"), 30)
+        .with_section_tokens(id("tool_b"), 25)
+        .with_section_tokens(id("tool_c"), 50)
+        .with_section_tokens(id("outro"), 4);
+    assert_eq!(
+        places(&project(&b, &resolver)),
+        vec![
+            (Some(id("framing")), None),
+            (None, Some(100 - 30 - 25)),
+            (Some(id("tool_a")), None),
+            (Some(id("tool_b")), None),
+            (Some(id("outro")), None),
+        ]
+    );
+}
+
 /// **A ranged collection is filled by tokens, not by its count**
 /// (`docs/placed_section_layout.md` §3.5): `top_k` 2 notwithstanding, the
 /// 60-position range takes a (30) and b (25) by score and would take a third

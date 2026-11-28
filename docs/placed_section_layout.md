@@ -638,27 +638,53 @@ entities finds those bindings carried by an ordering — *the first, the
 second* — that a separately computed section has no way to take
 (Feng & Steinhardt, ICLR 2024; Dai et al., EMNLP 2024).
 
-**So a file's members are sealed behind its repository's root listing**
-(`files/lead.rs`, `MembersPrefix::led_by`): the listing's sections stand just
-ahead of the file's first member, inside the range, the range's hole above
-them short by their positions, and every section of the file is computed as
-a part of the repository the listing names, read after its tree rather than
-as the first thing read. The listing's K/V is the one the knowledge base
-already holds — reused as a seed chain reuses its sections, its recurrent
-state run on from its own — so the lead costs no prefill. It is part of every
-member's address, so a file sealed behind it is another member than one
-sealed behind nothing.
+**So a file's members are sealed behind its repository's root listing, then
+the listing of the folder it is in** (`files/lead.rs`,
+`MembersPrefix::led_by`): the listings' sections stand just ahead of the
+file's first member, inside the range, after the collection's own lead
+(§3.5f), the range's hole above them short by their positions, and every
+section of the file is computed as a part of the repository and the folder
+the listings name — its bearings — read after their trees rather than as the
+first thing read. The listings' K/V is the one the knowledge base already
+holds — reused as a seed chain reuses its sections, its recurrent state run
+on from its own — so the lead costs no prefill. It is part of every member's
+address, so a file sealed behind it is another member than one sealed behind
+nothing.
 
-- **The listing first.** The repository layer (`repo_map`) is ingested ahead
-  of the files in every pass, so a file finds its listing sealed. A file whose
-  repository's listing this process holds no version of is sealed behind
-  nothing; a listing is led by nothing itself.
-- **The version on the file's branch.** A repository's listing has a version
-  per branch; a file is led by the first that shares a branch with it, in the
-  file's branch order.
+- **The listings first.** The repository layer (`repo_map`) is ingested ahead
+  of the files in every pass, so a file finds its listings sealed. A listing
+  this process holds no version of is left out of the lead; a file at the
+  repository's root is led by the root listing alone, and a listing is led by
+  no listing itself.
+- **The version on the file's branch.** A listing has a version per branch; a
+  file is led by the first that shares a branch with it, in the file's branch
+  order.
 - **Placed, the lead is not.** The listing stands in the range only when the
   fill places it, wherever relevance puts it; positions are applied at read
   time, so a section sealed behind it reads the same wherever it lies.
+
+### 3.5f Every collection declares a lead that is never placed
+
+A tool's signature, a journal's first section and a repository's root listing
+have no listing to stand behind, and each was sealed as the only one of its
+kind. **So every collection of the system prompt declares a lead in
+`projection.yaml`** (`lead:` beside `sections:`): records of the collection's
+own kind — a signature of a tool that does not exist, a journal entry 0, a
+file of a repository that is not in the workspace — sealed once by the
+creation walk at the collection's place, as members are, and placed ahead of
+every member each member is sealed behind (`SectionCollection::lead`).
+
+- **Never placed.** A lead is a section of the schema but no member of its
+  collection: it is never selected, never offered, never emitted. It shapes
+  the K/V of what is sealed behind it and nothing else, so no tool can be
+  called that is not there and no journal reads an entry nobody wrote.
+- **Every seal path.** The creation walk seals a collection's members behind
+  it (`insert_section_collection_with_progress`), a submitted section — a
+  journal's — straight after it (`Sequence::submit_section`), and a knowledge-
+  base file behind it and then its listings (`Sequence::members_prefix`). In a
+  range the hole above shrinks by its positions, so the range keeps its size.
+- **Part of the address.** The lead is in every member's prefix chain, so
+  changing it re-seals the collection.
 
 ### 3.6 Two orders: by relevance and by birth
 

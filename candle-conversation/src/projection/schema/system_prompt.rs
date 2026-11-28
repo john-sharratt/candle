@@ -49,11 +49,12 @@ impl SystemPromptSchema {
     /// collection's selection rule.
     pub fn all_sections(&self) -> impl Iterator<Item = &SectionSchema> {
         self.items.iter().flat_map(|it| match it {
-            SystemPromptItem::Section(s) => std::slice::from_ref(s).iter(),
-            SystemPromptItem::Collection(c) => c.sections.iter(),
+            SystemPromptItem::Section(s) => std::slice::from_ref(s).iter().chain([].iter()),
+            // A collection's lead, then its members.
+            SystemPromptItem::Collection(c) => c.lead.iter().chain(c.sections.iter()),
             // Tree nodes are not `SectionSchema`s (they carry per-branch
             // variants); address them via [`Self::all_section_ids`] instead.
-            SystemPromptItem::SectionTree(_) => [].iter(),
+            SystemPromptItem::SectionTree(_) => [].iter().chain([].iter()),
         })
     }
 
@@ -67,7 +68,9 @@ impl SystemPromptSchema {
             .flat_map(|it| -> Box<dyn Iterator<Item = SectionId>> {
                 match it {
                     SystemPromptItem::Section(s) => Box::new(std::iter::once(s.id)),
-                    SystemPromptItem::Collection(c) => Box::new(c.sections.iter().map(|s| s.id)),
+                    SystemPromptItem::Collection(c) => {
+                        Box::new(c.lead.iter().chain(c.sections.iter()).map(|s| s.id))
+                    }
                     SystemPromptItem::SectionTree(t) => Box::new(t.nodes.iter().flat_map(|n| {
                         n.options
                             .iter()
@@ -516,6 +519,20 @@ pub struct SectionCollection {
     /// ([`MEMBER_KV_LEVEL`] unless the collection declares `kv_level`): the
     /// knowledge base's sections at C5, a tool's signature at C4.
     pub kv_level: u8,
+    /// Records of the collection's own kind that every member is sealed
+    /// behind and that are never placed (`docs/placed_section_layout.md`
+    /// §3.5f): a tool's signature is computed after another signature, a
+    /// journal entry after another entry, so no member's K/V reads as the
+    /// only one of its kind. Sealed once, at the collection's place, as
+    /// members are; never selected, never emitted.
+    pub lead: Vec<SectionSchema>,
+}
+
+impl SectionCollection {
+    /// The ids of the collection's [`lead`](Self::lead), in order.
+    pub fn lead_ids(&self) -> Vec<SectionId> {
+        self.lead.iter().map(|s| s.id).collect()
+    }
 }
 
 /// The level a collection's members are sealed at when it declares none.
@@ -542,6 +559,7 @@ impl Default for SectionCollection {
             range: None,
             summary_range: None,
             kv_level: MEMBER_KV_LEVEL,
+            lead: Vec::new(),
         }
     }
 }

@@ -40,6 +40,41 @@ pub(super) mod projection_schema_tests {
         );
     }
 
+    /// **Every collection of the system prompt has a lead, and the lead is
+    /// none of its members** (`docs/placed_section_layout.md` §3.5f): the
+    /// journal, the tools and the knowledge base each declare one record its
+    /// members are sealed behind.
+    #[test]
+    fn every_system_collection_declares_a_lead_that_is_no_member() {
+        use candle_conversation::projection::SystemPromptItem;
+        let builder = build_projection_builder(Path::new("demo-project"));
+        let system = &builder.schema().system_prompt;
+        let leads: Vec<(String, Vec<String>)> = system
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                SystemPromptItem::Collection(c) => Some((
+                    c.name.clone(),
+                    c.lead.iter().map(|s| s.name.clone()).collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        let want = |c: &str, l: &str| (c.to_string(), vec![l.to_string()]);
+        assert_eq!(
+            leads,
+            vec![
+                want("journal", "journal_lead"),
+                want("tools", "tools_lead"),
+                want("files", "files_lead"),
+            ]
+        );
+        for id in ["journal_lead", "tools_lead", "files_lead"] {
+            let sid = builder.id_for_system_section(id).expect("a named section");
+            assert!(!system.is_collection_member(sid), "{id} is no member");
+        }
+    }
+
     /// The persona names the model the host serves, filled in where the schema
     /// is loaded, beside the workspace it works in.
     #[test]

@@ -567,6 +567,7 @@ pub(super) fn build_section_tree<'a>(
                     range: None,
                     summary_range: None,
                     kv_level: MEMBER_KV_LEVEL,
+                    lead: Vec::new(),
                 };
                 // Capture the branch templates so runtime member additions
                 // (the tool catalog) can seal ×branch without re-deriving them.

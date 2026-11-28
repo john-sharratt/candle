@@ -675,7 +675,7 @@ impl Sequence {
             ConversationError::Other(format!("the schema has no collection {collection:?}"))
         })?;
         let native = self.substrate.read().trained_window();
-        let prefix = prefix_before_collection(
+        let mut prefix = prefix_before_collection(
             &base.schema().system_prompt.items,
             collection_id,
             native,
@@ -687,6 +687,11 @@ impl Sequence {
                      member once per branch; submit to a top-level collection"
             ))
         })?;
+        // Straight behind the collection's lead, as every member of it is
+        // (`docs/placed_section_layout.md` §3.5f).
+        if let Some(c) = base.schema().system_prompt.collection_named(collection) {
+            prefix.extend(c.lead_ids().into_iter().map(PrefixItem::Section));
+        }
 
         if let Some(at) = self.submitted.position_of_name(name) {
             let earlier = self.submitted.entries.remove(at);

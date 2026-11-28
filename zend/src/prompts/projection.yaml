@@ -556,6 +556,13 @@ system_prompt:
       pin: true
       selection: { kind: always_visible }
       range: { tokens: 8192, small_context: 2048, fill: bottom }
+      # An entry every journal section is sealed behind and that is never
+      # placed (docs/placed_section_layout.md §3.5f): the first section a
+      # conversation writes is computed after another entry, not as the only
+      # one of its kind.
+      lead:
+        - id: journal_lead
+          content: "Entry 0 — Opened the conversation and read what the knowledge base holds."
       sections: []
 
     - kind: section
@@ -724,6 +731,12 @@ system_prompt:
       # everything after the summary stands where it stands whichever mode,
       # selection and lines a turn has. Startup logs what it needs of this.
       summary_range: { tokens: 4096 }
+      # A signature every tool's is sealed behind and that is never placed or
+      # offered (docs/placed_section_layout.md §3.5f): each tool's K/V is
+      # computed after another tool's, not as the only tool there is.
+      lead:
+        - id: tools_lead
+          content: '{"name": "dice_roll", "description": "Roll dice and return each face and their total.", "parameters": {"type": "object", "properties": {"count": {"type": "integer", "description": "How many dice to roll."}, "sides": {"type": "integer", "description": "How many faces each die has."}}, "required": ["count", "sides"]}}'
       sections: []
 
     - kind: template
@@ -757,6 +770,13 @@ system_prompt:
       # Sealed at C5, as the knowledge base is everywhere
       # (docs/npc_mind_layout.md §3): a collection that declares none is C4.
       kv_level: 5
+      # A file every knowledge-base section is sealed behind, ahead of its
+      # repository's listings, and that is never placed
+      # (docs/placed_section_layout.md §3.5f): even a root listing is computed
+      # after another file, not as the first thing read.
+      lead:
+        - id: files_lead
+          content: "## The content from notes/README.md:\n\n```markdown file=notes/README.md part=0 lines=1-3\n +1 # Notes\n +2 \n +3 Scratch notes kept beside the code.\n```\nend of notes/README.md lines 1-3 of 3 — the end of the file\n\n"
       sections: []
 
     - kind: template

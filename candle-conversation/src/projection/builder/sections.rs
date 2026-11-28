@@ -140,6 +140,7 @@ impl Builder {
                 range: None,
                 summary_range: None,
                 kv_level: MEMBER_KV_LEVEL,
+                lead: Vec::new(),
             }));
         self.name_maps
             .collection_names

@@ -383,8 +383,9 @@ impl Sequence {
                     }
                 }
                 SystemPromptItem::Collection(c) => c
-                    .sections
+                    .lead
                     .iter()
+                    .chain(c.sections.iter())
                     .filter(|s| !s.is_template)
                     .map(|s| s.content.len() as u64)
                     .sum::<u64>(),
@@ -512,6 +513,32 @@ impl Sequence {
                         .range
                         .filter(|r| r.fill == RangeFill::Top)
                         .map(|r| r.positions(native));
+                    // The lead first, sealed as a member is, at the
+                    // collection's place; then every member behind it
+                    // (`docs/placed_section_layout.md` §3.5f).
+                    let leads: Vec<(SectionId, &str)> = coll
+                        .lead
+                        .iter()
+                        .map(|sec| (sec.id, sec.content.as_str()))
+                        .collect();
+                    if !leads.is_empty() {
+                        let done_bytes_ref = &mut done_bytes;
+                        let report_ref = &report;
+                        conv.insert_section_collection_with_progress(
+                            &leads,
+                            &linear_prefix,
+                            sealed_at_top,
+                            &[],
+                            SectionSeal::Member {
+                                level: coll.kv_level,
+                            },
+                            |_sid, content_len| {
+                                *done_bytes_ref += content_len as u64;
+                                report_ref(*done_bytes_ref);
+                            },
+                        )?;
+                    }
+                    let lead = coll.lead_ids();
                     let batch: Vec<(SectionId, &str)> = coll
                         .sections
                         .iter()
@@ -533,6 +560,7 @@ impl Sequence {
                             &batch,
                             &linear_prefix,
                             sealed_at_top,
+                            &lead,
                             // A schema collection's members, at its level.
                             SectionSeal::Member {
                                 level: coll.kv_level,
@@ -624,6 +652,7 @@ impl Sequence {
                                             &batch,
                                             &prefix,
                                             None,
+                                            &[],
                                             SectionSeal::Member {
                                                 level: tc.collection.kv_level,
                                             },

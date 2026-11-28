@@ -306,6 +306,10 @@ pub(super) enum YamlSystemPromptItem {
         /// The compression level its members are sealed at.
         #[serde(default)]
         kv_level: Option<u8>,
+        /// Records every member is sealed behind and that are never placed
+        /// (`docs/placed_section_layout.md` §3.5f).
+        #[serde(default)]
+        lead: Vec<YamlSection>,
     },
     /// An ordered, individually-toggleable tree of sealed sections.  Each node
     /// is a `section` (mandatory), an `optional` (binary toggle), or a
