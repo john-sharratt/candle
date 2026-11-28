@@ -175,7 +175,28 @@ pub(crate) fn files_splice<R: ContentResolver>(
                         .get(&k)
                         .map(|(r, i)| r.chunks[*i].member.tokens as usize)
                 };
-                for s in choose(&ranked, tokens_of, kind_cap(share)) {
+                let chosen = choose(&ranked, tokens_of, kind_cap(share));
+                // What the kind ranked and what of it was placed: the first
+                // question when a file a question asks about is not placed.
+                tracing::debug!(
+                    target: "candle_conversation::projection::files",
+                    kind = group.id.raw(),
+                    cap = kind_cap(share),
+                    ranked = ranked.len(),
+                    chosen = chosen.len(),
+                    top = %ranked
+                        .iter()
+                        .take(RANKED_LOGGED)
+                        .map(|(k, m)| {
+                            let path = index.get(k).map_or("?", |(r, _)| r.path.as_str());
+                            let mark = if chosen.contains(k) { "+" } else { "" };
+                            format!("{mark}{path}#{}:{m:.0}", index.get(k).map_or(0, |(_, i)| *i))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    "the knowledge base's kind ranked (+ placed), strongest first"
+                );
+                for s in chosen {
                     picked.push((s, momentum.get(&s).copied().unwrap_or(0.0)));
                 }
             }
@@ -223,6 +244,9 @@ pub(crate) fn files_splice<R: ContentResolver>(
     };
     emit(places, &index, &member, None)
 }
+
+/// How many of a kind's ranked sections the splice's debug line names.
+const RANKED_LOGGED: usize = 24;
 
 /// The positions the knowledge base's range reserves on an engine of
 /// `native` context: the `files` collection's range, or no bound when it
