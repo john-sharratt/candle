@@ -1,0 +1,7 @@
+row,mean,peak
+Sessions in flight,14.4,16
+KV arenas held (GiB),1.3,1.71875
+Tokens resident,75343.84999991409,85101.99999990422
+The same tokens at BF16 (GiB),1.7808478921598279,2.0114942005032654
+Effective compression (BF16 / arenas held),1.2587840382399644,1.6098072368732326
+Expert zone (GiB),56.44101619720459,60.701894760131836
