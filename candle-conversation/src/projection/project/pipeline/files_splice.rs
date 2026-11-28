@@ -238,6 +238,26 @@ pub(crate) fn files_splice<R: ContentResolver>(
             // read (`FilesSet::order_score`, `docs/placed_section_layout.md`
             // §3.2). Every decode step reorders it from there.
             scope.reorder(|k| set.order_score(k), 0.0);
+            // The range as the first token reads it, top — beside the question —
+            // first: which file sits nearest decides a reading between two of
+            // the same kind (`docs/placed_section_layout.md` §3.2).
+            tracing::debug!(
+                target: "candle_conversation::projection::files",
+                order = %scope
+                    .sections()
+                    .take(RANKED_LOGGED)
+                    .map(|e| {
+                        let path = index.get(&e.key).map_or("?", |(r, _)| r.path.as_str());
+                        let i = index.get(&e.key).map_or(0, |(_, i)| *i);
+                        match set.order_score(e.key) {
+                            Some(s) => format!("{path}#{i}:{s:.0}"),
+                            None => format!("{path}#{i}:-"),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                "the knowledge base's range laid out, top first (order score)"
+            );
             let places = scope.places().iter().rev().copied().collect();
             return emit(places, &index, &member, Some(scope));
         }
