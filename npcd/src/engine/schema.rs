@@ -755,6 +755,39 @@ mod tests {
         );
     }
 
+    /// **A turn about none of the guides takes none.** The live mind's guides
+    /// group gates its belief at the tool catalog's strict band and may choose
+    /// nothing: without a band it had no gate at all, and every turn took its two
+    /// loudest guides whatever it was about.
+    #[test]
+    #[ignore = "reads the live mind checked out beside this repository"]
+    fn the_live_minds_guides_take_none_a_turn_is_not_about() {
+        let mind = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../mind");
+        let p = build(Some(&MindFiles::folder(&mind)), "moon").expect("the live mind parses");
+        let methods = p
+            .builder
+            .id_for_group("methods")
+            .expect("a `methods` group");
+        let group = p
+            .builder
+            .schema()
+            .layers
+            .iter()
+            .find(|l| l.name == "guides")
+            .and_then(|l| l.groups.iter().find(|g| g.id == methods))
+            .expect("the guides layer holds `methods`");
+        let cfg = group.belief_config(32);
+        assert_eq!(
+            (
+                cfg.min_score,
+                cfg.evict_score,
+                cfg.budget_min,
+                cfg.budget_max
+            ),
+            (800.0, 600.0, 0, 2)
+        );
+    }
+
     /// A schema holding exactly `items`, built the way [`build`] builds one.
     fn schema(items: &str) -> Builder {
         let yaml = format!("system_prompt:\n  items:\n{items}layers: []\n");
