@@ -35,12 +35,19 @@ Two correctness fixes came with these changes: holes are pieces of the layout
 (§2.7), and compaction catches up an outstanding gap before it relocates
 anything (§2.8).
 
-On a 24-question battery over the repositories' root files (depth 1), the
-production arm C1 now reaches **84.7% mean recall** (95% interval
-72.9–95.1%, two runs). Earlier that day it stood at 69–76% (§3). That battery
-is not the paper's battery: it has different questions and a different
-ingest depth. v3's numbers must come from the 128-question battery, rerun on
-a full-depth ingest (§5).
+The two 24-question batteries put the change in scale:
+
+- **Before (reading turns):** the pilot battery scored 46.2% mean recall on
+  production on 2026-11-18. It rose to 62.2% by 2026-11-20 as retrieval
+  changed (v2 §9.12).
+- **After (system prompt):** the depth-1 battery, over the repositories' root
+  files, first measured 74.3%. Production C1 now reaches **84.7% mean
+  recall** (95% interval 72.9–95.1%, two runs).
+
+The system prompt itself was the largest single step (§2.1, §3). The two
+batteries ask different questions at different ingest depths, and neither is
+the paper's. v3's numbers must come from the 128-question battery, rerun on a
+full-depth ingest (§5).
 
 ## 2. The changes
 
@@ -267,7 +274,32 @@ fix).
   prefilled fresh. It reports where the two diverge (20e8a4bc4 onward). Its
   transplant modes do not yet handle holes.
 
-## 3. Evidence so far: the depth-1 battery
+## 3. Evidence so far
+
+### 3.1 Before the move: the knowledge base as reading turns
+
+v2's own measurements of the memory, before §2.1:
+
+| Measurement | Questions | Mean recall | Source |
+|---|---:|---:|---|
+| Pilot battery on production, 2026-11-18 | 24 | 46.2% | `docs/results/dependency_battery_gap_analysis_2026-11-18.md` |
+| Pilot as retrieval changed, by 2026-11-20 | 24 | 57.6% → 62.2% | v2 §9.12, `docs/results/dependency_battery_2026-11-20_b.md` |
+| Pilot, reprojecting in thinking against held, 2026-11-23 | 24 | 57.3% against 38.8% | v2 §9.12, `docs/results/dependency_battery_2026-11-23_l_m.md` |
+| The 128-question battery, C1 | 128 | 37.5% | v2 §9.12, `docs/results/battery_128/` |
+
+The 18 November note found where the pilot lost its points. Of 54 answer
+files, 52% were placed, 22% could never be placed (over the 48K file cap),
+and 26% were not drawn. The 128-question battery then showed the model
+failing to read even the files it was given: 69.9% of in-view items named,
+against 97.6% from text (§2.1).
+
+### 3.2 After the move: the depth-1 battery
+
+The two batteries are not the same questions. The pilot is 24 hand-picked
+questions over the whole fork. The depth-1 battery is 24 questions over the
+root files. The step from 46.2% to the 70s is the move's scale, not a
+controlled contrast: its controlled measure is the 0/16 → 16/16 probe of
+§2.1, and in v3 it must be the 128-question battery rerun (§5).
 
 `zend/examples/dependency_battery/battery_depth1.yaml` holds 24 questions
 (k01–k24) over what an ingest at `max_depth: 1` holds: the root files of
@@ -276,6 +308,7 @@ dials. Each figure is mean recall, measured on BlackWorld on 2026-11-28.
 
 | Configuration | Mean recall |
 |---|---:|
+| *(before the move: the pilot battery, reading turns, 2026-11-18)* | *46.2%* |
 | Order by momentum, no lock | 74.3% |
 | Order-lock bar 50 | 74.3% |
 | Order-lock bar 150 | 70.1% |
