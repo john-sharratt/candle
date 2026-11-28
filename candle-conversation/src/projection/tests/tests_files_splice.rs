@@ -1,6 +1,8 @@
 //! The knowledge base's files spliced into the system prompt
 //! (`docs/provenance_system_collection.md` §3, §4).
 
+use std::collections::HashMap;
+
 use super::*;
 use crate::files::names::chunk_name;
 use crate::files::scope::RangeScope;
@@ -414,6 +416,42 @@ fn the_mandatory_files_open_a_free_knowledge_base() {
     mock.files.as_mut().unwrap().pin = FilesPin::Only(fa.section_keys());
     let pinned = files_splice(b.schema(), &mock, |_| 150, true);
     assert_eq!(pinned.order(), vec![fa.key()]);
+}
+
+/// **The question's first reading orders the opening, the seed among the
+/// rest** (`docs/placed_section_layout.md` §3.2): scanned, a (900) sits
+/// beside the question over the mandatory m (10); the first reading's index
+/// read m's sections at 800 and 700 and a's at 100, so the opening lays a at
+/// the front and m's first section beside the question, as the first decode
+/// step would.
+#[test]
+fn the_first_reading_orders_the_opening_the_seed_among_the_rest() {
+    let b = Builder::from_yaml(YAML).unwrap();
+    let fm = record("candle/README.md", &[(1, 200), (201, 300)]);
+    let fa = record("candle/a.rs", &[(1, 10)]);
+    let records = [fm.clone(), fa.clone()];
+    let (mut mock, _) = resolver(&b, &records, &[(fm.key(), 10.0), (fa.key(), 900.0)], vec![]);
+    mock.mandatory_files = vec!["candle/README.md".into()];
+    assert_eq!(
+        files_splice(b.schema(), &mock, |_| 150, true).order(),
+        vec![fm.key(), fa.key()],
+        "by the scan alone"
+    );
+    let rates: HashMap<SectionKey, f32> = [
+        (fm.section_key(0), 800.0),
+        (fm.section_key(1), 700.0),
+        (fa.section_key(0), 100.0),
+    ]
+    .into_iter()
+    .collect();
+    mock.files.as_mut().unwrap().observe_hits(&rates);
+    let read = files_splice(b.schema(), &mock, |_| 150, true);
+    assert_eq!(read.order(), vec![fa.key(), fm.key()]);
+    assert_eq!(
+        read.sections,
+        vec![fa.section_key(0), fm.section_key(1), fm.section_key(0)],
+        "front to top: m's first section, read most, beside the question"
+    );
 }
 
 /// **A file's sections compete apart** (`docs/placed_section_layout.md`

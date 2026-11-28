@@ -4,12 +4,18 @@
 //! own slot. The first reading prefills it, to the token before its last,
 //! against the projection with the seeds held out (`WorkingSet::holds_out`),
 //! and scores it: its fresh scores feed the working set's momentum and the
-//! boundary takes the question, which brings the seeds back. Its hits are
-//! discarded — they were earned against a slot the reply never sees — and so
-//! is its view: nothing was sealed, so the parent stands where it stood. The
-//! turn is then submitted again, unchanged, and its opening projection places
-//! the seeds and what the question ranked in one ranking, chosen whole, before
-//! the question is prefilled a second time and the reply decodes.
+//! boundary takes the question, which brings the seeds back. The index's hits
+//! on each knowledge-base section — the mandatory seed files among them, which
+//! the first reading places — are the range's first step
+//! (`docs/placed_section_layout.md` §3.2): their rates seed the files set's
+//! hit momentum, so the opening lays the range out in the order the first
+//! decode step would, the section the question read most beside it. The
+//! conversation rounds' counts were earned against a slot the reply never
+//! sees, and are dropped, and so is the view: nothing was sealed, so the
+//! parent stands where it stood. The turn is then submitted again, unchanged,
+//! and its opening projection places the seeds and what the question ranked
+//! in one ranking, chosen whole, before the question is prefilled a second
+//! time and the reply decodes.
 //!
 //! The seeds are background every conversation starts from, and the question
 //! read against them scored a different set of files: on BlackWorld
@@ -18,6 +24,7 @@
 //! A first reading that cannot be scored fails the turn: nothing decodes on a
 //! slot chosen half-way.
 
+use super::projection_assembler::section_rates;
 use super::*;
 
 /// What a submitted turn is, as far as reading it first depends on.
@@ -115,11 +122,12 @@ impl Scheduler {
             (Ok(_), None) => fail(ConversationError::Channel(format!(
                 "first reading: view {view_id} has no parent to submit its turn again on"
             ))),
-            (Ok((candidates, scores)), Some(parent)) => {
+            (Ok((candidates, rated, scores)), Some(parent)) => {
                 self.first_readings.insert(parent, scores);
                 note("first reading", || {
                     format!(
-                        "view={} parent={} tokens={} candidates={candidates} scored_ms={}",
+                        "view={} parent={} tokens={} candidates={candidates} \
+                         sections_rated={rated} scored_ms={}",
                         view_id.0,
                         parent.0,
                         prefill.offset,
@@ -142,14 +150,15 @@ impl Scheduler {
 
     /// Score the reading `view_id` holds: its probe through the belief scan,
     /// folded into the working set's momentum at a boundary that takes the
-    /// question. Its hits are read and dropped. Returns how many candidates
-    /// the scan scored, and its scores, which the second reading's opening
-    /// projection is ranked by.
+    /// question. Its hits rate the knowledge base's sections, the range's
+    /// first step (`Substrate::files_read_first`). Returns how many candidates
+    /// the scan scored, how many sections the index rated, and the scan's
+    /// scores, which the second reading's opening projection is ranked by.
     fn score_first_reading(
         &mut self,
         view_id: SequenceId,
         work: &PrefillWork,
-    ) -> Result<(usize, ProjectionScores), ConversationError> {
+    ) -> Result<(usize, usize, ProjectionScores), ConversationError> {
         let policy = work.reprojection.clone().ok_or_else(|| {
             ConversationError::Channel(format!(
                 "first reading: view {view_id} carries no reprojection policy"
@@ -186,15 +195,36 @@ impl Scheduler {
             Observe::No,
             self.gallery_arena.as_deref().map(|a| a as &dyn BeliefArena),
         );
-        // The reading's hits were counted against a slot the reply never
-        // sees: read, so the counters start the second reading at zero, and
-        // dropped.
+        // The reading's hits are read, so the counters start the second
+        // reading at zero. What the index read of each knowledge-base section
+        // is the question's, wherever the section sat: its rates are the
+        // range's first step, which the opening orders by. The conversation
+        // rounds' counts were earned against a slot the reply never sees, and
+        // are dropped.
         let slot = view_state.parent_id;
-        if let Some(state) = self.slot_projection_state.get_mut(&slot) {
-            state.unread_hits.clear();
-            self.model
-                .take_hits(slot.0)
-                .map_err(ConversationError::Model)?;
+        let rates = match self.slot_projection_state.get_mut(&slot) {
+            Some(state) => {
+                state.unread_hits.clear();
+                let hits = self
+                    .model
+                    .take_hits(slot.0)
+                    .map_err(ConversationError::Model)?;
+                match hits {
+                    // Only a read that counted the selection's queries says
+                    // how the placed sections were read.
+                    Some(h) if h.queries > 0 => {
+                        section_rates(&state.hit_keys, &h, &state.kb_rounds)
+                    }
+                    _ => HashMap::new(),
+                }
+            }
+            None => HashMap::new(),
+        };
+        if !rates.is_empty() {
+            let target = policy.target.timeline;
+            policy
+                .substrate
+                .update(|s| s.files_read_first(target, &rates));
         }
         if policy.substrate.read().pool_size() != self.pool_size {
             let size = self.pool_size;
@@ -212,7 +242,11 @@ impl Scheduler {
             &group_candidates,
             &HashMap::new(),
         );
-        Ok((group_candidates.iter().map(|(_, c)| c.len()).sum(), scores))
+        Ok((
+            group_candidates.iter().map(|(_, c)| c.len()).sum(),
+            rates.len(),
+            scores,
+        ))
     }
 }
 

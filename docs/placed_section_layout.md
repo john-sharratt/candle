@@ -189,18 +189,32 @@ end are read best; the end is what the question is nearest), each weaker one
 further from it. Nothing is exempt — the mandatory seed files are ordered like
 every other section, and sink back from the question as they stop being read.
 
-- **The first token reads the best order there is.** At a request's start the
-  range is ordered by the files set's momentum (§3.4's boundary fold), the
-  mandatory files among the rest (`files_splice`, `RangeScope::reorder`). A
-  pinned knowledge base — a test's, a calibration's frame — is ordered the
-  same way: the pin says what is placed, its sections never leave, and the
-  scan still folds their scores (`FilesSet::observe`), so it too opens with
-  the question's strongest beside it.
-- **The decode reorders it every step.** Each section's **momentum** is an
-  exponential average of its per-step hit rate on the 0–1000 band
-  (`files/scope/momentum.rs`): taken whole the first step that rates it, so
-  the order locks on at once, then a quarter of the way toward each step's
-  rate (`MOMENTUM_KEEP` 0.75). After every step the range is ordered by it
+- **The first token reads the best order there is.** A new question is read
+  twice (`docs/hit_driven_projection.md` §7.4). The first reading prefills it
+  against the range as it stands, the mandatory files among the placed
+  sections, and the index's hits on each section are **the range's first
+  step**: their rates are taken whole into the files set's hit momentum
+  (`Substrate::files_read_first`). The opening projection then orders the
+  range by that momentum before the second prefill (`files_splice`,
+  `FilesSet::order_score`, `RangeScope::reorder`). So the second prefill and
+  the first decoded token already read the order the first decode step would
+  give, with the section the question read most beside it, and the first
+  steps move only what the decode reads differently. A section the index has
+  not read this question is ordered by its scan momentum (the provenance
+  scan's fold, §3.4); both are on the 0–1000 band. A pinned knowledge base,
+  such as a test's or a calibration's frame, is ordered the same way. The pin
+  says what is placed and its sections never leave, but the index rates them
+  and the scan still folds their scores (`FilesSet::observe`), so it too
+  opens with the question's strongest beside it.
+- **The decode reorders it every step.** Each section's **hit momentum** is
+  an exponential average of its hit rate on the 0–1000 band, held on the
+  files set beside the range (`FilesSet::hits`, `files/scope/momentum.rs`). A
+  section's first rate this question is taken whole, from the first reading
+  or else from the first step that rates it, so the order locks on at once.
+  After that each step moves it a quarter of the way toward its rate
+  (`MOMENTUM_KEEP` 0.75). A new question starts it afresh
+  (`FilesSet::clear_withheld`), so the last question's reading does not hold
+  the order for this one. After every step the range is ordered by it
   (`files_step`), so a section the decode locks onto is drawn to the top
   within a few steps and stays there while it is read, and one it stops
   reading sinks back over several. A section passes the one above it only
@@ -257,9 +271,11 @@ section's **hit rate**: the share of the section's blocks the QSA index
 selected — or, for a section not placed, would have selected above the
 query's cut (the shadow scan) — per query, over the sampled layers, averaged
 step to step into its momentum (§3.2). Without a QSA index it is the section's
-provenance score (§3.8). At a request's start, before any step has read the
-range, the files set's momentum — the boundary fold of those same hits —
-orders it.
+provenance score (§3.8). At a request's start, the question's first reading
+is the first step. Its hits rate the sections that reading placed, and the
+shadow scan rates the resident ones, so the opening is ordered by the same
+signal every later step uses. Only a section neither rated falls back to the
+files set's scan momentum.
 
 - **A rate, not a raw count, and no kernel change.** The device already
   counts hits per declared round (`qsa_hits.cu`, `qsa_shadow.cu`: one
@@ -307,10 +323,10 @@ orders it.
   as hit rounds of their own (`RoundKey::of_section`), so a step's read
   rates them; every step's read is summed into the slot's unread hits, so
   the boundary still folds them into its momentum.
-- **The order is relevance.** At the opening the strongest by the files set's
-  momentum is at the top, nearest the question; after it, every step orders
-  the range by the decode's momentum (§3.2), so a section's position records
-  its rank, not when it entered.
+- **The order is relevance.** At the opening the section the question's
+  first reading read most is at the top, nearest the question. After that
+  every step orders the range by the same hit momentum (§3.2), so a section's
+  position records its rank, not when it entered.
 - **A step's decision applies from the next step.** The hits of step *t*
   decide the layout step *t* + 1 reads, so a step never reads a layout its own
   hits changed. With speculative decoding the step is the verified step: a
