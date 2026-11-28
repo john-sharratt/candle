@@ -10,6 +10,7 @@
 //! never offered walking.
 
 use super::*;
+use crate::engine::beyond;
 
 /// The tools offered in a mode, whatever the character's situation.
 ///
@@ -201,10 +202,12 @@ pub const SHOWN_ACTS: usize = 10;
 /// did not include it: "that tool does not exist in my available toolset". And
 /// so is an act that is granted — a mission's own, a terminal's verbs while it
 /// is connected — and a house device's, which are offered only for as long as
-/// they are what the character is there to do.
+/// they are what the character is there to do. And the few acts beyond the
+/// world the commonest questions are answered with ([`beyond::ALWAYS_SHOWN`]).
 pub fn shown_wherever_offered(t: &Tool) -> bool {
     routed(t.name)
         || BRIDGE_ACTS.iter().any(|b| b.name == t.name)
+        || beyond::ALWAYS_SHOWN.contains(&t.name)
         || matches!(
             t.availability,
             Availability::Granted | Availability::AtLift | Availability::AtLanding

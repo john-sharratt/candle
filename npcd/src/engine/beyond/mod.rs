@@ -64,6 +64,22 @@ impl Group {
         Group::ALL.into_iter().find(|r| r.name() == word.trim())
     }
 
+    /// What it lets the character do, as a conversation is told it.
+    pub fn doing(self) -> &'static str {
+        match self {
+            Group::Outside => {
+                "look up the weather and its forecast anywhere, search and read the web, \
+                 make requests to the internet, tell the time anywhere and look up a name"
+            }
+            Group::Reckoning => "work out sums, conversions and random draws",
+            Group::Memory => {
+                "read your own journal and the guides, and keep and read notes in the \
+                 world's notebook"
+            }
+            Group::Making => "draw a picture, or change one",
+        }
+    }
+
     /// The acts it offers, each named as its tool.
     pub fn acts(self) -> &'static [&'static str] {
         match self {
@@ -123,6 +139,36 @@ pub fn declared(body: &Value) -> (Vec<Group>, Vec<String>) {
     reaches_of(&words)
 }
 
+/// What a conversation is told `groups` let the character do once the call is
+/// over — `None` for a character that reaches nothing.
+///
+/// **A conversation is shown nothing of the world, so it has to be told.**
+/// Asked the weather, Zen's conversation answered "I do not have access to
+/// real-time weather data" while its mind held `weather`.
+pub fn away_from_the_phone(groups: &[Group]) -> Option<String> {
+    let doing: Vec<&str> = groups.iter().map(|g| g.doing()).collect();
+    let (last, rest) = doing.split_last()?;
+    let all = match rest.is_empty() {
+        true => last.to_string(),
+        false => format!("{}; and {last}", rest.join("; ")),
+    };
+    Some(format!(
+        "Away from the phone you can also {all}. Asked for one of these, say you will — \
+         never that you cannot, or have no way to know."
+    ))
+}
+
+/// The acts beyond the world a turn always describes when it offers them,
+/// however they rank: what the commonest questions from outside — the
+/// weather, the time, a sum, anything else — are answered with.
+///
+/// **Ranked with the rest, the narrow ones lost to the broad ones.** A turn
+/// describes ten acts by rank beside a connected terminal's verbs; asked the
+/// weather, the time in Hanoi and a sum, Zen called `web_fetch` and
+/// `web_search` for all three and never once `weather`, `datetime` or
+/// `calculator` — and its conversation answered that it had no live data.
+pub const ALWAYS_SHOWN: [&str; 4] = ["weather", "datetime", "calculator", "web_search"];
+
 /// Whether `tool` is one of these acts.
 pub fn is_mine(tool: &str) -> bool {
     Group::ALL.iter().any(|g| g.acts().contains(&tool))
@@ -138,6 +184,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::engine::tools::shown_wherever_offered;
 
     /// **The groups are the catalogue, exactly**: every act of every group is
     /// in it once, and nothing in it belongs to no group.
@@ -181,6 +228,39 @@ mod tests {
             declared(&json!({"reaches": "outside"})),
             (Vec::new(), Vec::new())
         );
+    }
+
+    /// **A conversation is told what its character reaches, in order, and of
+    /// one that reaches nothing, nothing.**
+    #[test]
+    fn a_conversation_is_told_what_its_character_reaches() {
+        assert_eq!(away_from_the_phone(&[]), None);
+        assert_eq!(
+            away_from_the_phone(&[Group::Reckoning]).unwrap(),
+            "Away from the phone you can also work out sums, conversions and random draws. \
+             Asked for one of these, say you will — never that you cannot, or have no way to \
+             know."
+        );
+        assert_eq!(
+            away_from_the_phone(&[Group::Reckoning, Group::Making]).unwrap(),
+            "Away from the phone you can also work out sums, conversions and random draws; and \
+             draw a picture, or change one. Asked for one of these, say you will — never that \
+             you cannot, or have no way to know."
+        );
+    }
+
+    /// **The acts always shown are reached acts, each in a group**, so none
+    /// is shown to a character whose personality does not reach it.
+    #[test]
+    fn the_acts_always_shown_are_reached_acts() {
+        for name in ALWAYS_SHOWN {
+            assert!(is_mine(name), "{name}");
+            let act = acts::of(name).unwrap();
+            assert!(shown_wherever_offered(&act.tool), "{name}");
+        }
+        assert!(!shown_wherever_offered(
+            &acts::of("web_fetch").unwrap().tool
+        ));
     }
 
     #[test]

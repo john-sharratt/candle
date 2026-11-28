@@ -472,9 +472,15 @@ argument the tool does not declare is no example.
 **Each act is granted, wherever the character stands and whatever it is connected to**: no
 terminal holds them, and a mind with no body reaches them as a Drone does. They are offered in the
 mind's own turns, never on the phone — a conversation only talks, and what it promises to find
-out is the mind's to do (`talk::within`, `talk::turn::ANSWERING`). Their availability is
-`Reached`: shown on the turns that are offered them, ranked against the turn like every other
-act, and never in another character's prompt. The act is checked again as it is performed: a
+out is the mind's to do (`talk::within`, `talk::turn::ANSWERING`), and the conversation is
+told what the character can do once the call is over (`beyond::away_from_the_phone`), so it
+says it will rather than that it cannot. Their availability is `Reached`: shown on the turns
+that are offered them, ranked against the turn like every other act, and never in another
+character's prompt — except `weather`, `datetime`, `calculator` and `web_search`
+(`beyond::ALWAYS_SHOWN`), described on every turn that offers them, because ranked with the
+rest the narrow ones lost to the broad: asked the weather, the time and a sum, Zen called the
+web for all three. An act beyond the world brings the mind straight back to read its answer,
+as a terminal's reading does (`Runtime::arm_followup`). The act is checked again as it is performed: a
 character whose personality has stopped naming the group is refused.
 
 **Each runs where the tool already lives**, with the arguments zend's tool of the same name

@@ -23,6 +23,7 @@ use serde_json::Map;
 use crate::api::now_ms;
 use crate::authority::ops::{ActSource, OpReply, Voiced, WorldOp};
 use crate::engine::act::Act;
+use crate::engine::beyond::away_from_the_phone;
 use crate::engine::event::{EventKind, Salience, TalkLine};
 use crate::engine::experience::line;
 use crate::engine::mind::{Minds, Talk, TalkTurn};
@@ -54,6 +55,9 @@ struct OnTheThread {
     /// The character's own last lines on it, newest last.
     own_last: Vec<String>,
     last_said_ms: Option<u64>,
+    /// How many of the character's own lines end the thread since the party
+    /// last said anything.
+    unanswered: usize,
 }
 
 impl Runtime {
@@ -209,18 +213,20 @@ impl Runtime {
         let seen = hosted
             .sim(|s| {
                 let t = s.threads.direct_between(&body, member)?;
-                let own_last: Vec<String> = t
-                    .since_joined(&body)
+                let since = t.since_joined(&body);
+                let own_last: Vec<String> = since
                     .iter()
                     .filter(|m| m.from == body)
                     .map(|m| m.text.clone())
                     .collect();
+                let unanswered = since.iter().rev().take_while(|m| m.from == body).count();
                 Some(OnTheThread {
                     thread: t.id.clone(),
                     party_name: t.as_named_to(&body),
                     me: s.roster_name(&body).unwrap_or(&body).to_string(),
                     last_said_ms: t.last_said_by(&body).map(|m| m.at_ms),
                     own_last,
+                    unanswered,
                 })
             })
             .ok_or_else(|| anyhow::anyhow!("npc {npc} has no thread with {member}"))?;
@@ -245,6 +251,33 @@ impl Runtime {
             Party::Person(handle) => self.journals.person(&world, handle),
             Party::Npc(_) => self.journals.bot(&world, member),
         };
+
+        // **Nobody is told a third thing while they have answered none of
+        // the last two** (§8, unprompted contact): what it meant to tell them
+        // is written down, and the mind is told it waits for them.
+        if lines.is_empty() && guard::holds_purpose(seen.unanswered, seen.last_said_ms, now_ms()) {
+            for purpose in &inputs.purposes {
+                self.journals.note(
+                    &world,
+                    &body,
+                    ExperienceKind::Wrote,
+                    &format!("Held for {}: {}", seen.party_name, purpose.trim()),
+                    about.clone(),
+                );
+            }
+            self.scheduler.deliver(
+                npc,
+                self.world_ms(npc),
+                Salience::NORMAL,
+                EventKind::Concluded {
+                    party: seen.party_name.clone(),
+                    applied: held_for_the_mind(&seen.party_name, seen.unanswered),
+                },
+            );
+            minds.park_talk(talk).await;
+            return Ok(Ended::Quiet);
+        }
+
         let input = match lines.is_empty() {
             true => Input::Purpose,
             false => Input::Line,
@@ -354,7 +387,10 @@ impl Runtime {
                  answer: you are the one speaking now, to tell them one thing.",
                 seen.party_name
             ),
-            None => format!("{head} {ANSWERING}"),
+            None => match away_from_the_phone(&self.reaches_of(npc)) {
+                Some(away) => format!("{head} {ANSWERING} {away}"),
+                None => format!("{head} {ANSWERING}"),
+            },
         };
         let spoken = minds
             .talk_turn(
@@ -789,6 +825,16 @@ const ANSWERING: &str = "On the phone you only talk. Whatever they ask you to do
                          is done, posted or sent: nothing is, until you have done it away from \
                          the phone.";
 
+/// What the mind reads when what it wanted to tell `party` is held: they have
+/// answered none of its last `unanswered` lines.
+fn held_for_the_mind(party: &str, unanswered: usize) -> String {
+    format!(
+        "You did not tell {party} that: they have not answered the last {unanswered} things you \
+         said to them, and a third would be talking at somebody who is away. It is written \
+         down; when they write again, tell them anything that still matters. Until then, rest."
+    )
+}
+
 /// What the mind reads once the words it asked for have been said: the words,
 /// that saying them again adds nothing, and that what they promised is still
 /// to be done — woken by its own telling, a mind with nothing new told the
@@ -835,7 +881,9 @@ fn talk_band(party: &Party) -> DecodePriority {
 
 #[cfg(test)]
 mod tests {
-    use super::{refused_post, said_for_the_mind, talk_band, DecodePriority, Party};
+    use super::{
+        held_for_the_mind, refused_post, said_for_the_mind, talk_band, DecodePriority, Party,
+    };
 
     /// **A refused post is told to the mind in the table's own words**, with
     /// whose request it was.
@@ -850,6 +898,17 @@ mod tests {
              refused it: Give it at least one step, or a standing `job` by name: `coding-task`. \
              Nothing is posted. It is yours to post now, as the table says, and to tell John \
              when it is done."
+        );
+    }
+
+    /// **A held telling is said to be held, why, and what to do instead.**
+    #[test]
+    fn a_held_telling_says_why_and_to_rest() {
+        assert_eq!(
+            held_for_the_mind("John", 2),
+            "You did not tell John that: they have not answered the last 2 things you said to \
+             them, and a third would be talking at somebody who is away. It is written down; \
+             when they write again, tell them anything that still matters. Until then, rest."
         );
     }
 

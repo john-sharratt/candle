@@ -22,6 +22,7 @@
 //! | Module | |
 //! |---|---|
 //! | [`acts`] | the catalogue's entries |
+//! | [`asked_job`] | whether a job on the cluster was asked for |
 //!
 //! This module is the reading: which terminals there are, what a connection
 //! puts in a mind's grammar, and what each verb asks of the thing behind it.
@@ -29,6 +30,7 @@
 //! (`crate::authority::terminals`).
 
 pub mod acts;
+pub mod asked_job;
 pub mod watch;
 
 use std::collections::BTreeMap;

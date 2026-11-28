@@ -30,6 +30,7 @@ use crate::bridge::{discover, PAIRING_AGENT};
 use crate::engine::act::Act;
 use crate::engine::event::{EventKind, Salience};
 use crate::engine::runtime::{still_asked, Recorded, Runtime, LANDED, REFUSED};
+use crate::engine::terminal::asked_job::{self, asks_for_a_job};
 use crate::engine::terminal::{
     self, check_args, tv_action, watch, welcome, Kind, Machine, Terminal, ALL_LIGHTS, CLUSTER,
     NETWORK,
@@ -224,21 +225,17 @@ impl Runtime {
                     false => (false, REST_REFUSED.into()),
                 },
             },
-            _ => match self.connection(&hosted, &body) {
-                None => (
-                    false,
-                    "You are connected to nothing: `terminal_list` says what there is, and \
-                     `terminal_connect` takes you to one."
-                        .into(),
-                ),
-                Some(terminal) => {
-                    let (landed, answer) = self.work(&hosted, &terminal, act).await;
-                    if landed {
-                        hosted.with_sim(|s| s.missions.worked_terminal(&body, &terminal.name));
-                    }
-                    (landed, answer)
+            // A build or a test only for somebody who asked for one.
+            "cluster_job_start" => match self.scheduler.asked(npc, self.world_ms(npc)) {
+                Some((_, request)) if asks_for_a_job(&request) => {
+                    self.on_connection(&hosted, &body, act).await
                 }
+                asked => (
+                    false,
+                    asked_job::refused(asked.as_ref().map(|(p, r)| (p.as_str(), r.as_str()))),
+                ),
             },
+            _ => self.on_connection(&hosted, &body, act).await,
         };
         if landed {
             hosted.with_sim(|s| {
@@ -247,6 +244,25 @@ impl Runtime {
             });
         }
         recorded(act, landed, answer)
+    }
+
+    /// `act` worked on the terminal `body` is connected to.
+    async fn on_connection(&self, hosted: &Hosted, body: &str, act: &Act) -> (bool, String) {
+        match self.connection(hosted, body) {
+            None => (
+                false,
+                "You are connected to nothing: `terminal_list` says what there is, and \
+                 `terminal_connect` takes you to one."
+                    .into(),
+            ),
+            Some(terminal) => {
+                let (landed, answer) = self.work(hosted, &terminal, act).await;
+                if landed {
+                    hosted.with_sim(|s| s.missions.worked_terminal(body, &terminal.name));
+                }
+                (landed, answer)
+            }
+        }
     }
 
     async fn list_terminals(&self, hosted: &Hosted) -> (bool, String) {

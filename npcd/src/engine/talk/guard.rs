@@ -6,7 +6,7 @@
 //! | Repeats | words that say again what this thread's last four lines of the character's said go to the journal instead: nothing is struck |
 //! | Reply cooldown | NPC↔NPC only, six seconds per party; people are never made to wait |
 //! | Activation cap | NPC↔NPC only, [`TALK_TURNS`] turns per side, then the journal or a goodbye |
-//! | Unprompted contact | a purpose for a party who has not answered the character's last line waits until they do, or an hour passes |
+//! | Unprompted contact | a purpose for a party who has answered none of the character's last two lines waits until they do, or an hour passes |
 
 use crate::engine::loopguard::would_repeat;
 use crate::engine::talk::key::Party;
@@ -34,10 +34,22 @@ pub fn cooling(party: &Party, last_said_ms: Option<u64>, now_ms: u64) -> Vec<Str
     }
 }
 
-/// Whether a purpose for the party waits: the thread's last line is the
-/// character's own, still unanswered, said less than an hour ago.
-pub fn holds_purpose(last_was_mine: bool, last_at_ms: u64, now_ms: u64) -> bool {
-    last_was_mine && now_ms < last_at_ms + UNANSWERED_HOLD_MS
+/// How many of the character's own lines may stand unanswered on a thread
+/// before what it wants to tell the party waits: the line that answered them,
+/// and the one that told them what came of it.
+pub const UNANSWERED_LINES: usize = 2;
+
+/// Whether a purpose for the party waits: the thread ends in
+/// [`UNANSWERED_LINES`] or more of the character's own lines, the newest said
+/// less than an hour ago.
+///
+/// **One line unanswered is the ordinary case, not a storm.** The phone says
+/// "I'll look", and the mind tells them what it found: holding on the first
+/// unanswered line would have held every answer the mind owes. Past two, it
+/// is talking at somebody who is away — Zen sent John four lines in
+/// twenty-four seconds, the last two "I'm here. What do you need?".
+pub fn holds_purpose(unanswered: usize, last_at_ms: Option<u64>, now_ms: u64) -> bool {
+    unanswered >= UNANSWERED_LINES && last_at_ms.is_some_and(|at| now_ms < at + UNANSWERED_HOLD_MS)
 }
 
 /// What a conversation does with words it is about to send to `party`, given
@@ -82,11 +94,18 @@ mod tests {
         assert!(cooling(&Party::Npc(2), None, 0).is_empty());
     }
 
+    /// **The answer owed after "I'll look" goes; the lines after it wait an
+    /// hour for a party who has not answered.**
     #[test]
     fn a_purpose_waits_an_hour_for_a_party_who_has_not_answered() {
-        assert!(holds_purpose(true, 0, UNANSWERED_HOLD_MS - 1));
-        assert!(!holds_purpose(true, 0, UNANSWERED_HOLD_MS));
-        assert!(!holds_purpose(false, 0, 1));
+        assert!(!holds_purpose(0, None, 1), "they spoke last");
+        assert!(
+            !holds_purpose(1, Some(0), 1),
+            "the answer after \"I'll look\""
+        );
+        assert!(holds_purpose(2, Some(0), UNANSWERED_HOLD_MS - 1));
+        assert!(holds_purpose(4, Some(0), 1));
+        assert!(!holds_purpose(2, Some(0), UNANSWERED_HOLD_MS));
     }
 
     #[test]

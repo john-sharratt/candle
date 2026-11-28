@@ -195,6 +195,15 @@ The terminals, each by the name `terminal_connect` takes
 | **`the cluster`** — on a member of one | zend's `/v1/mcp` as `service:zen`, the channel `zen_task` uses; each act one named tool (`terminal::cluster_call`) | how it stands: `cluster_status`, `cluster_services` (`service_status`), `cluster_member {node}` (`member_status`), `cluster_memory {node}` (`member_memory`), `cluster_audit`; its logs: `cluster_logs {grep, level, since}` (`log_grep`), `cluster_log {source}` (`log_read`); its jobs, started and seen through: `cluster_jobs` (`job_list`), `cluster_job {job}` (`job_status`), `cluster_job_read {job, page}` (`job_read`), `cluster_job_stop {job}` (`job_cancel`), `cluster_job_start {repo, program, args}` (`repo_job_start` on `main`, one program, never a shell line). Nothing that decides for the cluster — a rollout, a restart, a deploy — and nothing that writes code, which is a Drone's task |
 | **a machine, by its host name** — each machine an agent runs on: BlackWorld and WhiteWorld | that machine's own agent | `machine_check {check, args}` — the checks below |
 
+**A job on the cluster is started only for somebody who asked for one.** A
+build or a test takes a machine's memory from whatever else it is doing — on
+BlackWorld, the ingest of a substrate. `cluster_job_start` is refused where it
+is performed (`authority::terminals`, `terminal::asked_job`) unless what a
+person asked, and has not yet been told the outcome of, asks for a job in so
+many words — build, test, compile, cargo, bench, clippy, fmt. Told so in its
+personality, Zen still started `cargo test` on both machines on idle turns
+and while answering the time in Hanoi.
+
 **A device belongs to the house, not to a room.** The devices a room's parts
 stand for are that room's and are worked from it by a body, as before. A
 terminal's devices are kept by hardware address in the world's state
