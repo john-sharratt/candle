@@ -16,25 +16,66 @@
 //! background normalizer's band does: `1000 × −ln P(Z ≥ z) / ln 100`. 1000 is a
 //! score as far above its kind as 1 in 100, a file at its kind's mean reads
 //! about 150, and a score of no evidence reads 0, below every scoring file.
+//!
+//! **A kind too small to have a spread is read against every kind.** A mean
+//! and a spread over a handful of files say nothing about any of them: a lone
+//! file reads at its own mean, z 0, however far its probe lifted it, and two
+//! read ±1 whatever their scores. A kind with fewer than [`MIN_KIND_SAMPLE`]
+//! scoring files — a workspace's few `Makefile`s, its one `rust-toolchain.toml`
+//! among its manifests — is read against the scoring files of every kind
+//! together, which is the competition it would be in with no kinds at all.
 
-/// Each of `raw`'s scores as its kind's z-score on the band. `kinds[i]` is
-/// score `i`'s kind. A kind's z is over its scoring (positive) members; a kind
-/// with one scoring member reads it at z 0; a score at or below 0 reads 0.
+/// The fewest scoring files a kind is read against itself with; a smaller
+/// kind is read against every kind's.
+pub const MIN_KIND_SAMPLE: usize = 8;
+
+/// A sum, a sum of squares and a count: what a mean and a spread come from.
+#[derive(Clone, Copy, Default)]
+struct Moments {
+    sum: f64,
+    sq: f64,
+    n: usize,
+}
+
+impl Moments {
+    fn add(&mut self, x: f64) {
+        self.sum += x;
+        self.sq += x * x;
+        self.n += 1;
+    }
+
+    /// `x`'s z-score among these; 0 with fewer than two.
+    fn z(&self, x: f64) -> f64 {
+        if self.n < 2 {
+            return 0.0;
+        }
+        let n = self.n as f64;
+        let mean = self.sum / n;
+        let var = (self.sq / n - mean * mean).max(0.0);
+        (x - mean) / var.sqrt().max(f64::EPSILON)
+    }
+}
+
+/// Each of `raw`'s scores as a z-score on the band. `kinds[i]` is score `i`'s
+/// kind. A kind with at least [`MIN_KIND_SAMPLE`] scoring (positive) members
+/// is read against them; a smaller one against every kind's scoring members
+/// together. A score at or below 0 reads 0.
 pub fn kind_z_band<K: AsRef<str>>(raw: &[f32], kinds: &[K]) -> Vec<f32> {
-    let mut stats: Vec<(&str, f64, f64, usize)> = Vec::new();
+    let mut all = Moments::default();
+    let mut stats: Vec<(&str, Moments)> = Vec::new();
     for (x, k) in raw.iter().zip(kinds) {
         if *x <= 0.0 {
             continue;
         }
-        let k = k.as_ref();
-        let x = *x as f64;
+        let (k, x) = (k.as_ref(), *x as f64);
+        all.add(x);
         match stats.iter_mut().find(|s| s.0 == k) {
-            Some(s) => {
-                s.1 += x;
-                s.2 += x * x;
-                s.3 += 1;
+            Some(s) => s.1.add(x),
+            None => {
+                let mut m = Moments::default();
+                m.add(x);
+                stats.push((k, m));
             }
-            None => stats.push((k, x, x * x, 1)),
         }
     }
     raw.iter()
@@ -43,16 +84,12 @@ pub fn kind_z_band<K: AsRef<str>>(raw: &[f32], kinds: &[K]) -> Vec<f32> {
             if *x <= 0.0 {
                 return 0.0;
             }
-            let z = match stats.iter().find(|s| s.0 == k.as_ref()) {
-                Some(&(_, sum, sq, n)) if n > 1 => {
-                    let n = n as f64;
-                    let mean = sum / n;
-                    let var = (sq / n - mean * mean).max(0.0);
-                    (*x as f64 - mean) / var.sqrt().max(f64::EPSILON)
-                }
-                _ => 0.0,
+            let own = stats.iter().find(|s| s.0 == k.as_ref()).map(|s| s.1);
+            let against = match own {
+                Some(m) if m.n >= MIN_KIND_SAMPLE => m,
+                _ => all,
             };
-            band_of_z(z)
+            band_of_z(against.z(*x as f64))
         })
         .collect()
 }
@@ -142,23 +179,43 @@ mod tests {
         assert!(band_of_z(-80.0) > 0.0);
     }
 
-    /// **A kind is read against itself**: documents at 10 and 30 and code at 2
-    /// and 6 meet at the same band, a lone scoring kind reads at its mean, and
-    /// a score of no evidence reads 0.
+    /// **A kind of at least the sample is read against itself**: eight
+    /// documents at 10 and 30 alternately and eight code files at 2 and 6 meet
+    /// at the same band — z −1 and +1 in each — and a score of no evidence
+    /// reads 0.
     #[test]
-    fn each_kind_is_read_against_its_own() {
-        let raw = [10.0, 30.0, 2.0, 6.0, 5.0, 0.0];
-        let kinds = ["md", "md", "rs", "rs", "toml", "rs"];
+    fn a_large_kind_is_read_against_its_own() {
+        let mut raw = Vec::new();
+        let mut kinds = Vec::new();
+        for i in 0..MIN_KIND_SAMPLE {
+            raw.push(if i % 2 == 0 { 10.0 } else { 30.0 });
+            kinds.push("md");
+            raw.push(if i % 2 == 0 { 2.0 } else { 6.0 });
+            kinds.push("rs");
+        }
+        raw.push(0.0);
+        kinds.push("rs");
         let got = kind_z_band(&raw, &kinds);
-        assert_eq!(got[0], got[2], "z −1 in each kind");
-        assert_eq!(got[1], got[3], "z +1 in each kind");
-        assert!(got[1] > got[0]);
-        assert_eq!(
-            got[4],
-            band_of_z(0.0),
-            "a lone scoring member is its kind's mean"
-        );
-        assert_eq!(got[5], 0.0);
-        assert!(got.iter().take(5).all(|&b| b > 0.0));
+        assert_eq!(got[0], got[1], "z −1 in each kind");
+        assert_eq!(got[2], got[3], "z +1 in each kind");
+        assert_eq!(got[0], band_of_z(-1.0));
+        assert_eq!(got[2], band_of_z(1.0));
+        assert_eq!(*got.last().unwrap(), 0.0);
+    }
+
+    /// **A kind under the sample is read against every kind's**: a lone
+    /// `Makefile` at 30 among scores 10, 10, 30 and 30 — mean 22, spread
+    /// 9.80 — reads at z 0.816, not at its own mean; a kind of two at 10 and
+    /// 30 reads −1.22 and +0.816 there, not ±1.
+    #[test]
+    fn a_small_kind_is_read_against_every_kind() {
+        let raw = [10.0, 30.0, 10.0, 30.0, 30.0];
+        let kinds = ["md", "md", "toml", "toml", ""];
+        let got = kind_z_band(&raw, &kinds);
+        let (mean, sd) = (22.0_f64, (96.0_f64).sqrt());
+        assert_eq!(got[4], band_of_z((30.0 - mean) / sd), "the Makefile");
+        assert_eq!(got[0], band_of_z((10.0 - mean) / sd));
+        assert_eq!(got[1], got[4], "same score, same pool");
+        assert!(got[4] > band_of_z(0.0), "above where its own mean held it");
     }
 }
