@@ -609,11 +609,18 @@ user message opens is first prefilled, on the conversation's own slot, against
 the projection with the dialogue's seeds held out (`WorkingSet::holds_out`),
 to the token before its last, so nothing is sampled. That reading is scored
 like a boundary — its fresh scores feed the working set's momentum, and the
-boundary takes the question, which brings the seeds back — and its hits and its
-view are discarded: nothing was sealed, so the parent stands where it stood.
-The turn is then submitted again unchanged, and its opening projection places
-the seeds and what the question ranked in one ranking, chosen whole, before
-the question is prefilled the second time and the reply decodes
+boundary takes the question, which brings the seeds back. Its hits on the
+knowledge base's sections are kept as the range's first step
+(`docs/placed_section_layout.md` §3.2). They count the mandatory seed files,
+which the knowledge base places in both readings; only the dialogue's seed
+conversations are held out. Their rates seed the files set's hit momentum,
+and the opening orders the range by it, as the first decode step would. What
+the reading's hits rate is where the question's attention went, whatever slot
+held it. Its hits on the conversation rounds are discarded, as is its view:
+nothing was sealed, so the parent stands where it stood. The turn is then
+submitted again unchanged, and its opening projection places the seeds and
+what the question ranked in one ranking, chosen whole, before the question is
+prefilled the second time and the reply decodes
 (`scheduler/first_reading.rs`). The second reading only prefills: like every
 opening it takes no boundary at its end, so its slot is the first reading's
 ranking until the decode's own boundaries move it. Scored there again —

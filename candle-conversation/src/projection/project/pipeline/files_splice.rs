@@ -4,8 +4,10 @@
 //!
 //! Each kind's sections are chosen under the kind's share of the room
 //! ([`choose`]), strongest first. The sections of every kind, the mandatory
-//! files among them, then sit in relevance order by the set's momentum: the
-//! strongest at the top beside the question, each weaker one further away.
+//! files among them, then sit in relevance order by the set's order score —
+//! the index's hit momentum this question, the scan's momentum for a section
+//! the index has not read — the strongest at the top beside the question,
+//! each weaker one further away.
 //! Every section carries its own heading, closing line and, short of its
 //! file's end, the cut marker, so nothing is placed between them.
 //!
@@ -120,7 +122,7 @@ pub(crate) fn files_splice<R: ContentResolver>(
             // The range the decode has been ordering, while it still holds
             // exactly the pin; otherwise the pin opened afresh, each section
             // held as a mandatory one, so none leaves, and ordered by the set's
-            // momentum. The pin lists the range from its front to its top, so
+            // order score. The pin lists the range from its front to its top, so
             // it opens last first: where nothing ranks them, the pin's own
             // order stands, its last section beside the question.
             let scope = match &set.scope {
@@ -129,7 +131,7 @@ pub(crate) fn files_splice<R: ContentResolver>(
                     let top_first: Vec<Candidate> = pinned.iter().rev().copied().collect();
                     let mut s = RangeScope::new(positions);
                     s.open(&top_first, &[]);
-                    s.reorder(|k| set.momentum_of(k), 0.0);
+                    s.reorder(|k| set.order_score(k), 0.0);
                     s
                 }
             };
@@ -210,9 +212,11 @@ pub(crate) fn files_splice<R: ContentResolver>(
             }
             // The first token reads the range in relevance order: strongest
             // beside the question, the mandatory files among the rest, by the
-            // set's momentum (`docs/placed_section_layout.md` §3.2). The decode
-            // reorders it by its own momentum from there.
-            scope.reorder(|k| set.momentum_of(k), 0.0);
+            // index's momentum — the question's first reading's rates, then
+            // the decode's — and the scan's for a section the index has not
+            // read (`FilesSet::order_score`, `docs/placed_section_layout.md`
+            // §3.2). Every decode step reorders it from there.
+            scope.reorder(|k| set.order_score(k), 0.0);
             let places = scope.places().iter().rev().copied().collect();
             return emit(places, &index, &member, Some(scope));
         }

@@ -3,6 +3,7 @@
 //! §4): read by the projection, folded by every scan, its placed order kept
 //! by every fill.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::Substrate;
@@ -36,17 +37,29 @@ impl Substrate {
         Arc::make_mut(self.files_sets.entry(target).or_default()).set_scope(scope);
     }
 
-    /// A step of `target`'s range: `leaving` leave it until its next question
-    /// ([`FilesSet::evict`]), `candidates` over `bars`' entry bar by `rate`
-    /// enter it at their rank ([`FilesSet::admit`]), and the range is ordered
-    /// by `score`, the decode's momentum, strongest beside the question
+    /// The hit `rates` of `target`'s question's first reading, folded into its
+    /// files set's hit momentum before the opening projection orders the range
+    /// by it, as the first decode step would (`docs/placed_section_layout.md`
+    /// §3.2). Empty `rates` change nothing.
+    pub fn files_read_first(&mut self, target: TimelineId, rates: &HashMap<SectionKey, f32>) {
+        if let Some(set) = self.files_sets.get_mut(&target) {
+            Arc::make_mut(set).observe_hits(rates);
+        }
+    }
+
+    /// A step of `target`'s range: its hit `rates` fold into the hit momentum
+    /// when `placed_read` — the step counted the selection's queries, so it
+    /// says how the placed sections were read — `leaving` leave the range
+    /// until the next question ([`FilesSet::evict`]), `candidates` over
+    /// `bars`' entry bar enter it at their rank ([`FilesSet::admit`]), and the
+    /// range is ordered by the momentum, strongest beside the question
     /// ([`FilesSet::reorder`]); whether its layout changed.
     pub fn files_step(
         &mut self,
         target: TimelineId,
+        rates: &HashMap<SectionKey, f32>,
+        placed_read: bool,
         leaving: &[SectionKey],
-        rate: impl Fn(SectionKey) -> f32,
-        score: impl Fn(SectionKey) -> Option<f32>,
         candidates: &[Candidate],
         bars: &Bars,
     ) -> bool {
@@ -54,11 +67,15 @@ impl Substrate {
             return false;
         };
         let set = Arc::make_mut(set);
+        if placed_read {
+            set.observe_hits(rates);
+        }
         let left = set.evict(leaving);
-        let entered = set.admit(rate, &score, candidates, bars);
-        // The range in relevance order by the decode's momentum, strongest
+        let rate = |k: SectionKey| rates.get(&k).copied().unwrap_or(0.0);
+        let entered = set.admit(rate, candidates, bars);
+        // The range in relevance order by the index's momentum, strongest
         // beside the question (`docs/placed_section_layout.md` §3.2).
-        let moved = set.reorder(&score, REORDER_MARGIN);
+        let moved = set.reorder(REORDER_MARGIN);
         left || !entered.is_empty() || moved
     }
 

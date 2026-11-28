@@ -1,7 +1,9 @@
 //! A decode step's knowledge-base decision (`docs/placed_section_layout.md`
 //! §3.2, §3.4, §4.4): the step's hits, read from the mapped summary without a
 //! wait, rate each placed section and each resident one out of scope, and
-//! each rated section's momentum takes the step. A placed section that has
+//! each rated section's momentum in the files set takes the step, after the
+//! rates the question's first reading gave it (`first_reading`). A placed
+//! section that has
 //! stayed under the eviction bar for its steps leaves its range; a resident
 //! one at or over the entry bar enters it at its rank; and the range is
 //! ordered by momentum, strongest beside the question, so a section the
@@ -56,14 +58,6 @@ pub(super) fn step_sections(
     let rates = section_rates(&keys, &hits, &state.kb_rounds);
     let placed_read = hits.queries > 0;
     fold_part(&mut state.unread_hits, &keys, hits);
-    // Every rated section's momentum takes this step, what orders the range —
-    // only a read that counted the selection's queries says how the placed
-    // sections were read.
-    if placed_read {
-        state
-            .kb_momentum
-            .observe(rates.iter().map(|(&k, &r)| (k, r)));
-    }
     let bars = Bars::KNOWLEDGE_BASE;
     let target = policy.target.timeline;
     let (leaving, candidates) = {
@@ -98,18 +92,10 @@ pub(super) fn step_sections(
         .map(|c| c.key)
         .collect();
     state.kb_read.extend(read);
-    let rate = |k: SectionKey| rates.get(&k).copied().unwrap_or(0.0);
-    let momentum = &state.kb_momentum;
-    let changed = policy.substrate.update(|s| {
-        s.files_step(
-            target,
-            &leaving,
-            rate,
-            |k| momentum.score(k),
-            &candidates,
-            &bars,
-        )
-    });
+    // Every rated section's momentum takes this step, what orders the range.
+    let changed = policy
+        .substrate
+        .update(|s| s.files_step(target, &rates, placed_read, &leaving, &candidates, &bars));
     if changed {
         state.layout_owed = true;
         tracing::debug!(
