@@ -248,10 +248,13 @@ impl Sequence {
             return Ok(out_skip);
         }
 
-        let (base_chain, lead_tokens) = {
+        let (base_chain, lead_positions) = {
             let mut chain = ContentChain::new();
             let view = self.substrate.read();
-            let lead_tokens: Vec<_> = lead.iter().map(|&id| view.section_tokens_of(id)).collect();
+            let lead_positions: usize = lead
+                .iter()
+                .map(|&id| view.section_tokens_of(id).len())
+                .sum();
             let schema = self.projection.schema();
             for &item in prefix {
                 let pid = match item {
@@ -277,14 +280,11 @@ impl Sequence {
                 }
                 chain.push_section(&pre_tokens);
             }
-            (chain, lead_tokens)
+            (chain, lead_positions)
         };
         // A member of a range is sealed at its top: behind the prefix, the
         // part of the range above the lead and its own tokens, then the lead.
         // Without a range, behind the prefix and the lead alone.
-        let lead_positions: usize = lead_tokens.iter().map(|t| t.len()).sum();
-        let member_hole =
-            |tokens: usize| range.map_or(0, |r| r.saturating_sub(tokens + lead_positions));
         let behind = MembersPrefix {
             prefix: prefix.to_vec(),
             range,
@@ -293,12 +293,11 @@ impl Sequence {
             lead_tokens: lead_positions,
         };
         let member_prefix = |tokens: usize| behind.behind(tokens, &[]);
+        // Addressed with the lead left out, its positions part of the hole
+        // (`MembersPrefix::addressed`).
         let prefix_hash_of = |tokens: usize| {
             let mut chain = base_chain.clone();
-            chain.push_hole(member_hole(tokens));
-            for t in &lead_tokens {
-                chain.push_section(t);
-            }
+            chain.push_hole(range.map_or(0, |r| r.saturating_sub(tokens)));
             chain.prefix()
         };
         // ── Pass 2: triage what's left into two buckets ────────────────

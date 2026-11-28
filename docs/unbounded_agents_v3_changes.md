@@ -213,8 +213,11 @@ EMNLP 2024).
   selected, offered or emitted, so no tool can be called that is not there.
   npcd's schema declares the same records for its twelve filled collections.
 
-Both kinds of lead are part of every member's address, so the substrate is
-re-sealed when they change.
+Neither kind of lead is part of a member's address. A member is read behind
+its lead but addressed without it, so a restart restores what it sealed. An
+address that named the lead changed with every listing's line counts and with
+whether the lead's tokens were loaded, and each restart re-prefilled the
+knowledge base.
 
 Design: `docs/placed_section_layout.md` §3.5e, §3.5f. Built in 10712fbe8 and
 0ba161ecc.

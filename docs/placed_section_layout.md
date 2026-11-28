@@ -647,9 +647,8 @@ section of the file is computed as a part of the repository and the folder
 the listings name — its bearings — read after their trees rather than as the
 first thing read. The listings' K/V is the one the knowledge base already
 holds — reused as a seed chain reuses its sections, its recurrent state run
-on from its own — so the lead costs no prefill. It is part of every member's
-address, so a file sealed behind it is another member than one sealed behind
-nothing.
+on from its own — so the lead costs no prefill. It is not part of a member's address
+(§3.5f): a member is named by its prompt, its place and the members before it.
 
 - **The listings first.** The repository layer (`repo_map`) is ingested ahead
   of the files in every pass, so a file finds its listings sealed. A listing
@@ -683,8 +682,13 @@ every member each member is sealed behind (`SectionCollection::lead`).
   journal's — straight after it (`Sequence::submit_section`), and a knowledge-
   base file behind it and then its listings (`Sequence::members_prefix`). In a
   range the hole above shrinks by its positions, so the range keeps its size.
-- **Part of the address.** The lead is in every member's prefix chain, so
-  changing it re-seals the collection.
+- **Not part of the address.** A member is read behind its lead but addressed
+  without it, the lead's positions counted into the hole above
+  (`MembersPrefix::addressed`). An address that named the lead changed with
+  what else the workspace held — a listing's line counts — and with whether
+  the lead's tokens were loaded when the member was sealed, so on BlackWorld
+  (2026-11-28) every restart prefilled the knowledge base afresh instead of
+  restoring it. A changed lead therefore leaves its members' K/V as sealed.
 
 ### 3.6 Two orders: by relevance and by birth
 

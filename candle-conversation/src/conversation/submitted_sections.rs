@@ -303,6 +303,9 @@ struct SealJob {
     content: String,
     /// The schema's prompt before the collection, earlier ranges as holes.
     prefix: Vec<PrefixItem>,
+    /// The collection's lead, read just before the section and left out of its
+    /// address (`docs/placed_section_layout.md` §3.5f).
+    lead: Vec<SectionId>,
     /// This conversation's sections the section continues, in order — see
     /// [`Sequence::submit_section`].
     after: Vec<SectionRef>,
@@ -382,9 +385,11 @@ impl SealJob {
     }
 
     /// The sections the section is sealed against, in order: the schema's
-    /// prefix, then the sections it continues — once each of those has sealed.
+    /// prefix, the collection's lead, then the sections it continues — once
+    /// each of those has sealed.
     fn sealed_prefix(&self) -> crate::Result<Vec<PrefixItem>> {
         let mut ids = self.prefix.clone();
+        ids.extend(self.lead.iter().copied().map(PrefixItem::Section));
         for before in &self.after {
             before.wait().map_err(|e| {
                 ConversationError::Other(format!(
@@ -422,9 +427,11 @@ impl SealJob {
         let at_collection =
             state_after(&self.scheduler_tx, &self.substrate, &self.prompt_prefix())?;
         let after: Vec<PrefixItem> = self
-            .after
+            .lead
             .iter()
-            .map(|s| PrefixItem::Section(s.section_id()))
+            .copied()
+            .chain(self.after.iter().map(SectionRef::section_id))
+            .map(PrefixItem::Section)
             .collect();
         continue_state(&self.scheduler_tx, &self.substrate, at_collection, &after)
     }
@@ -675,7 +682,7 @@ impl Sequence {
             ConversationError::Other(format!("the schema has no collection {collection:?}"))
         })?;
         let native = self.substrate.read().trained_window();
-        let mut prefix = prefix_before_collection(
+        let prefix = prefix_before_collection(
             &base.schema().system_prompt.items,
             collection_id,
             native,
@@ -687,11 +694,14 @@ impl Sequence {
                      member once per branch; submit to a top-level collection"
             ))
         })?;
-        // Straight behind the collection's lead, as every member of it is
-        // (`docs/placed_section_layout.md` §3.5f).
-        if let Some(c) = base.schema().system_prompt.collection_named(collection) {
-            prefix.extend(c.lead_ids().into_iter().map(PrefixItem::Section));
-        }
+        // Read straight behind the collection's lead, as every member of it is
+        // (`docs/placed_section_layout.md` §3.5f); addressed without it.
+        let lead = base
+            .schema()
+            .system_prompt
+            .collection_named(collection)
+            .map(|c| c.lead_ids())
+            .unwrap_or_default();
 
         if let Some(at) = self.submitted.position_of_name(name) {
             let earlier = self.submitted.entries.remove(at);
@@ -723,6 +733,7 @@ impl Sequence {
             name: name.to_string(),
             content: content.to_string(),
             prefix,
+            lead,
             after: after.to_vec(),
             band,
             sharing,
@@ -1041,6 +1052,7 @@ layers:
             name: "journal/history".into(),
             content: "x".into(),
             prefix: Vec::new(),
+            lead: Vec::new(),
             after: Vec::new(),
             band: DecodePriority::Low,
             sharing: Sharing::Shared,

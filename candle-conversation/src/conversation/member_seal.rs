@@ -144,6 +144,22 @@ impl MembersPrefix {
         out.extend(earlier.iter().copied().map(PrefixItem::Section));
         out
     }
+
+    /// What a member's address is computed from: [`Self::behind`] with the
+    /// lead left out, its positions part of the hole. The lead is what the
+    /// member is read behind, not what it is: an address that named it changed
+    /// with whatever else the workspace holds, and with whether the lead's
+    /// tokens were loaded when the member was sealed, so a restart prefilled
+    /// afresh what it should have restored (`docs/placed_section_layout.md`
+    /// §3.5f).
+    pub(super) fn addressed(&self, through: usize, earlier: &[SectionId]) -> Vec<PrefixItem> {
+        Self {
+            lead: Vec::new(),
+            lead_tokens: 0,
+            ..self.clone()
+        }
+        .behind(through, earlier)
+    }
 }
 
 impl Sequence {
@@ -299,7 +315,7 @@ impl Sequence {
         let earlier: Vec<SectionId> = before.iter().map(|m| m.section).collect();
         let through = before.iter().map(|m| m.tokens).sum::<usize>() + tokens.len();
         let sealed_after = prefix.behind(through, &earlier);
-        let chain = chain_of(&self.substrate, &sealed_after).0;
+        let chain = chain_of(&self.substrate, &prefix.addressed(through, &earlier)).0;
         let address = ContentAddress {
             prefix_hash: match kind {
                 SealAs::Member => shared_section_prefix(chain),
@@ -508,9 +524,24 @@ mod tests {
             lead_tokens: 25,
         }
         .led_by(ids(&[20]), 50);
-        let mut want = prompt;
+        let mut want = prompt.clone();
         want.push(PrefixItem::Hole(525));
         want.extend(sections_prefix(&ids(&[30, 20, 10])));
         assert_eq!(both.behind(400, &ids(&[10])), want);
+        // Its address leaves both leads out, their positions in the hole: the
+        // same as a chain sealed behind no lead at all.
+        let mut addressed = prompt;
+        addressed.push(PrefixItem::Hole(600));
+        addressed.extend(sections_prefix(&ids(&[10])));
+        assert_eq!(both.addressed(400, &ids(&[10])), addressed);
+        assert_eq!(
+            both.addressed(400, &ids(&[10])),
+            MembersPrefix {
+                lead: Vec::new(),
+                lead_tokens: 0,
+                ..both.clone()
+            }
+            .behind(400, &ids(&[10]))
+        );
     }
 }
