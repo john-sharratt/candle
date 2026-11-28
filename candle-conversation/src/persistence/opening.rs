@@ -145,9 +145,20 @@ impl SubstratePersistence {
         dir: &Path,
         substrate: &mut Substrate,
     ) -> Result<SubstratePersistence> {
+        Self::open_store_read_only(&dir.join(SUBSTRATE_DIR), substrate)
+    }
+
+    /// [`Self::open_in_with_substrate_read_only`] on the store in `dir`
+    /// itself — the segment directory, wherever it is, rather than a
+    /// workspace's `substrate/`: a copy set aside beside the live store opens
+    /// as it lies.
+    pub fn open_store_read_only(
+        dir: &Path,
+        substrate: &mut Substrate,
+    ) -> Result<SubstratePersistence> {
         // Beside a live writer a segment can be compacted away mid-open; the
         // open starts over from an empty substrate (`vanished_segment`).
-        let dir = dir.join(SUBSTRATE_DIR);
+        let dir = dir.to_path_buf();
         let substrate = RefCell::new(substrate);
         let mut sp = retry_vanished(
             || {

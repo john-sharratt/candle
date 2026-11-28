@@ -23,13 +23,9 @@ use candle_conversation::substrate::Substrate;
 /// Count every member of the store at `substrate_dir` by what a restore would
 /// make of it, against `kv_layers` K/V layers.
 pub fn members(substrate_dir: &Path, kv_layers: usize) -> Result<()> {
-    let workspace = substrate_dir
-        .parent()
-        .context("the substrate directory has no parent to open it from")?;
     let mut substrate = Substrate::new();
-    let mut persistence =
-        SubstratePersistence::open_in_with_substrate_read_only(workspace, &mut substrate)
-            .with_context(|| format!("opening {} read-only", substrate_dir.display()))?;
+    let mut persistence = SubstratePersistence::open_store_read_only(substrate_dir, &mut substrate)
+        .with_context(|| format!("opening {} read-only", substrate_dir.display()))?;
 
     let (mut members, mut whole, mut no_chunks, mut no_tokens) = (0usize, 0usize, 0usize, 0usize);
     let mut partial: Vec<(String, String)> = Vec::new();
