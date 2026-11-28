@@ -78,10 +78,10 @@ pub struct FilesSet {
     /// reading's rates taken whole, then every decode step's folded in. Emptied
     /// by a new question ([`Self::clear_withheld`]).
     pub hits: Momentum,
-    /// The placed sections locked to their positions at the last step: the
-    /// nucleus of the range's attention ([`Self::relock`]). Emptied by a new
-    /// question.
-    pub locked: BTreeSet<SectionKey>,
+    /// The placed sections locked to their positions at the last step — the
+    /// nucleus of the range's attention ([`Self::relock`]) — each with the
+    /// share it locked at. Emptied by a new question.
+    pub locked: BTreeMap<SectionKey, f32>,
 }
 
 /// `section`'s place in the order: its hit momentum on the 0–1000 band, or —
@@ -198,8 +198,9 @@ impl FilesSet {
     }
 
     /// Lock this step's sections ([`relock`]): the nucleus of the placed
-    /// sections' momenta, those locked before kept while within the wider one,
-    /// none while the range is not `engaged`.
+    /// sections' momenta, those locked before kept while within the wider one
+    /// and holding half the share they locked at, none while the range is not
+    /// `engaged`.
     pub fn relock(&mut self, engaged: bool) {
         self.locked = relock(&self.locked, &self.placed_momenta(), engaged);
     }
@@ -212,7 +213,7 @@ impl FilesSet {
         let momenta = self.placed_momenta();
         let share = shares(&momenta);
         self.locked
-            .iter()
+            .keys()
             .filter_map(|k| share.get(k).copied())
             .min_by(f32::total_cmp)
             .unwrap_or(match share.len() {
@@ -264,7 +265,7 @@ impl FilesSet {
         let change = scope.admit(
             rate,
             |k| order_score(hits, members, k),
-            |k| locked.contains(&k),
+            |k| locked.contains_key(&k),
             &open,
             bars,
         );
@@ -285,7 +286,7 @@ impl FilesSet {
             scope.reorder_locked(
                 |k| order_score(hits, members, k),
                 margin,
-                |k| locked.contains(&k),
+                |k| locked.contains_key(&k),
             )
         })
     }
@@ -535,9 +536,9 @@ mod tests {
     /// positions each. A step reads a at 30 and b at 600: unlocked, b climbs
     /// to the top, and then — 95% of the range's attention — locks there.
     /// The next reads c at 900 and a at 0: c (59%) climbs to just under b,
-    /// which keeps the top though weaker, and locks; b, within the wider
-    /// nucleus, stays locked. Not engaged, nothing is. A new question forgets
-    /// every rate and every lock.
+    /// which keeps the top, and locks; b, down to 39% — under half the 95% it
+    /// locked at — unlocks. Not engaged, nothing is locked. A new question
+    /// forgets every rate and every lock.
     #[test]
     fn the_index_orders_the_range_and_the_scan_what_it_has_not_read() {
         let (a, b, c) = (SectionKey(1), SectionKey(2), SectionKey(3));
@@ -575,13 +576,14 @@ mod tests {
             moved
         };
         assert_eq!(set.order_score(c), Some(0.5), "unread: its scan, scaled");
+        let locked = |set: &FilesSet| set.locked.keys().copied().collect::<Vec<_>>();
         assert!(step(&mut set, &[(a, 30.0), (b, 600.0)], true));
         assert_eq!(top_first(&set), vec![b, a, c]);
-        assert_eq!(set.locked, BTreeSet::from([b]));
+        assert_eq!(set.locked, BTreeMap::from([(b, 600.0 / 630.0)]));
         assert_eq!(set.edge_share(), 600.0 / 630.0);
         assert!(step(&mut set, &[(c, 900.0), (a, 0.0)], true));
         assert_eq!(top_first(&set), vec![b, c, a], "b keeps the top");
-        assert_eq!(set.locked, BTreeSet::from([b, c]));
+        assert_eq!(locked(&set), vec![c], "b, faded under half, unlocks");
         step(&mut set, &[], false);
         assert!(set.locked.is_empty(), "not engaged, nothing locks");
         set.clear_withheld();

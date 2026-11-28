@@ -9,13 +9,17 @@
 //! model, so `p` holds on every one; and the nucleus adapts by itself — one
 //! section when the decode reads one hard, several when it reads several.
 //!
-//! A section **locks** when it enters the nucleus at [`P_LOCK`] and stays
-//! locked while it is within the wider nucleus at [`P_UNLOCK`], so one on the
-//! edge does not flip in and out step after step. While the selection reads
-//! the range no more than it reads the rest of the slot, nothing is locked:
-//! a share of almost nothing would otherwise lock the largest of it.
+//! A section **locks** when it enters the nucleus at [`P_LOCK`], at the share
+//! it holds then. It stays locked while it is within the wider nucleus at
+//! [`P_UNLOCK`] — so one on the edge does not flip in and out step after
+//! step — and holds at least [`KEEP_OF_LOCKED`] of the share it locked at, so
+//! one the decode has moved off does not keep its seat because the attention
+//! is spread wide enough for the wider nucleus to reach it. While the
+//! selection reads the range no more than it reads the rest of the slot,
+//! nothing is locked: a share of almost nothing would otherwise lock the
+//! largest of it.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::files::key::SectionKey;
 
@@ -26,9 +30,18 @@ pub const P_LOCK: f32 = 0.5;
 /// locked.
 pub const P_UNLOCK: f32 = 0.7;
 
-/// How far a section's share must pass the one above it before it takes its
-/// place: two-hundredths of the range's attention.
-pub const REORDER_SHARE: f32 = 0.02;
+/// The part of the share a section locked at that it must keep to stay
+/// locked. Measured on BlackWorld (2026-11-28): with only the wider nucleus
+/// to hold it, a section that locked at the top beside the question held its
+/// seat at 5% of the range's attention while one at 19% sat below it.
+pub const KEEP_OF_LOCKED: f32 = 0.5;
+
+/// How far an unlocked section's share must pass the one above it before it
+/// takes its place: a twentieth of the range's attention. The mildly read
+/// sections' shares, 3–6% each, swing by two hundredths a step on BlackWorld
+/// (2026-11-28), and at that margin the range was laid out again on nearly
+/// every step.
+pub const REORDER_SHARE: f32 = 0.05;
 
 /// The share of an even split under which a placed section counts a step
 /// toward leaving: a quarter of `1 / n`.
@@ -65,21 +78,31 @@ pub fn nucleus(momenta: &[(SectionKey, f32)], p: f32) -> BTreeSet<SectionKey> {
     out
 }
 
-/// The sections locked this step: none while the range is not `engaged` —
-/// read no more than the rest of the slot — and otherwise the nucleus at
-/// [`P_LOCK`] together with those of `was` still within the one at
-/// [`P_UNLOCK`].
+/// The sections locked this step, each with the share it locked at: none
+/// while the range is not `engaged` — read no more than the rest of the slot.
+/// Otherwise those of `was` still within the nucleus at [`P_UNLOCK`] and
+/// holding [`KEEP_OF_LOCKED`] of the share they locked at keep it, and the
+/// rest of the nucleus at [`P_LOCK`] lock at the share they hold now.
 pub fn relock(
-    was: &BTreeSet<SectionKey>,
+    was: &BTreeMap<SectionKey, f32>,
     momenta: &[(SectionKey, f32)],
     engaged: bool,
-) -> BTreeSet<SectionKey> {
+) -> BTreeMap<SectionKey, f32> {
     if !engaged {
-        return BTreeSet::new();
+        return BTreeMap::new();
     }
-    let keep = nucleus(momenta, P_UNLOCK);
-    let mut out = nucleus(momenta, P_LOCK);
-    out.extend(was.iter().filter(|k| keep.contains(k)).copied());
+    let share = shares(momenta);
+    let window = nucleus(momenta, P_UNLOCK);
+    let mut out: BTreeMap<SectionKey, f32> = was
+        .iter()
+        .filter(|(k, &at)| {
+            window.contains(k) && share.get(k).is_some_and(|&s| s >= KEEP_OF_LOCKED * at)
+        })
+        .map(|(&k, &at)| (k, at))
+        .collect();
+    for k in nucleus(momenta, P_LOCK) {
+        out.entry(k).or_insert(share[&k]);
+    }
     out
 }
 
@@ -110,15 +133,25 @@ mod tests {
         assert!(nucleus(&[(k(1), 0.0)], 0.5).is_empty());
     }
 
-    /// **A locked section stays locked inside the wider nucleus, and nothing
-    /// locks while the range is not engaged**: shares 0.4, 0.25, 0.2, 0.15 —
-    /// the nucleus at 0.5 is {1, 2}, at 0.7 {1, 2, 3}. 3, locked before,
-    /// stays; 4, locked before, is outside 0.7 and unlocks.
+    /// **A locked section stays locked inside the wider nucleus while it keeps
+    /// half the share it locked at, and nothing locks while the range is not
+    /// engaged**: shares 0.4, 0.25, 0.2, 0.15 — the nucleus at 0.5 is {1, 2},
+    /// at 0.7 {1, 2, 3}. 3, locked at 0.3, keeps 0.2 and stays; 4 is outside
+    /// 0.7 and unlocks; 1 and 2 lock at the shares they hold. Had 3 locked at
+    /// 0.5, its 0.2 is under half of it and it unlocks.
     #[test]
-    fn a_locked_section_stays_inside_the_wider_nucleus() {
+    fn a_locked_section_stays_while_it_keeps_half_its_share() {
         let m = [(k(1), 40.0), (k(2), 25.0), (k(3), 20.0), (k(4), 15.0)];
-        let was = BTreeSet::from([k(3), k(4)]);
-        assert_eq!(relock(&was, &m, true), BTreeSet::from([k(1), k(2), k(3)]));
+        let was = BTreeMap::from([(k(3), 0.3), (k(4), 0.2)]);
+        assert_eq!(
+            relock(&was, &m, true),
+            BTreeMap::from([(k(1), 0.4), (k(2), 0.25), (k(3), 0.3)])
+        );
+        let faded = BTreeMap::from([(k(3), 0.5)]);
+        assert_eq!(
+            relock(&faded, &m, true),
+            BTreeMap::from([(k(1), 0.4), (k(2), 0.25)])
+        );
         assert!(relock(&was, &m, false).is_empty());
     }
 }
