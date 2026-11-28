@@ -91,7 +91,7 @@ const WORK: [Work; 6] = [
         ],
         links: &[
             ("/blog/what-one-gpu-can-do", "See the numbers"),
-            ("/papers/one-card", "Read the paper"),
+            ("/papers/one-card-v2", "Read the paper"),
         ],
         status: "Working · 16 GB laptop to 72 GB workstation",
         span: 7,
@@ -139,7 +139,7 @@ const WORK: [Work; 6] = [
                the PDF of record. Maths typeset, tables intact, nothing behind a login.",
         points: &[],
         links: &[
-            ("/papers/one-card", "One Card, One Stack"),
+            ("/papers/one-card-v2", "One Card, One Stack"),
             ("/papers/palquant", "PalQuant"),
         ],
         status: "Published here",
@@ -524,7 +524,7 @@ mod tests {
         let html = rendered().await;
         assert!(html.starts_with("<!doctype html>"), "{}", &html[..80]);
         assert!(html.trim_end().ends_with("</html>"));
-        assert!(html.contains("href=\"/papers/one-card\""));
+        assert!(html.contains("href=\"/papers/one-card-v2\""));
         assert!(html.contains("href=\"/papers/palquant\""));
         assert!(html.contains("href=\"https://bot.tokera.com/\""));
     }

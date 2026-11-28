@@ -21,6 +21,24 @@
 # ============================================================================
 
 papers:
+  - slug: one-card-v3
+    title: "One Card, One Stack"
+    subtitle: >-
+      Constraint-driven architecture for asymptotically stable inference over
+      unbounded agent memory
+    authors: "Johnathan Paul Sharratt"
+    date: "Working draft"
+    status: "v3 working draft"
+    source: unbounded_agents.md
+    summary: >-
+      v3 of One Card, One Stack, in progress. What provenance retrieves is
+      placed as sealed sections of a knowledge base at the end of the system
+      prompt, re-laid at every decode step by the index's attention, each
+      section computed behind the listings of the repository and folder it
+      belongs to — in place of v2's reading turns, which the model read as one
+      confused dialogue. The 128-question battery is being rerun on it; its
+      results are marked pending until then.
+
   - slug: one-card-v2
     title: "One Card, One Stack"
     subtitle: >-
