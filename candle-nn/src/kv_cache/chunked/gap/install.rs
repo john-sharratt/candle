@@ -31,6 +31,7 @@ use super::super::types::{ChunkWindow, QSign};
 use super::assemble::{block_state, take_block, BlockState};
 use super::codes::CodeTables;
 use super::cycle::CatchUpHost;
+use super::deferred::Deferred;
 use super::demand::{count_bands, PerClass};
 use super::launch::{GapGroup, GapJob};
 use super::lease::Lease;
@@ -105,14 +106,15 @@ fn locate(chunks: &[ChunkWindow], job: &GapJob) -> Option<usize> {
 /// The bands of the native chunk now at `job`'s index, when it is a native
 /// block of the job's own window behind its sequence's cursor that no gap will
 /// take again: what a compaction leaves when it relocates a block's bands while
-/// a gap reads the old ones. The window is the job's — a full block for a
-/// gap's, a seal's partial or writer chunk at its valid tokens — so a chunk
-/// written since, or another chunk at that index, is not the job's block. A
-/// chunk past the cursor is the next gap's anyway; a quantized one is no block
-/// to quantize.
+/// a gap reads the old ones, and what a deferred block is re-read as when it
+/// leads a later table. The window is the job's — a full block for a gap's, a
+/// seal's partial or writer chunk at its valid tokens — so a chunk written
+/// since, or another chunk at that index, is not the job's block. A chunk past
+/// the cursor is the next gap's anyway; a quantized one is no block to
+/// quantize.
 pub(super) fn requeue_at(
     backings: &[&ChunkedKvBacking],
-    job: &GapJob,
+    job: &Deferred,
 ) -> Result<Option<ChunkBands>> {
     let backing = backings.get(job.layer).ok_or_else(|| {
         candle::Error::Msg(format!("gap install: job layer {} out of range", job.layer))
@@ -217,7 +219,7 @@ fn catch_up_inner(
             }
         }
         let Some(at) = locate_in(backings, job)? else {
-            match requeue_at(backings, job)? {
+            match requeue_at(backings, &Deferred::of(job))? {
                 Some(bands) => requeue.push((j, bands)),
                 None => out.stale += 1,
             }

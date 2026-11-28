@@ -113,13 +113,34 @@ use super::*;
 /// because nothing was orphaned and its hash covers only bands that *live* slots' block
 /// tables name. The engine probe's story gate is the oracle, and one clean run means
 /// nothing: require several consecutive.
+///
+/// # The gap's slots are no holder a sweep reaches
+///
+/// `gap` is the backings' gap quantize, when they have one. Its outstanding gap holds
+/// slots no block table names — its lease, and its jobs' clones of the native bands
+/// it converts — so a pass run under it would relocate them with nothing to rewrite
+/// them (on WhiteWorld, 2026-11-28, 218 of 401 relocated slots came back
+/// unwitnessed). The pass refuses while one stands
+/// ([`CompactionRefused::GapOutstanding`]); the caller catches the gap up first.
+/// Between gaps the cycle holds no slot at all: its deferred blocks are kept by where
+/// they stand and re-read from the block tables this pass rewrites.
 #[cfg(feature = "cuda")]
 pub fn compact_backings(
     backings: &[super::super::backing::ChunkedKvBacking],
+    gap: Option<&GapCycle>,
     budget: Duration,
     sweep: &mut dyn FnMut(&mut Sweep<'_>) -> Result<()>,
 ) -> std::result::Result<CompactionReport, CompactionRefused> {
     note(0, 1);
+    if gap.is_some_and(GapCycle::is_outstanding) {
+        note(9, 1);
+        tracing::error!(
+            target: "candle_nn::kv_cache::compact",
+            "compaction refused: a gap quantize is outstanding, and its lease and jobs \
+             hold slots the sweep does not reach — catch it up before compacting",
+        );
+        return Err(CompactionRefused::GapOutstanding);
+    }
     let Some(first) = backings.first() else {
         note(4, 1);
         return Err(CompactionRefused::NoDevice);
@@ -154,6 +175,8 @@ pub fn compact_backings(
             | CompactionRefused::SweepFailed(_)
             | CompactionRefused::Fault(_),
         ) => note(9, 1),
+        // Refused and counted before the pass, above.
+        Err(CompactionRefused::GapOutstanding) => {}
     }
     outcome
 }

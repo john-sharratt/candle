@@ -21,6 +21,7 @@ use std::time::Duration;
 use candle::Result;
 use candle_nn::kv_cache::REGION_BYTES;
 
+use crate::models::batch_test::gap_tally::GapTally;
 use crate::models::batched_inference::{BatchedInferenceSession, ManagedBatchedModel};
 
 /// Wall-clock one KV pass may spend planning and claiming — the scheduler's.
@@ -82,8 +83,9 @@ impl SpanSettler {
     /// to lower it. `None` when nothing ran.
     pub fn settle<M>(
         &mut self,
-        session: &BatchedInferenceSession,
+        session: &mut BatchedInferenceSession,
         model: &M,
+        gaps: &mut GapTally,
     ) -> Result<Option<SettleOutcome>>
     where
         M: ManagedBatchedModel + ?Sized,
@@ -94,7 +96,7 @@ impl SpanSettler {
         if self.stalled_at == Some((stats.live, stats.live_watermark)) {
             return Ok(None);
         }
-        let out = settle_span(session, model)?;
+        let out = settle_span(session, model, gaps)?;
         if let (Some(o), Some(after)) = (out, session.kv_region_stats()) {
             self.stalled_at = (o.passes > 0 && o.frontier_after >= o.frontier_before)
                 .then_some((after.live, after.live_watermark));
@@ -104,8 +106,14 @@ impl SpanSettler {
 }
 
 /// Pack the span and hand what packing frees to the weight side, between
-/// forwards. `None` when the device keeps no region pool.
-pub fn settle_span<M>(session: &BatchedInferenceSession, model: &M) -> Result<Option<SettleOutcome>>
+/// forwards. `None` when the device keeps no region pool. A KV pass is
+/// preceded by the outstanding gap's catch-up, charged to `gaps`, since the
+/// pass refuses while a gap is outstanding.
+pub fn settle_span<M>(
+    session: &mut BatchedInferenceSession,
+    model: &M,
+    gaps: &mut GapTally,
+) -> Result<Option<SettleOutcome>>
 where
     M: ManagedBatchedModel + ?Sized,
 {
@@ -129,6 +137,7 @@ where
         }
         let kv_on_top = session.kv_top_rank().map(|t| t + 1) == Some(frontier);
         if kv_on_top {
+            gaps.catch_up_outstanding(session)?;
             if session.compact_kv(KV_BUDGET, &mut |_| Ok(())).is_err() {
                 break;
             }

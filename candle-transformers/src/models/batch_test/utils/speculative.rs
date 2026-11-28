@@ -182,7 +182,7 @@ impl TestParams {
             #[cfg(feature = "cuda")]
             {
                 gaps.catch_up(session)?;
-                if let Some(settled) = settler.settle(session, model)? {
+                if let Some(settled) = settler.settle(session, model, gaps)? {
                     if settled.frontier_after < settled.frontier_before
                         || settled.weight_bytes_after > settled.weight_bytes_before
                     {
