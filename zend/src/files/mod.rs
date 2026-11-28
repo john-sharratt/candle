@@ -2,6 +2,7 @@
 //! what the daemon renders into it from the workspace.
 //!
 //! - [`ingest`] — a file cut, sealed as members and recorded;
+//! - [`lead`] — what a file is sealed behind: its repository's listing;
 //! - [`listing`] — a folder as the knowledge base shows it;
 //! - [`records`] — the file records in the substrate;
 //! - [`sections`] — a file cut where `file_read` pages it, each section its
@@ -10,6 +11,7 @@
 //!   repositories' roots and installed into the schema at startup.
 
 pub mod ingest;
+pub mod lead;
 pub mod listing;
 pub mod records;
 pub mod sections;

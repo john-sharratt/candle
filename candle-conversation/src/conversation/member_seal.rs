@@ -11,6 +11,15 @@
 //! after, so the same text after other text is another member, and a member
 //! whose stream is already on disk is restored rather than prefilled again.
 //!
+//! A chain may be sealed behind a **lead**: sealed sections placed just ahead
+//! of its first member, inside the range, their K/V and state reused as a
+//! seed chain's are — a file behind its repository's root listing
+//! (`docs/placed_section_layout.md` §3.5e). Sealed with nothing before it, a
+//! section's K/V reads as the only one of its kind: two files' `serde` lines
+//! sealed so are told apart by nothing but which sits nearer the question.
+//! Behind the listing that names its repository, it is computed as the part
+//! of that repository it is, and not as the first thing read.
+//!
 //! The seal runs on the caller's thread, one member after another: each waits
 //! for the one before it, whose end state it starts from.
 
@@ -101,21 +110,36 @@ pub struct MembersPrefix {
     /// The compression level a member is sealed at: its collection's
     /// [`kv_level`](crate::projection::SectionCollection::kv_level).
     pub level: u8,
+    /// The sealed sections the chain is sealed behind, just ahead of its first
+    /// member — a file's repository listing — and the positions they take.
+    pub lead: Vec<SectionId>,
+    pub lead_tokens: usize,
 }
 
 impl MembersPrefix {
+    /// The same prefix with the chain sealed behind `lead`, which takes
+    /// `tokens` positions.
+    pub fn led_by(self, lead: Vec<SectionId>, tokens: usize) -> Self {
+        Self {
+            lead,
+            lead_tokens: tokens,
+            ..self
+        }
+    }
+
     /// What a member is sealed behind when its run's members up to and
     /// including it take `through` positions and `earlier` of them precede
-    /// it: the prompt, the part of the range above the run left empty, then
-    /// the earlier members.
+    /// it: the prompt, the part of the range above the lead and the run left
+    /// empty, the lead, then the earlier members.
     fn behind(&self, through: usize, earlier: &[SectionId]) -> Vec<PrefixItem> {
         let mut out = self.prefix.clone();
         if let Some(range) = self.range {
-            let hole = range.saturating_sub(through);
+            let hole = range.saturating_sub(through + self.lead_tokens);
             if hole > 0 {
                 out.push(PrefixItem::Hole(hole));
             }
         }
+        out.extend(self.lead.iter().copied().map(PrefixItem::Section));
         out.extend(earlier.iter().copied().map(PrefixItem::Section));
         out
     }
@@ -158,6 +182,8 @@ impl Sequence {
                 prefix: range.member_prefix(&self.birth_prefix, range.positions),
                 range: range.sealed_at_top(),
                 level,
+                lead: Vec::new(),
+                lead_tokens: 0,
             });
         }
         let native = self.substrate.read().trained_window();
@@ -175,6 +201,8 @@ impl Sequence {
             prefix: in_birth_prefix(before, &self.birth_prefix, |s| self.section_tokens(s)),
             range: None,
             level,
+            lead: Vec::new(),
+            lead_tokens: 0,
         })
     }
 
@@ -194,14 +222,19 @@ impl Sequence {
     }
 
     /// Seal `chain` as members of `collection`, in order, each behind the
-    /// collection's prefix ([`Self::members_prefix`]) and the members before
-    /// it, and return them in the same order.
+    /// collection's prefix ([`Self::members_prefix`]), `lead` and the members
+    /// before it, and return them in the same order.
     pub fn seal_members(
         &self,
         collection: &str,
+        lead: &[SectionId],
         chain: &[MemberSpec],
     ) -> crate::Result<Vec<SealedMember>> {
-        self.seal_members_behind(&self.members_prefix(collection)?, chain, SealAs::Member)
+        let tokens = lead.iter().map(|&s| self.section_tokens(s)).sum();
+        let prefix = self
+            .members_prefix(collection)?
+            .led_by(lead.to_vec(), tokens);
+        self.seal_members_behind(&prefix, chain, SealAs::Member)
     }
 
     /// Seal `chain` in order, each behind `prefix` and the members before it,
@@ -407,6 +440,8 @@ mod tests {
             prefix: prompt.clone(),
             range: Some(1_000),
             level: MEMBER_KV_LEVEL,
+            lead: Vec::new(),
+            lead_tokens: 0,
         };
         let mut want = prompt.clone();
         want.push(PrefixItem::Hole(600));
@@ -421,9 +456,38 @@ mod tests {
             prefix: prompt.clone(),
             range: None,
             level: MEMBER_KV_LEVEL,
+            lead: Vec::new(),
+            lead_tokens: 0,
         };
         let mut bare = prompt;
         bare.extend(sections_prefix(&ids(&[10])));
         assert_eq!(plain.behind(400, &ids(&[10])), bare);
+    }
+
+    /// **A led chain is sealed behind its lead, just ahead of its first
+    /// member, the range's hole short by the lead's positions**: in a
+    /// 1,000-range a lead of 50 positions (20) and a chain through 400 take
+    /// 450, so 550 stay a hole above them; the lead stands between the hole
+    /// and the earlier members.
+    #[test]
+    fn a_led_chain_is_sealed_behind_its_lead() {
+        let prompt = sections_prefix(&ids(&[1, 2]));
+        let led = MembersPrefix {
+            prefix: prompt.clone(),
+            range: Some(1_000),
+            level: MEMBER_KV_LEVEL,
+            lead: Vec::new(),
+            lead_tokens: 0,
+        }
+        .led_by(ids(&[20]), 50);
+        let mut want = prompt.clone();
+        want.push(PrefixItem::Hole(550));
+        want.extend(sections_prefix(&ids(&[20, 10, 11])));
+        assert_eq!(led.behind(400, &ids(&[10, 11])), want);
+        // Its first member is sealed behind the lead alone.
+        let mut first = prompt;
+        first.push(PrefixItem::Hole(550));
+        first.extend(sections_prefix(&ids(&[20])));
+        assert_eq!(led.behind(400, &[]), first);
     }
 }
