@@ -109,6 +109,7 @@ pub(super) mod projection_schema_tests {
                 tokens: 8_192,
                 small_context: 2_048,
                 fill: RangeFill::Bottom,
+                most: None,
             })
         );
         assert_eq!(
@@ -117,6 +118,7 @@ pub(super) mod projection_schema_tests {
                 tokens: 8_192,
                 small_context: 8_192,
                 fill: RangeFill::Top,
+                most: None,
             })
         );
         assert_eq!(
@@ -125,6 +127,7 @@ pub(super) mod projection_schema_tests {
                 tokens: 114_688,
                 small_context: 114_688,
                 fill: RangeFill::Top,
+                most: None,
             })
         );
     }

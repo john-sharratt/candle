@@ -3,7 +3,8 @@
 use super::*;
 
 /// The range a collection declares, checked: a size no member could stand in
-/// — zero, or a small-context size past the full one — is refused by name.
+/// — zero, or a small-context size past the full one — and a range that holds
+/// at most no members are refused by name.
 pub(super) fn parse_reserved_range(
     label: &str,
     yaml: Option<&YamlReservedRange>,
@@ -33,10 +34,16 @@ pub(super) fn parse_reserved_range(
             )))
         }
     };
+    if r.most == Some(0) {
+        return Err(ConstructionError::InvalidRange(format!(
+            "{label}: a range of at most no members holds nothing"
+        )));
+    }
     Ok(Some(ReservedRange {
         tokens: r.tokens,
         small_context,
         fill,
+        most: r.most,
     }))
 }
 
@@ -49,6 +56,7 @@ mod tests {
             tokens,
             small_context,
             fill: None,
+            most: None,
         }
     }
 
@@ -62,6 +70,7 @@ mod tests {
                 tokens: 8_192,
                 small_context: 8_192,
                 fill: RangeFill::Top,
+                most: None,
             })
         );
         assert_eq!(parse_reserved_range("p/tools", None).unwrap(), None);
@@ -89,5 +98,29 @@ mod tests {
         assert!(parse_reserved_range("p/a", Some(&yaml(8, Some(0)))).is_err());
         assert!(parse_reserved_range("p/a", Some(&yaml(8, Some(9)))).is_err());
         assert!(parse_reserved_range("p/a", Some(&yaml(8, Some(8)))).is_ok());
+    }
+
+    /// **A range's member bound is read as written, and a bound of none is
+    /// refused**: a range of at most no members holds nothing.
+    #[test]
+    fn a_ranges_member_bound_is_read_and_none_is_refused() {
+        let one = YamlReservedRange {
+            most: Some(1),
+            ..yaml(1_024, None)
+        };
+        assert_eq!(
+            parse_reserved_range("p/response", Some(&one)).unwrap(),
+            Some(ReservedRange {
+                tokens: 1_024,
+                small_context: 1_024,
+                fill: RangeFill::Top,
+                most: Some(1),
+            })
+        );
+        let none = YamlReservedRange {
+            most: Some(0),
+            ..yaml(1_024, None)
+        };
+        assert!(parse_reserved_range("p/response", Some(&none)).is_err());
     }
 }

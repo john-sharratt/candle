@@ -162,9 +162,14 @@ after it has moved, and what was sealed behind its old slot is stale.
 
 The summary's slot stands where the summary is read: just before the first
 template gated on its collection (`<tools>`), or before the collection when
-none is. A collection with no range — none in zend's schema; npcd's
-identity, response and mood collections — takes what its members take, and
-moves what follows it.
+none is. A collection with no range takes what its members take, and moves
+what follows it, so every collection either schema fills has one; the only
+unranged ones are npcd's `mood` and `task`, which the daemon never fills and
+which therefore take nothing. npcd's ranges and margins are measured in the
+model's own tokens against the live mind by
+`engine::tests_slot_sizes::the_live_minds_items_fit_their_slots`, and
+`engine::tests_slots` holds what follows its collections still across
+characters, templates, stances and dials.
 
 Every walk of the system prompt lays the slots down the same way: the
 projection (`project/emit.rs`), the creation walk that seals the system
@@ -380,6 +385,13 @@ own triple in `projection.yaml`, beside the section:
   `project` moves from a count of signatures to tokens, so the tools range is
   a fixed size and the belief selection fills it by score until the next
   signature does not fit. Its minimum (one signature) stays.
+- **A range with a member bound** (`range: { tokens: N, most: M }`) holds at
+  most `M` members, however much room is left: the fill stops at the first
+  that does not fit or at the `M`th, and the belief budget is `M`. A
+  collection whose selection is one locked choice — npcd's talk template, one
+  per turn — is `most: 1`, so a range sized for its longest template never
+  admits a second short one beside it. Without `most` a ranged collection
+  ignores its count, as the tools do.
 
 The projection budgets are fixed for the dialect: they are positions, so a
 card does not change them, and the same turn lays out identically on all three

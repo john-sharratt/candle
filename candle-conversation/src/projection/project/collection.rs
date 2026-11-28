@@ -236,9 +236,12 @@ pub(super) fn select_collection_sections<R: ContentResolver>(
             }
             // A ranged collection is filled by tokens, not by a count: the
             // range is its size, so the selection may choose every member and
-            // the range takes them by score while they fit (`range_fill`).
-            if coll.range.is_some() {
-                cfg.budget_max = cfg.budget_max.max(candidates.len());
+            // the range takes them by score while they fit (`range_fill`) —
+            // up to the most it holds, when it declares one.
+            if let Some(range) = &coll.range {
+                cfg.budget_max = range
+                    .most
+                    .unwrap_or_else(|| cfg.budget_max.max(candidates.len()));
             }
             let beliefs = crate::provenance::belief_step(
                 &fresh,
@@ -292,7 +295,7 @@ pub(super) fn select_collection_sections<R: ContentResolver>(
                     .filter(|(_, b)| b.selected || no_opinion)
                     .map(|(s, b)| (s.id, b.score, resolver.section_token_count(s.id)))
                     .collect();
-                fit_by_tokens(&chosen, room, mandatory)
+                fit_by_tokens(&chosen, room, mandatory, range.most)
             });
             let mut beliefs = beliefs.into_iter();
             let mut out = Vec::new();

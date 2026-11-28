@@ -22,6 +22,11 @@ pub struct ReservedRange {
     pub small_context: usize,
     /// Which end of the range the members stand at.
     pub fill: RangeFill,
+    /// The most members the range holds, or none for as many as fit. A
+    /// ranged collection is filled by tokens, so its selection's count binds
+    /// only through this: one locked template is one member, whatever room
+    /// the range has for a second.
+    pub most: Option<usize>,
 }
 
 /// Which end of a range its members stand at (`docs/placed_section_layout.md`
@@ -64,6 +69,7 @@ mod tests {
         tokens: 8_192,
         small_context: 2_048,
         fill: RangeFill::Bottom,
+        most: None,
     };
 
     /// **The native context picks the size.**
