@@ -12,6 +12,7 @@
 //! that reference names.
 
 use super::*;
+use crate::files::is_member_stream_name;
 
 impl Substrate {
     /// A section tombstone ends one **generation** of a stream, not the stream.
@@ -347,12 +348,29 @@ impl Substrate {
         )
     }
 
-    /// Every shared section stream the substrate holds, by id — what the sweep
-    /// chooses from (`docs/shared_journal_sections.md` §6).
+    /// Every shared journal section stream the substrate holds, by id — what
+    /// the sweep chooses from (`docs/shared_journal_sections.md` §6).
+    ///
+    /// **Never a knowledge-base member.** A member is declared under the shared
+    /// prefix too (`shared/files/…`), but no journal run holds it and, on a
+    /// fresh start, no conversation does either — so the sweep, given every
+    /// shared stream, retired the whole knowledge base as "superseded" on the
+    /// first pass after a restart, and segment maintenance then reclaimed the
+    /// segments its chunks lived in as dead (2026-11-28: 17,658 members
+    /// retired, nine segments unlinked). A member ends only when its file
+    /// does, through the knowledge base's own records.
     pub fn shared_section_streams(&self) -> Vec<StreamId> {
-        let mut found = self
+        let mut found: Vec<StreamId> = self
             .streams
-            .sections_named_under(SHARED_SECTION_NAME_PREFIX);
+            .sections_named_under(SHARED_SECTION_NAME_PREFIX)
+            .into_iter()
+            .filter(|&s| {
+                !matches!(
+                    self.streams.get(s).and_then(|st| st.decl.as_ref()),
+                    Some(StreamDecl::PromptSection(d)) if is_member_stream_name(&d.debug_name)
+                )
+            })
+            .collect();
         found.sort_unstable_by_key(|s| s.0);
         found.dedup();
         found

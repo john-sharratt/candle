@@ -528,6 +528,19 @@ pub(super) mod tests {
         );
     }
 
+    /// **The sweep never chooses a knowledge-base member.** A member is a
+    /// shared stream (`shared/files/…`) that nothing holds after a restart;
+    /// offered to the sweep, it was retired as a superseded journal section.
+    #[test]
+    fn a_knowledge_base_member_is_no_sweep_candidate() {
+        let mut sub = Substrate::new();
+        declare_section(&mut sub, 301, "shared/journal/1");
+        declare_section(&mut sub, 302, "shared/files/candle/zend/src/lib.rs@b#1-200");
+        declare_section(&mut sub, 303, "conv/7/journal/1");
+        assert!(sub.is_shared_section_stream(StreamId(302)));
+        assert_eq!(sub.shared_section_streams(), vec![StreamId(301)]);
+    }
+
     /// **A section's end state goes with its generation**: the snapshot tail
     /// under its end-state stream is dropped when the section stream ends, and a
     /// later generation keeps one again.
