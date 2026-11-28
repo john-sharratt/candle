@@ -53,8 +53,10 @@ host:
 # (`docs/provenance_expectations/`) — a reading of those would answer the
 # battery from its answer key, as four answers did on 2026-11-16
 # (docs/unbounded_agents.md §9.12) — and the records of past states: every
-# measured result (`docs/results/`) and every archived document
-# (`docs/archived/`). A record names the code as it stood when it was written,
+# measured result (`docs/results/`), every archived document
+# (`docs/archived/`), and the paper's earlier versions and change record
+# (`docs/unbounded_agents_v*`), which stay beside the current one because the
+# site serves them from `docs/`. A record names the code as it stood when it was written,
 # and read as current it answers with paths and names that no longer exist, as
 # battery (i)'s answers did on 2026-11-22. A `…/*/*` pattern covers only below
 # the folder's own files, which the walk read at depth 3 before. Generated and
@@ -69,6 +71,7 @@ zend:
   ignore:
     - candle/docs/results/*
     - candle/docs/archived/*
+    - candle/docs/unbounded_agents_v*
     - candle/zend/examples/dependency_battery/*
     - candle/docs/provenance_expectations/*
     - candle/candle-examples/examples/*/*
