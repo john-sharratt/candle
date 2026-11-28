@@ -58,7 +58,9 @@ host:
 # (`docs/unbounded_agents_v*`), which stay beside the current one because the
 # site serves them from `docs/`, and the bots' per-day journal archives
 # (`journals/groups/*/bots/*/archive/`), some 4,400 small files whose current
-# entries the bots' journals already hold. A record names the code as it stood when it was written,
+# entries the bots' journals already hold — and the diaries
+# (`journals/.diaries/`), which are personal and opened only on request
+# (docs/private_mode.md). A record names the code as it stood when it was written,
 # and read as current it answers with paths and names that no longer exist, as
 # battery (i)'s answers did on 2026-11-22. A `…/*/*` pattern covers only below
 # the folder's own files, which the walk read at depth 3 before. Generated and
@@ -75,6 +77,7 @@ zend:
     - candle/docs/archived/*
     - candle/docs/unbounded_agents_v*
     - journals/groups/*/bots/*/archive/*
+    - journals/.diaries/*
     - candle/zend/examples/dependency_battery/*
     - candle/docs/provenance_expectations/*
     - candle/candle-examples/examples/*/*
